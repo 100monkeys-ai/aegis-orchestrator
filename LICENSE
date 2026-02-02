@@ -1,0 +1,189 @@
+Business Source License 1.1
+
+Licensor: Reely Inc.
+
+Licensed Work: AEGIS Orchestrator
+The Licensed Work is (c) 2026 Reely Inc.
+
+Additional Use Grant: You may make production use of the Licensed Work,
+provided that such use does not include offering the Licensed Work to third
+parties on a hosted or managed basis, whether as a service subscription,
+application service provider (ASP) offering, platform-as-a-service (PaaS),
+infrastructure-as-a-service (IaaS), or in any other form where the Licensed Work
+is made available to the public or to customers as a discrete service or
+offering by a Hyper-Scale Cloud Provider (defined below).
+
+For clarity, "Hyper-Scale Cloud Provider" means any entity that offers
+infrastructure-as-a-service, platform-as-a-service, or managed hosting services
+with global reach, including but not limited to Amazon Web Services (AWS),
+Microsoft Azure, Google Cloud Platform, Alibaba Cloud, IBM Cloud, or any
+substantially equivalent provider.
+
+Licensor Specified: Reely Inc.
+
+Licensor Specified EULA: The Licensor is not responsible for or liable for
+the performance or non-performance of the Licensed Work, including its use or
+failures, whether direct or indirect, and whether or not arising from or related
+to breaches of this license.
+
+Change Date: 2030-02-01
+
+Change License: Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed Work,
+please contact Reely Inc. at <licensing@reely.dev>
+
+---
+
+NOTICE OF FUTURE OPEN SOURCE
+
+This Licensed Work will automatically convert to the Apache License, Version 2.0
+on February 1, 2030. After the Change Date, the Licensed Work may be used under
+the terms of the Apache License, Version 2.0, in which case all restrictions
+on offering as a managed service or SaaS will no longer apply.
+
+---
+
+RATIONALE FOR DEFENSIVE LICENSING
+
+The Business Source License for AEGIS is adopted to prevent exploitation by
+hyper-scale cloud providers who would otherwise offer AEGIS as a managed service
+without contribution to the ecosystem or commercial agreement. This defensive
+posture follows the precedent established by companies like Sentry, CockroachDB,
+and other infrastructure providers.
+
+The BSL balances the need for:
+
+1. Open access for individual developers and organizations
+2. Protection against predatory appropriation by corporate cloud providers
+3. A clear path to true open source (Apache 2.0) in the future
+
+---
+
+PERMISSIONS AND RESTRICTIONS
+
+✅ PERMITTED (You may):
+
+- Use AEGIS internally for your business
+- Modify the source code for your own purposes
+- Run self-hosted instances
+- Contribute improvements back to the project
+- Use AEGIS in applications you build for customers
+- Deploy on your own infrastructure
+
+❌ PROHIBITED (You may not):
+
+- Offer AEGIS as a managed SaaS service to third parties
+- Resell or rebrand AEGIS as your own managed offering
+- Provide AEGIS as a cloud service without explicit commercial license
+
+For cloud provider partnerships or managed service arrangements, please
+contact <licensing@reely.dev>
+
+---
+
+BUSINESS SOURCE LICENSE V 1.1
+
+Parameters
+
+Licensor: Reely Inc.
+
+Licensed Work: AEGIS - Sovereign Agent Cloud Platform
+     The Licensed Work is (c) 2026 Reely Inc.
+
+Additional Use Grant: You may make production use of the Licensed Work,
+provided that such use does not include offering the Licensed Work to third
+parties on a hosted or managed basis, and provided that Licensee does not
+rebrand, resell, or remarket the Licensed Work as a discrete service to third
+parties. For purposes of clarity, offering the Licensed Work as part of a
+value-added service (such as consulting, integration, or support) is
+permitted under this license, provided that the Licensed Work itself is not
+the primary offering or competitive product.
+
+Licensor Specified: Reely Inc.
+
+Licensor Specified EULA: The Licensor is not responsible for or liable for the
+performance or non-performance of the Licensed Work, including its use or
+failures, and is not liable for any lost profits or other consequential damages
+arising from the use of the Licensed Work.
+
+Change Date: February 1, 2030 (4 years from initial release)
+
+Change License: Apache License, Version 2.0
+
+For information about alternative licensing arrangements for the Licensed Work,
+please visit <https://reely.dev/licensing> or contact <licensing@reely.dev>
+
+---
+
+Terms and Conditions
+
+1. DEFINITIONS
+
+   a) "Change Date" means February 1, 2030.
+
+   b) "Change License" means the Apache License, Version 2.0.
+
+   c) "Derivative Work" means any work, whether in Source or Object form, that
+      is based on (or derived from) the Licensed Work and for which editorial
+      revisions, annotations, elaborations, or other modifications represent
+      the work of authorship of the Licensor.
+
+   d) "Hyper-Scale Cloud Provider" means any entity offering infrastructure or
+      platform services with global geographic reach and customer base,
+      including but not limited to AWS, Google Cloud, Microsoft Azure, Alibaba
+      Cloud, and substantially equivalent providers as determined by Licensor.
+
+   e) "Licensor" means Reely Inc.
+
+   f) "Licensed Work" means AEGIS Control Plane, including all code,
+      documentation, and associated materials.
+
+   g) "Object" form means any form resulting from mechanical transformation or
+      translation of Source form, including but not limited to compiled object
+      code, generated documentation, and conversions to other media types.
+
+   h) "Source" form means the preferred form for making modifications, including
+      but not limited to software source code, documentation source, and
+      configuration files.
+
+   i) "You" or "Your" means each individual or legal entity exercising rights
+      granted by this License.
+
+2. GRANT
+
+   Subject to the terms and conditions of this License, Licensor hereby grants
+   to You a worldwide, non-exclusive, no-charge, royalty-free, irrevocable
+   copyright license to reproduce, prepare, publicly display, publicly perform,
+   sublicense, and distribute the Licensed Work and Derivative Works in Source
+   or Object form, PROVIDED that You do not offer the Licensed Work to third
+   parties on a hosted or managed basis.
+
+3. LIMITATIONS
+
+   3.1 If You are a Hyper-Scale Cloud Provider or offer managed services, you
+   may not offer the Licensed Work as a Service to third parties, whether as
+   SaaS, PaaS, IaaS, or any hosted offering, without obtaining an explicit
+   written commercial license from Licensor.
+
+   3.2 You may not offer the Licensed Work for managed hosting unless You enter
+   into a separate written agreement with Licensor.
+
+4. TERM
+
+   This License applies until the Change Date. Upon the Change Date, this
+   License terminates and the Licensed Work automatically becomes available
+   under the Change License terms, without any further action required.
+
+5. DISCLAIMER OF WARRANTIES
+
+   THE LICENSED WORK IS PROVIDED "AS IS" WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NONINFRINGEMENT.
+
+6. LIMITATION OF LIABILITY
+
+   IN NO EVENT SHALL LICENSOR BE LIABLE FOR ANY SPECIAL, INDIRECT,
+   INCIDENTAL, OR CONSEQUENTIAL DAMAGES ARISING OUT OF OR RELATING TO THIS
+   LICENSE, EVEN IF LICENSOR HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH
+   DAMAGES.
