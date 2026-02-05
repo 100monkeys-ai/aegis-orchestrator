@@ -8,11 +8,17 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+serde.workspace = true
+serde_json.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
 futures = { workspace = true }
+bollard.workspace = true
+sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+tracing.workspace = true
+axum.workspace = true
+tokio-stream = "0.1.18"
+tower-http.workspace = true
