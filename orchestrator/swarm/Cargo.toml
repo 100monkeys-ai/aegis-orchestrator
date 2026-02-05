@@ -13,6 +13,7 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+async-trait = "0.1"
 aegis-core = { path = "../core" } 
 
 # We might need agent-core to refer to AgentId? 

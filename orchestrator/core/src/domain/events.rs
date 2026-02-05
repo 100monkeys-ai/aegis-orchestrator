@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 use crate::domain::agent::{AgentId, AgentManifest};
 use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
-use crate::domain::policy::IsolationType; // Assuming policy events need this or similar
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentLifecycleEvent {
