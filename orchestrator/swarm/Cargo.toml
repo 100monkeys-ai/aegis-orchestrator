@@ -1,0 +1,21 @@
+[package]
+name = "aegis-swarm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+aegis-core = { path = "../core" } 
+
+# We might need agent-core to refer to AgentId? 
+# "aegis-core" is the new name for orchestrator/core crate from my implementation plan (Step 1).
+# I need to verify if I renamed it in Cargo.toml. 
+# Yes, I saw in a previous view_file that the name was "aegis-core".

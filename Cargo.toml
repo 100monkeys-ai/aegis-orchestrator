@@ -2,13 +2,11 @@
 resolver = "2"
 members = [
     "orchestrator/core",
-    "orchestrator/api",
-    "orchestrator/runtime-docker",
-    "orchestrator/runtime-firecracker",
-    "orchestrator/memory",
-    "orchestrator/security",
-    "cli",
-    "edge-node",
+
+    "orchestrator/swarm",
+    "cortex",
+
+
     "sdks",
 ]
 
