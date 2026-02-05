@@ -142,7 +142,7 @@ Prototype       Cloud           Platform        Scale
 
 **Deliverables**:
 
-- Public platform (reely.dev)
+- Public platform (100monkeys.ai)
 - SDKs and documentation
 - Open source release
 

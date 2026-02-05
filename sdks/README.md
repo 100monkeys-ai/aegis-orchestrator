@@ -21,7 +21,7 @@ use aegis_sdk::{AegisClient, AgentManifest, TaskInput};
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Create a client
-    let client = AegisClient::new("https://api.reely.dev")
+    let client = AegisClient::new("https://api.100monkeys.ai")
         .with_api_key("your-api-key");
 
     // Load agent manifest
