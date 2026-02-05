@@ -35,6 +35,7 @@ pub struct AgentManifest {
     pub description: String,
     pub runtime: RuntimeConfig,
     pub security: SecurityPolicy,
+    pub execution: Option<ExecutionConfig>,
     // Add other fields as needed
 }
 
@@ -43,6 +44,12 @@ pub struct RuntimeConfig {
     pub image: String,
     pub command: Option<Vec<String>>,
     pub env: std::collections::HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionConfig {
+    pub mode: Option<String>,
+    pub max_retries: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

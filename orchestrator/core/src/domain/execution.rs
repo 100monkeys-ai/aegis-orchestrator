@@ -148,3 +148,10 @@ impl Execution {
         self.ended_at = Some(Utc::now());
     }
 }
+
+#[async_trait::async_trait]
+pub trait ExecutionRepository: Send + Sync {
+    async fn save(&self, execution: &Execution) -> anyhow::Result<()>;
+    async fn get(&self, id: &ExecutionId) -> anyhow::Result<Option<Execution>>;
+    // async fn list(&self) -> anyhow::Result<Vec<Execution>>; // Optional for now
+}

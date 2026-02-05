@@ -1,4 +1,4 @@
-use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus};
+use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionRepository};
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::{AgentId, Agent, RuntimeConfig};
 use crate::domain::supervisor::Supervisor;
@@ -29,18 +29,21 @@ pub struct StandardExecutionService {
     runtime: Arc<dyn AgentRuntime>,
     agent_service: Arc<dyn AgentLifecycleService>,
     supervisor: Arc<Supervisor>,
+    repository: Arc<dyn ExecutionRepository>,
 }
 
 impl StandardExecutionService {
     pub fn new(
         runtime: Arc<dyn AgentRuntime>, 
         agent_service: Arc<dyn AgentLifecycleService>,
-        supervisor: Arc<Supervisor>
+        supervisor: Arc<Supervisor>,
+        repository: Arc<dyn ExecutionRepository>,
     ) -> Self {
         Self {
             runtime,
             agent_service,
             supervisor,
+            repository,
         }
     }
 }
@@ -49,50 +52,89 @@ impl StandardExecutionService {
 impl ExecutionService for StandardExecutionService {
     async fn start_execution(&self, agent_id: AgentId, input: ExecutionInput) -> Result<ExecutionId> {
         // 1. Fetch Agent
-        let agent = self.agent_service.get_agent(agent_id).await?; // Assuming async, need to check trait
+        let agent = self.agent_service.get_agent(agent_id).await?;
         
-        // 2. Spawn Runtime
-        let instance_id = self.runtime.spawn(agent.manifest.runtime).await
-            .map_err(|e| anyhow!("Failed to spawn runtime: {}", e))?;
+        // 2. Create Execution Record
+        let max_retries = if let Some(exec) = &agent.manifest.execution {
+             match exec.max_retries {
+                 Some(r) => r as u8,
+                 None => 3 // Default
+             }
+        } else {
+            3 // Default
+        };
+
+        let mut execution = Execution::new(agent_id, input.input.clone(), max_retries);
+        let execution_id = execution.id;
+        
+        // 3. Save initial state
+        self.repository.save(&execution).await?;
+
+        // 4. Spawn Runtime
+        let instance_id = match self.runtime.spawn(agent.manifest.runtime).await {
+            Ok(id) => id,
+            Err(e) => {
+                execution.fail();
+                self.repository.save(&execution).await?;
+                return Err(anyhow!("Failed to spawn runtime: {}", e));
+            }
+        };
+
+        execution.start();
+        self.repository.save(&execution).await?;
             
-        // 3. Run Supervisor Loop
-        // In a real system, this would be spawned in background and execution ID returned immediately
-        // For now, we mimic async execution by just returning ID, but strictly logic runs here? 
-        // No, start_execution implies async start.
-        // We'll spawn a tokio task.
-        
+        // 5. Run Supervisor Loop
         let supervisor = self.supervisor.clone();
         let runtime = self.runtime.clone();
+        let repository = self.repository.clone();
         let prompt = input.input.clone();
         
         tokio::spawn(async move {
             match supervisor.run_loop(&instance_id, prompt).await {
                 Ok(_) => {
-                    // Log success
-                    // Cleanup
+                    // Update to completed
+                    if let Ok(mut exec_opt) = repository.get(&execution_id).await {
+                        if let Some(mut exec) = exec_opt {
+                             exec.complete();
+                             let _ = repository.save(&exec).await;
+                        }
+                    }
                     let _ = runtime.terminate(&instance_id).await;
                 },
                 Err(_) => {
-                    // Log error
+                    // Update to failed
+                    if let Ok(mut exec_opt) = repository.get(&execution_id).await {
+                         if let Some(mut exec) = exec_opt {
+                              exec.fail();
+                              let _ = repository.save(&exec).await;
+                         }
+                     }
                     let _ = runtime.terminate(&instance_id).await;
                 }
             }
         });
 
-        // Return a new ExecutionId (mocked for now since DB isn't hooked up to store the record)
-        Ok(ExecutionId::new())
+        Ok(execution_id)
     }
 
-    async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
-        Err(anyhow!("Not implemented"))
+    async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+        self.repository.get(&id).await?
+            .ok_or_else(|| anyhow!("Execution not found"))
     }
 
-    async fn get_iterations(&self, _exec_id: ExecutionId) -> Result<Vec<Iteration>> {
-        Err(anyhow!("Not implemented"))
+    async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {
+        let execution = self.get_execution(exec_id).await?;
+        Ok(execution.iterations().to_vec())
     }
 
-    async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> {
-        Err(anyhow!("Not implemented"))
+    async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
+         // This would ideally signal the supervisor to stop too.
+         // For now, just mark state.
+         let mut execution = self.get_execution(id).await?;
+         execution.status = ExecutionStatus::Cancelled;
+         execution.ended_at = Some(Utc::now());
+         self.repository.save(&execution).await?;
+         Ok(())
     }
 
     async fn stream_execution(&self, _id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {

@@ -1,5 +1,6 @@
 use crate::application::agent::AgentLifecycleService;
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
+use crate::domain::execution::{Execution, ExecutionId, ExecutionRepository};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -55,5 +56,32 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     async fn list_agents(&self) -> Result<Vec<Agent>> {
         let agents = self.agents.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
         Ok(agents.values().cloned().collect())
+    }
+}
+
+#[derive(Clone)]
+pub struct InMemoryExecutionRepository {
+    executions: Arc<Mutex<HashMap<ExecutionId, Execution>>>,
+}
+
+impl InMemoryExecutionRepository {
+    pub fn new() -> Self {
+        Self {
+            executions: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionRepository for InMemoryExecutionRepository {
+    async fn save(&self, execution: &Execution) -> Result<()> {
+        let mut executions = self.executions.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        executions.insert(execution.id, execution.clone());
+        Ok(())
+    }
+
+    async fn get(&self, id: &ExecutionId) -> Result<Option<Execution>> {
+        let executions = self.executions.lock().map_err(|_| anyhow!("Mutex poisoned"))?;
+        Ok(executions.get(id).cloned())
     }
 }
