@@ -1,0 +1,47 @@
+[package]
+name = "aegis-cli"
+version = "0.1.0"
+edition = "2021"
+license = "BSL-1.1"
+
+[[bin]]
+name = "aegis"
+path = "src/main.rs"
+
+[dependencies]
+# CLI framework
+clap = { version = "4.5", features = ["derive", "cargo", "env"] }
+colored = "2.1"
+indicatif = "0.17"
+
+# Async runtime
+tokio = { workspace = true }
+tokio-stream = "0.1"
+
+# HTTP client for daemon delegation
+reqwest = { version = "0.12", features = ["json", "stream"] }
+axum = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = "0.9"
+
+# Types and errors
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Platform-specific daemon support
+[target.'cfg(unix)'.dependencies]
+daemonize = "0.5"
+libc = "0.2"
+
+# Internal dependencies
+aegis-sdk = { path = "../sdks" }
+aegis-core = { path = "../orchestrator/core" }

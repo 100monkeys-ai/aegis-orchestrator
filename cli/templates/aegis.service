@@ -1,0 +1,27 @@
+[Unit]
+Description=AEGIS Agent Host Daemon
+Documentation=https://github.com/aent-ai/aegis
+After=network.target docker.service
+Wants=docker.service
+
+[Service]
+Type=forking
+ExecStart={{BINARY_PATH}} --daemon
+PIDFile=/var/run/aegis.pid
+Restart=on-failure
+RestartSec=10s
+User={{USER}}
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/run /tmp
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,37 @@
+# AEGIS Agent Host - Minimal Configuration
+#
+# This is a minimal configuration to get started.
+# Refer to config-with-examples.yaml for full documentation.
+
+node:
+  node_id: "change-me-to-unique-id"
+  name: "my-aegis-node"
+  # region: "us-west-2"  # Optional
+  # tags: ["development"]  # Optional
+
+llm_providers:
+  - name: "local"
+    type: "ollama"
+    endpoint: "http://localhost:11434"
+    models:
+      - alias: "default"
+        model: "llama3.2:latest"
+        capabilities: ["code", "reasoning"]
+      - alias: "fast"
+        model: "qwen2.5-coder:7b"
+        capabilities: ["code"]
+
+llm_selection:
+  strategy: "PreferLocal"
+  default_provider: "local"
+  max_retries: 3
+  retry_delay_ms: 1000
+
+network:
+  # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
+  # api_key: "env:AEGIS_API_KEY"  # Optional
+
+observability:
+  log_level: "info"
+  # metrics_enabled: true  # Optional
+  # traces_enabled: false  # Optional

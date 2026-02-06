@@ -2,12 +2,10 @@
 resolver = "2"
 members = [
     "orchestrator/core",
-
     "orchestrator/swarm",
     "cortex",
-
-
     "sdks",
+    "cli",
 ]
 
 [workspace.package]
