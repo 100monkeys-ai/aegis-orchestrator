@@ -1,6 +1,6 @@
-# AEGIS Orchestrator Security Model
+# AEGIS Security Model
 
-This document describes the security architecture and threat model for the AEGIS Orchestrator.
+This document describes the security architecture and threat model for Project AEGIS.
 
 ## Security Principles
 
