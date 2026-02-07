@@ -399,7 +399,15 @@ fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
                 .with_context(|| format!("Failed to read input file: {}", path))?;
             serde_json::from_str(&content).context("Failed to parse input JSON")
         }
-        Some(s) => serde_json::from_str(&s).context("Failed to parse input JSON"),
+        Some(s) => {
+            // Try parsing as JSON first
+            if let Ok(val) = serde_json::from_str(&s) {
+                Ok(val)
+            } else {
+                // Fallback to string value
+                Ok(serde_json::Value::String(s))
+            }
+        }
     }
 }
 
