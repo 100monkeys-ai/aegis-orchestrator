@@ -18,8 +18,22 @@ impl StandardAgentLifecycleService {
 #[async_trait]
 impl AgentLifecycleService for StandardAgentLifecycleService {
     async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
+        // Check if agent with same name exists
+        if let Some(existing) = self.repository.find_by_name(&manifest.agent.name).await? {
+            // Need to decide: Update existing or Fail?
+            // "Deploy" usually implies creating or updating.
+            // If ID matches, it's an update (handled by update_agent).
+            // If ID is different but name matches, it's a conflict.
+            
+            // For now, let's enforce uniqueness strictly for new deployments.
+            // If the user wants to update, they should use update_agent or we can support upsert logic here.
+            // But since AgentId is generated on 'new', we can't easily match unless searching by name IS the identity.
+            // Let's return error if name exists.
+            
+            anyhow::bail!("Agent with name '{}' already exists (ID: {}). Use 'agent update' to modify it.", existing.name, existing.id.0);
+        }
+
         // Create new agent from manifest
-        // For now, we assume simple mapping. Domain logic might go here.
         let agent = Agent::new(manifest);
         self.repository.save(agent.clone()).await?; // Agent might not be Copy, so clone or move. save takes value.
         Ok(agent.id)
@@ -44,5 +58,11 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
 
     async fn list_agents(&self) -> Result<Vec<Agent>> {
         self.repository.list_all().await.map_err(|e| anyhow::anyhow!("Failed to list agents: {}", e))
+    }
+
+    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+        let agent = self.repository.find_by_name(name).await
+            .map_err(|e| anyhow::anyhow!("Repository error: {}", e))?;
+        Ok(agent.map(|a| a.id))
     }
 }

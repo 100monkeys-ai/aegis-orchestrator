@@ -34,6 +34,8 @@ struct OllamaOptions {
 struct OllamaResponse {
     response: String,
     done: bool,
+    eval_count: Option<u32>,
+    prompt_eval_count: Option<u32>,
 }
 
 impl OllamaAdapter {
@@ -91,7 +93,13 @@ impl LLMProvider for OllamaAdapter {
 
         Ok(GenerationResponse {
             text: ollama_response.response,
-            tokens_used: 0, // Ollama doesn't always return token count
+            usage: crate::domain::llm::TokenUsage {
+                prompt_tokens: ollama_response.prompt_eval_count.unwrap_or(0),
+                completion_tokens: ollama_response.eval_count.unwrap_or(0),
+                total_tokens: ollama_response.prompt_eval_count.unwrap_or(0) + ollama_response.eval_count.unwrap_or(0),
+            },
+            provider: "ollama".to_string(),
+            model: self.model.clone(),
             finish_reason: if ollama_response.done {
                 FinishReason::Stop
             } else {

@@ -165,6 +165,7 @@ impl ExecutionEventReceiver {
             ExecutionEvent::ExecutionFailed { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ExecutionCancelled { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ConsoleOutput { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
         }
     }
 }

@@ -9,4 +9,5 @@ pub trait AgentLifecycleService: Send + Sync {
     async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()>;
     async fn delete_agent(&self, id: AgentId) -> Result<()>;
     async fn list_agents(&self) -> Result<Vec<Agent>>;
+    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>>;
 }

@@ -182,16 +182,34 @@ async fn execute_daemon(
     client: DaemonClient,
 ) -> Result<()> {
     // Parse agent (UUID or manifest path)
+    // Parse agent (UUID, Name, or Manifest Path)
     let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent) {
         uuid
     } else {
-        // Deploy manifest and use resulting ID
-        let manifest_path = PathBuf::from(&agent);
-        let manifest_content = std::fs::read_to_string(&manifest_path)
-            .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
-        let agent_manifest: aegis_sdk::manifest::AgentManifest =
-            serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
-        client.deploy_agent(agent_manifest).await?
+        // Try lookup by name
+        if let Ok(Some(uuid)) = client.lookup_agent(&agent).await {
+            uuid
+        } else {
+            // Deploy manifest and use resulting ID
+            let manifest_path = PathBuf::from(&agent);
+            if manifest_path.exists() {
+                let manifest_content = std::fs::read_to_string(&manifest_path)
+                    .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
+                let agent_manifest: aegis_sdk::manifest::AgentManifest =
+                    serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
+                
+                // Deploy (will fail if name exists, so user sees error, which is good)
+                match client.deploy_agent(agent_manifest).await {
+                    Ok(id) => id,
+                    Err(e) => {
+                         // Simplify error for user
+                         anyhow::bail!("Failed to deploy manifest: {}", e);
+                    }
+                }
+            } else {
+                anyhow::bail!("Agent '{}' not found and not a valid manifest path.", agent);
+            }
+        }
     };
 
     // Parse input
@@ -283,14 +301,24 @@ async fn execute_embedded(
     executor: EmbeddedExecutor,
 ) -> Result<()> {
     // Parse agent (UUID or manifest path)
+    // Parse agent (UUID, Name, or Manifest Path)
     let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent) {
         AgentId(uuid)
     } else {
-        let manifest_path = PathBuf::from(&agent);
-        let manifest_content = std::fs::read_to_string(&manifest_path)?;
-        let agent_manifest: aegis_sdk::manifest::AgentManifest =
-            serde_yaml::from_str(&manifest_content)?;
-        executor.deploy_agent(agent_manifest).await?
+         // Try lookup by name
+        if let Ok(Some(id)) = executor.lookup_agent(&agent).await {
+            id
+        } else {
+            let manifest_path = PathBuf::from(&agent);
+            if manifest_path.exists() {
+                let manifest_content = std::fs::read_to_string(&manifest_path)?;
+                let agent_manifest: aegis_sdk::manifest::AgentManifest =
+                    serde_yaml::from_str(&manifest_content)?;
+                executor.deploy_agent(agent_manifest).await?
+            } else {
+                anyhow::bail!("Agent '{}' not found and not a valid manifest path.", agent);
+            }
+        }
     };
 
     let input_data = parse_input(input)?;

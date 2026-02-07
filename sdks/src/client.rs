@@ -91,6 +91,40 @@ impl AegisClient {
         
         Ok(())
     }
+
+    /// Generate text using the orchestrator's LLM proxy.
+    /// 
+    /// # Arguments
+    /// * `prompt` - The prompt to generate text from.
+    /// * `model` - Optional model alias to use.
+    /// * `execution_id` - Optional execution ID to associate logs with.
+    pub async fn generate_text(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        execution_id: Option<&str>,
+    ) -> Result<String> {
+        let url = format!("{}/api/llm/generate", self.base_url);
+        
+        let payload = serde_json::json!({
+            "prompt": prompt,
+            "model": model,
+            "execution_id": execution_id
+        });
+        
+        let mut req = self.client.post(&url).json(&payload);
+        
+        if let Some(key) = &self.api_key {
+            req = req.header("Authorization", format!("Bearer {}", key));
+        }
+        
+        let response = req.send().await?;
+        let json: serde_json::Value = response.json().await?;
+        
+        json["content"].as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("Invalid response format"))
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

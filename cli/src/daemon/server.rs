@@ -126,6 +126,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .route("/api/executions/:execution_id", axum::routing::delete(delete_execution_handler))
         .route("/api/agents", post(deploy_agent_handler).get(list_agents_handler))
         .route("/api/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
+        .route("/api/agents/lookup/:name", get(lookup_agent_handler))
+        .route("/api/llm/generate", post(llm_generate_handler))
         .with_state(Arc::new(app_state));
 
     // Start HTTP server
@@ -439,6 +441,18 @@ async fn stream_events_handler(
                                     "data": { "output": content }
                                 })
                             },
+                            aegis_core::domain::events::ExecutionEvent::LlmInteraction { provider, model, prompt, response, .. } => {
+                                serde_json::json!({
+                                    "event_type": "LlmInteraction",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": {
+                                        "provider": provider,
+                                        "model": model,
+                                        "prompt": prompt,
+                                        "response": response
+                                    }
+                                })
+                            },
                             _ => {
                                  serde_json::json!({
                                     "event_type": "Unknown",
@@ -540,5 +554,76 @@ async fn get_agent_handler(
              Json(serde_json::to_value(agent.manifest).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))
         },
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn lookup_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.agent_service.lookup_agent(&name).await {
+        Ok(Some(id)) => (StatusCode::OK, Json(serde_json::json!({"id": id.0}))),
+        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Agent not found"}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct LlmGenerateRequest {
+    execution_id: Option<Uuid>,
+    iteration_number: Option<u8>,
+    provider: Option<String>,
+    model: Option<String>,
+    prompt: String,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+}
+
+async fn llm_generate_handler(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<LlmGenerateRequest>,
+) -> impl IntoResponse {
+    use aegis_core::domain::llm::GenerationOptions;
+    
+    // Resolve alias or use default
+    let alias = req.model.as_deref().unwrap_or("default");
+    
+    let options = GenerationOptions {
+        temperature: req.temperature.or(Some(0.7)),
+        max_tokens: req.max_tokens,
+        ..Default::default()
+    };
+    
+    let registry = &state._llm_registry;
+    
+    match registry.generate(alias, &req.prompt, &options).await {
+        Ok(response) => {
+            if let Some(exec_id) = req.execution_id {
+                let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                    execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                    iteration_number: req.iteration_number.unwrap_or(0),
+                    provider: response.provider.clone(),
+                    model: response.model.clone(),
+                    input_tokens: Some(response.usage.prompt_tokens),
+                    output_tokens: Some(response.usage.completion_tokens),
+                    prompt: req.prompt.clone(),
+                    response: response.text.clone(),
+                    timestamp: chrono::Utc::now(),
+                };
+                state.event_bus.publish_execution_event(event);
+            }
+            
+            (StatusCode::OK, Json(serde_json::json!({
+                "content": response.text,
+                "usage": {
+                    "prompt_tokens": response.usage.prompt_tokens,
+                    "completion_tokens": response.usage.completion_tokens,
+                    "total_tokens": response.usage.total_tokens
+                },
+                "provider": response.provider,
+                "model": response.model
+            })))
+        },
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }

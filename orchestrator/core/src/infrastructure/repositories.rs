@@ -98,6 +98,12 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         self.list_all().await
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {}", e))
     }
+
+    async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
+        let agent = self.find_by_name(name).await
+            .map_err(|e| anyhow::anyhow!("Repository error: {}", e))?;
+        Ok(agent.map(|a| a.id))
+    }
 }
 
 /// In-memory implementation of ExecutionRepository

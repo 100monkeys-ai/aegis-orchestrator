@@ -159,6 +159,9 @@ impl EmbeddedExecutor {
 
         Ok(())
     }
+    pub async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+        self.agent_service.lookup_agent(name).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -265,6 +268,14 @@ fn print_event(event: &DomainEvent) {
             aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
                 let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
                 println!("{} {}", prefix, content.trim_end());
+            }
+            aegis_core::domain::events::ExecutionEvent::LlmInteraction { model, response, .. } => {
+                println!(
+                    "{} [{}] -> {}...",
+                    "LLM".purple(),
+                    model,
+                    response.chars().take(50).collect::<String>().replace('\n', " ")
+                );
             }
         },
         DomainEvent::Policy(policy_event) => match policy_event {

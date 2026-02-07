@@ -111,8 +111,13 @@ impl LLMProvider for AnthropicAdapter {
 
         Ok(GenerationResponse {
             text,
-            tokens_used: anthropic_response.usage.input_tokens
-                + anthropic_response.usage.output_tokens,
+            usage: crate::domain::llm::TokenUsage {
+                prompt_tokens: anthropic_response.usage.input_tokens,
+                completion_tokens: anthropic_response.usage.output_tokens,
+                total_tokens: anthropic_response.usage.input_tokens + anthropic_response.usage.output_tokens,
+            },
+            provider: "anthropic".to_string(),
+            model: self.model.clone(),
             finish_reason: match anthropic_response.stop_reason.as_deref() {
                 Some("end_turn") => FinishReason::Stop,
                 Some("max_tokens") => FinishReason::Length,

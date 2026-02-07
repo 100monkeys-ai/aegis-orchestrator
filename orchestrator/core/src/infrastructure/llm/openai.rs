@@ -46,7 +46,9 @@ struct OpenAIChoice {
 
 #[derive(Deserialize)]
 struct OpenAIUsage {
-    total_tokens: u32,
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }
 
 impl OpenAIAdapter {
@@ -120,7 +122,22 @@ impl LLMProvider for OpenAIAdapter {
 
         Ok(GenerationResponse {
             text: choice.message.content.clone(),
-            tokens_used: openai_response.usage.total_tokens,
+            usage: crate::domain::llm::TokenUsage {
+                prompt_tokens: openai_response.usage.prompt_tokens,
+                completion_tokens: openai_response.usage.completion_tokens,
+                total_tokens: openai_response.usage.total_tokens,
+            },
+            provider: "openai".to_string(), // Or use config name if passed/stored? 
+            // Better to use "openai" as type, or pass name in constructor if we want "production-gpt4"
+            // For now, hardcode provider type or store it?
+            // The Registry stores provider *instances*. The instance doesn't know its registry alias.
+            // But we can store "openai" or similar.
+            // Let's use "openai" or the model name?
+            // The request had 'provider' field we want to return.
+            // Let's use the adapter type name or similar.
+            // Wait, we can store "source" in adapter?
+            // For now, "openai" is fine.
+            model: self.model.clone(),
             finish_reason: match choice.finish_reason.as_str() {
                 "stop" => FinishReason::Stop,
                 "length" => FinishReason::Length,

@@ -278,6 +278,35 @@ impl DaemonClient {
 
         Ok(())
     }
+    pub async fn lookup_agent(&self, name: &str) -> Result<Option<Uuid>> {
+        let response = self
+            .client
+            .get(&format!("{}/api/agents/lookup/{}", self.base_url, name))
+            .send()
+            .await
+            .context("Failed to lookup agent")?;
+
+        if response.status() == 404 {
+            return Ok(None);
+        }
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to lookup agent: {}", error_text);
+        }
+
+        #[derive(Deserialize)]
+        struct LookupResponse {
+            id: Uuid,
+        }
+
+        let lookup_response: LookupResponse = response
+            .json()
+            .await
+            .context("Failed to parse lookup response")?;
+
+        Ok(Some(lookup_response.id))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -332,20 +361,22 @@ fn print_event(event: &serde_json::Value) {
         }
         "IterationCompleted" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
+            let output = event["data"]["output"].as_str().unwrap_or("");
             println!(
-                "{} {} {} {}",
+                "{} {} {} {}\n{}",
                 format!("[{}]", timestamp).dimmed(),
                 "Iteration".yellow(),
                 iteration,
-                "completed".green()
+                "completed".green(),
+                output.cyan()
             );
         }
         "IterationFailed" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let error = if let Some(err_obj) = event["error"].as_object() {
-                err_obj["message"].as_str().unwrap_or(event["error"].as_str().unwrap_or("Unknown error"))
+            let error = if let Some(err_obj) = event["data"]["error"].as_object() {
+                err_obj["message"].as_str().unwrap_or(event["data"]["error"].as_str().unwrap_or("Unknown error"))
             } else {
-                event["error"].as_str().unwrap_or("")
+                 event["data"]["error"].as_str().unwrap_or(event["error"].as_str().unwrap_or(""))
             };
             println!(
                 "{} {} {} {} - {}",
@@ -356,32 +387,20 @@ fn print_event(event: &serde_json::Value) {
                 error
             );
         }
-        "RefinementApplied" => {
-            let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            println!(
-                "{} {} {} {}",
-                format!("[{}]", timestamp).dimmed(),
-                "Iteration".yellow(),
-                iteration,
-                "refinement applied".cyan()
-            );
+        "ConsoleOutput" => {
+            let stream = event["stream"].as_str().unwrap_or("stdout");
+            let content = event["data"]["output"].as_str().unwrap_or("");
+            let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
+            println!("{} {}", prefix, content.trim_end());
         }
-        "ExecutionCompleted" => {
-            let total = event["total_iterations"].as_u64().unwrap_or(0);
+        "LlmInteraction" => {
+            let model = event["data"]["model"].as_str().unwrap_or("unknown");
+            let response = event["data"]["response"].as_str().unwrap_or("");
             println!(
-                "{} {} ({} iterations)",
-                format!("[{}]", timestamp).dimmed(),
-                "Execution completed".bold().green(),
-                total
-            );
-        }
-        "ExecutionFailed" => {
-            let reason = event["reason"].as_str().unwrap_or("");
-            println!(
-                "{} {} - {}",
-                format!("[{}]", timestamp).dimmed(),
-                "Execution failed".bold().red(),
-                reason
+                "{} [{}] -> {}...",
+                "LLM".purple(),
+                model,
+                response.chars().take(50).collect::<String>().replace('\n', " ")
             );
         }
         _ => {

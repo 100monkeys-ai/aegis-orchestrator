@@ -91,6 +91,17 @@ pub enum ExecutionEvent {
         content: String,
         timestamp: DateTime<Utc>,
     },
+    LlmInteraction {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        provider: String,
+        model: String,
+        input_tokens: Option<u32>,
+        output_tokens: Option<u32>,
+        prompt: String,
+        response: String,
+        timestamp: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

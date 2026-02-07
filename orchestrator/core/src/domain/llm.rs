@@ -47,17 +47,29 @@ impl Default for GenerationOptions {
     }
 }
 
-/// Response from LLM generation
 #[derive(Debug, Clone)]
 pub struct GenerationResponse {
     /// Generated text
     pub text: String,
     
-    /// Tokens used in generation
-    pub tokens_used: u32,
+    /// Token usage stats
+    pub usage: TokenUsage,
+    
+    /// Usage provider name (e.g., "openai", "ollama")
+    pub provider: String,
+    
+    /// Model used (e.g., "gpt-4o", "llama3.2")
+    pub model: String,
     
     /// Why generation stopped
     pub finish_reason: FinishReason,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TokenUsage {
+    pub prompt_tokens: u32,
+    pub completion_tokens: u32,
+    pub total_tokens: u32,
 }
 
 /// Reason why generation stopped
