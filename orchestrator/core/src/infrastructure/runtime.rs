@@ -79,12 +79,18 @@ impl AgentRuntime for DockerRuntime {
             platform: None,
         };
 
+        // Convert map to "KEY=VALUE" strings
+        let env_vars: Vec<String> = config.env.iter()
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+
         let res = self.docker.create_container(Some(options), Config {
             image: Some(image.clone()), // Clone image
             tty: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             cmd: Some(vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]),
+            env: Some(env_vars),
             host_config: Some(host_config),
             ..Default::default()
         }).await
@@ -114,13 +120,7 @@ impl AgentRuntime for DockerRuntime {
                 "/usr/local/bin/aegis-bootstrap".to_string(),
                 input.prompt.clone()
             ]),
-            env: Some(vec![
-                // Ensure PYTHONPATH or other envs if needed
-                "PYTHONUNBUFFERED=1".to_string(),
-                // We should pass execution ID if we had it in TaskInput? 
-                // Currently TaskInput doesn't have it.
-                // But we can add it or ignore for now.
-            ]),
+            // env: Some(vec!["PYTHONUNBUFFERED=1".to_string()]), // Commented out to ensure inheritance from container
             ..Default::default()
         };
 

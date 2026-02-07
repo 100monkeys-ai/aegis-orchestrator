@@ -27,27 +27,27 @@ pub struct BasicJudge;
 impl EvaluationEngine for BasicJudge {
     async fn evaluate(&self, _output: &str, exit_code: i64, stderr: &str) -> Result<ValidationResult, ValidationError> {
         let mut errors = Vec::new();
+        let mut feedback = None;
+        let mut success = true;
         
         if exit_code != 0 {
+            success = false;
             errors.push(format!("Process exited with code {}", exit_code));
-        }
-        
-        if !stderr.is_empty() {
-            errors.push(format!("Stderr is not empty: {}", stderr));
+            if !stderr.is_empty() {
+                errors.push(format!("Stderr: {}", stderr));
+            }
+            feedback = Some("Execution failed. Please fix the errors listed.".to_string());
+        } else if !stderr.is_empty() {
+            // If exit code is 0, we treat stderr as warnings/logs, not failure.
+            // But we can include it in the "errors" list if we want it visible, or just ignore it.
+            // For now, let's NOT fail on stderr if exit code is 0.
+            // The supervisor already logs stderr.
         }
 
-        if errors.is_empty() {
-            Ok(ValidationResult {
-                success: true,
-                errors: vec![],
-                feedback: None,
-            })
-        } else {
-            Ok(ValidationResult {
-                success: false,
-                errors,
-                feedback: Some("Execution failed. Please fix the errors listed.".to_string()),
-            })
-        }
+        Ok(ValidationResult {
+            success,
+            errors,
+            feedback,
+        })
     }
 }
