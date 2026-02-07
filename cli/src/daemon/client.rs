@@ -170,8 +170,6 @@ impl DaemonClient {
         follow: bool,
         errors_only: bool,
     ) -> Result<()> {
-        use colored::Colorize;
-
         let mut url = format!(
             "{}/api/executions/{}/events",
             self.base_url, execution_id
@@ -307,12 +305,14 @@ fn print_event(event: &serde_json::Value) {
             );
         }
         _ => {
-            println!(
-                "{} {} {}",
-                format!("[{}]", timestamp).dimmed(),
-                event_type.cyan(),
-                serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
-            );
+            if event_type != "Unknown" {
+                 println!(
+                    "{} {} {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    event_type.cyan(),
+                    serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
+                );
+            }
         }
     }
 }

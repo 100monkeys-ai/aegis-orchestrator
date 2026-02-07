@@ -9,8 +9,8 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use crate::domain::agent::Agent;
-use crate::domain::execution::Execution;
+use crate::domain::agent::{Agent, AgentId};
+use crate::domain::execution::{Execution, ExecutionId};
 use uuid::Uuid;
 
 /// Storage backend enum for pluggable persistence
@@ -34,7 +34,7 @@ pub trait AgentRepository: Send + Sync {
     async fn save(&self, agent: Agent) -> Result<(), RepositoryError>;
     
     /// Find agent by ID
-    async fn find_by_id(&self, id: Uuid) -> Result<Option<Agent>, RepositoryError>;
+    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError>;
     
     /// Find agent by name
     async fn find_by_name(&self, name: &str) -> Result<Option<Agent>, RepositoryError>;
@@ -43,7 +43,7 @@ pub trait AgentRepository: Send + Sync {
     async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError>;
     
     /// Delete agent by ID
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError>;
+    async fn delete(&self, id: AgentId) -> Result<(), RepositoryError>;
 }
 
 /// Repository interface for Execution aggregates
@@ -54,16 +54,16 @@ pub trait ExecutionRepository: Send + Sync {
     async fn save(&self, execution: Execution) -> Result<(), RepositoryError>;
     
     /// Find execution by ID
-    async fn find_by_id(&self, id: Uuid) -> Result<Option<Execution>, RepositoryError>;
+    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError>;
     
     /// Find executions by agent ID
-    async fn find_by_agent(&self, agent_id: Uuid) -> Result<Vec<Execution>, RepositoryError>;
+    async fn find_by_agent(&self, agent_id: AgentId) -> Result<Vec<Execution>, RepositoryError>;
     
     /// Find recent executions (limit results)
     async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError>;
     
     /// Delete execution by ID
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError>;
+    async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError>;
 }
 
 /// Repository errors
@@ -82,11 +82,13 @@ pub enum RepositoryError {
     Unknown(String),
 }
 
+use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecutionRepository};
+
 /// Factory for creating repositories from storage backend
 pub fn create_agent_repository(backend: &StorageBackend) -> Arc<dyn AgentRepository> {
     match backend {
         StorageBackend::InMemory => {
-            Arc::new(crate::infrastructure::persistence::memory::InMemoryAgentRepository::new())
+            Arc::new(InMemoryAgentRepository::new())
         }
         StorageBackend::PostgreSQL(_config) => {
             // Future: Arc::new(PostgresAgentRepository::new(config))
@@ -98,7 +100,7 @@ pub fn create_agent_repository(backend: &StorageBackend) -> Arc<dyn AgentReposit
 pub fn create_execution_repository(backend: &StorageBackend) -> Arc<dyn ExecutionRepository> {
     match backend {
         StorageBackend::InMemory => {
-            Arc::new(crate::infrastructure::persistence::memory::InMemoryExecutionRepository::new())
+            Arc::new(InMemoryExecutionRepository::new())
         }
         StorageBackend::PostgreSQL(_config) => {
             // Future: Arc::new(PostgresExecutionRepository::new(config))

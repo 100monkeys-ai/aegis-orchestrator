@@ -17,7 +17,7 @@ use super::openai::OpenAIAdapter;
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     alias_map: HashMap<String, (String, ModelConfig)>, // alias -> (provider_name, model_config)
-    selection_strategy: LLMSelectionStrategy,
+    _selection_strategy: LLMSelectionStrategy,
     fallback_provider: Option<String>,
     max_retries: u32,
     retry_delay_ms: u64,
@@ -70,7 +70,7 @@ impl ProviderRegistry {
         Ok(Self {
             providers,
             alias_map,
-            selection_strategy: config.llm_selection.strategy.clone(),
+            _selection_strategy: config.llm_selection.strategy.clone(),
             fallback_provider: config.llm_selection.fallback_provider.clone(),
             max_retries: config.llm_selection.max_retries,
             retry_delay_ms: config.llm_selection.retry_delay_ms,

@@ -1,7 +1,6 @@
 use crate::domain::runtime::{
-    AgentRuntime, InstanceId, TaskInput, TaskOutput, RuntimeError, InstanceStatus
+    AgentRuntime, InstanceId, TaskInput, TaskOutput, RuntimeError, InstanceStatus, RuntimeConfig
 };
-use crate::domain::agent::RuntimeConfig;
 use async_trait::async_trait;
 use bollard::Docker;
 use bollard::container::{

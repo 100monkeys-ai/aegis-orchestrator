@@ -37,11 +37,11 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Internal dependencies
+aegis-sdk = { path = "../sdks" }
+aegis-core = { path = "../orchestrator/core" }
+
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
 libc = "0.2"
-
-# Internal dependencies
-aegis-sdk = { path = "../sdks" }
-aegis-core = { path = "../orchestrator/core" }

@@ -3,7 +3,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use chrono::{DateTime, Utc};
-use crate::domain::agent::RuntimeConfig;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    pub image: String,
+    pub command: Option<Vec<String>>,
+    pub env: HashMap<String, String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InstanceId(pub String);

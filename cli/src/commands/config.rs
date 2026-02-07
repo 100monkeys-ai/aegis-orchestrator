@@ -49,8 +49,7 @@ pub async fn handle_command(
 }
 
 async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> {
-    let config = NodeConfig::discover(config_override.as_deref())
-        .await
+    let config = NodeConfig::load_or_default(config_override.clone())
         .context("Failed to load configuration")?;
 
     if show_paths {
@@ -77,8 +76,8 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
 
     // Node identity
     println!("{}", "Node Identity:".bold());
-    println!("  ID: {}", config.node.node_id);
-    println!("  Name: {}", config.node.name);
+    println!("  ID: {}", config.node.id);
+    // println!("  Name: {}", config.node.name);
     if let Some(region) = &config.node.region {
         println!("  Region: {}", region);
     }
@@ -88,9 +87,7 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("{}", "LLM Providers:".bold());
     for provider in &config.llm_providers {
         println!("  {} ({})", provider.name.bold(), provider.provider_type);
-        if let Some(endpoint) = &provider.endpoint {
-            println!("    Endpoint: {}", endpoint);
-        }
+        println!("    Endpoint: {}", provider.endpoint);
         println!("    Models: {}", provider.models.len());
         for model in &provider.models {
             println!("      - {} → {}", model.alias, model.model);
@@ -103,7 +100,7 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("  Strategy: {:?}", config.llm_selection.strategy);
     println!(
         "  Default provider: {}",
-        config.llm_selection.default_provider
+        config.llm_selection.default_provider.as_deref().unwrap_or("(none)")
     );
     if let Some(fallback) = &config.llm_selection.fallback_provider {
         println!("  Fallback provider: {}", fallback);
@@ -116,13 +113,11 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
 async fn validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("Validating configuration...");
 
-    let config = NodeConfig::discover(config_path.as_deref())
-        .await
+    let config = NodeConfig::load_or_default(config_path)
         .context("Failed to load configuration")?;
 
     config
         .validate()
-        .await
         .context("Configuration validation failed")?;
 
     println!("{}", "✓ Configuration is valid".green());

@@ -2,9 +2,24 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 use chrono::{DateTime, Utc};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct PatternId(pub Uuid);
+
+impl PatternId {
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl Default for PatternId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pattern {
-    pub id: Uuid,
+    pub id: PatternId,
     pub description: String,
     pub tags: Vec<String>,
     pub created_at: DateTime<Utc>,
@@ -17,7 +32,7 @@ pub struct Pattern {
 impl Pattern {
     pub fn new(description: String, tags: Vec<String>) -> Self {
         Self {
-            id: Uuid::new_v4(),
+            id: PatternId::new(),
             description,
             tags,
             created_at: Utc::now(),

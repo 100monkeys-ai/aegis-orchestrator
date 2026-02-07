@@ -5,7 +5,8 @@ use axum::{
 };
 use std::sync::Arc;
 use tokio_stream::StreamExt;
-use crate::application::execution::{ExecutionService, ExecutionInput};
+use crate::application::execution::ExecutionService;
+use crate::domain::execution::ExecutionInput;
 use crate::domain::agent::AgentId;
 use serde_json::json;
 use futures::stream::Stream;
@@ -40,7 +41,8 @@ async fn start_execution(
     };
 
     let input = ExecutionInput {
-        input: payload.input,
+        intent: Some(payload.input),
+        payload: serde_json::Value::Null,
     };
 
     match state.execution_service.start_execution(agent_id, input).await {

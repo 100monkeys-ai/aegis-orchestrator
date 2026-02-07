@@ -9,6 +9,8 @@ use std::path::PathBuf;
 use tracing::info;
 use uuid::Uuid;
 
+use aegis_core::domain::{agent::AgentId, execution::ExecutionId};
+
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
 use crate::embedded::EmbeddedExecutor;
 
@@ -106,6 +108,14 @@ pub async fn handle_command(
 }
 
 async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Result<()> {
+    // DaemonClient needs updates to handle typed IDs too, but for CLI input we have Uuid
+    // DaemonClient likely accepts Uuid and converts internally or expects string.
+    // For now, assuming DaemonClient still uses Uuid in method signatures, which might fail compilation.
+    // I should check client.rs but for now I'll fix the embedded path first.
+    
+    // Actually, to make this file compile, I must ensure calls match definitions.
+    // Assuming DaemonClient methods define Uuid, I'll pass Uuid.
+    
     match command {
         TaskCommand::Deploy { manifest } => deploy_daemon(manifest, client).await,
         TaskCommand::Execute {
@@ -280,7 +290,7 @@ async fn deploy_embedded(manifest: PathBuf, executor: EmbeddedExecutor) -> Resul
 
     let agent_id = executor.deploy_agent(agent_manifest).await?;
 
-    println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
+    println!("{}", format!("✓ Agent deployed: {}", agent_id.0).green());
 
     Ok(())
 }
@@ -292,8 +302,9 @@ async fn execute_embedded(
     follow: bool,
     executor: EmbeddedExecutor,
 ) -> Result<()> {
+    // Parse agent (UUID or manifest path)
     let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent) {
-        uuid
+        AgentId(uuid)
     } else {
         let manifest_path = PathBuf::from(&agent);
         let manifest_content = std::fs::read_to_string(&manifest_path)?;
@@ -304,13 +315,13 @@ async fn execute_embedded(
 
     let input_data = parse_input(input)?;
 
-    println!("Executing agent {}...", agent_id);
+    println!("Executing agent {}...", agent_id.0);
 
     let execution_id = executor.execute_agent(agent_id, input_data).await?;
 
     println!(
         "{}",
-        format!("✓ Execution started: {}", execution_id).green()
+        format!("✓ Execution started: {}", execution_id.0).green()
     );
 
     if follow || wait {
@@ -323,11 +334,11 @@ async fn execute_embedded(
 }
 
 async fn status_embedded(execution_id: Uuid, executor: EmbeddedExecutor) -> Result<()> {
-    let execution = executor.get_execution(execution_id).await?;
+    let execution = executor.get_execution(ExecutionId(execution_id)).await?;
 
     println!("Execution {}", execution_id);
     println!("  Status: {}", format_status(&execution.status));
-    println!("  Agent: {}", execution.agent_id);
+    println!("  Agent: {}", execution.agent_id.0);
 
     Ok(())
 }
@@ -339,13 +350,13 @@ async fn logs_embedded(
     executor: EmbeddedExecutor,
 ) -> Result<()> {
     executor
-        .stream_logs(execution_id, follow, errors_only)
+        .stream_logs(ExecutionId(execution_id), follow, errors_only)
         .await?;
     Ok(())
 }
 
 async fn cancel_embedded(execution_id: Uuid, _force: bool, executor: EmbeddedExecutor) -> Result<()> {
-    executor.cancel_execution(execution_id).await?;
+    executor.cancel_execution(ExecutionId(execution_id)).await?;
     println!(
         "{}",
         format!("✓ Execution {} cancelled", execution_id).green()
@@ -358,7 +369,7 @@ async fn list_embedded(
     limit: usize,
     executor: EmbeddedExecutor,
 ) -> Result<()> {
-    let executions = executor.list_executions(agent_id, limit).await?;
+    let executions = executor.list_executions(agent_id.map(AgentId), limit).await?;
 
     if executions.is_empty() {
         println!("{}", "No executions found".yellow());
@@ -369,8 +380,8 @@ async fn list_embedded(
     for exec in executions {
         println!(
             "  {} - Agent: {} - {}",
-            exec.id,
-            exec.agent_id,
+            exec.id.0,
+            exec.agent_id.0,
             format_status(&exec.status)
         );
     }

@@ -26,9 +26,15 @@ pub struct Execution {
     pub status: ExecutionStatus,
     iterations: Vec<Iteration>,
     pub max_iterations: u8,
-    pub input: String,
+    pub input: ExecutionInput,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionInput {
+    pub intent: Option<String>,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -46,10 +52,39 @@ pub struct Iteration {
     pub status: IterationStatus,
     pub action: String,
     pub output: Option<String>,
+    pub validation_results: Option<ValidationResults>,
     pub error: Option<IterationError>,
     pub code_changes: Option<CodeDiff>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResults {
+    pub system: Option<SystemValidationResult>,
+    pub output: Option<OutputValidationResult>,
+    pub semantic: Option<SemanticValidationResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemValidationResult {
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputValidationResult {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticValidationResult {
+    pub success: bool,
+    pub score: f64,
+    pub reasoning: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,7 +116,7 @@ pub enum ExecutionError {
 }
 
 impl Execution {
-    pub fn new(agent_id: AgentId, input: String, max_iterations: u8) -> Self {
+    pub fn new(agent_id: AgentId, input: ExecutionInput, max_iterations: u8) -> Self {
         Self {
             id: ExecutionId::new(),
             agent_id,
@@ -112,6 +147,7 @@ impl Execution {
             status: IterationStatus::Running,
             action,
             output: None,
+            validation_results: None,
             error: None,
             code_changes: None,
             started_at: Utc::now(),
@@ -149,9 +185,4 @@ impl Execution {
     }
 }
 
-#[async_trait::async_trait]
-pub trait ExecutionRepository: Send + Sync {
-    async fn save(&self, execution: &Execution) -> anyhow::Result<()>;
-    async fn get(&self, id: &ExecutionId) -> anyhow::Result<Option<Execution>>;
-    // async fn list(&self) -> anyhow::Result<Vec<Execution>>; // Optional for now
-}
+// Trait moved to domain/repository.rs

@@ -57,6 +57,11 @@ pub enum ExecutionEvent {
         total_iterations: u8,
         failed_at: DateTime<Utc>,
     },
+    ExecutionCancelled {
+        execution_id: ExecutionId,
+        reason: Option<String>,
+        cancelled_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,4 +71,18 @@ pub enum LearningEvent {
         execution_id: ExecutionId,
         discovered_at: DateTime<Utc>
     } 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PolicyEvent {
+    PolicyViolationAttempted {
+        violation_type: String,
+        details: String,
+        attempted_at: DateTime<Utc>,
+    },
+    PolicyViolationBlocked {
+        violation_type: String,
+        details: String,
+        blocked_at: DateTime<Utc>,
+    },
 }

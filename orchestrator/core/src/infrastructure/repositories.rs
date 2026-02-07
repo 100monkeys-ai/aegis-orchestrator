@@ -37,7 +37,7 @@ impl AgentRepository for InMemoryAgentRepository {
         Ok(())
     }
 
-    async fn find_by_id(&self, id: Uuid) -> Result<Option<Agent>, RepositoryError> {
+    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError> {
         let agents = self.agents.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
         Ok(agents.get(&id).cloned())
@@ -55,13 +55,13 @@ impl AgentRepository for InMemoryAgentRepository {
         Ok(agents.values().cloned().collect())
     }
 
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError> {
+    async fn delete(&self, id: AgentId) -> Result<(), RepositoryError> {
         let mut agents = self.agents.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
         if agents.remove(&id).is_some() {
             Ok(())
         } else {
-            Err(RepositoryError::NotFound(format!("Agent {} not found", id)))
+            Err(RepositoryError::NotFound(format!("Agent {:?} not found", id)))
         }
     }
 }
@@ -70,7 +70,7 @@ impl AgentRepository for InMemoryAgentRepository {
 #[async_trait]
 impl AgentLifecycleService for InMemoryAgentRepository {
     async fn deploy_agent(&self, manifest: AgentManifest) -> anyhow::Result<AgentId> {
-        let agent = Agent::new(manifest.name.clone(), manifest);
+        let agent = Agent::new(manifest);
         let id = agent.id;
         self.save(agent).await
             .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
@@ -131,13 +131,13 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(())
     }
 
-    async fn find_by_id(&self, id: Uuid) -> Result<Option<Execution>, RepositoryError> {
+    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError> {
         let executions = self.executions.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
         Ok(executions.get(&id).cloned())
     }
 
-    async fn find_by_agent(&self, agent_id: Uuid) -> Result<Vec<Execution>, RepositoryError> {
+    async fn find_by_agent(&self, agent_id: AgentId) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
         Ok(executions.values()
@@ -154,13 +154,13 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(execs.into_iter().take(limit).collect())
     }
 
-    async fn delete(&self, id: Uuid) -> Result<(), RepositoryError> {
+    async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError> {
         let mut executions = self.executions.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
         if executions.remove(&id).is_some() {
             Ok(())
         } else {
-            Err(RepositoryError::NotFound(format!("Execution {} not found", id)))
+            Err(RepositoryError::NotFound(format!("Execution {:?} not found", id)))
         }
     }
 }

@@ -448,9 +448,7 @@ fn default_health_timeout() -> u32 {
     5
 }
 
-fn default_health_timeout() -> u32 {
-    5
-}
+
 
 impl AgentManifest {
     /// Load a manifest from a YAML file.

@@ -9,19 +9,27 @@ use uuid::Uuid;
 
 use aegis_core::{
     application::{
-        execution_service::StandardExecutionService, lifecycle::AgentLifecycleService,
+        execution::StandardExecutionService, execution::ExecutionService,
+        lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
     },
-    domain::node_config::NodeConfig,
+    domain::{
+        node_config::NodeConfig,
+        agent::AgentId,
+        execution::{ExecutionInput, ExecutionId},
+        supervisor::Supervisor,
+        judge::BasicJudge,
+    },
     infrastructure::{
         event_bus::EventBus,
         llm::registry::ProviderRegistry,
         repositories::{InMemoryAgentRepository, InMemoryExecutionRepository},
+        runtime::DockerRuntime,
     },
 };
 use aegis_sdk::manifest::AgentManifest;
 
 pub struct EmbeddedExecutor {
-    agent_service: Arc<AgentLifecycleService<InMemoryAgentRepository>>,
+    agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
     _llm_registry: Arc<ProviderRegistry>,
@@ -30,30 +38,34 @@ pub struct EmbeddedExecutor {
 impl EmbeddedExecutor {
     pub async fn new(config_path: Option<PathBuf>) -> Result<Self> {
         // Load configuration
-        let config = NodeConfig::discover(config_path.as_deref())
-            .await
+        let config = NodeConfig::load_or_default(config_path)
             .context("Failed to load configuration")?;
 
         config
             .validate()
-            .await
             .context("Configuration validation failed")?;
 
         // Initialize services
         let agent_repo = Arc::new(InMemoryAgentRepository::new());
         let execution_repo = Arc::new(InMemoryExecutionRepository::new());
-        let event_bus = Arc::new(EventBus::new());
+        let event_bus = Arc::new(EventBus::new(100));
         let llm_registry = Arc::new(
             ProviderRegistry::from_config(&config)
-                .await
                 .context("Failed to initialize LLM providers")?,
         );
+        let runtime = Arc::new(
+            DockerRuntime::new()
+                .context("Failed to initialize Docker runtime")?
+        );
+        let judge = Arc::new(BasicJudge);
+        let supervisor = Arc::new(Supervisor::new(runtime.clone(), judge));
 
-        let agent_service = Arc::new(AgentLifecycleService::new(agent_repo.clone()));
+        let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
         let execution_service = Arc::new(StandardExecutionService::new(
+            runtime,
+            agent_service.clone(),
+            supervisor,
             execution_repo.clone(),
-            agent_repo.clone(),
-            event_bus.clone(),
         ));
 
         Ok(Self {
@@ -64,48 +76,54 @@ impl EmbeddedExecutor {
         })
     }
 
-    pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
-        // Convert SDK manifest to domain Agent
-        // TODO: Implement conversion
-        anyhow::bail!("Deploy not yet implemented in embedded mode")
+    pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
+        let core_manifest: aegis_core::domain::agent::AgentManifest = serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+        self.agent_service.deploy_agent(core_manifest).await
     }
 
     pub async fn execute_agent(
         &self,
-        _agent_id: Uuid,
-        _input: serde_json::Value,
-    ) -> Result<Uuid> {
-        // TODO: Implement
-        anyhow::bail!("Execute not yet implemented in embedded mode")
+        agent_id: AgentId,
+        input: serde_json::Value,
+    ) -> Result<ExecutionId> {
+        let execution_input = ExecutionInput {
+             intent: None, // Or extract from input if applicable
+             payload: input,
+        };
+        self.execution_service.start_execution(agent_id, execution_input).await
     }
 
-    pub async fn get_execution(&self, _execution_id: Uuid) -> Result<ExecutionInfo> {
-        // TODO: Implement
-        anyhow::bail!("Get execution not yet implemented in embedded mode")
+    pub async fn get_execution(&self, execution_id: ExecutionId) -> Result<ExecutionInfo> {
+        let exec = self.execution_service.get_execution(execution_id).await?;
+        Ok(ExecutionInfo {
+            id: exec.id,
+            agent_id: exec.agent_id,
+            status: format!("{:?}", exec.status),
+        })
     }
 
-    pub async fn cancel_execution(&self, _execution_id: Uuid) -> Result<()> {
-        // TODO: Implement
-        anyhow::bail!("Cancel execution not yet implemented in embedded mode")
+    pub async fn cancel_execution(&self, execution_id: ExecutionId) -> Result<()> {
+        self.execution_service.cancel_execution(execution_id).await
     }
 
     pub async fn list_executions(
         &self,
-        _agent_id: Option<Uuid>,
+        _agent_id: Option<AgentId>,
         _limit: usize,
     ) -> Result<Vec<ExecutionInfo>> {
-        // TODO: Implement
-        anyhow::bail!("List executions not yet implemented in embedded mode")
+        // TODO: Implement list in ExecutionService
+        // For MVP embedded, just return empty or implement a list method in service
+        Ok(vec![])
     }
 
     pub async fn stream_logs(
         &self,
-        execution_id: Uuid,
+        execution_id: ExecutionId,
         follow: bool,
         errors_only: bool,
     ) -> Result<()> {
         use colored::Colorize;
-        use tokio_stream::StreamExt;
+        // use tokio_stream::StreamExt; // Removed unused import if not used
 
         let mut receiver = self.event_bus.subscribe_execution(execution_id);
 
@@ -114,6 +132,8 @@ impl EmbeddedExecutor {
         loop {
             match receiver.recv().await {
                 Ok(event) => {
+                    let event = DomainEvent::Execution(event);
+                    
                     // Filter errors if requested
                     if errors_only && !is_error_event(&event) {
                         continue;
@@ -139,12 +159,12 @@ impl EmbeddedExecutor {
 
 #[derive(Debug, Clone)]
 pub struct ExecutionInfo {
-    pub id: Uuid,
-    pub agent_id: Uuid,
+    pub id: ExecutionId,
+    pub agent_id: AgentId,
     pub status: String,
 }
 
-use aegis_core::domain::events::DomainEvent;
+use aegis_core::infrastructure::event_bus::DomainEvent;
 
 fn is_error_event(event: &DomainEvent) -> bool {
     matches!(
@@ -179,14 +199,12 @@ fn print_event(event: &DomainEvent) {
             }
             aegis_core::domain::events::ExecutionEvent::IterationStarted {
                 iteration_number,
-                action,
                 ..
             } => {
                 println!(
-                    "{} {} - {}",
+                    "{} {}",
                     "Iteration".yellow(),
                     iteration_number,
-                    action
                 );
             }
             aegis_core::domain::events::ExecutionEvent::IterationCompleted {

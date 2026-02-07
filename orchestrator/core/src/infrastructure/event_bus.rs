@@ -6,7 +6,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, PolicyEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -19,7 +19,7 @@ pub enum DomainEvent {
     AgentLifecycle(AgentLifecycleEvent),
     Execution(ExecutionEvent),
     Learning(LearningEvent),
-    Policy(PolicyEvent),
+    Policy(crate::domain::events::PolicyEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -59,11 +59,6 @@ impl EventBus {
         self.publish(DomainEvent::Learning(event));
     }
 
-    /// Publish a policy event
-    pub fn publish_policy_event(&self, event: PolicyEvent) {
-        self.publish(DomainEvent::Policy(event));
-    }
-
     /// Publish a domain event to all subscribers
     fn publish(&self, event: DomainEvent) {
         debug!("Publishing event: {:?}", event);
@@ -86,7 +81,7 @@ impl EventBus {
 
     /// Subscribe and filter for specific execution ID
     /// Useful for streaming logs for a single execution
-    pub fn subscribe_execution(&self, execution_id: uuid::Uuid) -> ExecutionEventReceiver {
+    pub fn subscribe_execution(&self, execution_id: crate::domain::execution::ExecutionId) -> ExecutionEventReceiver {
         let receiver = self.sender.subscribe();
         ExecutionEventReceiver {
             receiver,
@@ -133,7 +128,7 @@ impl EventReceiver {
 /// Receiver for execution-specific events (filtered)
 pub struct ExecutionEventReceiver {
     receiver: broadcast::Receiver<DomainEvent>,
-    execution_id: uuid::Uuid,
+    execution_id: crate::domain::execution::ExecutionId,
 }
 
 impl ExecutionEventReceiver {
@@ -203,18 +198,29 @@ mod tests {
         let event_bus = EventBus::new(10);
         let mut receiver = event_bus.subscribe();
 
-        let agent_id = Uuid::new_v4();
+        let agent_id = crate::domain::agent::AgentId::new();
         let event = AgentLifecycleEvent::AgentDeployed {
             agent_id,
             manifest: crate::domain::agent::AgentManifest {
-                name: "test".to_string(),
-                description: "test".to_string(),
-                runtime: crate::domain::policy::RuntimeConfig {
-                    isolation: crate::domain::policy::IsolationType::Docker,
-                    image: "python:3.11".to_string(),
+                version: "1.1".to_string(),
+                execution_targets: vec![],
+                agent: crate::domain::agent::AgentIdentity {
+                    name: "test".to_string(),
+                    runtime: "python:3.11".to_string(),
+                    memory: false,
+                    description: None,
+                    version: None,
+                    timeout_seconds: 300,
                 },
-                security: crate::domain::policy::SecurityPolicy::default(),
+                schedule: None,
+                task: None,
+                context: vec![],
                 execution: None,
+                permissions: None,
+                tools: vec![],
+                env: std::collections::HashMap::new(),
+                advanced: None,
+                metadata: None,
             },
             deployed_at: Utc::now(),
         };
@@ -233,9 +239,9 @@ mod tests {
     #[tokio::test]
     async fn test_execution_event_filtering() {
         let event_bus = EventBus::new(10);
-        let execution_id = Uuid::new_v4();
-        let other_execution_id = Uuid::new_v4();
-        let agent_id = Uuid::new_v4();
+        let execution_id = crate::domain::execution::ExecutionId::new();
+        let other_execution_id = crate::domain::execution::ExecutionId::new();
+        let agent_id = crate::domain::agent::AgentId::new();
 
         let mut receiver = event_bus.subscribe_execution(execution_id);
 

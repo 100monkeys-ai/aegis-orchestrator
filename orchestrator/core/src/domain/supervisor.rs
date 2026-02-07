@@ -1,7 +1,6 @@
-use crate::domain::execution::{Execution, ExecutionId, Iteration};
-use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError};
+use crate::domain::execution::{ExecutionInput, Iteration, ValidationResults, SystemValidationResult, OutputValidationResult, SemanticValidationResult};
+use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError, RuntimeConfig};
 use crate::domain::judge::EvaluationEngine;
-use crate::domain::agent::RuntimeConfig;
 use std::sync::Arc;
 use tokio::time::Duration;
 use tracing::{info, warn, error};
@@ -21,27 +20,26 @@ impl Supervisor {
         }
     }
 
-    pub async fn run_loop(&self, instance_id: &InstanceId, initial_prompt: String) -> Result<String, RuntimeError> {
+    pub async fn run_loop(&self, instance_id: &InstanceId, input: ExecutionInput) -> Result<String, RuntimeError> {
         let mut attempts = 0;
-        let mut prompt = initial_prompt;
+        let mut prompt = input.intent.clone().unwrap_or_default();
+        // TODO: Handle payload merge into context if needed
 
         while attempts < self.max_retries {
             attempts += 1;
             info!("Starting iteration {}/{}", attempts, self.max_retries);
 
-            let input = TaskInput {
+            let task_input = TaskInput {
                 prompt: prompt.clone(),
                 context: std::collections::HashMap::new(),
             };
 
             // Execute
-            let output = self.runtime.execute(instance_id, input).await?;
-            let stdout = output.result.to_string(); // Simplified for now
+            let output = self.runtime.execute(instance_id, task_input).await?;
+            let stdout = output.result.to_string(); 
             let stderr = output.logs.join("\n");
             
             // Evaluate
-            // Note: Currently execute returns Result, so exit code implicit execution success needs detail
-            // For now assuming success if execute returns Ok, need to enrich TaskOutput to include exit code
             let valid_res = self.judge.evaluate(&stdout, 0, &stderr).await
                 .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
