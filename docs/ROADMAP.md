@@ -266,4 +266,4 @@ Ultimate goal: Create a safe environment for **Grounded Digital Consciousness (G
 
 ---
 
-For updates, see the [GitHub project board](https://github.com/aent-ai/aegis-greenfield/projects).
+For updates, see the [GitHub project board](https://github.com/100monkeys-ai/aegis-greenfield/projects).

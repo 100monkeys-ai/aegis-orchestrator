@@ -36,7 +36,7 @@ We are committed to providing a welcoming and inclusive environment. By particip
 1. **Clone the repository**
 
    ```bash
-   git clone https://github.com/aent-ai/aegis-greenfield.git
+   git clone https://github.com/100monkeys-ai/aegis-greenfield.git
    cd aegis-greenfield
    ```
 

@@ -39,7 +39,7 @@ This guide will walk you through setting up AEGIS, deploying your first agent, a
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/aent-ai/aegis-orchestrator.git
+git clone https://github.com/100monkeys-ai/aegis-orchestrator.git
 cd aegis-orchestrator
 ```
 

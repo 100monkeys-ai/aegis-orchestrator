@@ -234,10 +234,10 @@ Apache License 2.0. See [LICENSE](LICENSE) for details.
 
 ## Related Repositories
 
-- [aegis-sdk-python](https://github.com/aent-ai/aegis-sdk-python) - Python SDK
-- [aegis-sdk-typescript](https://github.com/aent-ai/aegis-sdk-typescript) - TypeScript SDK
-- [aegis-control-plane](https://github.com/aent-ai/aegis-control-plane) - Web dashboard
-- [aegis-examples](https://github.com/aent-ai/aegis-examples) - Example agents
+- [aegis-sdk-python](https://github.com/100monkeys-ai/aegis-sdk-python) - Python SDK
+- [aegis-sdk-typescript](https://github.com/100monkeys-ai/aegis-sdk-typescript) - TypeScript SDK
+- [aegis-control-plane](https://github.com/100monkeys-ai/aegis-control-plane) - Web dashboard
+- [aegis-examples](https://github.com/100monkeys-ai/aegis-examples) - Example agents
 
 ---
 
