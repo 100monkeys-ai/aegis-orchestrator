@@ -78,6 +78,9 @@ def main():
                     break
                 else:
                     errors.append(f"{base_url}: Status {response.status}")
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8')
+            errors.append(f"{base_url}: HTTP {e.code} {e.reason} - {body}")
         except Exception as e:
             errors.append(f"{base_url}: {e}")
             

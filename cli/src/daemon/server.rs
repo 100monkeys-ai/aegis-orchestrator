@@ -69,6 +69,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .validate()
         .context("Configuration validation failed")?;
 
+    if config.llm_providers.is_empty() {
+        tracing::warn!("Started with NO LLM providers configured. Agent execution will fail!");
+        println!("WARNING: No LLM providers configured. Agents will fail to generate text.");
+        println!("         Please check your config file or ensure one is discovered.");
+    }
+
     println!("Configuration loaded. Initializing services...");
 
     // Initialize services
@@ -640,6 +646,9 @@ async fn llm_generate_handler(
                 "model": response.model
             })))
         },
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => {
+            tracing::error!("LLM generation failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
+        },
     }
 }

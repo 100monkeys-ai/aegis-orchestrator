@@ -348,20 +348,12 @@ impl NodeConfig {
     }
     
     /// Discover configuration file using precedence order
-    /// 1. --config flag (passed as argument)
-    /// 2. AEGIS_CONFIG_PATH environment variable
-    /// 3. ./aegis-config.yaml (working directory)
-    /// 4. ~/.aegis/config.yaml (user home)
-    /// 5. /etc/aegis/config.yaml (system, Unix) or C:\ProgramData\Aegis\config.yaml (Windows)
-    pub fn discover_config(cli_path: Option<PathBuf>) -> Option<PathBuf> {
-        // 1. CLI flag (highest priority)
-        if let Some(path) = cli_path {
-            if path.exists() {
-                return Some(path);
-            }
-        }
-        
-        // 2. Environment variable
+    /// 1. AEGIS_CONFIG_PATH environment variable
+    /// 2. ./aegis-config.yaml (working directory)
+    /// 3. ~/.aegis/config.yaml (user home)
+    /// 4. /etc/aegis/config.yaml (system, Unix) or C:\ProgramData\Aegis\config.yaml (Windows)
+    pub fn discover_config() -> Option<PathBuf> {
+        // 1. Environment variable
         if let Ok(path) = std::env::var("AEGIS_CONFIG_PATH") {
             let path = PathBuf::from(path);
             if path.exists() {
@@ -398,11 +390,20 @@ impl NodeConfig {
     
     /// Load configuration with discovery, fallback to default
     pub fn load_or_default(cli_path: Option<PathBuf>) -> anyhow::Result<Self> {
-        if let Some(config_path) = Self::discover_config(cli_path) {
-            tracing::info!("Loading configuration from: {:?}", config_path);
+        // 1. Explicit CLI path (Fail if missing/invalid)
+        if let Some(path) = cli_path {
+            tracing::info!("Loading configuration from explicit path: {:?}", path);
+            return Self::from_yaml_file(&path).map_err(|e| {
+                anyhow::anyhow!("Failed to search/load config at {:?}: {}", path, e)
+            });
+        }
+
+        // 2. Discovery (Env -> Cwd -> Home -> System)
+        if let Some(config_path) = Self::discover_config() {
+            tracing::info!("Loading configuration from discovered path: {:?}", config_path);
             Self::from_yaml_file(config_path)
         } else {
-            tracing::warn!("No configuration file found, using defaults");
+            tracing::warn!("No configuration file found in standard locations. Using empty defaults.");
             Ok(Self::default())
         }
     }
