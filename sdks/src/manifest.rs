@@ -7,6 +7,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentManifest {
     /// Required: Schema version (must be "1.1")
+    #[serde(default = "default_version")]
     pub version: String,
     
     /// Optional: Execution targets for node routing
@@ -450,6 +451,10 @@ fn default_health_interval() -> u32 {
 
 fn default_health_timeout() -> u32 {
     5
+}
+
+fn default_version() -> String {
+    "1.1".to_string()
 }
 
 

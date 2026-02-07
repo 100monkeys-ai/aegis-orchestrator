@@ -29,6 +29,7 @@ pub struct Agent {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AgentManifest {
+    #[serde(default = "default_manifest_version")]
     pub version: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub execution_targets: Vec<String>,
@@ -348,6 +349,7 @@ fn default_post() -> String { "POST".to_string() }
 fn default_cpu() -> u32 { 1000 }
 fn default_memory() -> String { "512Mi".to_string() }
 fn default_disk() -> String { "1Gi".to_string() }
+fn default_manifest_version() -> String { "0.1.0".to_string() }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
