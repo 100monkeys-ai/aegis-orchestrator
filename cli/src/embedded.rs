@@ -65,6 +65,7 @@ impl EmbeddedExecutor {
             agent_service.clone(),
             supervisor,
             execution_repo.clone(),
+            event_bus.clone(),
         ));
 
         Ok(Self {
@@ -260,6 +261,10 @@ fn print_event(event: &DomainEvent) {
             }
             aegis_core::domain::events::ExecutionEvent::ExecutionCancelled { .. } => {
                 println!("{}", "Execution cancelled".bold().yellow());
+            }
+            aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
+                let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
+                println!("{} {}", prefix, content.trim_end());
             }
         },
         DomainEvent::Policy(policy_event) => match policy_event {

@@ -99,6 +99,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         agent_service.clone(),
         supervisor,
         execution_repo.clone(),
+        event_bus.clone(),
     ));
 
     let app_state = AppState {
@@ -361,11 +362,12 @@ async fn stream_events_handler(
                         yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
                     },
                     aegis_core::domain::execution::ExecutionStatus::Failed => {
+                        let reason = execution.error.clone().unwrap_or_else(|| "Execution failed".to_string());
                         let exec_fail = serde_json::json!({
                             "event_type": "ExecutionFailed",
-                            "reason": "Execution failed", // TODO: Store reason in Execution
+                            "reason": reason,
                             "timestamp": ended_at.to_rfc3339(),
-                            "data": { "error": "Execution failed" }
+                            "data": { "error": reason }
                         });
                         yield Ok::<_, anyhow::Error>(Event::default().data(exec_fail.to_string()));
                     },
@@ -427,6 +429,14 @@ async fn stream_events_handler(
                                     "reason": reason,
                                     "timestamp": chrono::Utc::now().to_rfc3339(),
                                     "data": { "error": reason }
+                                })
+                            },
+                            aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
+                                serde_json::json!({
+                                    "event_type": "ConsoleOutput",
+                                    "stream": stream,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": { "output": content }
                                 })
                             },
                             _ => {

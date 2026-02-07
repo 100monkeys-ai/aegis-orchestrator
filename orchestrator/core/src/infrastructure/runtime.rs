@@ -35,8 +35,18 @@ impl AgentRuntime for DockerRuntime {
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
         let image = config.image.clone();
         
-        // Ensure image exists (pull if needed)
-        if self.docker.inspect_image(&image).await.is_err() {
+        // Check autopull configuration
+        let should_pull = if config.autopull {
+            // If autopull is true, we verify existence and pull if missing.
+            // (We could also support "always" pull here if we had a policy enum, but bool usually means "ensure exists")
+            self.docker.inspect_image(&image).await.is_err()
+        } else {
+            // If autopull is false, we assume it exists. 
+            // If it doesn't, create_container will fail later, which is expected.
+            false
+        };
+
+        if should_pull {
             info!("Pulling image: {}", image);
             let options = Some(CreateImageOptions {
                 from_image: image.clone(),

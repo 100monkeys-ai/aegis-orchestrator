@@ -164,6 +164,7 @@ impl ExecutionEventReceiver {
             ExecutionEvent::ExecutionCompleted { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ExecutionFailed { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ExecutionCancelled { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::ConsoleOutput { execution_id, .. } => execution_id == &self.execution_id,
         }
     }
 }
@@ -207,6 +208,7 @@ mod tests {
                 agent: crate::domain::agent::AgentIdentity {
                     name: "test".to_string(),
                     runtime: "python:3.11".to_string(),
+                    autopull: true,
                     memory: false,
                     description: None,
                     version: None,
@@ -276,7 +278,7 @@ mod tests {
 
         assert_eq!(event_bus.subscriber_count(), 2);
 
-        let agent_id = Uuid::new_v4();
+        let agent_id = crate::domain::agent::AgentId::new();
         event_bus.publish_agent_event(AgentLifecycleEvent::AgentPaused {
             agent_id,
             paused_at: Utc::now(),

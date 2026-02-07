@@ -57,6 +57,8 @@ pub struct AgentManifest {
 pub struct AgentIdentity {
     pub name: String,
     pub runtime: String,
+    #[serde(default = "default_true")]
+    pub autopull: bool,
     #[serde(default)]
     pub memory: bool,
     #[serde(skip_serializing_if = "Option::is_none")]

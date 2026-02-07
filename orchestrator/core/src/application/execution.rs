@@ -2,9 +2,10 @@ use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatu
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
-use crate::domain::supervisor::Supervisor;
+use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::runtime::AgentRuntime;
 use crate::application::agent::AgentLifecycleService;
+use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::Stream;
@@ -28,6 +29,7 @@ pub struct StandardExecutionService {
     agent_service: Arc<dyn AgentLifecycleService>,
     supervisor: Arc<Supervisor>,
     repository: Arc<dyn ExecutionRepository>,
+    event_bus: Arc<EventBus>,
 }
 
 impl StandardExecutionService {
@@ -36,13 +38,90 @@ impl StandardExecutionService {
         agent_service: Arc<dyn AgentLifecycleService>,
         supervisor: Arc<Supervisor>,
         repository: Arc<dyn ExecutionRepository>,
+        event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             runtime,
             agent_service,
             supervisor,
             repository,
+            event_bus,
         }
+    }
+}
+
+struct ExecutionMonitor {
+    execution_id: ExecutionId,
+    repository: Arc<dyn ExecutionRepository>,
+    event_bus: Arc<EventBus>,
+}
+
+#[async_trait]
+impl SupervisorObserver for ExecutionMonitor {
+    async fn on_iteration_start(&self, iteration: u8, action: &str) {
+        let now = Utc::now();
+        // Update DB
+        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+            let _ = exec.start_iteration(action.to_string());
+            let _ = self.repository.save(exec).await;
+        }
+        // Emit Event
+        self.event_bus.publish_execution_event(ExecutionEvent::IterationStarted {
+            execution_id: self.execution_id,
+            iteration_number: iteration,
+            action: action.to_string(),
+            started_at: now,
+        });
+    }
+
+    async fn on_console_output(&self, iteration: u8, stream: &str, content: &str) {
+        let now = Utc::now();
+        // Update DB? Iteration struct doesn't have a list of logs yet, but we should eventually add it.
+        // For now, we mainly want to stream it to the user.
+        // TODO: Persist logs in Execution struct if needed.
+        
+        self.event_bus.publish_execution_event(ExecutionEvent::ConsoleOutput {
+            execution_id: self.execution_id,
+            iteration_number: iteration,
+            stream: stream.to_string(),
+            content: content.to_string(),
+            timestamp: now,
+        });
+    }
+
+    async fn on_iteration_complete(&self, iteration: u8, output: &str) {
+        let now = Utc::now();
+        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+            exec.complete_iteration(output.to_string());
+            let _ = self.repository.save(exec).await;
+        }
+        self.event_bus.publish_execution_event(ExecutionEvent::IterationCompleted {
+            execution_id: self.execution_id,
+            iteration_number: iteration,
+            output: output.to_string(),
+            completed_at: now,
+        });
+    }
+
+    async fn on_iteration_fail(&self, iteration: u8, error: &str) {
+        let now = Utc::now();
+        // Map string error to IterationError
+        let iter_error = crate::domain::execution::IterationError {
+            message: error.to_string(),
+            details: None,
+        };
+        
+        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+            exec.fail_iteration(iter_error.clone());
+            let _ = self.repository.save(exec).await;
+        }
+
+        self.event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
+            execution_id: self.execution_id,
+            iteration_number: iteration,
+            error: iter_error,
+            failed_at: now,
+        });
     }
 }
 
@@ -65,24 +144,36 @@ impl ExecutionService for StandardExecutionService {
         // 3. Save initial state
         self.repository.save(execution.clone()).await?;
 
+        // Emit Started Event
+        self.event_bus.publish_execution_event(ExecutionEvent::ExecutionStarted {
+            execution_id,
+            agent_id,
+            started_at: Utc::now(),
+        });
+
         // 4. Spawn Runtime
-        // Map agent.manifest.agent.runtime (string) into RuntimeConfig if needed, 
-        // or if AgentRuntime takes string/config.
-        // Currently AgentRuntime::spawn takes RuntimeConfig.
-        // But manifest.agent.runtime is a String (e.g. "python:3.11").
-        // We need to construct RuntimeConfig.
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             image: agent.manifest.agent.runtime.clone(),
             command: None, // Default
             env: agent.manifest.env.clone(),
+            autopull: agent.manifest.agent.autopull,
         };
 
         let instance_id = match self.runtime.spawn(runtime_config).await {
             Ok(id) => id,
             Err(e) => {
-                execution.fail();
+                let error_msg = format!("Failed to spawn runtime: {}", e);
+                execution.fail(error_msg.clone());
                 self.repository.save(execution.clone()).await?;
-                return Err(anyhow!("Failed to spawn runtime: {}", e));
+                
+                self.event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+                    execution_id,
+                    reason: error_msg.clone(),
+                    total_iterations: 0,
+                    failed_at: Utc::now(),
+                });
+
+                return Err(anyhow!(error_msg));
             }
         };
 
@@ -93,26 +184,49 @@ impl ExecutionService for StandardExecutionService {
         let supervisor = self.supervisor.clone();
         let runtime = self.runtime.clone();
         let repository = self.repository.clone();
+        let event_bus = self.event_bus.clone();
         let exec_input = input.clone();
         
+        let monitor = Arc::new(ExecutionMonitor {
+            execution_id,
+            repository: repository.clone(),
+            event_bus: event_bus.clone(),
+        });
+
         tokio::spawn(async move {
-            match supervisor.run_loop(&instance_id, exec_input).await {
-                Ok(_) => {
+            match supervisor.run_loop(&instance_id, exec_input, monitor).await {
+                Ok(final_output) => {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                         if let Some(mut exec) = exec_opt {
                              exec.complete();
+                             let total_iterations = exec.iterations().len() as u8;
                              let _ = repository.save(exec).await;
+
+                             event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
+                                 execution_id,
+                                 final_output: final_output.clone(),
+                                 total_iterations,
+                                 completed_at: Utc::now(),
+                             });
                         }
                     }
                     let _ = runtime.terminate(&instance_id).await;
                 },
-                Err(_) => {
+                Err(e) => {
                     // Update to failed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                          if let Some(mut exec) = exec_opt {
-                              exec.fail();
+                              exec.fail(e.to_string());
+                              let total_iterations = exec.iterations().len() as u8;
                               let _ = repository.save(exec).await;
+
+                              event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+                                 execution_id,
+                                 reason: e.to_string(),
+                                 total_iterations,
+                                 failed_at: Utc::now(),
+                             });
                          }
                      }
                     let _ = runtime.terminate(&instance_id).await;
@@ -134,12 +248,16 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-         // This would ideally signal the supervisor to stop too.
-         // For now, just mark state.
          let mut execution = self.get_execution(id).await?;
          execution.status = ExecutionStatus::Cancelled;
          execution.ended_at = Some(Utc::now());
          self.repository.save(execution).await?;
+         
+         self.event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
+             execution_id: id,
+             reason: None,
+             cancelled_at: Utc::now(),
+         });
          Ok(())
     }
 

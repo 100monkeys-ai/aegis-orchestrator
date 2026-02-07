@@ -61,6 +61,10 @@ pub struct AgentSpec {
     /// Required: Runtime (e.g., "python:3.11", "node:20")
     pub runtime: String,
     
+    /// Optional: Auto-pull image (default: true)
+    #[serde(default = "default_true")]
+    pub autopull: bool,
+    
     /// Optional: Enable Cortex memory
     #[serde(default)]
     pub memory: bool,

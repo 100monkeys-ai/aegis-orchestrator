@@ -11,7 +11,29 @@ pub enum AgentLifecycleEvent {
         manifest: AgentManifest,
         deployed_at: DateTime<Utc>,
     },
-    // ... other variants from AGENTS.md
+    AgentPaused {
+        agent_id: AgentId,
+        paused_at: DateTime<Utc>,
+    },
+    AgentResumed {
+        agent_id: AgentId,
+        resumed_at: DateTime<Utc>,
+    },
+    AgentUpdated {
+        agent_id: AgentId,
+        old_version: String,
+        new_version: String,
+        updated_at: DateTime<Utc>,
+    },
+    AgentRemoved {
+        agent_id: AgentId,
+        removed_at: DateTime<Utc>,
+    },
+    AgentFailed {
+        agent_id: AgentId,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +83,13 @@ pub enum ExecutionEvent {
         execution_id: ExecutionId,
         reason: Option<String>,
         cancelled_at: DateTime<Utc>,
+    },
+    ConsoleOutput {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        stream: String, // "stdout" or "stderr"
+        content: String,
+        timestamp: DateTime<Utc>,
     },
 }
 

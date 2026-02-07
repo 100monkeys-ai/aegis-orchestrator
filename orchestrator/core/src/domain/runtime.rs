@@ -9,6 +9,7 @@ pub struct RuntimeConfig {
     pub image: String,
     pub command: Option<Vec<String>>,
     pub env: HashMap<String, String>,
+    pub autopull: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

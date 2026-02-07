@@ -29,6 +29,7 @@ pub struct Execution {
     pub input: ExecutionInput,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +127,7 @@ impl Execution {
             input,
             started_at: Utc::now(),
             ended_at: None,
+            error: None,
         }
     }
 
@@ -179,10 +181,9 @@ impl Execution {
         self.ended_at = Some(Utc::now());
     }
 
-    pub fn fail(&mut self) {
+    pub fn fail(&mut self, reason: String) {
         self.status = ExecutionStatus::Failed;
+        self.error = Some(reason);
         self.ended_at = Some(Utc::now());
     }
 }
-
-// Trait moved to domain/repository.rs
