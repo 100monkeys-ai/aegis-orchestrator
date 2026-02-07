@@ -53,8 +53,8 @@ async fn main() -> anyhow::Result<()> {
 
 ## Documentation
 
-See the [main documentation](../../README.md) for more details.
+See the [main documentation](../README.md) for more details.
 
 ## 📜 License
 
-Business Source License 1.1 - See [LICENSE](LICENSE) for details.
+AGPL-3.0 - See [LICENSE](../LICENSE) for details.
