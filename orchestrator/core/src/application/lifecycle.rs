@@ -35,7 +35,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
 
         // Create new agent from manifest
         let agent = Agent::new(manifest);
-        self.repository.save(agent.clone()).await?; // Agent might not be Copy, so clone or move. save takes value.
+        self.repository.save(&agent).await?;
         Ok(agent.id)
     }
 
@@ -47,7 +47,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()> {
         let mut agent = self.get_agent(id).await?;
         agent.update_manifest(manifest);
-        self.repository.save(agent).await?;
+        self.repository.save(&agent).await?;
         Ok(())
     }
 

@@ -206,6 +206,56 @@ impl DaemonClient {
 
         Ok(())
     }
+
+    pub async fn stream_agent_logs(
+        &self,
+        agent_id: Uuid,
+        follow: bool,
+        errors_only: bool,
+    ) -> Result<()> {
+        let mut url = format!(
+            "{}/api/agents/{}/events",
+            self.base_url, agent_id
+        );
+        if !follow {
+            url.push_str("?follow=false");
+        }
+
+        let response = self
+            .client
+            .get(&url)
+            .send()
+            .await
+            .context("Failed to connect to agent event stream")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to stream agent logs: {}", error_text);
+        }
+
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read event stream chunk")?;
+            let text = String::from_utf8_lossy(&chunk);
+
+            for line in text.lines() {
+                if line.starts_with("data: ") {
+                    let json_str = &line[6..];
+                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
+                         // Reuse the print logic? Yes.
+                        if errors_only && !is_error_event(&event) {
+                            continue;
+                        }
+                        print_event(&event);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
             .client

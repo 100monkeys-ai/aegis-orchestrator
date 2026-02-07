@@ -89,6 +89,15 @@ impl EventBus {
         }
     }
 
+    /// Subscribe and filter for specific agent ID
+    pub fn subscribe_agent(&self, agent_id: crate::domain::agent::AgentId) -> AgentEventReceiver {
+        let receiver = self.sender.subscribe();
+        AgentEventReceiver {
+            receiver,
+            agent_id,
+        }
+    }
+
     /// Get the number of active subscribers
     pub fn subscriber_count(&self) -> usize {
         self.sender.receiver_count()
@@ -166,6 +175,58 @@ impl ExecutionEventReceiver {
             ExecutionEvent::ExecutionCancelled { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ConsoleOutput { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
+        }
+    }
+}
+
+/// Receiver for agent-specific events (filtered)
+pub struct AgentEventReceiver {
+    receiver: broadcast::Receiver<DomainEvent>,
+    agent_id: crate::domain::agent::AgentId,
+}
+
+impl AgentEventReceiver {
+    /// Receive the next event for the specified agent ID
+    pub async fn recv(&mut self) -> Result<DomainEvent, EventBusError> {
+        loop {
+            let event = self.receiver.recv().await.map_err(|e| match e {
+                broadcast::error::RecvError::Closed => EventBusError::Closed,
+                broadcast::error::RecvError::Lagged(n) => {
+                    warn!("Event receiver lagged by {} events", n);
+                    EventBusError::Lagged(n)
+                }
+            })?;
+
+            if self.matches_agent(&event) {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn matches_agent(&self, event: &DomainEvent) -> bool {
+        match event {
+            DomainEvent::AgentLifecycle(e) => match e {
+                AgentLifecycleEvent::AgentDeployed { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentPaused { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentResumed { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentUpdated { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentRemoved { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentFailed { agent_id, .. } => agent_id == &self.agent_id,
+            },
+            DomainEvent::Execution(e) => match e {
+                ExecutionEvent::ExecutionStarted { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::IterationStarted { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::IterationCompleted { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::IterationFailed { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::RefinementApplied { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ExecutionCompleted { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ExecutionFailed { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ExecutionCancelled { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ConsoleOutput { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
+            },
+            DomainEvent::Learning(_) => false, // TODO: Link learning to agent
+            DomainEvent::Policy(_) => false, // TODO: Link policy to agent
         }
     }
 }

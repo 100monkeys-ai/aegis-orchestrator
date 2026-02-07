@@ -45,47 +45,55 @@ pub enum ExecutionEvent {
     },
     IterationStarted {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         action: String,
         started_at: DateTime<Utc>,
     },
     IterationCompleted {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         output: String,
         completed_at: DateTime<Utc>,
     },
     IterationFailed {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         error: IterationError,
         failed_at: DateTime<Utc>,
     },
     RefinementApplied {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         code_diff: CodeDiff,
         applied_at: DateTime<Utc>,
     },
     ExecutionCompleted {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         final_output: String,
         total_iterations: u8,
         completed_at: DateTime<Utc>,
     },
      ExecutionFailed {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         reason: String,
         total_iterations: u8,
         failed_at: DateTime<Utc>,
     },
     ExecutionCancelled {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         reason: Option<String>,
         cancelled_at: DateTime<Utc>,
     },
     ConsoleOutput {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         stream: String, // "stdout" or "stderr"
         content: String,
@@ -93,6 +101,7 @@ pub enum ExecutionEvent {
     },
     LlmInteraction {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         provider: String,
         model: String,

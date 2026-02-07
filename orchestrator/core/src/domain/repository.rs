@@ -30,7 +30,7 @@ pub struct PostgresConfig {
 #[async_trait]
 pub trait AgentRepository: Send + Sync {
     /// Save agent (create or update)
-    async fn save(&self, agent: Agent) -> Result<(), RepositoryError>;
+    async fn save(&self, agent: &Agent) -> Result<(), RepositoryError>;
     
     /// Find agent by ID
     async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError>;
@@ -50,7 +50,7 @@ pub trait AgentRepository: Send + Sync {
 #[async_trait]
 pub trait ExecutionRepository: Send + Sync {
     /// Save execution (create or update)
-    async fn save(&self, execution: Execution) -> Result<(), RepositoryError>;
+    async fn save(&self, execution: &Execution) -> Result<(), RepositoryError>;
     
     /// Find execution by ID
     async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError>;

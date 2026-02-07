@@ -5,6 +5,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::pin::Pin;
+use futures::Stream;
 
 use aegis_core::{
     application::{
@@ -15,6 +17,7 @@ use aegis_core::{
         node_config::NodeConfig,
         agent::AgentId,
         execution::{ExecutionInput, ExecutionId},
+        events::ExecutionEvent,
         supervisor::Supervisor,
         judge::BasicJudge,
     },
@@ -92,6 +95,14 @@ impl EmbeddedExecutor {
              payload: input,
         };
         self.execution_service.start_execution(agent_id, execution_input).await
+    }
+
+    async fn stream_execution(&self, _id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn stream_agent_events(&self, _id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        Ok(Box::pin(futures::stream::empty()))
     }
 
     pub async fn get_execution(&self, execution_id: ExecutionId) -> Result<ExecutionInfo> {

@@ -29,10 +29,10 @@ impl Default for InMemoryAgentRepository {
 
 #[async_trait]
 impl AgentRepository for InMemoryAgentRepository {
-    async fn save(&self, agent: Agent) -> Result<(), RepositoryError> {
+    async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
         let mut agents = self.agents.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
-        agents.insert(agent.id, agent);
+        agents.insert(agent.id, agent.clone());
         Ok(())
     }
 
@@ -71,7 +71,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     async fn deploy_agent(&self, manifest: AgentManifest) -> anyhow::Result<AgentId> {
         let agent = Agent::new(manifest);
         let id = agent.id;
-        self.save(agent).await
+        self.save(&agent).await
             .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
         Ok(id)
     }
@@ -85,7 +85,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> anyhow::Result<()> {
         let mut agent = self.get_agent(id).await?;
         agent.update_manifest(manifest);
-        self.save(agent).await
+        self.save(&agent).await
             .map_err(|e| anyhow::anyhow!("Failed to update agent: {}", e))
     }
 
@@ -129,10 +129,10 @@ impl Default for InMemoryExecutionRepository {
 
 #[async_trait]
 impl ExecutionRepository for InMemoryExecutionRepository {
-    async fn save(&self, execution: Execution) -> Result<(), RepositoryError> {
+    async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
         let mut executions = self.executions.lock()
             .map_err(|_| RepositoryError::Unknown("Mutex poisoned".to_string()))?;
-        executions.insert(execution.id, execution);
+        executions.insert(execution.id, execution.clone());
         Ok(())
     }
 

@@ -31,6 +31,21 @@ pub enum AgentCommand {
         #[arg(value_name = "AGENT_ID")]
         agent_id: Uuid,
     },
+
+    /// Stream logs for an agent
+    Logs {
+        /// Agent ID or Name
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+
+        /// Follow log output
+        #[arg(short, long)]
+        follow: bool,
+
+        /// Show errors only
+        #[arg(short, long)]
+        errors: bool,
+    },
 }
 
 pub async fn handle_command(
@@ -64,6 +79,7 @@ pub async fn handle_command(
         AgentCommand::Deploy { manifest } => deploy_agent(manifest, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
+        AgentCommand::Logs { agent_id, follow, errors } => logs_agent(agent_id, follow, errors, client).await,
     }
 }
 
@@ -122,6 +138,32 @@ async fn deploy_agent(manifest: PathBuf, client: DaemonClient) -> Result<()> {
     let agent_id = client.deploy_agent(agent_manifest).await?;
 
     println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
+
+    Ok(())
+}
+
+async fn logs_agent(
+    agent_id_str: String,
+    follow: bool,
+    errors_only: bool,
+    client: DaemonClient,
+) -> Result<()> {
+    // Resolve ID if it's a name
+    let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent_id_str) {
+        uuid
+    } else {
+        // Look up by name
+        println!("{}", format!("Looking up agent '{}'...", agent_id_str).dimmed());
+        match client.lookup_agent(&agent_id_str).await? {
+            Some(id) => id,
+            None => {
+                anyhow::bail!("Agent '{}' not found", agent_id_str);
+            }
+        }
+    };
+
+    println!("{}", format!("Streaming logs for agent {}...", agent_id).dimmed());
+    client.stream_agent_logs(agent_id, follow, errors_only).await?;
 
     Ok(())
 }

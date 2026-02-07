@@ -5,7 +5,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::runtime::AgentRuntime;
 use crate::application::agent::AgentLifecycleService;
-use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::event_bus::{EventBus, DomainEvent};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::Stream;
@@ -20,6 +20,7 @@ pub trait ExecutionService: Send + Sync {
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>>;
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()>;
     async fn stream_execution(&self, id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>>;
+    async fn stream_agent_events(&self, id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
     async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>>;
     async fn delete_execution(&self, id: ExecutionId) -> Result<()>;
 }
@@ -55,6 +56,7 @@ impl StandardExecutionService {
 
 struct ExecutionMonitor {
     execution_id: ExecutionId,
+    agent_id: AgentId,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
 }
@@ -65,12 +67,15 @@ impl SupervisorObserver for ExecutionMonitor {
         let now = Utc::now();
         // Update DB
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
-            let _ = exec.start_iteration(action.to_string());
-            let _ = self.repository.save(exec).await;
+            {
+                let _ = exec.start_iteration(action.to_string());
+            }
+            let _ = self.repository.save(&exec).await;
         }
         // Emit Event
         self.event_bus.publish_execution_event(ExecutionEvent::IterationStarted {
             execution_id: self.execution_id,
+            agent_id: self.agent_id,
             iteration_number: iteration,
             action: action.to_string(),
             started_at: now,
@@ -85,6 +90,7 @@ impl SupervisorObserver for ExecutionMonitor {
         
         self.event_bus.publish_execution_event(ExecutionEvent::ConsoleOutput {
             execution_id: self.execution_id,
+            agent_id: self.agent_id,
             iteration_number: iteration,
             stream: stream.to_string(),
             content: content.to_string(),
@@ -96,10 +102,11 @@ impl SupervisorObserver for ExecutionMonitor {
         let now = Utc::now();
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
             exec.complete_iteration(output.to_string());
-            let _ = self.repository.save(exec).await;
+            let _ = self.repository.save(&exec).await;
         }
         self.event_bus.publish_execution_event(ExecutionEvent::IterationCompleted {
             execution_id: self.execution_id,
+            agent_id: self.agent_id,
             iteration_number: iteration,
             output: output.to_string(),
             completed_at: now,
@@ -116,11 +123,12 @@ impl SupervisorObserver for ExecutionMonitor {
         
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
             exec.fail_iteration(iter_error.clone());
-            let _ = self.repository.save(exec).await;
+            let _ = self.repository.save(&exec).await;
         }
 
         self.event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
             execution_id: self.execution_id,
+            agent_id: self.agent_id,
             iteration_number: iteration,
             error: iter_error,
             failed_at: now,
@@ -145,7 +153,7 @@ impl ExecutionService for StandardExecutionService {
         let execution_id = execution.id;
         
         // 3. Save initial state
-        self.repository.save(execution.clone()).await?;
+        self.repository.save(&execution).await?;
 
         // Emit Started Event
         self.event_bus.publish_execution_event(ExecutionEvent::ExecutionStarted {
@@ -193,10 +201,11 @@ impl ExecutionService for StandardExecutionService {
             Err(e) => {
                 let error_msg = format!("Failed to spawn runtime: {}", e);
                 execution.fail(error_msg.clone());
-                self.repository.save(execution.clone()).await?;
+                self.repository.save(&execution).await?;
                 
                 self.event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
                     execution_id,
+                    agent_id,
                     reason: error_msg.clone(),
                     total_iterations: 0,
                     failed_at: Utc::now(),
@@ -207,7 +216,7 @@ impl ExecutionService for StandardExecutionService {
         };
 
         execution.start();
-        self.repository.save(execution).await?;
+        self.repository.save(&execution).await?;
             
         // 5. Run Supervisor Loop
         let supervisor = self.supervisor.clone();
@@ -218,6 +227,7 @@ impl ExecutionService for StandardExecutionService {
         
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
+            agent_id,
             repository: repository.clone(),
             event_bus: event_bus.clone(),
         });
@@ -230,10 +240,11 @@ impl ExecutionService for StandardExecutionService {
                         if let Some(mut exec) = exec_opt {
                              exec.complete();
                              let total_iterations = exec.iterations().len() as u8;
-                             let _ = repository.save(exec).await;
+                             let _ = repository.save(&exec).await;
 
                              event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                                  execution_id,
+                                 agent_id,
                                  final_output: final_output.clone(),
                                  total_iterations,
                                  completed_at: Utc::now(),
@@ -248,10 +259,11 @@ impl ExecutionService for StandardExecutionService {
                          if let Some(mut exec) = exec_opt {
                               exec.fail(e.to_string());
                               let total_iterations = exec.iterations().len() as u8;
-                              let _ = repository.save(exec).await;
+                              let _ = repository.save(&exec).await;
 
                               event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
                                  execution_id,
+                                 agent_id,
                                  reason: e.to_string(),
                                  total_iterations,
                                  failed_at: Utc::now(),
@@ -280,10 +292,11 @@ impl ExecutionService for StandardExecutionService {
          let mut execution = self.get_execution(id).await?;
          execution.status = ExecutionStatus::Cancelled;
          execution.ended_at = Some(Utc::now());
-         self.repository.save(execution).await?;
+         self.repository.save(&execution).await?;
          
          self.event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
              execution_id: id,
+             agent_id: execution.agent_id,
              reason: None,
              cancelled_at: Utc::now(),
          });
@@ -292,6 +305,12 @@ impl ExecutionService for StandardExecutionService {
 
     async fn stream_execution(&self, _id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
         Ok(Box::pin(futures::stream::empty()))
+    }
+
+    async fn stream_agent_events(&self, _id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        Ok(Box::pin(futures::stream::empty()))
+        // The implementation will be done in the server handler for now because `Stream` requires `'static` usually or intricate lifetimes.
+        // Or we can implement it here properly.
     }
 
     async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>> {
