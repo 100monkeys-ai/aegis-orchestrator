@@ -110,16 +110,18 @@ impl AgentRuntime for DockerRuntime {
         let res = self.docker.start_exec(&exec.id, Some(start_opts)).await
             .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
-        let mut logs = Vec::new();
+        let mut stdout_logs = Vec::new();
+        let mut stderr_logs = Vec::new();
+        
         match res {
             StartExecResults::Attached { mut output, .. } => {
                 while let Some(msg) = output.next().await {
                     match msg {
                         Ok(LogOutput::StdOut { message }) => {
-                            logs.push(String::from_utf8_lossy(&message).to_string());
+                            stdout_logs.push(String::from_utf8_lossy(&message).to_string());
                         },
                         Ok(LogOutput::StdErr { message }) => {
-                            logs.push(String::from_utf8_lossy(&message).to_string());
+                            stderr_logs.push(String::from_utf8_lossy(&message).to_string());
                         },
                         _ => {}
                     }
@@ -128,15 +130,11 @@ impl AgentRuntime for DockerRuntime {
             _ => {}
         }
 
-        // Mock output for now since we rely on the agent process to actually run
-        let result = serde_json::json!({
-            "status": "success",
-            "executed_prompt": input.prompt
-        });
-
+        let result = serde_json::Value::String(stdout_logs.join(""));
+        
         Ok(TaskOutput {
             result,
-            logs,
+            logs: stderr_logs,
             tool_calls: vec![],
         })
     }

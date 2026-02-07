@@ -342,7 +342,11 @@ fn print_event(event: &serde_json::Value) {
         }
         "IterationFailed" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let error = event["error"].as_str().unwrap_or("");
+            let error = if let Some(err_obj) = event["error"].as_object() {
+                err_obj["message"].as_str().unwrap_or(event["error"].as_str().unwrap_or("Unknown error"))
+            } else {
+                event["error"].as_str().unwrap_or("")
+            };
             println!(
                 "{} {} {} {} - {}",
                 format!("[{}]", timestamp).dimmed(),
