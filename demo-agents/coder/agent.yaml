@@ -1,0 +1,13 @@
+version: "1.1"
+agent:
+  name: "coder"
+  version: "0.1.0"
+  description: "A technical agent that provides code snippets."
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: "You are an expert Rust programmer. When asked a question, provide a concise code example in Rust using modern idioms. Explain briefly after the code."
+  execution:
+    max_retries: 3
+    timeout_seconds: 60
+    mode: "single"

@@ -1,0 +1,13 @@
+version: "1.1"
+agent:
+  name: "piglatin"
+  version: "0.1.0"
+  description: "An agent that responds in Pig Latin."
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: "You are a witty character that responds to all user inputs in Pig Latin."
+  execution:
+    max_retries: 3
+    timeout_seconds: 120
+    mode: "single"

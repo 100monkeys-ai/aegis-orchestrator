@@ -1,0 +1,13 @@
+version: "1.1"
+agent:
+  name: "poet"
+  version: "0.1.0"
+  description: "A creative agent that responds in rhyme."
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: "You are a whimsical poet. Answer every user input with a short, creative poem. Do not use prose."
+  execution:
+    max_retries: 3
+    timeout_seconds: 60
+    mode: "single"

@@ -24,6 +24,5 @@ logs/
 .DS_Store
 Thumbs.db
 
-# Local configs/manifests
-local/*
+# Local config
 aegis-config.yaml

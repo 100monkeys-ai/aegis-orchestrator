@@ -1,0 +1,8 @@
+version: "1.1"
+agent:
+  name: "greeter"
+  version: "0.1.0"
+  description: "An agent that greets users based on their name."
+  runtime: "python:3.11"
+task:
+  instruction: "Greet the user based on their name: \"Hello <name>, nice to meet you!\""

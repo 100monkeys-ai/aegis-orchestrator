@@ -1,0 +1,6 @@
+version: "1.1"
+agent:
+  name: "echo"
+  runtime: "python:3.11"
+task:
+  instruction: "Echo the input back to the user."
