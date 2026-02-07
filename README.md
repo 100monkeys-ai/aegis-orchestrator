@@ -53,13 +53,28 @@ HTTP/gRPC server built with Axum for:
 
 ### CLI (`cli/`)
 
-Command-line tool for local development:
+Command-line tool for local development and agent management:
 
 ```bash
-aegis task deploy agent.yaml      # Deploy agent
-aegis task execute <agent-id>     # Execute task
-aegis task logs <execution-id>    # View logs
+# Daemon management
+aegis daemon start                    # Start daemon
+aegis daemon stop                     # Stop daemon
+aegis daemon status                   # Check status
+
+# Agent management
+aegis agent deploy agent.yaml         # Deploy agent
+aegis agent list                      # List agents
+aegis agent logs <agent-name>         # Stream agent logs
+aegis agent remove <agent-id>         # Remove agent
+
+# Task execution
+aegis task execute <agent-name>       # Execute task
+aegis task list                       # List executions
+aegis task logs <execution-id>        # View execution logs
+aegis task cancel <execution-id>      # Cancel execution
 ```
+
+See [CLI Reference](docs/CLI_REFERENCE.md) for complete documentation.
 
 ### Edge Node (`edge-node/`)
 
@@ -71,30 +86,69 @@ Lightweight binary for hybrid cloud/on-prem deployments.
 
 - Rust 1.75+
 - Docker 24.0+
+- Ollama (for local LLM) or OpenAI API key
 - (Production) Linux with KVM support
 
 ### Build
 
 ```bash
-# Build all components
-cargo build --release
+# Build the CLI and orchestrator
+cargo build -p aegis-cli
 
-# Run tests
-cargo test
-
-# Install CLI
-cargo install --path cli
+# Or build in release mode
+cargo build --release -p aegis-cli
 ```
+
+### Configuration
+
+Create or edit `aegis-config.yaml`:
+
+```yaml
+node:
+  id: "my-node-001"
+  type: "edge"
+  name: "my-aegis-node"
+
+llm_providers:
+  - name: "local"
+    type: "ollama"
+    endpoint: "http://localhost:11434"
+    models:
+      - alias: "default"
+        model: "phi3:mini"
+        capabilities: ["code", "reasoning"]
+        context_window: 4096
+```
+
+See [aegis-config.yaml](aegis-config.yaml) for a complete example.
 
 ### Running Locally
 
 ```bash
-# Start the orchestrator
-cargo run --bin aegis-orchestrator
+# Start the daemon
+target/debug/aegis daemon start
 
-# In another terminal, run an agent
-aegis task deploy examples/email-summarizer/agent.yaml
+# Check daemon status
+target/debug/aegis daemon status
+
+# Deploy demo agents
+target/debug/aegis agent deploy ./demo-agents/echo/agent.yaml
+target/debug/aegis agent deploy ./demo-agents/greeter/agent.yaml
+
+# List deployed agents
+target/debug/aegis agent list
+
+# Execute a task
+target/debug/aegis task execute echo --input "Hello Daemon"
+
+# View agent logs
+target/debug/aegis agent logs echo
+
+# Stop the daemon
+target/debug/aegis daemon stop
 ```
+
+For detailed instructions, see [Getting Started Guide](docs/GETTING_STARTED.md).
 
 ## Development
 
@@ -133,7 +187,7 @@ cargo test --test '*'
 cargo test -p aegis-core
 ```
 
-## Configuration
+## Configuration Reference
 
 See [`examples/`](examples/) for sample configurations.
 
@@ -156,9 +210,23 @@ For details, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
+### Getting Started
+
+- [Getting Started Guide](docs/GETTING_STARTED.md) - Complete setup walkthrough
+- [Local Testing Guide](docs/LOCAL_TESTING.md) - Build and test workflow
+- [CLI Reference](docs/CLI_REFERENCE.md) - Complete command documentation
+- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
+
+### Development Guides
+
+- [Agent Development Guide](docs/AGENT_DEVELOPMENT.md) - Creating custom agents
 - [Architecture](docs/ARCHITECTURE.md) - System design
+- [Contributing](docs/CONTRIBUTING.md) - Development guide
+
+### Security & Operations
+
 - [Security Model](docs/SECURITY.md) - Threat analysis
-- [Contributing](CONTRIBUTING.md) - Development guide
+- [Roadmap](docs/ROADMAP.md) - Future plans
 
 ## License
 
