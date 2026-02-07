@@ -289,71 +289,160 @@ async fn stream_events_handler(
     Path(execution_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let _follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
+    let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
+    let exec_id = aegis_core::domain::execution::ExecutionId(execution_id);
     
-    // Subscribe to events using the filtered subscriber
-    let mut receiver = state.event_bus.subscribe_execution(aegis_core::domain::execution::ExecutionId(execution_id));
+    // 1. Subscribe FIRST to catch any events that happen while we fetch history
+    let mut receiver = state.event_bus.subscribe_execution(exec_id);
+    
+    // 2. Fetch history
+    let execution_result = state.execution_service.get_execution(exec_id).await;
     
     let stream = async_stream::stream! {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    // Convert domain event to SSE event
-                    let json = match event {
-                        aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
-                            serde_json::json!({
-                                "event_type": "ExecutionStarted",
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": {}
-                            })
-                        },
-                        aegis_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
-                            serde_json::json!({
-                                "event_type": "IterationStarted",
-                                "iteration_number": iteration_number,
-                                "action": action, 
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": { "action": action }
-                            })
-                        },
-                         aegis_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
-                            serde_json::json!({
-                                "event_type": "IterationCompleted",
-                                "iteration_number": iteration_number,
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": { "output": output }
-                            })
-                        },
-                        aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
-                            serde_json::json!({
-                                "event_type": "ExecutionCompleted",
-                                "total_iterations": 0, 
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": { "result": final_output }
-                            })
-                        },
-                         aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
-                            serde_json::json!({
-                                "event_type": "ExecutionFailed",
-                                "reason": reason,
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": { "error": reason }
-                            })
-                        },
-                        _ => {
-                             serde_json::json!({
-                                "event_type": "Unknown",
-                                "timestamp": chrono::Utc::now().to_rfc3339(),
-                                "data": {}
-                            })
-                        }
-                    };
-                    
-                    yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
+        // 3. Replay history if execution exists
+        if let Ok(execution) = execution_result {
+            // ExecutionStarted
+            let start_event = serde_json::json!({
+                "event_type": "ExecutionStarted",
+                "timestamp": execution.started_at.to_rfc3339(),
+                "data": {}
+            });
+            yield Ok::<_, anyhow::Error>(Event::default().data(start_event.to_string()));
+
+            // Iterations
+            for iter in execution.iterations() { // Iterate over reference to avoid move
+                // IterationStarted
+                let iter_start = serde_json::json!({
+                    "event_type": "IterationStarted",
+                    "iteration_number": iter.number,
+                    "action": iter.action, 
+                    "timestamp": iter.started_at.to_rfc3339(),
+                    "data": { "action": iter.action }
+                });
+                yield Ok::<_, anyhow::Error>(Event::default().data(iter_start.to_string()));
+
+                // Completion/Failure
+                if let Some(output) = &iter.output {
+                     let iter_end = serde_json::json!({
+                        "event_type": "IterationCompleted",
+                        "iteration_number": iter.number,
+                        "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                        "data": { "output": output }
+                    });
+                     yield Ok::<_, anyhow::Error>(Event::default().data(iter_end.to_string()));
+                } else if let Some(error) = &iter.error {
+                     // Need to map IterationError to string or struct
+                     let iter_fail = serde_json::json!({
+                        "event_type": "IterationFailed",
+                        "iteration_number": iter.number,
+                        "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
+                        "data": { "error": error.message }
+                    });
+                     yield Ok::<_, anyhow::Error>(Event::default().data(iter_fail.to_string()));
                 }
-                Err(_) => {
-                    // Stream closed or lagged
-                    break;
+            }
+
+            // Execution Terminal State
+            if let Some(ended_at) = execution.ended_at {
+                match execution.status {
+                    aegis_core::domain::execution::ExecutionStatus::Completed => {
+                         // Need final result? It's usually the last iteration output or not stored directly in Execution struct root except implicitly?
+                         // The ExecutionEvent::ExecutionCompleted has `final_output`.
+                         // The Execution struct doesn't seem to have `final_output` field in the previous view, just iterations.
+                         // We'll infer it from the last iteration for now or empty.
+                        let result = execution.iterations().last().and_then(|i| i.output.clone()).unwrap_or_default();
+                        
+                        let exec_end = serde_json::json!({
+                            "event_type": "ExecutionCompleted",
+                            "total_iterations": execution.iterations().len(), 
+                            "timestamp": ended_at.to_rfc3339(),
+                            "data": { "result": result }
+                        });
+                        yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
+                    },
+                    aegis_core::domain::execution::ExecutionStatus::Failed => {
+                        let exec_fail = serde_json::json!({
+                            "event_type": "ExecutionFailed",
+                            "reason": "Execution failed", // TODO: Store reason in Execution
+                            "timestamp": ended_at.to_rfc3339(),
+                            "data": { "error": "Execution failed" }
+                        });
+                        yield Ok::<_, anyhow::Error>(Event::default().data(exec_fail.to_string()));
+                    },
+                    aegis_core::domain::execution::ExecutionStatus::Cancelled => {
+                         // Add Cancelled event if needed
+                    },
+                    _ => {}
+                }
+            }
+        }
+
+        // 4. Stream new events if following
+        if follow {
+            loop {
+                // TODO: Deduplication?
+                // For now, assume the user accepts potential slight overlap if the execution was active during replay.
+                match receiver.recv().await {
+                    Ok(event) => {
+                         // Convert domain event to JSON (Same logic as before)
+                         let json = match event {
+                            aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
+                                // Skip if we already replayed it? 
+                                // Simple filter: check timestamp? 
+                                // For now, just stream it.
+                                serde_json::json!({
+                                    "event_type": "ExecutionStarted",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": {}
+                                })
+                            },
+                             aegis_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
+                                serde_json::json!({
+                                    "event_type": "IterationStarted",
+                                    "iteration_number": iteration_number,
+                                    "action": action, 
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": { "action": action }
+                                })
+                            },
+                             aegis_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
+                                serde_json::json!({
+                                    "event_type": "IterationCompleted",
+                                    "iteration_number": iteration_number,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": { "output": output }
+                                })
+                            },
+                            aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                                serde_json::json!({
+                                    "event_type": "ExecutionCompleted",
+                                    "total_iterations": 0, 
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": { "result": final_output }
+                                })
+                            },
+                             aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
+                                serde_json::json!({
+                                    "event_type": "ExecutionFailed",
+                                    "reason": reason,
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": { "error": reason }
+                                })
+                            },
+                            _ => {
+                                 serde_json::json!({
+                                    "event_type": "Unknown",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "data": {}
+                                })
+                            }
+                        };
+                        
+                        yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
+                    }
+                    Err(_) => {
+                        break;
+                    }
                 }
             }
         }
