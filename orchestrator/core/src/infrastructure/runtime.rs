@@ -62,21 +62,32 @@ impl AgentRuntime for DockerRuntime {
             info!("Successfully pulled image: {}", image);
         }
         
-        let container_config = Config {
-            image: Some(image),
-            tty: Some(true), // Keep it alive
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            cmd: Some(vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]), // Keep alive command
+
+
+        let host_config = bollard::service::HostConfig {
+            binds: Some(vec![
+                format!("{}:/usr/local/bin/aegis-bootstrap", std::env::current_dir().unwrap().join("assets/bootstrap.py").to_str().unwrap()),
+            ]),
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
         };
+
+        // Removed container_config that was causing move issues and unused var warning
 
         let options = CreateContainerOptions {
             name: format!("aegis-agent-{}", uuid::Uuid::new_v4()),
             platform: None,
         };
 
-        let res = self.docker.create_container(Some(options), container_config).await
+        let res = self.docker.create_container(Some(options), Config {
+            image: Some(image.clone()), // Clone image
+            tty: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            cmd: Some(vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]),
+            host_config: Some(host_config),
+            ..Default::default()
+        }).await
             .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
 
         let id = res.id;
@@ -92,10 +103,24 @@ impl AgentRuntime for DockerRuntime {
         let container_id = id.as_str();
 
         // simple exec for now - just echo the prompt
+        // Execute via bootstrap script
         let exec_config = CreateExecOptions {
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            cmd: Some(vec!["echo".to_string(), input.prompt.clone()]),
+            // Pass input as argument. Note: Shell escaping might be needed if input has special chars.
+            // Using list form avoids shell: ["python", ...]
+            cmd: Some(vec![
+                "python".to_string(), 
+                "/usr/local/bin/aegis-bootstrap".to_string(),
+                input.prompt.clone()
+            ]),
+            env: Some(vec![
+                // Ensure PYTHONPATH or other envs if needed
+                "PYTHONUNBUFFERED=1".to_string(),
+                // We should pass execution ID if we had it in TaskInput? 
+                // Currently TaskInput doesn't have it.
+                // But we can add it or ignore for now.
+            ]),
             ..Default::default()
         };
 

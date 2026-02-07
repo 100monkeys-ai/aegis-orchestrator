@@ -167,6 +167,14 @@ pub struct NetworkConfig {
     /// TLS certificate configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsConfig>,
+
+    /// Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
+    #[serde(default = "default_bind_address")]
+    pub bind_address: String,
+
+    /// HTTP API port
+    #[serde(default = "default_api_port")]
+    pub port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -269,6 +277,14 @@ fn default_metrics_port() -> u16 {
 
 fn default_metrics_path() -> String {
     "/metrics".to_string()
+}
+
+fn default_bind_address() -> String {
+    "0.0.0.0".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8000
 }
 
 impl Default for LLMSelectionStrategy {

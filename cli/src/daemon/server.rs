@@ -100,6 +100,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         supervisor,
         execution_repo.clone(),
         event_bus.clone(),
+        Arc::new(config.clone()),
     ));
 
     let app_state = AppState {
@@ -131,7 +132,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_state(Arc::new(app_state));
 
     // Start HTTP server
-    let addr = format!("127.0.0.1:{}", port);
+    let bind_addr = if let Some(network) = &config.network {
+        network.bind_address.clone()
+    } else {
+        "0.0.0.0".to_string()
+    };
+    
+    // Config port takes precedence over CLI default if we consider config the source of truth for the node.
+    // However, start_daemon receives `port`. 
+    // Let's use the config port if network config is present, otherwise use the passed port.
+    let final_port = if let Some(network) = &config.network {
+        network.port
+    } else {
+        port
+    };
+
+    let addr = format!("{}:{}", bind_addr, final_port);
     println!("Binding to {}...", addr);
     let listener = TcpListener::bind(&addr)
         .await

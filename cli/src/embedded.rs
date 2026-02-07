@@ -66,6 +66,7 @@ impl EmbeddedExecutor {
             supervisor,
             execution_repo.clone(),
             event_bus.clone(),
+            Arc::new(config.clone()),
         ));
 
         Ok(Self {

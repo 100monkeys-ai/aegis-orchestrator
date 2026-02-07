@@ -56,7 +56,7 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    match client.get("http://127.0.0.1:8080/health").send().await {
+    match client.get("http://127.0.0.1:8000/health").send().await {
         Ok(resp) if resp.status().is_success() => {
             // Parse uptime from response
             let uptime = resp
@@ -115,7 +115,19 @@ pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
 
     #[cfg(windows)]
     {
-        anyhow::bail!("Windows daemon stop not yet implemented");
+        // Use taskkill to kill the process by PID
+        let output = std::process::Command::new("taskkill")
+            .args(&["/PID", &pid.to_string(), "/F"])
+            .output()
+            .context("Failed to execute taskkill")?;
+
+        if !output.status.success() {
+             let stderr = String::from_utf8_lossy(&output.stderr);
+             if !stderr.contains("not found") { // Ignore if already gone
+                 anyhow::bail!("Failed to stop daemon: {}", stderr);
+             }
+        }
+        info!("Daemon stopped (killed via taskkill)");
     }
 
     let _ = std::fs::remove_file(&pid_file);

@@ -103,6 +103,10 @@ llm_selection:
 # Network Configuration
 # ============================================================================
 network:
+  # Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
+  # bind_address: "0.0.0.0"
+  # port: 8000
+
   # Optional: Central orchestrator endpoint for multi-node coordination
   # Leave unset for standalone mode
   # orchestrator_endpoint: "https://orchestrator.aegis.example.com"
@@ -114,8 +118,8 @@ network:
   # heartbeat_interval_seconds: 30
   
   # Optional: Proxy configuration
-  # http_proxy: "http://proxy.example.com:8080"
-  # https_proxy: "http://proxy.example.com:8080"
+  # http_proxy: "http://proxy.example.com:8000"
+  # https_proxy: "http://proxy.example.com:8000"
   # no_proxy: "localhost,127.0.0.1,.local"
 
 # ============================================================================

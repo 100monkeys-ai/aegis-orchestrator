@@ -30,6 +30,7 @@ pub struct StandardExecutionService {
     supervisor: Arc<Supervisor>,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
+    config: Arc<crate::domain::node_config::NodeConfig>,
 }
 
 impl StandardExecutionService {
@@ -39,6 +40,7 @@ impl StandardExecutionService {
         supervisor: Arc<Supervisor>,
         repository: Arc<dyn ExecutionRepository>,
         event_bus: Arc<EventBus>,
+        config: Arc<crate::domain::node_config::NodeConfig>,
     ) -> Self {
         Self {
             runtime,
@@ -46,6 +48,7 @@ impl StandardExecutionService {
             supervisor,
             repository,
             event_bus,
+            config,
         }
     }
 }
@@ -152,10 +155,36 @@ impl ExecutionService for StandardExecutionService {
         });
 
         // 4. Spawn Runtime
+        let mut env = agent.manifest.env.clone();
+        
+        // Inject instruction from default task if available
+        if let Some(task_spec) = &agent.manifest.task {
+             if let Some(instr) = &task_spec.instruction {
+                 env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
+             }
+        }
+        // Fallback to description if not set above (or overwrite if desired, logic depends on precedence)
+        // If instruction is missing, we try description
+        if !env.contains_key("AEGIS_AGENT_INSTRUCTION") {
+            if let Some(desc) = &agent.manifest.agent.description {
+                env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), desc.clone());
+            }
+        }
+        
+        // Inject other metadata
+        env.insert("AEGIS_AGENT_ID".to_string(), agent_id.0.to_string());
+        env.insert("AEGIS_EXECUTION_ID".to_string(), execution_id.0.to_string());
+        
+        // Inject Orchestrator URL
+        // We use host.docker.internal as the generic host, but port comes from config.
+        let port = self.config.network.as_ref().map(|n| n.port).unwrap_or(8000);
+        let url = format!("http://host.docker.internal:{}", port);
+        env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
+        
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             image: agent.manifest.agent.runtime.clone(),
             command: None, // Default
-            env: agent.manifest.env.clone(),
+            env,
             autopull: agent.manifest.agent.autopull,
         };
 
