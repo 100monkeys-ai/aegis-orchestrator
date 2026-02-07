@@ -5,6 +5,8 @@ use axum::{
     extract::{State, Path},
     routing::{get, post},
     Json, Router,
+    http::StatusCode,
+    response::IntoResponse,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -38,10 +40,15 @@ use super::{remove_pid_file, write_pid_file};
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Daemonize on Unix
+    // NOTE: We skip internal daemonization because calling fork() (via daemonize)
+    // inside a Tokio runtime (#[tokio::main]) breaks the reactor.
+    // The CLI 'daemon start' command already spawns this process as a detached background child.
+    /*
     #[cfg(unix)]
     {
         daemonize_process()?;
     }
+    */
 
     // Write PID file
     let pid = std::process::id();
@@ -53,6 +60,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     info!("AEGIS daemon starting (PID: {})", pid);
 
     // Load configuration
+    println!("Loading configuration...");
     let config = NodeConfig::load_or_default(config_path)
         .context("Failed to load configuration")?;
 
@@ -60,20 +68,27 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .validate()
         .context("Configuration validation failed")?;
 
-    info!("Configuration loaded: node_id={}", config.node.id);
+    println!("Configuration loaded. Initializing services...");
 
     // Initialize services
     let agent_repo = Arc::new(InMemoryAgentRepository::new());
     let execution_repo = Arc::new(InMemoryExecutionRepository::new());
     let event_bus = Arc::new(EventBus::new(100));
+    
+    println!("Initializing LLM registry...");
     let llm_registry = Arc::new(
         ProviderRegistry::from_config(&config)
             .context("Failed to initialize LLM providers")?,
     );
-     let runtime = Arc::new(
+
+    println!("Initializing Docker runtime...");
+    // Force a timeout on docker connection if possible, or just log before/after
+    let runtime = Arc::new(
         DockerRuntime::new()
             .context("Failed to initialize Docker runtime")?
     );
+    println!("Docker runtime initialized.");
+
     let judge = Arc::new(BasicJudge);
     let supervisor = Arc::new(Supervisor::new(runtime.clone(), judge));
 
@@ -93,10 +108,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         start_time: std::time::Instant::now(),
     };
 
+    println!("Building router...");
     // Build HTTP router
     let app = Router::new()
         .route("/health", get(health_handler))
-        .route("/api/agents", post(deploy_agent_handler))
+
         .route("/api/agents/:agent_id/execute", post(execute_agent_handler))
         .route("/api/executions/:execution_id", get(get_execution_handler))
         .route(
@@ -105,15 +121,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
         // .route("/api/executions/:execution_id/events", get(stream_events_handler)) // TODO: SSE
         .route("/api/executions", get(list_executions_handler))
+        .route("/api/executions/:execution_id", axum::routing::delete(delete_execution_handler))
+        .route("/api/agents", post(deploy_agent_handler).get(list_agents_handler))
+        .route("/api/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
         .with_state(Arc::new(app_state));
 
     // Start HTTP server
     let addr = format!("127.0.0.1:{}", port);
+    println!("Binding to {}...", addr);
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {}", addr))?;
 
     info!("Daemon listening on {}", addr);
+    println!("Daemon listening on {}", addr);
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -127,11 +148,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
 #[cfg(unix)]
 fn daemonize_process() -> Result<()> {
+    // Kept for reference but unused in current flow
+    /*
     use daemonize::Daemonize;
+
+    let stdout = std::fs::File::create("/tmp/aegis.out").unwrap();
+    let stderr = std::fs::File::create("/tmp/aegis.err").unwrap();
 
     let daemon = Daemonize::new()
         .working_directory("/tmp")
         .umask(0o027)
+        .stdout(stdout)
+        .stderr(stderr)
         .privileged_action(|| {
             info!("Daemonizing process");
         });
@@ -139,7 +167,7 @@ fn daemonize_process() -> Result<()> {
     daemon
         .start()
         .context("Failed to daemonize process")?;
-
+    */
     Ok(())
 }
 
@@ -200,11 +228,11 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
 async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
     Json(manifest): Json<aegis_sdk::manifest::AgentManifest>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
     let core_manifest: aegis_core::domain::agent::AgentManifest = serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
     match state.agent_service.deploy_agent(core_manifest).await {
-        Ok(id) => Json(serde_json::json!({"agent_id": id.0})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -217,15 +245,15 @@ async fn execute_agent_handler(
     State(state): State<Arc<AppState>>,
     Path(agent_id): Path<Uuid>,
     Json(request): Json<ExecuteRequest>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
     let input = ExecutionInput {
         intent: Some(request.input.to_string()), // Simplified assumption
         payload: request.input,
     };
     
     match state.execution_service.start_execution(AgentId(agent_id), input).await {
-        Ok(id) => Json(serde_json::json!({"execution_id": id.0})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"execution_id": id.0}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -255,9 +283,84 @@ async fn cancel_execution_handler(
     }
 }
 
-async fn list_executions_handler(
-    State(_state): State<Arc<AppState>>,
+async fn delete_execution_handler(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    // TODO: Implement list in execution service
-    Json(serde_json::json!([]))
+    match state.execution_service.delete_execution(ExecutionId(execution_id)).await {
+        Ok(_) => Json(serde_json::json!({"success": true})),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ListExecutionsQuery {
+    agent_id: Option<Uuid>,
+    limit: Option<usize>,
+}
+
+async fn list_executions_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<ListExecutionsQuery>,
+) -> Json<serde_json::Value> {
+    let agent_id = query.agent_id.map(AgentId);
+    let limit = query.limit.unwrap_or(20);
+
+    match state.execution_service.list_executions(agent_id, limit).await {
+        Ok(executions) => {
+            let json_executions: Vec<serde_json::Value> = executions.into_iter().map(|exec| {
+                serde_json::json!({
+                    "id": exec.id.0,
+                    "agent_id": exec.agent_id.0,
+                    "status": format!("{:?}", exec.status),
+                    "started_at": exec.started_at,
+                    "ended_at": exec.ended_at
+                })
+            }).collect();
+            Json(serde_json::json!(json_executions))
+        },
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn list_agents_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    match state.agent_service.list_agents().await {
+        Ok(agents) => {
+             let json_agents: Vec<serde_json::Value> = agents.into_iter().map(|agent| {
+                serde_json::json!({
+                    "id": agent.id.0,
+                    "name": agent.manifest.agent.name,
+                    "version": agent.manifest.agent.version.clone().unwrap_or_else(|| "0.0.1".to_string()),
+                    "description": agent.manifest.agent.description.clone().unwrap_or_default(),
+                    "status": format!("{:?}", agent.status)
+                })
+            }).collect();
+            Json(serde_json::json!(json_agents))
+        },
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn delete_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    match state.agent_service.delete_agent(AgentId(agent_id)).await {
+        Ok(_) => Json(serde_json::json!({"success": true})),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
+async fn get_agent_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    match state.agent_service.get_agent(AgentId(id)).await {
+        Ok(agent) => {
+             Json(serde_json::to_value(agent.manifest).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))
+        },
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
 }

@@ -73,6 +73,14 @@ pub enum TaskCommand {
         /// Force kill without graceful shutdown
         #[arg(short, long)]
         force: bool,
+
+    },
+
+    /// Remove an execution
+    Remove {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
     },
 
     /// List recent executions
@@ -94,6 +102,12 @@ pub async fn handle_command(
 ) -> Result<()> {
     // Detect if daemon is running
     let daemon_status = check_daemon_running().await;
+    
+    if let Ok(DaemonStatus::Unhealthy { pid, error }) = &daemon_status {
+        println!("{}", format!("⚠ Daemon found (PID: {}) but unhealthy: {}", pid, error).yellow());
+        println!("Falling back to embedded mode.");
+    }
+
     let use_daemon = matches!(daemon_status, Ok(DaemonStatus::Running { .. }));
 
     if use_daemon {
@@ -134,6 +148,7 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
             execution_id,
             force,
         } => cancel_daemon(execution_id, force, client).await,
+        TaskCommand::Remove { execution_id } => remove_daemon(execution_id, client).await,
         TaskCommand::List { agent_id, limit } => list_daemon(agent_id, limit, client).await,
     }
 }
@@ -157,6 +172,7 @@ async fn handle_command_embedded(command: TaskCommand, executor: EmbeddedExecuto
             execution_id,
             force,
         } => cancel_embedded(execution_id, force, executor).await,
+        TaskCommand::Remove { execution_id } => remove_embedded(execution_id, executor).await,
         TaskCommand::List { agent_id, limit } => list_embedded(agent_id, limit, executor).await,
     }
 }
@@ -419,4 +435,22 @@ fn format_status(status: &str) -> colored::ColoredString {
         "cancelled" => "cancelled".yellow(),
         _ => status.normal(),
     }
+}
+
+async fn remove_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
+    client.delete_execution(execution_id).await?;
+    println!(
+        "{}",
+        format!("✓ Execution {} removed", execution_id).green()
+    );
+    Ok(())
+}
+
+async fn remove_embedded(execution_id: Uuid, executor: EmbeddedExecutor) -> Result<()> {
+    executor.delete_execution(ExecutionId(execution_id)).await?;
+    println!(
+        "{}",
+        format!("✓ Execution {} removed", execution_id).green()
+    );
+    Ok(())
 }

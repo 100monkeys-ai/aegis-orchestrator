@@ -105,6 +105,10 @@ impl EmbeddedExecutor {
         self.execution_service.cancel_execution(execution_id).await
     }
 
+    pub async fn delete_execution(&self, execution_id: ExecutionId) -> Result<()> {
+        self.execution_service.delete_execution(execution_id).await
+    }
+
     pub async fn list_executions(
         &self,
         _agent_id: Option<AgentId>,

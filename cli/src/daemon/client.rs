@@ -9,12 +9,7 @@ use uuid::Uuid;
 
 use aegis_sdk::manifest::AgentManifest;
 
-#[derive(Debug, Clone)]
-pub enum DaemonStatus {
-    Running { pid: u32, uptime: Option<u64> },
-    Stopped,
-    Unhealthy { pid: u32 },
-}
+
 
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
@@ -211,6 +206,78 @@ impl DaemonClient {
 
         Ok(())
     }
+    pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
+        let response = self
+            .client
+            .delete(&format!(
+                "{}/api/executions/{}",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to delete execution")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete execution: {}", error_text);
+        }
+
+        Ok(())
+    }
+
+    pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
+        let response = self
+            .client
+            .get(&format!("{}/api/agents", self.base_url))
+            .send()
+            .await
+            .context("Failed to list agents")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list agents: {}", error_text);
+        }
+
+        response
+            .json()
+            .await
+            .context("Failed to parse agents response")
+    }
+
+    pub async fn get_agent(&self, agent_id: Uuid) -> Result<AgentManifest> {
+        let response = self
+            .client
+            .get(&format!("{}/api/agents/{}", self.base_url, agent_id))
+            .send()
+            .await
+            .context("Failed to get agent")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get agent: {}", error_text);
+        }
+
+        response
+            .json()
+            .await
+            .context("Failed to parse agent manifest")
+    }
+
+    pub async fn delete_agent(&self, agent_id: Uuid) -> Result<()> {
+        let response = self
+            .client
+            .delete(&format!("{}/api/agents/{}", self.base_url, agent_id))
+            .send()
+            .await
+            .context("Failed to delete agent")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete agent: {}", error_text);
+        }
+
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -220,6 +287,15 @@ pub struct ExecutionInfo {
     pub status: String,
     pub started_at: Option<String>,
     pub ended_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AgentInfo {
+    pub id: Uuid,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub status: String,
 }
 
 fn is_error_event(event: &serde_json::Value) -> bool {

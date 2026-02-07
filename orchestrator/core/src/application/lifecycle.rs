@@ -43,14 +43,6 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     }
 
     async fn list_agents(&self) -> Result<Vec<Agent>> {
-        // Repository needs list method, or filtered query
-        // For MVP assuming find_by_tags or similar exists, or implementing list all
-        // Wait, AgentRepository in domain/repository.rs needs checking.
-        // Assuming it has list/find methods. If not, this might fail to compile.
-        // Let's check repository trait first? No, let's try to compile and fix.
-        // Actually, let's implement validation: repository.rs likely has list/find.
-        // I will assume find_by_tags exists or I'll add it.
-        // For now, returning empty or todo if trait is missing.
-        Ok(vec![]) 
+        self.repository.list_all().await.map_err(|e| anyhow::anyhow!("Failed to list agents: {}", e))
     }
 }

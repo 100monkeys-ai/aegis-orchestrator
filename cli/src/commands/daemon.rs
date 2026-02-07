@@ -70,8 +70,8 @@ async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
         Ok(DaemonStatus::Stopped) => {
             info!("Daemon not running, starting...");
         }
-        Ok(DaemonStatus::Unhealthy { pid }) => {
-            warn!("Daemon PID {} exists but unhealthy, stopping...", pid);
+        Ok(DaemonStatus::Unhealthy { pid, error }) => {
+            warn!("Daemon PID {} exists but unhealthy (error: {}), stopping...", pid, error);
             stop_daemon(false, 10).await?;
         }
         Err(e) => {
@@ -97,6 +97,19 @@ async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
+    
+    let temp_dir = std::env::temp_dir();
+    let stdout_path = temp_dir.join("aegis.out");
+    let stderr_path = temp_dir.join("aegis.err");
+
+    let stdout_file = std::fs::File::create(&stdout_path).context("Failed to create stdout log file")?;
+    let stderr_file = std::fs::File::create(&stderr_path).context("Failed to create stderr log file")?;
+
+    cmd.stdin(std::process::Stdio::null())
+       .stdout(stdout_file)
+       .stderr(stderr_file);
+    
+    println!("Redirecting logs to: {}", stdout_path.display());
 
     let child = cmd.spawn().context("Failed to spawn daemon process")?;
 
@@ -117,7 +130,7 @@ async fn stop(force: bool, timeout: u64) -> Result<()> {
             println!("{}", "ℹ Daemon not running".yellow());
             return Ok(());
         }
-        Ok(DaemonStatus::Running { pid, .. }) | Ok(DaemonStatus::Unhealthy { pid }) => {
+        Ok(DaemonStatus::Running { pid, .. }) | Ok(DaemonStatus::Unhealthy { pid, .. }) => {
             println!("Stopping daemon (PID: {})...", pid);
             stop_daemon(force, timeout).await?;
             println!("{}", "✓ Daemon stopped".green());
@@ -143,12 +156,13 @@ async fn status() -> Result<()> {
         Ok(DaemonStatus::Stopped) => {
             println!("{}", "✗ Daemon is not running".red());
         }
-        Ok(DaemonStatus::Unhealthy { pid }) => {
+        Ok(DaemonStatus::Unhealthy { pid, error }) => {
             println!(
                 "{}",
                 format!("⚠ Daemon unhealthy (PID: {})", pid).yellow()
             );
-            println!("  Process exists but HTTP API not responding");
+            println!("  Process exists but HTTP API check failed: {}", error);
+            println!("  Check logs at /tmp/aegis.out and /tmp/aegis.err");
         }
         Err(e) => {
             println!("{}", format!("✗ Failed to check status: {}", e).red());

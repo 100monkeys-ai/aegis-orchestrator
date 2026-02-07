@@ -7,7 +7,7 @@
 //! - Graceful shutdown
 
 use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -17,8 +17,15 @@ pub mod client;
 pub mod install;
 mod server;
 
-pub use client::{DaemonClient, DaemonStatus};
+pub use client::DaemonClient;
 pub use server::start_daemon;
+
+#[derive(Debug, Clone)]
+pub enum DaemonStatus {
+    Running { pid: u32, uptime: Option<u64> },
+    Stopped,
+    Unhealthy { pid: u32, error: String },
+}
 
 const PID_FILE: &str = "/var/run/aegis.pid";
 const PID_FILE_FALLBACK: &str = "/tmp/aegis.pid";
@@ -44,11 +51,12 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
     }
 
     // Check HTTP health endpoint
+    // Use 127.0.0.1 to avoid ipv4/ipv6 ambiguity with localhost
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
 
-    match client.get("http://localhost:8080/health").send().await {
+    match client.get("http://127.0.0.1:8080/health").send().await {
         Ok(resp) if resp.status().is_success() => {
             // Parse uptime from response
             let uptime = resp
@@ -59,7 +67,14 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
 
             Ok(DaemonStatus::Running { pid, uptime })
         }
-        Ok(_) | Err(_) => Ok(DaemonStatus::Unhealthy { pid }),
+        Ok(resp) => Ok(DaemonStatus::Unhealthy { 
+            pid, 
+            error: format!("HTTP {}", resp.status()) 
+        }),
+        Err(e) => Ok(DaemonStatus::Unhealthy { 
+            pid, 
+            error: e.to_string() 
+        }),
     }
 }
 
@@ -110,9 +125,9 @@ pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
 fn get_pid_file_path() -> PathBuf {
     #[cfg(unix)]
     {
-        let pid_file = Path::new(PID_FILE);
-        if pid_file.parent().unwrap().exists() {
-            pid_file.to_path_buf()
+        let uid = unsafe { libc::geteuid() };
+        if uid == 0 {
+            PathBuf::from(PID_FILE)
         } else {
             PathBuf::from(PID_FILE_FALLBACK)
         }

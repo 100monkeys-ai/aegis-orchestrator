@@ -1,0 +1,103 @@
+use anyhow::Result;
+use clap::Subcommand;
+use colored::Colorize;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+
+#[derive(Subcommand)]
+pub enum AgentCommand {
+    /// List deployed agents
+    List,
+
+    /// Show agent configuration (YAML)
+    Show {
+        /// Agent ID
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: Uuid,
+    },
+
+    /// Remove a deployed agent
+    Remove {
+        /// Agent ID
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: Uuid,
+    },
+}
+
+pub async fn handle_command(
+    command: AgentCommand,
+    _config_path: Option<PathBuf>,
+    port: u16,
+) -> Result<()> {
+    // Agents are currently only managed via Daemon.
+    // Embedded mode might support it through direct repository access, 
+    // but for now we'll focus on Daemon interaction as per architecture.
+    
+    let daemon_status = check_daemon_running().await;
+    match daemon_status {
+        Ok(DaemonStatus::Running { .. }) => {},
+        Ok(DaemonStatus::Unhealthy { pid, error }) => {
+             println!("{}", format!("⚠ Daemon is running (PID: {}) but unhealthy: {}", pid, error).yellow());
+             println!("Run 'aegis daemon status' for more info.");
+             return Ok(());
+        }
+        _ => {
+            println!("{}", "Agent management requires the daemon to be running.".red());
+            println!("Run 'aegis daemon start' to start the daemon.");
+            return Ok(());
+        }
+    }
+
+    let client = DaemonClient::new(port)?;
+
+    match command {
+        AgentCommand::List => list_agents(client).await,
+        AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
+        AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
+    }
+}
+
+async fn show_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
+    let manifest = client.get_agent(agent_id).await?;
+    
+    // Export as YAML to stdout
+    let yaml = manifest.to_yaml_str()?;
+    println!("{}", yaml);
+    
+    Ok(())
+}
+
+async fn list_agents(client: DaemonClient) -> Result<()> {
+    let agents = client.list_agents().await?;
+
+    if agents.is_empty() {
+        println!("{}", "No agents found".yellow());
+        return Ok(());
+    }
+
+    println!("{} agents found:", agents.len());
+    println!("{:<38} {:<20} {:<10} {}", "ID", "NAME", "VERSION", "STATUS");
+    
+    for agent in agents {
+        println!(
+            "{:<38} {:<20} {:<10} {}",
+            agent.id,
+            agent.name.bold(),
+            agent.version,
+            agent.status
+        );
+    }
+
+    Ok(())
+}
+
+async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
+    client.delete_agent(agent_id).await?;
+    println!(
+        "{}",
+        format!("✓ Agent {} removed", agent_id).green()
+    );
+    Ok(())
+}
