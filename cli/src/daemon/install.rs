@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Unix service installation (systemd/launchd)
 
 use anyhow::{Context, Result};

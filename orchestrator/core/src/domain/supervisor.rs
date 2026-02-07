@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use crate::domain::execution::ExecutionInput;
 use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError};
 use crate::domain::judge::EvaluationEngine;

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Daemon mode implementation
 //!
 //! Handles:
@@ -9,8 +12,7 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::{info};
 
 pub mod client;
 #[cfg(unix)]
@@ -26,9 +28,6 @@ pub enum DaemonStatus {
     Stopped,
     Unhealthy { pid: u32, error: String },
 }
-
-const PID_FILE: &str = "/var/run/aegis.pid";
-const PID_FILE_FALLBACK: &str = "/tmp/aegis.pid";
 
 /// Check if daemon is running via PID file + HTTP health check
 pub async fn check_daemon_running() -> Result<DaemonStatus> {
@@ -79,7 +78,7 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
 }
 
 /// Stop the daemon gracefully
-pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
+pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
     let pid_file = get_pid_file_path();
 
     let pid = std::fs::read_to_string(&pid_file)
@@ -151,7 +150,7 @@ fn get_pid_file_path() -> PathBuf {
     }
 }
 
-fn process_exists(pid: u32) -> bool {
+fn process_exists(_pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }

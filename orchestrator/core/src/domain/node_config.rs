@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // Node Configuration Types - Implements NODE_CONFIGURATION_SPEC.md
 //
 // Defines the configuration schema for AEGIS Agent Host nodes, including:

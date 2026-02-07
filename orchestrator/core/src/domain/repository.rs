@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // Repository Pattern - Storage Backend Abstraction
 //
 // Defines pluggable storage backend for repositories, enabling:

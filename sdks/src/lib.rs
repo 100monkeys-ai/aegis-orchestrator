@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 /// AEGIS Rust SDK
 /// 
 /// Build secure, autonomous agents with the AEGIS runtime.

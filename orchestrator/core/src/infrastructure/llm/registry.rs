@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // LLM Provider Registry - Model Alias Resolution and Provider Management
 //
 // Manages LLM providers and resolves model aliases to actual providers.

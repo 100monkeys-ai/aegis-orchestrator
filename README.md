@@ -2,7 +2,7 @@
 
 The core runtime and orchestrator for Project AEGIS - a secure, serverless runtime environment for autonomous AI agents.
 
-[![License](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 
 ## Overview
@@ -230,7 +230,7 @@ For details, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-Apache License 2.0. See [LICENSE](LICENSE) for details.
+AGPL-3.0. See [LICENSE](LICENSE) for details.
 
 ## Related Repositories
 

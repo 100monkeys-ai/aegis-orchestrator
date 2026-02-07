@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Daemon lifecycle management commands
 //!
 //! Commands: start, stop, status, install, uninstall
@@ -186,7 +189,7 @@ async fn status() -> Result<()> {
     Ok(())
 }
 
-async fn install(binary_path: Option<PathBuf>, user: Option<String>) -> Result<()> {
+async fn install(_binary_path: Option<PathBuf>, _user: Option<String>) -> Result<()> {
     #[cfg(unix)]
     {
         crate::daemon::install::install_service(binary_path, user).await

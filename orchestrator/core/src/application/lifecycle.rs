@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
 use crate::domain::repository::AgentRepository;
 use crate::application::agent::AgentLifecycleService;

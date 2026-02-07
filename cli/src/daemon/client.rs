@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! HTTP client for communicating with daemon API
 
 use anyhow::{Context, Result};

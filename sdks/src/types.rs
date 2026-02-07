@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use serde::{Deserialize, Serialize};
 
 /// Common types used across the SDK.

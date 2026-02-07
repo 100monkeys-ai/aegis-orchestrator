@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Daemon HTTP server implementation
 
 use anyhow::{Context, Result};
@@ -8,7 +11,6 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, sse::{Event, Sse}},
 };
-use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -800,7 +802,7 @@ async fn lookup_agent_handler(
 struct LlmGenerateRequest {
     execution_id: Option<Uuid>,
     iteration_number: Option<u8>,
-    provider: Option<String>,
+    _provider: Option<String>,
     model: Option<String>,
     prompt: String,
     temperature: Option<f32>,

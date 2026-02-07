@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // Anthropic LLM Provider Adapter
 //
 // Anti-Corruption Layer for Anthropic Claude API

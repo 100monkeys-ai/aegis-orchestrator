@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;

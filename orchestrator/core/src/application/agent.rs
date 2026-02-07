@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
 use anyhow::Result;
 use async_trait::async_trait;

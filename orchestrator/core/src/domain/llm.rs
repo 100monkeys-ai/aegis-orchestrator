@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // LLM Provider Domain Interface (Anti-Corruption Layer)
 //
 // Defines domain interface for LLM providers following DDD principles.

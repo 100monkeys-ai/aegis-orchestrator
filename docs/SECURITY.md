@@ -271,7 +271,7 @@ AEGIS is designed to support compliance with:
 If you discover a security vulnerability:
 
 1. **Do not** disclose publicly
-2. Email: <security@aegis.dev>
+2. Email: <security@100monkeys.ai>
 3. Include:
    - Description of the issue
    - Steps to reproduce
@@ -288,4 +288,4 @@ If you discover a security vulnerability:
 
 ---
 
-For security questions, contact: <security@aegis.dev>
+For security inquiries, contact: <security@100monkeys.ai>

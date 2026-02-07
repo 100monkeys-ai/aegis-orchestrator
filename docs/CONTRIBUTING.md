@@ -322,7 +322,7 @@ npm run docs
 
 **Do not** open public issues for security vulnerabilities.
 
-Instead, email: <security@aegis.dev>
+Instead, email: <security@100monkeys.ai>
 
 Include:
 

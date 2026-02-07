@@ -3,7 +3,7 @@ name = "aegis-sdk"
 version = "0.1.0"
 edition = "2021"
 authors = ["AEGIS Core Team"]
-license = "Apache-2.0"
+license = "AGPL-3.0"
 description = "Rust SDK for building AEGIS agents"
 repository = "https://github.com/100monkeys-ai/aegis-greenfield"
 

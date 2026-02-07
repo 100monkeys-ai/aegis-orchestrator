@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 // Event Bus Implementation - Pub/Sub for Domain Events
 //
 // Provides in-memory event streaming using tokio broadcast channels.
@@ -254,7 +257,6 @@ impl Default for EventBus {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use uuid::Uuid;
 
     #[tokio::test]
     async fn test_event_bus_publish_subscribe() {

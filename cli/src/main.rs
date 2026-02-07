@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! # AEGIS Agent Host CLI
 //!
 //! The `aegis` binary is the Agent Host that enables an Agent Node.
