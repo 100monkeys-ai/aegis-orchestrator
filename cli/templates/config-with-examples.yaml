@@ -8,10 +8,13 @@
 node:
   # Unique identifier for this node (required)
   # Generate with: uuidgen (Linux/Mac) or [guid]::NewGuid() (PowerShell)
-  node_id: "550e8400-e29b-41d4-a716-446655440000"
+  id: "550e8400-e29b-41d4-a716-446655440000"
   
   # Human-readable node name (required)
   name: "my-aegis-node"
+  
+  # Node type (edge, orchestrator, hybrid)
+  type: "edge"
   
   # Optional: Geographic region for multi-region deployments
   region: "us-west-2"
@@ -80,11 +83,11 @@ llm_providers:
 # ============================================================================
 llm_selection:
   # Strategy for choosing provider when multiple options available:
-  # - PreferLocal: Use local Ollama if available, else cloud
-  # - PreferCloud: Use cloud providers first
-  # - CostOptimized: Choose cheapest option for task
-  # - LatencyOptimized: Choose fastest responding provider
-  strategy: "PreferLocal"
+  # - prefer-local: Use local Ollama if available, else cloud
+  # - prefer-cloud: Use cloud providers first
+  # - cost-optimized: Choose cheapest option for task
+  # - latency-optimized: Choose fastest responding provider
+  strategy: "prefer-local"
   
   # Default provider name to use
   default_provider: "local"
@@ -108,7 +111,7 @@ network:
   # api_key: "env:AEGIS_API_KEY"
   
   # Optional: Heartbeat interval (seconds)
-  # heartbeat_interval: 30
+  # heartbeat_interval_seconds: 30
   
   # Optional: Proxy configuration
   # http_proxy: "http://proxy.example.com:8080"
@@ -119,17 +122,19 @@ network:
 # Observability
 # ============================================================================
 observability:
-  # Log level: trace, debug, info, warn, error
-  log_level: "info"
+  logging:
+    # Log level: trace, debug, info, warn, error
+    level: "info"
+    # Output format: text or json
+    format: "text"
   
-  # Enable structured JSON logging
-  json_logging: false
+  metrics:
+    # Enable Prometheus metrics endpoint (/metrics)
+    enabled: true
   
-  # Enable Prometheus metrics endpoint (/metrics)
-  metrics_enabled: true
-  
-  # Enable distributed tracing
-  traces_enabled: false
+  tracing:
+    # Enable distributed tracing
+    enabled: false
   
   # Optional: OpenTelemetry exporter endpoint
   # otel_endpoint: "http://localhost:4317"

@@ -8,7 +8,6 @@
 // - Network and observability settings
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Complete node configuration matching NODE_CONFIGURATION_SPEC.md
@@ -56,7 +55,7 @@ pub struct NodeIdentity {
     pub resources: Option<NodeResources>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NodeType {
     Edge,

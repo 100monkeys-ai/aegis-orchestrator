@@ -5,7 +5,6 @@ use crate::domain::repository::{AgentRepository, ExecutionRepository, Repository
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use uuid::Uuid;
 
 /// In-memory implementation of AgentRepository
 /// Suitable for development and testing

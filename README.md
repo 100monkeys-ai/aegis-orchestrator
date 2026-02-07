@@ -56,9 +56,9 @@ HTTP/gRPC server built with Axum for:
 Command-line tool for local development:
 
 ```bash
-aegis run agent.yaml      # Run agent locally
-aegis deploy agent.yaml   # Deploy to cloud
-aegis logs <agent-id>     # View logs
+aegis task deploy agent.yaml      # Deploy agent
+aegis task execute <agent-id>     # Execute task
+aegis task logs <execution-id>    # View logs
 ```
 
 ### Edge Node (`edge-node/`)
@@ -93,7 +93,7 @@ cargo install --path cli
 cargo run --bin aegis-orchestrator
 
 # In another terminal, run an agent
-aegis run examples/email-summarizer/agent.yaml
+aegis task deploy examples/email-summarizer/agent.yaml
 ```
 
 ## Development

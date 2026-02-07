@@ -23,3 +23,5 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+aegis-config.yaml
+agent.yaml

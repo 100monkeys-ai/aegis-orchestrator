@@ -1,9 +1,9 @@
 use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
-use crate::domain::agent::{AgentId, Agent};
+use crate::domain::agent::AgentId;
 use crate::domain::supervisor::Supervisor;
-use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeConfig};
+use crate::domain::runtime::AgentRuntime;
 use crate::application::agent::AgentLifecycleService;
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -97,7 +97,7 @@ impl ExecutionService for StandardExecutionService {
             match supervisor.run_loop(&instance_id, exec_input).await {
                 Ok(_) => {
                     // Update to completed
-                    if let Ok(mut exec_opt) = repository.find_by_id(execution_id).await {
+                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                         if let Some(mut exec) = exec_opt {
                              exec.complete();
                              let _ = repository.save(exec).await;
@@ -107,7 +107,7 @@ impl ExecutionService for StandardExecutionService {
                 },
                 Err(_) => {
                     // Update to failed
-                    if let Ok(mut exec_opt) = repository.find_by_id(execution_id).await {
+                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                          if let Some(mut exec) = exec_opt {
                               exec.fail();
                               let _ = repository.save(exec).await;

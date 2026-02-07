@@ -20,7 +20,7 @@ use aegis_core::{
     },
     domain::{
         node_config::NodeConfig,
-        agent::{AgentId, AgentManifest},
+        agent::AgentId,
         execution::ExecutionId,
         execution::ExecutionInput,
         supervisor::Supervisor,

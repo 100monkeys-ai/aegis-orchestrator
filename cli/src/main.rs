@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
-use tracing::{error, info};
+use tracing::info;
 
 mod commands;
 mod daemon;

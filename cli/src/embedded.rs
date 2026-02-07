@@ -5,7 +5,6 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
-use uuid::Uuid;
 
 use aegis_core::{
     application::{

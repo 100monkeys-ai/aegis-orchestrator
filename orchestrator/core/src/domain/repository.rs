@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
-use uuid::Uuid;
 
 /// Storage backend enum for pluggable persistence
 #[derive(Debug, Clone)]

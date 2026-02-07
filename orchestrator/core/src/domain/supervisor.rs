@@ -1,9 +1,8 @@
-use crate::domain::execution::{ExecutionInput, Iteration, ValidationResults, SystemValidationResult, OutputValidationResult, SemanticValidationResult};
-use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError, RuntimeConfig};
+use crate::domain::execution::ExecutionInput;
+use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError};
 use crate::domain::judge::EvaluationEngine;
 use std::sync::Arc;
-use tokio::time::Duration;
-use tracing::{info, warn, error};
+use tracing::{info, warn};
 
 pub struct Supervisor {
     runtime: Arc<dyn AgentRuntime>,

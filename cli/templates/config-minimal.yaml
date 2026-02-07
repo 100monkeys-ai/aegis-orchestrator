@@ -4,7 +4,8 @@
 # Refer to config-with-examples.yaml for full documentation.
 
 node:
-  node_id: "change-me-to-unique-id"
+  id: "change-me-to-unique-id"
+  type: "edge"
   name: "my-aegis-node"
   # region: "us-west-2"  # Optional
   # tags: ["development"]  # Optional
@@ -17,21 +18,26 @@ llm_providers:
       - alias: "default"
         model: "llama3.2:latest"
         capabilities: ["code", "reasoning"]
+        context_window: 8192
       - alias: "fast"
         model: "qwen2.5-coder:7b"
         capabilities: ["code"]
+        context_window: 4096
 
 llm_selection:
-  strategy: "PreferLocal"
+  strategy: "prefer-local"
   default_provider: "local"
   max_retries: 3
   retry_delay_ms: 1000
 
 network:
   # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
-  # api_key: "env:AEGIS_API_KEY"  # Optional
+  # heartbeat_interval_seconds: 30  # Optional
 
 observability:
-  log_level: "info"
-  # metrics_enabled: true  # Optional
-  # traces_enabled: false  # Optional
+  logging:
+    level: "info"
+  # metrics:
+  #   enabled: true
+  # tracing:
+  #   enabled: false
