@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 use std::path::PathBuf;
@@ -10,6 +10,13 @@ use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
 pub enum AgentCommand {
     /// List deployed agents
     List,
+
+    /// Deploy an agent from manifest file
+    Deploy {
+        /// Path to agent manifest YAML file
+        #[arg(value_name = "MANIFEST")]
+        manifest: PathBuf,
+    },
 
     /// Show agent configuration (YAML)
     Show {
@@ -54,6 +61,7 @@ pub async fn handle_command(
 
     match command {
         AgentCommand::List => list_agents(client).await,
+        AgentCommand::Deploy { manifest } => deploy_agent(manifest, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
     }
@@ -99,5 +107,21 @@ async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
         "{}",
         format!("✓ Agent {} removed", agent_id).green()
     );
+    Ok(())
+}
+
+async fn deploy_agent(manifest: PathBuf, client: DaemonClient) -> Result<()> {
+    let manifest_content = std::fs::read_to_string(&manifest)
+        .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
+
+    let agent_manifest: aegis_sdk::manifest::AgentManifest =
+        serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
+
+    println!("Deploying agent: {}", agent_manifest.agent.name.bold());
+
+    let agent_id = client.deploy_agent(agent_manifest).await?;
+
+    println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
+
     Ok(())
 }

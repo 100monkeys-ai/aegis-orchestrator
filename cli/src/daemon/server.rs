@@ -6,8 +6,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
     http::StatusCode,
-    response::IntoResponse,
+    response::{IntoResponse, sse::{Event, Sse}},
 };
+use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -119,7 +120,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             "/api/executions/:execution_id/cancel",
             post(cancel_execution_handler),
         )
-        // .route("/api/executions/:execution_id/events", get(stream_events_handler)) // TODO: SSE
+        .route("/api/executions/:execution_id/events", get(stream_events_handler))
         .route("/api/executions", get(list_executions_handler))
         .route("/api/executions/:execution_id", axum::routing::delete(delete_execution_handler))
         .route("/api/agents", post(deploy_agent_handler).get(list_agents_handler))
@@ -281,6 +282,84 @@ async fn cancel_execution_handler(
         Ok(_) => Json(serde_json::json!({"success": true})),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
+}
+
+async fn stream_events_handler(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<Uuid>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let _follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
+    
+    // Subscribe to events using the filtered subscriber
+    let mut receiver = state.event_bus.subscribe_execution(aegis_core::domain::execution::ExecutionId(execution_id));
+    
+    let stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    // Convert domain event to SSE event
+                    let json = match event {
+                        aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
+                            serde_json::json!({
+                                "event_type": "ExecutionStarted",
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": {}
+                            })
+                        },
+                        aegis_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
+                            serde_json::json!({
+                                "event_type": "IterationStarted",
+                                "iteration_number": iteration_number,
+                                "action": action, 
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": { "action": action }
+                            })
+                        },
+                         aegis_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
+                            serde_json::json!({
+                                "event_type": "IterationCompleted",
+                                "iteration_number": iteration_number,
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": { "output": output }
+                            })
+                        },
+                        aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                            serde_json::json!({
+                                "event_type": "ExecutionCompleted",
+                                "total_iterations": 0, 
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": { "result": final_output }
+                            })
+                        },
+                         aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
+                            serde_json::json!({
+                                "event_type": "ExecutionFailed",
+                                "reason": reason,
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": { "error": reason }
+                            })
+                        },
+                        _ => {
+                             serde_json::json!({
+                                "event_type": "Unknown",
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "data": {}
+                            })
+                        }
+                    };
+                    
+                    yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
+                }
+                Err(_) => {
+                    // Stream closed or lagged
+                    break;
+                }
+            }
+        }
+    };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
 async fn delete_execution_handler(

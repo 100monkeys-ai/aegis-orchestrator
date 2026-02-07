@@ -7,6 +7,7 @@ use bollard::container::{
     Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions,
     LogOutput
 };
+use bollard::image::CreateImageOptions;
 use bollard::exec::{CreateExecOptions, StartExecResults, StartExecOptions};
 use futures::StreamExt;
 use tracing::info;
@@ -35,7 +36,21 @@ impl AgentRuntime for DockerRuntime {
         let image = config.image.clone();
         
         // Ensure image exists (pull if needed)
-        // TODO: Add pull logic
+        if self.docker.inspect_image(&image).await.is_err() {
+            info!("Pulling image: {}", image);
+            let options = Some(CreateImageOptions {
+                from_image: image.clone(),
+                ..Default::default()
+            });
+
+            let mut stream = self.docker.create_image(options, None, None);
+            while let Some(result) = stream.next().await {
+                if let Err(e) = result {
+                    return Err(RuntimeError::SpawnFailed(format!("Failed to pull image {}: {}", image, e)));
+                }
+            }
+            info!("Successfully pulled image: {}", image);
+        }
         
         let container_config = Config {
             image: Some(image),

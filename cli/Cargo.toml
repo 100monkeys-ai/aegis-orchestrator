@@ -17,6 +17,8 @@ indicatif = "0.17"
 # Async runtime
 tokio = { workspace = true }
 tokio-stream = "0.1"
+futures = "0.3"
+async-stream = "0.3"
 
 # HTTP client for daemon delegation
 reqwest = { version = "0.12", features = ["json", "stream"] }

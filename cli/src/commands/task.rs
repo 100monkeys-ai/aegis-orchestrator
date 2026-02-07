@@ -17,11 +17,7 @@ use crate::embedded::EmbeddedExecutor;
 #[derive(Subcommand)]
 pub enum TaskCommand {
     /// Deploy an agent from manifest file
-    Deploy {
-        /// Path to agent manifest YAML file
-        #[arg(value_name = "MANIFEST")]
-        manifest: PathBuf,
-    },
+
 
     /// Execute an agent task
     Execute {
@@ -131,7 +127,7 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
     // Assuming DaemonClient methods define Uuid, I'll pass Uuid.
     
     match command {
-        TaskCommand::Deploy { manifest } => deploy_daemon(manifest, client).await,
+
         TaskCommand::Execute {
             agent,
             input,
@@ -155,7 +151,7 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
 
 async fn handle_command_embedded(command: TaskCommand, executor: EmbeddedExecutor) -> Result<()> {
     match command {
-        TaskCommand::Deploy { manifest } => deploy_embedded(manifest, executor).await,
+
         TaskCommand::Execute {
             agent,
             input,
@@ -178,22 +174,6 @@ async fn handle_command_embedded(command: TaskCommand, executor: EmbeddedExecuto
 }
 
 // Daemon mode implementations
-async fn deploy_daemon(manifest: PathBuf, client: DaemonClient) -> Result<()> {
-    let manifest_content = std::fs::read_to_string(&manifest)
-        .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
-
-    let agent_manifest: aegis_sdk::manifest::AgentManifest =
-        serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
-
-    println!("Deploying agent: {}", agent_manifest.agent.name.bold());
-
-    let agent_id = client.deploy_agent(agent_manifest).await?;
-
-    println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
-
-    Ok(())
-}
-
 async fn execute_daemon(
     agent: String,
     input: Option<String>,
@@ -295,22 +275,6 @@ async fn list_daemon(agent_id: Option<Uuid>, limit: usize, client: DaemonClient)
 }
 
 // Embedded mode implementations
-async fn deploy_embedded(manifest: PathBuf, executor: EmbeddedExecutor) -> Result<()> {
-    let manifest_content = std::fs::read_to_string(&manifest)
-        .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
-
-    let agent_manifest: aegis_sdk::manifest::AgentManifest =
-        serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
-
-    println!("Deploying agent: {}", agent_manifest.agent.name.bold());
-
-    let agent_id = executor.deploy_agent(agent_manifest).await?;
-
-    println!("{}", format!("✓ Agent deployed: {}", agent_id.0).green());
-
-    Ok(())
-}
-
 async fn execute_embedded(
     agent: String,
     input: Option<String>,
