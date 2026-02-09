@@ -56,7 +56,7 @@ impl EmbeddedExecutor {
                 .context("Failed to initialize LLM providers")?,
         );
         let runtime = Arc::new(
-            DockerRuntime::new()
+            DockerRuntime::new(config.runtime.bootstrap_script.clone())
                 .context("Failed to initialize Docker runtime")?
         );
         let judge = Arc::new(BasicJudge);

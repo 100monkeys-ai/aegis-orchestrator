@@ -93,7 +93,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Initializing Docker runtime...");
     // Force a timeout on docker connection if possible, or just log before/after
     let runtime = Arc::new(
-        DockerRuntime::new()
+        DockerRuntime::new(config.runtime.bootstrap_script.clone())
             .context("Failed to initialize Docker runtime")?
     );
     println!("Docker runtime initialized.");

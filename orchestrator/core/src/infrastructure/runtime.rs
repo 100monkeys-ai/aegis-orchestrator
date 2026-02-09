@@ -17,13 +17,14 @@ use tracing::info;
 
 pub struct DockerRuntime {
     docker: Docker,
+    bootstrap_script: String,
 }
 
 impl DockerRuntime {
-    pub fn new() -> Result<Self, RuntimeError> {
+    pub fn new(bootstrap_script: String) -> Result<Self, RuntimeError> {
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to connect to Docker: {}", e)))?;
-        Ok(Self { docker })
+        Ok(Self { docker, bootstrap_script })
     }
 
     async fn get_container_stats(&self, _id: &str) -> Option<(f64, u64, u64)> {
@@ -69,7 +70,8 @@ impl AgentRuntime for DockerRuntime {
 
         let host_config = bollard::service::HostConfig {
             binds: Some(vec![
-                format!("{}:/usr/local/bin/aegis-bootstrap", std::env::current_dir().unwrap().join("assets/bootstrap.py").to_str().unwrap()),
+                format!("{}:/usr/local/bin/aegis-bootstrap", 
+                    std::env::current_dir().unwrap().join(&self.bootstrap_script).to_str().unwrap()),
             ]),
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
