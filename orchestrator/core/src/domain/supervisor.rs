@@ -115,7 +115,7 @@ impl Supervisor {
             }
 
             // Evaluate
-            let valid_res = self.judge.evaluate(&stdout, 0, &stderr).await
+            let valid_res = self.judge.evaluate(&stdout, output.exit_code, &stderr).await
                 .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
             if valid_res.success {

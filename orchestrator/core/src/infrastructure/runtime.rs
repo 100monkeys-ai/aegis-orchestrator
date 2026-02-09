@@ -160,12 +160,19 @@ impl AgentRuntime for DockerRuntime {
             _ => {}
         }
 
+        // Get exit code from exec
+        let exec_inspect = self.docker.inspect_exec(&exec.id).await
+            .map_err(|e| RuntimeError::ExecutionFailed(format!("Failed to inspect exec: {}", e)))?;
+        
+        let exit_code = exec_inspect.exit_code.unwrap_or(0);
+
         let result = serde_json::Value::String(stdout_logs.join(""));
         
         Ok(TaskOutput {
             result,
             logs: stderr_logs,
             tool_calls: vec![],
+            exit_code,
         })
     }
 

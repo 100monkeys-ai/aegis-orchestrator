@@ -39,6 +39,7 @@ pub struct TaskOutput {
     pub result: serde_json::Value,
     pub logs: Vec<String>,
     pub tool_calls: Vec<ToolCall>,
+    pub exit_code: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
