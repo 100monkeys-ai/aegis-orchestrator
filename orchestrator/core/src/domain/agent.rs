@@ -97,6 +97,8 @@ pub struct TaskConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub input_data: Option<serde_json::Value>,
 }
 

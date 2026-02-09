@@ -19,7 +19,6 @@ use aegis_core::{
         agent::AgentId,
         execution::{ExecutionInput, ExecutionId},
         supervisor::Supervisor,
-        judge::BasicJudge,
     },
     infrastructure::{
         event_bus::EventBus,
@@ -59,8 +58,7 @@ impl EmbeddedExecutor {
             DockerRuntime::new(config.runtime.bootstrap_script.clone())
                 .context("Failed to initialize Docker runtime")?
         );
-        let judge = Arc::new(BasicJudge);
-        let supervisor = Arc::new(Supervisor::new(runtime.clone(), judge));
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
         let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
         let execution_service = Arc::new(StandardExecutionService::new(
@@ -69,6 +67,7 @@ impl EmbeddedExecutor {
             execution_repo.clone(),
             event_bus.clone(),
             Arc::new(config.clone()),
+            llm_registry.clone(),
         ));
 
         Ok(Self {

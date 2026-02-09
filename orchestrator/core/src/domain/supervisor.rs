@@ -23,14 +23,12 @@ pub trait SupervisorObserver: Send + Sync {
 
 pub struct Supervisor {
     runtime: Arc<dyn AgentRuntime>,
-    judge: Arc<dyn EvaluationEngine>,
 }
 
 impl Supervisor {
-    pub fn new(runtime: Arc<dyn AgentRuntime>, judge: Arc<dyn EvaluationEngine>) -> Self {
+    pub fn new(runtime: Arc<dyn AgentRuntime>) -> Self {
         Self {
             runtime,
-            judge,
         }
     }
 
@@ -44,12 +42,14 @@ impl Supervisor {
     /// * `runtime_config` - Configuration for spawning runtime instances
     /// * `input` - Execution input with intent/payload
     /// * `max_retries` - Maximum number of iteration attempts (from manifest)
+    /// * `judge` - Evaluation engine for validating iteration outputs
     /// * `observer` - Observer for iteration lifecycle events
     pub async fn run_loop(
         &self, 
         runtime_config: RuntimeConfig, 
         input: ExecutionInput,
         max_retries: u32,
+        judge: Arc<dyn EvaluationEngine>,
         observer: Arc<dyn SupervisorObserver>
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
@@ -140,7 +140,7 @@ impl Supervisor {
             }
 
             // Evaluate
-            let valid_res = self.judge.evaluate(&stdout, output.exit_code, &stderr).await
+            let valid_res = judge.evaluate(&stdout, output.exit_code, &stderr).await
                 .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
             if valid_res.success {

@@ -29,7 +29,6 @@ use aegis_core::{
         execution::ExecutionId,
         execution::ExecutionInput,
         supervisor::Supervisor,
-        judge::BasicJudge,
     },
     infrastructure::{
         event_bus::EventBus,
@@ -98,8 +97,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
     println!("Docker runtime initialized.");
 
-    let judge = Arc::new(BasicJudge);
-    let supervisor = Arc::new(Supervisor::new(runtime.clone(), judge));
+    let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(
@@ -108,6 +106,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_repo.clone(),
         event_bus.clone(),
         Arc::new(config.clone()),
+        llm_registry.clone(),
     ));
 
     let app_state = AppState {

@@ -8,6 +8,7 @@
 
 use crate::domain::llm::{GenerationOptions, GenerationResponse, LLMError, LLMProvider};
 use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfig};
+use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tracing::{info, warn};
@@ -262,5 +263,38 @@ mod tests {
         let registry = ProviderRegistry::from_config(&config).unwrap();
         assert!(registry.has_alias("default"));
         assert_eq!(registry.available_aliases().len(), 1);
+    }
+}
+
+// Implement domain LLMProvider trait for infrastructure ProviderRegistry
+// This allows the infrastructure to be used through domain interfaces
+#[async_trait]
+impl LLMProvider for ProviderRegistry {
+    async fn generate(
+        &self,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<GenerationResponse, LLMError> {
+        // Use the default provider alias for domain-level calls
+        // The registry's generate() method requires an alias for routing
+        let alias = "default";
+        
+        // Call the registry's generate method with the default alias
+        self.generate(alias, prompt, options).await
+    }
+
+    async fn health_check(&self) -> Result<(), LLMError> {
+        // Check if default alias exists and its provider is healthy
+        let (provider_name, _) = self
+            .alias_map
+            .get("default")
+            .ok_or_else(|| LLMError::Provider("Default model alias not configured".into()))?;
+
+        let provider = self
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
+
+        provider.health_check().await
     }
 }

@@ -34,6 +34,7 @@ pub struct StandardExecutionService {
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
     config: Arc<crate::domain::node_config::NodeConfig>,
+    llm_provider: Arc<dyn crate::domain::llm::LLMProvider>,
 }
 
 impl StandardExecutionService {
@@ -43,6 +44,7 @@ impl StandardExecutionService {
         repository: Arc<dyn ExecutionRepository>,
         event_bus: Arc<EventBus>,
         config: Arc<crate::domain::node_config::NodeConfig>,
+        llm_provider: Arc<dyn crate::domain::llm::LLMProvider>,
     ) -> Self {
         Self {
             agent_service,
@@ -50,6 +52,7 @@ impl StandardExecutionService {
             repository,
             event_bus,
             config,
+            llm_provider,
         }
     }
 }
@@ -192,6 +195,10 @@ impl ExecutionService for StandardExecutionService {
              if let Some(instr) = &task_spec.instruction {
                  env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
              }
+             // Inject prompt template if specified
+             if let Some(prompt_tpl) = &task_spec.prompt_template {
+                 env.insert("AEGIS_PROMPT_TEMPLATE".to_string(), prompt_tpl.clone());
+             }
         }
         // Fallback to description if not set above (or overwrite if desired, logic depends on precedence)
         // If instruction is missing, we try description
@@ -230,6 +237,17 @@ impl ExecutionService for StandardExecutionService {
         let event_bus = self.event_bus.clone();
         let exec_input = input.clone();
         
+        // Build judge from manifest configuration
+        let semantic_config = agent.manifest.execution
+            .as_ref()
+            .and_then(|e| e.validation.as_ref())
+            .and_then(|v| v.semantic.as_ref());
+        
+        let judge = crate::domain::judge::build_judge_from_manifest(
+            semantic_config,
+            self.llm_provider.clone(),
+        );
+        
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
             agent_id,
@@ -238,7 +256,7 @@ impl ExecutionService for StandardExecutionService {
         });
 
         tokio::spawn(async move {
-            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, monitor).await {
+            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, judge, monitor).await {
                 Ok(final_output) => {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
