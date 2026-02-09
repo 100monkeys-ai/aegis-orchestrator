@@ -53,19 +53,29 @@ impl Supervisor {
         observer: Arc<dyn SupervisorObserver>
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
-        let mut prompt = input.intent.clone().unwrap_or_default();
+        let original_intent = input.intent.clone().unwrap_or_default();
         // TODO: Handle payload merge into context if needed
+        
+        // Track iteration history for context in subsequent attempts
+        let mut iteration_history: Vec<serde_json::Value> = Vec::new();
 
         while attempts < max_retries {
             attempts += 1;
             info!("Starting iteration {}/{}", attempts, max_retries);
-            observer.on_iteration_start(attempts as u8, &prompt).await;
+            observer.on_iteration_start(attempts as u8, &original_intent).await;
 
             // SPAWN FRESH INSTANCE for this iteration
             info!("Spawning fresh runtime instance for iteration {}", attempts);
             
             let mut current_config = runtime_config.clone();
             current_config.env.insert("AEGIS_ITERATION".to_string(), attempts.to_string());
+            
+            // Inject iteration history as JSON for bootstrap.py to use
+            if !iteration_history.is_empty() {
+                let history_json = serde_json::to_string(&iteration_history)
+                    .unwrap_or_else(|_| "[]".to_string());
+                current_config.env.insert("AEGIS_ITERATION_HISTORY".to_string(), history_json);
+            }
             
             let instance_id = match self.runtime.spawn(current_config).await {
                 Ok(id) => {
@@ -76,12 +86,19 @@ impl Supervisor {
                     let error_msg = format!("Failed to spawn instance: {}", e);
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
+                    
+                    // Record spawn failure in history
+                    iteration_history.push(serde_json::json!({
+                        "iteration": attempts,
+                        "error": error_msg
+                    }));
+                    
                     continue; // Try next iteration
                 }
             };
 
             let task_input = TaskInput {
-                prompt: prompt.clone(),
+                prompt: original_intent.clone(),
                 context: std::collections::HashMap::new(),
             };
 
@@ -104,14 +121,18 @@ impl Supervisor {
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
                     
-                    // Refine prompt for next iteration
-                    prompt = format!("Previous attempt failed with error: {}\\nPlease fix and retry.\\nOriginal Request: {}", error_msg, prompt);
+                    // Record execution failure in history
+                    iteration_history.push(serde_json::json!({
+                        "iteration": attempts,
+                        "error": error_msg
+                    }));
+                    
                     continue;
                 }
             };
 
             let stdout = output.result.to_string(); 
-            let stderr = output.logs.join("\\n");
+            let stderr = output.logs.join("\n");
             
             observer.on_console_output(attempts as u8, "stdout", &stdout).await;
             if !stderr.is_empty() {
@@ -133,12 +154,19 @@ impl Supervisor {
             let error_msg = format!("{:?}", valid_res.errors);
             observer.on_iteration_fail(attempts as u8, &error_msg).await;
             
-            // Refine prompt for next iteration
-            if let Some(feedback) = valid_res.feedback {
-                prompt = format!("Previous attempt failed with errors: {:?}\\nFeedback: {}\\nPlease fix the code and retry.\\nOriginal Request: {}", valid_res.errors, feedback, prompt);
-            } else {
-                prompt = format!("Previous attempt failed with errors: {:?}\\nPlease fix and retry.\\nOriginal Request: {}", valid_res.errors, prompt);
+            // Record validation failure in history
+            let mut history_entry = serde_json::json!({
+                "iteration": attempts,
+                "output": stdout,
+                "error": valid_res.errors.join("; ")
+            });
+            
+            // Include feedback from judge if available
+            if let Some(ref feedback) = valid_res.feedback {
+                history_entry["feedback"] = serde_json::json!(feedback);
             }
+            
+            iteration_history.push(history_entry);
         }
 
         Err(RuntimeError::ExecutionFailed("Max retries exceeded".to_string()))

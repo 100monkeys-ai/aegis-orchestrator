@@ -15,6 +15,16 @@ def main():
     iteration_env = os.environ.get("AEGIS_ITERATION")
     iteration_number = int(iteration_env) if iteration_env else None
     
+    # Prompt template from manifest (task.prompt_template)
+    # Default: "{agent_instruction}\n\nUser: {user_input}\nAssistant:"
+    prompt_template = os.environ.get(
+        "AEGIS_PROMPT_TEMPLATE",
+        "{agent_instruction}\n\nUser: {user_input}\nAssistant:"
+    )
+    
+    # Previous iteration history (JSON array of {iteration, output, error})
+    iteration_history_json = os.environ.get("AEGIS_ITERATION_HISTORY", "[]")
+    
     # 2. Read Input
     # Input is passed as the first argument or via stdin
     if len(sys.argv) > 1:
@@ -28,8 +38,40 @@ def main():
         sys.exit(1)
 
     # 3. Construct Prompt
-    # Simple concatenation for now. In future, we can support chat history.
-    prompt = f"{agent_instruction}\n\nUser: {user_input}\nAssistant:"
+    # Build iteration history context if this is a retry
+    history_context = ""
+    try:
+        iteration_history = json.loads(iteration_history_json)
+        if iteration_history:
+            history_context = "\n\n# Previous Attempts:\n"
+            for item in iteration_history:
+                iter_num = item.get("iteration", "?")
+                history_context += f"\n## Iteration {iter_num}:\n"
+                
+                if "output" in item and item["output"]:
+                    history_context += f"Output:\n{item['output']}\n"
+                
+                if "error" in item and item["error"]:
+                    history_context += f"Error:\n{item['error']}\n"
+                
+                if "feedback" in item and item["feedback"]:
+                    history_context += f"Feedback:\n{item['feedback']}\n"
+            
+            history_context += "\n# Current Attempt:\n"
+    except json.JSONDecodeError:
+        # If history is malformed, continue without it
+        pass
+    
+    # Append history to user_input for context
+    enhanced_input = user_input
+    if history_context:
+        enhanced_input = f"{history_context}{user_input}"
+    
+    # Use template from manifest (or default if not specified)
+    prompt = prompt_template.format(
+        agent_instruction=agent_instruction,
+        user_input=enhanced_input
+    )
 
     # 4. Call LLM Proxy with Failover
     payload = {
