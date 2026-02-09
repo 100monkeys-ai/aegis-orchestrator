@@ -123,6 +123,10 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
     
+    /// Custom prompt template with placeholders: {agent_instruction}, {user_input}
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_template: Option<String>,
+    
     /// Structured input parameters
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_data: Option<HashMap<String, Value>>,
