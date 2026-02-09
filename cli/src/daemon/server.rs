@@ -174,31 +174,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     Ok(())
 }
 
-#[cfg(unix)]
-fn daemonize_process() -> Result<()> {
-    // Kept for reference but unused in current flow
-    /*
-    use daemonize::Daemonize;
-
-    let stdout = std::fs::File::create("/tmp/aegis.out").unwrap();
-    let stderr = std::fs::File::create("/tmp/aegis.err").unwrap();
-
-    let daemon = Daemonize::new()
-        .working_directory("/tmp")
-        .umask(0o027)
-        .stdout(stdout)
-        .stderr(stderr)
-        .privileged_action(|| {
-            info!("Daemonizing process");
-        });
-
-    daemon
-        .start()
-        .context("Failed to daemonize process")?;
-    */
-    Ok(())
-}
-
 struct PidFileGuard;
 
 impl Drop for PidFileGuard {
