@@ -137,6 +137,28 @@ impl SupervisorObserver for ExecutionMonitor {
             failed_at: now,
         });
     }
+
+    async fn on_instance_spawned(&self, iteration: u8, instance_id: &crate::domain::runtime::InstanceId) {
+        let now = Utc::now();
+        self.event_bus.publish_execution_event(ExecutionEvent::InstanceSpawned {
+            execution_id: self.execution_id,
+            agent_id: self.agent_id,
+            iteration_number: iteration,
+            instance_id: instance_id.clone(),
+            spawned_at: now,
+        });
+    }
+
+    async fn on_instance_terminated(&self, iteration: u8, instance_id: &crate::domain::runtime::InstanceId) {
+        let now = Utc::now();
+        self.event_bus.publish_execution_event(ExecutionEvent::InstanceTerminated {
+            execution_id: self.execution_id,
+            agent_id: self.agent_id,
+            iteration_number: iteration,
+            instance_id: instance_id.clone(),
+            terminated_at: now,
+        });
+    }
 }
 
 #[async_trait]
@@ -199,31 +221,14 @@ impl ExecutionService for StandardExecutionService {
             autopull: agent.manifest.agent.autopull,
         };
 
-        let instance_id = match self.runtime.spawn(runtime_config).await {
-            Ok(id) => id,
-            Err(e) => {
-                let error_msg = format!("Failed to spawn runtime: {}", e);
-                execution.fail(error_msg.clone());
-                self.repository.save(&execution).await?;
-                
-                self.event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
-                    execution_id,
-                    agent_id,
-                    reason: error_msg.clone(),
-                    total_iterations: 0,
-                    failed_at: Utc::now(),
-                });
-
-                return Err(anyhow!(error_msg));
-            }
-        };
+        // NOTE: We no longer spawn the instance here.
+        // The Supervisor will spawn fresh instances per iteration.
 
         execution.start();
         self.repository.save(&execution).await?;
             
         // 5. Run Supervisor Loop
         let supervisor = self.supervisor.clone();
-        let runtime = self.runtime.clone();
         let repository = self.repository.clone();
         let event_bus = self.event_bus.clone();
         let exec_input = input.clone();
@@ -236,7 +241,7 @@ impl ExecutionService for StandardExecutionService {
         });
 
         tokio::spawn(async move {
-            match supervisor.run_loop(&instance_id, exec_input, monitor).await {
+            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, monitor).await {
                 Ok(final_output) => {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
@@ -254,7 +259,7 @@ impl ExecutionService for StandardExecutionService {
                              });
                         }
                     }
-                    let _ = runtime.terminate(&instance_id).await;
+                    // NOTE: No need to terminate instance here - Supervisor handles it
                 },
                 Err(e) => {
                     // Update to failed
@@ -273,7 +278,7 @@ impl ExecutionService for StandardExecutionService {
                              });
                          }
                      }
-                    let _ = runtime.terminate(&instance_id).await;
+                    // NOTE: No need to terminate instance here - Supervisor handles it
                 }
             }
         });

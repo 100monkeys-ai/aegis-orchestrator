@@ -281,6 +281,32 @@ fn print_event(event: &DomainEvent) {
                     response.chars().take(50).collect::<String>().replace('\n', " ")
                 );
             }
+            aegis_core::domain::events::ExecutionEvent::InstanceSpawned {
+                iteration_number,
+                instance_id,
+                ..
+            } => {
+                println!(
+                    "{} {} {} {}",
+                    "Iteration".yellow(),
+                    iteration_number,
+                    "spawned instance".cyan(),
+                    instance_id.as_str().chars().take(12).collect::<String>()
+                );
+            }
+            aegis_core::domain::events::ExecutionEvent::InstanceTerminated {
+                iteration_number,
+                instance_id,
+                ..
+            } => {
+                println!(
+                    "{} {} {} {}",
+                    "Iteration".yellow(),
+                    iteration_number,
+                    "terminated instance".dimmed(),
+                    instance_id.as_str().chars().take(12).collect::<String>()
+                );
+            }
         },
         DomainEvent::Policy(policy_event) => match policy_event {
             aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted {

@@ -178,6 +178,8 @@ impl ExecutionEventReceiver {
             ExecutionEvent::ExecutionCancelled { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::ConsoleOutput { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::InstanceSpawned { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::InstanceTerminated { execution_id, .. } => execution_id == &self.execution_id,
         }
     }
 }
@@ -227,6 +229,8 @@ impl AgentEventReceiver {
                 ExecutionEvent::ExecutionCancelled { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::ConsoleOutput { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Learning(_) => false, // TODO: Link learning to agent
             DomainEvent::Policy(_) => false, // TODO: Link policy to agent

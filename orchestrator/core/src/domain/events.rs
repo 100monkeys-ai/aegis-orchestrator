@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
 use crate::domain::agent::{AgentId, AgentManifest};
 use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
+use crate::domain::runtime::InstanceId;
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +114,20 @@ pub enum ExecutionEvent {
         prompt: String,
         response: String,
         timestamp: DateTime<Utc>,
+    },
+    InstanceSpawned {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        instance_id: InstanceId,
+        spawned_at: DateTime<Utc>,
+    },
+    InstanceTerminated {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        instance_id: InstanceId,
+        terminated_at: DateTime<Utc>,
     },
 }
 

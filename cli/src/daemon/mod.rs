@@ -12,7 +12,8 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
-use tracing::{info};
+use tokio::time::sleep;
+use tracing::{info, warn};
 
 pub mod client;
 #[cfg(unix)]
@@ -21,6 +22,11 @@ mod server;
 
 pub use client::DaemonClient;
 pub use server::start_daemon;
+
+#[cfg(unix)]
+const PID_FILE: &str = "/var/run/aegis/aegis.pid";
+#[cfg(unix)]
+const PID_FILE_FALLBACK: &str = "/tmp/aegis.pid";
 
 #[derive(Debug, Clone)]
 pub enum DaemonStatus {
@@ -78,7 +84,7 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
 }
 
 /// Stop the daemon gracefully
-pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
+pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
     let pid_file = get_pid_file_path();
 
     let pid = std::fs::read_to_string(&pid_file)
@@ -150,7 +156,7 @@ fn get_pid_file_path() -> PathBuf {
     }
 }
 
-fn process_exists(_pid: u32) -> bool {
+fn process_exists(pid: u32) -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::kill(pid as i32, 0) == 0 }
