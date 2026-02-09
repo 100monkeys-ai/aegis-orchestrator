@@ -103,7 +103,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(
-        runtime,
         agent_service.clone(),
         supervisor,
         execution_repo.clone(),

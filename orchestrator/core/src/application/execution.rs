@@ -6,7 +6,6 @@ use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
-use crate::domain::runtime::AgentRuntime;
 use crate::application::agent::AgentLifecycleService;
 use crate::infrastructure::event_bus::{EventBus, DomainEvent};
 use anyhow::{Result, anyhow};
@@ -29,7 +28,6 @@ pub trait ExecutionService: Send + Sync {
 }
 
 pub struct StandardExecutionService {
-    runtime: Arc<dyn AgentRuntime>,
     agent_service: Arc<dyn AgentLifecycleService>,
     supervisor: Arc<Supervisor>,
     repository: Arc<dyn ExecutionRepository>,
@@ -39,7 +37,6 @@ pub struct StandardExecutionService {
 
 impl StandardExecutionService {
     pub fn new(
-        runtime: Arc<dyn AgentRuntime>, 
         agent_service: Arc<dyn AgentLifecycleService>,
         supervisor: Arc<Supervisor>,
         repository: Arc<dyn ExecutionRepository>,
@@ -47,7 +44,6 @@ impl StandardExecutionService {
         config: Arc<crate::domain::node_config::NodeConfig>,
     ) -> Self {
         Self {
-            runtime,
             agent_service,
             supervisor,
             repository,

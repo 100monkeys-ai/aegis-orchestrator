@@ -64,7 +64,6 @@ impl EmbeddedExecutor {
 
         let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
         let execution_service = Arc::new(StandardExecutionService::new(
-            runtime,
             agent_service.clone(),
             supervisor,
             execution_repo.clone(),

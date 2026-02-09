@@ -254,6 +254,7 @@ mod tests {
                 }],
             }],
             llm_selection: LLMSelection::default(),
+            runtime: crate::domain::node_config::RuntimeConfig::default(),
             network: None,
             observability: None,
         };
