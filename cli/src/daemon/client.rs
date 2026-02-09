@@ -167,6 +167,7 @@ impl DaemonClient {
         execution_id: Uuid,
         follow: bool,
         errors_only: bool,
+        verbose: bool,
     ) -> Result<()> {
         let mut url = format!(
             "{}/api/executions/{}/events",
@@ -203,7 +204,7 @@ impl DaemonClient {
                         if errors_only && !is_error_event(&event) {
                             continue;
                         }
-                        print_event(&event, false);
+                        print_event(&event, verbose);
                     }
                 }
             }
@@ -408,26 +409,47 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
         "IterationStarted" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let action = event["action"].as_str().unwrap_or("");
-            println!(
-                "{} {} {} - {}",
-                format!("[{}]", timestamp).dimmed(),
-                "Iteration".yellow(),
-                iteration,
-                action
-            );
+            
+            if verbose {
+                let action = event["action"].as_str().unwrap_or("");
+                println!(
+                    "{} {} {} - {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    "Iteration".yellow(),
+                    iteration,
+                    action
+                );
+            } else {
+                println!(
+                    "{} {} {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    "Iteration".yellow(),
+                    iteration
+                );
+            }
         }
         "IterationCompleted" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
             let output = event["data"]["output"].as_str().unwrap_or("");
-            println!(
-                "{} {} {} {}\n{}",
-                format!("[{}]", timestamp).dimmed(),
-                "Iteration".yellow(),
-                iteration,
-                "completed".green(),
-                output.cyan()
-            );
+            
+            if verbose {
+                println!(
+                    "{} {} {} {}\n{}",
+                    format!("[{}]", timestamp).dimmed(),
+                    "Iteration".yellow(),
+                    iteration,
+                    "completed".green(),
+                    output.cyan()
+                );
+            } else {
+                println!(
+                    "{} {} {} {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    "Iteration".yellow(),
+                    iteration,
+                    "completed".green()
+                );
+            }
         }
         "IterationFailed" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
@@ -453,12 +475,14 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
         "LlmInteraction" => {
             let model = event["data"]["model"].as_str().unwrap_or("unknown");
-            let response = event["data"]["response"].as_str().unwrap_or("");
-            let prompt = event["data"]["prompt"].as_str().unwrap_or("");
             
             if verbose {
+                let response = event["data"]["response"].as_str().unwrap_or("");
+                let prompt = event["data"]["prompt"].as_str().unwrap_or("");
+                
                 println!(
-                    "{} [{}]",
+                    "{} {} [{}]",
+                    format!("[{}]", timestamp).dimmed(),
                     "LLM Interaction".purple().bold(),
                     model
                 );
@@ -468,13 +492,38 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
                 println!("{}", response);
                 println!("{}", "-".repeat(40).dimmed());
             } else {
+                // Show model interaction indicator without response content
                 println!(
-                    "{} [{}] -> {}...",
+                    "{} {} [{}]",
+                    format!("[{}]", timestamp).dimmed(),
                     "LLM".purple(),
-                    model,
-                    response.chars().take(50).collect::<String>().replace('\n', " ")
+                    model
                 );
             }
+        }
+        "ExecutionCompleted" => {
+            if verbose {
+                println!(
+                    "{} {} {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    event_type.cyan(),
+                    serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
+                );
+            } else {
+                println!(
+                    "{} {}",
+                    format!("[{}]", timestamp).dimmed(),
+                    "Execution completed".green().bold()
+                );
+            }
+        }
+        "ExecutionFailed" => {
+            println!(
+                "{} {} {}",
+                format!("[{}]", timestamp).dimmed(),
+                "Execution failed".red().bold(),
+                event["data"]["error"].as_str().or(event["reason"].as_str()).unwrap_or("Unknown error")
+            );
         }
         _ => {
             if event_type != "Unknown" {

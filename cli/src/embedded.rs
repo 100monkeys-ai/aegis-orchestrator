@@ -128,6 +128,7 @@ impl EmbeddedExecutor {
         execution_id: ExecutionId,
         follow: bool,
         errors_only: bool,
+        verbose: bool,
     ) -> Result<()> {
         use colored::Colorize;
         // use tokio_stream::StreamExt; // Removed unused import if not used
@@ -146,7 +147,7 @@ impl EmbeddedExecutor {
                         continue;
                     }
 
-                    print_event(&event);
+                    print_event(&event, verbose);
 
                     // Exit if not following and execution complete
                     if !follow && is_terminal_event(&event) {
@@ -199,7 +200,7 @@ fn is_terminal_event(event: &DomainEvent) -> bool {
     )
 }
 
-fn print_event(event: &DomainEvent) {
+fn print_event(event: &DomainEvent, verbose: bool) {
     use colored::Colorize;
 
     match event {
@@ -209,24 +210,45 @@ fn print_event(event: &DomainEvent) {
             }
             aegis_core::domain::events::ExecutionEvent::IterationStarted {
                 iteration_number,
+                action,
                 ..
             } => {
-                println!(
-                    "{} {}",
-                    "Iteration".yellow(),
-                    iteration_number,
-                );
+                if verbose {
+                    println!(
+                        "{} {} - {}",
+                        "Iteration".yellow(),
+                        iteration_number,
+                        action
+                    );
+                } else {
+                    println!(
+                        "{} {}",
+                        "Iteration".yellow(),
+                        iteration_number,
+                    );
+                }
             }
             aegis_core::domain::events::ExecutionEvent::IterationCompleted {
                 iteration_number,
+                output,
                 ..
             } => {
-                println!(
-                    "{} {} {}",
-                    "Iteration".yellow(),
-                    iteration_number,
-                    "completed".green()
-                );
+                if verbose {
+                    println!(
+                        "{} {} {}\n{}",
+                        "Iteration".yellow(),
+                        iteration_number,
+                        "completed".green(),
+                        output.cyan()
+                    );
+                } else {
+                    println!(
+                        "{} {} {}",
+                        "Iteration".yellow(),
+                        iteration_number,
+                        "completed".green()
+                    );
+                }
             }
             aegis_core::domain::events::ExecutionEvent::IterationFailed {
                 iteration_number,
@@ -254,13 +276,23 @@ fn print_event(event: &DomainEvent) {
             }
             aegis_core::domain::events::ExecutionEvent::ExecutionCompleted {
                 total_iterations,
+                final_output,
                 ..
             } => {
-                println!(
-                    "{} ({} iterations)",
-                    "Execution completed".bold().green(),
-                    total_iterations
-                );
+                if verbose {
+                    println!(
+                        "{} ({} iterations)\n{}",
+                        "Execution completed".bold().green(),
+                        total_iterations,
+                        final_output.cyan()
+                    );
+                } else {
+                    println!(
+                        "{} ({} iterations)",
+                        "Execution completed".bold().green(),
+                        total_iterations
+                    );
+                }
             }
             aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
                 println!("{} - {}", "Execution failed".bold().red(), reason);
@@ -269,16 +301,26 @@ fn print_event(event: &DomainEvent) {
                 println!("{}", "Execution cancelled".bold().yellow());
             }
             aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
-                let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
-                println!("{} {}", prefix, content.trim_end());
+                if verbose {
+                    let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
+                    println!("{} {}", prefix, content.trim_end());
+                }
             }
-            aegis_core::domain::events::ExecutionEvent::LlmInteraction { model, response, .. } => {
-                println!(
-                    "{} [{}] -> {}...",
-                    "LLM".purple(),
-                    model,
-                    response.chars().take(50).collect::<String>().replace('\n', " ")
-                );
+            aegis_core::domain::events::ExecutionEvent::LlmInteraction { model, prompt, response, .. } => {
+                if verbose {
+                    println!(
+                        "{} [{}]",
+                        "LLM Interaction".purple().bold(),
+                        model
+                    );
+                    println!("{}", "PROMPT:".dimmed());
+                    println!("{}", prompt);
+                    println!("{}", "RESPONSE:".dimmed());
+                    println!("{}", response);
+                    println!("{}", "-".repeat(40).dimmed());
+                } else {
+                    println!("{} [{}]", "LLM".purple(), model);
+                }
             }
             aegis_core::domain::events::ExecutionEvent::InstanceSpawned {
                 iteration_number,

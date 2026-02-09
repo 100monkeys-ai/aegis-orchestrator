@@ -61,6 +61,10 @@ pub enum TaskCommand {
         /// Only show errors
         #[arg(long)]
         errors_only: bool,
+
+        /// Show verbose output (e.g. LLM prompts)
+        #[arg(short, long)]
+        verbose: bool,
     },
 
     /// Cancel running execution
@@ -142,7 +146,8 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
             execution_id,
             follow,
             errors_only,
-        } => logs_daemon(execution_id, follow, errors_only, client).await,
+            verbose,
+        } => logs_daemon(execution_id, follow, errors_only, verbose, client).await,
         TaskCommand::Cancel {
             execution_id,
             force,
@@ -166,7 +171,8 @@ async fn handle_command_embedded(command: TaskCommand, executor: EmbeddedExecuto
             execution_id,
             follow,
             errors_only,
-        } => logs_embedded(execution_id, follow, errors_only, executor).await,
+            verbose,
+        } => logs_embedded(execution_id, follow, errors_only, verbose, executor).await,
         TaskCommand::Cancel {
             execution_id,
             force,
@@ -228,7 +234,7 @@ async fn execute_daemon(
     );
 
     if follow {
-        logs_daemon(execution_id, true, false, client).await?;
+        logs_daemon(execution_id, true, false, false, client).await?;
     } else if wait {
         // TODO: Poll status until completion
         println!("Waiting for completion...");
@@ -257,10 +263,11 @@ async fn logs_daemon(
     execution_id: Uuid,
     follow: bool,
     errors_only: bool,
+    verbose: bool,
     client: DaemonClient,
 ) -> Result<()> {
     client
-        .stream_logs(execution_id, follow, errors_only)
+        .stream_logs(execution_id, follow, errors_only, verbose)
         .await?;
     Ok(())
 }
@@ -337,7 +344,7 @@ async fn execute_embedded(
 
     if follow || wait {
         executor
-            .stream_logs(execution_id, follow, false)
+            .stream_logs(execution_id, follow, false, false)
             .await?;
     }
 
@@ -358,10 +365,11 @@ async fn logs_embedded(
     execution_id: Uuid,
     follow: bool,
     errors_only: bool,
+    verbose: bool,
     executor: EmbeddedExecutor,
 ) -> Result<()> {
     executor
-        .stream_logs(ExecutionId(execution_id), follow, errors_only)
+        .stream_logs(ExecutionId(execution_id), follow, errors_only, verbose)
         .await?;
     Ok(())
 }
