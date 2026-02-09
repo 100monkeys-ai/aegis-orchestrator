@@ -1,6 +1,6 @@
 [Unit]
 Description=AEGIS Agent Host Daemon
-Documentation=https://github.com/100monkeys-ai/aegis
+Documentation=https://github.com/100monkeys-ai/aegis-orchestrator
 After=network.target docker.service
 Wants=docker.service
 

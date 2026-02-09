@@ -84,7 +84,7 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
 }
 
 /// Stop the daemon gracefully
-pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
+pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
     let pid_file = get_pid_file_path();
 
     let pid = std::fs::read_to_string(&pid_file)
@@ -100,7 +100,7 @@ pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
         send_signal(pid, libc::SIGTERM)?;
 
         // Wait for graceful shutdown
-        for _ in 0..timeout_secs {
+        for _ in 0.._timeout_secs {
             if !process_exists(pid) {
                 info!("Daemon stopped gracefully");
                 let _ = std::fs::remove_file(&pid_file);
@@ -109,7 +109,7 @@ pub async fn stop_daemon(force: bool, timeout_secs: u64) -> Result<()> {
             sleep(Duration::from_secs(1)).await;
         }
 
-        if force {
+        if _force {
             warn!("Graceful shutdown timeout, sending SIGKILL");
             send_signal(pid, libc::SIGKILL)?;
             sleep(Duration::from_secs(1)).await;
@@ -156,10 +156,10 @@ fn get_pid_file_path() -> PathBuf {
     }
 }
 
-fn process_exists(pid: u32) -> bool {
+fn process_exists(_pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        unsafe { libc::kill(_pid as i32, 0) == 0 }
     }
 
     #[cfg(windows)]
