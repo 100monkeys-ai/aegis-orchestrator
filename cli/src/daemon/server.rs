@@ -323,6 +323,21 @@ async fn stream_events_handler(
                 });
                 yield Ok::<_, anyhow::Error>(Event::default().data(iter_start.to_string()));
 
+                // Replay LlmInteractions
+                for interaction in &iter.llm_interactions {
+                    let event = serde_json::json!({
+                        "event_type": "LlmInteraction",
+                        "timestamp": interaction.timestamp.to_rfc3339(),
+                        "data": {
+                            "model": interaction.model,
+                            "provider": interaction.provider,
+                            "prompt": interaction.prompt,
+                            "response": interaction.response
+                        }
+                    });
+                    yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
+                }
+
                 // Completion/Failure
                 if let Some(output) = &iter.output {
                      let iter_end = serde_json::json!({
@@ -517,6 +532,24 @@ async fn stream_agent_events_handler(
                         "data": { "action": iter.action }
                     });
                     yield Ok::<_, anyhow::Error>(Event::default().data(iter_start.to_string()));
+
+                    // Replay LlmInteractions
+                    for interaction in &iter.llm_interactions {
+                         let event = serde_json::json!({
+                            "event_type": "LlmInteraction",
+                            "execution_id": execution.id.0,
+                            "agent_id": execution.agent_id.0,
+                            "iteration_number": iter.number,
+                            "timestamp": interaction.timestamp.to_rfc3339(),
+                            "data": {
+                                "model": interaction.model,
+                                "provider": interaction.provider,
+                                "prompt": interaction.prompt,
+                                "response": interaction.response
+                            }
+                         });
+                         yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
+                    }
 
                     // Completion/Failure
                     if let Some(output) = &iter.output {
@@ -830,6 +863,20 @@ async fn llm_generate_handler(
                         timestamp: chrono::Utc::now(),
                     };
                     state.event_bus.publish_execution_event(event);
+                    
+                    // Persist interaction
+                    let interaction = aegis_core::domain::execution::LlmInteraction {
+                        provider: response.provider.clone(),
+                        model: response.model.clone(),
+                        prompt: req.prompt.clone(),
+                        response: response.text.clone(),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    let _ = state.execution_service.record_llm_interaction(
+                        aegis_core::domain::execution::ExecutionId(exec_id), 
+                        req.iteration_number.unwrap_or(0), 
+                        interaction
+                    ).await;
                 }
             }
             
@@ -862,6 +909,20 @@ async fn llm_generate_handler(
                         timestamp: chrono::Utc::now(),
                     };
                     state.event_bus.publish_execution_event(event);
+
+                    // Persist interaction
+                    let interaction = aegis_core::domain::execution::LlmInteraction {
+                        provider: "unknown".to_string(),
+                        model: alias.to_string(),
+                        prompt: req.prompt.clone(),
+                        response: format!("ERROR: {}", e),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    let _ = state.execution_service.record_llm_interaction(
+                        aegis_core::domain::execution::ExecutionId(exec_id), 
+                        req.iteration_number.unwrap_or(0), 
+                        interaction
+                    ).await;
                 }
             }
 

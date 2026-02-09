@@ -63,7 +63,11 @@ impl Supervisor {
 
             // SPAWN FRESH INSTANCE for this iteration
             info!("Spawning fresh runtime instance for iteration {}", attempts);
-            let instance_id = match self.runtime.spawn(runtime_config.clone()).await {
+            
+            let mut current_config = runtime_config.clone();
+            current_config.env.insert("AEGIS_ITERATION".to_string(), attempts.to_string());
+            
+            let instance_id = match self.runtime.spawn(current_config).await {
                 Ok(id) => {
                     observer.on_instance_spawned(attempts as u8, &id).await;
                     id

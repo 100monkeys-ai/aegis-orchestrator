@@ -25,6 +25,7 @@ pub trait ExecutionService: Send + Sync {
     async fn stream_agent_events(&self, id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
     async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>>;
     async fn delete_execution(&self, id: ExecutionId) -> Result<()>;
+    async fn record_llm_interaction(&self, execution_id: ExecutionId, iteration: u8, interaction: crate::domain::execution::LlmInteraction) -> Result<()>;
 }
 
 pub struct StandardExecutionService {
@@ -329,6 +330,17 @@ impl ExecutionService for StandardExecutionService {
 
     async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
         self.repository.delete(id).await?;
+        Ok(())
+    }
+
+    async fn record_llm_interaction(&self, execution_id: ExecutionId, iteration: u8, interaction: crate::domain::execution::LlmInteraction) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+            if let Err(e) = exec.add_llm_interaction(iteration, interaction) {
+                tracing::warn!("Failed to record LLM interaction for execution {} iteration {}: {}", execution_id.0, iteration, e);
+            } else {
+                self.repository.save(&exec).await?;
+            }
+        }
         Ok(())
     }
 }

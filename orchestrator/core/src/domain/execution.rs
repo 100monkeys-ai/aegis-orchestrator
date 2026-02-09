@@ -61,6 +61,17 @@ pub struct Iteration {
     pub code_changes: Option<CodeDiff>,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub llm_interactions: Vec<LlmInteraction>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LlmInteraction {
+    pub provider: String,
+    pub model: String,
+    pub prompt: String,
+    pub response: String,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,6 +128,8 @@ pub enum ExecutionError {
     MaxIterationsReached,
     #[error("Execution is not running")]
     NotRunning,
+    #[error("Iteration {0} not found")]
+    IterationNotFound(u8),
 }
 
 impl Execution {
@@ -138,6 +151,15 @@ impl Execution {
         self.status = ExecutionStatus::Running;
     }
 
+    pub fn add_llm_interaction(&mut self, iteration_number: u8, interaction: LlmInteraction) -> Result<(), ExecutionError> {
+        if let Some(iter) = self.iterations.iter_mut().find(|i| i.number == iteration_number) {
+            iter.llm_interactions.push(interaction);
+            Ok(())
+        } else {
+             Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
+
     pub fn iterations(&self) -> &[Iteration] {
         &self.iterations
     }
@@ -157,6 +179,7 @@ impl Execution {
             code_changes: None,
             started_at: Utc::now(),
             ended_at: None,
+            llm_interactions: Vec::new(),
         };
 
         self.iterations.push(iteration);

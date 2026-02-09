@@ -10,7 +10,10 @@ def main():
     orchestrator_url = os.environ.get("AEGIS_ORCHESTRATOR_URL", "http://host.docker.internal:8000")
     agent_instruction = os.environ.get("AEGIS_AGENT_INSTRUCTION", "You are a helpful assistant.")
     agent_id = os.environ.get("AEGIS_AGENT_ID", "unknown")
+    agent_id = os.environ.get("AEGIS_AGENT_ID", "unknown")
     execution_id = os.environ.get("AEGIS_EXECUTION_ID")
+    iteration_env = os.environ.get("AEGIS_ITERATION")
+    iteration_number = int(iteration_env) if iteration_env else None
     
     # 2. Read Input
     # Input is passed as the first argument or via stdin
@@ -42,6 +45,7 @@ def main():
     payload = {
         "prompt": prompt,
         "execution_id": execution_id,
+        "iteration_number": iteration_number,
         "model": "default"
     }
     
