@@ -48,6 +48,10 @@ pub enum AgentCommand {
         /// Show errors only
         #[arg(short, long)]
         errors: bool,
+
+        /// Show verbose output (e.g. LLM prompts)
+        #[arg(short, long)]
+        verbose: bool,
     },
 }
 
@@ -82,7 +86,7 @@ pub async fn handle_command(
         AgentCommand::Deploy { manifest } => deploy_agent(manifest, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
-        AgentCommand::Logs { agent_id, follow, errors } => logs_agent(agent_id, follow, errors, client).await,
+        AgentCommand::Logs { agent_id, follow, errors, verbose } => logs_agent(agent_id, follow, errors, verbose, client).await,
     }
 }
 
@@ -149,6 +153,7 @@ async fn logs_agent(
     agent_id_str: String,
     follow: bool,
     errors_only: bool,
+    verbose: bool,
     client: DaemonClient,
 ) -> Result<()> {
     // Resolve ID if it's a name
@@ -166,7 +171,7 @@ async fn logs_agent(
     };
 
     println!("{}", format!("Streaming logs for agent {}...", agent_id).dimmed());
-    client.stream_agent_logs(agent_id, follow, errors_only).await?;
+    client.stream_agent_logs(agent_id, follow, errors_only, verbose).await?;
 
     Ok(())
 }

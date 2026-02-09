@@ -6,7 +6,6 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
@@ -23,7 +22,8 @@ pub struct DaemonClient {
 impl DaemonClient {
     pub fn new(port: u16) -> Result<Self> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(30))
+            // No global timeout for CLI client as we need long-lived streams
+
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -172,7 +172,9 @@ impl DaemonClient {
             "{}/api/executions/{}/events",
             self.base_url, execution_id
         );
-        if !follow {
+        if follow {
+            url.push_str("?follow=true");
+        } else {
             url.push_str("?follow=false");
         }
 
@@ -201,7 +203,7 @@ impl DaemonClient {
                         if errors_only && !is_error_event(&event) {
                             continue;
                         }
-                        print_event(&event);
+                        print_event(&event, false);
                     }
                 }
             }
@@ -215,12 +217,15 @@ impl DaemonClient {
         agent_id: Uuid,
         follow: bool,
         errors_only: bool,
+        verbose: bool,
     ) -> Result<()> {
         let mut url = format!(
             "{}/api/agents/{}/events",
             self.base_url, agent_id
         );
-        if !follow {
+        if follow {
+            url.push_str("?follow=true");
+        } else {
             url.push_str("?follow=false");
         }
 
@@ -250,7 +255,7 @@ impl DaemonClient {
                         if errors_only && !is_error_event(&event) {
                             continue;
                         }
-                        print_event(&event);
+                        print_event(&event, verbose);
                     }
                 }
             }
@@ -387,7 +392,7 @@ fn is_error_event(event: &serde_json::Value) -> bool {
     )
 }
 
-fn print_event(event: &serde_json::Value) {
+fn print_event(event: &serde_json::Value, verbose: bool) {
     use colored::Colorize;
 
     let event_type = event["event_type"].as_str().unwrap_or("Unknown");
@@ -449,12 +454,27 @@ fn print_event(event: &serde_json::Value) {
         "LlmInteraction" => {
             let model = event["data"]["model"].as_str().unwrap_or("unknown");
             let response = event["data"]["response"].as_str().unwrap_or("");
-            println!(
-                "{} [{}] -> {}...",
-                "LLM".purple(),
-                model,
-                response.chars().take(50).collect::<String>().replace('\n', " ")
-            );
+            let prompt = event["data"]["prompt"].as_str().unwrap_or("");
+            
+            if verbose {
+                println!(
+                    "{} [{}]",
+                    "LLM Interaction".purple().bold(),
+                    model
+                );
+                println!("{}", "PROMPT:".dimmed());
+                println!("{}", prompt);
+                println!("{}", "RESPONSE:".dimmed());
+                println!("{}", response);
+                println!("{}", "-".repeat(40).dimmed());
+            } else {
+                println!(
+                    "{} [{}] -> {}...",
+                    "LLM".purple(),
+                    model,
+                    response.chars().take(50).collect::<String>().replace('\n', " ")
+                );
+            }
         }
         _ => {
             if event_type != "Unknown" {

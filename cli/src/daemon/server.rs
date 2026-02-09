@@ -799,28 +799,27 @@ async fn llm_generate_handler(
     };
     
     let registry = &state._llm_registry;
+
+    // Resolve agent_id for event logging
+    let agent_id = if let Some(exec_id) = req.execution_id {
+        let execution_id = aegis_core::domain::execution::ExecutionId(exec_id);
+        if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
+            exec.agent_id
+        } else {
+            tracing::warn!("Could not find execution {} for LLM event", exec_id);
+            aegis_core::domain::agent::AgentId(Uuid::nil())
+        }
+    } else {
+        aegis_core::domain::agent::AgentId(Uuid::nil())
+    };
     
     match registry.generate(alias, &req.prompt, &options).await {
         Ok(response) => {
-            if let Some(exec_id) = req.execution_id {
-                let execution_id = aegis_core::domain::execution::ExecutionId(exec_id);
-                // Try to fetch execution to get agent_id
-                let agent_id = if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
-                    exec.agent_id
-                } else {
-                    // Fallback or skip event? 
-                    // If we can't find execution, we can't really attribute it correctly.
-                    // But we might want to log it anyway. 
-                    // For now, let's use a zero/nil UUID if we must, or just skip.
-                    // Skipping seems safer to avoid misleading logs.
-                    tracing::warn!("Could not find execution {} for LLM event", exec_id);
-                    aegis_core::domain::agent::AgentId(Uuid::nil())
-                };
-
-                if agent_id.0 != Uuid::nil() {
-                     let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
-                        execution_id,
-                        agent_id,
+            if agent_id.0 != Uuid::nil() {
+                if let Some(exec_id) = req.execution_id {
+                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                        agent_id: agent_id.clone(),
                         iteration_number: req.iteration_number.unwrap_or(0),
                         provider: response.provider.clone(),
                         model: response.model.clone(),
@@ -847,7 +846,26 @@ async fn llm_generate_handler(
         },
         Err(e) => {
             tracing::error!("LLM generation failed: {}", e);
+
+            if agent_id.0 != Uuid::nil() {
+                if let Some(exec_id) = req.execution_id {
+                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                        agent_id: agent_id.clone(),
+                        iteration_number: req.iteration_number.unwrap_or(0),
+                        provider: "unknown".to_string(),
+                        model: alias.to_string(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        prompt: req.prompt.clone(),
+                        response: format!("ERROR: {}", e),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    state.event_bus.publish_execution_event(event);
+                }
+            }
+
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
-        },
+        }
     }
 }
