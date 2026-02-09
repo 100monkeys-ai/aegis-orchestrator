@@ -27,6 +27,10 @@ pub struct NodeConfig {
     #[serde(default)]
     pub llm_selection: LLMSelection,
     
+    /// Runtime configuration
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    
     /// Network configuration (for edge nodes)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network: Option<NetworkConfig>,
@@ -155,6 +159,22 @@ pub enum LLMSelectionStrategy {
     PreferCloud,
     CostOptimized,
     LatencyOptimized,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeConfig {
+    /// Path to bootstrap script for agent containers
+    /// Default: "assets/bootstrap.py" (relative to orchestrator binary)
+    #[serde(default = "default_bootstrap_script")]
+    pub bootstrap_script: String,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            bootstrap_script: default_bootstrap_script(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +343,7 @@ impl Default for NodeConfig {
             },
             llm_providers: vec![],
             llm_selection: LLMSelection::default(),
+            runtime: RuntimeConfig::default(),
             network: None,
             observability: None,
         }
@@ -505,6 +526,7 @@ mod tests {
                 },
             ],
             llm_selection: LLMSelection::default(),
+            runtime: RuntimeConfig::default(),
             network: None,
             observability: None,
         };
@@ -540,4 +562,8 @@ mod tests {
         });
         assert!(config.validate().is_err());
     }
+}
+
+fn default_bootstrap_script() -> String {
+    "assets/bootstrap.py".to_string()
 }
