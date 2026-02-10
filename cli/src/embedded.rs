@@ -350,6 +350,28 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     instance_id.as_str().chars().take(12).collect::<String>()
                 );
             }
+            aegis_core::domain::events::ExecutionEvent::Validation(val_event) => {
+                match val_event {
+                    aegis_core::domain::events::ValidationEvent::GradientValidationPerformed { score, confidence, .. } => {
+                        println!(
+                            "{} {} (score: {:.2}, conf: {:.2})",
+                            "Validation".magenta().bold(),
+                            "performed".cyan(),
+                            score,
+                            confidence
+                        );
+                    }
+                    aegis_core::domain::events::ValidationEvent::MultiJudgeConsensus { final_score, confidence, .. } => {
+                        println!(
+                            "{} {} (score: {:.2}, conf: {:.2})",
+                            "Validation".magenta().bold(),
+                            "consensus reached".green(),
+                            final_score,
+                            confidence
+                        );
+                    }
+                }
+            }
         },
         DomainEvent::Policy(policy_event) => match policy_event {
             aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted {

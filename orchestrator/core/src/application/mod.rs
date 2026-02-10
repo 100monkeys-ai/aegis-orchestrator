@@ -4,5 +4,7 @@
 pub mod lifecycle;
 pub mod agent;
 pub mod execution;
+pub mod validation_service;
+
 pub mod policy;
 pub mod workflow_engine;

@@ -26,3 +26,7 @@ Thumbs.db
 
 # Local config
 aegis-config.yaml
+
+# Working
+docs/PIVOT/*
+!docs/PIVOT/IMPLEMENTATION_PLAN.md

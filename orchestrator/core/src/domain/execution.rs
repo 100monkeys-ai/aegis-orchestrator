@@ -177,11 +177,15 @@ pub struct LlmInteraction {
     pub timestamp: DateTime<Utc>,
 }
 
+use crate::domain::validation::{GradientResult, MultiJudgeConsensus};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResults {
     pub system: Option<SystemValidationResult>,
     pub output: Option<OutputValidationResult>,
     pub semantic: Option<SemanticValidationResult>,
+    pub gradient: Option<GradientResult>,
+    pub consensus: Option<MultiJudgeConsensus>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -49,6 +49,8 @@ use crate::domain::agent::AgentId;
 use crate::domain::events::ExecutionEvent;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use crate::infrastructure::event_bus::EventBus;
+use crate::application::validation_service::ValidationService;
+use crate::application::execution::ExecutionService;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -56,6 +58,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{debug, info};
+use futures::StreamExt;
 
 // ============================================================================
 // Application Service: WorkflowEngine
@@ -77,6 +80,12 @@ pub struct WorkflowEngine {
     
     /// Event bus for publishing domain events
     event_bus: Arc<EventBus>,
+
+    /// Validation service for multi-judge consensus
+    validation_service: Arc<ValidationService>,
+
+    /// Execution service for running agents
+    execution_service: Arc<dyn ExecutionService>,
     
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
@@ -84,12 +93,18 @@ pub struct WorkflowEngine {
 
 impl WorkflowEngine {
     /// Create a new WorkflowEngine
-    pub fn new(event_bus: Arc<EventBus>) -> Self {
+    pub fn new(
+        event_bus: Arc<EventBus>,
+        validation_service: Arc<ValidationService>,
+        execution_service: Arc<dyn ExecutionService>,
+    ) -> Self {
         Self {
             workflows: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             executions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             execution_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_bus,
+            validation_service,
+            execution_service,
             template_engine: Arc::new(handlebars::Handlebars::new()),
         }
     }
@@ -237,7 +252,7 @@ impl WorkflowEngine {
         );
 
         // Execute state (this is simplified - actual implementation would delegate to handlers)
-        let state_output = self.execute_state(&workflow, current_state, workflow_execution).await?;
+        let state_output = self.execute_state(&workflow, current_state, workflow_execution, execution_id).await?;
 
         // Record output
         workflow_execution.record_state_output(current_state_name.clone(), state_output.clone());
@@ -287,9 +302,10 @@ impl WorkflowEngine {
 
     async fn execute_state(
         &self,
-        _workflow: &Workflow,
+        workflow: &Workflow,
         state: &WorkflowState,
         workflow_execution: &WorkflowExecution,
+        execution_id: ExecutionId,
     ) -> Result<serde_json::Value> {
         match &state.kind {
             StateKind::Agent { agent, input, .. } => {
@@ -298,27 +314,51 @@ impl WorkflowEngine {
                 
                 debug!(agent = %agent, "Executing agent state");
                 
-                // TODO: Implement actual agent execution
-                // For now, return structured output that can be used in transitions
+                // Parse agent ID (assuming name is UUID for now)
+                let agent_id = crate::domain::agent::AgentId::from_string(agent)
+                    .map_err(|_| anyhow::anyhow!("Invalid agent ID: {}", agent))?;
+
+                // Prepare execution input
+                let execution_input = crate::domain::execution::ExecutionInput {
+                    intent: Some(rendered_input.clone()),
+                    payload: serde_json::json!({
+                        "workflow_id": workflow.id,
+                        "state": state.kind,
+                        "context": workflow_execution.blackboard.data()
+                    }),
+                };
+
+                // Start execution via ExecutionService
+                let execution_id = self.execution_service.start_execution(agent_id, execution_input).await?;
                 
-                // Check if this is a judge agent (contains "judge" in name)
-                if agent.to_lowercase().contains("judge") {
-                    // Return judge-like output for gradient validation
-                    Ok(serde_json::json!({
-                        "score": 0.85,
-                        "confidence": 0.90,
-                        "reasoning": "Output meets requirements with minor improvements needed",
-                        "suggestions": ["Add error handling", "Improve documentation"],
-                        "verdict": "pass"
-                    }))
-                } else {
-                    // Return generic agent output
-                    Ok(serde_json::json!({
-                        "output": format!("Agent {} executed with input: {}", agent, rendered_input),
-                        "code": "print('Hello, World!')",
-                        "success": true
-                    }))
+                info!(execution_id = %execution_id, "Started agent execution");
+
+                // Wait for completion via event stream
+                let mut stream = self.execution_service.stream_execution(execution_id).await?;
+                
+                while let Some(event_result) = stream.next().await {
+                    let event = event_result?;
+                    match event {
+                        ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                            return Ok(serde_json::json!({
+                                "output": final_output,
+                                "execution_id": execution_id, // include ID for tracking
+                                "success": true
+                            }));
+                        },
+                        ExecutionEvent::ExecutionFailed { reason, .. } => {
+                            return Err(anyhow::anyhow!("Agent execution failed: {}", reason));
+                        },
+                        ExecutionEvent::ExecutionCancelled { reason, .. } => {
+                            let reason = reason.unwrap_or_else(|| "Cancelled".to_string());
+                            return Err(anyhow::anyhow!("Agent execution cancelled: {}", reason));
+                        },
+                        _ => {} // Ignore intermediate events
+                    }
                 }
+
+                // If stream ends without terminal state (should not happen)
+                Err(anyhow::anyhow!("Execution stream ended unexpectedly"))
             }
 
             StateKind::System { command, .. } => {
@@ -347,13 +387,51 @@ impl WorkflowEngine {
             StateKind::ParallelAgents { agents, .. } => {
                 debug!(count = agents.len(), "Executing parallel agents state");
                 
-                // TODO: Execute agents in parallel and aggregate
-                // For now, return placeholder
-                Ok(serde_json::json!({
-                    "final_score": 0.95,
-                    "confidence": 0.9,
-                    "individual_scores": [0.9, 0.95, 0.98]
-                }))
+                // Collect agents to run
+                let mut agent_ids = Vec::new();
+                // TODO: Map string names to AgentIds. For now assuming they are UUID strings.
+                // In a real implementation, we would look up AgentId by name.
+                for config in agents {
+                    if let Ok(id) = crate::domain::agent::AgentId::from_string(&config.agent) {
+                        agent_ids.push(id);
+                    } else {
+                         // warning: invalid agent id
+                    }
+                }
+
+                // Construct validation request (assuming this is a validation step)
+                // We use the input from the first agent config as the content? 
+                // Or maybe the blackboard has the content?
+                // For ParallelAgents, usually they all get the same input or variations.
+                // The `input` field in ParallelAgentConfig is a template.
+                
+                // Let's assume the first agent's input template renders to the content we want validated.
+                // Or if there are no agents, we return empty.
+                if agent_ids.is_empty() {
+                     return Ok(serde_json::json!({
+                        "error": "No valid agents found for parallel execution"
+                     }));
+                }
+
+                // Render the input for the first agent (as a proxy for the request content)
+                // This is a simplification. Ideally, ValidationRequest should be explicit.
+                let content = if let Some(first_config) = agents.first() {
+                    self.render_template(&first_config.input, workflow_execution)?
+                } else {
+                    "No content".to_string()
+                };
+
+                let request = crate::domain::validation::ValidationRequest {
+                    content,
+                    criteria: "Evaluate based on system instructions".to_string(), // TODO: Make configurable
+                    context: Some(serde_json::to_value(workflow_execution.blackboard.data())?),
+                };
+
+                // Execute validation
+                match self.validation_service.validate_with_judges(execution_id, request, agent_ids).await {
+                    Ok(consensus) => Ok(serde_json::to_value(consensus)?),
+                    Err(e) => Err(anyhow::anyhow!("Validation failed: {}", e)),
+                }
             }
         }
     }
@@ -597,13 +675,51 @@ impl Default for WorkflowInput {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::execution::ExecutionService;
+    use crate::domain::execution::{Execution, ExecutionInput, Iteration, LlmInteraction};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use async_trait::async_trait;
+
+    struct MockExecutionService;
+
+    #[async_trait]
+    impl ExecutionService for MockExecutionService {
+        async fn start_execution(&self, _agent_id: AgentId, _input: ExecutionInput) -> Result<ExecutionId> {
+            Ok(ExecutionId::new())
+        }
+        async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
+            Ok(Execution::new(AgentId::new(), ExecutionInput { intent: None, payload: serde_json::Value::Null }, 3))
+        }
+        async fn get_iterations(&self, _exec_id: ExecutionId) -> Result<Vec<Iteration>> { Ok(vec![]) }
+        async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> { Ok(()) }
+        async fn stream_execution(&self, id: ExecutionId) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<ExecutionEvent>> + Send>>> {
+             let event = ExecutionEvent::ExecutionCompleted {
+                 execution_id: id,
+                 agent_id: AgentId::new(),
+                 final_output: "mock output".to_string(),
+                 total_iterations: 1,
+                 completed_at: chrono::Utc::now(),
+             };
+             Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+        }
+        async fn stream_agent_events(&self, _id: AgentId) -> Result<std::pin::Pin<Box<dyn futures::Stream<Item = Result<DomainEvent>> + Send>>> {
+             Ok(Box::pin(futures::stream::empty()))
+        }
+        async fn list_executions(&self, _agent_id: Option<AgentId>, _limit: usize) -> Result<Vec<Execution>> { Ok(vec![]) }
+        async fn delete_execution(&self, _id: ExecutionId) -> Result<()> { Ok(()) }
+        async fn record_llm_interaction(&self, _execution_id: ExecutionId, _iteration: u8, _interaction: LlmInteraction) -> Result<()> { Ok(()) }
+    }
 
     #[tokio::test]
     async fn test_workflow_engine_creation() {
-        let event_bus = EventBus::with_default_capacity();
-        let engine = WorkflowEngine::new(Arc::new(event_bus));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let exec_service = Arc::new(MockExecutionService);
+        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        
+        let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -611,8 +727,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_load_simple_workflow() {
-        let event_bus = EventBus::with_default_capacity();
-        let engine = WorkflowEngine::new(Arc::new(event_bus));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let exec_service = Arc::new(MockExecutionService);
+        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        
+        let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1

@@ -7,7 +7,7 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::application::agent::AgentLifecycleService;
-use crate::infrastructure::event_bus::{EventBus, DomainEvent};
+use crate::infrastructure::event_bus::{EventBus, DomainEvent, EventBusError};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::Stream;
@@ -312,8 +312,18 @@ impl ExecutionService for StandardExecutionService {
          Ok(())
     }
 
-    async fn stream_execution(&self, _id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
-        Ok(Box::pin(futures::stream::empty()))
+    async fn stream_execution(&self, id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        let receiver = self.event_bus.subscribe_execution(id);
+        
+        let stream = futures::stream::unfold(receiver, |mut receiver| async move {
+             match receiver.recv().await {
+                 Ok(event) => Some((Ok(event), receiver)),
+                 Err(EventBusError::Closed) => None,
+                 Err(e) => Some((Err(anyhow!("Event bus error: {}", e)), receiver)),
+             }
+        });
+        
+        Ok(Box::pin(stream))
     }
 
     async fn stream_agent_events(&self, _id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {

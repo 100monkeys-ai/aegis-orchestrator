@@ -129,6 +129,7 @@ pub enum ExecutionEvent {
         instance_id: InstanceId,
         terminated_at: DateTime<Utc>,
     },
+    Validation(ValidationEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +139,24 @@ pub enum LearningEvent {
         execution_id: ExecutionId,
         discovered_at: DateTime<Utc>
     } 
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ValidationEvent {
+    GradientValidationPerformed {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        score: f64,
+        confidence: f64,
+        validated_at: DateTime<Utc>,
+    },
+    MultiJudgeConsensus {
+        execution_id: ExecutionId,
+        judge_scores: Vec<(AgentId, f64)>,
+        final_score: f64,
+        confidence: f64,
+        reached_at: DateTime<Utc>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

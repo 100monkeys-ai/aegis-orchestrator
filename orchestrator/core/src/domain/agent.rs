@@ -12,6 +12,10 @@ impl AgentId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
+        Ok(Self(Uuid::parse_str(s)?))
+    }
 }
 
 impl Default for AgentId {

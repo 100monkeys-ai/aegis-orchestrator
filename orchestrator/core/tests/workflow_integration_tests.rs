@@ -11,9 +11,45 @@
 //! 5. Verify blackboard context passing
 
 use aegis_core::application::workflow_engine::WorkflowEngine;
-use aegis_core::infrastructure::event_bus::EventBus;
+use aegis_core::infrastructure::event_bus::{EventBus, DomainEvent};
 use aegis_core::infrastructure::workflow_parser::WorkflowParser;
 use std::sync::Arc;
+use aegis_core::application::execution::ExecutionService;
+use aegis_core::application::validation_service::ValidationService;
+use aegis_core::domain::agent::AgentId;
+use aegis_core::domain::execution::{Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction};
+use aegis_core::domain::events::ExecutionEvent;
+use async_trait::async_trait;
+
+struct MockExecutionService;
+
+#[async_trait]
+impl ExecutionService for MockExecutionService {
+    async fn start_execution(&self, _agent_id: AgentId, _input: ExecutionInput) -> anyhow::Result<ExecutionId> {
+        Ok(ExecutionId::new())
+    }
+    async fn get_execution(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
+        Ok(Execution::new(AgentId::new(), ExecutionInput { intent: None, payload: serde_json::Value::Null }, 3))
+    }
+    async fn get_iterations(&self, _exec_id: ExecutionId) -> anyhow::Result<Vec<Iteration>> { Ok(vec![]) }
+    async fn cancel_execution(&self, _id: ExecutionId) -> anyhow::Result<()> { Ok(()) }
+    async fn stream_execution(&self, id: ExecutionId) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<ExecutionEvent>> + Send>>> {
+             let event = ExecutionEvent::ExecutionCompleted {
+                 execution_id: id,
+                 agent_id: AgentId::new(),
+                 final_output: "mock output".to_string(),
+                 total_iterations: 1,
+                 completed_at: chrono::Utc::now(),
+             };
+             Ok(Box::pin(futures::stream::iter(vec![Ok(event)])))
+    }
+    async fn stream_agent_events(&self, _id: AgentId) -> anyhow::Result<std::pin::Pin<Box<dyn futures::Stream<Item = anyhow::Result<DomainEvent>> + Send>>> {
+            Ok(Box::pin(futures::stream::empty()))
+    }
+    async fn list_executions(&self, _agent_id: Option<AgentId>, _limit: usize) -> anyhow::Result<Vec<Execution>> { Ok(vec![]) }
+    async fn delete_execution(&self, _id: ExecutionId) -> anyhow::Result<()> { Ok(()) }
+    async fn record_llm_interaction(&self, _execution_id: ExecutionId, _iteration: u8, _interaction: LlmInteraction) -> anyhow::Result<()> { Ok(()) }
+}
 
 #[tokio::test]
 async fn test_parse_100monkeys_classic_workflow() {
@@ -55,8 +91,10 @@ async fn test_parse_100monkeys_classic_workflow() {
 #[tokio::test]
 async fn test_load_workflow_into_engine() {
     // Create workflow engine
-    let event_bus = EventBus::with_default_capacity();
-    let engine = WorkflowEngine::new(Arc::new(event_bus));
+    let event_bus = Arc::new(EventBus::with_default_capacity());
+    let exec_service = Arc::new(MockExecutionService);
+    let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+    let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
 
     // Load workflow
     let yaml_path = concat!(

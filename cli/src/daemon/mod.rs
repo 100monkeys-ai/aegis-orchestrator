@@ -12,8 +12,11 @@
 use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::time::Duration;
+#[cfg(unix)]
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::info;
+#[cfg(unix)]
+use tracing::warn;
 
 pub mod client;
 #[cfg(unix)]

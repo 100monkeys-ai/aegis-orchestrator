@@ -22,7 +22,7 @@ use aegis_core::{
     application::{
         execution::StandardExecutionService, execution::ExecutionService,
         lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
-        workflow_engine::WorkflowEngine,
+        workflow_engine::WorkflowEngine, validation_service::ValidationService,
     },
     domain::{
         node_config::NodeConfig,
@@ -110,7 +110,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     println!("Initializing workflow engine...");
-    let workflow_engine = Arc::new(WorkflowEngine::new(event_bus.clone()));
+    let validation_service = Arc::new(ValidationService::new(event_bus.clone(), execution_service.clone()));
+    let workflow_engine = Arc::new(WorkflowEngine::new(event_bus.clone(), validation_service, execution_service.clone()));
     println!("Workflow engine initialized.");
 
     let app_state = AppState {

@@ -9,7 +9,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -180,6 +180,10 @@ impl ExecutionEventReceiver {
             ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::InstanceSpawned { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::InstanceTerminated { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::Validation(e) => match e {
+                ValidationEvent::GradientValidationPerformed { execution_id, .. } => execution_id == &self.execution_id,
+                ValidationEvent::MultiJudgeConsensus { execution_id, .. } => execution_id == &self.execution_id,
+            },
         }
     }
 }
@@ -231,6 +235,7 @@ impl AgentEventReceiver {
                 ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::Validation(_) => false, // TODO: Add agent_id to ValidationEvent for filtering
             },
             DomainEvent::Learning(_) => false, // TODO: Link learning to agent
             DomainEvent::Policy(_) => false, // TODO: Link policy to agent
