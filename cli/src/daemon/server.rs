@@ -22,6 +22,7 @@ use aegis_core::{
     application::{
         execution::StandardExecutionService, execution::ExecutionService,
         lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
+        workflow_engine::WorkflowEngine,
     },
     domain::{
         node_config::NodeConfig,
@@ -106,14 +107,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_repo.clone(),
         event_bus.clone(),
         Arc::new(config.clone()),
-        llm_registry.clone(),
     ));
+
+    println!("Initializing workflow engine...");
+    let workflow_engine = Arc::new(WorkflowEngine::new(event_bus.clone()));
+    println!("Workflow engine initialized.");
 
     let app_state = AppState {
         agent_service,
         execution_service,
         event_bus,
         _llm_registry: llm_registry,
+        workflow_engine,
         start_time: std::time::Instant::now(),
     };
 
@@ -136,6 +141,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .route("/api/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
         .route("/api/agents/lookup/:name", get(lookup_agent_handler))
         .route("/api/llm/generate", post(llm_generate_handler))
+        
+        // Workflow API routes
+        .route("/api/workflows", post(deploy_workflow_handler).get(list_workflows_handler))
+        .route("/api/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
+        .route("/api/workflows/:name/run", post(run_workflow_handler))
+        .route("/api/workflows/executions/:execution_id", get(get_workflow_execution_handler))
+        .route("/api/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
+        
         .with_state(Arc::new(app_state));
 
     // Start HTTP server
@@ -216,6 +229,7 @@ struct AppState {
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
     _llm_registry: Arc<ProviderRegistry>,
+    workflow_engine: Arc<WorkflowEngine>,
     start_time: std::time::Instant,
 }
 
@@ -993,4 +1007,172 @@ async fn llm_generate_handler(
             (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
         }
     }
+}
+
+// ========================================
+// Workflow API Handlers
+// ========================================
+
+/// POST /api/workflows - Deploy a workflow from YAML
+async fn deploy_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+
+    // Parse YAML
+    match WorkflowParser::parse_yaml(&body) {
+        Ok(workflow) => {
+            // Register in engine
+            match state.workflow_engine.register_workflow(workflow).await {
+                Ok(workflow_id) => {
+                    (StatusCode::OK, Json(serde_json::json!({
+                        "workflow_id": workflow_id,
+                        "message": "Workflow deployed successfully"
+                    })))
+                }
+                Err(e) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "error": format!("Failed to register workflow: {}", e)
+                    })))
+                }
+            }
+        }
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Failed to parse workflow YAML: {}", e)
+            })))
+        }
+    }
+}
+
+/// GET /api/workflows - List all workflows
+async fn list_workflows_handler(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let workflows = state.workflow_engine.list_workflows().await;
+    
+    let workflow_list: Vec<serde_json::Value> = workflows
+        .iter()
+        .map(|name| {
+            serde_json::json!({
+                "name": name,
+                "status": "active"
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(workflow_list))
+}
+
+/// GET /api/workflows/:name - Get workflow YAML
+async fn get_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+
+    match state.workflow_engine.get_workflow(&name).await {
+        Some(workflow) => {
+            match WorkflowParser::to_yaml(&workflow) {
+                Ok(yaml) => {
+                    (StatusCode::OK, yaml)
+                }
+                Err(e) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to serialize workflow: {}", e))
+                }
+            }
+        }
+        None => {
+            (StatusCode::NOT_FOUND, format!("Workflow '{}' not found", name))
+        }
+    }
+}
+
+/// DELETE /api/workflows/:name - Delete workflow
+async fn delete_workflow_handler(
+    State(_state): State<Arc<AppState>>,
+    Path(_name): Path<String>,
+) -> impl IntoResponse {
+    // TODO: Implement workflow deletion once WorkflowEngine has remove method
+    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+        "error": "Workflow deletion not yet implemented"
+    })))
+}
+
+/// POST /api/workflows/:name/run - Execute a workflow
+#[derive(serde::Deserialize)]
+struct RunWorkflowRequest {
+    input: serde_json::Value,
+}
+
+async fn run_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<RunWorkflowRequest>,
+) -> impl IntoResponse {
+    use aegis_core::application::workflow_engine::WorkflowInput;
+    use aegis_core::domain::execution::ExecutionId;
+
+    let execution_id = ExecutionId(Uuid::new_v4());
+
+    let parameters = request.input
+        .as_object()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+    let input = WorkflowInput { parameters };
+
+    match state.workflow_engine.start_execution(&name, execution_id, input).await {
+        Ok(()) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "execution_id": execution_id.0,
+                "status": "running"
+            })))
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "error": format!("Failed to start workflow execution: {}", e)
+            })))
+        }
+    }
+}
+
+/// GET /api/workflows/executions/:execution_id - Get execution details
+async fn get_workflow_execution_handler(
+    State(_state): State<Arc<AppState>>,
+    Path(_execution_id): Path<Uuid>,
+) -> impl IntoResponse {
+    // TODO: Implement execution state retrieval once WorkflowEngine exposes active executions
+    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
+        "error": "Workflow execution retrieval not yet implemented"
+    })))
+}
+
+/// GET /api/workflows/executions/:execution_id/logs - Stream workflow logs
+async fn stream_workflow_logs_handler(
+    State(state): State<Arc<AppState>>,
+    Path(_execution_id): Path<Uuid>,
+) -> impl IntoResponse {
+    // Subscribe to workflow events
+    let mut receiver = state.event_bus.subscribe();
+    
+    // Create async stream from receiver
+    let event_stream = async_stream::stream! {
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    // Convert domain event to SSE Event
+                    if let Ok(json) = serde_json::to_string(&event) {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(json));
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    };
+
+    Sse::new(event_stream)
 }

@@ -13,8 +13,10 @@ serde_json.workspace = true
 serde_yaml = "0.9"
 uuid = { workspace = true }
 chrono = { workspace = true }
+humantime-serde = "1.1"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
+handlebars = "5.1"
 async-trait = "0.1"
 futures = { workspace = true }
 bollard.workspace = true

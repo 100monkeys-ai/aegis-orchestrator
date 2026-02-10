@@ -7,8 +7,10 @@ pub mod config;
 pub mod daemon;
 pub mod task;
 pub mod agent;
+pub mod workflow;
 
 pub use self::config::ConfigCommand;
 pub use self::daemon::DaemonCommand;
 pub use self::task::TaskCommand;
 pub use self::agent::AgentCommand;
+pub use self::workflow::WorkflowCommand;

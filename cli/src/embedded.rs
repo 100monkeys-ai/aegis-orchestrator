@@ -67,7 +67,6 @@ impl EmbeddedExecutor {
             execution_repo.clone(),
             event_bus.clone(),
             Arc::new(config.clone()),
-            llm_registry.clone(),
         ));
 
         Ok(Self {

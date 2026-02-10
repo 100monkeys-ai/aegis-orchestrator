@@ -541,3 +541,187 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
     }
 }
+
+// ============================================================================
+// Workflow Management Methods
+// ============================================================================
+
+impl DaemonClient {
+    /// Deploy a workflow from a file
+    pub async fn deploy_workflow(&self, file: &std::path::Path) -> Result<()> {
+        let workflow_yaml = std::fs::read_to_string(file)
+            .context("Failed to read workflow file")?;
+
+        let response = self
+            .client
+            .post(&format!("{}/api/workflows", self.base_url))
+            .header("Content-Type", "application/x-yaml")
+            .body(workflow_yaml)
+            .send()
+            .await
+            .context("Failed to deploy workflow")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to deploy workflow: {}", error_text);
+        }
+
+        Ok(())
+    }
+
+    /// Run a workflow
+    pub async fn run_workflow(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+    ) -> Result<Uuid> {
+        #[derive(Serialize)]
+        struct RunRequest {
+            input: serde_json::Value,
+        }
+
+        let response = self
+            .client
+            .post(&format!("{}/api/workflows/{}/run", self.base_url, name))
+            .json(&RunRequest { input })
+            .send()
+            .await
+            .context("Failed to run workflow")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to run workflow: {}", error_text);
+        }
+
+        #[derive(Deserialize)]
+        struct RunResponse {
+            execution_id: Uuid,
+        }
+
+        let run_response: RunResponse = response
+            .json()
+            .await
+            .context("Failed to parse run response")?;
+
+        Ok(run_response.execution_id)
+    }
+
+    /// List all workflows
+    pub async fn list_workflows(&self) -> Result<Vec<serde_json::Value>> {
+        let response = self
+            .client
+            .get(&format!("{}/api/workflows", self.base_url))
+            .send()
+            .await
+            .context("Failed to list workflows")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list workflows: {}", error_text);
+        }
+
+        #[derive(Deserialize)]
+        struct ListResponse {
+            workflows: Vec<serde_json::Value>,
+        }
+
+        let list_response: ListResponse = response
+            .json()
+            .await
+            .context("Failed to parse list response")?;
+
+        Ok(list_response.workflows)
+    }
+
+    /// Describe a workflow (get YAML definition)
+    pub async fn describe_workflow(&self, name: &str) -> Result<String> {
+        let response = self
+            .client
+            .get(&format!("{}/api/workflows/{}", self.base_url, name))
+            .send()
+            .await
+            .context("Failed to describe workflow")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to describe workflow: {}", error_text);
+        }
+
+        let workflow_yaml = response
+            .text()
+            .await
+            .context("Failed to read workflow YAML")?;
+
+        Ok(workflow_yaml)
+    }
+
+    /// Delete a workflow
+    pub async fn delete_workflow(&self, name: &str) -> Result<()> {
+        let response = self
+            .client
+            .delete(&format!("{}/api/workflows/{}", self.base_url, name))
+            .send()
+            .await
+            .context("Failed to delete workflow")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete workflow: {}", error_text);
+        }
+
+        Ok(())
+    }
+
+    /// Stream workflow execution logs
+    pub async fn stream_workflow_logs(&self, execution_id: Uuid) -> Result<()> {
+        let response = self
+            .client
+            .get(&format!(
+                "{}/api/workflows/executions/{}/logs",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to connect to log stream")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to stream logs: {}", error_text);
+        }
+
+        let mut stream = response.bytes_stream();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.context("Failed to read log chunk")?;
+            let text = String::from_utf8_lossy(&chunk);
+            print!("{}", text);
+        }
+
+        Ok(())
+    }
+
+    /// Get workflow execution logs (non-streaming)
+    pub async fn get_workflow_logs(&self, execution_id: Uuid) -> Result<String> {
+        let response = self
+            .client
+            .get(&format!(
+                "{}/api/workflows/executions/{}",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to get logs")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get logs: {}", error_text);
+        }
+
+        let logs = response
+            .text()
+            .await
+            .context("Failed to read logs")?;
+
+        Ok(logs)
+    }
+}

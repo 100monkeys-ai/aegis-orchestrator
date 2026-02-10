@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput, ValidationResults, SystemValidationResult, OutputValidationResult, SemanticValidationResult};
+use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
@@ -34,7 +34,6 @@ pub struct StandardExecutionService {
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
     config: Arc<crate::domain::node_config::NodeConfig>,
-    llm_provider: Arc<dyn crate::domain::llm::LLMProvider>,
 }
 
 impl StandardExecutionService {
@@ -44,7 +43,6 @@ impl StandardExecutionService {
         repository: Arc<dyn ExecutionRepository>,
         event_bus: Arc<EventBus>,
         config: Arc<crate::domain::node_config::NodeConfig>,
-        llm_provider: Arc<dyn crate::domain::llm::LLMProvider>,
     ) -> Self {
         Self {
             agent_service,
@@ -52,7 +50,6 @@ impl StandardExecutionService {
             repository,
             event_bus,
             config,
-            llm_provider,
         }
     }
 }
@@ -97,42 +94,8 @@ impl SupervisorObserver for ExecutionMonitor {
             timestamp: now,
         });
     }
-    
-    async fn on_validation_complete(&self, iteration: u8, stdout: &str, stderr: &str, exit_code: i64, valid_res: &crate::domain::judge::ValidationResult) {
-        // Store validation results in DB for later replay
-        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
-            let validation_results = ValidationResults {
-                system: Some(SystemValidationResult {
-                    success: exit_code == 0 && stderr.is_empty(),
-                    exit_code: exit_code as i32,
-                    stdout: stdout.to_string(),
-                    stderr: stderr.to_string(),
-                }),
-                output: Some(OutputValidationResult {
-                    success: valid_res.success,
-                    error: if !valid_res.success {
-                        Some(valid_res.errors.join("; "))
-                    } else {
-                        None
-                    },
-                }),
-                semantic: if let Some(metadata) = &valid_res.metadata {
-                    let confidence = metadata.get("confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
-                    Some(SemanticValidationResult {
-                        success: valid_res.success,
-                        score: confidence,
-                        reasoning: valid_res.feedback.clone().unwrap_or_default(),
-                    })
-                } else {
-                    None
-                },
-            };
-            let _ = exec.store_validation_results(iteration, validation_results);
-            let _ = self.repository.save(&exec).await;
-        }
-    }
 
-    async fn on_iteration_complete(&self, iteration: u8, output: &str) {
+    async fn on_iteration_complete(&self, iteration: u8, output: &str, _exit_code: i64) {
         let now = Utc::now();
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
             exec.complete_iteration(output.to_string());
@@ -268,22 +231,8 @@ impl ExecutionService for StandardExecutionService {
         let event_bus = self.event_bus.clone();
         let exec_input = input.clone();
         
-        // Build judge from manifest configuration
-        let semantic_config = agent.manifest.execution
-            .as_ref()
-            .and_then(|e| e.validation.as_ref())
-            .and_then(|v| v.semantic.as_ref());
-        
-        // Extract task instruction for judge criteria
-        let task_instruction = agent.manifest.task
-            .as_ref()
-            .and_then(|t| t.instruction.as_deref());
-        
-        let judge = crate::domain::judge::build_judge_from_manifest(
-            semantic_config,
-            task_instruction,
-            self.llm_provider.clone(),
-        );
+        // NOTE: We no longer build judges here. Validation is the workflow's responsibility.
+        // If workflows want validation, they should spawn judge agents.
         
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
@@ -293,11 +242,7 @@ impl ExecutionService for StandardExecutionService {
         });
 
         tokio::spawn(async move {
-            // Default to non-verbose mode (simplified output)
-            // TODO: Make verbose configurable via ExecutionInput if needed
-            let verbose = false;
-            
-            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, judge, monitor, verbose).await {
+            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, monitor).await {
                 Ok(final_output) => {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {

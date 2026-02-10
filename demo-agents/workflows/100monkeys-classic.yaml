@@ -1,0 +1,229 @@
+# 100monkeys Classic Workflow
+#
+# This workflow replicates the original hardcoded ExecutionSupervisor behavior:
+# Generate → Execute → Validate → Refine (loop)
+#
+# This is the default workflow for backward compatibility and serves as
+# a reference implementation for the classic iterative refinement pattern.
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "100monkeys-classic"
+  version: "1.0.0"
+  description: "Classic iterative refinement loop (generate → execute → validate → refine)"
+  labels:
+    category: "iterative"
+    pattern: "generate-execute-validate-refine"
+    stability: "stable"
+
+spec:
+  # Global context available to all states
+  context:
+    max_iterations: 10
+    validation_threshold: 0.95
+
+  # Start with code generation
+  initial_state: GENERATE
+
+  states:
+    # ========================================================================
+    # State 1: GENERATE
+    # Execute the agent to generate/refine code
+    # ========================================================================
+    GENERATE:
+      kind: Agent
+      
+      # Agent ID will be passed as workflow parameter
+      agent: "{{workflow.agent_id}}"
+      
+      # Input template with conditional refinement feedback
+      input: |
+        {{#if blackboard.iteration_number}}
+        === ITERATION {{blackboard.iteration_number}} ===
+        
+        Your previous attempt failed validation.
+        
+        --- PREVIOUS CODE ---
+        {{blackboard.previous_code}}
+        
+        --- VALIDATION ERRORS ---
+        {{blackboard.validation_errors}}
+        
+        --- REFINEMENT INSTRUCTIONS ---
+        Fix the code to pass validation. Focus on:
+        {{blackboard.validation_reasoning}}
+        
+        {{else}}
+        === INITIAL ATTEMPT ===
+        
+        {{workflow.task}}
+        {{/if}}
+      
+      # Timeout for code generation
+      timeout: 120s
+      
+      # Always proceed to execution after generation
+      transitions:
+        - condition: always
+          target: EXECUTE
+
+    # ========================================================================
+    # State 2: EXECUTE
+    # Run the generated code
+    # ========================================================================
+    EXECUTE:
+      kind: System
+      
+      # Command will be passed as workflow parameter (e.g., "python main.py")
+      command: "{{workflow.command}}"
+      
+      # Pass generated code via environment variable
+      env:
+        CODE: "{{GENERATE.output}}"
+        PYTHONPATH: "/workspace"
+      
+      workdir: "/workspace"
+      timeout: 60s
+      
+      # Branch based on execution result
+      transitions:
+        - condition: exit_code0
+          target: VALIDATE
+        
+        - condition: exit_code_non_zero
+          target: REFINE
+          feedback: "Execution failed: {{EXECUTE.output.stderr}}"
+
+    # ========================================================================
+    # State 3: VALIDATE
+    # Judge validates the execution output with gradient scoring
+    # ========================================================================
+    VALIDATE:
+      kind: Agent
+      
+      # Use the basic-judge agent (gradient scoring 0.0-1.0)
+      agent: "basic-judge"
+      
+      # Input for judge with task, code, and output
+      input: |
+        === VALIDATION REQUEST ===
+        
+        Original Task:
+        {{workflow.task}}
+        
+        Generated Code:
+        {{GENERATE.output}}
+        
+        Execution Output:
+        {{EXECUTE.output.stdout}}
+        
+        {{#if EXECUTE.output.stderr}}
+        Stderr:
+        {{EXECUTE.output.stderr}}
+        {{/if}}
+        
+        --- INSTRUCTIONS ---
+        Evaluate the code and output against the original task.
+        
+        Use the gradient scoring rubric:
+        - 1.0 (Perfect): Fully meets requirements, production-ready
+        - 0.7-0.9 (Good): Minor improvements possible but acceptable
+        - 0.3-0.7 (Needs Work): Significant issues requiring refinement
+        - 0.0-0.3 (Poor): Critical failures, fundamental rework needed
+        
+        Respond with JSON matching your output schema:
+        {
+          "score": 0.0-1.0,
+          "confidence": 0.0-1.0,
+          "reasoning": "Detailed explanation of score",
+          "suggestions": ["Specific improvement suggestions"],
+          "verdict": "pass" | "refine" | "fail"
+        }
+      
+      timeout: 60s
+      
+      # Branch based on judge verdict (thresholds: pass >=0.70, refine 0.30-0.70, fail <=0.30)
+      transitions:
+        # Success: Verdict is "pass" (score >= 0.70)
+        - condition: score_above
+          threshold: 0.70
+          target: COMPLETE
+        
+        # Refine: Verdict is "refine" (0.30 < score < 0.70)
+        - condition: score_between
+          min: 0.30
+          max: 0.70
+          target: REFINE
+          feedback: "{{VALIDATE.output.reasoning}}"
+        
+        # Failure: Verdict is "fail" (score <= 0.30)
+        - condition: score_below
+          threshold: 0.30
+          target: REFINE
+          feedback: "Critical issues found: {{VALIDATE.output.reasoning}}"
+
+    # ========================================================================
+    # State 4: REFINE
+    # Update blackboard with feedback and check iteration limit
+    # ========================================================================
+    REFINE:
+      kind: System
+      
+      command: "update_blackboard"
+      
+      # Update blackboard state for next iteration
+      env:
+        ITERATION_NUMBER: "{{blackboard.iteration_number + 1}}"
+        PREVIOUS_CODE: "{{GENERATE.output}}"
+        VALIDATION_ERRORS: "{{state.feedback}}"
+        VALIDATION_REASONING: "{{VALIDATE.output.reasoning}}"
+      
+      # Branch based on iteration count
+      transitions:
+        # Continue iterating if under max_iterations
+        - condition: custom
+          expression: "{{blackboard.iteration_number < workflow.context.max_iterations}}"
+          target: GENERATE
+        
+        # Give up if max_iterations reached
+        - condition: custom
+          expression: "{{blackboard.iteration_number >= workflow.context.max_iterations}}"
+          target: FAILED
+
+    # ========================================================================
+    # Terminal State: COMPLETE
+    # Workflow succeeded
+    # ========================================================================
+    COMPLETE:
+      kind: System
+      
+      command: "finalize_success"
+      
+      env:
+        FINAL_CODE: "{{GENERATE.output}}"
+        FINAL_OUTPUT: "{{EXECUTE.output.stdout}}"
+        VALIDATION_SCORE: "{{VALIDATE.output.score}}"
+        ITERATIONS: "{{blackboard.iteration_number}}"
+      
+      # No transitions = terminal state
+      transitions: []
+
+    # ========================================================================
+    # Terminal State: FAILED
+    # Workflow failed (max iterations reached)
+    # ========================================================================
+    FAILED:
+      kind: System
+      
+      command: "finalize_failure"
+      
+      env:
+        REASON: "Maximum iterations ({{workflow.context.max_iterations}}) reached without success"
+        FINAL_CODE: "{{GENERATE.output}}"
+        LAST_ERROR: "{{state.feedback}}"
+        ITERATIONS: "{{blackboard.iteration_number}}"
+      
+      # No transitions = terminal state
+      transitions: []

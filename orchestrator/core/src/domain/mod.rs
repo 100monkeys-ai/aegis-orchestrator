@@ -7,7 +7,7 @@ pub mod policy;
 pub mod events;
 pub mod runtime;
 pub mod supervisor;
-pub mod judge;
 pub mod node_config;
 pub mod repository;
 pub mod llm;
+pub mod workflow;

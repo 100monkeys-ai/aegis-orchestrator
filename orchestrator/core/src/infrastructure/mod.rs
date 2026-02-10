@@ -6,3 +6,4 @@ pub mod runtime;
 pub mod db;
 pub mod event_bus;
 pub mod llm;
+pub mod workflow_parser;

@@ -31,7 +31,7 @@ mod commands;
 mod daemon;
 mod embedded;
 
-use commands::{ConfigCommand, DaemonCommand, TaskCommand, AgentCommand};
+use commands::{ConfigCommand, DaemonCommand, TaskCommand, AgentCommand, WorkflowCommand};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -94,6 +94,13 @@ enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
+
+    /// Workflow management
+    #[command(name = "workflow")]
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
 }
 
 #[tokio::main]
@@ -122,6 +129,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Agent { command }) => {
             commands::agent::handle_command(command, cli.config, cli.port).await
+        }
+        Some(Commands::Workflow { command }) => {
+            commands::workflow::handle_command(command, cli.config, cli.port).await
         }
         None => {
             // No command provided - show help

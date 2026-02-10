@@ -1,0 +1,165 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: basic-judge
+  version: "1.0.0"
+  description: |
+    A foundational judge agent that validates code execution results.
+    Scores outputs on a 0.0-1.0 gradient scale based on:
+    - Correctness: Does it solve the problem?
+    - Completeness: Are all requirements met?
+    - Quality: Is the output well-formed?
+    
+    This is the first implementation of Agent-as-Judge pattern,
+    replacing hardcoded validation logic with declarative agent execution.
+  
+  labels:
+    role: judge
+    category: validation
+    cognitive-function: evaluation
+  
+  annotations:
+    examples: |
+      Input: {"code": "print('hello')", "expected": "hello"}
+      Output: {"score": 0.95, "reasoning": "Correct output, minor style issue"}
+
+spec:
+  # Runtime configuration
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: firecracker
+    timeout: 30s
+  
+  # Security policy
+  security:
+    network:
+      mode: deny-all  # Judges don't need network access
+    
+    filesystem:
+      mode: readonly
+      allowed_paths:
+        - /tmp/input  # Read execution artifacts
+    
+    resources:
+      cpu: 1.0
+      memory: 512Mi
+      max_iterations: 1  # Judges run once, no refinement
+  
+  # Agent prompt template
+  prompt: |
+    You are a **Judge Agent** responsible for evaluating code execution results.
+    
+    ## Your Task
+    Analyze the execution output and assign a validation score from 0.0 to 1.0.
+    
+    ## Input Context
+    - **Original Task**: {{task}}
+    - **Generated Code**: {{code}}
+    - **Execution Output**: {{output}}
+    - **Exit Code**: {{exit_code}}
+    - **Execution Time**: {{execution_time_ms}}ms
+    
+    ## Scoring Rubric
+    
+    ### 1.0 (Perfect)
+    - Code executes successfully (exit code 0)
+    - Output exactly matches requirements
+    - No errors, warnings, or edge cases missed
+    - Efficient and well-structured
+    
+    ### 0.8-0.9 (Excellent)
+    - Functionally correct
+    - Minor style or efficiency issues
+    - Output meets all requirements with small imperfections
+    
+    ### 0.6-0.7 (Good)
+    - Core functionality works
+    - Some edge cases not handled
+    - Output mostly correct but incomplete
+    
+    ### 0.4-0.5 (Fair)
+    - Partial functionality
+    - Significant bugs or missing features
+    - Output demonstrates understanding but needs refinement
+    
+    ### 0.2-0.3 (Poor)
+    - Major errors or crashes
+    - Output barely related to task
+    - Fundamental misunderstanding
+    
+    ### 0.0-0.1 (Failed)
+    - Complete failure (non-zero exit code)
+    - No meaningful output
+    - Agent did not attempt the task
+    
+    ## Output Format (JSON)
+    ```json
+    {
+      "score": 0.85,
+      "confidence": 0.92,
+      "reasoning": "The code successfully prints 'hello world'. Exit code 0 indicates success. The output matches expectations. Minor deduction for missing comments.",
+      "suggestions": [
+        "Add docstring explaining the function",
+        "Consider edge case handling"
+      ],
+      "verdict": "pass"
+    }
+    ```
+    
+    ## Guidelines
+    - Be objective and evidence-based
+    - Explain your reasoning clearly
+    - Confidence reflects your certainty (0.0-1.0)
+    - Verdict is "pass" (score >= 0.7) or "refine" (score < 0.7)
+    - Provide actionable suggestions for improvement
+    
+    Now evaluate the execution result and respond with your judgment JSON.
+  
+  # Validation configuration
+  validation:
+    type: json_schema
+    schema:
+      type: object
+      required: [score, confidence, reasoning, verdict]
+      properties:
+        score:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          description: "Validation score (0.0 = failed, 1.0 = perfect)"
+        
+        confidence:
+          type: number
+          minimum: 0.0
+          maximum: 1.0
+          description: "Judge's confidence in the score (0.0 = uncertain, 1.0 = certain)"
+        
+        reasoning:
+          type: string
+          minLength: 20
+          description: "Detailed explanation of the score"
+        
+        suggestions:
+          type: array
+          items:
+            type: string
+          description: "Actionable improvement suggestions"
+        
+        verdict:
+          type: string
+          enum: [pass, refine, fail]
+          description: "Final verdict (pass >= 0.7, refine < 0.7 and > 0.3, fail <= 0.3)"
+    
+    error_handling:
+      on_validation_failure: return_error
+      on_timeout: return_partial
+  
+  # Environment variables for judge context
+  environment:
+    JUDGE_MODE: "standard"
+    MIN_PASS_SCORE: "0.70"
+    MAX_REFINEMENT_ITERATIONS: "10"
