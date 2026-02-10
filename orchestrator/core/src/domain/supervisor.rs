@@ -13,6 +13,7 @@ use async_trait::async_trait;
 pub trait SupervisorObserver: Send + Sync {
     async fn on_iteration_start(&self, iteration: u8, prompt: &str);
     async fn on_console_output(&self, iteration: u8, stream: &str, content: &str);
+    async fn on_validation_complete(&self, iteration: u8, stdout: &str, stderr: &str, exit_code: i64, valid_res: &crate::domain::judge::ValidationResult);
     async fn on_iteration_complete(&self, iteration: u8, result: &str);
     async fn on_iteration_fail(&self, iteration: u8, error: &str);
     
@@ -44,13 +45,15 @@ impl Supervisor {
     /// * `max_retries` - Maximum number of iteration attempts (from manifest)
     /// * `judge` - Evaluation engine for validating iteration outputs
     /// * `observer` - Observer for iteration lifecycle events
+    /// * `verbose` - Whether to emit detailed logging (judge prompts, LLM responses)
     pub async fn run_loop(
         &self, 
         runtime_config: RuntimeConfig, 
         input: ExecutionInput,
         max_retries: u32,
         judge: Arc<dyn EvaluationEngine>,
-        observer: Arc<dyn SupervisorObserver>
+        observer: Arc<dyn SupervisorObserver>,
+        verbose: bool
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
@@ -139,17 +142,59 @@ impl Supervisor {
                 observer.on_console_output(attempts as u8, "stderr", &stderr).await;
             }
 
+            // Log judge evaluation start
+            observer.on_console_output(attempts as u8, "judge", "🧑‍⚖️ Evaluating output...").await;
+
             // Evaluate
-            let valid_res = judge.evaluate(&stdout, output.exit_code, &stderr).await
+            let valid_res = judge.evaluate(&stdout, output.exit_code, &stderr, verbose).await
                 .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
+
+            // Log judge result
+            if valid_res.success {
+                let confidence_msg = if let Some(metadata) = &valid_res.metadata {
+                    if let Some(conf) = metadata.get("confidence").and_then(|c| c.as_f64()) {
+                        format!("✅ Judge: PASS (confidence: {:.2})", conf)
+                    } else {
+                        "✅ Judge: PASS".to_string()
+                    }
+                } else {
+                    "✅ Judge: PASS".to_string()
+                };
+                observer.on_console_output(attempts as u8, "judge", &confidence_msg).await;
+                if let Some(feedback) = &valid_res.feedback {
+                    observer.on_console_output(attempts as u8, "judge", &format!("   {}", feedback)).await;
+                }
+            } else {
+                let failure_msg = if let Some(metadata) = &valid_res.metadata {
+                    match metadata.get("failure_type").and_then(|t| t.as_str()) {
+                        Some("semantic_check_failed") => "❌ Judge: FAIL (output did not meet criteria)".to_string(),
+                        Some("low_confidence") => {
+                            let actual = metadata.get("actual_confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                            let required = metadata.get("required_confidence").and_then(|c| c.as_f64()).unwrap_or(0.0);
+                            format!("⚠️ Judge: FAIL (low confidence: {:.2} < {:.2})", actual, required)
+                        },
+                        _ => "❌ Judge: FAIL".to_string()
+                    }
+                } else {
+                    "❌ Judge: FAIL".to_string()
+                };
+                observer.on_console_output(attempts as u8, "judge", &failure_msg).await;
+                if let Some(feedback) = &valid_res.feedback {
+                    observer.on_console_output(attempts as u8, "judge", &format!("   {}", feedback)).await;
+                }
+            }
 
             if valid_res.success {
                 info!("Iteration {} succeeded", attempts);
+                // Store validation results in DB before completing iteration
+                observer.on_validation_complete(attempts as u8, &stdout, &stderr, output.exit_code, &valid_res).await;
                 observer.on_iteration_complete(attempts as u8, &stdout).await;
                 return Ok(stdout);
             }
 
             warn!("Iteration {} failed: {:?}", attempts, valid_res.errors);
+            // Store validation results even on failure
+            observer.on_validation_complete(attempts as u8, &stdout, &stderr, output.exit_code, &valid_res).await;
             // Convert errors (Vec<String>) to single string for event
             let error_msg = format!("{:?}", valid_res.errors);
             observer.on_iteration_fail(attempts as u8, &error_msg).await;

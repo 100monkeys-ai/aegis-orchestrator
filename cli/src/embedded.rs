@@ -301,7 +301,11 @@ fn print_event(event: &DomainEvent, verbose: bool) {
             }
             aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
                 if verbose {
-                    let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
+                    let prefix = match stream.as_str() {
+                        "stderr" => "[STDERR]".red(),
+                        "judge" => "[JUDGE]".magenta().bold(),
+                        _ => "[STDOUT]".cyan(),
+                    };
                     println!("{} {}", prefix, content.trim_end());
                 }
             }

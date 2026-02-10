@@ -172,15 +172,57 @@ pub struct ScriptValidation {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SemanticValidation {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     pub model: String,
     pub prompt: String,
+    #[serde(default = "default_semantic_threshold")]
     pub threshold: f64,
     #[serde(default = "default_validation_timeout")]
     pub timeout_seconds: u64,
     #[serde(default)]
     pub fallback_on_unavailable: FallbackBehavior,
+}
+
+impl<'de> Deserialize<'de> for SemanticValidation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct SemanticValidationHelper {
+            #[serde(default = "default_true")]
+            enabled: bool,
+            model: String,
+            prompt: String,
+            #[serde(default = "default_semantic_threshold")]
+            threshold: f64,
+            #[serde(default = "default_validation_timeout")]
+            timeout_seconds: u64,
+            #[serde(default)]
+            fallback_on_unavailable: FallbackBehavior,
+        }
+        
+        let helper = SemanticValidationHelper::deserialize(deserializer)?;
+        
+        // Validate threshold is in valid range
+        if helper.threshold < 0.0 || helper.threshold > 1.0 {
+            return Err(serde::de::Error::custom(
+                format!("threshold must be between 0.0 and 1.0, got {}", helper.threshold)
+            ));
+        }
+        
+        Ok(SemanticValidation {
+            enabled: helper.enabled,
+            model: helper.model,
+            prompt: helper.prompt,
+            threshold: helper.threshold,
+            timeout_seconds: helper.timeout_seconds,
+            fallback_on_unavailable: helper.fallback_on_unavailable,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -350,6 +392,7 @@ fn default_timeout() -> u64 { 300 }
 fn default_max_retries() -> u32 { 5 }
 fn default_system_timeout() -> u64 { 90 }
 fn default_validation_timeout() -> u64 { 30 }
+fn default_semantic_threshold() -> f64 { 0.8 }
 fn default_post() -> String { "POST".to_string() }
 fn default_cpu() -> u32 { 1000 }
 fn default_memory() -> String { "512Mi".to_string() }

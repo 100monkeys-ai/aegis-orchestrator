@@ -470,7 +470,11 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         "ConsoleOutput" => {
             let stream = event["stream"].as_str().unwrap_or("stdout");
             let content = event["data"]["output"].as_str().unwrap_or("");
-            let prefix = if stream == "stderr" { "[STDERR]".red() } else { "[STDOUT]".cyan() };
+            let prefix = match stream {
+                "stderr" => "[STDERR]".red(),
+                "judge" => "[JUDGE]".magenta().bold(),
+                _ => "[STDOUT]".cyan(),
+            };
             println!("{} {}", prefix, content.trim_end());
         }
         "LlmInteraction" => {

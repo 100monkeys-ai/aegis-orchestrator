@@ -12,6 +12,8 @@ pub struct ValidationResult {
     pub success: bool,
     pub errors: Vec<String>,
     pub feedback: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Error)]
@@ -26,14 +28,20 @@ pub enum ValidationError {
 #[async_trait]
 pub trait EvaluationEngine: Send + Sync {
     /// Validates the output of an execution iteration
-    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str) -> Result<ValidationResult, ValidationError>;
+    /// 
+    /// # Arguments
+    /// * `output` - The stdout from the execution
+    /// * `exit_code` - The process exit code
+    /// * `stderr` - The stderr output
+    /// * `verbose` - Whether to emit detailed logging
+    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str, verbose: bool) -> Result<ValidationResult, ValidationError>;
 }
 
 pub struct BasicJudge;
 
 #[async_trait]
 impl EvaluationEngine for BasicJudge {
-    async fn evaluate(&self, _output: &str, exit_code: i64, stderr: &str) -> Result<ValidationResult, ValidationError> {
+    async fn evaluate(&self, _output: &str, exit_code: i64, stderr: &str, _verbose: bool) -> Result<ValidationResult, ValidationError> {
         let mut errors = Vec::new();
         let mut feedback = None;
         let mut success = true;
@@ -56,6 +64,7 @@ impl EvaluationEngine for BasicJudge {
             success,
             errors,
             feedback,
+            metadata: None,
         })
     }
 }
@@ -66,6 +75,7 @@ pub struct LlmJudge {
     prompt_template: String,
     threshold: f64,
     fallback_on_unavailable: bool,
+    task_instruction: Option<String>,
 }
 
 impl LlmJudge {
@@ -74,54 +84,83 @@ impl LlmJudge {
         prompt_template: String,
         threshold: f64,
         fallback_on_unavailable: bool,
+        task_instruction: Option<String>,
     ) -> Self {
         Self {
             llm_provider,
             prompt_template,
             threshold,
             fallback_on_unavailable,
+            task_instruction,
         }
     }
     
-    /// Default prompt template for semantic validation
+    /// Default prompt template for semantic validation.
+    /// 
+    /// Available placeholders:
+    /// - `{criteria}`: The task instruction from the manifest's `task.instruction` field.
+    ///                 Falls back to generic text if not provided.
+    /// - `{output}`: The agent's stdout from execution.
+    /// - `{exit_code}`: The process exit code (0 for success, non-zero for failure).
+    /// - `{stderr}`: The agent's stderr output.
+    /// 
+    /// The LLM must respond with valid JSON containing:
+    /// - `success`: boolean indicating if output meets criteria
+    /// - `confidence`: float 0.0-1.0 indicating judge's confidence
+    /// - `feedback`: string with brief explanation
     pub fn default_prompt_template() -> String {
-        r#"You are evaluating the output of an automated agent task.
+        r#"You are evaluating the output of an automated agent execution.
 
-Task Output:
+Task Requirements:
+{criteria}
+
+Agent Output:
 ```
 {output}
 ```
 
-Exit Code: {exit_code}
+Execution Details:
+- Exit Code: {exit_code}
+- Stderr: {stderr}
 
-Stderr:
-```
-{stderr}
-```
+Evaluate whether the output successfully meets the task requirements above.
 
-Evaluation Criteria:
-{criteria}
-
-Please evaluate whether this output successfully completes the task. Respond in JSON format:
+Respond in JSON format:
 {{
   "success": true/false,
   "confidence": 0.0-1.0,
   "feedback": "Brief explanation of your evaluation"
 }}
 
-Be objective and focus on whether the output meets the stated criteria."#.to_string()
+Be objective and precise. Focus on whether the output fulfills the stated task requirements."#.to_string()
     }
 }
 
 #[async_trait]
 impl EvaluationEngine for LlmJudge {
-    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str) -> Result<ValidationResult, ValidationError> {
-        // Construct the evaluation prompt
+    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str, verbose: bool) -> Result<ValidationResult, ValidationError> {
+        if verbose {
+            tracing::info!("🧑‍⚖️ LLM Judge evaluating output");
+        }
+        
+        // Construct the evaluation prompt with task instruction as criteria
+        let criteria = self.task_instruction
+            .as_deref()
+            .unwrap_or("Output should be valid, complete, and error-free");
+        
+        if verbose {
+            tracing::debug!("Judge criteria: {}", criteria);
+        }
+        
         let prompt = self.prompt_template
             .replace("{output}", output)
             .replace("{exit_code}", &exit_code.to_string())
             .replace("{stderr}", stderr)
-            .replace("{criteria}", "Output should be valid, complete, and error-free");
+            .replace("{criteria}", criteria);
+        
+        if verbose {
+            tracing::info!("Judge Prompt:\n{}", prompt);
+        }
         
         // Call LLM
         let options = GenerationOptions {
@@ -137,39 +176,83 @@ impl EvaluationEngine for LlmJudge {
                     // Fallback to basic validation
                     tracing::warn!("LLM validation unavailable, using basic validation: {}", e);
                     let basic_judge = BasicJudge;
-                    return basic_judge.evaluate(output, exit_code, stderr).await;
+                    return basic_judge.evaluate(output, exit_code, stderr, verbose).await;
                 } else {
                     return Err(ValidationError::LlmError(e));
                 }
             }
         };
         
+        if verbose {
+            tracing::info!("Judge Response:\n{}", response.text);
+        }
+        
+        // Strip markdown code fences if present (LLMs often wrap JSON in ```json ... ```)
+        let response_text = response.text.trim();
+        let json_text = if response_text.starts_with("```") {
+            // Extract content between code fences
+            response_text
+                .lines()
+                .skip(1) // Skip opening fence
+                .take_while(|line| !line.trim().starts_with("```")) // Stop at closing fence
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            response_text.to_string()
+        };
+        
         // Parse JSON response
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&response.text);
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(&json_text);
         
         match parsed {
             Ok(json) => {
-                let success = json["success"].as_bool().unwrap_or(false);
+                let llm_success = json["success"].as_bool().unwrap_or(false);
                 let confidence = json["confidence"].as_f64().unwrap_or(0.0);
-                let feedback = json["feedback"].as_str().map(|s| s.to_string());
+                let feedback = json["feedback"].as_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "No feedback provided".to_string());
                 
-                // Apply confidence threshold
-                let meets_threshold = confidence >= self.threshold;
-                
-                let mut errors = Vec::new();
-                if !success || !meets_threshold {
-                    if !meets_threshold {
-                        errors.push(format!("Confidence {} below threshold {}", confidence, self.threshold));
-                    }
-                    if let Some(ref fb) = feedback {
-                        errors.push(fb.clone());
-                    }
+                if verbose {
+                    tracing::info!("Judge response: success={}, confidence={:.2}, feedback={}", 
+                        llm_success, confidence, feedback);
                 }
                 
+                // Check if LLM explicitly failed the output
+                if !llm_success {
+                    return Ok(ValidationResult {
+                        success: false,
+                        errors: vec![format!("Output did not meet task criteria: {}", feedback)],
+                        feedback: Some(feedback.clone()),
+                        metadata: Some(serde_json::json!({
+                            "failure_type": "semantic_check_failed",
+                            "confidence": confidence,
+                        })),
+                    });
+                }
+                
+                // Check confidence threshold (even if LLM said success)
+                if confidence < self.threshold {
+                    return Ok(ValidationResult {
+                        success: false,
+                        errors: vec![format!("Judge confidence too low ({:.2} < {:.2}): {}", 
+                            confidence, self.threshold, feedback)],
+                        feedback: Some(feedback.clone()),
+                        metadata: Some(serde_json::json!({
+                            "failure_type": "low_confidence",
+                            "actual_confidence": confidence,
+                            "required_confidence": self.threshold,
+                        })),
+                    });
+                }
+                
+                // Success: both LLM approved and confidence is high enough
                 Ok(ValidationResult {
-                    success: success && meets_threshold,
-                    errors,
-                    feedback,
+                    success: true,
+                    errors: Vec::new(),
+                    feedback: Some(feedback),
+                    metadata: Some(serde_json::json!({
+                        "confidence": confidence,
+                    })),
                 })
             }
             Err(e) => {
@@ -199,32 +282,31 @@ impl CompositeJudge {
 
 #[async_trait]
 impl EvaluationEngine for CompositeJudge {
-    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str) -> Result<ValidationResult, ValidationError> {
+    async fn evaluate(&self, output: &str, exit_code: i64, stderr: &str, verbose: bool) -> Result<ValidationResult, ValidationError> {
         // First run basic validation (exit code, stderr)
-        let basic_result = self.basic.evaluate(output, exit_code, stderr).await?;
+        let basic_result = self.basic.evaluate(output, exit_code, stderr, verbose).await?;
         
         // If basic validation fails, return immediately
         if !basic_result.success {
+            if verbose {
+                tracing::info!("Basic validation failed");
+            }
             return Ok(basic_result);
         }
         
         // If LLM judge is configured, run semantic validation
         if let Some(ref llm_judge) = self.llm {
-            let llm_result = llm_judge.evaluate(output, exit_code, stderr).await?;
+            // Handle LLM validation result or error
+            let llm_result = llm_judge.evaluate(output, exit_code, stderr, verbose).await?;
             
-            // Combine results: both must pass
-            let combined_success = basic_result.success && llm_result.success;
-            let mut combined_errors = basic_result.errors.clone();
-            combined_errors.extend(llm_result.errors);
+            // LLM judge result takes precedence since basic passed
+            if !llm_result.success {
+                // Return LLM failure result
+                return Ok(llm_result);
+            }
             
-            // Prefer LLM feedback if available
-            let combined_feedback = llm_result.feedback.or(basic_result.feedback);
-            
-            Ok(ValidationResult {
-                success: combined_success,
-                errors: combined_errors,
-                feedback: combined_feedback,
-            })
+            // Both passed - return LLM result with its confidence metadata
+            Ok(llm_result)
         } else {
             // No LLM judge, return basic result
             Ok(basic_result)
@@ -233,20 +315,52 @@ impl EvaluationEngine for CompositeJudge {
 }
 
 /// Factory to build judge from manifest configuration
+/// 
+/// Semantic validation is enabled by default when task_instruction exists.
+/// Users can disable by setting semantic.enabled: false
 pub fn build_judge_from_manifest(
     semantic_config: Option<&crate::domain::agent::SemanticValidation>,
+    task_instruction: Option<&str>,
     llm_provider: Arc<dyn LLMProvider>,
 ) -> Arc<dyn EvaluationEngine> {
-    if let Some(semantic) = semantic_config {
+    // Determine if we should enable semantic validation
+    let should_enable_semantic = if let Some(semantic) = semantic_config {
+        // User explicitly configured semantic validation
+        // Check the enabled flag
+        semantic.enabled
+    } else {
+        // No explicit config: enable by default if task instruction exists
+        task_instruction.is_some()
+    };
+    
+    if should_enable_semantic {
+        // Use custom config if provided, otherwise use defaults
+        let (prompt, threshold, fallback) = if let Some(semantic) = semantic_config {
+            (
+                semantic.prompt.clone(),
+                semantic.threshold,
+                semantic.fallback_on_unavailable == crate::domain::agent::FallbackBehavior::Skip,
+            )
+        } else {
+            // Defaults when enabled implicitly
+            (
+                LlmJudge::default_prompt_template(),
+                0.8, // Default threshold
+                true, // Default to skip on LLM unavailable
+            )
+        };
+        
         let llm_judge = LlmJudge::new(
             llm_provider,
-            semantic.prompt.clone(),
-            semantic.threshold,
-            semantic.fallback_on_unavailable == crate::domain::agent::FallbackBehavior::Skip,
+            prompt,
+            threshold,
+            fallback,
+            task_instruction.map(|s| s.to_string()),
         );
         Arc::new(CompositeJudge::new(Some(llm_judge)))
     } else {
-        // No semantic validation configured, use basic judge only
+        // Semantic validation explicitly disabled or no task instruction
+        tracing::debug!("Semantic validation disabled - using basic judge only");
         Arc::new(CompositeJudge::new(None))
     }
 }

@@ -9,3 +9,6 @@ task:
     
     User: {user_input}
     Daemon:
+execution:
+  mode: "iterative"
+  max_retries: 3

@@ -549,6 +549,71 @@ async fn stream_agent_events_handler(
                          });
                          yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
                     }
+                    
+                    // Replay validation results as console output
+                    if let Some(validation_results) = &iter.validation_results {
+                        if let Some(system) = &validation_results.system {
+                            // Replay stdout
+                            if !system.stdout.is_empty() {
+                                let stdout_event = serde_json::json!({
+                                    "event_type": "ConsoleOutput",
+                                    "execution_id": execution.id.0,
+                                    "stream": "stdout",
+                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
+                                    "data": { "output": system.stdout }
+                                });
+                                yield Ok::<_, anyhow::Error>(Event::default().data(stdout_event.to_string()));
+                            }
+                            // Replay stderr
+                            if !system.stderr.is_empty() {
+                                let stderr_event = serde_json::json!({
+                                    "event_type": "ConsoleOutput",
+                                    "execution_id": execution.id.0,
+                                    "stream": "stderr",
+                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
+                                    "data": { "output": system.stderr }
+                                });
+                                yield Ok::<_, anyhow::Error>(Event::default().data(stderr_event.to_string()));
+                            }
+                        }
+                        
+                        // Replay judge evaluation
+                        if let Some(semantic) = &validation_results.semantic {
+                            let judge_start = serde_json::json!({
+                                "event_type": "ConsoleOutput",
+                                "execution_id": execution.id.0,
+                                "stream": "judge",
+                                "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
+                                "data": { "output": "🧑‍⚖️ Evaluating output..." }
+                            });
+                            yield Ok::<_, anyhow::Error>(Event::default().data(judge_start.to_string()));
+                            
+                            let judge_result = if semantic.success {
+                                format!("✅ Judge: PASS (confidence: {:.2})", semantic.score)
+                            } else {
+                                format!("❌ Judge: FAIL (confidence: {:.2})", semantic.score)
+                            };
+                            let judge_event = serde_json::json!({
+                                "event_type": "ConsoleOutput",
+                                "execution_id": execution.id.0,
+                                "stream": "judge",
+                                "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
+                                "data": { "output": judge_result }
+                            });
+                            yield Ok::<_, anyhow::Error>(Event::default().data(judge_event.to_string()));
+                            
+                            if !semantic.reasoning.is_empty() {
+                                let feedback_event = serde_json::json!({
+                                    "event_type": "ConsoleOutput",
+                                    "execution_id": execution.id.0,
+                                    "stream": "judge",
+                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
+                                    "data": { "output": format!("   {}", semantic.reasoning) }
+                                });
+                                yield Ok::<_, anyhow::Error>(Event::default().data(feedback_event.to_string()));
+                            }
+                        }
+                    }
 
                     // Completion/Failure
                     if let Some(output) = &iter.output {

@@ -193,6 +193,15 @@ impl Execution {
             iter.ended_at = Some(Utc::now());
         }
     }
+    
+    pub fn store_validation_results(&mut self, iteration_number: u8, results: ValidationResults) -> Result<(), ExecutionError> {
+        if let Some(iter) = self.iterations.iter_mut().find(|i| i.number == iteration_number) {
+            iter.validation_results = Some(results);
+            Ok(())
+        } else {
+            Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
 
     pub fn fail_iteration(&mut self, error: IterationError) {
         if let Some(iter) = self.iterations.last_mut() {
