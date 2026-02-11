@@ -1,0 +1,79 @@
+
+# Aegis Orchestrator Guardian Ignore File
+# Project-specific exclusions for rust-guardian
+
+# === Build and Dependencies ===
+target/
+**/*.rs.bk
+Cargo.lock
+
+# === Environment and Config ===
+.env
+.env.local
+.env.*
+*.env
+aegis-config.yaml
+
+# === Logs and Temporary ===
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+workspaces/
+build_check.log
+build_error.log
+build_error_core.log
+check_error*.log
+error.log
+full_error.log
+guardian_report.txt
+
+# === IDE and Tools ===
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# === Documentation and Assets ===
+assets/
+docs/PIVOT/*
+!docs/PIVOT/IMPLEMENTATION_PLAN.md
+docs/_build/
+site/
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
+
+# === Database ===
+*.db
+*.sqlite
+*.sqlite3
+
+# === Generated Files ===
+*.generated.*
+*.pb.rs
+*.g.rs
+
+# === Project Specific ===
+# Exclude demo agents as they might simulate simplified behavior
+demo-agents/
+# Exclude scripts from strict enforcement
+scripts/
+# Exclude node_modules if present (e.g. in docs or frontend)
+**/node_modules/
+
+# === Cache Files ===
+.guardian_cache.json
+.fastembed_cache/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+htmlcov/
+.coverage

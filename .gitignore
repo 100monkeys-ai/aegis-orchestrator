@@ -30,3 +30,6 @@ aegis-config.yaml
 # Working
 docs/PIVOT/*
 !docs/PIVOT/IMPLEMENTATION_PLAN.md
+
+# Rust Guardian
+guardian_report.*

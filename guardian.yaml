@@ -1,0 +1,309 @@
+
+# Aegis Orchestrator Guardian Configuration
+# Comprehensive code quality enforcement for the Aegis Orchestrator system
+
+version: "1.0"
+
+# Path filtering configuration
+paths:
+  patterns:
+    # Exclude patterns (like .gitignore)
+    - "target/"                    # Rust build directory
+    - "vendors/"                   # Third-party code
+    - "**/node_modules/"           # JavaScript dependencies
+    - "**/.git/"                   # Git directories
+    - "**/*.generated.*"           # Generated files
+    - "**/dist/"                   # Distribution builds
+    - "**/build/"                  # Build directories
+    - "**/*.log"                   # Log files
+    - "**/.DS_Store"               # macOS metadata
+    - "**/Cargo.lock"              # Lock files
+    - "**/.guardian_cache.json"    # Guardian cache
+    - "**/data/volumes/"           # Data volumes
+    - "**/.fastembed_cache/"       # FastEmbed cache
+    - "**/__pycache__/"            # Python cache
+    - "**/*.pyc"                   # Python compiled
+    - "**/htmlcov/"                # Coverage reports
+    - "**/.pytest_cache/"          # Pytest cache
+    - "**/.mypy_cache/"            # MyPy cache
+    - "**/workspaces/"             # Temporary workspaces
+    - "**/tmp/"                    # Temporary files
+    - "**/*.tmp"                   # Temporary files
+    - "bin/"                       # Binary outputs (deployments)
+    - ".env*"                      # Environment files
+    - "**/*.backup"                # Backup files
+    
+    # Include overrides (with !) - processed after excludes
+    - "!crates/**/*.rs"            # Always check all Rust crates
+    - "!src/**/*.rs"               # Always check main source
+    - "!tests/**/*.rs"             # Check test code too
+    - "!examples/**/*.rs"          # Check examples
+    - "!benches/**/*.rs"           # Check benchmarks
+    
+  # Use .guardianignore file for project-specific exclusions
+  ignore_file: ".guardianignore"
+
+# Pattern definitions organized by category
+patterns:
+  # Placeholder detection patterns - CRITICAL for production
+  placeholders:
+    severity: error
+    enabled: true
+    rules:
+      - id: todo_comments
+        type: regex
+        pattern: '\b(TODO|FIXME|HACK|XXX|BUG|REFACTOR|DEPRECATED)\b'
+        message: "Placeholder comment detected: {match}"
+        case_sensitive: false
+        exclude_if:
+          file_patterns:
+            - "**/docs/**/*.md"       # Documentation can have TODOs
+            - "**/README.md"           # README can have roadmap TODOs
+            - "**/*.md"                # Markdown files
+            - "**/CHANGELOG.md"        # Changelog
+      
+      - id: temporary_markers
+        type: regex
+        pattern: '(?i)\b(for now|temporary|placeholder|stub|dummy|fake|mock|test_only)\b'
+        message: "Temporary implementation marker found: {match}"
+        case_sensitive: false
+        exclude_if:
+          in_tests: true               # Tests can have mocks
+          file_patterns:
+            - "**/tests/**"
+            - "**/benches/**"
+            - "**/examples/**"         # Examples might use simplified code
+            - "**/mocks/**"            # Mock implementations
+      
+      - id: test_mod_detection
+        type: regex
+        pattern: 'mod\s+tests'
+        message: "Found mod tests: {match}"
+        case_sensitive: true
+      
+      - id: unimplemented_macros
+        type: ast
+        pattern: "macro_call:unimplemented|todo|unreachable|panic"
+        message: "Unfinished macro {macro_name}! found - complete implementation required"
+        exclude_if:
+          attribute: "#[test]"         # Tests can panic
+          in_tests: true
+          file_patterns:
+            - "**/tests/**"
+            - "**/benches/**"
+
+  # Incomplete implementation detection - CRITICAL
+  incomplete_implementations:
+    severity: error
+    enabled: true
+    rules:
+      - id: empty_ok_return
+        type: ast
+        pattern: "return_ok_unit_with_no_logic"
+        message: "Function returns Ok(()) with no meaningful implementation"
+        exclude_if:
+          attribute: "#[test]"
+          in_tests: true
+          file_patterns:
+            - "**/tests/**"
+            - "**/examples/**"
+      
+      - id: empty_function_body
+        type: ast
+        pattern: "empty_function_body"
+        message: "Empty function body detected - implementation required"
+        exclude_if:
+          attributes:
+            - "#[test]"
+            - "#[allow(unused)]"
+          in_tests: true
+      
+      - id: not_implemented_error
+        type: regex
+        pattern: 'NotImplemented|not.implemented|Not.Implemented'
+        message: "NotImplemented error pattern found"
+        case_sensitive: false
+
+  # Architectural violation detection - IMPORTANT
+  architectural_violations:
+    severity: warning
+    enabled: true
+    rules:
+      - id: hardcoded_paths
+        type: regex
+        pattern: '["''](/tmp/|/var/|/home/|/Users/|C:)[^"'']*["'']'
+        message: "Hardcoded path found - use configuration or relative paths"
+        case_sensitive: true
+        exclude_if:
+          in_tests: true
+          file_patterns:
+            - "**/tests/**"
+            - "**/examples/**"
+            - "**/docs/**"
+            - "**/deploy*.sh"          # Deploy scripts may need absolute paths
+            - "**/*.sh"                # Shell scripts
+      
+      # Domain should only depend on language primitives and maybe some util crates, NEVER infrastructure or application
+      - id: domain_imports_infrastructure
+        type: regex
+        pattern: "use\\s+.*infrastructure"
+        message: "Domain should not import infrastructure - violates DDD. Domain must be pure."
+        severity: error
+        exclude_if:
+          file_patterns:
+            - "**/infrastructure/**"
+            - "**/application/**"      # Application can import infrastructure (interfaces/impls)
+            - "**/main.rs"             # Main wires everything
+            - "**/bin/**"
+            - "**/tests/**"
+      
+      - id: domain_imports_application
+        type: regex
+        pattern: "use\\s+.*application"
+        message: "Domain should not import application - violates DDD layer dependency rule (Domain <- Application)."
+        severity: error
+        exclude_if:
+          file_patterns:
+            - "**/infrastructure/**"   # Infrastructure might use application
+            - "**/application/**"
+            - "**/main.rs"
+            - "**/bin/**"
+            - "**/tests/**"
+
+      # Infrastructure should depend on Domain (for entities/repos) and Application (for use cases/services)
+      # But sometimes Infrastructure implements Domain repositories directly.
+      
+      # Application should depend on Domain.
+      
+      - id: missing_domain_models
+        type: regex
+        pattern: "struct\\s+\\w+Repository"
+        message: "Repository definition found. Ensure it implements a Domain Trait."
+        severity: info
+        enabled: false # Hard to check with regex, placeholder for semantic analysis
+
+  # Code quality patterns - OPTIONAL but recommended
+  quality_issues:
+    severity: warning
+    enabled: true                      # Enable for comprehensive checking
+    rules:
+      - id: excessive_complexity
+        type: semantic
+        pattern: "cyclomatic_complexity_gt:10"
+        message: "Function too complex (complexity: {value}) - consider refactoring"
+        enabled: false
+      
+      - id: missing_docs
+        type: semantic
+        pattern: "public_without_docs"
+        message: "Public item missing documentation"
+        enabled: false
+        exclude_if:
+          file_patterns:
+            - "**/tests/**"
+            - "**/examples/**"
+      
+      - id: long_function
+        type: semantic
+        pattern: "function_lines_gt:50"
+        message: "Function is too long ({lines} lines) - consider refactoring"
+        enabled: false
+      
+      - id: deep_nesting
+        type: semantic
+        pattern: "nesting_depth_gt:4"
+        message: "Code nesting too deep ({depth} levels) - consider refactoring"
+        enabled: false
+      
+      - id: too_many_arguments
+        type: semantic
+        pattern: "function_args_gt:5"
+        message: "Function has too many arguments ({count}) - consider using a struct"
+        enabled: false
+      
+
+  # Async code patterns
+  async_patterns:
+    severity: warning
+    enabled: true
+    rules:
+      - id: blocking_in_async
+        type: semantic
+        pattern: "blocking_call_in_async"
+        message: "Blocking operation in async context - use async alternative"
+        severity: warning
+      
+      - id: missing_await
+        type: semantic
+        pattern: "future_not_awaited"
+        message: "Future created but not awaited - add .await or spawn"
+        severity: error
+      
+      - id: tokio_select_misuse
+        type: semantic
+        pattern: "select_without_biased"
+        message: "tokio::select! without biased - may cause starvation"
+        severity: info
+        enabled: false
+
+  # Security patterns
+  security_patterns:
+    severity: error
+    enabled: true
+    rules:
+      - id: credential_leak
+        type: regex
+        pattern: '(?i)(api.key|secret|password|token|credential).*=.*["'']\w+'
+        message: "Potential credential leak detected"
+        case_sensitive: false
+        exclude_if:
+          file_patterns:
+            - "**/examples/**"         # Examples might show usage
+            - "**/*.example"           # Example configs
+      
+      - id: missing_error_handling
+        type: ast
+        pattern: 'unwrap_or_expect_without_message'
+        message: "unwrap() or expect() without meaningful message"
+        severity: warning
+        exclude_if:
+          in_tests: true
+          file_patterns:
+            - "**/tests/**"
+            - "**/examples/**"
+      
+      - id: unsafe_code_usage
+        type: ast
+        pattern: "unsafe_block"
+        message: "Unsafe code block detected - ensure safety invariants are documented"
+        severity: warning
+        exclude_if:
+          file_patterns:
+            - "**/ffi/**"
+            - "**/sys/**"
+
+  # Test quality patterns
+  test_patterns:
+    severity: info
+    enabled: true
+    rules:
+      - id: test_without_assert
+        type: semantic
+        pattern: "test_fn_without_assertion"
+        message: "Test function without assertions - test may not verify anything"
+        severity: warning
+      
+      - id: ignored_test
+        type: ast
+        pattern: "ignored_test_attribute"
+        message: "Test is ignored - consider enabling or removing"
+        severity: info
+      
+      - id: test_println
+        type: regex
+        pattern: 'println'
+        message: "println! in test - use assertions or logging instead"
+        severity: error
+        exclude_if:
+          file_patterns:
+            - "**/examples/**"
