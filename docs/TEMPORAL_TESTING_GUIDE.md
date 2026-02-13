@@ -198,7 +198,7 @@ spec:
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- workflow deploy test-workflows/echo-workflow.yaml
+cargo run --bin aegis -- --port 8080 workflow deploy test-workflows/echo-workflow.yaml
 
 # OR using HTTP API
 curl -X POST http://localhost:8080/api/workflows/register \

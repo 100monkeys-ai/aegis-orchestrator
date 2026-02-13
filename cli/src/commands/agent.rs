@@ -58,13 +58,14 @@ pub enum AgentCommand {
 pub async fn handle_command(
     command: AgentCommand,
     _config_path: Option<PathBuf>,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     // Agents are currently only managed via Daemon.
     // Embedded mode might support it through direct repository access, 
     // but for now we'll focus on Daemon interaction as per architecture.
     
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {},
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
@@ -79,7 +80,7 @@ pub async fn handle_command(
         }
     }
 
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
 
     match command {
         AgentCommand::List => list_agents(client).await,

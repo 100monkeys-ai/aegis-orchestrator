@@ -57,6 +57,10 @@ struct Cli {
     #[arg(long, global = true, env = "AEGIS_PORT", default_value = "8000")]
     port: u16,
 
+    /// HTTP API host (default: 127.0.0.1)
+    #[arg(long, global = true, env = "AEGIS_HOST", default_value = "127.0.0.1")]
+    host: String,
+
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, global = true, env = "AEGIS_LOG_LEVEL", default_value = "info")]
     log_level: String,
@@ -119,19 +123,19 @@ async fn main() -> Result<()> {
     // Handle commands in CLI mode
     match cli.command {
         Some(Commands::Daemon { command }) => {
-            commands::daemon::handle_command(command, cli.config, cli.port).await
+            commands::daemon::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Task { command }) => {
-            commands::task::handle_command(command, cli.config, cli.port).await
+            commands::task::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Config { command }) => {
             commands::config::handle_command(command, cli.config).await
         }
         Some(Commands::Agent { command }) => {
-            commands::agent::handle_command(command, cli.config, cli.port).await
+            commands::agent::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Workflow { command }) => {
-            commands::workflow::handle_command(command, cli.config, cli.port).await
+            commands::workflow::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         None => {
             // No command provided - show help

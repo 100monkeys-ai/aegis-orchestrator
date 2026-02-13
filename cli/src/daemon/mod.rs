@@ -38,33 +38,33 @@ pub enum DaemonStatus {
     Unhealthy { pid: u32, error: String },
 }
 
-/// Check if daemon is running via PID file + HTTP health check
-pub async fn check_daemon_running() -> Result<DaemonStatus> {
-    let pid_file = get_pid_file_path();
-
-    // Read PID file
-    let pid = match std::fs::read_to_string(&pid_file) {
-        Ok(content) => content
-            .trim()
-            .parse::<u32>()
-            .context("Invalid PID in PID file")?,
-        Err(_) => return Ok(DaemonStatus::Stopped),
-    };
-
-    // Check if process exists
-    if !process_exists(pid) {
-        // Stale PID file
-        let _ = std::fs::remove_file(&pid_file);
-        return Ok(DaemonStatus::Stopped);
-    }
-
-    // Check HTTP health endpoint
-    // Use 127.0.0.1 to avoid ipv4/ipv6 ambiguity with localhost
+/// Check if daemon is running via HTTP health check (primary) or PID file (secondary)
+pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus> {
+    // 1. Try HTTP health check first (works for local and remote/forwarded ports)
+    // Use 127.0.0.1 to avoid ipv4/ipv6 ambiguity with localhost if host is explicitly localhost
+    // otherwise use provided host.
+    
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_millis(500)) // Fast timeout for local checks
         .build()?;
 
-    match client.get("http://127.0.0.1:8000/health").send().await {
+    let base_url = if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{}:{}", host, port)
+    } else {
+        format!("http://{}:{}", host, port)
+    };
+    
+    let health_url = format!("{}/health", base_url);
+    
+    // We check the PID file primarily to return the PID in the Running status if available locally.
+    // If not available (remote), we return 0 or another indicator.
+    let pid_file = get_pid_file_path();
+    let local_pid = match std::fs::read_to_string(&pid_file) {
+        Ok(content) => content.trim().parse::<u32>().ok(),
+        Err(_) => None,
+    };
+
+    match client.get(&health_url).send().await {
         Ok(resp) if resp.status().is_success() => {
             // Parse uptime from response
             let uptime = resp
@@ -73,16 +73,48 @@ pub async fn check_daemon_running() -> Result<DaemonStatus> {
                 .ok()
                 .and_then(|v| v["uptime_seconds"].as_u64());
 
-            Ok(DaemonStatus::Running { pid, uptime })
+            // If we have a local PID, use it. Otherwise, we might be remote.
+            // For now, if local PID is missing but HTTP works, we assume "Running" but maybe without a known PID?
+            // Or we just don't return a PID in that case (DaemonStatus might need update or just use 0).
+            // Existing `DaemonStatus::Running` requires `pid: u32`. Let's use 0 if unknown/remote.
+            let pid = local_pid.unwrap_or(0);
+            
+            return Ok(DaemonStatus::Running { pid, uptime });
         }
-        Ok(resp) => Ok(DaemonStatus::Unhealthy { 
-            pid, 
-            error: format!("HTTP {}", resp.status()) 
-        }),
-        Err(e) => Ok(DaemonStatus::Unhealthy { 
-            pid, 
-            error: e.to_string() 
-        }),
+        Ok(resp) => {
+            // HTTP reached but returned error
+            if let Some(pid) = local_pid {
+                 return Ok(DaemonStatus::Unhealthy { 
+                    pid, 
+                    error: format!("HTTP {}", resp.status()) 
+                });
+            }
+            // If no PID file and unhealthy HTTP, it's ambiguous but likely "Running but broken" or incompatible version?
+            // Let's treat as Unhealthy with PID 0
+            return Ok(DaemonStatus::Unhealthy { 
+                pid: 0, 
+                error: format!("HTTP {}", resp.status()) 
+            });
+        }
+        Err(e) => {
+             // HTTP failed. Check if local PID exists to determine if it SHOULD be running.
+             if let Some(pid) = local_pid {
+                 if process_exists(pid) {
+                      // PID exists, Process exists, but HTTP failed -> Unhealthy
+                      return Ok(DaemonStatus::Unhealthy { 
+                        pid, 
+                        error: e.to_string() 
+                    });
+                 } else {
+                     // Stale PID file
+                     let _ = std::fs::remove_file(&pid_file);
+                     return Ok(DaemonStatus::Stopped);
+                 }
+             }
+             
+             // No PID file, HTTP failed -> Stopped
+             return Ok(DaemonStatus::Stopped);
+        }
     }
 }
 

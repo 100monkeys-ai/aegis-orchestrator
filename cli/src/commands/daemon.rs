@@ -51,18 +51,19 @@ pub enum DaemonCommand {
 pub async fn handle_command(
     command: DaemonCommand,
     config_path: Option<PathBuf>,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     match command {
-        DaemonCommand::Start => start(config_path, port).await,
-        DaemonCommand::Stop { force, timeout } => stop(force, timeout).await,
-        DaemonCommand::Status => status().await,
+        DaemonCommand::Start => start(config_path, host, port).await,
+        DaemonCommand::Stop { force, timeout } => stop(force, timeout, host, port).await,
+        DaemonCommand::Status => status(host, port).await,
         DaemonCommand::Install { binary_path, user } => install(binary_path, user).await,
         DaemonCommand::Uninstall => uninstall().await,
     }
 }
 
-async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
+async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()> {
     // 1. Validation: Load config to check for existence and validity
     // logic in NodeConfig::load_or_default handles explicit path check (errors if missing)
     let config = NodeConfig::load_or_default(config_path.clone())
@@ -77,7 +78,7 @@ async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
 
     info!("Checking if daemon is already running...");
 
-    match check_daemon_running().await {
+    match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, .. }) => {
             println!("{}", format!("✓ Daemon already running (PID: {})", pid).green());
             println!("Use 'aegis daemon stop' to stop it first.");
@@ -101,6 +102,7 @@ async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
 
     let mut cmd = std::process::Command::new(current_exe);
     cmd.arg("--daemon");
+    cmd.arg("--host").arg(host);
     cmd.arg("--port").arg(port.to_string());
 
     if let Some(config) = config_path {
@@ -138,10 +140,10 @@ async fn start(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn stop(force: bool, timeout: u64) -> Result<()> {
+async fn stop(force: bool, timeout: u64, host: &str, port: u16) -> Result<()> {
     info!("Stopping daemon...");
 
-    match check_daemon_running().await {
+    match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Stopped) => {
             println!("{}", "ℹ Daemon not running".yellow());
             return Ok(());
@@ -160,8 +162,8 @@ async fn stop(force: bool, timeout: u64) -> Result<()> {
     Ok(())
 }
 
-async fn status() -> Result<()> {
-    match check_daemon_running().await {
+async fn status(host: &str, port: u16) -> Result<()> {
+    match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, uptime }) => {
             println!("{}", "✓ Daemon is running".green());
             println!("  PID: {}", pid);

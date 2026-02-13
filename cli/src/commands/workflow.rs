@@ -110,25 +110,26 @@ pub enum WorkflowCommand {
 pub async fn handle_command(
     command: WorkflowCommand,
     _config_path: Option<PathBuf>,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     match command {
         WorkflowCommand::Validate { file } => validate_workflow(file).await,
-        WorkflowCommand::Deploy { file } => deploy_workflow(file, port).await,
+        WorkflowCommand::Deploy { file } => deploy_workflow(file, host, port).await,
         WorkflowCommand::Run {
             name,
             input,
             params,
             follow,
-        } => run_workflow(name, input, params, follow, port).await,
-        WorkflowCommand::List { long, labels } => list_workflows(long, labels, port).await,
-        WorkflowCommand::Describe { name, output } => describe_workflow(name, output, port).await,
+        } => run_workflow(name, input, params, follow, host, port).await,
+        WorkflowCommand::List { long, labels } => list_workflows(long, labels, host, port).await,
+        WorkflowCommand::Describe { name, output } => describe_workflow(name, output, host, port).await,
         WorkflowCommand::Logs {
             execution_id,
             follow,
             transitions,
-        } => stream_workflow_logs(execution_id, follow, transitions, port).await,
-        WorkflowCommand::Delete { name, yes } => delete_workflow(name, yes, port).await,
+        } => stream_workflow_logs(execution_id, follow, transitions, host, port).await,
+        WorkflowCommand::Delete { name, yes } => delete_workflow(name, yes, host, port).await,
     }
 }
 
@@ -183,9 +184,9 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
 }
 
 /// Deploy a workflow to the registry
-async fn deploy_workflow(file: PathBuf, port: u16) -> Result<()> {
+async fn deploy_workflow(file: PathBuf, host: &str, port: u16) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
@@ -222,7 +223,7 @@ async fn deploy_workflow(file: PathBuf, port: u16) -> Result<()> {
     let workflow_name = workflow.metadata.name.clone();
 
     // Deploy via daemon API
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     client
         .deploy_workflow(&file)
         .await
@@ -242,10 +243,11 @@ async fn run_workflow(
     input_json: Option<String>,
     params: Vec<String>,
     follow: bool,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         _ => {
@@ -297,7 +299,7 @@ async fn run_workflow(
     println!();
 
     // Start execution via daemon API
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     let execution_id = client
         .run_workflow(&name, serde_json::Value::Object(input_params))
         .await
@@ -322,9 +324,9 @@ async fn run_workflow(
 }
 
 /// List registered workflows
-async fn list_workflows(long: bool, labels: Vec<String>, port: u16) -> Result<()> {
+async fn list_workflows(long: bool, labels: Vec<String>, host: &str, port: u16) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         _ => {
@@ -337,7 +339,7 @@ async fn list_workflows(long: bool, labels: Vec<String>, port: u16) -> Result<()
         }
     }
 
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     let workflows = client
         .list_workflows()
         .await
@@ -409,9 +411,9 @@ async fn list_workflows(long: bool, labels: Vec<String>, port: u16) -> Result<()
 }
 
 /// Describe a workflow (show YAML definition)
-async fn describe_workflow(name: String, output_format: String, port: u16) -> Result<()> {
+async fn describe_workflow(name: String, output_format: String, host: &str, port: u16) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         _ => {
@@ -424,7 +426,7 @@ async fn describe_workflow(name: String, output_format: String, port: u16) -> Re
         }
     }
 
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     let workflow_yaml = client
         .describe_workflow(&name)
         .await
@@ -454,10 +456,11 @@ async fn stream_workflow_logs(
     execution_id: Uuid,
     follow: bool,
     transitions_only: bool,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         _ => {
@@ -477,7 +480,7 @@ async fn stream_workflow_logs(
     }
     println!();
 
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     
     if follow {
         client
@@ -497,9 +500,9 @@ async fn stream_workflow_logs(
 }
 
 /// Delete a workflow from registry
-async fn delete_workflow(name: String, skip_confirmation: bool, port: u16) -> Result<()> {
+async fn delete_workflow(name: String, skip_confirmation: bool, host: &str, port: u16) -> Result<()> {
     // Check daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {}
         _ => {
@@ -530,7 +533,7 @@ async fn delete_workflow(name: String, skip_confirmation: bool, port: u16) -> Re
         }
     }
 
-    let client = DaemonClient::new(port)?;
+    let client = DaemonClient::new(host, port)?;
     client
         .delete_workflow(&name)
         .await

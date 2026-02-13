@@ -20,16 +20,22 @@ pub struct DaemonClient {
 }
 
 impl DaemonClient {
-    pub fn new(port: u16) -> Result<Self> {
+    pub fn new(host: &str, port: u16) -> Result<Self> {
         let client = Client::builder()
             // No global timeout for CLI client as we need long-lived streams
 
             .build()
             .context("Failed to create HTTP client")?;
 
+        let base_url = if host.starts_with("http://") || host.starts_with("https://") {
+            format!("{}:{}", host, port)
+        } else {
+            format!("http://{}:{}", host, port)
+        };
+
         Ok(Self {
             client,
-            base_url: format!("http://localhost:{}", port),
+            base_url,
         })
     }
 

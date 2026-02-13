@@ -101,10 +101,11 @@ pub enum TaskCommand {
 pub async fn handle_command(
     command: TaskCommand,
     config_path: Option<PathBuf>,
+    host: &str,
     port: u16,
 ) -> Result<()> {
     // Detect if daemon is running
-    let daemon_status = check_daemon_running().await;
+    let daemon_status = check_daemon_running(host, port).await;
     
     if let Ok(DaemonStatus::Unhealthy { pid, error }) = &daemon_status {
         println!("{}", format!("⚠ Daemon found (PID: {}) but unhealthy: {}", pid, error).yellow());
@@ -115,7 +116,7 @@ pub async fn handle_command(
 
     if use_daemon {
         info!("Delegating to daemon API");
-        let client = DaemonClient::new(port)?;
+        let client = DaemonClient::new(host, port)?;
         handle_command_daemon(command, client).await
     } else {
         info!("Daemon not running, using embedded mode");
