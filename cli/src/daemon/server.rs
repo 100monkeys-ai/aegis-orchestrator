@@ -83,6 +83,83 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let agent_repo = Arc::new(InMemoryAgentRepository::new());
     let execution_repo = Arc::new(InMemoryExecutionRepository::new());
     let event_bus = Arc::new(EventBus::new(100));
+
+    // Initialize Workflow Repository
+    let database_url = std::env::var("AEGIS_DATABASE_URL").ok();
+    let workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository> = if let Some(url) = database_url {
+        println!("Initializing PostgresWorkflowRepository with {}", url);
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(5)
+            .connect(&url)
+            .await 
+        {
+            Ok(pool) => {
+                println!("Connected to PostgreSQL.");
+                
+                // Check migration status
+                static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+                
+                let total_known = MIGRATOR.iter().count();
+                println!("INFO: Found {} migrations defined in binary.", total_known);
+                
+                if total_known == 0 {
+                    let msg = "CRITICAL: No migrations found in binary! Check build process.";
+                    tracing::error!("{}", msg);
+                    println!("{}", msg);
+                    // Panic to restart container and make issue obvious
+                    panic!("{}", msg);
+                }
+
+                // Check if we need to initialize (fresh install)
+                let applied_result = sqlx::query("SELECT version FROM _sqlx_migrations")
+                    .fetch_all(&pool)
+                    .await;
+
+                let applied_count = match applied_result {
+                    Ok(rows) => rows.len(),
+                    Err(_) => {
+                        println!("INFO: _sqlx_migrations table missing or empty. Assuming fresh install.");
+                        0
+                    },
+                };
+
+                println!("INFO: Database has {} applied migrations.", applied_count);
+
+                if applied_count == 0 {
+                    println!("Fresh installation detected. Initializing database...");
+                    match MIGRATOR.run(&pool).await {
+                        Ok(_) => println!("SUCCESS: Database initialized successfully."),
+                        Err(e) => {
+                            let msg = format!("ERROR: Failed to initialize database: {}", e);
+                            tracing::error!("{}", msg);
+                            println!("{}", msg);
+                            panic!("{}", msg); // Panic on init failure
+                        }
+                    }
+                } else {
+                    if applied_count < total_known {
+                        let pending = total_known - applied_count;
+                        tracing::warn!("Pending migrations found ({} pending).", pending);
+                        println!("WARNING: {} pending migrations found.", pending);
+                        println!("         Please run 'aegis update' to apply them.");
+                    } else {
+                        tracing::info!("Database is up to date.");
+                        println!("INFO: Database is up to date.");
+                    }
+                }
+
+                Arc::new(aegis_core::infrastructure::repositories::postgres::PostgresWorkflowRepository::new_with_pool(pool))
+            },
+            Err(e) => {
+                tracing::error!("Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
+                println!("ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
+                Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new())
+            }
+        }
+    } else {
+        println!("AEGIS_DATABASE_URL not set. Using InMemoryWorkflowRepository.");
+        Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new())
+    };
     
     println!("Initializing LLM registry...");
     let llm_registry = Arc::new(
@@ -111,7 +188,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Initializing workflow engine...");
     let validation_service = Arc::new(ValidationService::new(event_bus.clone(), execution_service.clone()));
-    let workflow_engine = Arc::new(WorkflowEngine::new(event_bus.clone(), validation_service, execution_service.clone()));
+    let workflow_engine = Arc::new(WorkflowEngine::new(
+        workflow_repo, 
+        event_bus.clone(), 
+        validation_service, 
+        execution_service.clone()
+    ));
     println!("Workflow engine initialized.");
 
     let app_state = AppState {

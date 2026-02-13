@@ -105,6 +105,12 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Update AEGIS database
+    #[command(name = "update")]
+    Update {
+        #[command(flatten)]
+        command: commands::UpdateCommand,
+    },
 }
 
 #[tokio::main]
@@ -136,6 +142,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Workflow { command }) => {
             commands::workflow::handle_command(command, cli.config, &cli.host, cli.port).await
+        }
+        Some(Commands::Update { command }) => {
+            commands::update::execute(command).await
         }
         None => {
             // No command provided - show help

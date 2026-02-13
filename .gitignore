@@ -33,3 +33,6 @@ docs/PIVOT/*
 
 # Rust Guardian
 guardian_report.*
+
+# Protocol Buffers
+cli/tools/*

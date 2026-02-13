@@ -94,7 +94,11 @@ async fn test_load_workflow_into_engine() {
     let event_bus = Arc::new(EventBus::with_default_capacity());
     let exec_service = Arc::new(MockExecutionService);
     let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
-    let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
+    
+    // Create in-memory repository for testing
+    let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
+    
+    let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service);
 
     // Load workflow
     let yaml_path = concat!(

@@ -48,7 +48,11 @@ fn create_test_engine() -> WorkflowEngine {
     let event_bus = Arc::new(EventBus::new(100));
     let exec_service = Arc::new(MockExecutionService);
     let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
-    WorkflowEngine::new(event_bus, val_service, exec_service)
+    
+    // Create in-memory repository for testing
+    let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
+    
+    WorkflowEngine::new(repository, event_bus, val_service, exec_service)
 }
 
 /// Helper to create test ExecutionInput

@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
+use crate::domain::workflow::{Workflow, WorkflowId};
 
 /// Storage backend enum for pluggable persistence
 #[derive(Debug, Clone)]
@@ -67,6 +68,28 @@ pub trait ExecutionRepository: Send + Sync {
     /// Delete execution by ID
     async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError>;
 }
+
+/// Repository interface for Workflow aggregates
+/// One repository per aggregate root (Workflow Context)
+#[async_trait]
+pub trait WorkflowRepository: Send + Sync {
+    /// Save workflow (create or update)
+    async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError>;
+    
+    /// Find workflow by ID
+    async fn find_by_id(&self, id: WorkflowId) -> Result<Option<Workflow>, RepositoryError>;
+    
+    /// Find workflow by name
+    async fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, RepositoryError>;
+    
+    /// List all workflows
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError>;
+    
+    /// Delete workflow by ID
+    async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError>;
+}
+
+
 
 /// Repository errors
 #[derive(Debug, thiserror::Error)]

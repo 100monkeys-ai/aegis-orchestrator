@@ -47,6 +47,7 @@ use crate::domain::agent::AgentId;
 // Note: JudgeVerdict and MAX_RECURSIVE_DEPTH will be used in Phase 3 for parallel judge evaluation
 // use crate::domain::judge::{JudgeVerdict, MAX_RECURSIVE_DEPTH};
 use crate::domain::events::ExecutionEvent;
+use crate::domain::repository::WorkflowRepository;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use crate::infrastructure::event_bus::EventBus;
 use crate::application::validation_service::ValidationService;
@@ -68,8 +69,8 @@ use futures::StreamExt;
 ///
 /// Orchestrates workflow execution using FSM pattern.
 pub struct WorkflowEngine {
-    /// Loaded workflow definitions (workflow_name -> workflow)
-    workflows: Arc<tokio::sync::RwLock<HashMap<String, Workflow>>>,
+    /// Workflow repository for persistence
+    repository: Arc<dyn WorkflowRepository>,
     
     /// Active workflow executions (execution_id -> workflow_execution)
     executions: Arc<tokio::sync::RwLock<HashMap<ExecutionId, WorkflowExecution>>>,
@@ -93,13 +94,15 @@ pub struct WorkflowEngine {
 
 impl WorkflowEngine {
     /// Create a new WorkflowEngine
+    /// Create a new WorkflowEngine
     pub fn new(
+        repository: Arc<dyn WorkflowRepository>,
         event_bus: Arc<EventBus>,
         validation_service: Arc<ValidationService>,
         execution_service: Arc<dyn ExecutionService>,
     ) -> Self {
         Self {
-            workflows: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+            repository,
             executions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             execution_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_bus,
@@ -143,22 +146,22 @@ impl WorkflowEngine {
             "Registering workflow"
         );
 
-        let mut workflows = self.workflows.write().await;
-        workflows.insert(workflow_name.clone(), workflow);
+        self.repository.save(&workflow).await?;
 
         Ok(workflow_id)
     }
 
     /// Get a workflow by name
     pub async fn get_workflow(&self, name: &str) -> Option<Workflow> {
-        let workflows = self.workflows.read().await;
-        workflows.get(name).cloned()
+        self.repository.find_by_name(name).await.ok().flatten()
     }
 
     /// List all registered workflows
     pub async fn list_workflows(&self) -> Vec<String> {
-        let workflows = self.workflows.read().await;
-        workflows.keys().cloned().collect()
+        match self.repository.list_all().await {
+            Ok(workflows) => workflows.into_iter().map(|w| w.metadata.name).collect(),
+            Err(_) => vec![],
+        }
     }
 
     // ========================================================================
@@ -613,8 +616,7 @@ impl WorkflowEngine {
     // ========================================================================
 
     async fn get_workflow_by_id(&self, workflow_id: WorkflowId) -> Option<Workflow> {
-        let workflows = self.workflows.read().await;
-        workflows.values().find(|w| w.id == workflow_id).cloned()
+        self.repository.find_by_id(workflow_id).await.ok().flatten()
     }
 
     /// Get execution context by ID (for recursive execution tracking)
@@ -718,8 +720,9 @@ mod tests {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -730,8 +733,9 @@ mod tests {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(event_bus, val_service, exec_service);
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
@@ -746,6 +750,7 @@ spec:
       command: echo "hello"
       transitions: []
 "#;
+
 
         let result = engine.load_workflow_from_yaml(yaml).await;
         assert!(result.is_ok());

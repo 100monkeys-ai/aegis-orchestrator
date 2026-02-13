@@ -41,6 +41,7 @@ COPY orchestrator/core ./orchestrator/core
 COPY orchestrator/swarm ./orchestrator/swarm
 COPY cli/src ./cli/src
 COPY cli/templates ./cli/templates
+COPY cli/migrations ./cli/migrations
 COPY cortex/src ./cortex/src
 COPY sdks/src ./sdks/src
 COPY proto ./proto
@@ -56,6 +57,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

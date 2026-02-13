@@ -29,7 +29,7 @@ use uuid::Uuid;
 
 /// Unique identifier for a Workflow definition
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkflowId(Uuid);
+pub struct WorkflowId(pub Uuid);
 
 impl WorkflowId {
     pub fn new() -> Self {

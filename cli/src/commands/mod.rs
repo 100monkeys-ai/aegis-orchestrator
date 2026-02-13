@@ -14,3 +14,5 @@ pub use self::daemon::DaemonCommand;
 pub use self::task::TaskCommand;
 pub use self::agent::AgentCommand;
 pub use self::workflow::WorkflowCommand;
+pub mod update;
+pub use self::update::UpdateCommand;
