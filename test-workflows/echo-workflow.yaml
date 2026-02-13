@@ -20,7 +20,7 @@ spec:
         MESSAGE: "{{workflow.context.message}}"
       timeout: 10s
       transitions:
-        - condition: exit_code_0
+        - condition: exit_code_zero
           target: COMPLETE
 
     COMPLETE:

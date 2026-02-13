@@ -90,7 +90,7 @@ export type TransitionCondition =
   | 'always'
   | 'on_success'
   | 'on_failure'
-  | 'exit_code_0'
+  | 'exit_code_zero'
   | 'exit_code_non_zero'
   | 'exit_code'
   | 'score_above'

@@ -69,6 +69,9 @@ cd /path/to/aegis-orchestrator
 
 # Start all services
 cd docker
+# Build containers
+docker compose build
+# Deploy containers
 docker compose up -d
 
 # Verify services are running
@@ -180,7 +183,7 @@ spec:
         MESSAGE: "{{workflow.context.message}}"
       timeout: 10s
       transitions:
-        - condition: exit_code_0
+        - condition: exit_code_zero
           target: COMPLETE
 
     COMPLETE:
@@ -194,8 +197,8 @@ spec:
 #### Step 1.2: Register Workflow (Manual Test)
 
 ```bash
-# Using Rust CLI (if implemented)
-cargo run --bin aegis-orchestrator -- workflow register test-workflows/echo-workflow.yaml
+# Using Rust CLI
+cargo run --bin aegis -- workflow deploy test-workflows/echo-workflow.yaml
 
 # OR using HTTP API
 curl -X POST http://localhost:8080/api/workflows/register \

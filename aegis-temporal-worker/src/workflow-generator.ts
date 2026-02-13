@@ -352,7 +352,7 @@ async function evaluateTransitionCondition(
     case 'on_failure':
       return stateOutput?.status === 'failed' || stateOutput?.status === 'error';
 
-    case 'exit_code_0':
+    case 'exit_code_zero':
       return stateOutput?.exit_code === 0;
 
     case 'exit_code_non_zero':

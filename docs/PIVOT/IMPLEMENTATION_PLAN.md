@@ -982,7 +982,7 @@ spec:
         INPUT: "{{GENERATE.output}}"
       
       transitions:
-        - condition: exit_code_0
+        - condition: exit_code_zero
           target: VALIDATE
         - condition: exit_code_non_zero
           target: REFINE
@@ -2406,7 +2406,7 @@ spec:
         PYTHONPATH: "/workspace"
       
       transitions:
-        - condition: exit_code_0
+        - condition: exit_code_zero
           target: AUDIT
         - condition: exit_code_non_zero
           target: CODE
