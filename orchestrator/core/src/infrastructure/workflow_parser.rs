@@ -152,7 +152,7 @@ pub enum TransitionConditionYaml {
     Always,
     OnSuccess,
     OnFailure,
-    ExitCode0,
+    ExitCodeZero,
     ExitCodeNonZero,
     ExitCode { value: i32 },
     ScoreAbove { threshold: f64 },
@@ -338,7 +338,7 @@ impl WorkflowParser {
             TransitionConditionYaml::Always => TransitionCondition::Always,
             TransitionConditionYaml::OnSuccess => TransitionCondition::OnSuccess,
             TransitionConditionYaml::OnFailure => TransitionCondition::OnFailure,
-            TransitionConditionYaml::ExitCode0 => TransitionCondition::ExitCode0,
+            TransitionConditionYaml::ExitCodeZero => TransitionCondition::ExitCodeZero,
             TransitionConditionYaml::ExitCodeNonZero => TransitionCondition::ExitCodeNonZero,
             TransitionConditionYaml::ExitCode { value } => TransitionCondition::ExitCode { value },
             TransitionConditionYaml::ScoreAbove { threshold } => {
@@ -478,7 +478,7 @@ impl WorkflowParser {
             TransitionCondition::Always => TransitionConditionYaml::Always,
             TransitionCondition::OnSuccess => TransitionConditionYaml::OnSuccess,
             TransitionCondition::OnFailure => TransitionConditionYaml::OnFailure,
-            TransitionCondition::ExitCode0 => TransitionConditionYaml::ExitCode0,
+            TransitionCondition::ExitCodeZero => TransitionConditionYaml::ExitCodeZero,
             TransitionCondition::ExitCodeNonZero => TransitionConditionYaml::ExitCodeNonZero,
             TransitionCondition::ExitCode { value } => {
                 TransitionConditionYaml::ExitCode { value: *value }

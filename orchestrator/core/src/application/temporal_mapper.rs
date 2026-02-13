@@ -273,7 +273,7 @@ impl TemporalWorkflowMapper {
             TransitionCondition::Always => ("always".to_string(), None, None, None, None, None, None),
             TransitionCondition::OnSuccess => ("on_success".to_string(), None, None, None, None, None, None),
             TransitionCondition::OnFailure => ("on_failure".to_string(), None, None, None, None, None, None),
-            TransitionCondition::ExitCode0 => ("exit_code_zero".to_string(), None, None, None, None, None, None),
+            TransitionCondition::ExitCodeZero => ("exit_code_zero".to_string(), None, None, None, None, None, None),
             TransitionCondition::ExitCodeNonZero => {
                 ("exit_code_non_zero".to_string(), None, None, None, None, None, None)
             }

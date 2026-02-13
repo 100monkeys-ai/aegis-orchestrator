@@ -416,7 +416,7 @@ pub enum TransitionCondition {
     OnFailure,
 
     /// System state exit code is 0
-    ExitCode0,
+    ExitCodeZero,
 
     /// System state exit code is non-zero
     ExitCodeNonZero,

@@ -89,7 +89,7 @@ spec:
       
       # Branch based on execution result
       transitions:
-        - condition: exit_code0
+        - condition: exit_code_zero
           target: VALIDATE
         
         - condition: exit_code_non_zero

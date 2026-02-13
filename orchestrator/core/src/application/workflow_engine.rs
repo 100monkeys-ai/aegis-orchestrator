@@ -477,7 +477,7 @@ impl WorkflowEngine {
                 !state_output.get("success").and_then(|v| v.as_bool()).unwrap_or(true)
             }
 
-            TransitionCondition::ExitCode0 => {
+            TransitionCondition::ExitCodeZero => {
                 state_output.get("exit_code").and_then(|v| v.as_i64()).unwrap_or(1) == 0
             }
 
