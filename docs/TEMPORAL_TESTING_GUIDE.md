@@ -96,13 +96,9 @@ docker compose ps
 
 **Note:** All Docker files are now organized in the `docker/` directory. See `docker/README.md` for detailed infrastructure documentation.
 
-### 2. Database Migration
+### 2. Database Verification
 
 ```bash
-# Apply migration (run from orchestrator root)
-psql -h localhost -U aegis -d aegis -f migrations/001_temporal_era.sql
-# Password: temporal
-
 # Verify tables
 psql -h localhost -U aegis -d aegis -c "\dt"
 
@@ -119,52 +115,6 @@ psql -h localhost -U aegis -d aegis -c "\dv"
 # Expected views:
 # - active_workflow_executions
 # - agent_success_rates
-```
-
-### 3. Build Rust Services
-
-```bash
-cd orchestrator/core
-
-# Compile with protobuf generation
-cargo build --release
-
-# Expected output:
-# Compiling aegis-core v0.1.0
-# Built: target/release/aegis-core
-```
-
-### 4. Build TypeScript Worker
-
-```bash
-cd aegis-temporal-worker
-
-# Install dependencies
-npm install
-
-# Build TypeScript
-npm run build
-
-# Verify build
-ls dist/
-# Expected: index.js, server.js, worker.js, config.js, etc.
-```
-
-### 5. Verify Temporal Mapper (Unit Test)
-
-Before running full integration tests, verify that the Rust-side mapper is correctly generating Temporal definitions.
-
-```bash
-cd orchestrator/core
-cargo test --test temporal_mapper_tests
-```
-
-**Expected Output:**
-
-```text
-running 1 test
-test test_map_100monkeys_workflow ... ok
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
 ```
 
 ---
