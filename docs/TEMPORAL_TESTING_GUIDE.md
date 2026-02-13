@@ -95,10 +95,11 @@ docker compose ps
 
 ```bash
 # Apply migration (run from orchestrator root)
-psql -h localhost -U aegis -d aegis_db -f migrations/001_temporal_era.sql
+psql -h localhost -U temporal -d temporal -f migrations/001_temporal_era.sql
+# Password: temporal
 
 # Verify tables
-psql -h localhost -U aegis -d aegis_db -c "\dt"
+psql -h localhost -U temporal -d temporal -c "\dt"
 
 # Expected tables:
 # - workflows
@@ -108,7 +109,7 @@ psql -h localhost -U aegis -d aegis_db -c "\dt"
 # - workflow_definitions
 
 # Verify views
-psql -h localhost -U aegis -d aegis_db -c "\dv"
+psql -h localhost -U temporal -d temporal -c "\dv"
 
 # Expected views:
 # - active_workflow_executions
@@ -218,7 +219,7 @@ curl -X POST http://localhost:8080/api/workflows/register \
 
 ```bash
 # Check database
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT id, name, version FROM workflows WHERE name = 'echo-test';"
 
 # Check TypeScript worker
@@ -264,7 +265,7 @@ Result: {
 
 ```bash
 # Check database
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT * FROM workflow_executions WHERE temporal_workflow_id = 'test-echo-001';"
 
 # Check Temporal UI
@@ -397,7 +398,7 @@ temporal workflow show --workflow-id test-agent-001 --follow
 
 ```bash
 # Check executions table
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT agent_id, status, iterations FROM executions ORDER BY started_at DESC LIMIT 1;"
 
 # Expected:
@@ -422,7 +423,7 @@ cargo run --bin aegis-orchestrator -- agent deploy demo-agents/coder/agent.yaml
 cargo run --bin aegis-orchestrator -- agent deploy demo-agents/judges/basic-judge.yaml
 
 # Verify deployments
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT name, status FROM agents;"
 ```
 
@@ -511,14 +512,14 @@ temporal workflow show --workflow-id test-100monkeys-001 --follow
 
 ```bash
 # Check workflow execution
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT we.id, we.status, we.started_at, we.completed_at, w.name
    FROM workflow_executions we
    JOIN workflows w ON we.workflow_id = w.id
    WHERE we.temporal_workflow_id = 'test-100monkeys-001';"
 
 # Check agent executions (should be multiple for refinement loop)
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT agent_id, status, jsonb_array_length(iterations) as iteration_count
    FROM executions
    WHERE workflow_execution_id = (
@@ -886,13 +887,13 @@ grpcurl -plaintext -d '{"command":"echo test"}' \
 
 ```bash
 # Check database connection
-psql -h localhost -U aegis -d aegis_db -c "SELECT 1;"
+psql -h localhost -U temporal -d temporal -c "SELECT 1;"
 
 # Check worker logs
 docker logs aegis-temporal-worker
 
 # Verify schema
-psql -h localhost -U aegis -d aegis_db -c "\dt workflow_definitions"
+psql -h localhost -U temporal -d temporal -c "\dt workflow_definitions"
 
 # Test with minimal workflow
 curl -X POST http://localhost:3000/register-workflow \
@@ -911,7 +912,7 @@ curl -X POST http://localhost:3000/register-workflow \
 
 ```bash
 # Check agent is deployed
-psql -h localhost -U aegis -d aegis_db -c \
+psql -h localhost -U temporal -d temporal -c \
   "SELECT name, status FROM agents WHERE name = 'coder';"
 
 # Check execution service
@@ -1042,7 +1043,7 @@ docker compose logs -f temporal-worker
 docker compose logs -f aegis-runtime
 
 # Database queries
-psql -h localhost -U aegis -d aegis_db
+psql -h localhost -U temporal -d temporal
 
 # Temporal CLI
 temporal workflow list

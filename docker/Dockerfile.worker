@@ -1,5 +1,6 @@
 # Dockerfile for AEGIS Temporal Worker
-FROM node:20-alpine AS builder
+# Using Debian-based image for glibc compatibility with Temporal native addons
+FROM node:20-slim AS builder
 
 WORKDIR /app
 
@@ -17,7 +18,7 @@ COPY aegis-temporal-worker/src ./src
 RUN npm run build
 
 # Production image
-FROM node:20-alpine
+FROM node:20-slim
 
 WORKDIR /app
 
@@ -27,6 +28,9 @@ RUN npm ci --production
 
 # Copy built artifacts from builder
 COPY --from=builder /app/dist ./dist
+
+# Copy proto files (needed at runtime for gRPC client)
+COPY proto ./proto
 
 # Create data directory
 RUN mkdir -p /app/data

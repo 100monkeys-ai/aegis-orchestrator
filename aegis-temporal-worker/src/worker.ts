@@ -29,14 +29,19 @@ export async function startWorker(): Promise<void> {
     logger.info({ workflow_count: Object.keys(workflowFunctions).length }, 'Loaded workflow functions');
 
     // Create worker pointing to workflows directory
+    // Using fileURLToPath for ESM compatibility
     const worker = await Worker.create({
       connection,
       namespace: config.temporal.namespace,
       taskQueue: config.temporal.taskQueue,
-      workflowsPath: require.resolve('./workflows'),
+      workflowsPath: new URL('./workflows/index.js', import.meta.url).pathname,
       activities,
       maxConcurrentActivityTaskExecutions: config.worker.maxConcurrentActivityTaskExecutions,
       maxConcurrentWorkflowTaskExecutions: config.worker.maxConcurrentWorkflowTaskExecutions,
+      bundlerOptions: {
+        // Ignore non-deterministic modules that are imported by dependencies but not used at runtime
+        ignoreModules: ['fs', 'path', 'os', 'crypto'],
+      },
     });
 
     logger.info(
@@ -52,7 +57,11 @@ export async function startWorker(): Promise<void> {
 
     logger.info('Temporal worker is running');
   } catch (error) {
-    logger.error({ error }, 'Failed to start Temporal worker');
+    logger.error({ 
+      error,
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : undefined
+    }, 'Failed to start Temporal worker');
     throw error;
   }
 }

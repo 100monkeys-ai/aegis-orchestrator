@@ -88,10 +88,11 @@ services:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_NAMESPACE=default
       - TEMPORAL_TASK_QUEUE=aegis-agents
-      - DATABASE_URL=postgresql://temporal:temporal@postgres:5432/aegis
+      - DATABASE_URL=postgresql://temporal:temporal@postgres:5432/temporal
       - AEGIS_RUNTIME_GRPC_URL=aegis-runtime:50051
       - NODE_ENV=development
       - LOG_LEVEL=info
+      - PROTO_PATH=/app/proto/aegis_runtime.proto
     ports:
       - "3000:3000"   # HTTP API for workflow registration
     networks:

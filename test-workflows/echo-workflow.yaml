@@ -1,0 +1,31 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "echo-test"
+  version: "1.0.0"
+  description: "Simple echo workflow for testing"
+
+spec:
+  context:
+    message: "Hello from Temporal!"
+
+  initial_state: ECHO
+
+  states:
+    ECHO:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "{{workflow.context.message}}"
+      timeout: 10s
+      transitions:
+        - condition: exit_code_0
+          target: COMPLETE
+
+    COMPLETE:
+      kind: System
+      command: "echo"
+      env:
+        RESULT: "Workflow completed successfully"
+      transitions: []

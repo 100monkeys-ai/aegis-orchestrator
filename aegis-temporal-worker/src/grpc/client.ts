@@ -21,7 +21,9 @@ import type {
 } from '../types.js';
 
 // Load protobuf definition
-const PROTO_PATH = '../../proto/aegis_runtime.proto';
+// In Docker: /app/proto/aegis_runtime.proto
+// In development: ../../proto/aegis_runtime.proto (from aegis-temporal-worker/src/grpc/)
+const PROTO_PATH = process.env.PROTO_PATH || '../../proto/aegis_runtime.proto';
 
 const packageDefinition = protoLoader.loadSync(PROTO_PATH, {
   keepCase: true,
@@ -38,7 +40,8 @@ class AegisRuntimeClient {
   private client: any;
 
   constructor(serverAddress: string) {
-    this.client = new aegisProto.aegis_runtime.AegisRuntime(
+    // Package name is aegis.runtime.v1
+    this.client = new aegisProto.aegis.runtime.v1.AegisRuntime(
       serverAddress,
       grpc.credentials.createInsecure()
     );
