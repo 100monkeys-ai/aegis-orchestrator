@@ -1,0 +1,138 @@
+version: "3.8"
+
+# AEGIS Temporal Infrastructure
+# Self-hosted Temporal Server with PostgreSQL backend
+# For development and production deployment
+
+services:
+  # PostgreSQL database for both Temporal and AEGIS
+  postgres:
+    image: postgres:15-alpine
+    container_name: aegis-postgres
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ../migrations:/docker-entrypoint-initdb.d
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U temporal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Temporal Server (auto-setup version for easy deployment)
+  temporal:
+    image: temporalio/auto-setup:1.23.0
+    container_name: aegis-temporal
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DB=postgresql
+      - DB_PORT=5432
+      - POSTGRES_USER=temporal
+      - POSTGRES_PWD=temporal
+      - POSTGRES_SEEDS=postgres
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      - ENABLE_ES=false
+      - ES_SEEDS=
+      - ES_VERSION=v7
+    ports:
+      - "7233:7233"   # gRPC endpoint for clients and workers
+      - "6933:6933"   # gRPC endpoint for history service
+      - "6934:6934"   # gRPC endpoint for matching service
+      - "6935:6935"   # gRPC endpoint for worker service
+      - "6939:6939"   # gRPC endpoint for frontend service
+    networks:
+      - aegis-network
+    volumes:
+      - ../config/temporal:/etc/temporal/config/dynamicconfig
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "cluster", "health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Temporal Web UI for workflow visualization and debugging
+  temporal-ui:
+    image: temporalio/ui:2.21.3
+    container_name: aegis-temporal-ui
+    depends_on:
+      - temporal
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_CORS_ORIGINS=http://localhost:3000
+    ports:
+      - "8233:8080"   # Access UI at http://localhost:8233
+    networks:
+      - aegis-network
+
+  # AEGIS Temporal Worker (TypeScript)
+  temporal-worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.worker
+    container_name: aegis-temporal-worker
+    depends_on:
+      temporal:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - TEMPORAL_NAMESPACE=default
+      - TEMPORAL_TASK_QUEUE=aegis-agents
+      - DATABASE_URL=postgresql://temporal:temporal@postgres:5432/aegis
+      - AEGIS_RUNTIME_GRPC_URL=aegis-runtime:50051
+      - NODE_ENV=development
+      - LOG_LEVEL=info
+    ports:
+      - "3000:3000"   # HTTP API for workflow registration
+    networks:
+      - aegis-network
+    volumes:
+      - ../aegis-temporal-worker/src:/app/src
+      - temporal-worker-data:/app/data
+    restart: unless-stopped
+
+  # AEGIS Runtime Service (Rust gRPC Server)
+  aegis-runtime:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.runtime
+    container_name: aegis-runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - DATABASE_URL=postgresql://temporal:temporal@postgres:5432/aegis
+      - RUST_LOG=info,aegis_orchestrator=debug
+      - TEMPORAL_WORKER_URL=http://temporal-worker:3000
+    ports:
+      - "8080:8080"   # gRPC server for orchestrator API
+      - "50051:50051" # gRPC server for worker activities
+    networks:
+      - aegis-network
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock  # For Docker-based agent isolation
+      - ../demo-agents:/app/demo-agents
+      - aegis-runtime-data:/app/data
+    restart: unless-stopped
+
+networks:
+  aegis-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  temporal-worker-data:
+    driver: local
+  aegis-runtime-data:
+    driver: local

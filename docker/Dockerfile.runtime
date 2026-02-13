@@ -1,0 +1,76 @@
+# Multi-stage build for AEGIS Runtime Service
+# This builds the Rust gRPC server that provides ExecutionService, ValidationService, etc.
+
+# Stage 1: Build the Rust binary
+FROM rust:latest as builder
+
+# Install build dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy workspace Cargo files for dependency caching
+COPY Cargo.toml Cargo.lock ./
+COPY orchestrator/core/Cargo.toml ./orchestrator/core/
+COPY orchestrator/swarm/Cargo.toml ./orchestrator/swarm/
+COPY cli/Cargo.toml ./cli/
+COPY cortex/Cargo.toml ./cortex/
+COPY sdks/Cargo.toml ./sdks/
+
+# Create dummy source files to build dependencies
+RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src cortex/src sdks/src && \
+    echo "fn main() {}" > cli/src/main.rs && \
+    echo "pub fn dummy() {}" > orchestrator/core/src/lib.rs && \
+    echo "pub fn dummy() {}" > orchestrator/swarm/src/lib.rs && \
+    echo "pub fn dummy() {}" > cortex/src/lib.rs && \
+    echo "pub fn dummy() {}" > sdks/src/lib.rs
+
+# Build dependencies only (skip building to avoid edition2024 issues with dummy files)
+# We'll do a full build after copying real source
+RUN cargo fetch --locked
+
+# Remove dummy source files (keep cargo cache)
+RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src cortex/src sdks/src target
+
+# Copy actual source code
+COPY orchestrator/core ./orchestrator/core
+COPY orchestrator/swarm ./orchestrator/swarm
+COPY cli/src ./cli/src
+COPY cli/templates ./cli/templates
+COPY cortex/src ./cortex/src
+COPY sdks/src ./sdks/src
+COPY proto ./proto
+
+# Build the actual binary with all real source
+RUN cargo build --release --bin aegis --locked
+
+# Stage 2: Runtime image
+FROM debian:bookworm-slim
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the built binary from builder
+COPY --from=builder /app/target/release/aegis /usr/local/bin/aegis-runtime
+
+# Copy configuration files
+COPY aegis-config.yaml ./
+
+# Expose gRPC ports
+EXPOSE 8080 50051
+
+# Run as non-root user
+RUN useradd -m -u 1000 aegis && chown -R aegis:aegis /app
+USER aegis
+
+# Start the gRPC server
+CMD ["aegis-runtime", "server", "--grpc-port", "50051"]

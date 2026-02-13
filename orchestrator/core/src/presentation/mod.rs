@@ -2,3 +2,4 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 pub mod api;
+pub mod grpc;

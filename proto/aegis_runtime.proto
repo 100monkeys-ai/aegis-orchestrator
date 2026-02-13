@@ -1,0 +1,243 @@
+// AEGIS Runtime Service Protocol
+// gRPC service definition for communication between TypeScript Temporal Worker and Rust Runtime
+syntax = "proto3";
+
+package aegis.runtime.v1;
+
+// =============================================================================
+// AEGIS Runtime Service
+// Exposes agent execution, validation, and system operations
+// =============================================================================
+
+service AegisRuntime {
+  // Execute an agent with 100monkeys iterative refinement
+  rpc ExecuteAgent(ExecuteAgentRequest) returns (stream ExecutionEvent);
+  
+  // Execute a system command
+  rpc ExecuteSystemCommand(ExecuteSystemCommandRequest) returns (ExecuteSystemCommandResponse);
+  
+  // Validate output using gradient scoring (judge agents)
+  rpc ValidateWithJudges(ValidateRequest) returns (ValidateResponse);
+  
+  // Query Cortex for patterns
+  rpc QueryCortexPatterns(QueryCortexRequest) returns (QueryCortexResponse);
+  
+  // Store a learned pattern in Cortex
+  rpc StoreCortexPattern(StoreCortexPatternRequest) returns (StoreCortexPatternResponse);
+}
+
+// =============================================================================
+// ExecuteAgent RPC
+// =============================================================================
+
+message ExecuteAgentRequest {
+  string agent_id = 1;
+  string input = 2;
+  map<string, string> context = 3;
+  optional SecurityPolicy security_policy = 4;
+  optional string workflow_execution_id = 5; // Link to workflow execution
+}
+
+message ExecutionEvent {
+  oneof event {
+    ExecutionStarted execution_started = 1;
+    IterationStarted iteration_started = 2;
+    IterationOutput iteration_output = 3;
+    IterationCompleted iteration_completed = 4;
+    IterationFailed iteration_failed = 5;
+    RefinementApplied refinement_applied = 6;
+    ExecutionCompleted execution_completed = 7;
+    ExecutionFailed execution_failed = 8;
+  }
+}
+
+message ExecutionStarted {
+  string execution_id = 1;
+  string agent_id = 2;
+  string started_at = 3; // ISO 8601 timestamp
+}
+
+message IterationStarted {
+  string execution_id = 1;
+  uint32 iteration_number = 2;
+  string action = 3;
+  string started_at = 4;
+}
+
+message IterationOutput {
+  string execution_id = 1;
+  uint32 iteration_number = 2;
+  string output = 3;
+}
+
+message IterationCompleted {
+  string execution_id = 1;
+  uint32 iteration_number = 2;
+  string output = 3;
+  string completed_at = 4;
+}
+
+message IterationFailed {
+  string execution_id = 1;
+  uint32 iteration_number = 2;
+  IterationError error = 3;
+  string failed_at = 4;
+}
+
+message IterationError {
+  string error_type = 1;
+  string message = 2;
+  optional string stacktrace = 3;
+}
+
+message RefinementApplied {
+  string execution_id = 1;
+  uint32 iteration_number = 2;
+  string code_diff = 3;
+  string applied_at = 4;
+}
+
+message ExecutionCompleted {
+  string execution_id = 1;
+  string final_output = 2;
+  uint32 total_iterations = 3;
+  string completed_at = 4;
+}
+
+message ExecutionFailed {
+  string execution_id = 1;
+  string reason = 2;
+  uint32 total_iterations = 3;
+  string failed_at = 4;
+}
+
+message SecurityPolicy {
+  NetworkPolicy network_policy = 1;
+  FilesystemPolicy filesystem_policy = 2;
+  ResourceLimits resource_limits = 3;
+}
+
+message NetworkPolicy {
+  repeated string allowed_domains = 1;
+  repeated string blocked_domains = 2;
+}
+
+message FilesystemPolicy {
+  repeated string read_paths = 1;
+  repeated string write_paths = 2;
+}
+
+message ResourceLimits {
+  uint32 cpu_millicores = 1;
+  uint64 memory_bytes = 2;
+  uint32 timeout_seconds = 3;
+}
+
+// =============================================================================
+// ExecuteSystemCommand RPC
+// =============================================================================
+
+message ExecuteSystemCommandRequest {
+  string command = 1;
+  map<string, string> env = 2;
+  optional string workdir = 3;
+  optional uint32 timeout_seconds = 4;
+}
+
+message ExecuteSystemCommandResponse {
+  int32 exit_code = 1;
+  string stdout = 2;
+  string stderr = 3;
+  uint64 duration_ms = 4;
+}
+
+// =============================================================================
+// ValidateWithJudges RPC
+// =============================================================================
+
+message ValidateRequest {
+  string output = 1;
+  string task = 2;
+  repeated JudgeConfig judges = 3;
+  ConsensusConfig consensus = 4;
+}
+
+message JudgeConfig {
+  string agent_id = 1;
+  string input_template = 2;
+  float weight = 3;
+}
+
+message ConsensusConfig {
+  enum Strategy {
+    WEIGHTED_AVERAGE = 0;
+    MAJORITY_VOTE = 1;
+    UNANIMOUS = 2;
+    ANY_APPROVED = 3;
+  }
+  Strategy strategy = 1;
+  optional float threshold = 2;
+  optional float agreement = 3;
+  optional uint32 n = 4;
+}
+
+message ValidateResponse {
+  float score = 1; // 0.0 - 1.0
+  float confidence = 2; // 0.0 - 1.0
+  string reasoning = 3;
+  bool binary_valid = 4;
+  repeated JudgeResult individual_results = 5;
+}
+
+message JudgeResult {
+  string judge_id = 1;
+  float score = 2;
+  float confidence = 3;
+  string reasoning = 4;
+}
+
+// =============================================================================
+// Cortex RPCs
+// =============================================================================
+
+message QueryCortexRequest {
+  string error_signature = 1;
+  optional string error_type = 2;
+  optional uint32 limit = 3;
+  optional float min_success_score = 4;
+}
+
+message QueryCortexResponse {
+  repeated CortexPattern patterns = 1;
+}
+
+message CortexPattern {
+  string id = 1;
+  string error_signature_hash = 2;
+  string error_type = 3;
+  string error_message = 4;
+  string solution_approach = 5;
+  optional string solution_code = 6;
+  uint32 frequency = 7;
+  uint32 success_count = 8;
+  uint32 total_count = 9;
+  float success_score = 10;
+  string created_at = 11;
+  string last_used_at = 12;
+}
+
+message StoreCortexPatternRequest {
+  string error_signature = 1;
+  string error_type = 2;
+  string error_message = 3;
+  string solution_approach = 4;
+  optional string solution_code = 5;
+  optional string agent_id = 6;
+  repeated string tags = 7;
+}
+
+message StoreCortexPatternResponse {
+  string pattern_id = 1;
+  bool deduplicated = 2; // true if pattern already existed and weight was incremented
+  uint32 new_frequency = 3;
+}
