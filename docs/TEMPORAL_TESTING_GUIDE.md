@@ -15,6 +15,11 @@
 5. [Expected Outcomes](#expected-outcomes)
 6. [Troubleshooting](#troubleshooting)
 
+> [!NOTE]
+> **Future Improvement:** Currently, the application writes to both `workflows` and `workflow_definitions` tables in the same repository method.
+> In a future iteration, we should move the `workflow_definitions` insert to a database trigger or an event-driven subscriber that listens to changes on the `workflows` table.
+> This will ensure better separation of concerns and robustness.
+
 ---
 
 ## Overview

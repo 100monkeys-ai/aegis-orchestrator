@@ -6,29 +6,31 @@ use crate::domain::repository::{WorkflowRepository, RepositoryError};
 use crate::domain::workflow::{Workflow, WorkflowId};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 
+use sha2::{Sha256, Digest};
+use std::fmt::Write;
+
 pub struct PostgresWorkflowRepository {
     pool: PgPool,
 }
 
 impl PostgresWorkflowRepository {
     pub fn new(_connection_string: String) -> Self {
-        // NOTE: This assumes connection_string isn't needed here if we pass the pool, 
-        // but the factory interface passes connection string.
-        // For simplicity, let's change the factory to panic or fix it properly later. 
-        // Ideally we should reuse the pool.
-        // But `create_workflow_repository` factory in `repository.rs` takes a `StorageBackend` enum which has config.
-        // We will need to create a pool here.
-        // BLOCKING ISSUE: Creating a pool is async, but `create_workflow_repository` is synchronous.
-        // We might need to change how repositories are created or pass a lazy pool.
-        
-        // However, `server.rs` already creates a pool.
-        // Let's assume for now we construct it with a pool, but we need to change standard factory pattern or just let binding layer handle it.
-        // For this file, let's provide a constructor that takes the pool, and we'll fix the factory usage or simply instantiate it directly in `server.rs`.
         unimplemented!("Use new_with_pool instad")
     }
 
     pub fn new_with_pool(pool: PgPool) -> Self {
         Self { pool }
+    }
+    
+    fn compute_hash(json: &serde_json::Value) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(json.to_string().as_bytes());
+        let result = hasher.finalize();
+        let mut hex_string = String::new();
+        for byte in result {
+            let _ = write!(hex_string, "{:02x}", byte);
+        }
+        hex_string
     }
 }
 
@@ -66,14 +68,36 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         )
         .bind(workflow.id.0)
         .bind(&workflow.metadata.name)
-        .bind(version)
-        .bind(description)
+        .bind(&version)
+        .bind(&description)
         .bind(yaml_source)
-        .bind(definition_json)
-        .bind(temporal_def_json)
+        .bind(&definition_json)
+        .bind(&temporal_def_json)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflows: {}", e)))?;
+
+        // Also save to shared workflow_definitions table for TypeScript worker
+        let def_hash = Self::compute_hash(&temporal_def_json);
+        
+        sqlx::query(
+            r#"
+            INSERT INTO workflow_definitions (workflow_id, name, definition, definition_hash, registered_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (workflow_id) DO UPDATE SET
+                name = EXCLUDED.name,
+                definition = EXCLUDED.definition,
+                definition_hash = EXCLUDED.definition_hash,
+                registered_at = NOW()
+            "#
+        )
+        .bind(workflow.id.0)
+        .bind(&workflow.metadata.name)
+        .bind(&temporal_def_json)
+        .bind(def_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflow_definitions: {}", e)))?;
 
         Ok(())
     }
