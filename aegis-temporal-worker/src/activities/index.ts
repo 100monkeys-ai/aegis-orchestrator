@@ -23,17 +23,10 @@ export async function executeAgentActivity(params: {
 }): Promise<any> {
   logger.info({ agent_id: params.agentId }, 'Executing agent activity');
 
-  // Build context map with input and blackboard data
-  const contextMap: Record<string, string> = {
-    input: params.input,
-    ...Object.fromEntries(
-      Object.entries(params.context).map(([k, v]) => [k, String(v)])
-    ),
-  };
-
   const request: ExecuteAgentRequest = {
     agent_id: params.agentId,
-    context: contextMap,
+    input: params.input,
+    context_json: JSON.stringify(params.context),
     timeout_seconds: 300,
   };
 
@@ -151,7 +144,8 @@ export async function executeParallelAgentsActivity(params: {
       params.agents.map(async (agentConfig) => {
         const events = await aegisRuntimeClient.executeAgent({
           agent_id: agentConfig.agent,
-          context: { input: agentConfig.input },
+          input: agentConfig.input,
+          context_json: JSON.stringify({ input: agentConfig.input }),
           timeout_seconds: 300,
         });
 

@@ -33,7 +33,7 @@ service AegisRuntime {
 message ExecuteAgentRequest {
   string agent_id = 1;
   string input = 2;
-  map<string, string> context = 3;
+  string context_json = 3;
   optional SecurityPolicy security_policy = 4;
   optional string workflow_execution_id = 5; // Link to workflow execution
 }

@@ -20,26 +20,26 @@ export interface TemporalWorkflowDefinition {
  */
 export interface WorkflowState {
   kind: StateKind;
-  
+
   // Agent-specific fields
   agent?: string;
   input?: string;
   isolation?: 'firecracker' | 'docker' | 'process';
   timeout?: string;
-  
+
   // System-specific fields
   command?: string;
   env?: Record<string, string>;
   workdir?: string;
-  
+
   // Human-specific fields
   prompt?: string;
   default_response?: string;
-  
+
   // ParallelAgents-specific fields
   agents?: ParallelAgentConfig[];
   consensus?: ConsensusConfig;
-  
+
   // Transitions
   transitions: TransitionRule[];
 }
@@ -197,7 +197,8 @@ export interface ConsensusResult {
  */
 export interface ExecuteAgentRequest {
   agent_id: string;
-  context: Record<string, string>;
+  input?: string;
+  context_json: string;
   timeout_seconds?: number;
 }
 
@@ -205,9 +206,9 @@ export interface ExecuteAgentRequest {
  * Execution event (streaming response)
  */
 export interface ExecutionEvent {
-  event_type: 'ExecutionStarted' | 'IterationStarted' | 'IterationCompleted' | 
-               'IterationFailed' | 'RefinementApplied' | 'ExecutionCompleted' | 
-               'ExecutionFailed';
+  event_type: 'ExecutionStarted' | 'IterationStarted' | 'IterationCompleted' |
+  'IterationFailed' | 'RefinementApplied' | 'ExecutionCompleted' |
+  'ExecutionFailed';
   execution_id: string;
   timestamp: string;
   iteration_number?: number;

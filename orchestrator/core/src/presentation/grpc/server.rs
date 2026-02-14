@@ -63,14 +63,16 @@ impl AegisRuntime for AegisRuntimeService {
             .map_err(|e| Status::invalid_argument(format!("Invalid agent_id: {}", e)))?;
 
         // Create execution input
-        let mut context_map = serde_json::Map::new();
-        for (k, v) in req.context {
-            context_map.insert(k, serde_json::Value::String(v));
-        }
-        
+        let payload = if req.context_json.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_str(&req.context_json)
+                .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {}", e)))?
+        };
+
         let input = ExecutionInput {
             intent: Some(req.input.clone()),
-            payload: serde_json::Value::Object(context_map),
+            payload,
         };
 
         // Channel for streaming events
