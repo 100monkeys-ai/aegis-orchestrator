@@ -711,7 +711,7 @@ impl DaemonClient {
         let response = self
             .client
             .get(&format!(
-                "{}/api/workflows/executions/{}",
+                "{}/api/workflows/executions/{}/logs",
                 self.base_url, execution_id
             ))
             .send()

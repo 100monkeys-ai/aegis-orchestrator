@@ -36,6 +36,7 @@ use aegis_core::{
         llm::registry::ProviderRegistry,
         repositories::{InMemoryAgentRepository, InMemoryExecutionRepository},
         runtime::DockerRuntime,
+        temporal_client::TemporalClient,
     },
 };
 
@@ -187,18 +188,63 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     println!("Initializing workflow engine...");
+    
+    // Initialize Temporal Client
+    let temporal_address = std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "temporal:7233".to_string());
+    println!("Initializing Temporal Client (Address: {})...", temporal_address);
+    
+    // Initialize Temporal Client (Async / Non-blocking)
+    let temporal_address = std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "temporal:7233".to_string());
+    println!("Initializing Temporal Client (Address: {})...", temporal_address);
+    
+    // Create a shared container for the client that relies on interior mutability
+    let temporal_client_container = Arc::new(tokio::sync::RwLock::new(None));
+    let temporal_client_container_clone = temporal_client_container.clone();
+    
+    // Spawn background task to connect
+    tokio::spawn(async move {
+        let mut retries = 0;
+        let max_retries = 30; // Try for 1 minute (2s * 30) or indefinitely? User said "eventually timeout/quit trying"
+        
+        loop {
+            match TemporalClient::new(&temporal_address, "default", "aegis-agents").await {
+                Ok(client) => {
+                    println!("Async: Temporal Client connected successfully.");
+                    let mut lock = temporal_client_container_clone.write().await;
+                    *lock = Some(Arc::new(client));
+                    break;
+                },
+                Err(e) => {
+                    retries += 1;
+                    if retries >= max_retries {
+                        println!("Async WARNING: Failed to connect to Temporal after {} attempts. Giving up. Workflow execution will fail.", retries);
+                        tracing::error!("Async: Failed to connect to Temporal: {}. Giving up.", e);
+                        break;
+                    }
+                    
+                    if retries % 5 == 0 {
+                        println!("Async INFO: Still verifying Temporal connection... ({}/{})", retries, max_retries);
+                    }
+                    tracing::debug!("Async: Failed to connect to Temporal: {}. Retrying in 2s...", e);
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+    });
+    
     let validation_service = Arc::new(ValidationService::new(event_bus.clone(), execution_service.clone()));
     let workflow_engine = Arc::new(WorkflowEngine::new(
         workflow_repo, 
         event_bus.clone(), 
-        validation_service, 
-        execution_service.clone()
+        validation_service.clone(), 
+        execution_service.clone(),
+        temporal_client_container,
     ));
     println!("Workflow engine initialized.");
 
     let app_state = AppState {
         agent_service,
-        execution_service,
+        execution_service: execution_service.clone(),
         event_bus,
         _llm_registry: llm_registry,
         workflow_engine,
@@ -249,6 +295,34 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     } else {
         port
     };
+
+    // Start gRPC Server
+    let grpc_port = if let Some(network) = &config.network {
+        network.grpc_port
+    } else {
+        50051
+    };
+
+    let grpc_addr_str = format!("{}:{}", bind_addr, grpc_port);
+    let grpc_addr: std::net::SocketAddr = grpc_addr_str.parse()
+        .with_context(|| format!("Failed to parse gRPC address: {}", grpc_addr_str))?;
+
+    // Spawn gRPC server
+    let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
+    let val_service_clone = validation_service.clone();
+    
+    tokio::spawn(async move {
+        tracing::info!("Starting gRPC server on {}", grpc_addr);
+        println!("Starting gRPC server on {}", grpc_addr);
+        if let Err(e) = aegis_core::presentation::grpc::server::start_grpc_server(
+            grpc_addr,
+            exec_service_clone,
+            val_service_clone
+        ).await {
+             tracing::error!("gRPC server failed: {}", e);
+             eprintln!("gRPC server failed: {}", e);
+        }
+    });
 
     let addr = format!("{}:{}", bind_addr, final_port);
     println!("Binding to {}...", addr);
@@ -1235,27 +1309,48 @@ async fn get_workflow_execution_handler(
 }
 
 /// GET /api/workflows/executions/:execution_id/logs - Stream workflow logs
+/// GET /api/workflows/executions/:execution_id/logs - Stream workflow logs
 async fn stream_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
-    Path(_execution_id): Path<Uuid>,
+    Path(execution_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    // Subscribe to workflow events
-    let mut receiver = state.event_bus.subscribe();
-    
-    // Create async stream from receiver
-    let event_stream = async_stream::stream! {
-        loop {
-            match receiver.recv().await {
-                Ok(event) => {
-                    // Convert domain event to SSE Event
-                    if let Ok(json) = serde_json::to_string(&event) {
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(json));
-                    }
-                }
-                Err(_) => break,
-            }
-        }
+    use std::fmt::Write;
+
+    // Get Temporal Client
+    let client = match state.workflow_engine.get_temporal_client().await {
+        Some(c) => c,
+        None => return (StatusCode::SERVICE_UNAVAILABLE, "Temporal client not available".to_string()),
     };
 
-    Sse::new(event_stream)
+    // Fetch history
+    // Note: This fetches existing history. Streaming live events would require
+    // using 'wait_new_event' loop or similar, but for now we just return current history.
+    match client.get_workflow_history(execution_id.to_string(), None).await {
+        Ok(history) => {
+            let mut output = String::new();
+            for event in history {
+                // Approximate timestamp formatting
+                let timestamp = event.event_time.map(|t| {
+                    let secs = t.seconds;
+                    let nanos = t.nanos;
+                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos as u32) {
+                        dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                    } else {
+                        "Unknown Time".to_string()
+                    }
+                }).unwrap_or_else(|| "Unknown Time".to_string());
+
+                let event_type = event.event_type(); // Enum
+                
+                let _ = writeln!(output, "[{}] {:?}", timestamp, event_type);
+                
+                // Add details for key events if possible?
+                // For now just the type is useful enough to verify it works.
+            }
+            (StatusCode::OK, output)
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get workflow logs: {}", e))
+        }
+    }
 }

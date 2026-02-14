@@ -11,6 +11,7 @@ import type {
   ValidateRequest,
   Blackboard,
 } from '../types.js';
+import { fetchWorkflowDefinition } from './workflow-activities.js';
 
 /**
  * Execute an agent via Rust ExecutionService
@@ -195,5 +196,9 @@ export const activities = {
   executeSystemCommandActivity,
   validateOutputActivity,
   executeParallelAgentsActivity,
+  fetchWorkflowDefinition,
 };
+
+export { fetchWorkflowDefinition };
+
 

@@ -60,6 +60,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{debug, info};
 use futures::StreamExt;
+use crate::infrastructure::temporal_client::TemporalClient;
 
 // ============================================================================
 // Application Service: WorkflowEngine
@@ -90,16 +91,20 @@ pub struct WorkflowEngine {
     
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
+    
+    /// Temporal client for starting workflows (Optional, Hot-swappable)
+    /// Wrapped in RwLock to allow background connection/reconnection
+    temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
 }
 
 impl WorkflowEngine {
-    /// Create a new WorkflowEngine
     /// Create a new WorkflowEngine
     pub fn new(
         repository: Arc<dyn WorkflowRepository>,
         event_bus: Arc<EventBus>,
         validation_service: Arc<ValidationService>,
         execution_service: Arc<dyn ExecutionService>,
+        temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
     ) -> Self {
         Self {
             repository,
@@ -109,6 +114,7 @@ impl WorkflowEngine {
             validation_service,
             execution_service,
             template_engine: Arc::new(handlebars::Handlebars::new()),
+            temporal_client,
         }
     }
 
@@ -200,7 +206,7 @@ impl WorkflowEngine {
             AgentId::new(), // Placeholder - workflows are not agents yet
             ExecutionInput {
                 intent: Some(workflow_name.to_string()),
-                payload: serde_json::to_value(input.parameters)?,
+                payload: serde_json::to_value(&input.parameters)?,
             },
             10, // Max iterations placeholder
         );
@@ -219,6 +225,25 @@ impl WorkflowEngine {
                 agent_id: crate::domain::agent::AgentId::new(), // TODO: Map to agent
                 started_at: Utc::now(),
             });
+
+        // Start Temporal Workflow if client is available
+        let client_opt = self.temporal_client.read().await;
+        if let Some(client) = client_opt.as_ref() {
+            info!("Triggering Temporal workflow: {}", workflow_name);
+            match client.start_workflow(workflow_name, execution_id, input.parameters).await {
+                Ok(run_id) => {
+                    info!(execution_id = %execution_id, run_id = %run_id, "Temporal workflow started");
+                }
+                Err(e) => {
+                    tracing::error!(execution_id = %execution_id, error = %e, "Failed to start Temporal workflow");
+                    // We don't fail the whole request? Or should we?
+                    // Ideally we should fail.
+                    return Err(anyhow::anyhow!("Failed to start Temporal workflow: {}", e));
+                }
+            }
+        } else {
+            tracing::warn!("Temporal client not configured - workflow will not be executed in Temporal!");
+        }
 
         Ok(())
     }
@@ -639,6 +664,11 @@ impl WorkflowEngine {
             .await
             .map(|ctx| ctx.depth())
     }
+
+    /// Get the temporal client if available
+    pub async fn get_temporal_client(&self) -> Option<Arc<TemporalClient>> {
+        self.temporal_client.read().await.clone()
+    }
 }
 
 // ============================================================================
@@ -722,7 +752,7 @@ mod tests {
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service);
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)));
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -735,7 +765,7 @@ mod tests {
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service);
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)));
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1

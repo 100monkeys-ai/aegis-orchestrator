@@ -64,8 +64,8 @@ blake3 = "1.5"
 reqwest = { version = "0.12", features = ["json"] }
 
 # gRPC
-tonic = "0.11"
-prost = "0.12"
+tonic = "0.13"
+prost = "0.13"
 
 # Utilities
 bytes = "1.7"

@@ -198,6 +198,10 @@ pub struct NetworkConfig {
     /// HTTP API port
     #[serde(default = "default_api_port")]
     pub port: u16,
+
+    /// gRPC API port
+    #[serde(default = "default_grpc_port")]
+    pub grpc_port: u16,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +312,10 @@ fn default_bind_address() -> String {
 
 fn default_api_port() -> u16 {
     8000
+}
+
+fn default_grpc_port() -> u16 {
+    50051
 }
 
 impl Default for LLMSelectionStrategy {

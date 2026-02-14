@@ -1,8 +1,7 @@
 # AEGIS Temporal Workflow Testing Guide
 
-**Created:** February 12, 2026  
-**Status:** Ready for Integration Testing  
-**Prerequisites:** Docker, Docker Compose, PostgreSQL, Temporal Server
+**Status:** Verification Phase
+**Prerequisites:** Docker, Docker Compose, Rust Toolchain
 
 ---
 
@@ -12,8 +11,16 @@
 2. [Architecture Recap](#architecture-recap)
 3. [Pre-Flight Checklist](#pre-flight-checklist)
 4. [Test Scenarios](#test-scenarios)
+   - [Scenario 1: Echo Workflow (Basic Connectivity)](#scenario-1-echo-workflow-basic-connectivity)
+   - [Scenario 2: Agent Execution (gRPC Bridge)](#scenario-2-agent-execution-grpc-bridge)
+   - [Scenario 3: 100monkeys Classic (Full Integration)](#scenario-3-100monkeys-classic-workflow-full-integration)
+   - [Scenario 4: Multi-Judge Consensus Workflow](#scenario-4-multi-judge-consensus-workflow)
+   - [Scenario 5: Human-in-the-Loop Workflow](#scenario-5-human-in-the-loop-workflow)
 5. [Expected Outcomes](#expected-outcomes)
 6. [Troubleshooting](#troubleshooting)
+7. [Advanced Testing](#advanced-testing)
+8. [Next Steps](#next-steps-after-testing)
+9. [Quick Reference Commands](#quick-reference-commands)
 
 > [!NOTE]
 > **Future Improvement:** Currently, the application writes to both `workflows` and `workflow_definitions` tables in the same repository method.
@@ -34,6 +41,11 @@ This guide walks you through testing the complete Temporal workflow integration 
 - ✅ Agent execution with 100monkeys refinement
 - ✅ Multi-judge validation
 - ✅ System command execution
+
+There are two main ways to run the system:
+
+1. **Full Docker Stack** (Recommended): Runs everything in containers.
+2. **Hybrid Local/Docker**: Runs Temporal/Postgres/Worker in Docker, but runs the Orchestrator via `cargo run` for debugging.
 
 ---
 
@@ -67,7 +79,7 @@ This guide walks you through testing the complete Temporal workflow integration 
 
 ## Pre-Flight Checklist
 
-### 1. Infrastructure Setup
+### 1. Full Docker Stack Setup
 
 ```bash
 cd /path/to/aegis-orchestrator
@@ -101,7 +113,41 @@ docker compose ps
 
 **Note:** All Docker files are now organized in the `docker/` directory. See `docker/README.md` for detailed infrastructure documentation.
 
-### 2. Database Verification
+### 2. Hybrid Local/Docker Setup (For Debugging)
+
+First, minimize the Orchestrator container so we can run it locally, but keep the rest of the stack (Temporal, Postgres, Worker) running.
+
+```bash
+cd docker
+# Build all images first to ensure worker is up to date
+docker compose build
+
+# Start core infrastructure (Postgres, Temporal, Worker)
+# We exclude 'aegis-runtime' because we will run it locally
+docker compose up -d postgres temporal temporal-ui temporal-worker
+```
+
+**Verify Services:**
+
+- Temporal UI: [http://localhost:8233](http://localhost:8233)
+- Temporal Worker: `docker compose logs -f temporal-worker`
+
+**Run the Orchestrator Locally:**
+
+Run the Aegis Orchestrator (Daemon) locally. We configure it to listen on port **8080** to match the default configuration expected by the test commands.
+
+```bash
+# In the root of the repo (aegis-orchestrator)
+export TEMPORAL_ADDRESS=localhost:7233
+export AEGIS_DATABASE_URL=postgresql://aegis:aegis@localhost:5432/aegis
+
+# Run the daemon
+cargo run --bin aegis -- --daemon --port 8080
+```
+
+*Leave this terminal open.*
+
+### 3. Database Verification
 
 ```bash
 # Verify tables
@@ -126,9 +172,11 @@ psql -h localhost -U aegis -d aegis -c "\dv"
 
 ## Test Scenarios
 
-### Scenario 1: Simple Echo Workflow
+Run these commands in a new terminal (when using hybrid setup) or directly against the Docker stack.
 
-**Objective:** Test basic workflow registration and execution
+### Scenario 1: Echo Workflow (Basic Connectivity)
+
+**Objective:** Test basic workflow registration and execution. Tests the ability to register and execute a generic workflow definition.
 
 #### Step 1.1: Create Simple Workflow
 
@@ -168,7 +216,7 @@ spec:
       transitions: []
 ```
 
-#### Step 1.2: Register Workflow (Manual Test)
+#### Step 1.2: Deploy Workflow
 
 ```bash
 # Using Rust CLI
@@ -212,10 +260,14 @@ curl http://localhost:3000/workflows
 # ]
 ```
 
-#### Step 1.4: Execute Workflow
+#### Step 1.4: Run Workflow
 
 ```bash
-# Using Temporal CLI
+# Using Rust CLI
+cargo run --bin aegis -- --port 8080 workflow run echo-test \
+  --param message="Hello from Local Rust!"
+
+# OR using Temporal CLI directly
 temporal workflow start \
   --task-queue aegis-task-queue \
   --type aegis_workflow_echo_test \
@@ -238,7 +290,11 @@ Result: {
 }
 ```
 
-#### Step 1.5: Verify Results
+#### Step 1.5: Verification
+
+- **Console:** Should show `✓ Workflow execution started! Execution ID: ...`
+- **Temporal UI:** Check [http://localhost:8233](http://localhost:8233) for `aegis-workflow` execution.
+- **Output:** The workflow details in the UI should show the variable `message` reflected in the state.
 
 ```bash
 # Check database
@@ -251,9 +307,9 @@ open http://localhost:8233/namespaces/default/workflows/test-echo-001
 
 ---
 
-### Scenario 2: Agent Execution Workflow
+### Scenario 2: Agent Execution (gRPC Bridge)
 
-**Objective:** Test agent execution via gRPC
+**Objective:** Test agent execution via gRPC. Tests the `Orchestrator -> Activity -> gRPC -> Orchestrator` loop.
 
 #### Step 2.1: Deploy Test Agent
 
@@ -294,13 +350,13 @@ spec:
 
 ```bash
 # Deploy agent
-cargo run --bin aegis-orchestrator -- agent deploy test-agents/hello-agent.yaml
+cargo run --bin aegis -- --port 8080 agent deploy demo-agents/coder/agent.yaml
 
 # Expected output:
-# Agent deployed: hello-agent (id: ...)
+# Agent deployed: coder (id: ...)
 ```
 
-#### Step 2.2: Create Agent Workflow
+#### Step 2.2: Create and Deploy Agent Workflow
 
 Create `test-workflows/agent-workflow.yaml`:
 
@@ -336,15 +392,24 @@ spec:
       transitions: []
 ```
 
-#### Step 2.3: Register & Execute
+```bash
+# Deploy workflow
+cargo run --bin aegis -- --port 8080 workflow deploy test-workflows/agent-workflow.yaml
+```
+
+#### Step 2.3: Run Workflow
 
 ```bash
-# Register
+# Using Rust CLI
+cargo run --bin aegis -- --port 8080 workflow run agent-test \
+  --param input="Write a python script to count prime numbers"
+
+# OR using HTTP API
 curl -X POST http://localhost:8080/api/workflows/register \
   -H "Content-Type: application/yaml" \
   --data-binary @test-workflows/agent-workflow.yaml
 
-# Execute
+# Execute with Temporal CLI
 temporal workflow start \
   --task-queue aegis-task-queue \
   --type aegis_workflow_agent_test \
@@ -371,7 +436,10 @@ temporal workflow show --workflow-id test-agent-001 --follow
 11. WorkflowExecutionCompleted
 ```
 
-#### Step 2.4: Verify Agent Execution
+#### Step 2.4: Verification
+
+- **Daemon Logs:** You should see `ExecuteContainerAgent` activity being requested via gRPC.
+- **Docker:** A new Docker container for the agent (e.g., `python:3.11`) should spin up briefly.
 
 ```bash
 # Check executions table
@@ -388,16 +456,16 @@ psql -h localhost -U aegis -d aegis -c \
 
 ### Scenario 3: 100monkeys Classic Workflow (Full Integration)
 
-**Objective:** Test complete iterative refinement loop
+**Objective:** Test complete iterative refinement loop with the sophisticated refinement loop and Judges.
 
 #### Step 3.1: Deploy Agents
 
 ```bash
 # Deploy coder agent
-cargo run --bin aegis-orchestrator -- agent deploy demo-agents/coder/agent.yaml
+cargo run --bin aegis -- --port 8080 agent deploy demo-agents/coder/agent.yaml
 
 # Deploy judge agent
-cargo run --bin aegis-orchestrator -- agent deploy demo-agents/judges/basic-judge.yaml
+cargo run --bin aegis -- --port 8080 agent deploy demo-agents/judges/basic-judge.yaml
 
 # Verify deployments
 psql -h localhost -U aegis -d aegis -c \
@@ -407,7 +475,10 @@ psql -h localhost -U aegis -d aegis -c \
 #### Step 3.2: Register 100monkeys Workflow
 
 ```bash
-# Register the classic workflow
+# Register the classic workflow using CLI
+cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/100monkeys-classic.yaml
+
+# OR using HTTP API
 curl -X POST http://localhost:8080/api/workflows/register \
   -H "Content-Type: application/yaml" \
   --data-binary @demo-agents/workflows/100monkeys-classic.yaml
@@ -419,7 +490,15 @@ curl http://localhost:3000/workflows | jq '.[] | select(.name == "100monkeys-cla
 #### Step 3.3: Execute Full Refinement Loop
 
 ```bash
-# Start workflow with coding task
+# Using Rust CLI
+cargo run --bin aegis -- --port 8080 workflow run 100monkeys-classic \
+  --input '{
+    "agent_id": "coder",
+    "task": "Create a fibonacci function in Python",
+    "command": "python fib.py"
+  }'
+
+# OR start workflow with Temporal CLI directly
 temporal workflow start \
   --task-queue aegis-task-queue \
   --type aegis_workflow_100monkeys_classic \
@@ -430,7 +509,10 @@ temporal workflow start \
     "command": "python main.py"
   }'
 
-# Follow execution
+# Follow execution (when using CLI)
+cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
+
+# OR follow with Temporal CLI
 temporal workflow show --workflow-id test-100monkeys-001 --follow
 ```
 
@@ -922,6 +1004,20 @@ curl http://localhost:8080/health
 **Expected:** This is normal! Cortex is stubbed for future implementation.
 
 **Action:** No action needed - stubbed methods return empty results gracefully.
+
+### "Connection Refused" on Port 8080
+
+- Is the daemon running? (`cargo run --bin aegis -- --daemon --port 8080`)
+- Is something else using port 8080?
+
+### Temporal Workflow Stays "Running"
+
+- Check the **Temporal Worker** logs: `docker compose logs -f temporal-worker`
+- If the worker is crashing or silent, it might have failed to register the workflow or connect to Temporal.
+
+### "Workflow not found"
+
+- Did you run `workflow deploy`? The worker needs to know about the workflow definition to execute it generic interpreter logic.
 
 ---
 

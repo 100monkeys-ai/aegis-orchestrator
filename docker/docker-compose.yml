@@ -112,10 +112,13 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      temporal:
+        condition: service_healthy
     environment:
       - AEGIS_DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
       - RUST_LOG=info,aegis_orchestrator=debug
       - TEMPORAL_WORKER_URL=http://temporal-worker:3000
+      - TEMPORAL_ADDRESS=temporal:7233
     ports:
       - "8080:8080"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities

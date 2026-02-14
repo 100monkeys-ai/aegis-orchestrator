@@ -1,19 +1,18 @@
 /**
  * Temporal Workflows
- * Workflow functions define the orchestration logic
- * These are dynamically generated from AEGIS workflow definitions
+ * 
+ * We export the Generic Interpreter Workflow which handles all
+ * AEGIS workflow definitions dynamically.
  */
 
-import { workflowRegistry } from '../workflow-registry.js';
+import { aegis_workflow } from './aegis-workflow.js';
 
-// Export all dynamically registered workflow functions
-// Temporal Worker will pick up all exported functions from this file
-const workflows = workflowRegistry.getAllWorkflowFunctions();
+// Export with the specific name that the Rust client invokes
+const workflows = {
+  'aegis-workflow': aegis_workflow,
+};
 
-// Re-export all workflow functions
 export default workflows;
 
-// Also export them individually for Temporal's discovery
-Object.entries(workflows).forEach(([name, fn]) => {
-  (exports as any)[name] = fn;
-});
+// Individual exports for discovery if needed (though default export covers it)
+export { aegis_workflow };

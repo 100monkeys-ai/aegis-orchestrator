@@ -7,3 +7,5 @@ pub mod db;
 pub mod event_bus;
 pub mod llm;
 pub mod workflow_parser;
+pub mod temporal_client;
+pub mod temporal_proto;

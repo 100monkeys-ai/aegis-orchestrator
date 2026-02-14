@@ -32,7 +32,9 @@ reqwest = { version = "0.12", features = ["json"] }
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
+prost-types = "0.13"
+
 
 [build-dependencies]
-tonic-build = "0.11"
+tonic-build = "0.13"
 protoc-bin-vendored = "3.0"

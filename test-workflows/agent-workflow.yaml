@@ -1,0 +1,29 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "agent-test"
+  version: "1.0.0"
+  description: "Test agent execution"
+
+spec:
+  context: {}
+
+  initial_state: RUN_AGENT
+
+  states:
+    RUN_AGENT:
+      kind: Agent
+      agent: "hello-agent"
+      input: "Say hello to the world!"
+      timeout: 60s
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+
+    COMPLETE:
+      kind: System
+      command: "echo"
+      env:
+        AGENT_OUTPUT: "{{RUN_AGENT.output}}"
+      transitions: []
