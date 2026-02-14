@@ -64,6 +64,7 @@ use crate::infrastructure::temporal_client::TemporalClient;
 
 // Import Cortex service
 use aegis_cortex::application::CortexService;
+use aegis_cortex::infrastructure::EmbeddingClient;
 
 // ============================================================================
 // Application Service: WorkflowEngine
@@ -95,6 +96,9 @@ pub struct WorkflowEngine {
     /// Cortex service for pattern learning (Optional)
     cortex_service: Option<Arc<dyn CortexService>>,
     
+    /// Embedding client for generating semantic embeddings (Optional)
+    embedding_client: Option<Arc<EmbeddingClient>>,
+    
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
     
@@ -113,6 +117,9 @@ impl WorkflowEngine {
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         cortex_service: Option<Arc<dyn CortexService>>,
     ) -> Self {
+        // Create embedding client if Cortex is enabled
+        let embedding_client = cortex_service.as_ref().map(|_| Arc::new(EmbeddingClient::new()));
+        
         Self {
             repository,
             executions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
@@ -121,6 +128,7 @@ impl WorkflowEngine {
             validation_service,
             execution_service,
             cortex_service,
+            embedding_client,
             template_engine: Arc::new(handlebars::Handlebars::new()),
             temporal_client,
         }
@@ -750,9 +758,13 @@ impl WorkflowEngine {
             input_template, // Using the raw template as the signature base for now
         );
 
-        // 2. Generate Embedding (Simple Hash-based for MVP)
-        // In the future, this should use the EmbeddingClient
-        let embedding = self.generate_embedding(&format!("{}{}", input_template, final_output));
+        // 2. Generate Embedding using EmbeddingClient
+        let embedding = if let Some(client) = &self.embedding_client {
+            client.generate_embedding(&format!("{}{}", input_template, final_output)).await?
+        } else {
+            // Fallback to simple hash-based embedding if client not available
+            vec![0.0; 384]
+        };
 
         // 3. Store in Cortex
         // We assume success since we are in the success branch
@@ -769,23 +781,6 @@ impl WorkflowEngine {
 
         debug!("Captured execution pattern: {}", pattern_id.0);
         Ok(())
-    }
-
-    fn generate_embedding(&self, text: &str) -> Vec<f32> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Generate 384-dimensional vector from hash (simulating small model)
-        (0..384)
-            .map(|i| {
-                let bit = (hash >> (i % 64)) & 1;
-                bit as f32
-            })
-            .collect()
     }
 }
 
