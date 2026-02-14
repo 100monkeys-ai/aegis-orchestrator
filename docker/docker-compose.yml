@@ -160,7 +160,7 @@ services:
 
   # LanceDB (Vector Store)
   lancedb:
-    image: lancedb/lancedb:latest
+    image: lancedb/lancedb:v0.5.0  # Pin version for reproducibility; update intentionally when upgrading
     container_name: aegis-lancedb
     ports:
       - "8765:8765"
