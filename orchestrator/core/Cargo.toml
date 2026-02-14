@@ -34,6 +34,9 @@ prost = { workspace = true }
 bytes = { workspace = true }
 prost-types = "0.13"
 
+# Cortex (Learning & Memory)
+aegis-cortex = { path = "../../cortex" }
+
 
 [build-dependencies]
 tonic-build = "0.13"

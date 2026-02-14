@@ -62,6 +62,9 @@ use tracing::{debug, info};
 use futures::StreamExt;
 use crate::infrastructure::temporal_client::TemporalClient;
 
+// Import Cortex service
+use aegis_cortex::application::CortexService;
+
 // ============================================================================
 // Application Service: WorkflowEngine
 // ============================================================================
@@ -89,6 +92,9 @@ pub struct WorkflowEngine {
     /// Execution service for running agents
     execution_service: Arc<dyn ExecutionService>,
     
+    /// Cortex service for pattern learning (Optional)
+    cortex_service: Option<Arc<dyn CortexService>>,
+    
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
     
@@ -105,6 +111,7 @@ impl WorkflowEngine {
         validation_service: Arc<ValidationService>,
         execution_service: Arc<dyn ExecutionService>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+        cortex_service: Option<Arc<dyn CortexService>>,
     ) -> Self {
         Self {
             repository,
@@ -113,6 +120,7 @@ impl WorkflowEngine {
             event_bus,
             validation_service,
             execution_service,
+            cortex_service,
             template_engine: Arc::new(handlebars::Handlebars::new()),
             temporal_client,
         }
@@ -367,7 +375,14 @@ impl WorkflowEngine {
                 while let Some(event_result) = stream.next().await {
                     let event = event_result?;
                     match event {
+
                         ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                            // Cortex Integration: Capture pattern on success
+                            if let Some(cortex) = &self.cortex_service {
+                                self.capture_execution_pattern(cortex, workflow, state, &final_output, execution_id).await
+                                    .unwrap_or_else(|e| tracing::warn!("Failed to capture pattern: {}", e));
+                            }
+
                             return Ok(serde_json::json!({
                                 "output": final_output,
                                 "execution_id": execution_id, // include ID for tracking
@@ -706,7 +721,73 @@ impl Default for WorkflowInput {
     }
 }
 
-#[cfg(test)]
+    // ========================================================================
+    // Cortex Pattern Capture
+    // ========================================================================
+
+impl WorkflowEngine {
+
+    async fn capture_execution_pattern(
+        &self,
+        cortex: &Arc<dyn CortexService>,
+        workflow: &Workflow,
+        state: &WorkflowState,
+        final_output: &str,
+        execution_id: ExecutionId,
+    ) -> Result<()> {
+        // Only capture patterns for Agents for now
+        let (_agent_name, input_template) = match &state.kind {
+            StateKind::Agent { agent, input, .. } => (agent, input),
+            _ => return Ok(()),
+        };
+
+        // 1. Generate Error Signature (Context/Intent)
+        // For successful execution, the "error" is actually the "task" or "intent"
+        // We use the input content as the signature of the problem being solved.
+        let signature = aegis_cortex::domain::ErrorSignature::new(
+            "task_execution".to_string(),
+            input_template, // Using the raw template as the signature base for now
+        );
+
+        // 2. Generate Embedding (Simple Hash-based for MVP)
+        // In the future, this should use the EmbeddingClient
+        let embedding = self.generate_embedding(&format!("{}{}", input_template, final_output));
+
+        // 3. Store in Cortex
+        // We assume success since we are in the success branch
+        let pattern_id = cortex.store_pattern(
+            Some(execution_id.0), // Pass underlying Uuid
+            signature,
+            final_output.to_string(),
+            workflow.metadata.name.clone(), // Category
+            embedding,
+        ).await?;
+
+        // 4. Reinforce (Success)
+        cortex.apply_dopamine(pattern_id, Some(execution_id.0), 0.5).await?;
+
+        debug!("Captured execution pattern: {}", pattern_id.0);
+        Ok(())
+    }
+
+    fn generate_embedding(&self, text: &str) -> Vec<f32> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        text.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        // Generate 384-dimensional vector from hash (simulating small model)
+        (0..384)
+            .map(|i| {
+                let bit = (hash >> (i % 64)) & 1;
+                bit as f32
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,10 +830,11 @@ mod tests {
     async fn test_workflow_engine_creation() {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
-        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)));
+        // Note: Cortex service is None here
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -762,10 +844,10 @@ mod tests {
     async fn test_load_simple_workflow() {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
-        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)));
+        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1

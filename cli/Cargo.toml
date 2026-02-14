@@ -40,9 +40,10 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-# Internal dependencies
-aegis-sdk = { path = "../sdks" }
+# Internal [dependencies]
 aegis-core = { path = "../orchestrator/core" }
+aegis-cortex = { path = "../cortex" }
+aegis-sdk = { path = "../sdks" }
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]

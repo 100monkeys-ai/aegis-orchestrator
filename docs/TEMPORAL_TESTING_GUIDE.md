@@ -1073,6 +1073,66 @@ docker compose start temporal-worker
 
 ---
 
+### Scenario 6: Cortex Pattern Learning
+
+**Objective:** Verify that the Holographic Cortex captures and streams pattern discovery events during execution.
+
+#### Step 6.1: Run a Validation-Heavy Workflow
+
+Use the `100monkeys-classic` workflow, which triggers the validation loop where Cortex learning occurs.
+
+```bash
+# Run workflow (if not already running)
+cargo run --bin aegis -- --port 8080 workflow run 100monkeys-classic \
+  --input '{
+    "agent_id": "coder",
+    "task": "Write a Python function to calculate factorial",
+    "command": "python factorial.py"
+  }'
+```
+
+#### Step 6.2: Verify Event Streaming
+
+Watch the console output. You should see "Cortex Event" logs interleaved with execution logs when a pattern is discovered (usually after a successful validation).
+
+```bash
+# Watch logs
+cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
+```
+
+**Expected Output:**
+
+```markdown
+[2026-02-14 12:00:01] Iteration 1 completed
+[2026-02-14 12:00:02] Validation performed (score: 0.95, conf: 0.90)
+[2026-02-14 12:00:02] Cortex Event: PatternDiscovered { pattern_id: "...", execution_id: "...", ... }
+[2026-02-14 12:00:02] Execution completed
+```
+
+#### Step 6.3: Verify via HTTP Stream (Optional)
+
+You can also connect to the raw event stream to see the JSON structure of the Cortex event.
+
+```bash
+curl -N http://localhost:8080/api/executions/<EXECUTION_ID>/events
+```
+
+**Expected JSON:**
+
+```json
+{
+  "Cortex": {
+    "PatternDiscovered": {
+      "pattern_id": "...",
+      "execution_id": "...",
+      "discovered_at": "..."
+    }
+  }
+}
+```
+
+---
+
 ## Next Steps After Testing
 
 1. **If all tests pass:**

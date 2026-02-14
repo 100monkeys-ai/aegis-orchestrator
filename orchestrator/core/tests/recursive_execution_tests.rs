@@ -47,12 +47,12 @@ impl ExecutionService for MockExecutionService {
 fn create_test_engine() -> WorkflowEngine {
     let event_bus = Arc::new(EventBus::new(100));
     let exec_service = Arc::new(MockExecutionService);
-    let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone()));
+    let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
     
     // Create in-memory repository for testing
     let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
     
-    WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)))
+    WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None)
 }
 
 /// Helper to create test ExecutionInput

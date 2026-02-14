@@ -93,7 +93,7 @@ impl ExecutionService for MockExecutionService {
 async fn test_validation_event_streaming() {
     let event_bus = Arc::new(EventBus::with_default_capacity());
     let exec_service = Arc::new(MockExecutionService);
-    let val_service = ValidationService::new(event_bus.clone(), exec_service.clone());
+    let val_service = ValidationService::new(event_bus.clone(), exec_service.clone(), None);
     
     let execution_id = ExecutionId::new();
     let mut receiver = event_bus.subscribe_execution(execution_id);
