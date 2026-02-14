@@ -365,12 +365,12 @@ impl WorkflowEngine {
                 };
 
                 // Start execution via ExecutionService
-                let execution_id = self.execution_service.start_execution(agent_id, execution_input).await?;
+                let agent_execution_id = self.execution_service.start_execution(agent_id, execution_input).await?;
                 
-                info!(execution_id = %execution_id, "Started agent execution");
+                info!(agent_execution_id = %agent_execution_id, "Started agent execution");
 
                 // Wait for completion via event stream
-                let mut stream = self.execution_service.stream_execution(execution_id).await?;
+                let mut stream = self.execution_service.stream_execution(agent_execution_id).await?;
                 
                 while let Some(event_result) = stream.next().await {
                     let event = event_result?;
@@ -378,6 +378,7 @@ impl WorkflowEngine {
 
                         ExecutionEvent::ExecutionCompleted { final_output, .. } => {
                             // Cortex Integration: Capture pattern on success
+                            // Use workflow execution_id (not agent_execution_id) for workflow-level correlation
                             if let Some(cortex) = &self.cortex_service {
                                 self.capture_execution_pattern(cortex, workflow, state, &final_output, execution_id).await
                                     .unwrap_or_else(|e| tracing::warn!("Failed to capture pattern: {}", e));
@@ -385,7 +386,7 @@ impl WorkflowEngine {
 
                             return Ok(serde_json::json!({
                                 "output": final_output,
-                                "execution_id": execution_id, // include ID for tracking
+                                "agent_execution_id": agent_execution_id, // agent execution ID for tracking
                                 "success": true
                             }));
                         },
