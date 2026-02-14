@@ -10,11 +10,13 @@ use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 // Import Cortex for pattern learning
 use aegis_cortex::application::CortexService;
 use aegis_cortex::domain::ErrorSignature;
+use aegis_cortex::infrastructure::EmbeddingClient;
 
 pub struct ValidationService {
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     execution_service: Arc<dyn ExecutionService>,
     cortex_service: Option<Arc<dyn CortexService>>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
 }
 
 impl ValidationService {
@@ -23,7 +25,10 @@ impl ValidationService {
         execution_service: Arc<dyn ExecutionService>,
         cortex_service: Option<Arc<dyn CortexService>>,
     ) -> Self {
-        Self { event_bus, execution_service, cortex_service }
+        // Create embedding client if Cortex is enabled
+        let embedding_client = cortex_service.as_ref().map(|_| Arc::new(EmbeddingClient::new()));
+        
+        Self { event_bus, execution_service, cortex_service, embedding_client }
     }
 
     pub async fn validate_with_judges(
@@ -112,8 +117,13 @@ impl ValidationService {
             &request.content,
         );
 
-        // Generate embedding (using hash-based for now)
-        let embedding = self.generate_embedding(&signature.error_message_hash).await?;
+        // Generate embedding using EmbeddingClient
+        let embedding = if let Some(client) = &self.embedding_client {
+            client.generate_embedding(&signature.error_message_hash).await?
+        } else {
+            // Fallback to empty embedding if client not available
+            vec![0.0; 384]
+        };
 
         if consensus.final_score > 0.7 {
             // High score: Store pattern and apply dopamine (success reinforcement)
@@ -147,26 +157,6 @@ impl ValidationService {
         }
 
         Ok(())
-    }
-
-    /// Generate embedding for text (simple hash-based for now)
-    async fn generate_embedding(&self, text: &str) -> Result<Vec<f32>> {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        text.hash(&mut hasher);
-        let hash = hasher.finish();
-
-        // Generate 384-dimensional vector from hash
-        let embedding: Vec<f32> = (0..384)
-            .map(|i| {
-                let bit = (hash >> (i % 64)) & 1;
-                bit as f32
-            })
-            .collect();
-
-        Ok(embedding)
     }
 
     async fn run_judge(
