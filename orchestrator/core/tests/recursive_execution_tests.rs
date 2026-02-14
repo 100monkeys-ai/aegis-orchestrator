@@ -51,8 +51,9 @@ fn create_test_engine() -> WorkflowEngine {
     
     // Create in-memory repository for testing
     let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
+    let workflow_execution_repo = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
     
-    WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None)
+    WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None)
 }
 
 /// Helper to create test ExecutionInput

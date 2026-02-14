@@ -113,12 +113,11 @@ impl EmbeddedExecutor {
 
     pub async fn list_executions(
         &self,
-        _agent_id: Option<AgentId>,
-        _limit: usize,
+        agent_id: Option<AgentId>,
+        limit: usize,
     ) -> Result<Vec<ExecutionInfo>> {
-        // TODO: Implement list in ExecutionService
-        // For MVP embedded, just return empty or implement a list method in service
-        Ok(vec![])
+        let executions = self.execution_service.list_executions(agent_id, limit).await?;
+        Ok(executions.into_iter().map(ExecutionInfo::from).collect())
     }
 
     pub async fn stream_logs(
@@ -171,6 +170,18 @@ pub struct ExecutionInfo {
     pub id: ExecutionId,
     pub agent_id: AgentId,
     pub status: String,
+}
+
+use aegis_core::domain::execution::Execution;
+
+impl From<Execution> for ExecutionInfo {
+    fn from(exec: Execution) -> Self {
+        Self {
+            id: exec.id,
+            agent_id: exec.agent_id,
+            status: format!("{:?}", exec.status),
+        }
+    }
 }
 
 use aegis_core::infrastructure::event_bus::DomainEvent;

@@ -97,8 +97,9 @@ async fn test_load_workflow_into_engine() {
     
     // Create in-memory repository for testing
     let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
+    let workflow_execution_repo = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
     
-    let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+    let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
 
     // Load workflow
     let yaml_path = concat!(
@@ -200,7 +201,12 @@ async fn test_workflow_execution_initialization() {
         .expect("Failed to parse workflow");
 
     // Initialize execution
-    let workflow_execution = WorkflowExecution::new(&workflow);
+    let execution_id = aegis_core::domain::execution::ExecutionId::new();
+    let input = serde_json::json!({
+        "max_iterations": 10
+    });
+    
+    let workflow_execution = WorkflowExecution::new(&workflow, execution_id, input);
 
     // Verify initial state
     assert_eq!(workflow_execution.current_state.as_str(), "GENERATE");
@@ -258,7 +264,10 @@ async fn test_workflow_state_transitions() {
     let workflow = WorkflowParser::parse_file(yaml_path)
         .expect("Failed to parse workflow");
 
-    let mut workflow_execution = WorkflowExecution::new(&workflow);
+    let execution_id = aegis_core::domain::execution::ExecutionId::new();
+    let parameters = serde_json::json!({});
+    
+    let mut workflow_execution = WorkflowExecution::new(&workflow, execution_id, parameters);
 
     // Initial state
     assert_eq!(workflow_execution.current_state.as_str(), "GENERATE");

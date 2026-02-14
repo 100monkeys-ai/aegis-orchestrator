@@ -125,7 +125,7 @@ pub struct Execution {
     pub id: ExecutionId,
     pub agent_id: AgentId,
     pub status: ExecutionStatus,
-    iterations: Vec<Iteration>,
+    pub iterations: Vec<Iteration>,
     pub max_iterations: u8,
     pub input: ExecutionInput,
     pub started_at: DateTime<Utc>,
@@ -371,5 +371,28 @@ impl Execution {
         self.status = ExecutionStatus::Failed;
         self.error = Some(reason);
         self.ended_at = Some(Utc::now());
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionInfo {
+    pub id: ExecutionId,
+    pub agent_id: AgentId,
+    pub status: ExecutionStatus,
+    pub started_at: DateTime<Utc>,
+    pub ended_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+}
+
+impl From<Execution> for ExecutionInfo {
+    fn from(exec: Execution) -> Self {
+        Self {
+            id: exec.id,
+            agent_id: exec.agent_id,
+            status: exec.status,
+            started_at: exec.started_at,
+            ended_at: exec.ended_at,
+            error: exec.error,
+        }
     }
 }

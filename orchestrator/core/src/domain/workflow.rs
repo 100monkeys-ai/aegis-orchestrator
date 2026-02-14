@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
+use crate::domain::execution::{ExecutionId, ExecutionStatus};
 
 // ============================================================================
 // Value Objects: Identifiers
@@ -529,14 +530,23 @@ impl Blackboard {
 /// Stored here for convenience but belongs to Execution Context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowExecution {
+    /// Unique execution ID
+    pub id: ExecutionId,
+
     /// Workflow being executed
     pub workflow_id: WorkflowId,
+
+    /// Execution status
+    pub status: ExecutionStatus,
 
     /// Current state name
     pub current_state: StateName,
 
     /// Shared context (blackboard)
     pub blackboard: Blackboard,
+
+    /// Input parameters
+    pub input: serde_json::Value,
 
     /// State outputs (state_name -> output_json)
     pub state_outputs: HashMap<StateName, serde_json::Value>,
@@ -549,14 +559,17 @@ pub struct WorkflowExecution {
 }
 
 impl WorkflowExecution {
-    pub fn new(workflow: &Workflow) -> Self {
+    pub fn new(workflow: &Workflow, id: ExecutionId, input: serde_json::Value) -> Self {
         let initial_state = workflow.spec.initial_state.clone();
         let now = Utc::now();
 
         Self {
+            id,
             workflow_id: workflow.id,
+            status: ExecutionStatus::Running,
             current_state: initial_state,
             blackboard: Blackboard::new(),
+            input,
             state_outputs: HashMap::new(),
             started_at: now,
             last_transition_at: now,

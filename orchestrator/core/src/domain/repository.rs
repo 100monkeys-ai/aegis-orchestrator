@@ -89,6 +89,20 @@ pub trait WorkflowRepository: Send + Sync {
     async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError>;
 }
 
+/// Repository interface for WorkflowExecution aggregates
+/// One repository per aggregate root (Workflow Execution Context)
+#[async_trait]
+pub trait WorkflowExecutionRepository: Send + Sync {
+    /// Save workflow execution (create or update)
+    async fn save(&self, execution: &crate::domain::workflow::WorkflowExecution) -> Result<(), RepositoryError>;
+    
+    /// Find workflow execution by ID
+    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
+        
+    /// Find active workflow executions
+    async fn find_active(&self) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
+}
+
 
 
 /// Repository errors
@@ -115,9 +129,9 @@ pub fn create_agent_repository(backend: &StorageBackend) -> Arc<dyn AgentReposit
         StorageBackend::InMemory => {
             Arc::new(InMemoryAgentRepository::new())
         }
-        StorageBackend::PostgreSQL(_config) => {
+        StorageBackend::PostgreSQL(config) => {
             // Future: Arc::new(PostgresAgentRepository::new(config))
-            todo!("PostgreSQL repository not yet implemented")
+            todo!("PostgreSQL repository not yet implemented. Connection string: {}", config.connection_string)
         }
     }
 }
@@ -127,9 +141,22 @@ pub fn create_execution_repository(backend: &StorageBackend) -> Arc<dyn Executio
         StorageBackend::InMemory => {
             Arc::new(InMemoryExecutionRepository::new())
         }
-        StorageBackend::PostgreSQL(_config) => {
-            // Future: Arc::new(PostgresExecutionRepository::new(config))
-            todo!("PostgreSQL repository not yet implemented")
+        StorageBackend::PostgreSQL(config) => {
+            // Arc::new(PostgresExecutionRepository::new(config))
+            todo!("PostgresExecutionRepository not yet implemented. Connection string: {}", config.connection_string)
+        }
+    }
+}
+
+pub fn create_workflow_execution_repository(backend: &StorageBackend) -> Arc<dyn WorkflowExecutionRepository> {
+    match backend {
+        StorageBackend::InMemory => {
+            // Arc::new(InMemoryWorkflowExecutionRepository::new())
+            todo!("InMemoryWorkflowExecutionRepository not yet implemented")
+        }
+        StorageBackend::PostgreSQL(config) => {
+             // Arc::new(PostgresWorkflowExecutionRepository::new(config))
+             todo!("PostgresWorkflowExecutionRepository not yet implemented. Connection string: {}", config.connection_string)
         }
     }
 }

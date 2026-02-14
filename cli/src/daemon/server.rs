@@ -34,7 +34,9 @@ use aegis_core::{
     infrastructure::{
         event_bus::EventBus,
         llm::registry::ProviderRegistry,
-        repositories::{InMemoryAgentRepository, InMemoryExecutionRepository},
+        repositories::{
+            InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryWorkflowExecutionRepository
+        },
         runtime::DockerRuntime,
         temporal_client::TemporalClient,
     },
@@ -92,13 +94,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Initialize services
     let agent_repo = Arc::new(InMemoryAgentRepository::new());
-    let execution_repo = Arc::new(InMemoryExecutionRepository::new());
-    let event_bus = Arc::new(EventBus::new(100));
-
-    // Initialize Workflow Repository
+    // Initialize repositories
+    // Initialize repositories 
+    // But `PostgresAgentRepository` is not implemented in my plan (I focused on execution persistence).
+    // So I will keep `agent_repo` as InMemory or check if PostgresAgentRepository exists/is implemented.
+    // Checking `repository.rs`, PostgresAgentRepository was todo!.
+    
     let database_url = std::env::var("AEGIS_DATABASE_URL").ok();
-    let workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository> = if let Some(url) = database_url {
-        println!("Initializing PostgresWorkflowRepository with {}", url);
+    
+    let (workflow_repo, execution_repo, workflow_execution_repo): (
+        Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
+        Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
+        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>
+    ) = if let Some(url) = database_url {
+        println!("Initializing repositories with PostgreSQL: {}", url);
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
             .connect(&url)
@@ -111,66 +120,64 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
                 
                 let total_known = MIGRATOR.iter().count();
-                println!("INFO: Found {} migrations defined in binary.", total_known);
-                
                 if total_known == 0 {
                     let msg = "CRITICAL: No migrations found in binary! Check build process.";
                     tracing::error!("{}", msg);
-                    println!("{}", msg);
-                    // Panic to restart container and make issue obvious
                     panic!("{}", msg);
                 }
 
-                // Check if we need to initialize (fresh install)
+                // Check applied migrations
                 let applied_result = sqlx::query("SELECT version FROM _sqlx_migrations")
                     .fetch_all(&pool)
                     .await;
 
                 let applied_count = match applied_result {
                     Ok(rows) => rows.len(),
-                    Err(_) => {
-                        println!("INFO: _sqlx_migrations table missing or empty. Assuming fresh install.");
-                        0
-                    },
+                    Err(_) => 0,
                 };
 
-                println!("INFO: Database has {} applied migrations.", applied_count);
+                println!("INFO: Database has {}/{} applied migrations.", applied_count, total_known);
 
-                if applied_count == 0 {
-                    println!("Fresh installation detected. Initializing database...");
+                if applied_count < total_known {
+                    println!("Applying pending migrations...");
                     match MIGRATOR.run(&pool).await {
-                        Ok(_) => println!("SUCCESS: Database initialized successfully."),
+                        Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
-                            let msg = format!("ERROR: Failed to initialize database: {}", e);
+                            let msg = format!("ERROR: Failed to apply migrations: {}", e);
                             tracing::error!("{}", msg);
-                            println!("{}", msg);
-                            panic!("{}", msg); // Panic on init failure
+                            panic!("{}", msg);
                         }
                     }
                 } else {
-                    if applied_count < total_known {
-                        let pending = total_known - applied_count;
-                        tracing::warn!("Pending migrations found ({} pending).", pending);
-                        println!("WARNING: {} pending migrations found.", pending);
-                        println!("         Please run 'aegis update' to apply them.");
-                    } else {
-                        tracing::info!("Database is up to date.");
-                        println!("INFO: Database is up to date.");
-                    }
+                    println!("INFO: Database is up to date.");
                 }
 
-                Arc::new(aegis_core::infrastructure::repositories::postgres::PostgresWorkflowRepository::new_with_pool(pool))
+                (
+                    Arc::new(aegis_core::infrastructure::repositories::postgres::PostgresWorkflowRepository::new_with_pool(pool.clone())),
+                    Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
+                    Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool)),
+                )
             },
             Err(e) => {
                 tracing::error!("Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
                 println!("ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
-                Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new())
+                (
+                    Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
+                    Arc::new(InMemoryExecutionRepository::new()),
+                    Arc::new(InMemoryWorkflowExecutionRepository::new()),
+                )
             }
         }
     } else {
-        println!("AEGIS_DATABASE_URL not set. Using InMemoryWorkflowRepository.");
-        Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new())
+        println!("AEGIS_DATABASE_URL not set. Using InMemory repositories.");
+        (
+            Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
+            Arc::new(InMemoryExecutionRepository::new()),
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+        )
     };
+    
+    let event_bus = Arc::new(EventBus::new(100));
     
     println!("Initializing LLM registry...");
     let llm_registry = Arc::new(
@@ -262,7 +269,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(cortex_service.clone()),
     ));
     let workflow_engine = Arc::new(WorkflowEngine::new(
-        workflow_repo, 
+        workflow_repo,
+        workflow_execution_repo, 
         event_bus.clone(), 
         validation_service.clone(), 
         execution_service.clone(),

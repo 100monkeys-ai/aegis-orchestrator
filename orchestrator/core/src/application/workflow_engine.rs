@@ -47,7 +47,7 @@ use crate::domain::agent::AgentId;
 // Note: JudgeVerdict and MAX_RECURSIVE_DEPTH will be used in Phase 3 for parallel judge evaluation
 // use crate::domain::judge::{JudgeVerdict, MAX_RECURSIVE_DEPTH};
 use crate::domain::events::ExecutionEvent;
-use crate::domain::repository::WorkflowRepository;
+use crate::domain::repository::{WorkflowRepository, WorkflowExecutionRepository};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use crate::infrastructure::event_bus::EventBus;
 use crate::application::validation_service::ValidationService;
@@ -76,6 +76,9 @@ use aegis_cortex::infrastructure::EmbeddingClient;
 pub struct WorkflowEngine {
     /// Workflow repository for persistence
     repository: Arc<dyn WorkflowRepository>,
+
+    /// Workflow execution repository for persistence
+    workflow_execution_repository: Arc<dyn WorkflowExecutionRepository>,
     
     /// Active workflow executions (execution_id -> workflow_execution)
     executions: Arc<tokio::sync::RwLock<HashMap<ExecutionId, WorkflowExecution>>>,
@@ -111,6 +114,7 @@ impl WorkflowEngine {
     /// Create a new WorkflowEngine
     pub fn new(
         repository: Arc<dyn WorkflowRepository>,
+        workflow_execution_repository: Arc<dyn WorkflowExecutionRepository>,
         event_bus: Arc<EventBus>,
         validation_service: Arc<ValidationService>,
         execution_service: Arc<dyn ExecutionService>,
@@ -122,6 +126,7 @@ impl WorkflowEngine {
         
         Self {
             repository,
+            workflow_execution_repository,
             executions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             execution_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_bus,
@@ -186,6 +191,16 @@ impl WorkflowEngine {
         }
     }
 
+    /// List agent executions (proxy to ExecutionService)
+    pub async fn list_executions(
+        &self,
+        agent_id: Option<AgentId>,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::execution::ExecutionInfo>> {
+        let executions = self.execution_service.list_executions(agent_id, limit).await?;
+        Ok(executions.into_iter().map(crate::domain::execution::ExecutionInfo::from).collect())
+    }
+
     // ========================================================================
     // Workflow Execution
     // ========================================================================
@@ -210,7 +225,11 @@ impl WorkflowEngine {
         );
 
         // Initialize execution state
-        let mut workflow_execution = WorkflowExecution::new(&workflow);
+        let mut workflow_execution = WorkflowExecution::new(
+            &workflow, 
+            execution_id, 
+            serde_json::to_value(&input.parameters)?
+        );
 
         // Populate blackboard with input parameters
         for (key, value) in input.parameters.clone() {
@@ -226,6 +245,11 @@ impl WorkflowEngine {
             },
             10, // Max iterations placeholder
         );
+
+        // Persist initial state (before moving into in-memory store)
+        if let Err(e) = self.workflow_execution_repository.save(&workflow_execution).await {
+            tracing::error!(execution_id = %execution_id, error = %e, "Failed to persist workflow execution");
+        }
 
         // Store execution and context
         let mut executions = self.executions.write().await;
@@ -304,10 +328,19 @@ impl WorkflowEngine {
         // Check if terminal state
         if current_state.transitions.is_empty() {
             info!(
-                execution_id = %execution_id,
                 state = %current_state_name,
                 "Reached terminal state"
             );
+            
+            // Mark as completed in the local object (WorkflowExecution struct needs to update its status!)
+            // Currently WorkflowExecution struct has status field I added.
+            workflow_execution.status = crate::domain::execution::ExecutionStatus::Completed;
+            
+            // Persist final state
+            if let Err(e) = self.workflow_execution_repository.save(workflow_execution).await {
+                 tracing::error!(execution_id = %execution_id, error = %e, "Failed to persist completed workflow execution");
+            }
+
             return Ok(false); // Execution complete
         }
 
@@ -318,6 +351,11 @@ impl WorkflowEngine {
 
         // Transition to next state
         workflow_execution.transition_to(next_state.clone());
+
+        // Persist state
+        if let Err(e) = self.workflow_execution_repository.save(workflow_execution).await {
+             tracing::error!(execution_id = %execution_id, error = %e, "Failed to persist workflow execution state");
+        }
 
         info!(
             execution_id = %execution_id,
@@ -828,9 +866,10 @@ mod tests {
         let exec_service = Arc::new(MockExecutionService);
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
+        let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
         
         // Note: Cortex service is None here
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -842,8 +881,9 @@ mod tests {
         let exec_service = Arc::new(MockExecutionService);
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
+        let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
         
-        let engine = WorkflowEngine::new(repository, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1

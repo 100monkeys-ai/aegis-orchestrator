@@ -1,4 +1,6 @@
 pub mod postgres;
+pub mod postgres_execution;
+pub mod postgres_workflow_execution;
 
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -184,5 +186,40 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         let mut workflows = self.workflows.write().unwrap();
         workflows.remove(&id);
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct InMemoryWorkflowExecutionRepository {
+    executions: Arc<RwLock<HashMap<crate::domain::execution::ExecutionId, crate::domain::workflow::WorkflowExecution>>>,
+}
+
+impl InMemoryWorkflowExecutionRepository {
+    pub fn new() -> Self {
+        Self {
+            executions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::domain::repository::WorkflowExecutionRepository for InMemoryWorkflowExecutionRepository {
+    async fn save(&self, execution: &crate::domain::workflow::WorkflowExecution) -> Result<(), RepositoryError> {
+        let mut executions = self.executions.write().unwrap();
+        executions.insert(execution.id, execution.clone());
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: crate::domain::execution::ExecutionId) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        Ok(executions.get(&id).cloned())
+    }
+
+    async fn find_active(&self) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        Ok(executions.values()
+            .filter(|e| e.status == crate::domain::execution::ExecutionStatus::Running)
+            .cloned()
+            .collect())
     }
 }
