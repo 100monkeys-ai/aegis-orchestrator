@@ -3292,7 +3292,6 @@ Each phase is complete when:
 - [ADR-006: Cyber-Biological Architecture](../../../aegis-architecture/adrs/006-cyber-biological-architecture-philosophy.md) — Membrane + Nucleus
 - [100monkeys Algorithm Spec](../../../aegis-architecture/specs/100MONKEYS_ALGORITHM_SPECIFICATION.md) — Iterative refinement
 - [Safe Evolution Manifesto](../../../aegis-architecture/specs/SAFE_EVOLUTION_MANIFESTO.md) — Trust through containment
-- [The Fractal God](../../../aegis-architecture/THE_FRACTAL_GOD.md) — Cortex as Universal Mind
 - [Zaru Paradigm](../../../aegis-architecture/specs/ZARU_PARADIGM.md) — Product vision, UX principles
 - [NODE_CONFIGURATION_SPEC.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC.md) — Node config, runtime isolation
 
