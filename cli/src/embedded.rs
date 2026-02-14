@@ -372,6 +372,13 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     }
                 }
             }
+            aegis_core::domain::events::ExecutionEvent::Cortex(e) => {
+                println!(
+                    "{} {:?}",
+                    "Cortex Event".magenta().bold(),
+                    e
+                );
+            }
         },
         DomainEvent::Policy(policy_event) => match policy_event {
             aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted {

@@ -135,6 +135,73 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # ============================================================================
+  # Cortex Services (Learning & Memory)
+  # ============================================================================
+
+  # Embedding Service (Sentence Transformers)
+  embedding-service:
+    build:
+      context: ../embedding-service
+      dockerfile: Dockerfile
+    container_name: aegis-embedding-service
+    ports:
+      - "50052:50052"
+    environment:
+      - MODEL_NAME=all-MiniLM-L6-v2
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc, json; channel = grpc.insecure_channel('localhost:50052'); stub = channel.unary_unary('/EmbeddingService/HealthCheck'); resp = stub(b'{}', timeout=5); channel.close()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # LanceDB (Vector Store)
+  lancedb:
+    image: lancedb/lancedb:v0.5.0  # Pin version for reproducibility; update intentionally when upgrading
+    container_name: aegis-lancedb
+    ports:
+      - "8765:8765"
+    volumes:
+      - lancedb-data:/data
+    environment:
+      - LANCE_DB_PATH=/data
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # Neo4j (Knowledge Graph)
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: aegis-neo4j
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    environment:
+      - NEO4J_AUTH=neo4j/aegis_dev_password
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=2G
+    volumes:
+      - neo4j-data:/data
+      - neo4j-logs:/logs
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "aegis_dev_password", "RETURN 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
 networks:
   aegis-network:
     driver: bridge
@@ -145,4 +212,10 @@ volumes:
   temporal-worker-data:
     driver: local
   aegis-runtime-data:
+    driver: local
+  lancedb-data:
+    driver: local
+  neo4j-data:
+    driver: local
+  neo4j-logs:
     driver: local

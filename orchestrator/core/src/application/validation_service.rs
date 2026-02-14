@@ -7,17 +7,28 @@ use crate::domain::validation::{GradientResult, MultiJudgeConsensus, ValidationR
 use crate::application::execution::ExecutionService;
 use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 
+// Import Cortex for pattern learning
+use aegis_cortex::application::CortexService;
+use aegis_cortex::domain::ErrorSignature;
+use aegis_cortex::infrastructure::EmbeddingClient;
+
 pub struct ValidationService {
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     execution_service: Arc<dyn ExecutionService>,
+    cortex_service: Option<Arc<dyn CortexService>>,
+    embedding_client: Option<Arc<EmbeddingClient>>,
 }
 
 impl ValidationService {
     pub fn new(
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
-        execution_service: Arc<dyn ExecutionService>
+        execution_service: Arc<dyn ExecutionService>,
+        cortex_service: Option<Arc<dyn CortexService>>,
     ) -> Self {
-        Self { event_bus, execution_service }
+        // Create embedding client if Cortex is enabled
+        let embedding_client = cortex_service.as_ref().map(|_| Arc::new(EmbeddingClient::new()));
+        
+        Self { event_bus, execution_service, cortex_service, embedding_client }
     }
 
     pub async fn validate_with_judges(
@@ -82,7 +93,70 @@ impl ValidationService {
             )
         );
 
+        // Pattern Learning: Capture patterns based on validation score
+        if let Some(cortex) = &self.cortex_service {
+            self.capture_pattern(cortex.clone(), execution_id, &request, &consensus).await
+                .unwrap_or_else(|e| tracing::warn!("Failed to capture pattern: {}", e));
+        }
+
         Ok(consensus)
+    }
+
+    /// Capture pattern from validation result
+    async fn capture_pattern(
+        &self,
+        cortex: Arc<dyn CortexService>,
+        execution_id: crate::domain::execution::ExecutionId,
+        request: &ValidationRequest,
+        consensus: &MultiJudgeConsensus,
+    ) -> Result<()> {
+        // Extract error signature from request content
+        // For now, use a simple heuristic: look for error patterns
+        let signature = ErrorSignature::new(
+            "validation_error".to_string(),
+            &request.content,
+        );
+
+        // Generate embedding using EmbeddingClient
+        let embedding = if let Some(client) = &self.embedding_client {
+            client.generate_embedding(&signature.error_message_hash).await?
+        } else {
+            // Fallback to empty embedding if client not available
+            vec![0.0; 384]
+        };
+
+        if consensus.final_score > 0.7 {
+            // High score: Store pattern and apply dopamine (success reinforcement)
+            tracing::info!(
+                score = consensus.final_score,
+                "Capturing successful pattern"
+            );
+
+            let pattern_id = cortex.store_pattern(
+                Some(execution_id.0),
+                signature,
+                request.content.clone(), // solution
+                "validation".to_string(), // category
+                embedding,
+            ).await?;
+
+            // Apply dopamine for successful pattern
+            cortex.apply_dopamine(pattern_id, Some(execution_id.0), 0.5).await?;
+        } else if consensus.final_score < 0.3 {
+            // Low score: Apply cortisol (failure penalty) if pattern exists
+            tracing::debug!(
+                score = consensus.final_score,
+                "Low validation score - applying cortisol if pattern exists"
+            );
+
+            // Search for similar patterns
+            let similar = cortex.search_patterns(embedding.clone(), 1).await?;
+            if let Some(pattern) = similar.first() {
+                cortex.apply_cortisol(pattern.id, 0.3).await?;
+            }
+        }
+
+        Ok(())
     }
 
     async fn run_judge(

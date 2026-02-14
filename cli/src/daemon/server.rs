@@ -40,6 +40,16 @@ use aegis_core::{
     },
 };
 
+// Cortex imports for pattern learning
+use aegis_cortex::{
+    application::{CortexService, StandardCortexService},
+    infrastructure::{
+        InMemoryPatternRepository,
+
+
+    },
+};
+
 use super::{remove_pid_file, write_pid_file};
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
@@ -187,6 +197,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(config.clone()),
     ));
 
+    println!("Initializing Cortex service...");
+    
+    // Create Cortex repositories (in-memory for now)
+    let pattern_repo = Arc::new(InMemoryPatternRepository::new());
+
+    // Create Cortex service
+    let cortex_service: Arc<dyn CortexService> = Arc::new(
+        StandardCortexService::new(
+            pattern_repo,
+            event_bus.clone(),
+        )
+    );
+
+    println!("Cortex service initialized.");
     println!("Initializing workflow engine...");
     
     // Initialize Temporal Client
@@ -232,13 +256,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
     
-    let validation_service = Arc::new(ValidationService::new(event_bus.clone(), execution_service.clone()));
+    let validation_service = Arc::new(ValidationService::new(
+        event_bus.clone(), 
+        execution_service.clone(),
+        Some(cortex_service.clone()),
+    ));
     let workflow_engine = Arc::new(WorkflowEngine::new(
         workflow_repo, 
         event_bus.clone(), 
         validation_service.clone(), 
         execution_service.clone(),
         temporal_client_container,
+        Some(cortex_service),
     ));
     println!("Workflow engine initialized.");
 

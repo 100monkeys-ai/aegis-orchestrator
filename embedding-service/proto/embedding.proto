@@ -1,0 +1,41 @@
+syntax = "proto3";
+
+package embedding;
+
+// Embedding service for generating semantic embeddings
+service EmbeddingService {
+  // Generate embedding for a single text
+  rpc GenerateEmbedding(EmbeddingRequest) returns (EmbeddingResponse);
+  
+  // Generate embeddings for multiple texts (batch)
+  rpc GenerateBatch(BatchEmbeddingRequest) returns (BatchEmbeddingResponse);
+  
+  // Health check
+  rpc HealthCheck(HealthCheckRequest) returns (HealthCheckResponse);
+}
+
+message EmbeddingRequest {
+  string text = 1;
+}
+
+message EmbeddingResponse {
+  repeated float embedding = 1;
+  int32 dimension = 2;
+  string model = 3;
+}
+
+message BatchEmbeddingRequest {
+  repeated string texts = 1;
+}
+
+message BatchEmbeddingResponse {
+  repeated EmbeddingResponse embeddings = 1;
+}
+
+message HealthCheckRequest {}
+
+message HealthCheckResponse {
+  bool healthy = 1;
+  string model = 2;
+  int32 dimension = 3;
+}

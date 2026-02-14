@@ -130,6 +130,7 @@ pub enum ExecutionEvent {
         terminated_at: DateTime<Utc>,
     },
     Validation(ValidationEvent),
+    Cortex(aegis_cortex::domain::events::CortexEvent),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

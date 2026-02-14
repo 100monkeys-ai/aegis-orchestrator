@@ -10,6 +10,8 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent};
+use aegis_cortex::domain::events::CortexEvent;
+use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -22,6 +24,7 @@ pub enum DomainEvent {
     AgentLifecycle(AgentLifecycleEvent),
     Execution(ExecutionEvent),
     Learning(LearningEvent),
+    Cortex(CortexEvent),
     Policy(crate::domain::events::PolicyEvent),
 }
 
@@ -107,6 +110,14 @@ impl EventBus {
     }
 }
 
+#[async_trait::async_trait]
+impl CortexEventBus for EventBus {
+    async fn publish(&self, event: CortexEvent) -> anyhow::Result<()> {
+        let _ = self.sender.send(DomainEvent::Cortex(event));
+        Ok(())
+    }
+}
+
 /// Receiver for all domain events
 pub struct EventReceiver {
     receiver: broadcast::Receiver<DomainEvent>,
@@ -157,10 +168,18 @@ impl ExecutionEventReceiver {
             })?;
 
             // Filter for execution events matching our ID
-            if let DomainEvent::Execution(exec_event) = event {
-                if self.matches_execution(&exec_event) {
-                    return Ok(exec_event);
-                }
+            match event {
+                DomainEvent::Execution(exec_event) => {
+                    if self.matches_execution(&exec_event) {
+                        return Ok(exec_event);
+                    }
+                },
+                DomainEvent::Cortex(cortex_event) => {
+                    if self.matches_cortex(&cortex_event) {
+                        return Ok(ExecutionEvent::Cortex(cortex_event));
+                    }
+                },
+                _ => {}
             }
             // Continue loop if event doesn't match
         }
@@ -184,6 +203,16 @@ impl ExecutionEventReceiver {
                 ValidationEvent::GradientValidationPerformed { execution_id, .. } => execution_id == &self.execution_id,
                 ValidationEvent::MultiJudgeConsensus { execution_id, .. } => execution_id == &self.execution_id,
             },
+            ExecutionEvent::Cortex(e) => self.matches_cortex(e),
+        }
+    }
+    
+    fn matches_cortex(&self, event: &CortexEvent) -> bool {
+        match event {
+            CortexEvent::PatternDiscovered { execution_id, .. } => *execution_id == Some(self.execution_id.0),
+            CortexEvent::PatternWeightIncreased { execution_id, .. } => *execution_id == Some(self.execution_id.0),
+            CortexEvent::PatternSuccessUpdated { execution_id, .. } => *execution_id == Some(self.execution_id.0),
+            _ => false,
         }
     }
 }
@@ -236,8 +265,10 @@ impl AgentEventReceiver {
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::Validation(_) => false, // TODO: Add agent_id to ValidationEvent for filtering
+                ExecutionEvent::Cortex(_) => false,
             },
             DomainEvent::Learning(_) => false, // TODO: Link learning to agent
+            DomainEvent::Cortex(_) => false,
             DomainEvent::Policy(_) => false, // TODO: Link policy to agent
         }
     }
