@@ -152,7 +152,7 @@ services:
     networks:
       - aegis-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import grpc; channel = grpc.insecure_channel('localhost:50052'); channel.close()"]
+      test: ["CMD", "python", "-c", "import grpc, json; channel = grpc.insecure_channel('localhost:50052'); stub = channel.unary_unary('/EmbeddingService/HealthCheck'); resp = stub(b'{}', timeout=5); channel.close()"]
       interval: 30s
       timeout: 10s
       retries: 3
