@@ -1111,10 +1111,10 @@ cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
 
 #### Step 6.3: Verify via HTTP Stream (Optional)
 
-You can also connect to the raw event stream to see the JSON structure of the Cortex event.
+You can also connect to the raw **agent execution** event stream (not the workflow logs) to see the JSON structure of the Cortex event. Use the agent execution ID associated with the `/api/executions/...` resource, not the workflow execution ID returned by `/api/workflows/:name/run`.
 
 ```bash
-curl -N http://localhost:8080/api/executions/<EXECUTION_ID>/events
+curl -N http://localhost:8080/api/executions/<AGENT_EXECUTION_ID>/events
 ```
 
 **Expected JSON:**
