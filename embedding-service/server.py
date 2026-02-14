@@ -84,11 +84,11 @@ class EmbeddingServicer(embedding_pb2_grpc.EmbeddingServiceServicer):
             dimension=self.dimension
         )
 
-def serve(port=50052):
+def serve(port=50052, model_name='all-MiniLM-L6-v2'):
     """Start the gRPC server"""
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
     embedding_pb2_grpc.add_EmbeddingServiceServicer_to_server(
-        EmbeddingServicer(), server
+        EmbeddingServicer(model_name=model_name), server
     )
     server.add_insecure_port(f'[::]:{port}')
     server.start()
@@ -96,4 +96,7 @@ def serve(port=50052):
     server.wait_for_termination()
 
 if __name__ == '__main__':
-    serve()
+    import os
+    port = int(os.getenv('PORT', '50052'))
+    model_name = os.getenv('MODEL_NAME', 'all-MiniLM-L6-v2')
+    serve(port=port, model_name=model_name)
