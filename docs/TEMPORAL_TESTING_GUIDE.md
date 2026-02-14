@@ -122,30 +122,14 @@ cd docker
 # Build all images first to ensure worker is up to date
 docker compose build
 
-# Start core infrastructure (Postgres, Temporal, Worker)
-# We exclude 'aegis-runtime' because we will run it locally
-docker compose up -d postgres temporal temporal-ui temporal-worker
+# Start core infrastructure
+docker compose up -d
 ```
 
 **Verify Services:**
 
 - Temporal UI: [http://localhost:8233](http://localhost:8233)
 - Temporal Worker: `docker compose logs -f temporal-worker`
-
-**Run the Orchestrator Locally:**
-
-Run the Aegis Orchestrator (Daemon) locally. We configure it to listen on port **8080** to match the default configuration expected by the test commands.
-
-```bash
-# In the root of the repo (aegis-orchestrator)
-export TEMPORAL_ADDRESS=localhost:7233
-export AEGIS_DATABASE_URL=postgresql://aegis:aegis@localhost:5432/aegis
-
-# Run the daemon
-cargo run --bin aegis -- --daemon --port 8080
-```
-
-*Leave this terminal open.*
 
 ### 3. Database Verification
 
@@ -180,7 +164,7 @@ Run these commands in a new terminal (when using hybrid setup) or directly again
 
 #### Step 1.1: Create Simple Workflow
 
-Create `test-workflows/echo-workflow.yaml`:
+Create `demo-agents/workflows/echo-workflow.yaml`:
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
@@ -220,12 +204,12 @@ spec:
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- --port 8080 workflow deploy test-workflows/echo-workflow.yaml
+cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/echo-workflow.yaml
 
 # OR using HTTP API
 curl -X POST http://localhost:8080/api/workflows/register \
   -H "Content-Type: application/yaml" \
-  --data-binary @test-workflows/echo-workflow.yaml
+  --data-binary @demo-agents/workflows/echo-workflow.yaml
 ```
 
 **Expected Response:**
@@ -265,7 +249,7 @@ curl http://localhost:3000/workflows
 ```bash
 # Using Rust CLI
 cargo run --bin aegis -- --port 8080 workflow run echo-test \
-  --param message="Hello from Local Rust!"
+  --param message="Hello World!"
 
 # OR using Temporal CLI directly
 temporal workflow start \
@@ -313,52 +297,36 @@ open http://localhost:8233/namespaces/default/workflows/test-echo-001
 
 #### Step 2.1: Deploy Test Agent
 
-Create `test-agents/hello-agent.yaml`:
+Create `demo-agents/greeter/agent.yaml`:
 
 ```yaml
-apiVersion: 100monkeys.ai/v1
-kind: Agent
-
-metadata:
-  name: "hello-agent"
-  version: "1.0.0"
-  description: "Simple test agent"
-
-spec:
-  runtime:
-    language: python
-    version: "3.11"
-    isolation: docker
-    timeout: 30s
-
-  security:
-    network:
-      mode: allow-all
-    filesystem:
-      mode: readwrite
-      allowed_paths: ["/tmp"]
-    resources:
-      cpu: 1.0
-      memory: 512Mi
-      max_iterations: 3
-
-  prompt: |
-    You are a helpful assistant. 
-    User input: {{input}}
-    Respond with a friendly greeting.
+version: "1.1"
+agent:
+  name: "greeter"
+  version: "0.1.0"
+  description: "An agent that greets users based on their name."
+  runtime: "python:3.11"
+task:
+  instruction: "Greet the user based on their name: \"Hello <name>, nice to meet you!\""
 ```
 
 ```bash
 # Deploy agent
-cargo run --bin aegis -- --port 8080 agent deploy demo-agents/coder/agent.yaml
+cargo run --bin aegis -- --port 8080 agent deploy demo-agents/greeter/agent.yaml
 
 # Expected output:
 # Agent deployed: coder (id: ...)
 ```
 
-#### Step 2.2: Create and Deploy Agent Workflow
+### Step 2.2: Execute Test Agent
 
-Create `test-workflows/agent-workflow.yaml`:
+```bash
+cargo run --bin aegis -- --port 8080 task execute greeter --input "Jeshua"
+```
+
+#### Step 2.3: Create and Deploy Agent Workflow
+
+Create `demo-agents/workflows/agent-workflow.yaml`:
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
@@ -377,8 +345,8 @@ spec:
   states:
     RUN_AGENT:
       kind: Agent
-      agent: "hello-agent"
-      input: "Say hello to the world!"
+      agent: "greeter"
+      input: "Jeshua"
       timeout: 60s
       transitions:
         - condition: on_success
@@ -394,20 +362,15 @@ spec:
 
 ```bash
 # Deploy workflow
-cargo run --bin aegis -- --port 8080 workflow deploy test-workflows/agent-workflow.yaml
+cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/agent-workflow.yaml
 ```
 
-#### Step 2.3: Run Workflow
+#### Step 2.4: Run Workflow
 
 ```bash
 # Using Rust CLI
 cargo run --bin aegis -- --port 8080 workflow run agent-test \
-  --param input="Write a python script to count prime numbers"
-
-# OR using HTTP API
-curl -X POST http://localhost:8080/api/workflows/register \
-  -H "Content-Type: application/yaml" \
-  --data-binary @test-workflows/agent-workflow.yaml
+  --param input="Hello"
 
 # Execute with Temporal CLI
 temporal workflow start \
@@ -436,7 +399,7 @@ temporal workflow show --workflow-id test-agent-001 --follow
 11. WorkflowExecutionCompleted
 ```
 
-#### Step 2.4: Verification
+#### Step 2.5: Verification
 
 - **Daemon Logs:** You should see `ExecuteContainerAgent` activity being requested via gRPC.
 - **Docker:** A new Docker container for the agent (e.g., `python:3.11`) should spin up briefly.
@@ -492,22 +455,14 @@ curl http://localhost:3000/workflows | jq '.[] | select(.name == "100monkeys-cla
 ```bash
 # Using Rust CLI
 cargo run --bin aegis -- --port 8080 workflow run 100monkeys-classic \
-  --input '{
-    "agent_id": "coder",
-    "task": "Create a fibonacci function in Python",
-    "command": "python fib.py"
-  }'
+  --input '{"agent_id": "coder", "task": "Create a fibonacci function in Python", "command": "python fib.py"}'
 
 # OR start workflow with Temporal CLI directly
 temporal workflow start \
   --task-queue aegis-task-queue \
   --type aegis_workflow_100monkeys_classic \
   --workflow-id test-100monkeys-001 \
-  --input '{
-    "agent_id": "coder",
-    "task": "Write a Python function to calculate Fibonacci numbers recursively",
-    "command": "python main.py"
-  }'
+  --input '{"agent_id": "coder", "task": "Create a fibonacci function in Python", "command": "python fib.py"}'
 
 # Follow execution (when using CLI)
 cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
@@ -598,7 +553,7 @@ temporal workflow show --workflow-id test-100monkeys-001
 
 #### Step 4.1: Create Multi-Judge Workflow
 
-Create `test-workflows/multi-judge.yaml`:
+Create `demo-agents/workflows/multi-judge.yaml`:
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
@@ -672,7 +627,7 @@ spec:
 # Register
 curl -X POST http://localhost:8080/api/workflows/register \
   -H "Content-Type: application/yaml" \
-  --data-binary @test-workflows/multi-judge.yaml
+  --data-binary @demo-agents/workflows/multi-judge.yaml
 
 # Execute
 temporal workflow start \
@@ -708,7 +663,7 @@ temporal workflow show --workflow-id test-multi-judge-001 --follow
 
 #### Step 5.1: Create Human Approval Workflow
 
-Create `test-workflows/human-approval.yaml`:
+Create `demo-agents/workflows/human-approval.yaml`:
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
@@ -1211,4 +1166,3 @@ For questions, refer to:
 
 - [ADR-022: Temporal Integration](../../aegis-architecture/adrs/022-temporal-workflow-engine-integration.md)
 - [Proto Definitions](../../proto/aegis_runtime.proto)
-- [gRPC Server README](./grpc/README.md)

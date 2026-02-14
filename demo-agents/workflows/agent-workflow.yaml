@@ -14,8 +14,8 @@ spec:
   states:
     RUN_AGENT:
       kind: Agent
-      agent: "hello-agent"
-      input: "Say hello to the world!"
+      agent: "greeter"
+      input: "Jeshua"
       timeout: 60s
       transitions:
         - condition: on_success

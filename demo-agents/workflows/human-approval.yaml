@@ -1,0 +1,39 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "human-approval-test"
+  version: "1.0.0"
+  description: "Test human approval step"
+
+spec:
+  context: {}
+
+  initial_state: REQUEST_APPROVAL
+
+  states:
+    REQUEST_APPROVAL:
+      kind: Human
+      prompt: "Do you approve this deployment? (yes/no)"
+      timeout: 300s  # 5 minutes
+      default_response: "no"
+      transitions:
+        - condition: input_equals_yes
+          target: DEPLOY
+
+        - condition: input_equals_no
+          target: CANCELLED
+
+    DEPLOY:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "Deployment approved and started"
+      transitions: []
+
+    CANCELLED:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "Deployment cancelled by user"
+      transitions: []
