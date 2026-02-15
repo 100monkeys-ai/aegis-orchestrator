@@ -27,6 +27,8 @@ use aegis_runtime::*;
 pub struct AegisRuntimeService {
     execution_service: Arc<dyn ExecutionService>,
     validation_service: Arc<ValidationService>,
+    cortex_service: Option<Arc<dyn aegis_cortex::application::CortexService>>,
+    embedding_client: Option<Arc<aegis_cortex::infrastructure::EmbeddingClient>>,
 }
 
 impl AegisRuntimeService {
@@ -37,7 +39,20 @@ impl AegisRuntimeService {
         Self {
             execution_service,
             validation_service,
+            cortex_service: None,
+            embedding_client: None,
         }
+    }
+
+    /// Set the Cortex service (optional)
+    pub fn with_cortex(
+        mut self,
+        cortex_service: Arc<dyn aegis_cortex::application::CortexService>,
+        embedding_client: Arc<aegis_cortex::infrastructure::EmbeddingClient>,
+    ) -> Self {
+        self.cortex_service = Some(cortex_service);
+        self.embedding_client = Some(embedding_client);
+        self
     }
 
     /// Create a gRPC server instance
@@ -245,37 +260,142 @@ impl AegisRuntime for AegisRuntimeService {
         }
     }
 
-    /// Query Cortex for patterns (STUBBED - Will be implemented with Vector+RAG)
+    /// Query Cortex for patterns based on error signature or embedding similarity
     async fn query_cortex_patterns(
         &self,
         request: Request<QueryCortexRequest>,
     ) -> Result<Response<QueryCortexResponse>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
         
-        // TODO: Implement Cortex pattern search with Vector+RAG in future iteration
-        tracing::warn!("QueryCortexPatterns called but Cortex is not yet implemented (stubbed)");
-        
-        // Return empty results for now
+        // Check if Cortex is enabled
+        let (cortex, embedding_client) = match (&self.cortex_service, &self.embedding_client) {
+            (Some(c), Some(e)) => (c, e),
+            _ => {
+                tracing::warn!("QueryCortexPatterns called but Cortex is not enabled");
+                return Ok(Response::new(QueryCortexResponse {
+                    patterns: vec![],
+                }));
+            }
+        };
+
+        // Generate embedding from error signature
+        let query_embedding = embedding_client
+            .generate_embedding(&req.error_signature)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to generate embedding: {}", e)))?;
+
+        // Search for similar patterns
+        let limit = req.limit.unwrap_or(10) as usize;
+        let patterns = cortex
+            .search_patterns(query_embedding, limit)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to search patterns: {}", e)))?;
+
+        // Filter by success score if requested
+        let min_score = req.min_success_score.unwrap_or(0.0);
+        let filtered_patterns: Vec<_> = patterns
+            .into_iter()
+            .filter(|p| p.success_score >= min_score as f64)
+            .collect();
+
+        // Convert domain patterns to proto
+        let proto_patterns: Vec<CortexPattern> = filtered_patterns
+            .into_iter()
+            .map(|p| CortexPattern {
+                id: p.id.0.to_string(),
+                error_signature_hash: p.error_signature.error_message_hash.clone(),
+                error_type: p.error_signature.error_type.clone(),
+                error_message: format!("Pattern for {}", p.task_category), // Simplified
+                solution_approach: p.task_category.clone(),
+                solution_code: Some(p.solution_code.clone()),
+                frequency: p.execution_count as u32,
+                success_count: (p.execution_count as f64 * p.success_score) as u32,
+                total_count: p.execution_count as u32,
+                success_score: p.success_score as f32,
+                created_at: p.created_at.to_rfc3339(),
+                last_used_at: p.last_verified.to_rfc3339(),
+            })
+            .collect();
+
+        tracing::info!("Returned {} patterns from Cortex", proto_patterns.len());
+
         Ok(Response::new(QueryCortexResponse {
-            patterns: vec![],
+            patterns: proto_patterns,
         }))
     }
 
-    /// Store a learned pattern in Cortex (STUBBED - Will be implemented with Vector+RAG)
+    /// Store a learned pattern in Cortex with automatic deduplication
     async fn store_cortex_pattern(
         &self,
         request: Request<StoreCortexPatternRequest>,
     ) -> Result<Response<StoreCortexPatternResponse>, Status> {
-        let _req = request.into_inner();
+        let req = request.into_inner();
         
-        // TODO: Implement Cortex pattern storage with Vector+RAG in future iteration
-        tracing::warn!("StoreCortexPattern called but Cortex is not yet implemented (stubbed)");
-        
-        // Return placeholder response
+        // Check if Cortex is enabled
+        let (cortex, embedding_client) = match (&self.cortex_service, &self.embedding_client) {
+            (Some(c), Some(e)) => (c, e),
+            _ => {
+                tracing::warn!("StoreCortexPattern called but Cortex is not enabled");
+                return Ok(Response::new(StoreCortexPatternResponse {
+                    pattern_id: uuid::Uuid::new_v4().to_string(),
+                    deduplicated: false,
+                    new_frequency: 1,
+                }));
+            }
+        };
+
+        // Generate embedding
+        let content = format!(
+            "{} {} {}",
+            req.error_message,
+            req.solution_approach,
+            req.solution_code.as_ref().unwrap_or(&String::new())
+        );
+        let embedding = embedding_client
+            .generate_embedding(&content)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to generate embedding: {}", e)))?;
+
+        // Create error signature
+        let error_signature = aegis_cortex::domain::ErrorSignature::new(
+            req.error_type.clone(),
+            &req.error_message,
+        );
+
+        // Store pattern (with automatic deduplication)
+        let solution_code = req.solution_code.unwrap_or_else(|| req.solution_approach.clone());
+        let pattern_id = cortex
+            .store_pattern(
+                None, // No execution_id for gRPC-stored patterns
+                error_signature,
+                solution_code,
+                req.solution_approach,
+                embedding,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to store pattern: {}", e)))?;
+
+        // Get the stored pattern to check if it was deduplicated
+        let pattern = cortex
+            .get_pattern(pattern_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to retrieve pattern: {}", e)))?
+            .ok_or_else(|| Status::internal("Pattern not found after storing"))?;
+
+        let deduplicated = pattern.weight > 1.0;
+        let new_frequency = pattern.execution_count as u32;
+
+        tracing::info!(
+            "Stored pattern {} (deduplicated: {}, frequency: {})",
+            pattern_id.0,
+            deduplicated,
+            new_frequency
+        );
+
         Ok(Response::new(StoreCortexPatternResponse {
-            pattern_id: uuid::Uuid::new_v4().to_string(),
-            deduplicated: false,
-            new_frequency: 1,
+            pattern_id: pattern_id.0.to_string(),
+            deduplicated,
+            new_frequency,
         }))
     }
 }
