@@ -1,0 +1,337 @@
+# The Forge Workflow
+#
+# Constitutional Development Lifecycle implementing ADR-020
+# Requirements → Architecture → Testing → Implementation → Review → Human Approval → Deploy
+#
+# This workflow demonstrates:
+# - 7 specialized agents working in sequence
+# - Parallel execution of code reviewers
+# - Gradient validation at each stage
+# - Human-in-the-loop approval gates
+# - Cortex pattern injection
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "the-forge"
+  version: "1.0.0"
+  description: "Constitutional development pipeline with 7 specialized agents"
+  labels:
+    category: "development"
+    pattern: "constitutional-pipeline"
+    stability: "production"
+
+spec:
+  # Global context
+  context:
+    project_name: "{{workflow.project_name}}"
+    development_task: "{{workflow.task}}"
+    review_threshold: 0.75
+    approval_required: true
+
+  initial_state: REQUIREMENTS
+
+  states:
+    # ========================================================================
+    # State 1: REQUIREMENTS ANALYSIS
+    # Requirements analyst extracts and formalizes requirements
+    # ========================================================================
+    REQUIREMENTS:
+      kind: Agent
+      
+      agent: "requirements-analyst"
+      
+      input: |
+        # Development Task
+        {{workflow.task}}
+        
+        # Project Context
+        {{#if workflow.context}}
+        {{workflow.context}}
+        {{/if}}
+        
+        Analyze this development task and produce a comprehensive requirements specification.
+        Include functional requirements, non-functional requirements, acceptance criteria,
+        edge cases, and dependencies.
+      
+      timeout: 180s
+      
+      transitions:
+        - condition: always
+          target: ARCHITECTURE
+
+    # ========================================================================
+    # State 2: ARCHITECTURE DESIGN
+    # Architect designs technical solution
+    # ========================================================================
+    ARCHITECTURE:
+      kind: Agent
+      
+      agent: "architect-agent"
+      
+      input: |
+        # Requirements Specification
+        {{REQUIREMENTS.output}}
+        
+        Design a technical architecture for this project. Include:
+        - High-level system design
+        - Component breakdown
+        - Data models and schemas
+        - API contracts / interfaces
+        - Technology choices with rationale
+        - Implementation approach
+      
+      timeout: 240s
+      
+      transitions:
+        - condition: always
+          target: TEST_DESIGN
+
+    # ========================================================================
+    # State 3: TEST DESIGN
+    # Test engineer creates comprehensive test strategy
+    # ========================================================================
+    TEST_DESIGN:
+      kind: Agent
+      
+      agent: "tester-agent"
+      
+      input: |
+        # Requirements
+        {{REQUIREMENTS.output}}
+        
+        # Architecture
+        {{ARCHITECTURE.output}}
+        
+        Design a comprehensive test strategy including:
+        - Unit test cases with pseudo-code
+        - Integration test scenarios
+        - End-to-end test flows
+        - Test data requirements
+        - Edge cases and negative tests
+        - Coverage targets
+      
+      timeout: 200s
+      
+      transitions:
+        - condition: always
+          target: IMPLEMENTATION
+
+    # ========================================================================
+    # State 4: IMPLEMENTATION
+    # Coder writes production-ready code
+    # ========================================================================
+    IMPLEMENTATION:
+      kind: Agent
+      
+      agent: "coder-agent"
+      
+      input: |
+        # Requirements
+        {{REQUIREMENTS.output}}
+        
+        # Architecture
+        {{ARCHITECTURE.output}}
+        
+        # Test Strategy
+        {{TEST_DESIGN.output}}
+        
+        Implement the solution following the architecture and requirements.
+        Include:
+        - Complete, runnable implementation
+        - Proper error handling
+        - Documentation and comments
+        - Unit tests for your code
+        
+        Code should be production-ready and follow best practices.
+      
+      timeout: 600s
+      
+      transitions:
+        - condition: always
+          target: PARALLEL_REVIEW
+
+    # ========================================================================
+    # State 5: PARALLEL REVIEW
+    # Three reviewers evaluate simultaneously: code quality, design, security
+    # ========================================================================
+    PARALLEL_REVIEW:
+      kind: ParallelAgents
+      
+      agents:
+        - agent: "code-reviewer-agent"
+          input: |
+            # Requirements
+            {{REQUIREMENTS.output}}
+            
+            # Architecture
+            {{ARCHITECTURE.output}}
+            
+            # Implementation
+            {{IMPLEMENTATION.output}}
+            
+            Review the code for correctness, quality, and completeness.
+            Provide assessment: PASS, NEEDS_WORK, or REJECT with specific feedback.
+          weight: 1.5
+        
+        - agent: "critic-agent"
+          input: |
+            # Requirements
+            {{REQUIREMENTS.output}}
+            
+            # Architecture
+            {{ARCHITECTURE.output}}
+            
+            # Implementation
+            {{IMPLEMENTATION.output}}
+            
+            Critically evaluate the overall solution design and architecture.
+            Assess if it truly solves the problem with appropriate complexity.
+            Provide design assessment score (0.0-1.0) and recommendation.
+          weight: 1.0
+        
+        - agent: "security-auditor-agent"
+          input: |
+            # Implementation
+            {{IMPLEMENTATION.output}}
+            
+            Perform security audit of the implementation.
+            Check for OWASP Top 10 vulnerabilities, injection attacks,
+            authentication/authorization issues, sensitive data exposure.
+            Provide risk assessment and specific vulnerabilities found.
+          weight: 1.2
+      
+      consensus:
+        strategy: weighted_average
+        threshold: 0.75
+      
+      timeout: 300s
+      
+      transitions:
+        # All reviewers approve (weighted average >= 0.75)
+        - condition: consensus
+          threshold: 0.75
+          min_agreement: 0.6
+          target: HUMAN_APPROVAL
+        
+        # Any reviewer rejects or low consensus
+        - condition: score_below
+          threshold: 0.75
+          target: REVIEW_FAILED
+          feedback: "{{PARALLEL_REVIEW.consensus.reasoning}}"
+
+    # ========================================================================
+    # State 6: HUMAN APPROVAL
+    # Human decision maker reviews and approves/rejects
+    # ========================================================================
+    HUMAN_APPROVAL:
+      kind: Human
+      
+      prompt: |
+        # The Forge Review - Human Approval Required
+        
+        ## Development Task
+        {{workflow.task}}
+        
+        ## Requirements Analysis
+        {{REQUIREMENTS.output}}
+        
+        ## Architecture Design
+        {{ARCHITECTURE.output}}
+        
+        ## Test Strategy
+        {{TEST_DESIGN.output}}
+        
+        ## Implementation
+        {{IMPLEMENTATION.output}}
+        
+        ## Review Results
+        
+        ### Code Review Score: {{PARALLEL_REVIEW.agents.0.score}}
+        {{PARALLEL_REVIEW.agents.0.output}}
+        
+        ### Design Critique Score: {{PARALLEL_REVIEW.agents.1.score}}
+        {{PARALLEL_REVIEW.agents.1.output}}
+        
+        ### Security Audit Score: {{PARALLEL_REVIEW.agents.2.score}}
+        {{PARALLEL_REVIEW.agents.2.output}}
+        
+        ### Consensus Score: {{PARALLEL_REVIEW.consensus.score}}
+        
+        ---
+        
+        **Decision Required:** Approve for deployment or request revisions?
+        
+        Options:
+        - APPROVE: Deploy to production
+        - REVISE: Send back for improvements with feedback
+        - REJECT: Cancel deployment
+      
+      timeout: 3600s  # 1 hour for human review
+      
+      transitions:
+        - condition: approved
+          target: DEPLOY
+        
+        - condition: rejected
+          target: DEPLOYMENT_REJECTED
+        
+        - condition: timeout
+          target: APPROVAL_TIMEOUT
+
+    # ========================================================================
+    # State 7: DEPLOY
+    # Final deployment step (simulated)
+    # ========================================================================
+    DEPLOY:
+      kind: System
+      
+      command: "echo"
+      
+      env:
+        MESSAGE: "Deployment successful - The Forge pipeline complete"
+        PROJECT: "{{workflow.context.project_name}}"
+        CONSENSUS_SCORE: "{{PARALLEL_REVIEW.consensus.score}}"
+        HUMAN_DECISION: "APPROVED"
+        FINAL_CODE: "{{IMPLEMENTATION.output}}"
+      
+      transitions: []  # Terminal state
+
+    # ========================================================================
+    # Terminal States: Error Conditions
+    # ========================================================================
+    
+    REVIEW_FAILED:
+      kind: System
+      
+      command: "echo"
+      
+      env:
+        MESSAGE: "Review failed - refinement needed"
+        REASON: "{{state.feedback}}"
+        CONSENSUS_SCORE: "{{PARALLEL_REVIEW.consensus.score}}"
+      
+      transitions: []
+    
+    DEPLOYMENT_REJECTED:
+      kind: System
+      
+      command: "echo"
+      
+      env:
+        MESSAGE: "Deployment rejected by human reviewer"
+        CONSENSUS_SCORE: "{{PARALLEL_REVIEW.consensus.score}}"
+      
+      transitions: []
+    
+    APPROVAL_TIMEOUT:
+      kind: System
+      
+      command: "echo"
+      
+      env:
+        MESSAGE: "Human approval timeout - deployment cancelled"
+        TIMEOUT: "3600s"
+      
+      transitions: []

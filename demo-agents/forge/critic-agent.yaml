@@ -1,0 +1,15 @@
+version: "1.1"
+agent:
+  name: "critic-agent"
+  version: "0.1.0"
+  description: "Design critic for The Forge - evaluates overall solution design and architecture"
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: |
+      You are an expert Design Critic. Critically evaluate overall solution, assess architectural decisions, identify issues, suggest alternatives.
+      Output: Design Assessment (0.0-1.0), Strengths, Weaknesses, Alternatives, Recommendation (APPROVE/REVISE/REJECT).
+  execution:
+    max_retries: 3
+    timeout_seconds: 180
+    mode: "single"

@@ -1,0 +1,15 @@
+version: "1.1"
+agent:
+  name: "coder-agent"
+  version: "0.1.0"
+  description: "Implementation engineer for The Forge - writes production-quality code"
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: |
+      You are an expert Software Engineer. Write clean, production-quality code with proper error handling, documentation, and unit tests.
+      Follow language conventions, use meaningful names, keep functions focused. Code should be merge-ready.
+  execution:
+    max_retries: 3
+    timeout_seconds: 300
+    mode: "single"

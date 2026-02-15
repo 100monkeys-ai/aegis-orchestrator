@@ -53,6 +53,14 @@ pub enum CortexEvent {
         timestamp: DateTime<Utc>,
     },
     
+    /// Multiple patterns were pruned in a batch operation
+    PatternsPruned {
+        count: usize,
+        min_weight: f64,
+        max_age_days: i64,
+        pruned_at: DateTime<Utc>,
+    },
+    
     // Skill events (ADR-023: Evolutionary Skill Crystallization)
     
     /// A skill was crystallized from patterns
@@ -145,6 +153,7 @@ impl CortexEvent {
             CortexEvent::PatternWeightIncreased { timestamp, .. } => *timestamp,
             CortexEvent::PatternSuccessUpdated { timestamp, .. } => *timestamp,
             CortexEvent::PatternPruned { timestamp, .. } => *timestamp,
+            CortexEvent::PatternsPruned { pruned_at, .. } => *pruned_at,
             CortexEvent::SkillCrystallized { timestamp, .. } => *timestamp,
             CortexEvent::SkillEvolved { timestamp, .. } => *timestamp,
             CortexEvent::NodeCreated { timestamp, .. } => *timestamp,
@@ -163,6 +172,7 @@ impl CortexEvent {
             CortexEvent::PatternWeightIncreased { .. } => "pattern_weight_increased",
             CortexEvent::PatternSuccessUpdated { .. } => "pattern_success_updated",
             CortexEvent::PatternPruned { .. } => "pattern_pruned",
+            CortexEvent::PatternsPruned { .. } => "patterns_pruned",
             CortexEvent::SkillCrystallized { .. } => "skill_crystallized",
             CortexEvent::SkillEvolved { .. } => "skill_evolved",
             CortexEvent::NodeCreated { .. } => "node_created",
