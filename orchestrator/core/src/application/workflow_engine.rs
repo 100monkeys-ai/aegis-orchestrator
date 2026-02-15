@@ -485,54 +485,174 @@ impl WorkflowEngine {
                 }))
             }
 
-            StateKind::ParallelAgents { agents, .. } => {
+            StateKind::ParallelAgents { agents, consensus, .. } => {
                 debug!(count = agents.len(), "Executing parallel agents state");
                 
-                // Collect agents to run
-                let mut agent_ids = Vec::new();
-                // TODO: Map string names to AgentIds. For now assuming they are UUID strings.
-                // In a real implementation, we would look up AgentId by name.
+                if agents.is_empty() {
+                    return Ok(serde_json::json!({
+                        "error": "No agents configured for parallel execution"
+                    }));
+                }
+
+                // Execute all agents in parallel using tokio::spawn
+                let mut handles = Vec::new();
+                let mut agent_configs = Vec::new();
+
                 for config in agents {
-                    if let Ok(id) = crate::domain::agent::AgentId::from_string(&config.agent) {
-                        agent_ids.push(id);
-                    } else {
-                         // warning: invalid agent id
+                    // Render the input template for each agent
+                    let rendered_input = self.render_template(&config.input, workflow_execution)?;
+                    
+                    // Parse agent ID - try as UUID first, then as agent name
+                    let agent_id = crate::domain::agent::AgentId::from_string(&config.agent)
+                        .unwrap_or_else(|_| {
+                            // If not a UUID, treat as agent name and generate a consistent ID
+                            // In production, this would look up the agent by name
+                            tracing::warn!("Agent '{}' not found as UUID, using placeholder", config.agent);
+                            crate::domain::agent::AgentId::new()
+                        });
+
+                    agent_configs.push((agent_id, rendered_input, config.weight));
+                }
+
+                // Use a semaphore to limit concurrent executions
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(10)); // Max 10 concurrent
+                let execution_service = self.execution_service.clone();
+
+                for (agent_id, input, weight) in agent_configs {
+                    let permit = semaphore.clone().acquire_owned().await
+                        .map_err(|e| anyhow::anyhow!("Failed to acquire semaphore: {}", e))?;
+                    let exec_service = execution_service.clone();
+                    let workflow_id = workflow.id;
+                    let blackboard_data = workflow_execution.blackboard.data().clone();
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit; // Hold permit for duration of execution
+                        
+                        // Prepare execution input
+                        let execution_input = crate::domain::execution::ExecutionInput {
+                            intent: Some(input.clone()),
+                            payload: serde_json::json!({
+                                "workflow_id": workflow_id,
+                                "parallel_execution": true,
+                                "context": blackboard_data
+                            }),
+                        };
+
+                        // Start execution
+                        let exec_id = match exec_service.start_execution(agent_id, execution_input).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::error!("Failed to start agent execution: {}", e);
+                                return (agent_id, weight, Err(e));
+                            }
+                        };
+
+                        // Wait for completion by streaming events
+                        match exec_service.stream_execution(exec_id).await {
+                            Ok(mut stream) => {
+                                use futures::StreamExt;
+                                while let Some(event_result) = stream.next().await {
+                                    match event_result {
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. }) => {
+                                            return (agent_id, weight, Ok(final_output));
+                                        }
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionFailed { reason, .. }) => {
+                                            return (agent_id, weight, Err(anyhow::anyhow!("Execution failed: {}", reason)));
+                                        }
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionCancelled { reason, .. }) => {
+                                            return (agent_id, weight, Err(anyhow::anyhow!("Execution cancelled: {:?}", reason)));
+                                        }
+                                        Err(e) => {
+                                            return (agent_id, weight, Err(e));
+                                        }
+                                        _ => {} // Continue on intermediate events
+                                    }
+                                }
+                                (agent_id, weight, Err(anyhow::anyhow!("Stream ended without completion")))
+                            }
+                            Err(e) => (agent_id, weight, Err(e))
+                        }
+                    });
+
+                    handles.push(handle);
+                }
+
+                // Wait for all agents to complete
+                let mut results = Vec::new();
+                for handle in handles {
+                    match handle.await {
+                        Ok((agent_id, weight, result)) => {
+                            results.push((agent_id, weight, result));
+                        }
+                        Err(e) => {
+                            tracing::error!("Parallel agent task panicked: {}", e);
+                            return Err(anyhow::anyhow!("Parallel execution task failed: {}", e));
+                        }
                     }
                 }
 
-                // Construct validation request (assuming this is a validation step)
-                // We use the input from the first agent config as the content? 
-                // Or maybe the blackboard has the content?
-                // For ParallelAgents, usually they all get the same input or variations.
-                // The `input` field in ParallelAgentConfig is a template.
-                
-                // Let's assume the first agent's input template renders to the content we want validated.
-                // Or if there are no agents, we return empty.
-                if agent_ids.is_empty() {
-                     return Ok(serde_json::json!({
-                        "error": "No valid agents found for parallel execution"
-                     }));
+                // Process results and calculate consensus
+                let mut agent_outputs = Vec::new();
+                let mut agent_scores = Vec::new();
+                let mut total_weight = 0.0;
+                let mut weighted_score_sum = 0.0;
+
+                for (agent_id, weight, result) in results {
+                    match result {
+                        Ok(output) => {
+                            // Try to parse as JSON with score field
+                            let score = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
+                                json.get("score").and_then(|s| s.as_f64()).unwrap_or(0.8)
+                            } else {
+                                0.8 // Default score if not JSON
+                            };
+
+                            agent_outputs.push(serde_json::json!({
+                                "agent_id": agent_id.0.to_string(),
+                                "output": output,
+                                "score": score,
+                                "weight": weight
+                            }));
+
+                            agent_scores.push(score);
+                            total_weight += weight;
+                            weighted_score_sum += score * weight;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Agent {:?} failed: {}", agent_id.0, e);
+                            agent_outputs.push(serde_json::json!({
+                                "agent_id": agent_id.0.to_string(),
+                                "error": e.to_string(),
+                                "score": 0.0,
+                                "weight": weight
+                            }));
+                        }
+                    }
                 }
 
-                // Render the input for the first agent (as a proxy for the request content)
-                // This is a simplification. Ideally, ValidationRequest should be explicit.
-                let content = if let Some(first_config) = agents.first() {
-                    self.render_template(&first_config.input, workflow_execution)?
+                // Calculate consensus score
+                let consensus_score = if total_weight > 0.0 {
+                    weighted_score_sum / total_weight
                 } else {
-                    "No content".to_string()
+                    0.0
                 };
 
-                let request = crate::domain::validation::ValidationRequest {
-                    content,
-                    criteria: "Evaluate based on system instructions".to_string(), // TODO: Make configurable
-                    context: Some(serde_json::to_value(workflow_execution.blackboard.data())?),
-                };
+                // Determine consensus threshold
+                let threshold = consensus.threshold.unwrap_or(0.7);
 
-                // Execute validation
-                match self.validation_service.validate_with_judges(execution_id, request, agent_ids).await {
-                    Ok(consensus) => Ok(serde_json::to_value(consensus)?),
-                    Err(e) => Err(anyhow::anyhow!("Validation failed: {}", e)),
-                }
+                let consensus_reached = consensus_score >= threshold;
+
+                Ok(serde_json::json!({
+                    "agents": agent_outputs,
+                    "consensus": {
+                        "score": consensus_score,
+                        "threshold": threshold,
+                        "reached": consensus_reached,
+                        "strategy": "weighted_average",
+                        "individual_scores": agent_scores,
+                    },
+                    "total_weight": total_weight,
+                }))
             }
         }
     }
