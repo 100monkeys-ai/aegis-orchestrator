@@ -305,11 +305,11 @@ impl AegisRuntime for AegisRuntimeService {
                 id: p.id.0.to_string(),
                 error_signature_hash: p.error_signature.error_message_hash.clone(),
                 error_type: p.error_signature.error_type.clone(),
-                error_message: format!("Pattern for {}", p.task_category), // Simplified
+                error_message: p.error_signature.error_message_hash.clone(), // Hash serves as message identifier
                 solution_approach: p.task_category.clone(),
                 solution_code: Some(p.solution_code.clone()),
                 frequency: p.execution_count as u32,
-                success_count: (p.execution_count as f64 * p.success_score) as u32,
+                success_count: (p.execution_count as f64 * p.success_score).round() as u32,
                 total_count: p.execution_count as u32,
                 success_score: p.success_score as f32,
                 created_at: p.created_at.to_rfc3339(),
@@ -382,7 +382,8 @@ impl AegisRuntime for AegisRuntimeService {
             .map_err(|e| Status::internal(format!("Failed to retrieve pattern: {}", e)))?
             .ok_or_else(|| Status::internal("Pattern not found after storing"))?;
 
-        let deduplicated = pattern.weight > 1.0;
+        // Pattern is deduplicated if execution_count > 1 (means it was incremented)
+        let deduplicated = pattern.execution_count > 1;
         let new_frequency = pattern.execution_count as u32;
 
         tracing::info!(

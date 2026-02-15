@@ -49,6 +49,7 @@ pub struct CortexPruner {
     cortex_service: Arc<dyn CortexService>,
     event_bus: Arc<dyn EventBus>,
     config: CortexPrunerConfig,
+    shutdown_token: tokio_util::sync::CancellationToken,
 }
 
 impl CortexPruner {
@@ -61,7 +62,13 @@ impl CortexPruner {
             cortex_service,
             event_bus,
             config,
+            shutdown_token: tokio_util::sync::CancellationToken::new(),
         }
+    }
+
+    /// Get a handle to trigger shutdown
+    pub fn shutdown_token(&self) -> tokio_util::sync::CancellationToken {
+        self.shutdown_token.clone()
     }
 
     /// Start the pruner background task
@@ -72,7 +79,7 @@ impl CortexPruner {
         })
     }
 
-    /// Run the pruner loop
+    /// Run the pruner loop with graceful shutdown support
     async fn run(&self) {
         if !self.config.enabled {
             info!("Cortex pruner is disabled");
@@ -89,22 +96,30 @@ impl CortexPruner {
         let mut tick = interval(Duration::from_secs(self.config.interval_seconds));
 
         loop {
-            tick.tick().await;
+            tokio::select! {
+                _ = tick.tick() => {
+                    debug!("Running Cortex pruner cycle");
 
-            debug!("Running Cortex pruner cycle");
-
-            match self.prune_cycle().await {
-                Ok(pruned_count) => {
-                    info!(
-                        pruned_count,
-                        "Cortex pruner cycle completed successfully"
-                    );
+                    match self.prune_cycle().await {
+                        Ok(pruned_count) => {
+                            info!(
+                                pruned_count,
+                                "Cortex pruner cycle completed successfully"
+                            );
+                        }
+                        Err(e) => {
+                            warn!("Cortex pruner cycle failed: {}", e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    warn!("Cortex pruner cycle failed: {}", e);
+                _ = self.shutdown_token.cancelled() => {
+                    info!("Shutdown signal received, stopping Cortex pruner");
+                    break;
                 }
             }
         }
+
+        info!("Cortex pruner background task stopped");
     }
 
     /// Execute a single pruning cycle

@@ -10,7 +10,7 @@
 #### 1. Qdrant Vector Database Integration
 - **File:** `cortex/src/infrastructure/qdrant_repository.rs` (NEW - 450+ lines)
 - **Features:**
-  - Full PatternRepository implementation using Qdrant 1.16
+  - Full PatternRepository implementation using Qdrant server (via Rust client crate `qdrant-client` v1.7)
   - Vector similarity search with cosine distance
   - CRUD operations for patterns
   - Automatic deduplication via vector similarity
@@ -186,7 +186,7 @@ This entire phase needs implementation:
 
 ## Files Modified/Created
 
-### New Files (8):
+### New Files (9):
 1. `cortex/src/infrastructure/qdrant_repository.rs`
 2. `cortex/src/application/cortex_pruner.rs`
 3. `demo-agents/forge/requirements-analyst.yaml`

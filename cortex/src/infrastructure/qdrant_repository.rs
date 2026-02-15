@@ -26,7 +26,7 @@ use crate::domain::{CortexPattern, PatternId, ErrorSignature};
 use crate::infrastructure::repository::PatternRepository;
 
 const COLLECTION_NAME: &str = "aegis_patterns";
-const VECTOR_DIM: u64 = 1536; // OpenAI ada-002 embedding dimension
+const VECTOR_DIM: u64 = 384; // EmbeddingClient vector dimension (all-MiniLM-L6-v2)
 
 pub struct QdrantPatternRepository {
     client: Qdrant,
@@ -90,7 +90,7 @@ impl QdrantPatternRepository {
     /// Convert Qdrant payload to CortexPattern
     fn payload_to_pattern(payload: &HashMap<String, Value>) -> Result<CortexPattern> {
         let id_str = payload.get("id")
-            .context("Missing id")?
+            .context("Missing id field")?
             .kind.as_ref().context("Missing id kind")?;
         let id = match id_str {
             qdrant_client::qdrant::value::Kind::StringValue(s) => Uuid::parse_str(s)?,
@@ -133,27 +133,27 @@ impl QdrantPatternRepository {
     }
     
     fn get_string_value(payload: &HashMap<String, Value>, key: &str) -> Result<String> {
-        let value = payload.get(key).context(format!("Missing {}", key))?;
+        let value = payload.get(key).with_context(|| format!("Missing field: {}", key))?;
         match &value.kind {
             Some(qdrant_client::qdrant::value::Kind::StringValue(s)) => Ok(s.clone()),
-            _ => anyhow::bail!("Invalid {} type", key),
+            _ => anyhow::bail!("Invalid type for field: {}", key),
         }
     }
     
     fn get_double_value(payload: &HashMap<String, Value>, key: &str) -> Result<f64> {
-        let value = payload.get(key).context(format!("Missing {}", key))?;
+        let value = payload.get(key).with_context(|| format!("Missing field: {}", key))?;
         match &value.kind {
             Some(qdrant_client::qdrant::value::Kind::DoubleValue(d)) => Ok(*d),
             Some(qdrant_client::qdrant::value::Kind::IntegerValue(i)) => Ok(*i as f64),
-            _ => anyhow::bail!("Invalid {} type", key),
+            _ => anyhow::bail!("Invalid type for field: {}", key),
         }
     }
     
     fn get_integer_value(payload: &HashMap<String, Value>, key: &str) -> Result<i64> {
-        let value = payload.get(key).context(format!("Missing {}", key))?;
+        let value = payload.get(key).with_context(|| format!("Missing field: {}", key))?;
         match &value.kind {
             Some(qdrant_client::qdrant::value::Kind::IntegerValue(i)) => Ok(*i),
-            _ => anyhow::bail!("Invalid {} type", key),
+            _ => anyhow::bail!("Invalid type for field: {}", key),
         }
     }
 }
@@ -161,6 +161,15 @@ impl QdrantPatternRepository {
 #[async_trait]
 impl PatternRepository for QdrantPatternRepository {
     async fn store_pattern(&self, pattern: &CortexPattern, embedding: Vec<f32>) -> Result<PatternId> {
+        // Validate embedding dimension
+        if embedding.len() != VECTOR_DIM as usize {
+            anyhow::bail!(
+                "Invalid embedding dimension: expected {}, got {}",
+                VECTOR_DIM,
+                embedding.len()
+            );
+        }
+
         let payload = Self::pattern_to_payload(pattern);
         
         let point = PointStruct::new(
@@ -281,8 +290,15 @@ impl PatternRepository for QdrantPatternRepository {
     async fn get_all_patterns(&self) -> Result<Vec<CortexPattern>> {
         let mut patterns = Vec::new();
         let mut offset: Option<PointId> = None;
+        let mut iteration_count = 0;
+        const MAX_ITERATIONS: usize = 1000; // Safety limit to prevent infinite loops
         
         loop {
+            if iteration_count >= MAX_ITERATIONS {
+                tracing::warn!("Reached maximum iteration limit while scrolling patterns");
+                break;
+            }
+            
             let mut builder = ScrollPointsBuilder::new(COLLECTION_NAME)
                 .with_payload(true)
                 .limit(100);
@@ -309,6 +325,8 @@ impl PatternRepository for QdrantPatternRepository {
             if offset.is_none() {
                 break;
             }
+            
+            iteration_count += 1;
         }
         
         Ok(patterns)
