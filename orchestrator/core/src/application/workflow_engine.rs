@@ -58,7 +58,7 @@ use std::path::Path;
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use futures::StreamExt;
 use crate::infrastructure::temporal_client::TemporalClient;
 
@@ -102,6 +102,9 @@ pub struct WorkflowEngine {
     /// Embedding client for generating semantic embeddings (Optional)
     embedding_client: Option<Arc<EmbeddingClient>>,
     
+    /// Human input service for approval gates
+    human_input_service: Arc<crate::infrastructure::HumanInputService>,
+    
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
     
@@ -120,6 +123,7 @@ impl WorkflowEngine {
         execution_service: Arc<dyn ExecutionService>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         cortex_service: Option<Arc<dyn CortexService>>,
+        human_input_service: Arc<crate::infrastructure::HumanInputService>,
     ) -> Self {
         // Create embedding client if Cortex is enabled
         let embedding_client = cortex_service.as_ref().map(|_| Arc::new(EmbeddingClient::new()));
@@ -134,6 +138,7 @@ impl WorkflowEngine {
             execution_service,
             cortex_service,
             embedding_client,
+            human_input_service,
             template_engine: Arc::new(handlebars::Handlebars::new()),
             temporal_client,
         }
@@ -474,15 +479,62 @@ impl WorkflowEngine {
                 }))
             }
 
-            StateKind::Human { prompt: _, .. } => {
-                debug!("Executing human state");
+            StateKind::Human { prompt, .. } => {
+                debug!("Executing human approval state");
                 
-                // TODO: Wait for human input
-                // For now, return placeholder
-                Ok(serde_json::json!({
-                    "response": "yes",
-                    "feedback": ""
-                }))
+                // Render the prompt template
+                let rendered_prompt = self.render_template(prompt, workflow_execution)?;
+                
+                // Use default timeout of 1 hour (could be made configurable via workflow context)
+                let timeout_seconds = workflow_execution.blackboard
+                    .get("human_approval_timeout_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3600);
+                
+                info!(
+                    execution_id = %execution_id,
+                    timeout_seconds = timeout_seconds,
+                    "Requesting human input"
+                );
+                
+                // Request human input and wait
+                let result = self.human_input_service
+                    .request_input(execution_id, rendered_prompt.clone(), timeout_seconds)
+                    .await?;
+                
+                // Convert result to JSON response
+                match result {
+                    crate::infrastructure::HumanInputStatus::Approved { feedback, approved_at, approved_by } => {
+                        info!("Human approval received");
+                        Ok(serde_json::json!({
+                            "decision": "approved",
+                            "feedback": feedback,
+                            "approved_at": approved_at.to_rfc3339(),
+                            "approved_by": approved_by,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::Rejected { reason, rejected_at, rejected_by } => {
+                        info!("Human rejection received");
+                        Ok(serde_json::json!({
+                            "decision": "rejected",
+                            "reason": reason,
+                            "rejected_at": rejected_at.to_rfc3339(),
+                            "rejected_by": rejected_by,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::TimedOut { timeout_at } => {
+                        warn!("Human input request timed out");
+                        Ok(serde_json::json!({
+                            "decision": "timeout",
+                            "timeout_at": timeout_at.to_rfc3339(),
+                            "timeout_seconds": timeout_seconds,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::Pending => {
+                        // Shouldn't happen - request_input waits for completion
+                        Err(anyhow::anyhow!("Human input still pending (unexpected)"))
+                    }
+                }
             }
 
             StateKind::ParallelAgents { agents, consensus, .. } => {

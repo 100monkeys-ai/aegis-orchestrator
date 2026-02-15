@@ -9,3 +9,6 @@ pub mod llm;
 pub mod workflow_parser;
 pub mod temporal_client;
 pub mod temporal_proto;
+pub mod human_input_service;
+
+pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};

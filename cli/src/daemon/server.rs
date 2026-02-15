@@ -268,6 +268,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_service.clone(),
         Some(cortex_service.clone()),
     ));
+    
+    // Create human input service
+    let human_input_service = Arc::new(aegis_core::infrastructure::HumanInputService::new());
+    
     let workflow_engine = Arc::new(WorkflowEngine::new(
         workflow_repo,
         workflow_execution_repo, 
@@ -276,6 +280,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_service.clone(),
         temporal_client_container,
         Some(cortex_service),
+        human_input_service.clone(),
     ));
     println!("Workflow engine initialized.");
 
@@ -285,6 +290,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         event_bus,
         _llm_registry: llm_registry,
         workflow_engine,
+        human_input_service: human_input_service.clone(),
         start_time: std::time::Instant::now(),
     };
 
@@ -314,6 +320,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .route("/api/workflows/:name/run", post(run_workflow_handler))
         .route("/api/workflows/executions/:execution_id", get(get_workflow_execution_handler))
         .route("/api/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
+        
+        // Human Approval API routes
+        .route("/api/human-approvals", get(list_pending_approvals_handler))
+        .route("/api/human-approvals/:id", get(get_pending_approval_handler))
+        .route("/api/human-approvals/:id/approve", post(approve_request_handler))
+        .route("/api/human-approvals/:id/reject", post(reject_request_handler))
         
         .with_state(Arc::new(app_state));
 
@@ -424,6 +436,7 @@ struct AppState {
     event_bus: Arc<EventBus>,
     _llm_registry: Arc<ProviderRegistry>,
     workflow_engine: Arc<WorkflowEngine>,
+    human_input_service: Arc<aegis_core::infrastructure::HumanInputService>,
     start_time: std::time::Instant,
 }
 
@@ -1389,5 +1402,94 @@ async fn stream_workflow_logs_handler(
         Err(e) => {
             (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get workflow logs: {}", e))
         }
+    }
+}
+
+// ============================================================================
+// Human Approval Handlers
+// ============================================================================
+
+/// GET /api/human-approvals - List all pending approval requests
+async fn list_pending_approvals_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let pending = state.human_input_service.list_pending_requests().await;
+    Json(serde_json::json!({
+        "pending_requests": pending,
+        "count": pending.len()
+    }))
+}
+
+/// GET /api/human-approvals/:id - Get a specific pending approval request
+async fn get_pending_approval_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Json<serde_json::Value> {
+    let request_id = match Uuid::parse_str(&id) {
+        Ok(uid) => uid,
+        Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
+    };
+
+    match state.human_input_service.get_pending_request(request_id).await {
+        Some(request) => Json(serde_json::json!({ "request": request })),
+        None => Json(serde_json::json!({ "error": "Request not found or already completed" })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ApprovalRequest {
+    feedback: Option<String>,
+    approved_by: Option<String>,
+}
+
+/// POST /api/human-approvals/:id/approve - Approve a pending request
+async fn approve_request_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<ApprovalRequest>,
+) -> Json<serde_json::Value> {
+    let request_id = match Uuid::parse_str(&id) {
+        Ok(uid) => uid,
+        Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
+    };
+
+    match state.human_input_service
+        .submit_approval(request_id, payload.feedback, payload.approved_by)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "status": "approved",
+            "request_id": id
+        })),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RejectionRequest {
+    reason: String,
+    rejected_by: Option<String>,
+}
+
+/// POST /api/human-approvals/:id/reject - Reject a pending request
+async fn reject_request_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<RejectionRequest>,
+) -> Json<serde_json::Value> {
+    let request_id = match Uuid::parse_str(&id) {
+        Ok(uid) => uid,
+        Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
+    };
+
+    match state.human_input_service
+        .submit_rejection(request_id, payload.reason, payload.rejected_by)
+        .await
+    {
+        Ok(()) => Json(serde_json::json!({
+            "status": "rejected",
+            "request_id": id
+        })),
+        Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
     }
 }
