@@ -400,9 +400,20 @@ impl WorkflowEngine {
                 let agent_id = crate::domain::agent::AgentId::from_string(agent)
                     .map_err(|_| anyhow::anyhow!("Invalid agent ID: {}", agent))?;
 
-                // Prepare execution input
+                // NEW: Inject relevant Cortex patterns before execution
+                let input_with_patterns = if let Some(cortex) = &self.cortex_service {
+                    self.inject_cortex_patterns(cortex, &rendered_input, &workflow_execution.blackboard).await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("Failed to inject patterns: {}", e);
+                            rendered_input.clone()
+                        })
+                } else {
+                    rendered_input.clone()
+                };
+
+                // Prepare execution input with injected patterns
                 let execution_input = crate::domain::execution::ExecutionInput {
-                    intent: Some(rendered_input.clone()),
+                    intent: Some(input_with_patterns),
                     payload: serde_json::json!({
                         "workflow_id": workflow.id,
                         "state": state.kind,
@@ -769,10 +780,69 @@ impl Default for WorkflowInput {
 }
 
     // ========================================================================
-    // Cortex Pattern Capture
+    // Cortex Pattern Injection and Capture
     // ========================================================================
 
 impl WorkflowEngine {
+
+    /// Inject relevant learned patterns into agent input
+    async fn inject_cortex_patterns(
+        &self,
+        cortex: &Arc<dyn CortexService>,
+        input: &str,
+        _blackboard: &Blackboard,
+    ) -> Result<String> {
+        // Generate embedding for the input to search for similar patterns
+        let query_embedding = if let Some(client) = &self.embedding_client {
+            client.generate_embedding(input).await?
+        } else {
+            // If no embedding client, skip injection
+            return Ok(input.to_string());
+        };
+
+        // Search for top 3 relevant patterns
+        let patterns = cortex
+            .search_patterns(query_embedding, 3)
+            .await?;
+
+        if patterns.is_empty() {
+            // No relevant patterns found
+            return Ok(input.to_string());
+        }
+
+        // Build augmented input with pattern context
+        let mut augmented_input = String::new();
+        augmented_input.push_str("# Relevant Learned Patterns\n\n");
+        augmented_input.push_str("The following patterns from previous successful executions may be relevant:\n\n");
+
+        for (idx, pattern) in patterns.iter().enumerate() {
+            augmented_input.push_str(&format!(
+                "## Pattern {}\n",
+                idx + 1
+            ));
+            augmented_input.push_str(&format!("**Category:** {}\n", pattern.task_category));
+            augmented_input.push_str(&format!("**Success Score:** {:.2}\n", pattern.success_score));
+            augmented_input.push_str(&format!("**Used {} times**\n\n", pattern.execution_count));
+            augmented_input.push_str("**Solution Approach:**\n");
+            augmented_input.push_str("```\n");
+            augmented_input.push_str(&pattern.solution_code);
+            augmented_input.push_str("\n```\n\n");
+        }
+
+        augmented_input.push_str("---\n\n");
+        augmented_input.push_str("# Current Task\n\n");
+        augmented_input.push_str(input);
+        augmented_input.push_str("\n\n");
+        augmented_input.push_str("Note: Consider the patterns above when solving this task, but adapt them to the current context.\n");
+
+        debug!(
+            pattern_count = patterns.len(),
+            "Injected {} patterns into agent input",
+            patterns.len()
+        );
+
+        Ok(augmented_input)
+    }
 
     async fn capture_execution_pattern(
         &self,
