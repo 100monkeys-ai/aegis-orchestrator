@@ -1,5 +1,29 @@
-// Build script for aegis-core
-// Compiles Protocol Buffer definitions for gRPC
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
+//! Build Script for aegis-core
+//!
+//! This build script compiles Protocol Buffer definitions for gRPC communication
+//! with external services, primarily Temporal.io workflow engine integration.
+//!
+//! # Compilation Targets
+//!
+//! - **Temporal API**: Workflow service, common types, task queues, history
+//! - **AEGIS Runtime**: Custom runtime protocol definitions
+//!
+//! # Code Generation
+//!
+//! Uses `tonic-build` to generate Rust code from `.proto` files located in:
+//! - `../../proto/aegis_runtime.proto` - AEGIS-specific protocols
+//! - `../../proto/temporal/api/**/*.proto` - Temporal API definitions
+//!
+//! Generated code is placed in `OUT_DIR` and included via `tonic::include_proto!`
+//! in `src/infrastructure/temporal_proto.rs`.
+//!
+//! # Dependencies
+//!
+//! - **protoc**: Protocol buffer compiler (vendored via `protoc-bin-vendored`)
+//! - **tonic-build**: Code generator for Rust gRPC stubs
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set PROTOC environment variable to point to the vendored protoc binary

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use aegis_core::application::temporal_mapper::TemporalWorkflowMapper;
 use aegis_core::domain::workflow::*;
 use std::collections::HashMap;

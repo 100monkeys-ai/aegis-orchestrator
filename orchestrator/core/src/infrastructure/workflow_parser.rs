@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Workflow YAML Parser
 //!
 //! This module provides infrastructure for parsing workflow YAML manifests

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Prompt Template Engine
 //!
 //! This module provides template rendering functionality for agent prompts,

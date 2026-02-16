@@ -1,3 +1,65 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
+//! Validation Service
+//!
+//! This application service implements multi-agent validation patterns including
+//! Judge agents, consensus strategies, and gradient-based evaluation for agent outputs.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Orchestrate validation workflows with multiple judge agents
+//! - **Integration:** Execution Service → Judge Agents → Consensus Calculation
+//!
+//! # Validation Patterns
+//!
+//! ## Multi-Judge Consensus
+//!
+//! Execute multiple judge agents in parallel and aggregate their verdicts using
+//! configurable consensus strategies:
+//!
+//! - **Weighted Average**: Combine scores using judge-specific weights
+//! - **Majority Vote**: Simple majority with optional threshold
+//! - **Top-N**: Select best N judges and average their scores
+//! - **Unanimous**: Require all judges to agree
+//!
+//! ## Gradient Evaluation
+//!
+//! Judge agents return structured `GradientResult` with:
+//! - Pass/fail verdict
+//! - Confidence score (0.0 - 1.0)
+//! - Detailed reasoning
+//!
+//! ## Cortex Integration
+//!
+//! When enabled, validation results are sent to Cortex for pattern learning:
+//! - Success/failure signatures
+//! - Error pattern detection
+//! - Confidence calibration
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use validation_service::ValidationService;
+//! use domain::validation::ValidationRequest;
+//!
+//! let service = ValidationService::new(event_bus, execution_service, cortex);
+//! let judges = vec![
+//!     (judge1_id, 1.0),  // weight: 1.0
+//!     (judge2_id, 0.8),  // weight: 0.8
+//! ];
+//!
+//! let consensus = service.validate_with_judges(
+//!     execution_id,
+//!     request,
+//!     judges,
+//!     Some(config),
+//!     timeout_secs,
+//!     poll_interval_ms
+//! ).await?;
+//! ```
+
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, anyhow, Context};

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use aegis_core::application::validation_service::ValidationService;
 use aegis_core::domain::agent::AgentId;
 use aegis_core::domain::execution::{Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction};

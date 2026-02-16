@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Workflow Engine Application Service
 //!
 //! This module implements the FSM execution engine that drives workflow state transitions.
@@ -22,7 +25,7 @@
 //! ```text
 //! loop {
 //!     current_state = workflow_execution.current_state
-//!     
+//!
 //!     // Execute state
 //!     output = execute_state(current_state)
 //!     
