@@ -122,41 +122,41 @@ pub enum RepositoryError {
 }
 
 use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecutionRepository};
+use crate::infrastructure::repositories::postgres_agent::PostgresAgentRepository;
+use crate::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
+use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
 
 /// Factory for creating repositories from storage backend
-pub fn create_agent_repository(backend: &StorageBackend) -> Arc<dyn AgentRepository> {
+pub fn create_agent_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn AgentRepository> {
     match backend {
         StorageBackend::InMemory => {
             Arc::new(InMemoryAgentRepository::new())
         }
-        StorageBackend::PostgreSQL(config) => {
-            // Future: Arc::new(PostgresAgentRepository::new(config))
-            todo!("PostgreSQL repository not yet implemented. Connection string: {}", config.connection_string)
+        StorageBackend::PostgreSQL(_) => {
+            Arc::new(PostgresAgentRepository::new(pool))
         }
     }
 }
 
-pub fn create_execution_repository(backend: &StorageBackend) -> Arc<dyn ExecutionRepository> {
+pub fn create_execution_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn ExecutionRepository> {
     match backend {
         StorageBackend::InMemory => {
             Arc::new(InMemoryExecutionRepository::new())
         }
-        StorageBackend::PostgreSQL(config) => {
-            // Arc::new(PostgresExecutionRepository::new(config))
-            todo!("PostgresExecutionRepository not yet implemented. Connection string: {}", config.connection_string)
+        StorageBackend::PostgreSQL(_) => {
+            Arc::new(PostgresExecutionRepository::new(pool))
         }
     }
 }
 
-pub fn create_workflow_execution_repository(backend: &StorageBackend) -> Arc<dyn WorkflowExecutionRepository> {
+pub fn create_workflow_execution_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn WorkflowExecutionRepository> {
     match backend {
         StorageBackend::InMemory => {
             // Arc::new(InMemoryWorkflowExecutionRepository::new())
             todo!("InMemoryWorkflowExecutionRepository not yet implemented")
         }
-        StorageBackend::PostgreSQL(config) => {
-             // Arc::new(PostgresWorkflowExecutionRepository::new(config))
-             todo!("PostgresWorkflowExecutionRepository not yet implemented. Connection string: {}", config.connection_string)
+        StorageBackend::PostgreSQL(_) => {
+             Arc::new(PostgresWorkflowExecutionRepository::new(pool))
         }
     }
 }

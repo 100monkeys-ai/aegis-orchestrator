@@ -30,6 +30,7 @@ use aegis_core::{
         execution::ExecutionId,
         execution::ExecutionInput,
         supervisor::Supervisor,
+        repository::AgentRepository,
     },
     infrastructure::{
         event_bus::EventBus,
@@ -92,17 +93,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Configuration loaded. Initializing services...");
 
-    // Initialize services
-    let agent_repo = Arc::new(InMemoryAgentRepository::new());
-    // Initialize repositories
     // Initialize repositories 
-    // But `PostgresAgentRepository` is not implemented in my plan (I focused on execution persistence).
-    // So I will keep `agent_repo` as InMemory or check if PostgresAgentRepository exists/is implemented.
-    // Checking `repository.rs`, PostgresAgentRepository was todo!.
-    
     let database_url = std::env::var("AEGIS_DATABASE_URL").ok();
     
-    let (workflow_repo, execution_repo, workflow_execution_repo): (
+    let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): (
+        Arc<dyn AgentRepository>,
         Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
         Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
         Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>
@@ -153,7 +148,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
 
                 (
-                    Arc::new(aegis_core::infrastructure::repositories::postgres::PostgresWorkflowRepository::new_with_pool(pool.clone())),
+                    Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
+                    Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
                     Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
                     Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool)),
                 )
@@ -162,6 +158,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 tracing::error!("Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
                 println!("ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
                 (
+                    Arc::new(InMemoryAgentRepository::new()),
                     Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
                     Arc::new(InMemoryExecutionRepository::new()),
                     Arc::new(InMemoryWorkflowExecutionRepository::new()),
@@ -171,6 +168,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     } else {
         println!("AEGIS_DATABASE_URL not set. Using InMemory repositories.");
         (
+            Arc::new(InMemoryAgentRepository::new()),
             Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
             Arc::new(InMemoryExecutionRepository::new()),
             Arc::new(InMemoryWorkflowExecutionRepository::new()),

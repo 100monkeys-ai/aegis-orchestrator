@@ -1,5 +1,6 @@
-pub mod postgres;
+pub mod postgres_agent;
 pub mod postgres_execution;
+pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 
 use std::sync::{Arc, RwLock};

@@ -13,6 +13,7 @@
 use aegis_core::application::workflow_engine::WorkflowEngine;
 use aegis_core::infrastructure::event_bus::{EventBus, DomainEvent};
 use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+use aegis_core::infrastructure::HumanInputService;
 use std::sync::Arc;
 use aegis_core::application::execution::ExecutionService;
 use aegis_core::application::validation_service::ValidationService;
@@ -94,12 +95,13 @@ async fn test_load_workflow_into_engine() {
     let event_bus = Arc::new(EventBus::with_default_capacity());
     let exec_service = Arc::new(MockExecutionService);
     let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
+    let human_input_service = Arc::new(HumanInputService::new());
     
     // Create in-memory repository for testing
     let repository = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new());
     let workflow_execution_repo = Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
     
-    let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+    let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
 
     // Load workflow
     let yaml_path = concat!(

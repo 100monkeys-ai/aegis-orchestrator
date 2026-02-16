@@ -1109,9 +1109,10 @@ mod tests {
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
+        let human_input_service = Arc::new(crate::infrastructure::HumanInputService::new());
         
         // Note: Cortex service is None here
-        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -1124,8 +1125,9 @@ mod tests {
         let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
+        let human_input_service = Arc::new(crate::infrastructure::HumanInputService::new());
         
-        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
