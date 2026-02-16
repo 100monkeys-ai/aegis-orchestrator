@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-// Node Configuration Types - Implements NODE_CONFIGURATION_SPEC.md
+// Node Configuration Types - Implements NODE_CONFIGURATION_SPEC_V1.md
 //
 // Defines the configuration schema for AEGIS Agent Host nodes, including:
 // - Node identity and capabilities
@@ -13,7 +13,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Complete node configuration matching NODE_CONFIGURATION_SPEC.md
+/// Complete node configuration matching NODE_CONFIGURATION_SPEC_V1.md
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfig {
     /// Node identity and capabilities

@@ -72,7 +72,7 @@ This plan synthesizes insights from:
 - ✅ Basic 100monkeys loop in `ExecutionSupervisor`
 - ✅ Event-driven domain events via `EventBus`
 - ✅ Repository pattern with PostgreSQL
-- ✅ LLM provider abstraction (see [NODE_CONFIGURATION_SPEC.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC.md))
+- ✅ LLM provider abstraction (see [NODE_CONFIGURATION_SPEC_V1.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC_V1.md))
 
 **What Is Now Complete:**
 
@@ -243,7 +243,7 @@ states:
 - Judges are derived from workflow specification (see [workflow-based.md](workflow-based.md))
 - Full isolation ensures fairness (judge can't manipulate worker)
 - Aligns with fractal principle (judges are peer agents)
-- Node config determines runtime (see [NODE_CONFIGURATION_SPEC.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC.md))
+- Node config determines runtime (see [NODE_CONFIGURATION_SPEC_V1.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC_V1.md))
 
 **Implementation:**
 
@@ -591,7 +591,7 @@ pub enum LearningEvent {
 - ✅ `aegis-architecture/adrs/021-stimulus-response-routing.md`
 - ✅ `aegis-architecture/adrs/023-evolutionary-skill-crystallization.md` (NEW)
 - ✅ `aegis-architecture/adrs/024-holographic-cortex-memory-architecture.md` (NEW)
-- ✅ `aegis-architecture/specs/WORKFLOW_MANIFEST_SPEC.md`
+- ✅ `aegis-architecture/specs/WORKFLOW_MANIFEST_SPEC_V1.md`
 - ✅ Updated `aegis-architecture/AGENTS.md` with Workflow Orchestration Context
 
 **Success Criteria:**
@@ -3105,7 +3105,7 @@ AEGIS AGI Loop (type 'exit' to quit)
 
 ### 1. Workflow Manifest Schema
 
-Full specification: [WORKFLOW_MANIFEST_SPEC.md](../../../aegis-architecture/specs/WORKFLOW_MANIFEST_SPEC.md)
+Full specification: [WORKFLOW_MANIFEST_SPEC_V1.md](../../../aegis-architecture/specs/WORKFLOW_MANIFEST_SPEC_V1.md)
 
 **Minimal Example:**
 
@@ -3295,7 +3295,7 @@ Each phase is complete when:
 - [100monkeys Algorithm Spec](../../../aegis-architecture/specs/100MONKEYS_ALGORITHM_SPECIFICATION.md) — Iterative refinement
 - [Safe Evolution Manifesto](../../../aegis-architecture/specs/SAFE_EVOLUTION_MANIFESTO.md) — Trust through containment
 - [Zaru Paradigm](../../../aegis-architecture/specs/ZARU_PARADIGM.md) — Product vision, UX principles
-- [NODE_CONFIGURATION_SPEC.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC.md) — Node config, runtime isolation
+- [NODE_CONFIGURATION_SPEC_V1.md](../../../aegis-architecture/specs/NODE_CONFIGURATION_SPEC_V1.md) — Node config, runtime isolation
 
 **ADRs:**
 
@@ -3309,7 +3309,7 @@ Each phase is complete when:
 
 **Specs:**
 
-- WORKFLOW_MANIFEST_SPEC.md
+- WORKFLOW_MANIFEST_SPEC_V1.md
 
 ### External Resources
 

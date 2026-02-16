@@ -331,5 +331,5 @@ Use stimulus-response routing to select judges based on task type:
 
 - **ADR-016:** Agent-as-Judge Pattern
 - **ADR-017:** Gradient Validation System
-- **WORKFLOW_MANIFEST_SPEC.md:** StateKind definitions
+- **WORKFLOW_MANIFEST_SPEC_V1.md:** StateKind definitions
 - **AGENTS.md:** Domain-Driven Design principles

@@ -8,7 +8,7 @@
 //! - **Bounded Context:** Execution Context
 //! - **Aggregate Root:** Workflow
 //! - **Related ADRs:** ADR-015 (Workflow Engine Architecture)
-//! - **Specification:** WORKFLOW_MANIFEST_SPEC.md
+//! - **Specification:** WORKFLOW_MANIFEST_SPEC_V1.md
 //!
 //! # Design Principles
 //!
