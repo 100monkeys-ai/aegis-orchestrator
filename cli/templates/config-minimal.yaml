@@ -3,43 +3,56 @@
 # This is a minimal configuration to get started.
 # Refer to config-with-examples.yaml for full documentation.
 
-node:
-  id: "change-me-to-unique-id"
-  type: "edge"
+# Kubernetes-style manifest format (required)
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+
+# Node identity and metadata
+metadata:
   name: "my-aegis-node"
-  # region: "us-west-2"  # Optional
-  # tags: ["development"]  # Optional
+  version: "1.0.0"
+  # labels:
+  #   environment: "development"
+  #   region: "us-west-2"
 
-llm_providers:
-  - name: "local"
-    type: "ollama"
-    endpoint: "http://localhost:11434"
-    models:
-      - alias: "default"
-        model: "llama3.2:latest"
-        capabilities: ["code", "reasoning"]
-        context_window: 8192
-      - alias: "fast"
-        model: "qwen2.5-coder:7b"
-        capabilities: ["code"]
-        context_window: 4096
+# Node configuration specification
+spec:
+  node:
+    id: "change-me-to-unique-id"
+    type: "edge"
+    # region: "us-west-2"  # Optional
+    # tags: ["development"]  # Optional
 
-llm_selection:
-  strategy: "prefer-local"
-  default_provider: "local"
-  max_retries: 3
-  retry_delay_ms: 1000
+  llm_providers:
+    - name: "local"
+      type: "ollama"
+      endpoint: "http://localhost:11434"
+      models:
+        - alias: "default"
+          model: "llama3.2:latest"
+          capabilities: ["code", "reasoning"]
+          context_window: 8192
+        - alias: "fast"
+          model: "qwen2.5-coder:7b"
+          capabilities: ["code"]
+          context_window: 4096
 
-network:
-  # bind_address: "0.0.0.0"  # Optional (default: 0.0.0.0)
-  # port: 8000               # Optional (default: 8000)
-  # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
-  # heartbeat_interval_seconds: 30  # Optional
+  llm_selection:
+    strategy: "prefer-local"
+    default_provider: "local"
+    max_retries: 3
+    retry_delay_ms: 1000
 
-observability:
-  logging:
-    level: "info"
-  # metrics:
-  #   enabled: true
-  # tracing:
-  #   enabled: false
+  network:
+    # bind_address: "0.0.0.0"  # Optional (default: 0.0.0.0)
+    # port: 8000               # Optional (default: 8000)
+    # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
+    # heartbeat_interval_seconds: 30  # Optional
+
+  observability:
+    logging:
+      level: "info"
+    # metrics:
+    #   enabled: true
+    # tracing:
+    #   enabled: false

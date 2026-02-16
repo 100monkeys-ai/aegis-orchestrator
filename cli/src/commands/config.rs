@@ -10,7 +10,7 @@ use clap::Subcommand;
 use colored::Colorize;
 use std::path::PathBuf;
 
-use aegis_core::domain::node_config::NodeConfig;
+use aegis_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -52,7 +52,7 @@ pub async fn handle_command(
 }
 
 async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> {
-    let config = NodeConfig::load_or_default(config_override.clone())
+    let config = NodeConfigManifest::load_or_default(config_override.clone())
         .context("Failed to load configuration")?;
 
     if show_paths {
@@ -77,18 +77,43 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("{}", "Current configuration:".bold());
     println!();
 
+    // Manifest info
+    println!("{}", "Manifest:".bold());
+    println!("  API Version: {}", config.api_version);
+    println!("  Kind: {}", config.kind);
+    println!();
+
+    // Metadata
+    println!("{}", "Metadata:".bold());
+    println!("  Name: {}", config.metadata.name);
+    if let Some(version) = &config.metadata.version {
+        println!("  Version: {}", version);
+    }
+    if let Some(labels) = &config.metadata.labels {
+        if !labels.is_empty() {
+            println!("  Labels:");
+            for (key, value) in labels {
+                println!("    {}: {}", key, value);
+            }
+        }
+    }
+    println!();
+
     // Node identity
     println!("{}", "Node Identity:".bold());
-    println!("  ID: {}", config.node.id);
-    // println!("  Name: {}", config.node.name);
-    if let Some(region) = &config.node.region {
+    println!("  ID: {}", config.spec.node.id);
+    println!("  Type: {:?}", config.spec.node.node_type);
+    if let Some(region) = &config.spec.node.region {
         println!("  Region: {}", region);
+    }
+    if !config.spec.node.tags.is_empty() {
+        println!("  Tags: {}", config.spec.node.tags.join(", "));
     }
     println!();
 
     // LLM providers
     println!("{}", "LLM Providers:".bold());
-    for provider in &config.llm_providers {
+    for provider in &config.spec.llm_providers {
         println!("  {} ({})", provider.name.bold(), provider.provider_type);
         println!("    Endpoint: {}", provider.endpoint);
         println!("    Models: {}", provider.models.len());
@@ -100,12 +125,12 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
 
     // LLM selection strategy
     println!("{}", "LLM Selection:".bold());
-    println!("  Strategy: {:?}", config.llm_selection.strategy);
+    println!("  Strategy: {:?}", config.spec.llm_selection.strategy);
     println!(
         "  Default provider: {}",
-        config.llm_selection.default_provider.as_deref().unwrap_or("(none)")
+        config.spec.llm_selection.default_provider.as_deref().unwrap_or("(none)")
     );
-    if let Some(fallback) = &config.llm_selection.fallback_provider {
+    if let Some(fallback) = &config.spec.llm_selection.fallback_provider {
         println!("  Fallback provider: {}", fallback);
     }
     println!();
@@ -116,7 +141,7 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
 async fn validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("Validating configuration...");
 
-    let config = NodeConfig::load_or_default(config_path)
+    let config = NodeConfigManifest::load_or_default(config_path)
         .context("Failed to load configuration")?;
 
     config

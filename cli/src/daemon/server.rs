@@ -25,7 +25,7 @@ use aegis_core::{
         workflow_engine::WorkflowEngine, validation_service::ValidationService,
     },
     domain::{
-        node_config::NodeConfig,
+        node_config::NodeConfigManifest,
         agent::AgentId,
         execution::ExecutionId,
         execution::ExecutionInput,
@@ -78,14 +78,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Load configuration
     println!("Loading configuration...");
-    let config = NodeConfig::load_or_default(config_path)
+    let config = NodeConfigManifest::load_or_default(config_path)
         .context("Failed to load configuration")?;
 
     config
         .validate()
         .context("Configuration validation failed")?;
 
-    if config.llm_providers.is_empty() {
+    if config.spec.llm_providers.is_empty() {
         tracing::warn!("Started with NO LLM providers configured. Agent execution will fail!");
         println!("WARNING: No LLM providers configured. Agents will fail to generate text.");
         println!("         Please check your config file or ensure one is discovered.");
@@ -186,7 +186,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Initializing Docker runtime...");
     // Force a timeout on docker connection if possible, or just log before/after
     let runtime = Arc::new(
-        DockerRuntime::new(config.runtime.bootstrap_script.clone())
+        DockerRuntime::new(config.spec.runtime.bootstrap_script.clone())
             .context("Failed to initialize Docker runtime")?
     );
     println!("Docker runtime initialized.");
@@ -327,7 +327,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_state(Arc::new(app_state));
 
     // Start HTTP server
-    let bind_addr = if let Some(network) = &config.network {
+    let bind_addr = if let Some(network) = &config.spec.network {
         network.bind_address.clone()
     } else {
         "0.0.0.0".to_string()
@@ -336,14 +336,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Config port takes precedence over CLI default if we consider config the source of truth for the node.
     // However, start_daemon receives `port`. 
     // Let's use the config port if network config is present, otherwise use the passed port.
-    let final_port = if let Some(network) = &config.network {
+    let final_port = if let Some(network) = &config.spec.network {
         network.port
     } else {
         port
     };
 
     // Start gRPC Server
-    let grpc_port = if let Some(network) = &config.network {
+    let grpc_port = if let Some(network) = &config.spec.network {
         network.grpc_port
     } else {
         50051

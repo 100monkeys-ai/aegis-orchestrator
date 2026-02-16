@@ -7,7 +7,7 @@
 // Implements fallback and retry strategies per ADR-009.
 
 use crate::domain::llm::{GenerationOptions, GenerationResponse, LLMError, LLMProvider};
-use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfig};
+use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -29,14 +29,14 @@ pub struct ProviderRegistry {
 
 impl ProviderRegistry {
     /// Create provider registry from node configuration
-    pub fn from_config(config: &NodeConfig) -> anyhow::Result<Self> {
+    pub fn from_config(config: &NodeConfigManifest) -> anyhow::Result<Self> {
         let mut providers = HashMap::new();
         let mut alias_map = HashMap::new();
 
         info!("Initializing LLM provider registry");
 
         // Initialize providers from config
-        for provider_config in &config.llm_providers {
+        for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
                 info!("Provider '{}' disabled, skipping", provider_config.name);
                 continue;
@@ -74,10 +74,10 @@ impl ProviderRegistry {
         Ok(Self {
             providers,
             alias_map,
-            _selection_strategy: config.llm_selection.strategy.clone(),
-            fallback_provider: config.llm_selection.fallback_provider.clone(),
-            max_retries: config.llm_selection.max_retries,
-            retry_delay_ms: config.llm_selection.retry_delay_ms,
+            _selection_strategy: config.spec.llm_selection.strategy.clone(),
+            fallback_provider: config.spec.llm_selection.fallback_provider.clone(),
+            max_retries: config.spec.llm_selection.max_retries,
+            retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
         })
     }
 
@@ -228,36 +228,47 @@ impl ProviderRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::node_config::{LLMSelection, NodeConfig, NodeIdentity, NodeType};
+    use crate::domain::node_config::{
+        LLMSelection, ManifestMetadata, NodeConfigManifest, NodeConfigSpec, NodeIdentity, NodeType
+    };
 
     #[test]
     fn test_registry_creation() {
-        let config = NodeConfig {
-            node: NodeIdentity {
-                id: "test".to_string(),
-                node_type: NodeType::Edge,
-                region: None,
-                tags: vec![],
-                resources: None,
+        let config = NodeConfigManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "NodeConfig".to_string(),
+            metadata: ManifestMetadata {
+                name: "test-node".to_string(),
+                version: Some("1.0.0".to_string()),
+                labels: None,
             },
-            llm_providers: vec![LLMProviderConfig {
-                name: "test-ollama".to_string(),
-                provider_type: "ollama".to_string(),
-                endpoint: "http://localhost:11434".to_string(),
-                api_key: None,
-                enabled: true,
-                models: vec![ModelConfig {
-                    alias: "default".to_string(),
-                    model: "llama3.2".to_string(),
-                    capabilities: vec!["chat".to_string()],
-                    context_window: 8192,
-                    cost_per_1k_tokens: 0.0,
+            spec: NodeConfigSpec {
+                node: NodeIdentity {
+                    id: "test".to_string(),
+                    node_type: NodeType::Edge,
+                    region: None,
+                    tags: vec![],
+                    resources: None,
+                },
+                llm_providers: vec![LLMProviderConfig {
+                    name: "test-ollama".to_string(),
+                    provider_type: "ollama".to_string(),
+                    endpoint: "http://localhost:11434".to_string(),
+                    api_key: None,
+                    enabled: true,
+                    models: vec![ModelConfig {
+                        alias: "default".to_string(),
+                        model: "llama3.2".to_string(),
+                        capabilities: vec!["chat".to_string()],
+                        context_window: 8192,
+                        cost_per_1k_tokens: 0.0,
+                    }],
                 }],
-            }],
-            llm_selection: LLMSelection::default(),
-            runtime: crate::domain::node_config::RuntimeConfig::default(),
-            network: None,
-            observability: None,
+                llm_selection: LLMSelection::default(),
+                runtime: crate::domain::node_config::RuntimeConfig::default(),
+                network: None,
+                observability: None,
+            },
         };
 
         let registry = ProviderRegistry::from_config(&config).unwrap();

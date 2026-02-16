@@ -33,7 +33,7 @@ pub struct StandardExecutionService {
     supervisor: Arc<Supervisor>,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
-    config: Arc<crate::domain::node_config::NodeConfig>,
+    config: Arc<crate::domain::node_config::NodeConfigManifest>,
 }
 
 impl StandardExecutionService {
@@ -42,7 +42,7 @@ impl StandardExecutionService {
         supervisor: Arc<Supervisor>,
         repository: Arc<dyn ExecutionRepository>,
         event_bus: Arc<EventBus>,
-        config: Arc<crate::domain::node_config::NodeConfig>,
+        config: Arc<crate::domain::node_config::NodeConfigManifest>,
     ) -> Self {
         Self {
             agent_service,
@@ -208,7 +208,7 @@ impl ExecutionService for StandardExecutionService {
         
         // Inject Orchestrator URL
         // We use host.docker.internal as the generic host, but port comes from config.
-        let port = self.config.network.as_ref().map(|n| n.port).unwrap_or(8000);
+        let port = self.config.spec.network.as_ref().map(|n| n.port).unwrap_or(8000);
         let url = format!("http://host.docker.internal:{}", port);
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
         

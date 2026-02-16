@@ -15,7 +15,7 @@ use aegis_core::{
         lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
     },
     domain::{
-        node_config::NodeConfig,
+        node_config::NodeConfigManifest,
         agent::AgentId,
         execution::{ExecutionInput, ExecutionId},
         supervisor::Supervisor,
@@ -39,7 +39,7 @@ pub struct EmbeddedExecutor {
 impl EmbeddedExecutor {
     pub async fn new(config_path: Option<PathBuf>) -> Result<Self> {
         // Load configuration
-        let config = NodeConfig::load_or_default(config_path)
+        let config = NodeConfigManifest::load_or_default(config_path)
             .context("Failed to load configuration")?;
 
         config
@@ -55,7 +55,7 @@ impl EmbeddedExecutor {
                 .context("Failed to initialize LLM providers")?,
         );
         let runtime = Arc::new(
-            DockerRuntime::new(config.runtime.bootstrap_script.clone())
+            DockerRuntime::new(config.spec.runtime.bootstrap_script.clone())
                 .context("Failed to initialize Docker runtime")?
         );
         let supervisor = Arc::new(Supervisor::new(runtime.clone()));

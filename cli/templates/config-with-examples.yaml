@@ -1,174 +1,201 @@
 # AEGIS Agent Host - Complete Configuration Example
 #
-# This file demonstrates all available configuration options.
+# This file demonstrates all available configuration options for v1.0+
+# using the Kubernetes-style manifest format.
 
 # ============================================================================
-# Node Identity
+# Kubernetes-Style Manifest Structure (REQUIRED)
 # ============================================================================
-node:
-  # Unique identifier for this node (required)
-  # Generate with: uuidgen (Linux/Mac) or [guid]::NewGuid() (PowerShell)
-  id: "550e8400-e29b-41d4-a716-446655440000"
-  
-  # Human-readable node name (required)
+# API version for schema evolution
+apiVersion: 100monkeys.ai/v1
+
+# Resource type discriminator
+kind: NodeConfig
+
+# ============================================================================
+# Metadata: Node Identity and Classification
+# ============================================================================
+metadata:
+  # Required: Human-readable node name (unique identifier)
   name: "my-aegis-node"
   
-  # Node type (edge, orchestrator, hybrid)
-  type: "edge"
+  # Optional: Configuration version for tracking
+  version: "1.0.0"
   
-  # Optional: Geographic region for multi-region deployments
-  region: "us-west-2"
-  
-  # Optional: Tags for organization and filtering
-  tags:
-    - "development"
-    - "team-alpha"
+  # Optional: Labels for categorization and discovery
+  labels:
+    environment: "development"
+    team: "alpha"
+    region: "us-west-2"
 
 # ============================================================================
-# LLM Providers (BYOLLM)
+# Spec: Node Configuration
 # ============================================================================
-# Define one or more LLM providers. Agents reference models by alias
-# (default, fast, smart) rather than specific model names.
-llm_providers:
-  # Example 1: Local Ollama provider (free, air-gapped)
-  - name: "local"
-    type: "ollama"
-    endpoint: "http://localhost:11434"
-    # No API key required for Ollama
-    models:
-      - alias: "default"
-        model: "llama3.2:latest"
-        capabilities: ["code", "reasoning", "general"]
-        context_window: 8192
-        cost_per_1k_tokens: 0.0  # Free
-      
-      - alias: "fast"
-        model: "qwen2.5-coder:7b"
-        capabilities: ["code"]
-        context_window: 4096
-        cost_per_1k_tokens: 0.0
+spec:
+  # --------------------------------------------------------------------------
+  # Node Identity and Capabilities
+  # --------------------------------------------------------------------------
+  node:
+    # Required: Unique stable identifier (UUID recommended)
+    # Generate with: uuidgen (Linux/Mac) or [guid]::NewGuid() (PowerShell)
+    id: "550e8400-e29b-41d4-a716-446655440000"
+    
+    # Required: Node type (edge, orchestrator, hybrid)
+    type: "edge"
+    
+    # Optional: Geographic region for multi-region deployments
+    region: "us-west-2"
+    
+    # Optional: Tags for organization and filtering
+    tags:
+      - "development"
+      - "team-alpha"
   
-  # Example 2: OpenAI (or compatible API like Azure OpenAI)
-  - name: "openai"
-    type: "openai"
-    endpoint: "https://api.openai.com/v1"  # Default OpenAI endpoint
-    api_key: "env:OPENAI_API_KEY"  # Read from environment variable
-    models:
-      - alias: "smart"
-        model: "gpt-4o"
-        capabilities: ["code", "reasoning", "general", "vision"]
-        context_window: 128000
-        cost_per_1k_tokens: 0.005  # $5 per 1M tokens (approximate)
-      
-      - alias: "fast"
-        model: "gpt-4o-mini"
-        capabilities: ["code", "general"]
-        context_window: 128000
-        cost_per_1k_tokens: 0.00015  # $0.15 per 1M tokens
+  # --------------------------------------------------------------------------
+  # LLM Providers (BYOLLM)
+  # --------------------------------------------------------------------------
+  # Define one or more LLM providers. Agents reference models by alias
+  # (default, fast, smart) rather than specific model names.
+  llm_providers:
+    # Example 1: Local Ollama provider (free, air-gapped)
+    - name: "local"
+      type: "ollama"
+      endpoint: "http://localhost:11434"
+      # No API key required for Ollama
+      models:
+        - alias: "default"
+          model: "llama3.2:latest"
+          capabilities: ["code", "reasoning", "general"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0  # Free
+        
+        - alias: "fast"
+          model: "qwen2.5-coder:7b"
+          capabilities: ["code"]
+          context_window: 4096
+          cost_per_1k_tokens: 0.0
+    
+    # Example 2: OpenAI (or compatible API like Azure OpenAI)
+    - name: "openai"
+      type: "openai"
+      endpoint: "https://api.openai.com/v1"  # Default OpenAI endpoint
+      api_key: "env:OPENAI_API_KEY"  # Read from environment variable
+      models:
+        - alias: "smart"
+          model: "gpt-4o"
+          capabilities: ["code", "reasoning", "general", "vision"]
+          context_window: 128000
+          cost_per_1k_tokens: 0.005  # $5 per 1M tokens (approximate)
+        
+        - alias: "fast"
+          model: "gpt-4o-mini"
+          capabilities: ["code", "general"]
+          context_window: 128000
+          cost_per_1k_tokens: 0.00015  # $0.15 per 1M tokens
+    
+    # Example 3: Anthropic Claude
+    - name: "anthropic"
+      type: "anthropic"
+      # Endpoint is implicit for Anthropic (https://api.anthropic.com/v1)
+      api_key: "env:ANTHROPIC_API_KEY"
+      models:
+        - alias: "smart"
+          model: "claude-3-5-sonnet-20241022"
+          capabilities: ["code", "reasoning", "general"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003  # $3 per 1M tokens
   
-  # Example 3: Anthropic Claude
-  - name: "anthropic"
-    type: "anthropic"
-    # Endpoint is implicit for Anthropic (https://api.anthropic.com/v1)
-    api_key: "env:ANTHROPIC_API_KEY"
-    models:
-      - alias: "smart"
-        model: "claude-3-5-sonnet-20241022"
-        capabilities: ["code", "reasoning", "general"]
-        context_window: 200000
-        cost_per_1k_tokens: 0.003  # $3 per 1M tokens
+  # --------------------------------------------------------------------------
+  # LLM Selection Strategy
+  # --------------------------------------------------------------------------
+  llm_selection:
+    # Strategy for choosing provider when multiple options available:
+    # - prefer-local: Use local Ollama if available, else cloud
+    # - prefer-cloud: Use cloud providers first
+    # - cost-optimized: Choose cheapest option for task
+    # - latency-optimized: Choose fastest responding provider
+    strategy: "prefer-local"
+    
+    # Default provider name to use
+    default_provider: "local"
+    
+    # Optional: Fallback provider if default fails
+    fallback_provider: "openai"
+    
+    # Retry configuration
+    max_retries: 3
+    retry_delay_ms: 1000  # Initial delay, doubles on each retry (exponential backoff)
+  
+  # --------------------------------------------------------------------------
+  # Network Configuration
+  # --------------------------------------------------------------------------
+  network:
+    # Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
+    # bind_address: "0.0.0.0"
+    # port: 8000
 
-# ============================================================================
-# LLM Selection Strategy
-# ============================================================================
-llm_selection:
-  # Strategy for choosing provider when multiple options available:
-  # - prefer-local: Use local Ollama if available, else cloud
-  # - prefer-cloud: Use cloud providers first
-  # - cost-optimized: Choose cheapest option for task
-  # - latency-optimized: Choose fastest responding provider
-  strategy: "prefer-local"
+    # Optional: Central orchestrator endpoint for multi-node coordination
+    # Leave unset for standalone mode
+    # orchestrator_endpoint: "https://orchestrator.aegis.example.com"
+    
+    # Optional: API key for authenticating with orchestrator
+    # api_key: "env:AEGIS_API_KEY"
+    
+    # Optional: Heartbeat interval (seconds)
+    # heartbeat_interval_seconds: 30
+    
+    # Optional: Proxy configuration
+    # http_proxy: "http://proxy.example.com:8000"
+    # https_proxy: "http://proxy.example.com:8000"
+    # no_proxy: "localhost,127.0.0.1,.local"
   
-  # Default provider name to use
-  default_provider: "local"
+  # --------------------------------------------------------------------------
+  # Observability
+  # --------------------------------------------------------------------------
+  observability:
+    logging:
+      # Log level: trace, debug, info, warn, error
+      level: "info"
+      # Output format: text or json
+      format: "text"
+    
+    metrics:
+      # Enable Prometheus metrics endpoint (/metrics)
+      enabled: true
+    
+    tracing:
+      # Enable distributed tracing
+      enabled: false
+    
+    # Optional: OpenTelemetry exporter endpoint
+    # otel_endpoint: "http://localhost:4317"
   
-  # Optional: Fallback provider if default fails
-  fallback_provider: "openai"
+  # --------------------------------------------------------------------------
+  # Storage (Optional)
+  # --------------------------------------------------------------------------
+  # storage:
+  #   # Backend: InMemory (default) or PostgreSQL
+  #   backend: "InMemory"
+  #   
+  #   # For PostgreSQL backend:
+  #   # postgres:
+  #   #   connection_string: "env:DATABASE_URL"
+  #   #   max_connections: 10
   
-  # Retry configuration
-  max_retries: 3
-  retry_delay_ms: 1000  # Initial delay, doubles on each retry (exponential backoff)
-
-# ============================================================================
-# Network Configuration
-# ============================================================================
-network:
-  # Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
-  # bind_address: "0.0.0.0"
-  # port: 8000
-
-  # Optional: Central orchestrator endpoint for multi-node coordination
-  # Leave unset for standalone mode
-  # orchestrator_endpoint: "https://orchestrator.aegis.example.com"
-  
-  # Optional: API key for authenticating with orchestrator
-  # api_key: "env:AEGIS_API_KEY"
-  
-  # Optional: Heartbeat interval (seconds)
-  # heartbeat_interval_seconds: 30
-  
-  # Optional: Proxy configuration
-  # http_proxy: "http://proxy.example.com:8000"
-  # https_proxy: "http://proxy.example.com:8000"
-  # no_proxy: "localhost,127.0.0.1,.local"
-
-# ============================================================================
-# Observability
-# ============================================================================
-observability:
-  logging:
-    # Log level: trace, debug, info, warn, error
-    level: "info"
-    # Output format: text or json
-    format: "text"
-  
-  metrics:
-    # Enable Prometheus metrics endpoint (/metrics)
-    enabled: true
-  
-  tracing:
-    # Enable distributed tracing
-    enabled: false
-  
-  # Optional: OpenTelemetry exporter endpoint
-  # otel_endpoint: "http://localhost:4317"
-
-# ============================================================================
-# Storage (Optional)
-# ============================================================================
-# storage:
-#   # Backend: InMemory (default) or PostgreSQL
-#   backend: "InMemory"
-#   
-#   # For PostgreSQL backend:
-#   # postgres:
-#   #   connection_string: "env:DATABASE_URL"
-#   #   max_connections: 10
-
-# ============================================================================
-# Execution (Optional)
-# ============================================================================
-# execution:
-#   # Default isolation: docker or firecracker
-#   default_isolation: "docker"
-#   
-#   # Docker configuration
-#   docker:
-#     socket_path: "/var/run/docker.sock"
-#     default_image: "aegis/agent-runtime:latest"
-#   
-#   # Resource limits
-#   default_resources:
-#     cpu_cores: 1.0
-#     memory_mb: 512
-#     timeout_seconds: 300
+  # --------------------------------------------------------------------------
+  # Execution (Optional)
+  # --------------------------------------------------------------------------
+  # execution:
+  #   # Default isolation: docker or firecracker
+  #   default_isolation: "docker"
+  #   
+  #   # Docker configuration
+  #   docker:
+  #     socket_path: "/var/run/docker.sock"
+  #     default_image: "aegis/agent-runtime:latest"
+  #   
+  #   # Resource limits
+  #   default_resources:
+  #     cpu_cores: 1.0
+  #     memory_mb: 512
+  #     timeout_seconds: 300

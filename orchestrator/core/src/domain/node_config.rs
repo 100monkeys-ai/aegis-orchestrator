@@ -4,6 +4,7 @@
 // Node Configuration Types - Implements NODE_CONFIGURATION_SPEC_V1.md
 //
 // Defines the configuration schema for AEGIS Agent Host nodes, including:
+// - Kubernetes-style manifest format (apiVersion/kind/metadata/spec)
 // - Node identity and capabilities
 // - LLM provider configuration (BYOLLM support)
 // - Model alias mapping for provider independence
@@ -11,11 +12,44 @@
 // - Network and observability settings
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Complete node configuration matching NODE_CONFIGURATION_SPEC_V1.md
+/// Top-level Kubernetes-style node configuration manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct NodeConfig {
+pub struct NodeConfigManifest {
+    /// API version (must be "100monkeys.ai/v1")
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    
+    /// Resource kind (must be "NodeConfig")
+    pub kind: String,
+    
+    /// Node metadata (name, labels, version)
+    pub metadata: ManifestMetadata,
+    
+    /// Node configuration specification
+    pub spec: NodeConfigSpec,
+}
+
+/// Manifest metadata (Kubernetes-style)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManifestMetadata {
+    /// Human-readable node name (unique identifier)
+    pub name: String,
+    
+    /// Optional: Configuration version for tracking
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    
+    /// Optional: Labels for categorization and discovery
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub labels: Option<HashMap<String, String>>,
+}
+
+/// Node configuration specification (content under spec:)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfigSpec {
     /// Node identity and capabilities
     pub node: NodeIdentity,
     
@@ -42,7 +76,8 @@ pub struct NodeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeIdentity {
-    /// Unique node identifier (e.g., "edge-node-001")
+    /// Unique stable node identifier (UUID recommended)
+    /// Note: Human-readable name is in metadata.name
     pub id: String,
     
     /// Node type
@@ -336,14 +371,11 @@ impl Default for LLMSelection {
     }
 }
 
-impl Default for NodeConfig {
+impl Default for NodeConfigSpec {
     fn default() -> Self {
         Self {
             node: NodeIdentity {
-                id: hostname::get()
-                    .ok()
-                    .and_then(|h| h.into_string().ok())
-                    .unwrap_or_else(|| "aegis-node".to_string()),
+                id: uuid::Uuid::new_v4().to_string(),
                 node_type: NodeType::Edge,
                 region: None,
                 tags: vec![],
@@ -358,7 +390,27 @@ impl Default for NodeConfig {
     }
 }
 
-impl NodeConfig {
+impl Default for NodeConfigManifest {
+    fn default() -> Self {
+        let hostname = hostname::get()
+            .ok()
+            .and_then(|h| h.into_string().ok())
+            .unwrap_or_else(|| "aegis-node".to_string());
+        
+        Self {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "NodeConfig".to_string(),
+            metadata: ManifestMetadata {
+                name: hostname,
+                version: Some("1.0.0".to_string()),
+                labels: None,
+            },
+            spec: NodeConfigSpec::default(),
+        }
+    }
+}
+
+impl NodeConfigManifest {
     /// Load configuration from YAML file
     pub fn from_yaml_file(path: impl AsRef<Path>) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
@@ -442,13 +494,31 @@ impl NodeConfig {
     
     /// Validate configuration
     pub fn validate(&self) -> anyhow::Result<()> {
+        // Validate apiVersion
+        if self.api_version != "100monkeys.ai/v1" {
+            anyhow::bail!(
+                "Invalid apiVersion: '{}'. Must be '100monkeys.ai/v1'",
+                self.api_version
+            );
+        }
+        
+        // Validate kind
+        if self.kind != "NodeConfig" {
+            anyhow::bail!("Invalid kind: '{}'. Must be 'NodeConfig'", self.kind);
+        }
+        
+        // Validate metadata.name
+        if self.metadata.name.is_empty() {
+            anyhow::bail!("metadata.name cannot be empty");
+        }
+        
         // Validate node ID is not empty
-        if self.node.id.is_empty() {
-            anyhow::bail!("Node ID cannot be empty");
+        if self.spec.node.id.is_empty() {
+            anyhow::bail!("spec.node.id cannot be empty");
         }
         
         // Validate LLM providers
-        for provider in &self.llm_providers {
+        for provider in &self.spec.llm_providers {
             if provider.name.is_empty() {
                 anyhow::bail!("LLM provider name cannot be empty");
             }
@@ -473,14 +543,14 @@ impl NodeConfig {
         }
         
         // Validate default/fallback providers exist
-        if let Some(default_provider) = &self.llm_selection.default_provider {
-            if !self.llm_providers.iter().any(|p| &p.name == default_provider) {
+        if let Some(default_provider) = &self.spec.llm_selection.default_provider {
+            if !self.spec.llm_providers.iter().any(|p| &p.name == default_provider) {
                 anyhow::bail!("Default provider '{}' not found in llm_providers", default_provider);
             }
         }
         
-        if let Some(fallback_provider) = &self.llm_selection.fallback_provider {
-            if !self.llm_providers.iter().any(|p| &p.name == fallback_provider) {
+        if let Some(fallback_provider) = &self.spec.llm_selection.fallback_provider {
+            if !self.spec.llm_providers.iter().any(|p| &p.name == fallback_provider) {
                 anyhow::bail!("Fallback provider '{}' not found in llm_providers", fallback_provider);
             }
         }
@@ -494,73 +564,105 @@ mod tests {
     use super::*;
     
     #[test]
-    fn test_default_config() {
-        let config = NodeConfig::default();
-        assert_eq!(config.node.node_type, NodeType::Edge);
-        assert!(config.llm_providers.is_empty());
+    fn test_default_manifest() {
+        let manifest = NodeConfigManifest::default();
+        assert_eq!(manifest.api_version, "100monkeys.ai/v1");
+        assert_eq!(manifest.kind, "NodeConfig");
+        assert!(!manifest.metadata.name.is_empty());
+        assert_eq!(manifest.spec.node.node_type, NodeType::Edge);
+        assert!(manifest.spec.llm_providers.is_empty());
     }
     
     #[test]
     fn test_yaml_roundtrip() {
-        let config = NodeConfig {
-            node: NodeIdentity {
-                id: "test-node".to_string(),
-                node_type: NodeType::Edge,
-                region: Some("us-east-1".to_string()),
-                tags: vec!["production".to_string()],
-                resources: Some(NodeResources {
-                    cpu_cores: 4,
-                    memory_gb: 16,
-                    disk_gb: 100,
-                    gpu: false,
-                }),
+        let manifest = NodeConfigManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "NodeConfig".to_string(),
+            metadata: ManifestMetadata {
+                name: "test-node".to_string(),
+                version: Some("1.0.0".to_string()),
+                labels: Some(HashMap::from([
+                    ("environment".to_string(), "test".to_string()),
+                ])),
             },
-            llm_providers: vec![
-                LLMProviderConfig {
-                    name: "ollama".to_string(),
-                    provider_type: "ollama".to_string(),
-                    endpoint: "http://localhost:11434".to_string(),
-                    api_key: None,
-                    enabled: true,
-                    models: vec![
-                        ModelConfig {
-                            alias: "default".to_string(),
-                            model: "llama3.2:latest".to_string(),
-                            capabilities: vec!["chat".to_string(), "reasoning".to_string()],
-                            context_window: 8192,
-                            cost_per_1k_tokens: 0.0,
-                        },
-                    ],
+            spec: NodeConfigSpec {
+                node: NodeIdentity {
+                    id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                    node_type: NodeType::Edge,
+                    region: Some("us-east-1".to_string()),
+                    tags: vec!["production".to_string()],
+                    resources: Some(NodeResources {
+                        cpu_cores: 4,
+                        memory_gb: 16,
+                        disk_gb: 100,
+                        gpu: false,
+                    }),
                 },
-            ],
-            llm_selection: LLMSelection::default(),
-            runtime: RuntimeConfig::default(),
-            network: None,
-            observability: None,
+                llm_providers: vec![
+                    LLMProviderConfig {
+                        name: "ollama".to_string(),
+                        provider_type: "ollama".to_string(),
+                        endpoint: "http://localhost:11434".to_string(),
+                        api_key: None,
+                        enabled: true,
+                        models: vec![
+                            ModelConfig {
+                                alias: "default".to_string(),
+                                model: "llama3.2:latest".to_string(),
+                                capabilities: vec!["chat".to_string(), "reasoning".to_string()],
+                                context_window: 8192,
+                                cost_per_1k_tokens: 0.0,
+                            },
+                        ],
+                    },
+                ],
+                llm_selection: LLMSelection::default(),
+                runtime: RuntimeConfig::default(),
+                network: None,
+                observability: None,
+            },
         };
         
-        let yaml = serde_yaml::to_string(&config).unwrap();
-        let parsed: NodeConfig = serde_yaml::from_str(&yaml).unwrap();
+        let yaml = serde_yaml::to_string(&manifest).unwrap();
+        let parsed: NodeConfigManifest = serde_yaml::from_str(&yaml).unwrap();
         
-        assert_eq!(parsed.node.id, "test-node");
-        assert_eq!(parsed.llm_providers.len(), 1);
-        assert_eq!(parsed.llm_providers[0].name, "ollama");
+        assert_eq!(parsed.api_version, "100monkeys.ai/v1");
+        assert_eq!(parsed.kind, "NodeConfig");
+        assert_eq!(parsed.metadata.name, "test-node");
+        assert_eq!(parsed.spec.node.id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(parsed.spec.llm_providers.len(), 1);
+        assert_eq!(parsed.spec.llm_providers[0].name, "ollama");
     }
     
     #[test]
     fn test_validation() {
-        let mut config = NodeConfig::default();
+        let mut manifest = NodeConfigManifest::default();
+        
+        // Valid default should pass
+        assert!(manifest.validate().is_ok());
+        
+        // Invalid apiVersion should fail
+        manifest.api_version = "wrong/v1".to_string();
+        assert!(manifest.validate().is_err());
+        manifest.api_version = "100monkeys.ai/v1".to_string();
+        
+        // Invalid kind should fail
+        manifest.kind = "WrongKind".to_string();
+        assert!(manifest.validate().is_err());
+        manifest.kind = "NodeConfig".to_string();
+        
+        // Empty metadata.name should fail
+        manifest.metadata.name = "".to_string();
+        assert!(manifest.validate().is_err());
+        manifest.metadata.name = "test-node".to_string();
         
         // Empty node ID should fail
-        config.node.id = "".to_string();
-        assert!(config.validate().is_err());
-        
-        // Fix node ID
-        config.node.id = "test-node".to_string();
-        assert!(config.validate().is_ok());
+        manifest.spec.node.id = "".to_string();
+        assert!(manifest.validate().is_err());
+        manifest.spec.node.id = "test-node-id".to_string();
         
         // Add invalid provider (no models)
-        config.llm_providers.push(LLMProviderConfig {
+        manifest.spec.llm_providers.push(LLMProviderConfig {
             name: "invalid".to_string(),
             provider_type: "openai".to_string(),
             endpoint: "https://api.openai.com".to_string(),
@@ -568,7 +670,7 @@ mod tests {
             enabled: true,
             models: vec![],
         });
-        assert!(config.validate().is_err());
+        assert!(manifest.validate().is_err());
     }
 }
 

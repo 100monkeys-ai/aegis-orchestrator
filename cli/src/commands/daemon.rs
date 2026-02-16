@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::daemon::{check_daemon_running, stop_daemon, DaemonStatus};
-use aegis_core::domain::node_config::NodeConfig;
+use aegis_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]
 pub enum DaemonCommand {
@@ -65,12 +65,12 @@ pub async fn handle_command(
 
 async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()> {
     // 1. Validation: Load config to check for existence and validity
-    // logic in NodeConfig::load_or_default handles explicit path check (errors if missing)
-    let config = NodeConfig::load_or_default(config_path.clone())
+    // logic in NodeConfigManifest::load_or_default handles explicit path check (errors if missing)
+    let config = NodeConfigManifest::load_or_default(config_path.clone())
         .context("Failed to load configuration")?;
     
     // 2. Warning: Check for empty providers
-    if config.llm_providers.is_empty() {
+    if config.spec.llm_providers.is_empty() {
         println!("{}", "WARNING: Started with NO LLM providers configured.".yellow().bold());
         println!("{}", "         Agents will fail to generate text.".yellow());
         println!("         Please check your config file or use --config <path>.");
