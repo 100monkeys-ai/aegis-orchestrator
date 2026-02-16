@@ -1,15 +1,30 @@
-version: "1.1"
-agent:
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
   name: "tester-agent"
-  version: "0.1.0"
+  version: "1.0.0"
   description: "Test engineer for The Forge - designs test strategies and test cases"
-  runtime: "python:3.10-slim"
-  autopull: true
+  labels:
+    role: "worker"
+    category: "forge"
+    function: "testing"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.10"
+    entrypoint: "main.py"
+  
   task:
     instruction: |
       You are an expert Test Engineer. Design comprehensive test strategies, create test cases, identify edge cases.
       Output: Test Strategy, Unit/Integration/E2E Test Cases, Test Data Requirements, Coverage Targets.
+  
   execution:
-    max_retries: 3
-    timeout_seconds: 150
-    mode: "single"
+    mode: "one-shot"
+    max_iterations: 3
+  
+  security:
+    resources:
+      timeout: "150s"

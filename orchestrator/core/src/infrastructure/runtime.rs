@@ -22,6 +22,7 @@ pub struct DockerRuntime {
 
 impl DockerRuntime {
     pub fn new(bootstrap_script: String) -> Result<Self, RuntimeError> {
+        // Increase timeout for image pulls (5 minutes)
         let docker = Docker::connect_with_local_defaults()
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to connect to Docker: {}", e)))?;
         Ok(Self { docker, bootstrap_script })
@@ -39,14 +40,16 @@ impl AgentRuntime for DockerRuntime {
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
         let image = config.image.clone();
         
-        // Check autopull configuration
-        let should_pull = if config.autopull {
-            // If autopull is true, we verify existence and pull if missing.
-            // (We could also support "always" pull here if we had a policy enum, but bool usually means "ensure exists")
-            self.docker.inspect_image(&image).await.is_err()
+        // Check if image exists locally first
+        let image_exists = self.docker.inspect_image(&image).await.is_ok();
+        
+        // Decide whether to pull
+        let should_pull = if image_exists {
+            false
+        } else if config.autopull {
+            info!("Image {} not found locally, will attempt to pull", image);
+            true
         } else {
-            // If autopull is false, we assume it exists. 
-            // If it doesn't, create_container will fail later, which is expected.
             false
         };
 
@@ -60,10 +63,14 @@ impl AgentRuntime for DockerRuntime {
             let mut stream = self.docker.create_image(options, None, None);
             while let Some(result) = stream.next().await {
                 if let Err(e) = result {
+                    // If image exists but inspect failed for some weird reason, we might still want to try creating
+                    // but here we already know it doesn't exist or we want to pull.
                     return Err(RuntimeError::SpawnFailed(format!("Failed to pull image {}: {}", image, e)));
                 }
             }
             info!("Successfully pulled image: {}", image);
+        } else if !image_exists && !config.autopull {
+             return Err(RuntimeError::SpawnFailed(format!("Image {} not found locally and autopull is disabled", image)));
         }
         
 

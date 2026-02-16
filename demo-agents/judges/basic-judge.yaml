@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 
 apiVersion: 100monkeys.ai/v1
-kind: Agent
+kind: AgentManifest
 metadata:
   name: basic-judge
   version: "1.0.0"

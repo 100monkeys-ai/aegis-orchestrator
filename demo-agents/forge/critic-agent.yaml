@@ -1,15 +1,30 @@
-version: "1.1"
-agent:
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
   name: "critic-agent"
-  version: "0.1.0"
+  version: "1.0.0"
   description: "Design critic for The Forge - evaluates overall solution design and architecture"
-  runtime: "python:3.10-slim"
-  autopull: true
+  labels:
+    role: "worker"
+    category: "forge"
+    function: "review"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.10"
+    entrypoint: "main.py"
+  
   task:
     instruction: |
       You are an expert Design Critic. Critically evaluate overall solution, assess architectural decisions, identify issues, suggest alternatives.
       Output: Design Assessment (0.0-1.0), Strengths, Weaknesses, Alternatives, Recommendation (APPROVE/REVISE/REJECT).
+  
   execution:
-    max_retries: 3
-    timeout_seconds: 180
-    mode: "single"
+    mode: "one-shot"
+    max_iterations: 3
+  
+  security:
+    resources:
+      timeout: "180s"

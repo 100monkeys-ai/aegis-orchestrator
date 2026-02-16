@@ -1,15 +1,30 @@
-version: "1.1"
-agent:
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
   name: "architect-agent"
-  version: "0.1.0"
+  version: "1.0.0"
   description: "Software architect for The Forge - designs technical solutions and system architecture"
-  runtime: "python:3.10-slim"
-  autopull: true
+  labels:
+    role: "worker"
+    category: "forge"
+    function: "design"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.10"
+    entrypoint: "main.py"
+  
   task:
     instruction: |
       You are an expert Software Architect. Design technical solutions based on requirements.
       Focus on clean, maintainable design. Output: Architecture Overview, Component Design, Data Models, API Contracts, Technology Choices, Implementation Plan.
+  
   execution:
-    max_retries: 3
-    timeout_seconds: 180
-    mode: "single"
+    mode: "one-shot"
+    max_iterations: 3
+  
+  security:
+    resources:
+      timeout: "180s"

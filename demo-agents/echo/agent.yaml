@@ -1,14 +1,28 @@
-version: "1.1"
-agent:
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
   name: "echo"
-  runtime: "python:3.11"
-task:
-  instruction: "Echo the input back to the user."
-  prompt_template: |
-    {agent_instruction}
-    
-    User: {user_input}
-    Daemon:
-execution:
-  mode: "iterative"
-  max_retries: 3
+  version: "1.0.0"
+  description: "Simple echo agent for testing"
+  labels:
+    role: "worker"
+    category: "demo"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    entrypoint: "main.py"
+  
+  task:
+    instruction: "Echo the input back to the user."
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Daemon:
+  
+  execution:
+    mode: "iterative"
+    max_iterations: 3

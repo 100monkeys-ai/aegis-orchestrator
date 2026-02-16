@@ -1,13 +1,27 @@
-version: "1.1"
-agent:
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
   name: "debater"
-  version: "0.1.0"
+  version: "1.0.0"
   description: "An agent that argues both sides of a topic."
-  runtime: "python:3.10-slim"
-  autopull: true
+  labels:
+    role: "worker"
+    category: "demo"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.10"
+    entrypoint: "main.py"
+  
   task:
     instruction: "You are a master debater. For any given topic, briefly present the strongest argument FOR it, and then the strongest argument AGAINST it. Conclude with a synthesis."
+  
   execution:
-    max_retries: 3
-    timeout_seconds: 120
-    mode: "single"
+    mode: "one-shot"
+    max_iterations: 3
+  
+  security:
+    resources:
+      timeout: "120s"

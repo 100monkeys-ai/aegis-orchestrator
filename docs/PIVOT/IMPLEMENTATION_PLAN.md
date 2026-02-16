@@ -1214,7 +1214,7 @@ impl RunCommand {
 **Content:**
 
 ```yaml
-apiVersion: aegis.io/v1
+apiVersion: 100monkeys.ai/v1
 kind: AgentManifest
 metadata:
   name: basic-judge-v1
@@ -2196,7 +2196,7 @@ Use these patterns if they help solve the task.",
 ##### Example: requirements-ai.yaml
 
 ```yaml
-apiVersion: aegis.io/v1
+apiVersion: 100monkeys.ai/v1
 kind: AgentManifest
 metadata:
   name: requirements-ai-v1
@@ -2697,7 +2697,7 @@ async fn submit_human_input(
 **Content:**
 
 ```yaml
-apiVersion: aegis.io/v1
+apiVersion: 100monkeys.ai/v1
 kind: AgentManifest
 metadata:
   name: router-agent-v1
