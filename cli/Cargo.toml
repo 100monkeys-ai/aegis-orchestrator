@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
 
+[lib]
+name = "aegis_cli"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aegis"
 path = "src/main.rs"
