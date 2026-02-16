@@ -22,9 +22,32 @@ spec:
       Output: Design Assessment (0.0-1.0), Strengths, Weaknesses, Alternatives, Recommendation (APPROVE/REVISE/REJECT).
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for critique depth
     max_iterations: 3
+    memory: true  # Learn from design evaluation patterns
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.80
+        prompt: |
+          Evaluate the design critique for depth and usefulness:
+          {criteria}
+          
+          Check:
+          - Numeric assessment (0.0-1.0) is provided
+          - Strengths are identified with reasoning
+          - Weaknesses are explained with impact
+          - Alternatives are concrete and viable
+          - Final recommendation is clear and justified
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 750        # 0.75 CPU core
+      memory: "768Mi"
       timeout: "180s"

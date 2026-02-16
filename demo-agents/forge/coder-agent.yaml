@@ -22,9 +22,32 @@ spec:
       Follow language conventions, use meaningful names, keep functions focused. Code should be merge-ready.
   
   execution:
-    mode: "one-shot"
-    max_iterations: 3
+    mode: "iterative"  # Enable refinement for code quality
+    max_iterations: 5
+    memory: true  # Learn from coding patterns and corrections
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.80
+        prompt: |
+          Assess the code quality against professional standards:
+          {criteria}
+          
+          Check:
+          - Code compiles/runs without errors
+          - Proper error handling exists
+          - Documentation is clear and complete
+          - Unit tests cover key functionality
+          - Follows language conventions and best practices
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 1000       # 1.0 CPU core (code generation is intensive)
+      memory: "1Gi"
       timeout: "300s"

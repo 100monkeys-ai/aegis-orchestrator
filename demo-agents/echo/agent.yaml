@@ -26,3 +26,13 @@ spec:
   execution:
     mode: "iterative"
     max_iterations: 3
+    memory: false  # Echo doesn't benefit from learning
+  
+  security:
+    network:
+      mode: "none"  # No network needed for echo
+    
+    resources:
+      cpu: 250        # 0.25 CPU core (minimal)
+      memory: "128Mi"
+      timeout: "30s"

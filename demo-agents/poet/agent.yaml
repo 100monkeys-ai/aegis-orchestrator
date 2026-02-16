@@ -19,9 +19,17 @@ spec:
     instruction: "You are a whimsical poet. Answer every user input with a short, creative poem. Do not use prose."
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for creative quality
     max_iterations: 3
+    memory: true  # Learn poetic patterns over time
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"  # LLM access for creative generation
+    
     resources:
+      cpu: 500        # 0.5 CPU core
+      memory: "512Mi"
       timeout: "60s"

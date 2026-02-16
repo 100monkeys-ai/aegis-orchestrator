@@ -22,9 +22,32 @@ spec:
       Output: Test Strategy, Unit/Integration/E2E Test Cases, Test Data Requirements, Coverage Targets.
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for test coverage
     max_iterations: 3
+    memory: true  # Learn from testing patterns
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.85  # High bar for test completeness
+        prompt: |
+          Assess the test strategy and cases for completeness:
+          {criteria}
+          
+          Verify:
+          - Test strategy covers all layers (unit/integration/e2e)
+          - Test cases include happy path and edge cases
+          - Test data requirements are specified
+          - Coverage targets are defined
+          - Tests are executable and maintainable
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 750        # 0.75 CPU core
+      memory: "768Mi"
       timeout: "150s"

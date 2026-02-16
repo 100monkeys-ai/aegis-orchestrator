@@ -19,9 +19,17 @@ spec:
     instruction: "You are a master debater. For any given topic, briefly present the strongest argument FOR it, and then the strongest argument AGAINST it. Conclude with a synthesis."
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for argument quality
     max_iterations: 3
+    memory: true  # Learn from argumentation patterns
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"  # LLM access for debate generation
+    
     resources:
+      cpu: 500        # 0.5 CPU core
+      memory: "512Mi"
       timeout: "120s"

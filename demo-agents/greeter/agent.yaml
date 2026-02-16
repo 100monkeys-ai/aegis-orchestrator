@@ -17,3 +17,15 @@ spec:
   
   task:
     instruction: "Greet the user based on their name: \"Hello <name>, nice to meet you!\""
+  
+  execution:
+    mode: "one-shot"  # Simple greeting, no iteration needed
+  
+  security:
+    network:
+      mode: "none"  # No network access needed for simple greetings
+    
+    resources:
+      cpu: 250        # 0.25 CPU core (minimal)
+      memory: "128Mi"
+      timeout: "30s"

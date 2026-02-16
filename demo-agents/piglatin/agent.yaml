@@ -23,5 +23,10 @@ spec:
     max_iterations: 3
   
   security:
+    network:
+      mode: "none"  # No network access needed
+    
     resources:
+      cpu: 250        # 0.25 CPU core (lightweight)
+      memory: "256Mi"
       timeout: "120s"

@@ -22,9 +22,32 @@ spec:
       Output: Risk Assessment (LOW/MEDIUM/HIGH/CRITICAL), Identified Vulnerabilities, Recommended Fixes.
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for security depth
     max_iterations: 3
+    memory: true  # Learn from security patterns and vulnerabilities
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.90  # Very high bar for security audits
+        prompt: |
+          Validate the security audit is comprehensive and accurate:
+          {criteria}
+          
+          Verify:
+          - Risk level assessment is provided (LOW/MEDIUM/HIGH/CRITICAL)
+          - OWASP Top 10 categories addressed
+          - Vulnerabilities include severity and exploit scenarios
+          - Fixes are specific and actionable
+          - No false positives that could reduce trust
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 1000       # 1.0 CPU core (security analysis is intensive)
+      memory: "1Gi"
       timeout: "180s"

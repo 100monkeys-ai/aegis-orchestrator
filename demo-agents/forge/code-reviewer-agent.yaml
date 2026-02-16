@@ -22,9 +22,32 @@ spec:
       Output: Overall Assessment (PASS/NEEDS_WORK/REJECT), Issues, Improvements, Coverage Assessment, Recommendation.
   
   execution:
-    mode: "one-shot"
+    mode: "iterative"  # Enable refinement for review thoroughness
     max_iterations: 3
+    memory: true  # Learn from review patterns
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.85  # High bar for review completeness
+        prompt: |
+          Validate the code review is thorough and actionable:
+          {criteria}
+          
+          Ensure:
+          - All critical aspects reviewed (correctness, quality, safety, testing)
+          - Issues identified with specific locations
+          - Improvements are concrete and actionable
+          - Overall assessment justified
+          - Clear recommendation provided
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 750        # 0.75 CPU core
+      memory: "768Mi"
       timeout: "180s"

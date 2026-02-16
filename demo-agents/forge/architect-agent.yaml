@@ -22,9 +22,32 @@ spec:
       Focus on clean, maintainable design. Output: Architecture Overview, Component Design, Data Models, API Contracts, Technology Choices, Implementation Plan.
   
   execution:
-    mode: "one-shot"
-    max_iterations: 3
+    mode: "iterative"  # Enable refinement for architecture quality
+    max_iterations: 5
+    memory: true  # Learn from architectural patterns
+    
+    validation:
+      semantic:
+        enabled: true
+        threshold: 0.85  # High bar for architecture quality
+        prompt: |
+          Evaluate the architecture design against these criteria:
+          {criteria}
+          
+          Verify:
+          - All required sections are present and complete
+          - Design choices are well-justified
+          - Component boundaries are clear
+          - API contracts are well-defined
+          - Technical choices are appropriate for requirements
   
   security:
+    network:
+      mode: "allow"
+      allowlist:
+        - "api.openai.com"
+    
     resources:
+      cpu: 1000       # 1.0 CPU core (architecture work is compute-intensive)
+      memory: "1Gi"
       timeout: "180s"
