@@ -61,7 +61,7 @@ This document provides the complete implementation roadmap to bring AEGIS Orches
 ### Phase Completion Summary
 
 | Phase | Status | Completion | Key Deliverables | Tests |
-|-------|--------|------------|------------------|-------|
+| ------- | -------- | ------------ | ------------------ | ------- |
 | **Phase 0:** Documentation & ADRs | ✅ COMPLETE | 100% | 12 ADRs, IMPLEMENTATION_PLAN.md, AGENTS.md updates | N/A |
 | **Phase 1:** WorkflowEngine Foundation | ✅ COMPLETE | 100% | workflow.rs (790 lines), workflow_engine.rs (911 lines), YAML parser | 7/7 passing |
 | **Phase 2:** Agent-as-Judge Pattern | ✅ COMPLETE | 100% | ExecutionHierarchy, recursive execution tracking | 5/5 passing |
@@ -79,7 +79,7 @@ Based on [AGENTS.md](../../../aegis-architecture/AGENTS.md) DDD specifications:
 #### Bounded Contexts (9 total)
 
 | Context | Status | Notes |
-|---------|--------|-------|
+| --------- | -------- | ------- |
 | 1. Agent Lifecycle Context | ✅ Complete | Agent, AgentManifest, AgentRepository all implemented |
 | 2. Execution Context | ✅ Complete | Execution, Iteration, ExecutionHierarchy fully working |
 | 3. Workflow Orchestration Context | ✅ Complete | Workflow, WorkflowState, Blackboard operational |
@@ -93,7 +93,7 @@ Based on [AGENTS.md](../../../aegis-architecture/AGENTS.md) DDD specifications:
 #### Aggregates & Entities
 
 | Aggregate | Root Entity | Status | Location |
-|-----------|-------------|--------|----------|
+| ----------- | ------------- | -------- | ---------- |
 | **Agent Aggregate** | `Agent` | ✅ Complete | `orchestrator/core/src/domain/agent.rs` |
 | **Execution Aggregate** | `Execution` | ✅ Complete | `orchestrator/core/src/domain/execution.rs` |
 | **Workflow Aggregate** | `Workflow` | ✅ Complete | `orchestrator/core/src/domain/workflow.rs` |
@@ -122,7 +122,7 @@ All event categories implemented and publishing:
 #### Repositories
 
 | Repository | Interface | Implementation | Status |
-|------------|-----------|----------------|--------|
+| ------------ | ----------- | ---------------- | -------- |
 | `AgentRepository` | ✅ | ✅ PostgreSQL | ✅ Production-ready |
 | `ExecutionRepository` | ✅ | ✅ PostgreSQL | ✅ Production-ready |
 | `WorkflowRepository` | ✅ | ✅ PostgreSQL | ✅ Production-ready |
@@ -1597,13 +1597,12 @@ Key settings:
 - `learning.resonance_alpha`: Weight factor for resonance ranking
 - `learning.decay_lambda`: Time-decay constant
 
-```
-
 ---
 
 ## Phase 4 Summary
 
 **Deliverables:**
+
 1. ✅ Qdrant repository implementation (~500 lines)
 2. ✅ Cortex configuration file
 3. ✅ Pattern injection in WorkflowEngine
@@ -1623,12 +1622,14 @@ Key settings:
 **Goal:** Build complete constitutional development lifecycle from 0% → 100% with 7 specialized agents demonstrating fractal composition and adversarial testing.
 
 **Current State:**
+
 - ❌ No forge agents exist
 - ❌ No forge workflow defined
 - ❌ ParallelAgents execution logic incomplete
 - ❌ Human approval infrastructure missing
 
 **Target State:**
+
 - Requirements → Architecture → Tests → Code → Parallel Review → Human Approval → Deploy
 - All specialists are agents (fractal compliance)
 - Demonstrates gradient validation in real workflow
@@ -1642,6 +1643,7 @@ Key settings:
 **Objective:** Define 7 specialized AI agents implementing Constitutional Development Lifecycle per [ADR-020](../../../aegis-architecture/adrs/020-the-forge-reference-pattern.md).
 
 **Design Principles:**
+
 - Each agent has a single, well-defined responsibility
 - Agents consume and produce structured outputs (markdown, YAML, JSON)
 - Prompts emphasize quality over speed
@@ -5853,7 +5855,7 @@ aegis workflow execute forge --input '{
 
 The workflow will progress through all 7 agents:
 
-```
+```markdown
 [RequirementsAnalysis] requirements-ai is analyzing...
  ├─ Formalizing requirements
  ├─ Identifying edge cases
@@ -5898,7 +5900,7 @@ aegis workflow show-pending
 
 Output:
 
-```
+```markdown
 Pending Human Inputs:
 1. Execution: abc-123
    State: HumanApproval
@@ -5929,7 +5931,7 @@ aegis workflow respond abc-123 --reject --feedback "Add logging for failed authe
 
 If approved, the workflow finalizes:
 
-```
+```markdown
 [Deploy] Workflow complete ✅
 
 Output:
@@ -6003,8 +6005,6 @@ This demo showcases:
 
 Every component follows the cyber-biological membrane principle: agents operate with autonomy inside strict constitutional boundaries enforced by AEGIS infrastructure.
 
-```
-
 ---
 
 ### 20.2 Stimulus-Response Demo
@@ -6057,7 +6057,7 @@ aegis sense --source stdin --verbose
 
 Output:
 
-```
+```markdown
 📡 AEGIS Sense Active (Stdin Mode)
 Type your input and press Enter. Ctrl+C to exit.
 ```
@@ -6066,7 +6066,7 @@ Type your input and press Enter. Ctrl+C to exit.
 
 **Example 1: Conversational**
 
-```
+```markdown
 > Hello, how are you today?
 
 📨 Received: Hello, how are you today?
@@ -6080,7 +6080,7 @@ Type your input and press Enter. Ctrl+C to exit.
 
 **Example 2: Debugging**
 
-```
+```markdown
 > I'm getting a "Cannot read property 'map' of undefined" error
 
 📨 Received: I'm getting a "Cannot read property 'map' of undefined" error
@@ -6100,7 +6100,7 @@ Type your input and press Enter. Ctrl+C to exit.
 
 **Example 3: Development**
 
-```
+```markdown
 > Write a function to validate email addresses
 
 📨 Received: Write a function to validate email addresses
@@ -6132,7 +6132,7 @@ aegis sense --source webhook --webhook-endpoint 0.0.0.0:9000
 
 Output:
 
-```
+```markdown
 📡 AEGIS Sense Active (Webhook Mode)
 Listening on: http://0.0.0.0:9000/webhook
 Send POST requests with JSON body: {"content": "your input"}
@@ -6202,8 +6202,6 @@ aegis execution list --recent 10
 
 This pattern enables AEGIS to function as a conversational AI interface where workflows are transparent to the user.
 
-```
-
 ---
 
 ## Step 21: Run Full Test Suite and Fix Issues
@@ -6227,7 +6225,7 @@ docker-compose -f docker-compose.test.yml up --abort-on-container-exit
 
 ### 21.2 Expected Test Results
 
-```
+```markdown
 Test Summary:
 ├─ Cortex tests: 29/29 passing ✅
 ├─ Workflow engine tests: 7/7 passing ✅
@@ -6243,7 +6241,7 @@ Test coverage: 83% (target: 80%)
 
 **Issue 1: Qdrant connection timeout**
 
-```
+```markdown
 Error: Failed to connect to Qdrant at localhost:6334
 ```
 
@@ -6255,7 +6253,7 @@ docker run -p 6333:6333 -p 6334:6334 qdrant/qdrant
 
 **Issue 2: PostgreSQL migration conflicts**
 
-```
+```markdown
 Error: Migration 014_workflow_registry.sql already applied
 ```
 
@@ -6267,7 +6265,7 @@ sqlx database reset
 
 **Issue 3: Test agent manifests not found**
 
-```
+```markdown
 Error: Agent 'router-agent' not found
 ```
 
@@ -6641,7 +6639,7 @@ pub mod fixtures {
 ## Test Coverage Targets
 
 | Component | Target | Actual |
-|-----------|--------|--------|
+| ----------- | -------- | -------- |
 | Domain layer | 100% | 98% ✅ |
 | Application layer | 90% | 87% ✅ |
 | Infrastructure layer | 80% | 81% ✅ |
@@ -6655,7 +6653,7 @@ pub mod fixtures {
 ## Performance Benchmarks
 
 | Metric | Target | Actual |
-|--------|--------|--------|
+| -------- | -------- | -------- |
 | Pattern search latency (Qdrant) | <100ms | 45ms (p95) ✅ |
 | Workflow startup time | <500ms | 320ms (p95) ✅ |
 | Parallel agent execution (3 agents) | <10s | 7.2s (avg) ✅ |
@@ -6674,7 +6672,7 @@ pub mod fixtures {
 
 **Expected output:**
 
-```
+```markdown
 ✅ All 7 agents deployed
 ✅ Forge workflow deployed
 ✅ Task executed: "Implement JWT middleware"
@@ -6694,7 +6692,7 @@ pub mod fixtures {
 
 **Expected output:**
 
-```
+```markdown
 ✅ RouterAgent deployed
 ✅ 4 workflows registered
 ✅ Stimulus "Help debug error" → Classified as "debug" (0.88 confidence)
@@ -6907,7 +6905,7 @@ pub mod fixtures {
 Based on scope defined above, 2-person team, full-time:
 
 | Phase | Estimated Time | Confidence |
-|-------|----------------|------------|
+| ------- | ---------------- | ------------ |
 | Phase 4: Cortex Persistence | 3 days | High |
 | Phase 5: The Forge | 5 days | Medium |
 | Phase 6: Stimulus-Response | 3 days | High |
