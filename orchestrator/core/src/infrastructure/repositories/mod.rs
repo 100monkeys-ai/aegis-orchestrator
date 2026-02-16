@@ -224,3 +224,67 @@ impl crate::domain::repository::WorkflowExecutionRepository for InMemoryWorkflow
             .collect())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    #[tokio::test]
+    async fn test_in_memory_agent_repository_basic() {
+        let repo = InMemoryAgentRepository::new();
+        
+        // Test with empty repository
+        let all_agents = repo.list_all().await.unwrap();
+        assert_eq!(all_agents.len(), 0);
+        
+        // Test finding non-existent agent
+        let non_existent_id = AgentId::new();
+        let result = repo.find_by_id(non_existent_id).await.unwrap();
+        assert!(result.is_none());
+        
+        // Test finding by non-existent name
+        let result = repo.find_by_name("non-existent").await.unwrap();
+        assert!(result.is_none());
+        
+        // Test deleting non-existent agent (should not error)
+        let delete_result = repo.delete(non_existent_id).await;
+        assert!(delete_result.is_ok());
+    }
+    
+    #[tokio::test]
+    async fn test_in_memory_execution_repository_basic() {
+        let repo = InMemoryExecutionRepository::new();
+        
+        // Test with empty repository
+        let agent_id = AgentId::new();
+        let agent_executions = repo.find_by_agent(agent_id).await.unwrap();
+        assert_eq!(agent_executions.len(), 0);
+        
+        // Test finding non-existent execution
+        let execution_id = ExecutionId::new();
+        let result = repo.find_by_id(execution_id).await.unwrap();
+        assert!(result.is_none());
+        
+        // Test deleting non-existent execution (should not error)
+        let delete_result = repo.delete(execution_id).await;
+        assert!(delete_result.is_ok());
+    }
+    
+    #[tokio::test]
+    async fn test_in_memory_workflow_repository_basic() {
+        let repo = InMemoryWorkflowRepository::new();
+        
+        // Test with empty repository
+        let all_workflows = repo.list_all().await.unwrap();
+        assert_eq!(all_workflows.len(), 0);
+        
+        // Test finding non-existent workflow
+        let workflow_id = WorkflowId::new();
+        let result = repo.find_by_id(workflow_id).await.unwrap();
+        assert!(result.is_none());
+        
+        // Test finding by non-existent name
+        let result = repo.find_by_name("non-existent").await.unwrap();
+        assert!(result.is_none());
+    }
+}

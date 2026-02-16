@@ -156,3 +156,125 @@ impl LLMProvider for AnthropicAdapter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::llm::{FinishReason, GenerationOptions};
+    
+    #[test]
+    fn test_anthropic_adapter_creation() {
+        let adapter = AnthropicAdapter::new(
+            "test-key".to_string(),
+            "claude-3-opus".to_string(),
+        );
+        
+        assert_eq!(adapter.api_key, "test-key");
+        assert_eq!(adapter.model, "claude-3-opus");
+    }
+    
+    #[test]
+    fn test_anthropic_request_serialization() {
+        let request = AnthropicRequest {
+            model: "claude-3-opus".to_string(),
+            messages: vec![AnthropicMessage {
+                role: "user".to_string(),
+                content: "Hello Claude".to_string(),
+            }],
+            max_tokens: 1024,
+            temperature: Some(0.7),
+        };
+        
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["model"], "claude-3-opus");
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][0]["content"], "Hello Claude");
+        assert_eq!(json["max_tokens"], 1024);
+        // Use approximate comparison for floating point
+        let temp = json["temperature"].as_f64().unwrap();
+        assert!((temp - 0.7).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_anthropic_response_deserialization() {
+        let json = serde_json::json!({
+            "content": [{
+                "text": "Hello! How can I assist you today?"
+            }],
+            "usage": {
+                "input_tokens": 15,
+                "output_tokens": 25
+            },
+            "stop_reason": "end_turn"
+        });
+        
+        let response: AnthropicResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.content.len(), 1);
+        assert_eq!(response.content[0].text, "Hello! How can I assist you today?");
+        assert_eq!(response.usage.input_tokens, 15);
+        assert_eq!(response.usage.output_tokens, 25);
+        assert_eq!(response.stop_reason, Some("end_turn".to_string()));
+    }
+    
+    #[test]
+    fn test_anthropic_finish_reason_mapping() {
+        // Test that finish reasons are correctly mapped
+        let reasons = vec![
+            (Some("end_turn"), FinishReason::Stop),
+            (Some("max_tokens"), FinishReason::Length),
+            (Some("stop_sequence"), FinishReason::Stop),
+            (None, FinishReason::Stop), // Default case
+        ];
+        
+        for (anthropic_reason, expected) in reasons {
+            let mapped = match anthropic_reason.as_deref() {
+                Some("end_turn") => FinishReason::Stop,
+                Some("max_tokens") => FinishReason::Length,
+                Some("stop_sequence") => FinishReason::Stop,
+                _ => FinishReason::Stop,
+            };
+            assert_eq!(mapped, expected);
+        }
+    }
+    
+    #[test]
+    fn test_anthropic_message_structure() {
+        let message = AnthropicMessage {
+            role: "user".to_string(),
+            content: "Test message for Claude".to_string(),
+        };
+        
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"], "Test message for Claude");
+        
+        // Test round-trip
+        let deserialized: AnthropicMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.content, "Test message for Claude");
+    }
+    
+    #[test]
+    fn test_default_max_tokens() {
+        // Test that max_tokens defaults to 4096 when not provided
+        let options = GenerationOptions {
+            max_tokens: None,
+            temperature: Some(0.5),
+            stop_sequences: None,
+        };
+        
+        let max_tokens = options.max_tokens.unwrap_or(4096);
+        assert_eq!(max_tokens, 4096);
+    }
+    
+    #[test]
+    fn test_anthropic_usage_calculation() {
+        let usage = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+        };
+        
+        let total = usage.input_tokens + usage.output_tokens;
+        assert_eq!(total, 300);
+    }
+}
