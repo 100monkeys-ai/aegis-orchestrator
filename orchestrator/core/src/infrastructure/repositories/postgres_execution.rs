@@ -1,6 +1,48 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! PostgreSQL Execution Repository
+//!
+//! Provides PostgreSQL-backed persistence for agent execution state and history.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure
+//! - **Purpose:** Persist execution state, iterations, and results
+//! - **Integration:** Domain ExecutionRepository → PostgreSQL executions table
+//!
+//! # Schema
+//!
+//! The `executions` table stores:
+//! - Execution metadata (ID, agent ID, status, timestamps)
+//! - Input parameters (JSONB)
+//! - Iteration history (JSONB array with LLM interactions)
+//! - Final output and error messages
+//! - Execution hierarchy (parent/child relationships)
+//!
+//! # Features
+//!
+//! - **Full History Tracking**: All iterations with token usage
+//! - **Status Management**: Lifecycle state (pending → running → completed/failed)
+//! - **Hierarchical Queries**: Support for agent-as-judge recursive execution trees
+//! - **JSONB Indexing**: Efficient queries on structured execution data
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use sqlx::PgPool;
+//! use repositories::PostgresExecutionRepository;
+//!
+//! let pool = PgPool::connect(&database_url).await?;
+//! let repo = PostgresExecutionRepository::new(pool);
+//!
+//! // Save execution state
+//! repo.save(&execution).await?;
+//!
+//! // Query by ID
+//! let execution = repo.find_by_id(execution_id).await?;
+//! ```
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;

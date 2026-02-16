@@ -1,6 +1,38 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! Database Update Command
+//!
+//! This module implements the `aegis update` command for applying database
+//! migrations to keep the schema in sync with the application version.
+//!
+//! # Architecture
+//!
+//! - **Layer:** CLI/Presentation
+//! - **Purpose:** Database schema migration management
+//! - **Integration:** CLI → SQLx Migrator → PostgreSQL
+//!
+//! # Features
+//!
+//! - **Dry Run**: Preview pending migrations without applying them
+//! - **Auto-Detection**: Automatically discovers and applies pending migrations
+//! - **Status Display**: Shows applied vs. available migration counts
+//! - **Safe Execution**: Uses SQLx's built-in migration tracking
+//!
+//! # Usage
+//!
+//! ```bash
+//! # Apply all pending migrations
+//! aegis update
+//!
+//! # Preview migrations without applying
+//! aegis update --dry-run
+//! ```
+//!
+//! # Environment
+//!
+//! Requires `AEGIS_DATABASE_URL` environment variable to be set.
+
 use clap::Args;
 use anyhow::{Result, Context};
 use colored::Colorize;

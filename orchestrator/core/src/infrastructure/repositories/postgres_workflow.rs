@@ -1,6 +1,49 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! PostgreSQL Workflow Repository
+//!
+//! Provides PostgreSQL-backed persistence for workflow definitions with versioning
+//! and content-addressable storage via SHA-256 hashing.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure
+//! - **Purpose:** Store and retrieve workflow FSM definitions
+//! - **Integration:** Domain WorkflowRepository → PostgreSQL workflows table
+//!
+//! # Schema
+//!
+//! The `workflows` table stores:
+//! - Workflow metadata (ID, name, version, description)
+//! - Complete FSM definition (JSONB)
+//! - YAML source representation
+//! - Temporal workflow mapping (for execution engine integration)
+//! - Content hash (SHA-256 for deduplication)
+//!
+//! # Features
+//!
+//! - **Version Management**: Multiple versions of the same workflow
+//! - **Content Hashing**: SHA-256 based deduplication
+//! - **Multi-Format Storage**: YAML source + JSON definition + Temporal mapping
+//! - **Immutable Definitions**: Workflows are append-only (new versions created)
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use sqlx::PgPool;
+//! use repositories::PostgresWorkflowRepository;
+//!
+//! let pool = PgPool::connect(&database_url).await?;
+//! let repo = PostgresWorkflowRepository::new_with_pool(pool);
+//!
+//! // Save workflow definition
+//! repo.save(&workflow).await?;
+//!
+//! // Retrieve by ID
+//! let workflow = repo.find_by_id(workflow_id).await?;
+//! ```
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;

@@ -1,6 +1,54 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! Repository Implementations
+//!
+//! This module provides infrastructure implementations of repository abstractions
+//! defined in the domain layer, following the Repository pattern from DDD.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure
+//! - **Purpose:** Persist and retrieve domain aggregates
+//! - **Pattern:** Repository (DDD), Adapter (Hexagonal Architecture)
+//!
+//! # Available Implementations
+//!
+//! ## PostgreSQL Repositories
+//!
+//! Production-ready implementations backed by PostgreSQL:
+//! - **PostgresAgentRepository** - Agent manifest persistence
+//! - **PostgresExecutionRepository** - Execution state and history
+//! - **PostgresWorkflowRepository** - Workflow definitions and versions
+//! - **PostgresWorkflowExecutionRepository** - Workflow execution state
+//!
+//! ## In-Memory Repositories
+//!
+//! Lightweight implementations for testing and development:
+//! - **InMemoryAgentRepository** - Thread-safe HashMap-backed storage
+//! - **InMemoryExecutionRepository** - Ephemeral execution tracking
+//! - **InMemoryWorkflowRepository** - Workflow definition cache
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use sqlx::PgPool;
+//! use repositories::PostgresAgentRepository;
+//!
+//! let pool = PgPool::connect(&database_url).await?;
+//! let repo = PostgresAgentRepository::new(pool);
+//!
+//! // Repository implements AgentRepository trait
+//! let agent = repo.find_by_id(agent_id).await?;
+//! ```
+//!
+//! # Design Principles
+//!
+//! 1. **Technology Agnostic**: Domain layer has no knowledge of persistence
+//! 2. **Transactional Consistency**: Operations are atomic where possible
+//! 3. **Error Mapping**: Infrastructure errors mapped to domain RepositoryError
+//! 4. **Connection Pooling**: Efficient database connection management
+
 pub mod postgres_agent;
 pub mod postgres_execution;
 pub mod postgres_workflow;

@@ -1,6 +1,57 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! PostgreSQL Workflow Execution Repository
+//!
+//! Provides PostgreSQL-backed persistence for workflow execution state tracking
+//! including FSM state transitions, blackboard data, and integration with Temporal.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure
+//! - **Purpose:** Track workflow execution state and FSM progress
+//! - **Integration:** Domain WorkflowExecutionRepository → PostgreSQL workflow_executions table
+//!
+//! # Schema
+//!
+//! The `workflow_executions` table stores:
+//! - Workflow execution metadata (ID, workflow ID, status)
+//! - Temporal integration IDs (workflow ID, run ID)
+//! - Input parameters (JSONB)
+//! - Current FSM state and state history
+//! - Blackboard data (shared state between workflow steps)
+//! - Execution timestamps
+//!
+//! # FSM State Tracking
+//!
+//! Workflow executions follow a finite state machine model:
+//! - **Current State**: Active state in the workflow graph
+//! - **State History**: Ordered list of visited states
+//! - **Blackboard**: Key-value storage for passing data between states
+//! - **Transitions**: State transitions evaluated based on conditions
+//!
+//! # Temporal Integration
+//!
+//! Links AEGIS workflow executions to Temporal.io workflow runs:
+//! - `temporal_workflow_id`: Temporal workflow type identifier
+//! - `temporal_run_id`: Unique run identifier for status tracking
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use sqlx::PgPool;
+//! use repositories::PostgresWorkflowExecutionRepository;
+//!
+//! let pool = PgPool::connect(&database_url).await?;
+//! let repo = PostgresWorkflowExecutionRepository::new(pool);
+//!
+//! // Save workflow execution state
+//! repo.save(&workflow_execution).await?;
+//!
+//! // Query by ID
+//! let execution = repo.find_by_id(execution_id).await?;
+//! ```
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;

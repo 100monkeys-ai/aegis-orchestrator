@@ -1,6 +1,62 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+//! Temporal.io gRPC Client
+//!
+//! Provides low-level gRPC client for interacting with Temporal.io workflow engine.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure
+//! - **Purpose:** gRPC communication with Temporal workflow service
+//! - **Integration:** AEGIS Workflow Engine → Temporal.io gRPC API
+//!
+//! # Client Features
+//!
+//! - **Workflow Execution**: Start workflows with the Generic Interpreter pattern
+//! - **Connection Management**: Persistent gRPC channel with timeout handling
+//! - **JSON Payload Encoding**: Standard encoding for workflow inputs
+//! - **Namespace Isolation**: Multi-tenant workflow execution support
+//!
+//! # Generic Interpreter Pattern
+//!
+//! This client uses a generic workflow pattern where:
+//! 1. All AEGIS workflows execute via a single TypeScript workflow function (`aegis_workflow`)
+//! 2. The workflow name and input are passed as payload parameters
+//! 3. The TypeScript worker interprets the workflow definition at runtime
+//!
+//! Input structure:
+//! ```json
+//! {
+//!   "workflow_name": "user-query-pipeline",
+//!   "input": { "query": "..." }
+//! }
+//! ```
+//!
+//! # Usage
+//!
+//! ```no_run
+//! use temporal_client::TemporalClient;
+//!
+//! let client = TemporalClient::new(
+//!     "localhost:7233",
+//!     "default",
+//!     "aegis-task-queue"
+//! ).await?;
+//!
+//! let run_id = client.start_workflow(
+//!     "my-workflow",
+//!     execution_id,
+//!     input_params
+//! ).await?;
+//! ```
+//!
+//! # Configuration
+//!
+//! - **Address**: Temporal server endpoint (e.g., `localhost:7233`)
+//! - **Namespace**: Logical isolation boundary for workflows
+//! - **Task Queue**: Worker registration and task routing identifier
+
 use crate::domain::execution::ExecutionId;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
