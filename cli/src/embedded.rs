@@ -27,7 +27,7 @@ use aegis_core::{
         runtime::DockerRuntime,
     },
 };
-use aegis_sdk::manifest::AgentManifest;
+use aegis_sdk::AgentManifest;
 
 pub struct EmbeddedExecutor {
     agent_service: Arc<StandardAgentLifecycleService>,

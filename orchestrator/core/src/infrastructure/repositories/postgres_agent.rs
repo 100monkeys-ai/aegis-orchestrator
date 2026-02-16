@@ -34,8 +34,8 @@ impl AgentRepository for PostgresAgentRepository {
             AgentStatus::Failed => "active", // Map Failed to active for now if table doesn't support it
         };
 
-        // Extract security policy (permissions)
-        let security_policy = serde_json::to_value(&agent.manifest.permissions)
+        // Extract security policy (from spec.security)
+        let security_policy = serde_json::to_value(&agent.manifest.spec.security)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         sqlx::query(
@@ -60,11 +60,11 @@ impl AgentRepository for PostgresAgentRepository {
         )
         .bind(agent.id.0)
         .bind(&agent.name)
-        .bind(agent.manifest.agent.version.clone().unwrap_or_else(|| "1.0.0".to_string()))
+        .bind(agent.manifest.metadata.version.clone())
         .bind(manifest_yaml)
         .bind(manifest_json)
-        .bind(&agent.manifest.agent.runtime)
-        .bind(agent.manifest.agent.timeout_seconds as i32)
+        .bind(&agent.manifest.runtime_string())
+        .bind(300 as i32) // Default timeout, can be extracted from spec.security.resources.timeout if present
         .bind(security_policy)
         .bind(status_str)
         .bind(agent.created_at)

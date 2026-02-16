@@ -34,47 +34,106 @@ pub struct Agent {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Kubernetes-style Agent Manifest (v1.0)
+/// Follows spec: MANIFEST_SPEC_V1.md
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct AgentManifest {
-    #[serde(default = "default_manifest_version")]
-    pub version: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub execution_targets: Vec<String>,
-    pub agent: AgentIdentity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub schedule: Option<ScheduleConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task: Option<TaskConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub context: Vec<ContextItem>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub execution: Option<ExecutionStrategy>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub permissions: Option<PermissionsConfig>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tools: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
-    pub env: std::collections::HashMap<String, String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub advanced: Option<AdvancedConfig>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub metadata: Option<MetadataConfig>,
+    /// API version (e.g., "100monkeys.ai/v1")
+    #[serde(rename = "apiVersion")]
+    pub api_version: String,
+    
+    /// Resource kind (must be "AgentManifest")
+    pub kind: String,
+    
+    /// Kubernetes-style metadata
+    pub metadata: ManifestMetadata,
+    
+    /// Agent specification
+    pub spec: AgentSpec,
 }
 
+/// Kubernetes-style metadata
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AgentIdentity {
+pub struct ManifestMetadata {
+    /// Unique agent name (DNS label format)
     pub name: String,
-    pub runtime: String,
-    #[serde(default = "default_true")]
-    pub autopull: bool,
-    #[serde(default)]
-    pub memory: bool,
+    
+    /// Manifest schema version (semantic versioning)
+    pub version: String,
+    
+    /// Optional human-readable description
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    
+    /// Optional labels for categorization
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub labels: std::collections::HashMap<String, String>,
+    
+    /// Optional annotations (non-identifying metadata)
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub annotations: std::collections::HashMap<String, String>,
+}
+
+/// Agent specification (the main configuration)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentSpec {
+    /// Runtime configuration
+    pub runtime: RuntimeConfig,
+    
+    /// Optional task definition
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub version: Option<String>,
-    #[serde(default = "default_timeout")]
-    pub timeout_seconds: u64,
+    pub task: Option<TaskConfig>,
+    
+    /// Optional context attachments
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextItem>,
+    
+    /// Optional execution strategy
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionStrategy>,
+    
+    /// Optional security permissions
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityConfig>,
+    
+    /// Optional scheduling configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<ScheduleConfig>,
+    
+    /// Optional tools/MCP servers
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    
+    /// Optional environment variables
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub env: std::collections::HashMap<String, String>,
+    
+    /// Optional advanced configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advanced: Option<AdvancedConfig>,
+}
+
+/// Runtime configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RuntimeConfig {
+    /// Programming language (python, javascript, typescript, rust, go)
+    pub language: String,
+    
+    /// Language version (e.g., "3.11", "20", "1.75")
+    pub version: String,
+    
+    /// Optional custom entrypoint (default: main.py, index.js, main.rs, etc.)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entrypoint: Option<String>,
+    
+    /// Optional isolation mode (inherit, firecracker, docker, process)
+    #[serde(default = "default_isolation")]
+    pub isolation: String,
+    
+    /// Optional autopull
+    #[serde(default = "default_true")]
+    pub autopull: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -320,40 +379,94 @@ pub struct SmsConfig {
     pub message: String,
 }
 
+/// Security configuration (renamed from PermissionsConfig to match spec)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct PermissionsConfig {
+pub struct SecurityConfig {
     #[serde(default)]
-    pub network: NetworkPermissions,
+    pub network: NetworkPolicy,
     #[serde(default)]
-    pub fs: FsPermissions,
+    pub filesystem: FilesystemPolicy,
     #[serde(default)]
     pub resources: ResourceLimits,
 }
 
+/// Network access policy
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct NetworkPermissions {
-    #[serde(default)]
-    pub allow: Vec<String>,
-    #[serde(default)]
-    pub deny: Vec<String>,
+pub struct NetworkPolicy {
+    /// Policy mode: "allow" (allowlist) | "deny" (denylist) | "none"
+    #[serde(default = "default_network_mode")]
+    pub mode: String,
+    
+    /// Allowed domains/IPs (for 'allow' mode)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowlist: Vec<String>,
+    
+    /// Denied domains/IPs (for 'deny' mode)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denylist: Vec<String>,
 }
 
+/// Filesystem access policy
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-pub struct FsPermissions {
+pub struct FilesystemPolicy {
+    /// Readable paths
     #[serde(default)]
     pub read: Vec<String>,
+    
+    /// Writable paths
     #[serde(default)]
     pub write: Vec<String>,
+    
+    /// Read-only mode
+    #[serde(default)]
+    pub read_only: bool,
 }
 
+/// Resource limits
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResourceLimits {
+    /// CPU quota in millicores (1000 = 1 CPU core)
     #[serde(default = "default_cpu")]
     pub cpu: u32,
+    
+    /// Memory limit (human-readable: "512Mi", "1Gi", "2G")
     #[serde(default = "default_memory")]
     pub memory: String,
+    
+    /// Disk space limit
     #[serde(default = "default_disk")]
     pub disk: String,
+    
+    /// Execution timeout (human-readable duration or seconds)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<String>,
+}
+
+impl ResourceLimits {
+    /// Parse memory/disk string (e.g., "512Mi", "1Gi") to bytes
+    /// Returns None if parsing fails
+    pub fn parse_size_to_bytes(size_str: &str) -> Option<u64> {
+        let size_str = size_str.trim();
+        if size_str.ends_with("Gi") {
+            size_str.trim_end_matches("Gi").parse::<u64>().ok().map(|v| v * 1024 * 1024 * 1024)
+        } else if size_str.ends_with("Mi") {
+            size_str.trim_end_matches("Mi").parse::<u64>().ok().map(|v| v * 1024 * 1024)
+        } else if size_str.ends_with("Ki") {
+            size_str.trim_end_matches("Ki").parse::<u64>().ok().map(|v| v * 1024)
+        } else {
+            size_str.parse::<u64>().ok()
+        }
+    }
+    
+    /// Get memory limit in bytes
+    pub fn memory_bytes(&self) -> Option<u64> {
+        Self::parse_size_to_bytes(&self.memory)
+    }
+    
+    /// Get disk limit in bytes
+    pub fn disk_bytes(&self) -> Option<u64> {
+        Self::parse_size_to_bytes(&self.disk)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -373,14 +486,7 @@ pub struct HealthCheckConfig {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MetadataConfig {
-    pub author: Option<String>,
-    pub created: Option<String>,
-    #[serde(default)]
-    pub tags: Vec<String>,
-    pub cost_center: Option<String>,
-}
+// MetadataConfig removed - now handled by ManifestMetadata in K8s format
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
@@ -392,7 +498,6 @@ pub enum AgentStatus {
 
 // Defaults
 fn default_true() -> bool { true }
-fn default_timeout() -> u64 { 300 }
 fn default_max_retries() -> u32 { 5 }
 fn default_system_timeout() -> u64 { 90 }
 fn default_validation_timeout() -> u64 { 30 }
@@ -401,7 +506,8 @@ fn default_post() -> String { "POST".to_string() }
 fn default_cpu() -> u32 { 1000 }
 fn default_memory() -> String { "512Mi".to_string() }
 fn default_disk() -> String { "1Gi".to_string() }
-fn default_manifest_version() -> String { "0.1.0".to_string() }
+fn default_isolation() -> String { "inherit".to_string() }
+fn default_network_mode() -> String { "allow".to_string() }
 
 impl Default for ResourceLimits {
     fn default() -> Self {
@@ -409,6 +515,7 @@ impl Default for ResourceLimits {
             cpu: default_cpu(),
             memory: default_memory(),
             disk: default_disk(),
+            timeout: None,
         }
     }
 }
@@ -418,7 +525,7 @@ impl Agent {
         let now = Utc::now();
         Self {
             id: AgentId::new(),
-            name: manifest.agent.name.clone(),
+            name: manifest.metadata.name.clone(),
             manifest,
             status: AgentStatus::Active,
             created_at: now,
@@ -427,6 +534,7 @@ impl Agent {
     }
 
     pub fn update_manifest(&mut self, manifest: AgentManifest) {
+        self.name = manifest.metadata.name.clone();
         self.manifest = manifest;
         self.updated_at = Utc::now();
     }
@@ -444,5 +552,64 @@ impl Agent {
     pub fn archive(&mut self) {
         self.status = AgentStatus::Archived;
         self.updated_at = Utc::now();
+    }
+}
+
+impl AgentManifest {
+    /// Validate the manifest structure and constraints
+    pub fn validate(&self) -> Result<(), String> {
+        // Validate API version
+        if self.api_version != "100monkeys.ai/v1" {
+            return Err(format!("Invalid apiVersion: expected '100monkeys.ai/v1', got '{}'", self.api_version));
+        }
+        
+        // Validate kind
+        if self.kind != "AgentManifest" {
+            return Err(format!("Invalid kind: expected 'AgentManifest', got '{}'", self.kind));
+        }
+        
+        // Validate name format (DNS label: lowercase alphanumeric with hyphens)
+        if self.metadata.name.is_empty() {
+            return Err("metadata.name cannot be empty".to_string());
+        }
+        for ch in self.metadata.name.chars() {
+            if !ch.is_ascii_lowercase() && !ch.is_ascii_digit() && ch != '-' {
+                return Err(format!("Invalid metadata.name: '{}' must be lowercase alphanumeric with hyphens", self.metadata.name));
+            }
+        }
+        if self.metadata.name.starts_with('-') || self.metadata.name.ends_with('-') {
+            return Err(format!("Invalid metadata.name: '{}' cannot start or end with hyphen", self.metadata.name));
+        }
+        
+        // Validate timeout hierarchy if all are present
+        if let Some(exec) = &self.spec.execution {
+            if let Some(validation) = &exec.validation {
+                if let Some(system) = &validation.system {
+                    if let Some(security) = &self.spec.security {
+                        if let Some(_timeout_str) = &security.resources.timeout {
+                            // Parse timeouts and enforce hierarchy
+                            // semantic timeout <= system timeout <= resource timeout
+                            let system_timeout = system.timeout_seconds;
+                            
+                            if let Some(semantic) = &validation.semantic {
+                                if semantic.timeout_seconds > system_timeout {
+                                    return Err(format!(
+                                        "Timeout hierarchy violation: semantic.timeout ({}) > system.timeout ({})",
+                                        semantic.timeout_seconds, system_timeout
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Ok(())
+    }
+    
+    /// Get the runtime as a combined string
+    pub fn runtime_string(&self) -> String {
+        format!("{}:{}", self.spec.runtime.language, self.spec.runtime.version)
     }
 }

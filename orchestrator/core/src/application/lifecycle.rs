@@ -21,8 +21,11 @@ impl StandardAgentLifecycleService {
 #[async_trait]
 impl AgentLifecycleService for StandardAgentLifecycleService {
     async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
+        // Validate manifest before deploying
+        manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
+        
         // Check if agent with same name exists
-        if let Some(existing) = self.repository.find_by_name(&manifest.agent.name).await? {
+        if let Some(existing) = self.repository.find_by_name(&manifest.metadata.name).await? {
             // Need to decide: Update existing or Fail?
             // "Deploy" usually implies creating or updating.
             // If ID matches, it's an update (handled by update_agent).

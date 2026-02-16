@@ -19,6 +19,10 @@ pub enum AgentCommand {
         /// Path to agent manifest YAML file
         #[arg(value_name = "MANIFEST")]
         manifest: PathBuf,
+        
+        /// Validate manifest without deploying
+        #[arg(long)]
+        validate_only: bool,
     },
 
     /// Show agent configuration (YAML)
@@ -84,7 +88,7 @@ pub async fn handle_command(
 
     match command {
         AgentCommand::List => list_agents(client).await,
-        AgentCommand::Deploy { manifest } => deploy_agent(manifest, client).await,
+        AgentCommand::Deploy { manifest, validate_only } => deploy_agent(manifest, validate_only, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
         AgentCommand::Logs { agent_id, follow, errors, verbose } => logs_agent(agent_id, follow, errors, verbose, client).await,
@@ -95,7 +99,8 @@ async fn show_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     let manifest = client.get_agent(agent_id).await?;
     
     // Export as YAML to stdout
-    let yaml = manifest.to_yaml_str()?;
+    let yaml = serde_yaml::to_string(&manifest)
+        .context("Failed to serialize manifest to YAML")?;
     println!("{}", yaml);
     
     Ok(())
@@ -134,14 +139,29 @@ async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     Ok(())
 }
 
-async fn deploy_agent(manifest: PathBuf, client: DaemonClient) -> Result<()> {
+async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClient) -> Result<()> {
     let manifest_content = std::fs::read_to_string(&manifest)
         .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
 
-    let agent_manifest: aegis_sdk::manifest::AgentManifest =
-        serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
+    // Parse with SDK types (now using core domain re-exports)
+    let agent_manifest: aegis_sdk::AgentManifest = serde_yaml::from_str(&manifest_content)
+        .context("Failed to parse manifest YAML")?;
+    
+    // Use domain validation (comprehensive checks including DNS labels, timeouts, etc.)
+    agent_manifest.validate()
+        .map_err(|e| anyhow::anyhow!("Manifest validation failed: {}", e))?;
+    
+    if validate_only {
+        println!("{}", format!("✓ Manifest is valid: {}", agent_manifest.metadata.name).green());
+        println!("  API Version: {}", agent_manifest.api_version);
+        println!("  Kind: {}", agent_manifest.kind);
+        println!("  Name: {}", agent_manifest.metadata.name);
+        println!("  Version: {}", agent_manifest.metadata.version);
+        println!("  Runtime: {}:{}", agent_manifest.spec.runtime.language, agent_manifest.spec.runtime.version);
+        return Ok(());
+    }
 
-    println!("Deploying agent: {}", agent_manifest.agent.name.bold());
+    println!("Deploying agent: {}", agent_manifest.metadata.name.bold());
 
     let agent_id = client.deploy_agent(agent_manifest).await?;
 

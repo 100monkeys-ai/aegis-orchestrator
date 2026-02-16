@@ -29,6 +29,7 @@ tower-http.workspace = true
 hostname = "0.4"
 dirs = "5.0"
 reqwest = { version = "0.12", features = ["json"] }
+walkdir = "2.4"
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
@@ -37,6 +38,8 @@ prost-types = "0.13"
 # Cortex (Learning & Memory)
 aegis-cortex = { path = "../../cortex" }
 
+[dev-dependencies]
+tokio-test = "0.4"
 
 [build-dependencies]
 tonic-build = "0.13"

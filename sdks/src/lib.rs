@@ -6,9 +6,16 @@
 /// Build secure, autonomous agents with the AEGIS runtime.
 
 pub mod client;
-pub mod manifest;
 pub mod types;
 
+// Re-export core domain types for manifest (single source of truth)
+pub use aegis_core::domain::agent::{
+    AgentManifest, ManifestMetadata, AgentSpec, RuntimeConfig, TaskConfig,
+    SecurityConfig, NetworkPolicy, FilesystemPolicy, ResourceLimits,
+    ExecutionStrategy, ValidationConfig, ContextItem, AdvancedConfig,
+    SemanticValidation, SystemValidation, OutputValidation, ScriptValidation,
+    DeliveryConfig, DeliveryDestination, FallbackBehavior,
+};
+
 pub use client::AegisClient;
-pub use manifest::AgentManifest;
 pub use types::*;

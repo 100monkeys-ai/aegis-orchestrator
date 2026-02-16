@@ -38,7 +38,10 @@ impl DockerRuntime {
 #[async_trait]
 impl AgentRuntime for DockerRuntime {
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
-        let image = config.image.clone();
+        // Validate isolation mode first
+        config.validate_isolation()?;
+        
+        let image = config.to_image();
         
         // Check if image exists locally first
         let image_exists = self.docker.inspect_image(&image).await.is_ok();
@@ -73,9 +76,13 @@ impl AgentRuntime for DockerRuntime {
              return Err(RuntimeError::SpawnFailed(format!("Image {} not found locally and autopull is disabled", image)));
         }
         
+        // Validate isolation mode first
+        config.validate_isolation()?;
 
+        let image = config.to_image();
 
-        let host_config = bollard::service::HostConfig {
+        // Build host config with resource limits
+        let mut host_config = bollard::service::HostConfig {
             binds: Some(vec![
                 format!("{}:/usr/local/bin/aegis-bootstrap", 
                     std::env::current_dir().unwrap().join(&self.bootstrap_script).to_str().unwrap()),
@@ -83,6 +90,19 @@ impl AgentRuntime for DockerRuntime {
             extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
         };
+        
+        // Apply resource limits if specified
+        if let Some(memory_bytes) = config.resources.memory_bytes {
+            host_config.memory = Some(memory_bytes as i64);
+        }
+        if let Some(cpu_millis) = config.resources.cpu_millis {
+            // Docker nano_cpus: 1 CPU = 1e9 nano CPUs, 1 milli CPU = 1e6 nano CPUs
+            host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
+        }
+        if let Some(disk_bytes) = config.resources.disk_bytes {
+            // Storage limits via storage_opt (requires overlay2 driver)
+            host_config.storage_opt = Some([("size".to_string(), disk_bytes.to_string())].into());
+        }
 
         // Removed container_config that was causing move issues and unused var warning
 
@@ -96,12 +116,21 @@ impl AgentRuntime for DockerRuntime {
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
 
+        // Determine command - use entrypoint if specified, otherwise default tail
+        let cmd = if let Some(entrypoint) = &config.entrypoint {
+            // If custom entrypoint specified, use it as the command
+            vec![entrypoint.clone()]
+        } else {
+            // Default: keep container alive
+            vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]
+        };
+
         let res = self.docker.create_container(Some(options), Config {
             image: Some(image.clone()), // Clone image
             tty: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            cmd: Some(vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()]),
+            cmd: Some(cmd),
             env: Some(env_vars),
             host_config: Some(host_config),
             ..Default::default()

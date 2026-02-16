@@ -9,10 +9,49 @@ use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
-    pub image: String,
-    pub command: Option<Vec<String>>,
+    pub language: String,
+    pub version: String,
+    pub entrypoint: Option<String>,
+    pub isolation: String,
     pub env: HashMap<String, String>,
     pub autopull: bool,
+    pub resources: ResourceLimits,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    pub cpu_millis: Option<u32>,
+    pub memory_bytes: Option<u64>,
+    pub disk_bytes: Option<u64>,
+}
+
+impl RuntimeConfig {
+    /// Convert language + version to Docker image name
+    pub fn to_image(&self) -> String {
+        match self.language.as_str() {
+            "python" => format!("python:{}", self.version),
+            "javascript" | "typescript" => format!("node:{}", self.version),
+            "rust" => format!("rust:{}", self.version),
+            "go" => format!("golang:{}", self.version),
+            _ => format!("{}:{}", self.language, self.version),
+        }
+    }
+    
+    /// Validate isolation mode and return error for unsupported modes
+    pub fn validate_isolation(&self) -> Result<(), RuntimeError> {
+        match self.isolation.as_str() {
+            "docker" | "inherit" => Ok(()),
+            "firecracker" => Err(RuntimeError::SpawnFailed(
+                "Firecracker isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string()
+            )),
+            "process" => Err(RuntimeError::SpawnFailed(
+                "Process isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string()
+            )),
+            other => Err(RuntimeError::SpawnFailed(
+                format!("Unknown isolation mode '{}'. Supported: docker, inherit", other)
+            )),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

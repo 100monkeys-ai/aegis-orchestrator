@@ -162,7 +162,7 @@ impl ExecutionService for StandardExecutionService {
         let agent = self.agent_service.get_agent(agent_id).await?;
         
         // 2. Create Execution Record
-        let max_retries = if let Some(exec) = &agent.manifest.execution {
+        let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
              exec.max_retries as u8
         } else {
             3 // Default
@@ -182,10 +182,10 @@ impl ExecutionService for StandardExecutionService {
         });
 
         // 4. Spawn Runtime
-        let mut env = agent.manifest.env.clone();
+        let mut env = agent.manifest.spec.env.clone();
         
         // Inject instruction from default task if available
-        if let Some(task_spec) = &agent.manifest.task {
+        if let Some(task_spec) = &agent.manifest.spec.task {
              if let Some(instr) = &task_spec.instruction {
                  env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
              }
@@ -194,10 +194,9 @@ impl ExecutionService for StandardExecutionService {
                  env.insert("AEGIS_PROMPT_TEMPLATE".to_string(), prompt_tpl.clone());
              }
         }
-        // Fallback to description if not set above (or overwrite if desired, logic depends on precedence)
-        // If instruction is missing, we try description
+        // Fallback to description if not set above
         if !env.contains_key("AEGIS_AGENT_INSTRUCTION") {
-            if let Some(desc) = &agent.manifest.agent.description {
+            if let Some(desc) = &agent.manifest.metadata.description {
                 env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), desc.clone());
             }
         }
@@ -212,11 +211,29 @@ impl ExecutionService for StandardExecutionService {
         let url = format!("http://host.docker.internal:{}", port);
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
         
+        // Convert resource limits from domain format to runtime format
+        let resources = if let Some(security) = &agent.manifest.spec.security {
+            crate::domain::runtime::ResourceLimits {
+                cpu_millis: Some(security.resources.cpu),
+                memory_bytes: security.resources.memory_bytes(),
+                disk_bytes: security.resources.disk_bytes(),
+            }
+        } else {
+            crate::domain::runtime::ResourceLimits {
+                cpu_millis: None,
+                memory_bytes: None,
+                disk_bytes: None,
+            }
+        };
+        
         let runtime_config = crate::domain::runtime::RuntimeConfig {
-            image: agent.manifest.agent.runtime.clone(),
-            command: None, // Default
+            language: agent.manifest.spec.runtime.language.clone(),
+            version: agent.manifest.spec.runtime.version.clone(),
+            entrypoint: agent.manifest.spec.runtime.entrypoint.clone(),
+            isolation: agent.manifest.spec.runtime.isolation.clone(),
             env,
-            autopull: agent.manifest.agent.autopull,
+            autopull: agent.manifest.spec.runtime.autopull,
+            resources,
         };
 
         // NOTE: We no longer spawn the instance here.

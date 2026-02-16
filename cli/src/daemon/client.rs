@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use aegis_sdk::manifest::AgentManifest;
+use aegis_sdk::AgentManifest;
 
 
 

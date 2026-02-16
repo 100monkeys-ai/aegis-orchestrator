@@ -447,10 +447,10 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
 
 async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
-    Json(manifest): Json<aegis_sdk::manifest::AgentManifest>,
+    Json(manifest): Json<aegis_sdk::AgentManifest>,
 ) -> impl IntoResponse {
-    let core_manifest: aegis_core::domain::agent::AgentManifest = serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
-    match state.agent_service.deploy_agent(core_manifest).await {
+    // SDK now re-exports core types, so no conversion needed
+    match state.agent_service.deploy_agent(manifest).await {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
     }
@@ -1042,9 +1042,9 @@ async fn list_agents_handler(
              let json_agents: Vec<serde_json::Value> = agents.into_iter().map(|agent| {
                 serde_json::json!({
                     "id": agent.id.0,
-                    "name": agent.manifest.agent.name,
-                    "version": agent.manifest.agent.version.clone().unwrap_or_else(|| "0.0.1".to_string()),
-                    "description": agent.manifest.agent.description.clone().unwrap_or_default(),
+                    "name": agent.manifest.metadata.name,
+                    "version": agent.manifest.metadata.version,
+                    "description": agent.manifest.metadata.description.clone().unwrap_or_default(),
                     "status": format!("{:?}", agent.status)
                 })
             }).collect();
