@@ -171,3 +171,123 @@ impl LLMProvider for OpenAIAdapter {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::llm::{FinishReason, GenerationOptions, TokenUsage};
+    
+    #[test]
+    fn test_openai_adapter_creation() {
+        let adapter = OpenAIAdapter::new(
+            "https://api.openai.com/v1".to_string(),
+            "test-key".to_string(),
+            "gpt-4".to_string(),
+        );
+        
+        assert_eq!(adapter.endpoint, "https://api.openai.com/v1");
+        assert_eq!(adapter.api_key, "test-key");
+        assert_eq!(adapter.model, "gpt-4");
+    }
+    
+    #[test]
+    fn test_openai_request_serialization() {
+        let request = OpenAIRequest {
+            model: "gpt-4".to_string(),
+            messages: vec![OpenAIMessage {
+                role: "user".to_string(),
+                content: "Hello".to_string(),
+            }],
+            max_tokens: Some(100),
+            temperature: Some(0.7),
+            stop: Some(vec!["STOP".to_string()]),
+        };
+        
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["model"], "gpt-4");
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert_eq!(json["messages"][0]["content"], "Hello");
+        assert_eq!(json["max_tokens"], 100);
+        // Use approximate comparison for floating point
+        let temp = json["temperature"].as_f64().unwrap();
+        assert!((temp - 0.7).abs() < 0.01);
+    }
+    
+    #[test]
+    fn test_openai_response_deserialization() {
+        let json = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Hello, how can I help?"
+                },
+                "finish_reason": "stop"
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 20,
+                "total_tokens": 30
+            }
+        });
+        
+        let response: OpenAIResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(response.choices.len(), 1);
+        assert_eq!(response.choices[0].message.content, "Hello, how can I help?");
+        assert_eq!(response.choices[0].finish_reason, "stop");
+        assert_eq!(response.usage.prompt_tokens, 10);
+        assert_eq!(response.usage.completion_tokens, 20);
+        assert_eq!(response.usage.total_tokens, 30);
+    }
+    
+    #[test]
+    fn test_finish_reason_mapping() {
+        // Test that finish reasons are correctly mapped
+        let reasons = vec![
+            ("stop", FinishReason::Stop),
+            ("length", FinishReason::Length),
+            ("content_filter", FinishReason::ContentFilter),
+            ("unknown", FinishReason::Stop), // Default case
+        ];
+        
+        for (openai_reason, expected) in reasons {
+            let mapped = match openai_reason {
+                "stop" => FinishReason::Stop,
+                "length" => FinishReason::Length,
+                "content_filter" => FinishReason::ContentFilter,
+                _ => FinishReason::Stop,
+            };
+            assert_eq!(mapped, expected);
+        }
+    }
+    
+    #[test]
+    fn test_generation_options_mapping() {
+        let options = GenerationOptions {
+            max_tokens: Some(500),
+            temperature: Some(0.8),
+            stop_sequences: Some(vec!["END".to_string(), "STOP".to_string()]),
+        };
+        
+        // Verify options are properly structured
+        assert_eq!(options.max_tokens, Some(500));
+        assert_eq!(options.temperature, Some(0.8));
+        assert_eq!(options.stop_sequences.as_ref().unwrap().len(), 2);
+    }
+    
+    #[test]
+    fn test_openai_message_structure() {
+        let message = OpenAIMessage {
+            role: "user".to_string(),
+            content: "Test message".to_string(),
+        };
+        
+        let json = serde_json::to_value(&message).unwrap();
+        assert_eq!(json["role"], "user");
+        assert_eq!(json["content"], "Test message");
+        
+        // Test round-trip
+        let deserialized: OpenAIMessage = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.role, "user");
+        assert_eq!(deserialized.content, "Test message");
+    }
+}

@@ -178,7 +178,7 @@ pub enum ContextItem {
 pub struct ExecutionStrategy {
     #[serde(default)]
     pub mode: ExecutionMode,
-    #[serde(default = "default_max_retries")]
+    #[serde(default = "default_max_retries", alias = "max_iterations")]
     pub max_retries: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_per_iteration: Option<u64>,

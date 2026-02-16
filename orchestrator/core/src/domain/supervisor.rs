@@ -161,3 +161,230 @@ impl Supervisor {
         Err(RuntimeError::ExecutionFailed("Max retries exceeded".to_string()))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::runtime::{TaskOutput, InstanceStatus, ResourceLimits};
+    use tokio::sync::Mutex;
+    use std::collections::HashMap;
+    
+    // Mock runtime for testing
+    struct MockRuntime {
+        spawn_results: Arc<Mutex<Vec<Result<InstanceId, RuntimeError>>>>,
+        execute_results: Arc<Mutex<Vec<Result<TaskOutput, RuntimeError>>>>,
+        terminate_calls: Arc<Mutex<Vec<InstanceId>>>,
+    }
+    
+    impl MockRuntime {
+        fn new() -> Self {
+            Self {
+                spawn_results: Arc::new(Mutex::new(Vec::new())),
+                execute_results: Arc::new(Mutex::new(Vec::new())),
+                terminate_calls: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+        
+        fn with_spawn_success(self, count: usize) -> Self {
+            let mut results = Vec::new();
+            for i in 0..count {
+                results.push(Ok(InstanceId::new(format!("instance-{}", i))));
+            }
+            Self {
+                spawn_results: Arc::new(Mutex::new(results)),
+                ..self
+            }
+        }
+        
+        fn with_execute_success(self, outputs: Vec<String>) -> Self {
+            let results = outputs.into_iter().map(|output| {
+                Ok(TaskOutput {
+                    result: serde_json::Value::String(output),
+                    logs: vec![],
+                    tool_calls: vec![],
+                    exit_code: 0,
+                })
+            }).collect();
+            Self {
+                execute_results: Arc::new(Mutex::new(results)),
+                ..self
+            }
+        }
+    }
+    
+    #[async_trait]
+    impl AgentRuntime for MockRuntime {
+        async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            let mut results = self.spawn_results.lock().await;
+            results.remove(0)
+        }
+        
+        async fn execute(&self, _id: &InstanceId, _input: TaskInput) -> Result<TaskOutput, RuntimeError> {
+            let mut results = self.execute_results.lock().await;
+            results.remove(0)
+        }
+        
+        async fn terminate(&self, id: &InstanceId) -> Result<(), RuntimeError> {
+            let mut calls = self.terminate_calls.lock().await;
+            calls.push(id.clone());
+            Ok(())
+        }
+        
+        async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+            Ok(InstanceStatus {
+                id: id.clone(),
+                state: "running".to_string(),
+                uptime_seconds: 0,
+                memory_usage_mb: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
+    }
+    
+    // Mock observer for testing
+    #[derive(Default)]
+    struct MockObserver {
+        iteration_starts: Arc<Mutex<Vec<u8>>>,
+        iteration_completes: Arc<Mutex<Vec<u8>>>,
+        iteration_fails: Arc<Mutex<Vec<u8>>>,
+    }
+    
+    #[async_trait]
+    impl SupervisorObserver for MockObserver {
+        async fn on_iteration_start(&self, iteration: u8, _prompt: &str) {
+            self.iteration_starts.lock().await.push(iteration);
+        }
+        
+        async fn on_console_output(&self, _iteration: u8, _stream: &str, _content: &str) {}
+        
+        async fn on_iteration_complete(&self, iteration: u8, _result: &str, _exit_code: i64) {
+            self.iteration_completes.lock().await.push(iteration);
+        }
+        
+        async fn on_iteration_fail(&self, iteration: u8, _error: &str) {
+            self.iteration_fails.lock().await.push(iteration);
+        }
+        
+        async fn on_instance_spawned(&self, _iteration: u8, _instance_id: &InstanceId) {}
+        
+        async fn on_instance_terminated(&self, _iteration: u8, _instance_id: &InstanceId) {}
+    }
+    
+    fn create_test_config() -> RuntimeConfig {
+        RuntimeConfig {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            entrypoint: None,
+            isolation: "process".to_string(),
+            env: HashMap::new(),
+            autopull: false,
+            resources: ResourceLimits {
+                cpu_millis: None,
+                memory_bytes: None,
+                disk_bytes: None,
+            },
+        }
+    }
+    
+    fn create_test_input() -> ExecutionInput {
+        ExecutionInput {
+            intent: Some("Test task".to_string()),
+            payload: serde_json::json!({}),
+        }
+    }
+    
+    #[tokio::test]
+    async fn test_supervisor_success_first_iteration() {
+        let runtime = Arc::new(
+            MockRuntime::new()
+                .with_spawn_success(1)
+                .with_execute_success(vec!["Success output".to_string()])
+        );
+        
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(MockObserver::default());
+        
+        let result = supervisor.run_loop(create_test_config(), create_test_input(), 3, observer.clone()).await;
+        
+        assert!(result.is_ok());
+        // The result is serialized as JSON string, so it includes quotes
+        assert_eq!(result.unwrap(), "\"Success output\"");
+        
+        // Verify observer was called correctly
+        assert_eq!(observer.iteration_starts.lock().await.len(), 1);
+        assert_eq!(observer.iteration_completes.lock().await.len(), 1);
+        assert_eq!(observer.iteration_fails.lock().await.len(), 0);
+    }
+    
+    #[tokio::test]
+    async fn test_supervisor_retries_on_spawn_failure() {
+        let runtime = Arc::new(
+            MockRuntime::new()
+        );
+        
+        // Setup: first spawn fails, second succeeds
+        runtime.spawn_results.lock().await.push(Err(RuntimeError::SpawnFailed("Network error".to_string())));
+        runtime.spawn_results.lock().await.push(Ok(InstanceId::new("instance-1".to_string())));
+        runtime.execute_results.lock().await.push(Ok(TaskOutput {
+            result: serde_json::Value::String("Success".to_string()),
+            logs: vec![],
+            tool_calls: vec![],
+            exit_code: 0,
+        }));
+        
+        let supervisor = Supervisor::new(runtime);
+        let observer = Arc::new(MockObserver::default());
+        
+        let result = supervisor.run_loop(create_test_config(), create_test_input(), 3, observer.clone()).await;
+        
+        assert!(result.is_ok());
+        // Verify we had one failure and one success
+        assert_eq!(observer.iteration_starts.lock().await.len(), 2);
+        assert_eq!(observer.iteration_fails.lock().await.len(), 1);
+        assert_eq!(observer.iteration_completes.lock().await.len(), 1);
+    }
+    
+    #[tokio::test]
+    async fn test_supervisor_max_retries_exceeded() {
+        let runtime = Arc::new(MockRuntime::new());
+        
+        // All spawn attempts fail
+        for _ in 0..3 {
+            runtime.spawn_results.lock().await.push(
+                Err(RuntimeError::SpawnFailed("Resource exhausted".to_string()))
+            );
+        }
+        
+        let supervisor = Supervisor::new(runtime);
+        let observer = Arc::new(MockObserver::default());
+        
+        let result = supervisor.run_loop(create_test_config(), create_test_input(), 3, observer.clone()).await;
+        
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), RuntimeError::ExecutionFailed(_)));
+        
+        // Verify all attempts were made
+        assert_eq!(observer.iteration_starts.lock().await.len(), 3);
+        assert_eq!(observer.iteration_fails.lock().await.len(), 3);
+        assert_eq!(observer.iteration_completes.lock().await.len(), 0);
+    }
+    
+    #[tokio::test]
+    async fn test_supervisor_terminates_instances() {
+        let runtime = Arc::new(
+            MockRuntime::new()
+                .with_spawn_success(2)
+                .with_execute_success(vec!["Output1".to_string(), "Output2".to_string()])
+        );
+        
+        let supervisor = Supervisor::new(runtime.clone());
+        let observer = Arc::new(MockObserver::default());
+        
+        let _result = supervisor.run_loop(create_test_config(), create_test_input(), 3, observer).await;
+        
+        // Verify instance was terminated
+        let terminate_calls = runtime.terminate_calls.lock().await;
+        assert_eq!(terminate_calls.len(), 1);
+        assert_eq!(terminate_calls[0].as_str(), "instance-0");
+    }
+}

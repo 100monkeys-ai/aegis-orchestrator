@@ -21,7 +21,7 @@ use tracing::warn;
 pub mod client;
 #[cfg(unix)]
 pub mod install;
-mod server;
+pub mod server;
 
 pub use client::DaemonClient;
 pub use server::start_daemon;
