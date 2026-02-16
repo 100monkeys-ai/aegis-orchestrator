@@ -58,7 +58,7 @@ use std::path::Path;
 use std::sync::Arc;
 use anyhow::{Context, Result};
 use chrono::Utc;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use futures::StreamExt;
 use crate::infrastructure::temporal_client::TemporalClient;
 
@@ -102,6 +102,9 @@ pub struct WorkflowEngine {
     /// Embedding client for generating semantic embeddings (Optional)
     embedding_client: Option<Arc<EmbeddingClient>>,
     
+    /// Human input service for approval gates
+    human_input_service: Arc<crate::infrastructure::HumanInputService>,
+    
     /// Template renderer (Handlebars)
     template_engine: Arc<handlebars::Handlebars<'static>>,
     
@@ -120,6 +123,7 @@ impl WorkflowEngine {
         execution_service: Arc<dyn ExecutionService>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         cortex_service: Option<Arc<dyn CortexService>>,
+        human_input_service: Arc<crate::infrastructure::HumanInputService>,
     ) -> Self {
         // Create embedding client if Cortex is enabled
         let embedding_client = cortex_service.as_ref().map(|_| Arc::new(EmbeddingClient::new()));
@@ -134,6 +138,7 @@ impl WorkflowEngine {
             execution_service,
             cortex_service,
             embedding_client,
+            human_input_service,
             template_engine: Arc::new(handlebars::Handlebars::new()),
             temporal_client,
         }
@@ -400,9 +405,20 @@ impl WorkflowEngine {
                 let agent_id = crate::domain::agent::AgentId::from_string(agent)
                     .map_err(|_| anyhow::anyhow!("Invalid agent ID: {}", agent))?;
 
-                // Prepare execution input
+                // NEW: Inject relevant Cortex patterns before execution
+                let input_with_patterns = if let Some(cortex) = &self.cortex_service {
+                    self.inject_cortex_patterns(cortex, &rendered_input, &workflow_execution.blackboard).await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!("Failed to inject patterns: {}", e);
+                            rendered_input.clone()
+                        })
+                } else {
+                    rendered_input.clone()
+                };
+
+                // Prepare execution input with injected patterns
                 let execution_input = crate::domain::execution::ExecutionInput {
-                    intent: Some(rendered_input.clone()),
+                    intent: Some(input_with_patterns),
                     payload: serde_json::json!({
                         "workflow_id": workflow.id,
                         "state": state.kind,
@@ -463,65 +479,232 @@ impl WorkflowEngine {
                 }))
             }
 
-            StateKind::Human { prompt: _, .. } => {
-                debug!("Executing human state");
+            StateKind::Human { prompt, .. } => {
+                debug!("Executing human approval state");
                 
-                // TODO: Wait for human input
-                // For now, return placeholder
-                Ok(serde_json::json!({
-                    "response": "yes",
-                    "feedback": ""
-                }))
+                // Render the prompt template
+                let rendered_prompt = self.render_template(prompt, workflow_execution)?;
+                
+                // Use default timeout of 1 hour (could be made configurable via workflow context)
+                let timeout_seconds = workflow_execution.blackboard
+                    .get("human_approval_timeout_seconds")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(3600);
+                
+                info!(
+                    execution_id = %execution_id,
+                    timeout_seconds = timeout_seconds,
+                    "Requesting human input"
+                );
+                
+                // Request human input and wait
+                let result = self.human_input_service
+                    .request_input(execution_id, rendered_prompt.clone(), timeout_seconds)
+                    .await?;
+                
+                // Convert result to JSON response
+                match result {
+                    crate::infrastructure::HumanInputStatus::Approved { feedback, approved_at, approved_by } => {
+                        info!("Human approval received");
+                        Ok(serde_json::json!({
+                            "decision": "approved",
+                            "feedback": feedback,
+                            "approved_at": approved_at.to_rfc3339(),
+                            "approved_by": approved_by,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::Rejected { reason, rejected_at, rejected_by } => {
+                        info!("Human rejection received");
+                        Ok(serde_json::json!({
+                            "decision": "rejected",
+                            "reason": reason,
+                            "rejected_at": rejected_at.to_rfc3339(),
+                            "rejected_by": rejected_by,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::TimedOut { timeout_at } => {
+                        warn!("Human input request timed out");
+                        Ok(serde_json::json!({
+                            "decision": "timeout",
+                            "timeout_at": timeout_at.to_rfc3339(),
+                            "timeout_seconds": timeout_seconds,
+                        }))
+                    }
+                    crate::infrastructure::HumanInputStatus::Pending => {
+                        // Shouldn't happen - request_input waits for completion
+                        Err(anyhow::anyhow!("Human input still pending (unexpected)"))
+                    }
+                }
             }
 
-            StateKind::ParallelAgents { agents, .. } => {
+            StateKind::ParallelAgents { agents, consensus, .. } => {
                 debug!(count = agents.len(), "Executing parallel agents state");
                 
-                // Collect agents to run
-                let mut agent_ids = Vec::new();
-                // TODO: Map string names to AgentIds. For now assuming they are UUID strings.
-                // In a real implementation, we would look up AgentId by name.
+                if agents.is_empty() {
+                    return Ok(serde_json::json!({
+                        "error": "No agents configured for parallel execution"
+                    }));
+                }
+
+                // Execute all agents in parallel using tokio::spawn
+                let mut handles = Vec::new();
+                let mut agent_configs = Vec::new();
+
                 for config in agents {
-                    if let Ok(id) = crate::domain::agent::AgentId::from_string(&config.agent) {
-                        agent_ids.push(id);
-                    } else {
-                         // warning: invalid agent id
+                    // Render the input template for each agent
+                    let rendered_input = self.render_template(&config.input, workflow_execution)?;
+                    
+                    // Parse agent ID - try as UUID first, then as agent name
+                    let agent_id = crate::domain::agent::AgentId::from_string(&config.agent)
+                        .unwrap_or_else(|_| {
+                            // If not a UUID, treat as agent name and generate a consistent ID
+                            // In production, this would look up the agent by name
+                            tracing::warn!("Agent '{}' not found as UUID, using placeholder", config.agent);
+                            crate::domain::agent::AgentId::new()
+                        });
+
+                    agent_configs.push((agent_id, rendered_input, config.weight));
+                }
+
+                // Use a semaphore to limit concurrent executions
+                let semaphore = Arc::new(tokio::sync::Semaphore::new(10)); // Max 10 concurrent
+                let execution_service = self.execution_service.clone();
+
+                for (agent_id, input, weight) in agent_configs {
+                    let permit = semaphore.clone().acquire_owned().await
+                        .map_err(|e| anyhow::anyhow!("Failed to acquire semaphore: {}", e))?;
+                    let exec_service = execution_service.clone();
+                    let workflow_id = workflow.id;
+                    let blackboard_data = workflow_execution.blackboard.data().clone();
+
+                    let handle = tokio::spawn(async move {
+                        let _permit = permit; // Hold permit for duration of execution
+                        
+                        // Prepare execution input
+                        let execution_input = crate::domain::execution::ExecutionInput {
+                            intent: Some(input.clone()),
+                            payload: serde_json::json!({
+                                "workflow_id": workflow_id,
+                                "parallel_execution": true,
+                                "context": blackboard_data
+                            }),
+                        };
+
+                        // Start execution
+                        let exec_id = match exec_service.start_execution(agent_id, execution_input).await {
+                            Ok(id) => id,
+                            Err(e) => {
+                                tracing::error!("Failed to start agent execution: {}", e);
+                                return (agent_id, weight, Err(e));
+                            }
+                        };
+
+                        // Wait for completion by streaming events
+                        match exec_service.stream_execution(exec_id).await {
+                            Ok(mut stream) => {
+                                use futures::StreamExt;
+                                while let Some(event_result) = stream.next().await {
+                                    match event_result {
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. }) => {
+                                            return (agent_id, weight, Ok(final_output));
+                                        }
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionFailed { reason, .. }) => {
+                                            return (agent_id, weight, Err(anyhow::anyhow!("Execution failed: {}", reason)));
+                                        }
+                                        Ok(crate::domain::events::ExecutionEvent::ExecutionCancelled { reason, .. }) => {
+                                            return (agent_id, weight, Err(anyhow::anyhow!("Execution cancelled: {:?}", reason)));
+                                        }
+                                        Err(e) => {
+                                            return (agent_id, weight, Err(e));
+                                        }
+                                        _ => {} // Continue on intermediate events
+                                    }
+                                }
+                                (agent_id, weight, Err(anyhow::anyhow!("Stream ended without completion")))
+                            }
+                            Err(e) => (agent_id, weight, Err(e))
+                        }
+                    });
+
+                    handles.push(handle);
+                }
+
+                // Wait for all agents to complete
+                let mut results = Vec::new();
+                for handle in handles {
+                    match handle.await {
+                        Ok((agent_id, weight, result)) => {
+                            results.push((agent_id, weight, result));
+                        }
+                        Err(e) => {
+                            tracing::error!("Parallel agent task panicked: {}", e);
+                            return Err(anyhow::anyhow!("Parallel execution task failed: {}", e));
+                        }
                     }
                 }
 
-                // Construct validation request (assuming this is a validation step)
-                // We use the input from the first agent config as the content? 
-                // Or maybe the blackboard has the content?
-                // For ParallelAgents, usually they all get the same input or variations.
-                // The `input` field in ParallelAgentConfig is a template.
-                
-                // Let's assume the first agent's input template renders to the content we want validated.
-                // Or if there are no agents, we return empty.
-                if agent_ids.is_empty() {
-                     return Ok(serde_json::json!({
-                        "error": "No valid agents found for parallel execution"
-                     }));
+                // Process results and calculate consensus
+                let mut agent_outputs = Vec::new();
+                let mut agent_scores = Vec::new();
+                let mut total_weight = 0.0;
+                let mut weighted_score_sum = 0.0;
+
+                for (agent_id, weight, result) in results {
+                    match result {
+                        Ok(output) => {
+                            // Try to parse as JSON with score field
+                            let score = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
+                                json.get("score").and_then(|s| s.as_f64()).unwrap_or(0.8)
+                            } else {
+                                0.8 // Default score if not JSON
+                            };
+
+                            agent_outputs.push(serde_json::json!({
+                                "agent_id": agent_id.0.to_string(),
+                                "output": output,
+                                "score": score,
+                                "weight": weight
+                            }));
+
+                            agent_scores.push(score);
+                            total_weight += weight;
+                            weighted_score_sum += score * weight;
+                        }
+                        Err(e) => {
+                            tracing::warn!("Agent {:?} failed: {}", agent_id.0, e);
+                            agent_outputs.push(serde_json::json!({
+                                "agent_id": agent_id.0.to_string(),
+                                "error": e.to_string(),
+                                "score": 0.0,
+                                "weight": weight
+                            }));
+                        }
+                    }
                 }
 
-                // Render the input for the first agent (as a proxy for the request content)
-                // This is a simplification. Ideally, ValidationRequest should be explicit.
-                let content = if let Some(first_config) = agents.first() {
-                    self.render_template(&first_config.input, workflow_execution)?
+                // Calculate consensus score
+                let consensus_score = if total_weight > 0.0 {
+                    weighted_score_sum / total_weight
                 } else {
-                    "No content".to_string()
+                    0.0
                 };
 
-                let request = crate::domain::validation::ValidationRequest {
-                    content,
-                    criteria: "Evaluate based on system instructions".to_string(), // TODO: Make configurable
-                    context: Some(serde_json::to_value(workflow_execution.blackboard.data())?),
-                };
+                // Determine consensus threshold
+                let threshold = consensus.threshold.unwrap_or(0.7);
 
-                // Execute validation
-                match self.validation_service.validate_with_judges(execution_id, request, agent_ids).await {
-                    Ok(consensus) => Ok(serde_json::to_value(consensus)?),
-                    Err(e) => Err(anyhow::anyhow!("Validation failed: {}", e)),
-                }
+                let consensus_reached = consensus_score >= threshold;
+
+                Ok(serde_json::json!({
+                    "agents": agent_outputs,
+                    "consensus": {
+                        "score": consensus_score,
+                        "threshold": threshold,
+                        "reached": consensus_reached,
+                        "strategy": "weighted_average",
+                        "individual_scores": agent_scores,
+                    },
+                    "total_weight": total_weight,
+                }))
             }
         }
     }
@@ -769,10 +952,69 @@ impl Default for WorkflowInput {
 }
 
     // ========================================================================
-    // Cortex Pattern Capture
+    // Cortex Pattern Injection and Capture
     // ========================================================================
 
 impl WorkflowEngine {
+
+    /// Inject relevant learned patterns into agent input
+    async fn inject_cortex_patterns(
+        &self,
+        cortex: &Arc<dyn CortexService>,
+        input: &str,
+        _blackboard: &Blackboard,
+    ) -> Result<String> {
+        // Generate embedding for the input to search for similar patterns
+        let query_embedding = if let Some(client) = &self.embedding_client {
+            client.generate_embedding(input).await?
+        } else {
+            // If no embedding client, skip injection
+            return Ok(input.to_string());
+        };
+
+        // Search for top 3 relevant patterns
+        let patterns = cortex
+            .search_patterns(query_embedding, 3)
+            .await?;
+
+        if patterns.is_empty() {
+            // No relevant patterns found
+            return Ok(input.to_string());
+        }
+
+        // Build augmented input with pattern context
+        let mut augmented_input = String::new();
+        augmented_input.push_str("# Relevant Learned Patterns\n\n");
+        augmented_input.push_str("The following patterns from previous successful executions may be relevant:\n\n");
+
+        for (idx, pattern) in patterns.iter().enumerate() {
+            augmented_input.push_str(&format!(
+                "## Pattern {}\n",
+                idx + 1
+            ));
+            augmented_input.push_str(&format!("**Category:** {}\n", pattern.task_category));
+            augmented_input.push_str(&format!("**Success Score:** {:.2}\n", pattern.success_score));
+            augmented_input.push_str(&format!("**Used {} times**\n\n", pattern.execution_count));
+            augmented_input.push_str("**Solution Approach:**\n");
+            augmented_input.push_str("```\n");
+            augmented_input.push_str(&pattern.solution_code);
+            augmented_input.push_str("\n```\n\n");
+        }
+
+        augmented_input.push_str("---\n\n");
+        augmented_input.push_str("# Current Task\n\n");
+        augmented_input.push_str(input);
+        augmented_input.push_str("\n\n");
+        augmented_input.push_str("Note: Consider the patterns above when solving this task, but adapt them to the current context.\n");
+
+        debug!(
+            pattern_count = patterns.len(),
+            "Injected {} patterns into agent input",
+            patterns.len()
+        );
+
+        Ok(augmented_input)
+    }
 
     async fn capture_execution_pattern(
         &self,

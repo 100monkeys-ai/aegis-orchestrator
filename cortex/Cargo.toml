@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 tokio = { workspace = true }
+tokio-util = "0.7"
 serde.workspace = true
 serde_json.workspace = true
 uuid = { workspace = true }
@@ -17,11 +18,10 @@ anyhow.workspace = true
 async-trait = "0.1"
 regex = "1.10"
 once_cell = "1.19"
+tracing = { workspace = true }
 
 # Vector store and graph database
-# TODO: LanceDB temporarily disabled due to arrow-arith version conflicts
-# Resolution options: 1) Wait for arrow-arith fix, 2) Use vectordb crate instead, 3) Direct HTTP API
-# lancedb = "0.3"
+qdrant-client = "1.7"
 neo4rs = "0.7"
 
 # gRPC for embedding service

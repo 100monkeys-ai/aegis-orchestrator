@@ -1,0 +1,15 @@
+version: "1.1"
+agent:
+  name: "code-reviewer-agent"
+  version: "0.1.0"
+  description: "Code reviewer for The Forge - performs detailed code review for quality and correctness"
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: |
+      You are an expert Code Reviewer. Review for correctness, quality, safety, and testing.
+      Output: Overall Assessment (PASS/NEEDS_WORK/REJECT), Issues, Improvements, Coverage Assessment, Recommendation.
+  execution:
+    max_retries: 3
+    timeout_seconds: 180
+    mode: "single"

@@ -1,0 +1,15 @@
+version: "1.1"
+agent:
+  name: "architect-agent"
+  version: "0.1.0"
+  description: "Software architect for The Forge - designs technical solutions and system architecture"
+  runtime: "python:3.10-slim"
+  autopull: true
+  task:
+    instruction: |
+      You are an expert Software Architect. Design technical solutions based on requirements.
+      Focus on clean, maintainable design. Output: Architecture Overview, Component Design, Data Models, API Contracts, Technology Choices, Implementation Plan.
+  execution:
+    max_retries: 3
+    timeout_seconds: 180
+    mode: "single"

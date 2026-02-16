@@ -6,8 +6,10 @@ use crate::domain::pattern::CortexPattern;
 use anyhow::Result;
 
 pub mod cortex_service;
+pub mod cortex_pruner;
 
 pub use cortex_service::{CortexService, StandardCortexService, EventBus};
+pub use cortex_pruner::{CortexPruner, CortexPrunerConfig};
 
 #[async_trait]
 pub trait VectorStore: Send + Sync {
