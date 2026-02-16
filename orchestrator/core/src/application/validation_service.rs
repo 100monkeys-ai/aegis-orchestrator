@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use std::sync::Arc;
 use std::time::Duration;
 use anyhow::{Result, anyhow, Context};

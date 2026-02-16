@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;

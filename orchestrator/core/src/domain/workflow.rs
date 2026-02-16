@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Workflow Domain Model
 //!
 //! This module defines the core domain entities and value objects for the Workflow Engine.

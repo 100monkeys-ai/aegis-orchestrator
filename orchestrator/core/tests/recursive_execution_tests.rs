@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 //! Integration tests for recursive agent execution (Agent-as-Judge pattern)
 //!
 //! Tests the ability of agents to call other agents recursively,

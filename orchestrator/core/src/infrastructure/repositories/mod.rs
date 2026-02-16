@@ -1,3 +1,6 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+
 pub mod postgres_agent;
 pub mod postgres_execution;
 pub mod postgres_workflow;
