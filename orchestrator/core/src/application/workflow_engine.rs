@@ -50,7 +50,6 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::repository::{WorkflowRepository, WorkflowExecutionRepository};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use crate::infrastructure::event_bus::EventBus;
-use crate::application::validation_service::ValidationService;
 use crate::application::execution::ExecutionService;
 
 use std::collections::HashMap;
@@ -90,9 +89,6 @@ pub struct WorkflowEngine {
     /// Event bus for publishing domain events
     event_bus: Arc<EventBus>,
 
-    /// Validation service for multi-judge consensus
-    validation_service: Arc<ValidationService>,
-
     /// Execution service for running agents
     execution_service: Arc<dyn ExecutionService>,
     
@@ -119,7 +115,6 @@ impl WorkflowEngine {
         repository: Arc<dyn WorkflowRepository>,
         workflow_execution_repository: Arc<dyn WorkflowExecutionRepository>,
         event_bus: Arc<EventBus>,
-        validation_service: Arc<ValidationService>,
         execution_service: Arc<dyn ExecutionService>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         cortex_service: Option<Arc<dyn CortexService>>,
@@ -134,7 +129,6 @@ impl WorkflowEngine {
             executions: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             execution_contexts: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
             event_bus,
-            validation_service,
             execution_service,
             cortex_service,
             embedding_client,
@@ -794,12 +788,19 @@ impl WorkflowEngine {
             }
 
             TransitionCondition::Consensus { threshold, agreement } => {
-                let score = state_output.get("final_score")
+                // Check both final_score and consensus.score for backward compatibility
+                let score = state_output.get("consensus")
+                    .and_then(|c| c.get("score"))
                     .and_then(|v| v.as_f64())
+                    .or_else(|| state_output.get("final_score").and_then(|v| v.as_f64()))
                     .unwrap_or(0.0);
-                let conf = state_output.get("confidence")
+                    
+                let conf = state_output.get("consensus")
+                    .and_then(|c| c.get("confidence"))
                     .and_then(|v| v.as_f64())
+                    .or_else(|| state_output.get("confidence").and_then(|v| v.as_f64()))
                     .unwrap_or(0.0);
+                    
                 score > *threshold && conf > *agreement
             }
 
@@ -1106,13 +1107,12 @@ mod tests {
     async fn test_workflow_engine_creation() {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
-        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
         let human_input_service = Arc::new(crate::infrastructure::HumanInputService::new());
         
         // Note: Cortex service is None here
-        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
         
         let workflows = engine.list_workflows().await;
         assert_eq!(workflows.len(), 0);
@@ -1122,12 +1122,11 @@ mod tests {
     async fn test_load_simple_workflow() {
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let exec_service = Arc::new(MockExecutionService);
-        let val_service = Arc::new(ValidationService::new(event_bus.clone(), exec_service.clone(), None));
         let repository = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowRepository::new());
         let workflow_execution_repo = Arc::new(crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository::new());
         let human_input_service = Arc::new(crate::infrastructure::HumanInputService::new());
         
-        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, val_service, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
+        let engine = WorkflowEngine::new(repository, workflow_execution_repo, event_bus, exec_service, Arc::new(tokio::sync::RwLock::new(None)), None, human_input_service);
 
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1

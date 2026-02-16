@@ -346,10 +346,26 @@ pub struct ParallelAgentConfig {
     /// Weight for consensus (default: 1.0)
     #[serde(default = "default_weight")]
     pub weight: f64,
+
+    /// Timeout in seconds for this agent execution (default: 60)
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: u64,
+
+    /// Poll interval in milliseconds (default: 500)
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: u64,
 }
 
 fn default_weight() -> f64 {
     1.0
+}
+
+fn default_timeout() -> u64 {
+    60
+}
+
+fn default_poll_interval() -> u64 {
+    500
 }
 
 /// Consensus strategy for parallel agents
@@ -363,12 +379,74 @@ pub struct ConsensusConfig {
     pub threshold: Option<f64>,
 
     /// Minimum agreement confidence (0.0-1.0)
-    #[serde(default)]
-    pub agreement: Option<f64>,
+    /// Renamed from 'agreement' for clarity
+    #[serde(default, alias = "agreement")]
+    pub min_agreement_confidence: Option<f64>,
 
     /// For BestOfN strategy
     #[serde(default)]
     pub n: Option<usize>,
+
+    /// Minimum number of judges that must succeed (default: 1)
+    #[serde(default = "default_min_judges")]
+    pub min_judges_required: usize,
+
+    /// Confidence weighting factors for consensus calculation
+    #[serde(default)]
+    pub confidence_weighting: Option<ConfidenceWeighting>,
+}
+
+fn default_min_judges() -> usize {
+    1
+}
+
+/// Weights for combining agreement and self-confidence in consensus
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfidenceWeighting {
+    /// Weight for agreement among judges (default: 0.7)
+    #[serde(default = "default_agreement_factor")]
+    pub agreement_factor: f64,
+
+    /// Weight for judges' self-confidence (default: 0.3)
+    #[serde(default = "default_self_confidence_factor")]
+    pub self_confidence_factor: f64,
+}
+
+impl Default for ConfidenceWeighting {
+    fn default() -> Self {
+        Self {
+            agreement_factor: 0.7,
+            self_confidence_factor: 0.3,
+        }
+    }
+}
+
+impl ConfidenceWeighting {
+    /// Validate that weights sum to approximately 1.0
+    pub fn validate(&self) -> Result<(), String> {
+        let sum = self.agreement_factor + self.self_confidence_factor;
+        if (sum - 1.0).abs() > 0.01 {
+            return Err(format!(
+                "Confidence weights must sum to 1.0, got {:.2} (agreement) + {:.2} (self-confidence) = {:.2}",
+                self.agreement_factor, self.self_confidence_factor, sum
+            ));
+        }
+        if self.agreement_factor < 0.0 || self.agreement_factor > 1.0 {
+            return Err(format!("Agreement factor must be between 0.0 and 1.0, got {}", self.agreement_factor));
+        }
+        if self.self_confidence_factor < 0.0 || self.self_confidence_factor > 1.0 {
+            return Err(format!("Self-confidence factor must be between 0.0 and 1.0, got {}", self.self_confidence_factor));
+        }
+        Ok(())
+    }
+}
+
+fn default_agreement_factor() -> f64 {
+    0.7
+}
+
+fn default_self_confidence_factor() -> f64 {
+    0.3
 }
 
 /// Consensus strategy for aggregating parallel agent results

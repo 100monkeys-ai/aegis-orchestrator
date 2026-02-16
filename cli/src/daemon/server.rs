@@ -274,7 +274,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_repo,
         workflow_execution_repo, 
         event_bus.clone(), 
-        validation_service.clone(), 
         execution_service.clone(),
         temporal_client_container,
         Some(cortex_service),

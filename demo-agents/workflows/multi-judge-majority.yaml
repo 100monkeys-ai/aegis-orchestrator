@@ -1,0 +1,104 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "multi-judge-majority"
+  version: "1.0.0"
+  description: "Multi-judge consensus using majority vote strategy"
+
+spec:
+  context:
+    design_proposal: |
+      # Feature: Dark Mode
+      
+      Add a dark mode toggle to the UI with system preference detection.
+      - Use CSS variables for easy theming
+      - Persist user preference in localStorage
+      - Smooth transition animations
+
+  initial_state: APPROVAL_VOTE
+
+  states:
+    APPROVAL_VOTE:
+      kind: ParallelAgents
+      agents:
+        # Product Manager: Evaluates product fit
+        - agent: "basic-judge"
+          input: |
+            As a product manager, evaluate this design proposal:
+            {{workflow.context.design_proposal}}
+            
+            Score 0.8+ if it meets product requirements.
+          weight: 1.0
+          timeout_seconds: 60
+        
+        # Tech Lead: Evaluates technical feasibility
+        - agent: "basic-judge"
+          input: |
+            As a tech lead, evaluate this design proposal:
+            {{workflow.context.design_proposal}}
+            
+            Score 0.8+ if it's technically sound.
+          weight: 1.0
+          timeout_seconds: 60
+        
+        # UX Designer: Evaluates user experience
+        - agent: "basic-judge"
+          input: |
+            As a UX designer, evaluate this design proposal:
+            {{workflow.context.design_proposal}}
+            
+            Score 0.8+ if it provides good UX.
+          weight: 1.0
+          timeout_seconds: 60
+
+      consensus:
+        strategy: majority  # Binary vote: pass (>= threshold) or fail (< threshold)
+        threshold: 0.8  # Score >= 0.8 counts as "approve"
+        min_judges_required: 3  # All 3 must vote (no abstentions)
+
+      transitions:
+        # Majority approved (final_score = 1.0 means majority passed)
+        - condition: score_above
+          threshold: 0.5
+          target: APPROVED
+
+        # Majority rejected (final_score = 0.0 means majority failed)
+        - condition: score_below
+          threshold: 0.5
+          target: REJECTED
+        
+        # Tie (final_score = 0.5 means equal pass/fail votes)
+        - condition: score_between
+          min: 0.4
+          max: 0.6
+          target: TIE_BREAKER
+
+    APPROVED:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "✅ Design approved by majority vote"
+        PASS_VOTES: "{{APPROVAL_VOTE.consensus.metadata.pass_votes}}"
+        FAIL_VOTES: "{{APPROVAL_VOTE.consensus.metadata.fail_votes}}"
+        FINAL_SCORE: "{{APPROVAL_VOTE.consensus.score}}"
+      transitions: []
+
+    REJECTED:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "❌ Design rejected by majority vote"
+        PASS_VOTES: "{{APPROVAL_VOTE.consensus.metadata.pass_votes}}"
+        FAIL_VOTES: "{{APPROVAL_VOTE.consensus.metadata.fail_votes}}"
+        FINAL_SCORE: "{{APPROVAL_VOTE.consensus.score}}"
+      transitions: []
+
+    TIE_BREAKER:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "⚖️ Tie vote - escalating to leadership"
+        PASS_VOTES: "{{APPROVAL_VOTE.consensus.metadata.pass_votes}}"
+        FAIL_VOTES: "{{APPROVAL_VOTE.consensus.metadata.fail_votes}}"
+      transitions: []

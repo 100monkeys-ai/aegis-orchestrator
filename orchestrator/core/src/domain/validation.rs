@@ -4,6 +4,8 @@
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use crate::domain::agent::AgentId;
+use std::collections::HashMap;
+use serde_json::Value;
 
 /// Score between 0.0 and 1.0 representing confidence/quality
 pub type ValidationScore = f64;
@@ -23,6 +25,10 @@ pub struct GradientResult {
     /// Specific signals identified (e.g., "syntax_error", "security_risk")
     #[serde(default)]
     pub signals: Vec<ValidationSignal>,
+
+    /// Extensible metadata for future enhancements
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -47,6 +53,10 @@ pub struct MultiJudgeConsensus {
     
     /// Strategy used to reach consensus (e.g., "average", "weighted", "strict")
     pub strategy: String,
+
+    /// Extensible metadata for future enhancements
+    #[serde(default)]
+    pub metadata: HashMap<String, Value>,
 }
 
 #[derive(Debug, Error)]

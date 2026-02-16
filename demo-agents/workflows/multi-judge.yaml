@@ -2,9 +2,9 @@ apiVersion: 100monkeys.ai/v1
 kind: Workflow
 
 metadata:
-  name: "multi-judge-test"
-  version: "1.0.0"
-  description: "Test multi-judge consensus"
+  name: "multi-judge-weighted-average"
+  version: "2.0.0"
+  description: "Multi-judge consensus using weighted average strategy"
 
 spec:
   context:
@@ -20,44 +20,63 @@ spec:
     VALIDATE_WITH_PANEL:
       kind: ParallelAgents
       agents:
+        # Judge 1: Correctness evaluation (standard weight)
         - agent: "basic-judge"
           input: "Evaluate this code for correctness: {{workflow.context.test_code}}"
-          weight: 1.0
+          weight: 1.0  # Default weight
+          timeout_seconds: 60  # Max 60s for this judge
+          poll_interval_ms: 500  # Check status every 500ms
         
+        # Judge 2: Style evaluation (lower weight)
         - agent: "basic-judge"
           input: "Evaluate this code for style: {{workflow.context.test_code}}"
-          weight: 0.5
+          weight: 0.5  # Style matters less than correctness
+          timeout_seconds: 30  # Faster timeout for style check
         
+        # Judge 3: Security evaluation (highest weight)
         - agent: "basic-judge"
           input: "Evaluate this code for security: {{workflow.context.test_code}}"
-          weight: 1.5
+          weight: 1.5  # Security is critical, weighted higher
+          timeout_seconds: 90  # Thorough security check takes longer
 
       consensus:
-        strategy: weighted_average
-        threshold: 0.7
-
-      timeout: 120s
+        strategy: weighted_average  # Compute weighted average of scores
+        threshold: 0.7  # Minimum score to pass
+        min_agreement_confidence: 0.6  # At least 60% consensus confidence required
+        min_judges_required: 2  # At least 2 of 3 judges must succeed
+        
+        # Optional: Customize confidence calculation
+        confidence_weighting:
+          agreement_factor: 0.7  # 70% weight on inter-judge agreement
+          self_confidence_factor: 0.3  # 30% weight on judge self-confidence
 
       transitions:
+        # Pass if consensus score >= 0.7 AND confidence >= 0.6
         - condition: consensus
           threshold: 0.7
-          min_agreement: 0.6
+          agreement: 0.6  # Note: 'agreement' is alias for 'min_agreement_confidence'
           target: APPROVED
 
-        - condition: any_rejected
+        # Explicit fail transition
+        - condition: score_below
+          threshold: 0.7
           target: REJECTED
 
     APPROVED:
       kind: System
       command: "echo"
       env:
-        MESSAGE: "Code approved by consensus"
-        FINAL_SCORE: "{{VALIDATE_WITH_PANEL.final_score}}"
+        MESSAGE: "✅ Code approved by consensus"
+        FINAL_SCORE: "{{VALIDATE_WITH_PANEL.consensus.score}}"
+        CONFIDENCE: "{{VALIDATE_WITH_PANEL.consensus.confidence}}"
+        STRATEGY: "{{VALIDATE_WITH_PANEL.consensus.strategy}}"
       transitions: []
 
     REJECTED:
       kind: System
       command: "echo"
       env:
-        MESSAGE: "Code rejected by consensus"
+        MESSAGE: "❌ Code rejected by consensus"
+        FINAL_SCORE: "{{VALIDATE_WITH_PANEL.consensus.score}}"
+        CONFIDENCE: "{{VALIDATE_WITH_PANEL.consensus.confidence}}"
       transitions: []

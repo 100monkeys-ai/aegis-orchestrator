@@ -120,10 +120,22 @@ pub struct ParallelAgentConfigYaml {
     pub input: String,
     #[serde(default = "default_weight")]
     pub weight: f64,
+    #[serde(default = "default_timeout")]
+    pub timeout_seconds: Option<u64>,
+    #[serde(default = "default_poll_interval")]
+    pub poll_interval_ms: Option<u64>,
 }
 
 fn default_weight() -> f64 {
     1.0
+}
+
+fn default_timeout() -> Option<u64> {
+    Some(60)
+}
+
+fn default_poll_interval() -> Option<u64> {
+    Some(500)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -131,10 +143,18 @@ pub struct ConsensusConfigYaml {
     pub strategy: ConsensusStrategy,
     #[serde(default)]
     pub threshold: Option<f64>,
-    #[serde(default)]
+    #[serde(default, alias = "min_agreement_confidence")]
     pub agreement: Option<f64>,
     #[serde(default)]
     pub n: Option<usize>,
+    #[serde(default = "default_min_judges")]
+    pub min_judges_required: Option<usize>,
+    #[serde(default)]
+    pub confidence_weighting: Option<crate::domain::workflow::ConfidenceWeighting>,
+}
+
+fn default_min_judges() -> Option<usize> {
+    Some(1)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -300,14 +320,18 @@ impl WorkflowParser {
                         agent: a.agent,
                         input: a.input,
                         weight: a.weight,
+                        timeout_seconds: a.timeout_seconds.unwrap_or(60),
+                        poll_interval_ms: a.poll_interval_ms.unwrap_or(500),
                     })
                     .collect();
 
                 let consensus_config = ConsensusConfig {
                     strategy: consensus.strategy,
                     threshold: consensus.threshold,
-                    agreement: consensus.agreement,
+                    min_agreement_confidence: consensus.agreement,
                     n: consensus.n,
+                    min_judges_required: consensus.min_judges_required.unwrap_or(1),
+                    confidence_weighting: consensus.confidence_weighting,
                 };
 
                 StateKind::ParallelAgents {
@@ -453,13 +477,17 @@ impl WorkflowParser {
                         agent: a.agent.clone(),
                         input: a.input.clone(),
                         weight: a.weight,
+                        timeout_seconds: Some(a.timeout_seconds),
+                        poll_interval_ms: Some(a.poll_interval_ms),
                     })
                     .collect(),
                 consensus: ConsensusConfigYaml {
                     strategy: consensus.strategy,
                     threshold: consensus.threshold,
-                    agreement: consensus.agreement,
+                    agreement: consensus.min_agreement_confidence,
                     n: consensus.n,
+                    min_judges_required: Some(consensus.min_judges_required),
+                    confidence_weighting: consensus.confidence_weighting.clone(),
                 },
             },
         }

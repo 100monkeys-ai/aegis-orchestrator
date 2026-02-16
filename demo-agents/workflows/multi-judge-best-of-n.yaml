@@ -1,0 +1,140 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "multi-judge-best-of-n"
+  version: "1.0.0"
+  description: "Multi-judge consensus using best-of-N strategy (top judges win)"
+
+spec:
+  context:
+    essay_submission: |
+      # The Future of AI Development
+      
+      Artificial intelligence is rapidly transforming software development.
+      Tools like GitHub Copilot and ChatGPT are already helping developers
+      write code faster. In the next decade, AI agents will likely handle
+      entire features autonomously, with humans focusing on high-level
+      architecture and creative problem-solving.
+      
+      The key challenge will be ensuring AI-generated code is secure,
+      maintainable, and aligned with business goals. This requires robust
+      validation frameworks and human oversight.
+
+  initial_state: GRADE_ESSAY
+
+  states:
+    GRADE_ESSAY:
+      kind: ParallelAgents
+      agents:
+        # Fast judge: Quick heuristic evaluation
+        - agent: "basic-judge"
+          input: |
+            Quickly evaluate this essay (spend 30s max):
+            {{workflow.context.essay_submission}}
+            
+            Grade on: clarity, structure, grammar (0.0-1.0 scale)
+          weight: 1.0
+          timeout_seconds: 30
+        
+        # Thorough judge: Deep analysis
+        - agent: "basic-judge"
+          input: |
+            Thoroughly evaluate this essay (take your time):
+            {{workflow.context.essay_submission}}
+            
+            Grade on: argument quality, evidence, originality, style
+          weight: 1.0
+          timeout_seconds: 120
+        
+        # Creative judge: Novelty and insight
+        - agent: "basic-judge"
+          input: |
+            Evaluate creativity and insight in this essay:
+            {{workflow.context.essay_submission}}
+            
+            Grade on: originality, depth of thought, novel perspectives
+          weight: 1.0
+          timeout_seconds: 60
+        
+        # Critical judge: Find flaws
+        - agent: "basic-judge"
+          input: |
+            Be critical - find weaknesses in this essay:
+            {{workflow.context.essay_submission}}
+            
+            Grade on: logical consistency, unsupported claims, biases
+          weight: 1.0
+          timeout_seconds: 90
+        
+        # Lenient judge: Focus on positives
+        - agent: "basic-judge"
+          input: |
+            Be generous - what works well in this essay:
+            {{workflow.context.essay_submission}}
+            
+            Grade on: strengths, good ideas, potential
+          weight: 1.0
+          timeout_seconds: 45
+
+      consensus:
+        strategy: best_of_n
+        n: 3  # Take average of top 3 judges (out of 5)
+        min_judges_required: 4  # At least 4 of 5 must complete
+
+      transitions:
+        # A grade: Top 3 judges averaged >= 0.9
+        - condition: score_above
+          threshold: 0.9
+          target: GRADE_A
+
+        # B grade: Top 3 judges averaged 0.7-0.9
+        - condition: score_between
+          min: 0.7
+          max: 0.9
+          target: GRADE_B
+
+        # C grade: Top 3 judges averaged 0.5-0.7
+        - condition: score_between
+          min: 0.5
+          max: 0.7
+          target: GRADE_C
+
+        # F grade: Top 3 judges averaged < 0.5
+        - condition: score_below
+          threshold: 0.5
+          target: GRADE_F
+
+    GRADE_A:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "🏆 Grade: A (Excellent) - Top judges scored this highly"
+        FINAL_SCORE: "{{GRADE_ESSAY.consensus.score}}"
+        TOP_N: "{{GRADE_ESSAY.consensus.metadata.n}}"
+        TOTAL_JUDGES: "{{GRADE_ESSAY.consensus.metadata.total_judges}}"
+      transitions: []
+
+    GRADE_B:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "✅ Grade: B (Good) - Solid work according to top judges"
+        FINAL_SCORE: "{{GRADE_ESSAY.consensus.score}}"
+      transitions: []
+
+    GRADE_C:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "⚠️ Grade: C (Acceptable) - Meets minimum standards"
+        FINAL_SCORE: "{{GRADE_ESSAY.consensus.score}}"
+      transitions: []
+
+    GRADE_F:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "❌ Grade: F (Failing) - Significant issues identified"
+        FINAL_SCORE: "{{GRADE_ESSAY.consensus.score}}"
+      transitions: []

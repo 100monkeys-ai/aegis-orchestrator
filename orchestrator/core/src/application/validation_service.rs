@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Result, anyhow, Context};
 use crate::domain::agent::AgentId;
 use crate::domain::validation::{GradientResult, MultiJudgeConsensus, ValidationRequest};
+use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy, ConfidenceWeighting};
 
 use crate::application::execution::ExecutionService;
 use crate::domain::execution::{ExecutionInput, ExecutionStatus};
@@ -35,50 +36,81 @@ impl ValidationService {
         &self,
         execution_id: crate::domain::execution::ExecutionId,
         request: ValidationRequest,
-        judges: Vec<AgentId>,
+        judges: Vec<(AgentId, f64)>, // (judge_id, weight)
+        config: Option<ConsensusConfig>,
+        timeout_seconds: u64,
+        poll_interval_ms: u64,
     ) -> Result<MultiJudgeConsensus> {
         if judges.is_empty() {
             return Err(anyhow!("No judges provided for validation"));
         }
 
+        let config = config.unwrap_or_else(|| ConsensusConfig {
+            strategy: ConsensusStrategy::WeightedAverage,
+            threshold: None,
+            min_agreement_confidence: None,
+            n: None,
+            min_judges_required: 1,
+            confidence_weighting: None,
+        });
+
+        // Validate confidence weighting if provided
+        if let Some(ref weighting) = config.confidence_weighting {
+            weighting.validate()
+                .map_err(|e| anyhow!("Invalid confidence weighting: {}", e))?;
+        }
+
         let mut futures = Vec::new();
-        for judge_id in judges {
+        for (judge_id, weight) in &judges {
             let service = self.execution_service.clone();
             let req = request.clone();
+            let judge = *judge_id;
+            let w = *weight;
+            let timeout = timeout_seconds;
+            let poll_interval = poll_interval_ms;
             
             futures.push(tokio::spawn(async move {
-                Self::run_judge(service, judge_id, req).await
+                match Self::run_judge(service, judge, req, timeout, poll_interval).await {
+                    Ok((_agent_id, gradient_result)) => Ok((judge, gradient_result, w)),
+                    Err(e) => Err(e),
+                }
             }));
         }
 
         let mut results = Vec::new();
         for future in futures {
             match future.await {
-                Ok(Ok((agent_id, result))) => {
+                Ok(Ok((agent_id, result, weight))) => {
                     // Publish individual judge result
                     self.event_bus.publish_execution_event(
                         crate::domain::events::ExecutionEvent::Validation(
                             crate::domain::events::ValidationEvent::GradientValidationPerformed {
                                 execution_id,
-                                iteration_number: 0, // TODO: Pass iteration number
+                                iteration_number: 0, // TODO: Pass iteration number from caller
                                 score: result.score,
                                 confidence: result.confidence,
                                 validated_at: chrono::Utc::now(),
                             }
                         )
                     );
-                    results.push((agent_id, result));
+                    results.push((agent_id, result, weight));
                 },
                 Ok(Err(e)) => tracing::warn!("Judge execution failed: {}", e),
                 Err(e) => tracing::error!("Join error: {}", e),
             }
         }
 
-        if results.is_empty() {
-            return Err(anyhow!("All judges failed to produce a result"));
+        // Check minimum judges requirement
+        if results.len() < config.min_judges_required {
+            return Err(anyhow!(
+                "Insufficient judges succeeded: {} of {} required (total: {})",
+                results.len(),
+                config.min_judges_required,
+                judges.len()
+            ));
         }
 
-        let consensus = self.compute_consensus(results);
+        let consensus = self.compute_consensus(results, &config)?;
 
         // Publish consensus event
         self.event_bus.publish_execution_event(
@@ -163,6 +195,8 @@ impl ValidationService {
         service: Arc<dyn ExecutionService>,
         judge_id: AgentId,
         request: ValidationRequest,
+        timeout_seconds: u64,
+        poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
         // 1. Prepare input
         // payload must match what the Judge Agent expects.
@@ -176,14 +210,13 @@ impl ValidationService {
         // 2. Start execution
         let exec_id = service.start_execution(judge_id, input).await?;
 
-        // 3. Poll for completion
-        // TODO: Use events/streams instead of polling in future
+        // 3. Poll for completion with configurable timeout and interval
+        let max_attempts = (timeout_seconds * 1000) / poll_interval_ms;
         let mut attempts = 0;
-        let max_attempts = 120; // 60 seconds
         
         loop {
             if attempts >= max_attempts {
-                return Err(anyhow!("Judge execution timed out"));
+                return Err(anyhow!("Judge execution timed out after {} seconds", timeout_seconds));
             }
             
             let exec = service.get_execution(exec_id).await?;
@@ -209,7 +242,7 @@ impl ValidationService {
                     return Err(anyhow!("Judge execution failed or cancelled"));
                 },
                 _ => {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
                     attempts += 1;
                 }
             }
@@ -241,46 +274,205 @@ impl ValidationService {
         None
     }
 
-    fn compute_consensus(&self, results: Vec<(AgentId, GradientResult)>) -> MultiJudgeConsensus {
-        let count = results.len() as f64;
-        if count == 0.0 {
-            // Should be handled by caller, but safe fallback
-            return MultiJudgeConsensus {
-                final_score: 0.0,
-                consensus_confidence: 0.0,
-                individual_results: vec![],
-                strategy: "none".to_string(),
-            };
+    fn compute_consensus(&self, results: Vec<(AgentId, GradientResult, f64)>, config: &ConsensusConfig) -> Result<MultiJudgeConsensus> {
+        if results.is_empty() {
+            return Err(anyhow!("Cannot compute consensus with zero results"));
         }
 
-        // Strategy: Simple Average for score
-        // TODO: Weighted average based on judge reputation/competence (Phase 4)
-        let total_score: f64 = results.iter().map(|(_, r)| r.score).sum();
-        let average_score = total_score / count;
+        // Dispatch to appropriate strategy
+        match config.strategy {
+            ConsensusStrategy::WeightedAverage => self.compute_weighted_average_consensus(results, config),
+            ConsensusStrategy::Majority => self.compute_majority_consensus(results, config),
+            ConsensusStrategy::Unanimous => self.compute_unanimous_consensus(results, config),
+            ConsensusStrategy::BestOfN => self.compute_best_of_n_consensus(results, config),
+        }
+    }
 
-        // Confidence calculation
-        // If judges disagree significantly, confidence drops.
+    fn compute_weighted_average_consensus(
+        &self,
+        results: Vec<(AgentId, GradientResult, f64)>,
+        config: &ConsensusConfig,
+    ) -> Result<MultiJudgeConsensus> {
+        let total_weight: f64 = results.iter().map(|(_, _, w)| w).sum();
+        
+        if total_weight == 0.0 {
+            return Err(anyhow!("Total weight is zero"));
+        }
+
+        // Weighted average of scores
+        let weighted_score: f64 = results.iter()
+            .map(|(_, r, w)| r.score * w)
+            .sum::<f64>() / total_weight;
+
+        // Confidence calculation with configurable weighting
+        let count = results.len() as f64;
+        let unweighted_mean: f64 = results.iter().map(|(_, r, _)| r.score).sum::<f64>() / count;
+        
         // Variance = sum((x - mean)^2) / n
         let variance: f64 = results.iter()
-            .map(|(_, r)| (r.score - average_score).powi(2))
+            .map(|(_, r, _)| (r.score - unweighted_mean).powi(2))
             .sum::<f64>() / count;
             
-        // Convert variance to confidence (0 variance = 1.0 confidence, 0.25 variance = 0.0 confidence (max variance for 0-1 range is 0.25))
         // Max variance for [0,1] is 0.25 (e.g. half 0s, half 1s)
         let disagreement_penalty = (variance / 0.25).min(1.0);
         let agreement_factor = 1.0 - disagreement_penalty;
         
-        // Also factor in the judges' own confidence
-        let avg_judge_confidence: f64 = results.iter().map(|(_, r)| r.confidence).sum::<f64>() / count;
+        // Average of judges' self-confidence (weighted)
+        let avg_judge_confidence: f64 = results.iter()
+            .map(|(_, r, w)| r.confidence * w)
+            .sum::<f64>() / total_weight;
         
-        // Final consensus confidence is a mix of agreement and judge self-confidence
-        let consensus_confidence = agreement_factor * 0.7 + avg_judge_confidence * 0.3;
+        // Use configurable confidence weighting or defaults
+        let default_weighting = ConfidenceWeighting::default();
+        let weighting = config.confidence_weighting.as_ref().unwrap_or(&default_weighting);
+        let consensus_confidence = 
+            agreement_factor * weighting.agreement_factor + 
+            avg_judge_confidence * weighting.self_confidence_factor;
 
-        MultiJudgeConsensus {
-            final_score: average_score,
+        Ok(MultiJudgeConsensus {
+            final_score: weighted_score,
             consensus_confidence,
-            individual_results: results,
-            strategy: "average_with_variance_penalty".to_string(),
+            individual_results: results.iter().map(|(id, r, _)| (*id, r.clone())).collect(),
+            strategy: "weighted_average".to_string(),
+            metadata: std::collections::HashMap::new(),
+        })
+    }
+
+    fn compute_majority_consensus(
+        &self,
+        results: Vec<(AgentId, GradientResult, f64)>,
+        config: &ConsensusConfig,
+    ) -> Result<MultiJudgeConsensus> {
+        let threshold = config.threshold.unwrap_or(0.7);
+        
+        // Count votes: pass (score >= threshold) vs fail (score < threshold)
+        let pass_votes: usize = results.iter()
+            .filter(|(_, r, _)| r.score >= threshold)
+            .count();
+        
+        let fail_votes = results.len() - pass_votes;
+        
+        // Majority decision
+        let final_score = if pass_votes > fail_votes {
+            1.0 // Pass
+        } else if fail_votes > pass_votes {
+            0.0 // Fail
+        } else {
+            0.5 // Tie - neutral
+        };
+        
+        // Confidence based on margin of victory
+        let total = results.len() as f64;
+        let margin = ((pass_votes as f64 - fail_votes as f64).abs() / total).min(1.0);
+        
+        // Also factor in individual judge confidence
+        let avg_judge_confidence: f64 = results.iter()
+            .map(|(_, r, _)| r.confidence)
+            .sum::<f64>() / total;
+        
+        let consensus_confidence = margin * 0.7 + avg_judge_confidence * 0.3;
+
+        Ok(MultiJudgeConsensus {
+            final_score,
+            consensus_confidence,
+            individual_results: results.iter().map(|(id, r, _)| (*id, r.clone())).collect(),
+            strategy: "majority".to_string(),
+            metadata: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("pass_votes".to_string(), serde_json::json!(pass_votes));
+                map.insert("fail_votes".to_string(), serde_json::json!(fail_votes));
+                map.insert("threshold".to_string(), serde_json::json!(threshold));
+                map
+            },
+        })
+    }
+
+    fn compute_unanimous_consensus(
+        &self,
+        results: Vec<(AgentId, GradientResult, f64)>,
+        config: &ConsensusConfig,
+    ) -> Result<MultiJudgeConsensus> {
+        let threshold = config.threshold.unwrap_or(0.7);
+        
+        // All judges must score >= threshold
+        let all_pass = results.iter().all(|(_, r, _)| r.score >= threshold);
+        
+        let final_score = if all_pass {
+            // Average of actual scores
+            let count = results.len() as f64;
+            results.iter().map(|(_, r, _)| r.score).sum::<f64>() / count
+        } else {
+            0.0 // Any dissenter fails consensus
+        };
+        
+        // Confidence is minimum of all judge confidences (weakest link)
+        let min_confidence = results.iter()
+            .map(|(_, r, _)| r.confidence)
+            .fold(f64::INFINITY, f64::min);
+        
+        Ok(MultiJudgeConsensus {
+            final_score,
+            consensus_confidence: min_confidence,
+            individual_results: results.iter().map(|(id, r, _)| (*id, r.clone())).collect(),
+            strategy: "unanimous".to_string(),
+            metadata: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("all_pass".to_string(), serde_json::json!(all_pass));
+                map.insert("threshold".to_string(), serde_json::json!(threshold));
+                map
+            },
+        })
+    }
+
+    fn compute_best_of_n_consensus(
+        &self,
+        results: Vec<(AgentId, GradientResult, f64)>,
+        config: &ConsensusConfig,
+    ) -> Result<MultiJudgeConsensus> {
+        let n = config.n.unwrap_or(results.len());
+        
+        if n == 0 {
+            return Err(anyhow!("BestOfN requires n > 0"));
         }
+        
+        // Sort by score * confidence (descending)
+        let mut sorted_results = results.clone();
+        sorted_results.sort_by(|(_, a, _), (_, b, _)| {
+            let score_a = a.score * a.confidence;
+            let score_b = b.score * b.confidence;
+            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+        });
+        
+        // Take top N (or all if N > total)
+        let top_n: Vec<_> = sorted_results.iter().take(n).collect();
+        let count = top_n.len() as f64;
+        
+        // Average of top N scores (weighted)
+        let total_weight: f64 = top_n.iter().map(|(_, _, w)| w).sum();
+        let final_score = if total_weight > 0.0 {
+            top_n.iter()
+                .map(|(_, r, w)| r.score * w)
+                .sum::<f64>() / total_weight
+        } else {
+            top_n.iter().map(|(_, r, _)| r.score).sum::<f64>() / count
+        };
+        
+        // Average confidence of top N
+        let consensus_confidence = top_n.iter()
+            .map(|(_, r, _)| r.confidence)
+            .sum::<f64>() / count;
+
+        Ok(MultiJudgeConsensus {
+            final_score,
+            consensus_confidence,
+            individual_results: results.iter().map(|(id, r, _)| (*id, r.clone())).collect(),
+            strategy: "best_of_n".to_string(),
+            metadata: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("n".to_string(), serde_json::json!(n));
+                map.insert("total_judges".to_string(), serde_json::json!(results.len()));
+                map
+            },
+        })
     }
 }

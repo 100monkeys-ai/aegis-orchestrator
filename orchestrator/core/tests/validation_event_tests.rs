@@ -104,11 +104,19 @@ async fn test_validation_event_streaming() {
         context: None,
     };
     
-    let judges = vec![AgentId::new()];
+    // Updated to use tuples with weights (judge_id, weight)
+    let judges = vec![(AgentId::new(), 1.0)];
     
     // Spawn validation in background
     let handle = tokio::spawn(async move {
-        val_service.validate_with_judges(execution_id, request, judges).await
+        val_service.validate_with_judges(
+            execution_id,
+            request,
+            judges,
+            None,  // Use default consensus config
+            60,    // timeout_seconds
+            500,   // poll_interval_ms
+        ).await
     });
     
     // Listen for events

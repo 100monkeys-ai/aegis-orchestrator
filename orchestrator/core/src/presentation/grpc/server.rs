@@ -223,6 +223,9 @@ impl AegisRuntime for AegisRuntimeService {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {}", e)))?;
 
+        // Convert to Vec<(AgentId, f64)> with default weight of 1.0
+        let judge_configs: Vec<(AgentId, f64)> = judge_ids.into_iter().map(|id| (id, 1.0)).collect();
+
         // Create validation request
         use crate::domain::validation::ValidationRequest;
         let validation_req = ValidationRequest {
@@ -234,8 +237,15 @@ impl AegisRuntime for AegisRuntimeService {
         // TODO: Get actual execution_id from context
         let dummy_exec_id = crate::domain::execution::ExecutionId::new();
 
-        // Call validation service
-        match self.validation_service.validate_with_judges(dummy_exec_id, validation_req, judge_ids).await {
+        // Call validation service with default configuration
+        match self.validation_service.validate_with_judges(
+            dummy_exec_id, 
+            validation_req, 
+            judge_configs,
+            None, // Use default consensus config
+            60, // 60 second timeout
+            500 // 500ms poll interval
+        ).await {
             Ok(consensus) => {
                 // Convert to protobuf
                 let individual_results = consensus.individual_results

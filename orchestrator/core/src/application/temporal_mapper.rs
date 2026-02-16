@@ -223,7 +223,7 @@ impl TemporalWorkflowMapper {
                     let temporal_consensus = TemporalConsensusConfig {
                         strategy: Self::map_consensus_strategy(consensus.strategy),
                         threshold: consensus.threshold,
-                        agreement: consensus.agreement,
+                        agreement: consensus.min_agreement_confidence,
                         n: consensus.n,
                     };
 

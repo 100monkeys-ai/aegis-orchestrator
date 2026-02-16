@@ -1,0 +1,96 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "multi-judge-unanimous"
+  version: "1.0.0"
+  description: "Multi-judge consensus requiring unanimous agreement (security gate)"
+
+spec:
+  context:
+    deployment_package: |
+      # Production Deployment Request
+      
+      Service: payment-processor-v2
+      Version: 2.1.5
+      Changes:
+        - Updated stripe API to v2024
+        - Added fraud detection hooks
+        - Improved error handling
+      
+      Docker image: payments:2.1.5
+      Env: production
+
+  initial_state: SECURITY_GATE
+
+  states:
+    SECURITY_GATE:
+      kind: ParallelAgents
+      agents:
+        # Static Security Analyzer
+        - agent: "basic-judge"
+          input: |
+            As a static security analyzer, audit this deployment:
+            {{workflow.context.deployment_package}}
+            
+            Check for: SQL injection, XSS, CSRF, secrets exposure.
+            Score 0.95+ only if NO security issues found.
+          weight: 1.0
+          timeout_seconds: 300  # Thorough static analysis
+        
+        # Penetration Tester
+        - agent: "basic-judge"
+          input: |
+            As a penetration tester, evaluate this deployment:
+            {{workflow.context.deployment_package}}
+            
+            Test for: authentication bypass, privilege escalation, data leaks.
+            Score 0.95+ only if system withstands all attacks.
+          weight: 1.0
+          timeout_seconds: 600  # Pen testing takes time
+        
+        # Security Expert Human Review
+        - agent: "basic-judge"
+          input: |
+            As a senior security engineer, review this deployment:
+            {{workflow.context.deployment_package}}
+            
+            Manual review of architecture, dependencies, and risk.
+            Score 0.95+ only if you would personally approve for production.
+          weight: 1.0
+          timeout_seconds: 180
+
+      consensus:
+        strategy: unanimous  # ALL judges must approve
+        threshold: 0.95  # Each judge must score >= 0.95
+        min_judges_required: 3  # All 3 security checks must succeed
+
+      transitions:
+        # Only pass if unanimous approval (all judges scored >= 0.95)
+        - condition: score_above
+          threshold: 0.94  # Final score only high if unanimous
+          target: PRODUCTION_DEPLOY
+
+        # Any rejection or low score
+        - condition: always
+          target: SECURITY_FAILED
+
+    PRODUCTION_DEPLOY:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "🚀 APPROVED: Unanimous security approval - deploying to production"
+        FINAL_SCORE: "{{SECURITY_GATE.consensus.score}}"
+        CONFIDENCE: "{{SECURITY_GATE.consensus.confidence}}"
+        ALL_PASS: "{{SECURITY_GATE.consensus.metadata.all_pass}}"
+      transitions: []
+
+    SECURITY_FAILED:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "🛑 BLOCKED: Security gate failed - deployment rejected"
+        FINAL_SCORE: "{{SECURITY_GATE.consensus.score}}"
+        ALL_PASS: "{{SECURITY_GATE.consensus.metadata.all_pass}}"
+        REASON: "At least one security judge rejected or scored below 0.95"
+      transitions: []

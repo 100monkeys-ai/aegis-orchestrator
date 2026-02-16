@@ -261,7 +261,6 @@ mod tests {
     async fn test_approval_flow() {
         let service = HumanInputService::new();
         let execution_id = ExecutionId::new();
-        let request_id = Uuid::new_v4();
 
         // Spawn task to approve after 100ms
         let service_clone = Arc::new(service);
