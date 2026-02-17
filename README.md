@@ -283,6 +283,15 @@ For details, see [SECURITY.md](SECURITY.md).
 - [Security Model](docs/SECURITY.md) - Threat analysis
 - [Roadmap](docs/ROADMAP.md) - Future plans
 
+### References
+
+- Enable CUDA for containers
+  - <https://learn.microsoft.com/en-us/windows/ai/directml/gpu-cuda-in-wsl>
+  - <https://docs.nvidia.com/cuda/wsl-user-guide/index.html#getting-started-with-cuda-on-wsl-2>
+  - <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
+  - `sudo nvidia-ctk runtime configure --runtime=docker`
+  - `sudo systemctl restart docker`
+
 ## License
 
 AGPL-3.0. See [LICENSE](LICENSE) for details.
