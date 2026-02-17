@@ -118,6 +118,8 @@ services:
         condition: service_healthy
       temporal:
         condition: service_healthy
+      ollama:
+        condition: service_healthy
     environment:
       - AEGIS_DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
       - RUST_LOG=info,aegis_orchestrator=debug
@@ -132,12 +134,34 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock  # For Docker-based agent isolation
       - ../demo-agents:/app/demo-agents
+      - ../aegis-config.yaml:/app/aegis-config.yaml  # Mount config file
       - aegis-runtime-data:/app/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # LLM Services
+  # ============================================================================
+
+  # Ollama (Local LLM Runtime)
+  ollama:
+    image: ollama/ollama:latest
+    container_name: aegis-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - /usr/share/ollama/.ollama/models:/root/.ollama/models  # Mount existing models
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
     restart: unless-stopped
 
   # ============================================================================
