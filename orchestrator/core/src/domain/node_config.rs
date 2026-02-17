@@ -219,6 +219,21 @@ pub struct RuntimeConfig {
     /// Set to false to skip disk quota attempts entirely for efficiency
     #[serde(default = "default_enable_disk_quotas")]
     pub enable_disk_quotas: bool,
+    
+    /// Docker network to attach agent containers to (e.g., "aegis-network", "bridge")
+    /// If None, uses Docker's default network behavior
+    /// Supports env:VAR_NAME syntax for environment variable substitution
+    /// Default: None (no explicit network)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_network_mode: Option<String>,
+    
+    /// Orchestrator URL for agent containers to call back to
+    /// Used by agent bootstrap scripts to reach the LLM proxy endpoint
+    /// Supports env:VAR_NAME syntax for environment variable substitution
+    /// Default: "http://localhost:8000" (local development)
+    /// Docker deployments should override to "http://aegis-runtime:8080"
+    #[serde(default = "default_orchestrator_url")]
+    pub orchestrator_url: String,
 }
 
 impl Default for RuntimeConfig {
@@ -228,6 +243,8 @@ impl Default for RuntimeConfig {
             default_isolation: default_isolation_mode(),
             docker_socket_path: None,
             enable_disk_quotas: default_enable_disk_quotas(),
+            docker_network_mode: None,
+            orchestrator_url: default_orchestrator_url(),
         }
     }
 }
@@ -347,6 +364,10 @@ fn default_heartbeat() -> u64 {
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_orchestrator_url() -> String {
+    "http://localhost:8000".to_string()
 }
 
 fn default_log_format() -> String {

@@ -19,10 +19,12 @@ pub struct DockerRuntime {
     docker: Docker,
     bootstrap_script: String,
     enable_disk_quotas: bool,
+    network_mode: Option<String>,
+    orchestrator_url: String,
 }
 
 impl DockerRuntime {
-    pub fn new(bootstrap_script: String, socket_path: Option<String>, enable_disk_quotas: bool) -> Result<Self, RuntimeError> {
+    pub fn new(bootstrap_script: String, socket_path: Option<String>, enable_disk_quotas: bool, network_mode: Option<String>, orchestrator_url: String) -> Result<Self, RuntimeError> {
         // Connect to Docker daemon (custom socket or auto-detect)
         let docker = if let Some(path) = socket_path {
             // Try custom socket path
@@ -55,7 +57,7 @@ impl DockerRuntime {
                 )))?
         };
         
-        Ok(Self { docker, bootstrap_script, enable_disk_quotas })
+        Ok(Self { docker, bootstrap_script, enable_disk_quotas, network_mode, orchestrator_url })
     }
     
     /// Verify Docker daemon is accessible
@@ -141,7 +143,7 @@ impl AgentRuntime for DockerRuntime {
                 format!("{}:/usr/local/bin/aegis-bootstrap", 
                     std::env::current_dir().unwrap().join(&self.bootstrap_script).to_str().unwrap()),
             ]),
-            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+            network_mode: self.network_mode.clone(),  // Optional Docker network (None = default)
             ..Default::default()
         };
         
@@ -176,9 +178,12 @@ impl AgentRuntime for DockerRuntime {
         };
 
         // Convert map to "KEY=VALUE" strings
-        let env_vars: Vec<String> = config.env.iter()
+        let mut env_vars: Vec<String> = config.env.iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
+        
+        // Add orchestrator URL for agent bootstrap script to call LLM proxy
+        env_vars.push(format!("AEGIS_ORCHESTRATOR_URL={}", self.orchestrator_url));
 
         // Keep container alive - actual agent execution happens via bootstrap script in execute()
         let cmd = vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()];

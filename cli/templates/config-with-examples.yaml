@@ -127,6 +127,54 @@ spec:
     retry_delay_ms: 1000  # Initial delay, doubles on each retry (exponential backoff)
   
   # --------------------------------------------------------------------------
+  # Runtime Configuration (Optional)
+  # --------------------------------------------------------------------------
+  runtime:
+    # Path to bootstrap script for agent containers
+    # Default: "assets/bootstrap.py" (relative to orchestrator binary)
+    # bootstrap_script: "assets/bootstrap.py"
+    
+    # Default isolation mode for agent execution
+    # Options: "docker", "firecracker", "inherit", "process"
+    # Default: "inherit" (uses whatever the parent process provides)
+    # default_isolation: "inherit"
+    
+    # Custom path to Docker socket (for Docker-based isolation)
+    # Optional: If not specified, uses platform defaults
+    # Examples:
+    #   - Linux/macOS: "/var/run/docker.sock"
+    #   - Windows: "//./pipe/docker_engine"
+    #   - Rootless: "unix:///run/user/1000/docker.sock"
+    #   - Remote: "tcp://192.168.1.100:2375"
+    # docker_socket_path: "/var/run/docker.sock"
+    
+    # Enable Docker disk quotas via --storage-opt
+    # Default: true (attempts, gracefully degrades if unsupported)
+    # Set to false for WSL/macOS (no XFS+pquota support)
+    # Environment variable: AEGIS_ENABLE_DISK_QUOTAS
+    # enable_disk_quotas: false
+    
+    # Docker network for agent containers (Docker deployments only)
+    # Optional: If not specified, uses Docker's default network
+    # Supports env:VAR_NAME syntax for environment variable substitution
+    # Examples:
+    #   - Custom bridge: "aegis-network"
+    #   - Environment var: "env:AEGIS_DOCKER_NETWORK"
+    #   - Docker default: null (omit field)
+    # docker_network_mode: "env:AEGIS_DOCKER_NETWORK"
+    
+    # Orchestrator URL for agent bootstrap callbacks
+    # Used by agent containers to reach the LLM proxy endpoint
+    # Default: "http://localhost:8000" (local development)
+    # Supports env:VAR_NAME syntax for environment variable substitution
+    # Examples:
+    #   - Local development: "http://localhost:8000"
+    #   - Docker deployment: "http://aegis-runtime:8080"
+    #   - Remote deployment: "https://orchestrator.example.com"
+    #   - Environment var: "env:AEGIS_ORCHESTRATOR_URL"
+    # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
+  
+  # --------------------------------------------------------------------------
   # Network Configuration
   # --------------------------------------------------------------------------
   network:
@@ -181,21 +229,4 @@ spec:
   #   # postgres:
   #   #   connection_string: "env:DATABASE_URL"
   #   #   max_connections: 10
-  
-  # --------------------------------------------------------------------------
-  # Execution (Optional)
-  # --------------------------------------------------------------------------
-  # execution:
-  #   # Default isolation: docker or firecracker
-  #   default_isolation: "docker"
-  #   
-  #   # Docker configuration
-  #   docker:
-  #     socket_path: "/var/run/docker.sock"
-  #     default_image: "aegis/agent-runtime:latest"
-  #   
-  #   # Resource limits
-  #   default_resources:
-  #     cpu_cores: 1.0
-  #     memory_mb: 512
-  #     timeout_seconds: 300
+

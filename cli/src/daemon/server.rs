@@ -184,11 +184,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     println!("Initializing Docker runtime...");
+    
+    // Resolve orchestrator URL (supports env:VAR_NAME syntax)
+    let orchestrator_url = if config.spec.runtime.orchestrator_url.starts_with("env:") {
+        let env_var = config.spec.runtime.orchestrator_url.strip_prefix("env:").unwrap();
+        std::env::var(env_var)
+            .unwrap_or_else(|_| {
+                tracing::warn!("Environment variable {} not set, using default orchestrator URL", env_var);
+                "http://localhost:8000".to_string()
+            })
+    } else {
+        config.spec.runtime.orchestrator_url.clone()
+    };
+    
+    // Resolve Docker network mode (supports env:VAR_NAME syntax)
+    let network_mode = config.spec.runtime.docker_network_mode.as_ref().map(|nm| {
+        if nm.starts_with("env:") {
+            let env_var = nm.strip_prefix("env:").unwrap();
+            std::env::var(env_var)
+                .unwrap_or_else(|_| {
+                    tracing::debug!("Environment variable {} not set, using no explicit Docker network", env_var);
+                    String::new()
+                })
+        } else {
+            nm.clone()
+        }
+    }).filter(|s| !s.is_empty());
+    
     let runtime = Arc::new(
         DockerRuntime::new(
             config.spec.runtime.bootstrap_script.clone(),
             config.spec.runtime.docker_socket_path.clone(),
-            config.spec.runtime.enable_disk_quotas
+            config.spec.runtime.enable_disk_quotas,
+            network_mode,
+            orchestrator_url
         )
         .context("Failed to initialize Docker runtime")?
     );

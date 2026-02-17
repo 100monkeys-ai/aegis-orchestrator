@@ -126,6 +126,12 @@ services:
       - TEMPORAL_WORKER_URL=http://temporal-worker:3000
       - TEMPORAL_ADDRESS=temporal:7233
       - AEGIS_ENABLE_DISK_QUOTAS=false  # Disable disk quotas on WSL/macOS (no XFS+pquota)
+      # Docker network for agent containers
+      # Referenced in node config via: runtime.docker_network_mode: "env:AEGIS_DOCKER_NETWORK"
+      - AEGIS_DOCKER_NETWORK=aegis-network
+      # Agent bootstrap orchestrator callback URL (used by assets/bootstrap.py)
+      # Referenced in node config via: runtime.orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
+      - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8080
     ports:
       - "8080:8080"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities
