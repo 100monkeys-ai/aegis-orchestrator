@@ -132,6 +132,7 @@ services:
       # Agent bootstrap orchestrator callback URL (used by assets/bootstrap.py)
       # Referenced in node config via: runtime.orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
       - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8080
+      - RUST_LOG=debug
     ports:
       - "8080:8080"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities
@@ -198,25 +199,6 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # # LanceDB (Vector Store)
-  # lancedb:
-  #   image: lancedb/lancedb:v0.5.0  # Pin version for reproducibility; update intentionally when upgrading
-  #   container_name: aegis-lancedb
-  #   ports:
-  #     - "8765:8765"
-  #   volumes:
-  #     - lancedb-data:/data
-  #   environment:
-  #     - LANCE_DB_PATH=/data
-  #   networks:
-  #     - aegis-network
-  #   healthcheck:
-  #     test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
-  #     interval: 30s
-  #     timeout: 10s
-  #     retries: 3
-  #   restart: unless-stopped
-
   # Neo4j (Knowledge Graph)
   neo4j:
     image: neo4j:5.15-community
@@ -244,6 +226,7 @@ services:
 
 networks:
   aegis-network:
+    name: aegis-network  # Use exact name without docker-compose prefix
     driver: bridge
 
 volumes:
@@ -253,8 +236,6 @@ volumes:
     driver: local
   aegis-runtime-data:
     driver: local
-  # lancedb-data:
-  #   driver: local
   neo4j-data:
     driver: local
   neo4j-logs:

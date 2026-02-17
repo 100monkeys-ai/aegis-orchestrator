@@ -20,7 +20,7 @@ spec:
       {{instruction}}
       
       User: {{input}}
-      Agent:
+      Greeter:
   
   execution:
     mode: "one-shot"  # Simple greeting, no iteration needed

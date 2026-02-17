@@ -122,6 +122,61 @@ llm_providers:
 
 See [aegis-config.yaml](aegis-config.yaml) for a complete example.
 
+### Debugging and Logging
+
+The orchestrator uses structured logging via the `tracing` crate. Log levels: `trace`, `debug`, `info`, `warn`, `error`.
+
+**Set Log Level:**
+
+```bash
+# Via environment variable (recommended for development)
+export RUST_LOG=debug
+cargo run -p aegis-cli -- daemon start
+
+# Via CLI flag
+cargo run -p aegis-cli -- daemon start --log-level debug
+
+# Via config file (aegis-config.yaml)
+spec:
+  observability:
+    logging:
+      level: "debug"  # trace, debug, info, warn, error
+```
+
+**Bootstrap.py Debugging:**
+
+When running at `debug` level, the orchestrator automatically:
+
+- Logs all stdout from `bootstrap.py` (the Python script inside agent containers)
+- Logs all stderr from `bootstrap.py` as warnings
+- Enables verbose mode in `bootstrap.py` (via `AEGIS_BOOTSTRAP_DEBUG=true` environment variable)
+
+This is useful for tracing LLM connectivity issues, prompt delivery, or agent execution failures.
+
+**Example Debug Output:**
+
+```bash
+# Start with debug logging
+RUST_LOG=debug cargo run -p aegis-cli -- daemon start
+
+# In another terminal, execute an agent
+cargo run -p aegis-cli -- task execute my-agent --input "test"
+
+# You'll see in the orchestrator logs:
+# DEBUG aegis_core::infrastructure::runtime: Starting bootstrap.py execution container_id="abc123"
+# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "Attempting to connect to Orchestrator at http://host.docker.internal:8000..."
+# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Bootstrap starting - execution_id=xxx, iteration=1"
+# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Received prompt (1234 chars)"
+```
+
+**Troubleshooting Bootstrap Issues:**
+
+If agents fail to execute or you see connection errors:
+
+1. Enable debug logging: `RUST_LOG=debug`
+2. Check bootstrap.py output in orchestrator logs
+3. Verify `AEGIS_ORCHESTRATOR_URL` is reachable from inside containers
+
 ### Running Locally
 
 ```bash

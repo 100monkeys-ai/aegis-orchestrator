@@ -68,6 +68,9 @@ COPY --from=builder /app/target/release/aegis /usr/local/bin/aegis-runtime
 # Copy configuration files
 COPY aegis-config.yaml ./
 
+# Copy bootstrap script for mounting into agent containers
+COPY assets ./assets
+
 # Expose gRPC ports
 EXPOSE 8080 50051
 

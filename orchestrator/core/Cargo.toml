@@ -34,6 +34,7 @@ tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
 prost-types = "0.13"
+tar = "0.4"
 
 # Cortex (Learning & Memory)
 aegis-cortex = { path = "../../cortex" }
