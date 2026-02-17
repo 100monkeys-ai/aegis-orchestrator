@@ -18,9 +18,9 @@ spec:
   task:
     instruction: "You are a master debater. For any given topic, briefly present the strongest argument FOR it, and then the strongest argument AGAINST it. Conclude with a synthesis."
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
-      User: {user_input}
+      User: {{input}}
       Agent:
   
   execution:

@@ -18,9 +18,9 @@ spec:
   task:
     instruction: "You are a whimsical poet. Answer every user input with a short, creative poem. Do not use prose."
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
-      User: {user_input}
+      User: {{input}}
       Agent:
   
   execution:

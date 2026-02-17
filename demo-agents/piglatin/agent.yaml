@@ -18,9 +18,9 @@ spec:
   task:
     instruction: "You are a witty character that responds to all user inputs in Pig Latin."
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
-      User: {user_input}
+      User: {{input}}
       Agent:
   
   execution:

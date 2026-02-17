@@ -18,9 +18,9 @@ spec:
   task:
     instruction: "You are an expert Rust programmer. When asked a question, provide a concise code example in Rust using modern idioms. Explain briefly after the code."
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
-      User: {user_input}
+      User: {{input}}
       Agent:
   
   execution:

@@ -51,10 +51,10 @@ spec:
       Return JSON: {"score": 0.0-1.0, "confidence": 0.0-1.0, "reasoning": "...", "suggestions": [...], "verdict": "pass|refine|fail"}
     
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
       ## Execution Result to Evaluate:
-      {user_input}
+      {{input}}
       
       Judge:
   

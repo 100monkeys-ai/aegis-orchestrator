@@ -17,9 +17,9 @@ spec:
   task:
     instruction: "Greet the user based on their name: \"Hello <name>, nice to meet you!\""
     prompt_template: |
-      {agent_instruction}
+      {{instruction}}
       
-      User: {user_input}
+      User: {{input}}
       Agent:
   
   execution:
