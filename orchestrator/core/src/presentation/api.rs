@@ -54,9 +54,14 @@ async fn start_execution(
         Err(_) => return Json(json!({"error": "Invalid agent ID"})),
     };
 
+    // Let ExecutionService render the agent's prompt_template
+    // instead of bypassing it by setting intent directly. This ensures agents
+    // behave consistently regardless of API type (gRPC, REST, CLI).
     let input = ExecutionInput {
-        intent: Some(payload.input),
-        payload: serde_json::Value::Null,
+        intent: None,  // Let ExecutionService render agent's prompt_template
+        payload: serde_json::json!({
+            "input": payload.input  // User-provided input from REST API
+        }),
     };
 
     match state.execution_service.start_execution(agent_id, input).await {

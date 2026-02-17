@@ -34,90 +34,44 @@ spec:
     isolation: firecracker
     timeout: 30s
   
+  # Judge task definition
+  task:
+    instruction: |
+      You are a Judge Agent responsible for evaluating code execution results.
+      Analyze execution output and assign a validation score from 0.0 to 1.0.
+      
+      Scoring Rubric:
+      - 1.0 (Perfect): Code executes successfully, output exactly matches requirements
+      - 0.8-0.9 (Excellent): Functionally correct with minor style issues
+      - 0.6-0.7 (Good): Core functionality works, some edge cases not handled
+      - 0.4-0.5 (Fair): Partial functionality, significant bugs
+      - 0.2-0.3 (Poor): Major errors or crashes
+      - 0.0-0.1 (Failed): Complete failure, no meaningful output
+      
+      Return JSON: {"score": 0.0-1.0, "confidence": 0.0-1.0, "reasoning": "...", "suggestions": [...], "verdict": "pass|refine|fail"}
+    
+    prompt_template: |
+      {agent_instruction}
+      
+      ## Execution Result to Evaluate:
+      {user_input}
+      
+      Judge:
+  
+  # Execution configuration
+  execution:
+    mode: "one-shot"  # Judges run once, no refinement
+    max_iterations: 1
+  
   # Security policy
   security:
     network:
-      mode: deny-all  # Judges don't need network access
-    
-    filesystem:
-      mode: readonly
-      allowed_paths:
-        - /tmp/input  # Read execution artifacts
+      mode: "none"  # Judges don't need network access
     
     resources:
-      cpu: 1.0
-      memory: 512Mi
-      max_iterations: 1  # Judges run once, no refinement
-  
-  # Agent prompt template
-  prompt: |
-    You are a **Judge Agent** responsible for evaluating code execution results.
-    
-    ## Your Task
-    Analyze the execution output and assign a validation score from 0.0 to 1.0.
-    
-    ## Input Context
-    - **Original Task**: {{task}}
-    - **Generated Code**: {{code}}
-    - **Execution Output**: {{output}}
-    - **Exit Code**: {{exit_code}}
-    - **Execution Time**: {{execution_time_ms}}ms
-    
-    ## Scoring Rubric
-    
-    ### 1.0 (Perfect)
-    - Code executes successfully (exit code 0)
-    - Output exactly matches requirements
-    - No errors, warnings, or edge cases missed
-    - Efficient and well-structured
-    
-    ### 0.8-0.9 (Excellent)
-    - Functionally correct
-    - Minor style or efficiency issues
-    - Output meets all requirements with small imperfections
-    
-    ### 0.6-0.7 (Good)
-    - Core functionality works
-    - Some edge cases not handled
-    - Output mostly correct but incomplete
-    
-    ### 0.4-0.5 (Fair)
-    - Partial functionality
-    - Significant bugs or missing features
-    - Output demonstrates understanding but needs refinement
-    
-    ### 0.2-0.3 (Poor)
-    - Major errors or crashes
-    - Output barely related to task
-    - Fundamental misunderstanding
-    
-    ### 0.0-0.1 (Failed)
-    - Complete failure (non-zero exit code)
-    - No meaningful output
-    - Agent did not attempt the task
-    
-    ## Output Format (JSON)
-    ```json
-    {
-      "score": 0.85,
-      "confidence": 0.92,
-      "reasoning": "The code successfully prints 'hello world'. Exit code 0 indicates success. The output matches expectations. Minor deduction for missing comments.",
-      "suggestions": [
-        "Add docstring explaining the function",
-        "Consider edge case handling"
-      ],
-      "verdict": "pass"
-    }
-    ```
-    
-    ## Guidelines
-    - Be objective and evidence-based
-    - Explain your reasoning clearly
-    - Confidence reflects your certainty (0.0-1.0)
-    - Verdict is "pass" (score >= 0.7) or "refine" (score < 0.7)
-    - Provide actionable suggestions for improvement
-    
-    Now evaluate the execution result and respond with your judgment JSON.
+      cpu: 1000        # 1.0 CPU core
+      memory: "512Mi"
+      timeout: "30s"
   
   # Validation configuration
   validation:

@@ -8,36 +8,28 @@ import urllib.error
 def main():
     # 1. Configuration
     orchestrator_url = os.environ.get("AEGIS_ORCHESTRATOR_URL", "http://host.docker.internal:8000")
-    agent_instruction = os.environ.get("AEGIS_AGENT_INSTRUCTION", "You are a helpful assistant.")
-    agent_id = os.environ.get("AEGIS_AGENT_ID", "unknown")
-    agent_id = os.environ.get("AEGIS_AGENT_ID", "unknown")
     execution_id = os.environ.get("AEGIS_EXECUTION_ID")
     iteration_env = os.environ.get("AEGIS_ITERATION")
     iteration_number = int(iteration_env) if iteration_env else None
     
-    # Prompt template from manifest (task.prompt_template)
-    # Default: "{agent_instruction}\n\nUser: {user_input}\nAssistant:"
-    prompt_template = os.environ.get(
-        "AEGIS_PROMPT_TEMPLATE",
-        "{agent_instruction}\n\nUser: {user_input}\nAssistant:"
-    )
-    
     # Previous iteration history (JSON array of {iteration, output, error})
     iteration_history_json = os.environ.get("AEGIS_ITERATION_HISTORY", "[]")
     
-    # 2. Read Input
-    # Input is passed as the first argument or via stdin
+    # 2. Read Fully-Rendered Prompt
+    # NOTE: As of the prompt preparation refactor, the prompt is now FULLY RENDERED
+    # by ExecutionService before being passed to the agent. We no longer do template
+    # rendering here - we receive the complete LLM prompt as argv[1].
     if len(sys.argv) > 1:
-        user_input = sys.argv[1]
+        rendered_prompt = sys.argv[1]
     else:
-        # Fallback to stdin if needed, but for now we expect args
-        user_input = sys.stdin.read().strip()
+        # Fallback to stdin if needed
+        rendered_prompt = sys.stdin.read().strip()
 
-    if not user_input:
-        print("Error: No input provided", file=sys.stderr)
+    if not rendered_prompt:
+        print("Error: No prompt provided", file=sys.stderr)
         sys.exit(1)
 
-    # 3. Construct Prompt
+    # 3. Enhance with Iteration History (if retry)
     # Build iteration history context if this is a retry
     history_context = ""
     try:
@@ -62,30 +54,19 @@ def main():
         # If history is malformed, continue without it
         pass
     
-    # Append history to user_input for context
-    enhanced_input = user_input
+    # Prepend history context to the rendered prompt if we're in a retry
+    final_prompt = rendered_prompt
     if history_context:
-        enhanced_input = f"{history_context}{user_input}"
-    
-    # Use template from manifest (or default if not specified)
-    prompt = prompt_template.format(
-        agent_instruction=agent_instruction,
-        user_input=enhanced_input
-    )
+        final_prompt = f"{history_context}{rendered_prompt}"
 
-    # 4. Call LLM Proxy with Failover
-    payload = {
-        "prompt": prompt,
-        "execution_id": execution_id,
-        "model": "default" # Or from env
-    }
+    # Prepend history context to the rendered prompt if we're in a retry
+    final_prompt = rendered_prompt
+    if history_context:
+        final_prompt = f"{history_context}{rendered_prompt}"
 
     # 4. Call LLM Proxy
-    # We rely on DockerRuntime setting "host.docker.internal:host-gateway"
-    # or the user providing AEGIS_ORCHESTRATOR_URL.
-    
     payload = {
-        "prompt": prompt,
+        "prompt": final_prompt,
         "execution_id": execution_id,
         "iteration_number": iteration_number,
         "model": "default"

@@ -85,9 +85,15 @@ impl AegisRuntime for AegisRuntimeService {
                 .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {}", e)))?
         };
 
+        // Let ExecutionService render the agent's prompt_template
+        // instead of bypassing it by setting intent directly. This ensures agents
+        // behave consistently regardless of API type (gRPC, REST, CLI).
         let input = ExecutionInput {
-            intent: Some(req.input.clone()),
-            payload,
+            intent: None,  // Let ExecutionService render agent's prompt_template
+            payload: serde_json::json!({
+                "input": req.input,  // User-provided input
+                "context": payload   // Additional context if provided
+            }),
         };
 
         // Channel for streaming events

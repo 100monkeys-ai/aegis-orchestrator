@@ -123,10 +123,6 @@ pub struct RuntimeConfig {
     /// Language version (e.g., "3.11", "20", "1.75")
     pub version: String,
     
-    /// Optional custom entrypoint (default: main.py, index.js, main.rs, etc.)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub entrypoint: Option<String>,
-    
     /// Optional isolation mode (inherit, firecracker, docker, process)
     #[serde(default = "default_isolation")]
     pub isolation: String,

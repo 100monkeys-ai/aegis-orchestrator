@@ -133,7 +133,7 @@ impl LLMProvider for OllamaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::llm::{FinishReason, GenerationOptions};
+    use crate::domain::llm::FinishReason;
     
     #[test]
     fn test_ollama_adapter_creation() {

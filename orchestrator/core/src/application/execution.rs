@@ -1,13 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput};
+use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput, ExecutionError};
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::application::agent::AgentLifecycleService;
 use crate::infrastructure::event_bus::{EventBus, DomainEvent, EventBusError};
+use crate::infrastructure::prompt_template_engine::{PromptTemplateEngine, PromptContext};
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use futures::Stream;
@@ -155,20 +156,115 @@ impl SupervisorObserver for ExecutionMonitor {
     }
 }
 
+impl StandardExecutionService {
+    /// Extract user input string from ExecutionInput payload
+    /// 
+    /// Handles various input formats with priority order:
+    /// 1. Workflow data: `{"workflow_input": "..."}`  (from WorkflowEngine)
+    /// 2. Direct input: `{"input": "..."}`  (from CLI/API)
+    /// 3. Direct string: `"hello world"`
+    /// 4. Fallback: serialize entire object
+    fn extract_user_input(payload: &serde_json::Value) -> Result<String> {
+        match payload {
+            // Direct string value
+            serde_json::Value::String(s) => Ok(s.clone()),
+            
+            // Object - check for special keys in priority order
+            serde_json::Value::Object(map) => {
+                // Priority 1: workflow_input (from WorkflowEngine)
+                if let Some(workflow_input) = map.get("workflow_input") {
+                    if let serde_json::Value::String(s) = workflow_input {
+                        return Ok(s.clone());
+                    }
+                }
+                
+                // Priority 2: input (from CLI/direct calls)
+                if let Some(input_val) = map.get("input") {
+                    if let serde_json::Value::String(s) = input_val {
+                        return Ok(s.clone());
+                    }
+                }
+                
+                // Fallback: serialize the whole object as JSON string
+                Ok(serde_json::to_string_pretty(payload)?)
+            },
+            
+            // Null or empty
+            serde_json::Value::Null => {
+                Err(ExecutionError::InvalidExecutionInput(
+                    "Payload is null or empty".to_string()
+                ).into())
+            },
+            
+            // Other types: serialize as string representation
+            _ => Ok(payload.to_string()),
+        }
+    }
+    
+    /// Prepare execution input by rendering prompt template
+    /// 
+    /// ARCHITECTURAL PRINCIPLE: Always renders the agent's prompt_template to ensure
+    /// agents are deterministic black boxes. External callers provide data via payload,
+    /// but the agent controls how that data is formatted into an LLM prompt.
+    /// 
+    /// Any pre-existing intent value is ignored to enforce this boundary.
+    fn prepare_execution_input(
+        &self,
+        mut input: ExecutionInput,
+        agent: &crate::domain::agent::Agent,
+    ) -> Result<ExecutionInput> {
+        // Get task spec with prompt template
+        let task_spec = agent.manifest.spec.task.as_ref()
+            .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
+        
+        let prompt_template = task_spec.prompt_template.as_ref()
+            .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
+        
+        // Get agent instruction
+        let agent_instruction = task_spec.instruction.as_ref()
+            .or(agent.manifest.metadata.description.as_ref())
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        
+        // Extract user input from payload
+        let user_input = Self::extract_user_input(&input.payload)?;
+        
+        // Build prompt context
+        let context = PromptContext::new()
+            .instruction(agent_instruction)
+            .input(user_input)
+            .iteration_number(1);
+        
+        // Render template
+        let template_engine = PromptTemplateEngine::new();
+        let rendered_prompt = template_engine
+            .render(prompt_template, &context)
+            .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
+        
+        // Set the rendered prompt as intent (overwriting any pre-existing value)
+        input.intent = Some(rendered_prompt);
+        
+        Ok(input)
+    }
+}
+
 #[async_trait]
 impl ExecutionService for StandardExecutionService {
     async fn start_execution(&self, agent_id: AgentId, input: ExecutionInput) -> Result<ExecutionId> {
         // 1. Fetch Agent
         let agent = self.agent_service.get_agent(agent_id).await?;
         
-        // 2. Create Execution Record
+        // 2. Prepare execution input (render prompt template if needed)
+        let prepared_input = self.prepare_execution_input(input, &agent)?;
+        
+        // 3. Create Execution Record
         let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
              exec.max_retries as u8
         } else {
             3 // Default
         };
 
-        let mut execution = Execution::new(agent_id, input.clone(), max_retries);
+        let mut execution = Execution::new(agent_id, prepared_input.clone(), max_retries);
         let execution_id = execution.id;
         
         // 3. Save initial state
@@ -229,7 +325,6 @@ impl ExecutionService for StandardExecutionService {
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             language: agent.manifest.spec.runtime.language.clone(),
             version: agent.manifest.spec.runtime.version.clone(),
-            entrypoint: agent.manifest.spec.runtime.entrypoint.clone(),
             isolation: agent.manifest.spec.runtime.isolation.clone(),
             env,
             autopull: agent.manifest.spec.runtime.autopull,
@@ -246,7 +341,7 @@ impl ExecutionService for StandardExecutionService {
         let supervisor = self.supervisor.clone();
         let repository = self.repository.clone();
         let event_bus = self.event_bus.clone();
-        let exec_input = input.clone();
+        let exec_input = prepared_input.clone();
         
         // NOTE: We no longer build judges here. Validation is the workflow's responsibility.
         // If workflows want validation, they should spawn judge agents.

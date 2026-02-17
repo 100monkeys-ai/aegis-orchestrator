@@ -108,6 +108,10 @@ services:
     build:
       context: ..
       dockerfile: docker/Dockerfile.runtime
+      # Optional: Override default docker GID (999) if your host uses different GID
+      # Find your host's docker GID: getent group docker | cut -d: -f3
+      # args:
+      #   DOCKER_GID: 999
     container_name: aegis-runtime
     depends_on:
       postgres:
@@ -119,6 +123,7 @@ services:
       - RUST_LOG=info,aegis_orchestrator=debug
       - TEMPORAL_WORKER_URL=http://temporal-worker:3000
       - TEMPORAL_ADDRESS=temporal:7233
+      - AEGIS_ENABLE_DISK_QUOTAS=false  # Disable disk quotas on WSL/macOS (no XFS+pquota)
     ports:
       - "8080:8080"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities
@@ -152,7 +157,12 @@ services:
     networks:
       - aegis-network
     healthcheck:
-      test: ["CMD", "python", "-c", "import grpc, json; channel = grpc.insecure_channel('localhost:50052'); stub = channel.unary_unary('/EmbeddingService/HealthCheck'); resp = stub(b'{}', timeout=5); channel.close()"]
+      test: [
+        "CMD", 
+        "python", 
+        "-c", 
+        "import grpc; import embedding_pb2; import embedding_pb2_grpc; channel = grpc.insecure_channel('localhost:50052'); stub = embedding_pb2_grpc.EmbeddingServiceStub(channel); stub.HealthCheck(embedding_pb2.HealthCheckRequest(), timeout=5); channel.close()"
+      ]
       interval: 30s
       timeout: 10s
       retries: 3

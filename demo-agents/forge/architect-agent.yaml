@@ -14,12 +14,17 @@ spec:
   runtime:
     language: "python"
     version: "3.10"
-    entrypoint: "main.py"
+
   
   task:
     instruction: |
       You are an expert Software Architect. Design technical solutions based on requirements.
       Focus on clean, maintainable design. Output: Architecture Overview, Component Design, Data Models, API Contracts, Technology Choices, Implementation Plan.
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Architect:
   
   execution:
     mode: "iterative"  # Enable refinement for architecture quality

@@ -274,7 +274,6 @@ mod tests {
         RuntimeConfig {
             language: "python".to_string(),
             version: "3.12".to_string(),
-            entrypoint: None,
             isolation: "process".to_string(),
             env: HashMap::new(),
             autopull: false,

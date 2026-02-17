@@ -261,12 +261,17 @@ impl ValidationService {
         poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
         // 1. Prepare input
-        // payload must match what the Judge Agent expects.
-        // Usually { "content": ..., "criteria": ... } which matches ValidationRequest
-        let payload = serde_json::to_value(&request)?;
+        // Let ExecutionService render the judge agent's prompt_template
+        // The judge agent's manifest defines how it should receive validation requests.
+        // We pass the validation data as workflow_input so it gets rendered through
+        // the judge's template (e.g., "You are a validation judge...{user_input}").
+        let payload_data = serde_json::to_value(&request)?;
         let input = ExecutionInput {
-            intent: Some("Validate content".to_string()),
-            payload,
+            intent: None,  // Let ExecutionService render judge agent's prompt_template
+            payload: serde_json::json!({
+                "workflow_input": payload_data,  // ValidationRequest data
+                "validation_context": "judge_execution"
+            }),
         };
 
         // 2. Start execution

@@ -255,7 +255,6 @@ spec:
                 runtime: RuntimeConfig {
                     language: "python".to_string(),
                     version: "3.11".to_string(),
-                    entrypoint: None,
                     isolation: "inherit".to_string(),
                     autopull: true,
                 },

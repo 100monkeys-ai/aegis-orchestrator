@@ -13,7 +13,6 @@ spec:
   runtime:
     language: "python"
     version: "3.11"
-    entrypoint: "main.py"
   
   task:
     instruction: "Echo the input back to the user."

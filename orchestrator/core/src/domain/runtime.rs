@@ -11,7 +11,6 @@ use chrono::{DateTime, Utc};
 pub struct RuntimeConfig {
     pub language: String,
     pub version: String,
-    pub entrypoint: Option<String>,
     pub isolation: String,
     pub env: HashMap<String, String>,
     pub autopull: bool,

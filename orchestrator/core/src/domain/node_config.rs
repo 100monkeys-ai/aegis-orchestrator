@@ -202,12 +202,32 @@ pub struct RuntimeConfig {
     /// Default: "assets/bootstrap.py" (relative to orchestrator binary)
     #[serde(default = "default_bootstrap_script")]
     pub bootstrap_script: String,
+    
+    /// Default isolation mode for agent execution
+    /// Options: "docker", "firecracker", "inherit", "process"
+    /// Default: "inherit" (uses whatever the parent process provides)
+    #[serde(default = "default_isolation_mode")]
+    pub default_isolation: String,
+    
+    /// Path to Docker socket (for Docker-based isolation)
+    /// Default: "/var/run/docker.sock" on Linux/Mac, "//./pipe/docker_engine" on Windows
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub docker_socket_path: Option<String>,
+    
+    /// Enable Docker disk quotas via storage_opt (requires overlay2 + XFS with pquota)
+    /// Default: true (will attempt and gracefully degrade if not supported)
+    /// Set to false to skip disk quota attempts entirely for efficiency
+    #[serde(default = "default_enable_disk_quotas")]
+    pub enable_disk_quotas: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
         Self {
             bootstrap_script: default_bootstrap_script(),
+            default_isolation: default_isolation_mode(),
+            docker_socket_path: None,
+            enable_disk_quotas: default_enable_disk_quotas(),
         }
     }
 }
@@ -477,19 +497,51 @@ impl NodeConfigManifest {
         // 1. Explicit CLI path (Fail if missing/invalid)
         if let Some(path) = cli_path {
             tracing::info!("Loading configuration from explicit path: {:?}", path);
-            return Self::from_yaml_file(&path).map_err(|e| {
+            let mut config = Self::from_yaml_file(&path).map_err(|e| {
                 anyhow::anyhow!("Failed to search/load config at {:?}: {}", path, e)
-            });
+            })?;
+            config.apply_env_overrides();
+            return Ok(config);
         }
 
         // 2. Discovery (Env -> Cwd -> Home -> System)
         if let Some(config_path) = Self::discover_config() {
             tracing::info!("Loading configuration from discovered path: {:?}", config_path);
-            Self::from_yaml_file(config_path)
+            let mut config = Self::from_yaml_file(config_path)?;
+            config.apply_env_overrides();
+            Ok(config)
         } else {
             tracing::warn!("No configuration file found in standard locations. Using empty defaults.");
-            Ok(Self::default())
+            let mut config = Self::default();
+            config.apply_env_overrides();
+            Ok(config)
         }
+    }
+    
+    /// Apply environment variable overrides to configuration
+    /// This allows container deployments to override config via env vars
+    pub fn apply_env_overrides(&mut self) {
+        // Runtime configuration overrides
+        if let Ok(val) = std::env::var("AEGIS_ENABLE_DISK_QUOTAS") {
+            match val.to_lowercase().as_str() {
+                "true" | "1" | "yes" | "on" => {
+                    tracing::info!("Environment override: AEGIS_ENABLE_DISK_QUOTAS=true");
+                    self.spec.runtime.enable_disk_quotas = true;
+                }
+                "false" | "0" | "no" | "off" => {
+                    tracing::info!("Environment override: AEGIS_ENABLE_DISK_QUOTAS=false");
+                    self.spec.runtime.enable_disk_quotas = false;
+                }
+                _ => {
+                    tracing::warn!(
+                        "Invalid value for AEGIS_ENABLE_DISK_QUOTAS: '{}'. Expected true/false. Ignoring.",
+                        val
+                    );
+                }
+            }
+        }
+        
+        // Add more environment variable overrides here as needed
     }
     
     /// Validate configuration
@@ -676,4 +728,12 @@ mod tests {
 
 fn default_bootstrap_script() -> String {
     "assets/bootstrap.py".to_string()
+}
+
+fn default_isolation_mode() -> String {
+    "inherit".to_string()
+}
+
+fn default_enable_disk_quotas() -> bool {
+    true
 }

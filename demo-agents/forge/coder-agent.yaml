@@ -14,12 +14,17 @@ spec:
   runtime:
     language: "python"
     version: "3.10"
-    entrypoint: "main.py"
+
   
   task:
     instruction: |
       You are an expert Software Engineer. Write clean, production-quality code with proper error handling, documentation, and unit tests.
       Follow language conventions, use meaningful names, keep functions focused. Code should be merge-ready.
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Engineer:
   
   execution:
     mode: "iterative"  # Enable refinement for code quality

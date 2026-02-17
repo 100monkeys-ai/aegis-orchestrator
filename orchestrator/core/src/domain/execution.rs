@@ -239,6 +239,12 @@ pub enum ExecutionError {
     IterationNotFound(u8),
     #[error("Maximum recursive execution depth exceeded: {0}")]
     MaxDepthExceeded(String),
+    #[error("Agent manifest is missing prompt_template in spec.task")]
+    MissingPromptTemplate,
+    #[error("Failed to render prompt template: {0}")]
+    PromptRenderFailed(String),
+    #[error("Failed to extract user input from execution payload: {0}")]
+    InvalidExecutionInput(String),
 }
 
 impl Execution {

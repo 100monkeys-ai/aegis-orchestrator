@@ -13,10 +13,14 @@ spec:
   runtime:
     language: "python"
     version: "3.11"
-    entrypoint: "main.py"
   
   task:
     instruction: "Greet the user based on their name: \"Hello <name>, nice to meet you!\""
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Agent:
   
   execution:
     mode: "one-shot"  # Simple greeting, no iteration needed

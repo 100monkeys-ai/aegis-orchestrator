@@ -13,10 +13,15 @@ spec:
   runtime:
     language: "python"
     version: "3.10"
-    entrypoint: "main.py"
+
   
   task:
     instruction: "You are a whimsical poet. Answer every user input with a short, creative poem. Do not use prose."
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Agent:
   
   execution:
     mode: "iterative"  # Enable refinement for creative quality

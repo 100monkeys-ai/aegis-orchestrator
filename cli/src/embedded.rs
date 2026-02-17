@@ -55,8 +55,12 @@ impl EmbeddedExecutor {
                 .context("Failed to initialize LLM providers")?,
         );
         let runtime = Arc::new(
-            DockerRuntime::new(config.spec.runtime.bootstrap_script.clone())
-                .context("Failed to initialize Docker runtime")?
+            DockerRuntime::new(
+                config.spec.runtime.bootstrap_script.clone(),
+                config.spec.runtime.docker_socket_path.clone(),
+                config.spec.runtime.enable_disk_quotas
+            )
+            .context("Failed to initialize Docker runtime")?
         );
         let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
@@ -87,8 +91,10 @@ impl EmbeddedExecutor {
         agent_id: AgentId,
         input: serde_json::Value,
     ) -> Result<ExecutionId> {
+        // For now, keep intent as None and let ExecutionService handle prompt rendering
+        // The input payload will be processed by ExecutionService.prepare_execution_input()
         let execution_input = ExecutionInput {
-             intent: None, // Or extract from input if applicable
+             intent: None, // Will be rendered by ExecutionService from prompt template
              payload: input,
         };
         self.execution_service.start_execution(agent_id, execution_input).await

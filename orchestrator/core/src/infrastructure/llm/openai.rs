@@ -175,7 +175,7 @@ impl LLMProvider for OpenAIAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::llm::{FinishReason, GenerationOptions, TokenUsage};
+    use crate::domain::llm::{FinishReason, GenerationOptions};
     
     #[test]
     fn test_openai_adapter_creation() {

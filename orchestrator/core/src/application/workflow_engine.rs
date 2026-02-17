@@ -322,7 +322,7 @@ impl WorkflowEngine {
         );
 
         // Execute state (this is simplified - actual implementation would delegate to handlers)
-        let state_output = self.execute_state(&workflow, current_state, workflow_execution, execution_id).await?;
+        let state_output = self.execute_state(&workflow, &current_state_name, current_state, workflow_execution, execution_id).await?;
 
         // Record output
         workflow_execution.record_state_output(current_state_name.clone(), state_output.clone());
@@ -387,6 +387,7 @@ impl WorkflowEngine {
     async fn execute_state(
         &self,
         workflow: &Workflow,
+        state_name: &StateName,
         state: &WorkflowState,
         workflow_execution: &WorkflowExecution,
         execution_id: ExecutionId,
@@ -413,13 +414,18 @@ impl WorkflowEngine {
                     rendered_input.clone()
                 };
 
-                // Prepare execution input with injected patterns
+                // Agents must be deterministic black boxes.
+                // Instead of bypassing the agent's prompt_template by setting `intent`,
+                // we pass workflow data as payload and let ExecutionService apply the
+                // agent's template. This ensures agents behave consistently regardless
+                // of whether they're called from workflows, CLI, or API.
                 let execution_input = crate::domain::execution::ExecutionInput {
-                    intent: Some(input_with_patterns),
+                    intent: None,  // Let ExecutionService render agent's prompt_template
                     payload: serde_json::json!({
+                        "workflow_input": input_with_patterns,  // Workflow-provided data
                         "workflow_id": workflow.id,
-                        "state": state.kind,
-                        "context": workflow_execution.blackboard.data()
+                        "workflow_state": state_name.as_str(),
+                        "blackboard": workflow_execution.blackboard.data()
                     }),
                 };
 
@@ -577,10 +583,13 @@ impl WorkflowEngine {
                     let handle = tokio::spawn(async move {
                         let _permit = permit; // Hold permit for duration of execution
                         
-                        // Prepare execution input
+                        // ARCHITECTURAL FIX: Let ExecutionService render the agent's prompt_template
+                        // Same principle as sequential workflow execution - agents must be deterministic
+                        // black boxes that control their own prompting.
                         let execution_input = crate::domain::execution::ExecutionInput {
-                            intent: Some(input.clone()),
+                            intent: None,  // Let ExecutionService render agent's prompt_template
                             payload: serde_json::json!({
+                                "workflow_input": input.clone(),  // Workflow-provided data
                                 "workflow_id": workflow_id,
                                 "parallel_execution": true,
                                 "context": blackboard_data

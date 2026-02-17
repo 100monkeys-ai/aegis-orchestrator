@@ -184,12 +184,24 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     println!("Initializing Docker runtime...");
-    // Force a timeout on docker connection if possible, or just log before/after
     let runtime = Arc::new(
-        DockerRuntime::new(config.spec.runtime.bootstrap_script.clone())
-            .context("Failed to initialize Docker runtime")?
+        DockerRuntime::new(
+            config.spec.runtime.bootstrap_script.clone(),
+            config.spec.runtime.docker_socket_path.clone(),
+            config.spec.runtime.enable_disk_quotas
+        )
+        .context("Failed to initialize Docker runtime")?
     );
-    println!("Docker runtime initialized.");
+    
+    // Only healthcheck Docker if it's the configured isolation mode
+    if config.spec.runtime.default_isolation == "docker" {
+        runtime.healthcheck().await
+            .context("Docker healthcheck failed. Docker isolation is configured but Docker daemon is not accessible.")?;
+        println!("✓ Docker runtime connected and healthy.");
+    } else {
+        println!("Docker runtime initialized (healthcheck skipped - isolation mode: {}).", 
+                 config.spec.runtime.default_isolation);
+    }
 
     let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
@@ -1492,8 +1504,6 @@ async fn reject_request_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    
     #[test]
     fn test_create_router_returns_router() {
         // This is a smoke test to ensure create_router compiles and can be called

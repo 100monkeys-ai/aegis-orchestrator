@@ -14,7 +14,7 @@ spec:
   runtime:
     language: "python"
     version: "3.10"
-    entrypoint: "main.py"
+
   
   task:
     instruction: |
@@ -42,6 +42,11 @@ spec:
       - Success Metrics
       
       Be thorough but concise. Flag any ambiguities or missing information.
+    prompt_template: |
+      {agent_instruction}
+      
+      User: {user_input}
+      Analyst:
   
   execution:
     mode: "one-shot"
