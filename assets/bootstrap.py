@@ -104,7 +104,7 @@ def main():
     
     for base_url in urls:
         debug_print(f"Attempting to connect to Orchestrator at {base_url}...")
-        url = f"{base_url.rstrip('/')}/api/llm/generate"
+        url = f"{base_url.rstrip('/')}/v1/llm/generate"
         debug_print(f"Trying URL: {url}")
         try:
             req = urllib.request.Request(

@@ -101,7 +101,7 @@ docker compose ps
 # temporal          Up      7233/tcp
 # temporal-ui       Up      8233/tcp
 # temporal-worker   Up      3000/tcp
-# aegis-runtime     Up      50051/tcp, 8080/tcp
+# aegis-runtime     Up      50051/tcp, 8088/tcp
 ```
 
 **Service Health Checks:**
@@ -204,10 +204,10 @@ spec:
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/echo-workflow.yaml
+cargo run --bin aegis -- --port 8088 workflow deploy demo-agents/workflows/echo-workflow.yaml
 
 # OR using HTTP API
-curl -X POST http://localhost:8080/api/workflows/register \
+curl -X POST http://localhost:8088/v1/workflows/register \
   -H "Content-Type: application/yaml" \
   --data-binary @demo-agents/workflows/echo-workflow.yaml
 ```
@@ -248,7 +248,7 @@ curl http://localhost:3000/workflows
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- --port 8080 workflow run echo-test \
+cargo run --bin aegis -- --port 8088 workflow run echo-test \
   --param message="Hello World!"
 
 # OR using Temporal CLI directly
@@ -312,7 +312,7 @@ task:
 
 ```bash
 # Deploy agent
-cargo run --bin aegis -- --port 8080 agent deploy demo-agents/greeter/agent.yaml
+cargo run --bin aegis -- --port 8088 agent deploy demo-agents/greeter/agent.yaml
 
 # Expected output:
 # Agent deployed: coder (id: ...)
@@ -321,7 +321,7 @@ cargo run --bin aegis -- --port 8080 agent deploy demo-agents/greeter/agent.yaml
 ### Step 2.2: Execute Test Agent
 
 ```bash
-cargo run --bin aegis -- --port 8080 task execute greeter --input "Jeshua"
+cargo run --bin aegis -- --port 8088 task execute greeter --input "Jeshua"
 ```
 
 #### Step 2.3: Create and Deploy Agent Workflow
@@ -362,14 +362,14 @@ spec:
 
 ```bash
 # Deploy workflow
-cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/agent-workflow.yaml
+cargo run --bin aegis -- --port 8088 workflow deploy demo-agents/workflows/agent-workflow.yaml
 ```
 
 #### Step 2.4: Run Workflow
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- --port 8080 workflow run agent-test \
+cargo run --bin aegis -- --port 8088 workflow run agent-test \
   --param input="Hello"
 
 # Execute with Temporal CLI
@@ -425,10 +425,10 @@ psql -h localhost -U aegis -d aegis -c \
 
 ```bash
 # Deploy coder agent
-cargo run --bin aegis -- --port 8080 agent deploy demo-agents/coder/agent.yaml
+cargo run --bin aegis -- --port 8088 agent deploy demo-agents/coder/agent.yaml
 
 # Deploy judge agent
-cargo run --bin aegis -- --port 8080 agent deploy demo-agents/judges/basic-judge.yaml
+cargo run --bin aegis -- --port 8088 agent deploy demo-agents/judges/basic-judge.yaml
 
 # Verify deployments
 psql -h localhost -U aegis -d aegis -c \
@@ -439,10 +439,10 @@ psql -h localhost -U aegis -d aegis -c \
 
 ```bash
 # Register the classic workflow using CLI
-cargo run --bin aegis -- --port 8080 workflow deploy demo-agents/workflows/100monkeys-classic.yaml
+cargo run --bin aegis -- --port 8088 workflow deploy demo-agents/workflows/100monkeys-classic.yaml
 
 # OR using HTTP API
-curl -X POST http://localhost:8080/api/workflows/register \
+curl -X POST http://localhost:8088/v1/workflows/register \
   -H "Content-Type: application/yaml" \
   --data-binary @demo-agents/workflows/100monkeys-classic.yaml
 
@@ -454,7 +454,7 @@ curl http://localhost:3000/workflows | jq '.[] | select(.name == "100monkeys-cla
 
 ```bash
 # Using Rust CLI
-cargo run --bin aegis -- --port 8080 workflow run 100monkeys-classic \
+cargo run --bin aegis -- --port 8088 workflow run 100monkeys-classic \
   --input '{"agent_id": "coder", "task": "Create a fibonacci function in Python", "command": "python fib.py"}'
 
 # OR start workflow with Temporal CLI directly
@@ -465,7 +465,7 @@ temporal workflow start \
   --input '{"agent_id": "coder", "task": "Create a fibonacci function in Python", "command": "python fib.py"}'
 
 # Follow execution (when using CLI)
-cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
+cargo run --bin aegis -- --port 8088 workflow logs <EXECUTION_ID> --follow
 
 # OR follow with Temporal CLI
 temporal workflow show --workflow-id test-100monkeys-001 --follow
@@ -625,7 +625,7 @@ spec:
 
 ```bash
 # Register
-curl -X POST http://localhost:8080/api/workflows/register \
+curl -X POST http://localhost:8088/v1/workflows/register \
   -H "Content-Type: application/yaml" \
   --data-binary @demo-agents/workflows/multi-judge.yaml
 
@@ -736,6 +736,304 @@ temporal workflow show --workflow-id test-human-001
 3. Signal received → evaluates condition
 4. `input_equals_yes` → transitions to DEPLOY
 5. DEPLOY executes → workflow completes
+
+---
+
+### Scenario 6: Volume Management & File System Handoff (ADR-032)
+
+**Objective:** Test unified storage layer with SeaweedFS-backed volumes for multi-agent workflows
+
+#### Step 6.1: Verify SeaweedFS Infrastructure
+
+```bash
+# Check all SeaweedFS containers are running
+docker compose ps | grep seaweedfs
+
+# Expected output:
+# aegis-seaweedfs-master   Up   9333/tcp, 19333/tcp
+# aegis-seaweedfs-volume   Up   8080/tcp
+# aegis-seaweedfs-filer    Up   8888/tcp, 18888/tcp, 8333/tcp
+
+# Verify filer health
+curl -f http://localhost:8888/ && echo "✓ Filer is healthy"
+
+# Verify master status
+curl http://localhost:9333/cluster/status | jq
+
+# Expected response:
+# {
+#   "IsLeader": true,
+#   "Leader": "seaweedfs-master:9333",
+#   "Peers": []
+# }
+
+# Check seaweedfs database created
+psql -h localhost -U aegis -d seaweedfs -c "\dt"
+
+# Expected tables: seaweedfs_meta (filer metadata)
+```
+
+#### Step 6.2: Run Volume Migration
+
+```bash
+# Apply database migration for volumes table
+psql -h localhost -U aegis -d aegis -f cli/migrations/002_create_volumes_table.sql
+
+# Verify table created
+psql -h localhost -U aegis -d aegis -c "\d volumes"
+
+# Expected columns:
+# - id (UUID)
+# - name (TEXT)
+# - tenant_id (UUID)
+# - storage_class (JSONB)
+# - filer_endpoint (JSONB)
+# - remote_path (TEXT UNIQUE)
+# - size_limit_bytes (BIGINT)
+# - status (JSONB)
+# - ownership (JSONB)
+# - created_at, attached_at, detached_at, expires_at (TIMESTAMPTZ)
+
+# Verify indexes
+psql -h localhost -U aegis -d aegis -c "\di volumes*"
+
+# Expected indexes:
+# - volumes_pkey (PRIMARY KEY on id)
+# - idx_volumes_tenant_id
+# - idx_volumes_expires_at
+# - idx_volumes_ownership (GIN)
+# - idx_volumes_status (GIN)
+```
+
+#### Step 6.3: Test Volume Creation via SeaweedFS API
+
+```bash
+# Create test directory
+curl -X POST "http://localhost:8888/dir/?path=/aegis/volumes/test-tenant/test-volume-001"
+
+# Verify creation
+curl "http://localhost:8888/dir/status?path=/aegis/volumes/test-tenant/test-volume-001" | jq
+
+# Expected response:
+# {
+#   "TotalSize": 0,
+#   "FileCount": 0
+# }
+
+# Set quota (10MB)
+curl -X POST "http://localhost:8888/quota?path=/aegis/volumes/test-tenant/test-volume-001&bytes=10485760"
+
+# Upload test file
+echo "Hello from AEGIS volume!" > /tmp/test.txt
+curl -F "file=@/tmp/test.txt" "http://localhost:8888/aegis/volumes/test-tenant/test-volume-001/"
+
+# Verify file uploaded
+curl "http://localhost:8888/dir/status?path=/aegis/volumes/test-tenant/test-volume-001" | jq
+
+# Expected: TotalSize > 0, FileCount = 1
+
+# Test S3 gateway (optional external access)
+aws s3 ls s3://aegis/volumes/ --endpoint-url http://localhost:8333 --no-sign-request
+
+# Delete test directory
+curl -X DELETE "http://localhost:8888/dir/?path=/aegis/volumes/test-tenant/test-volume-001&recursive=true"
+```
+
+#### Step 6.4: Create Multi-Agent Workflow with Shared Volume
+
+Create `demo-agents/workflows/volume-handoff-test.yaml`:
+
+```yaml
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: "volume-handoff-test"
+  version: "1.0.0"
+  description: "Test file system handoff between agents via shared volume"
+
+spec:
+  # Shared workspace volume for all states
+  storage:
+    workspace:
+      name: "shared-workspace"
+      storage_class:
+        type: ephemeral
+        ttl: "6h"
+      size_limit_mb: 100
+
+  context:
+    task: "Create a simple Python calculator function"
+
+  initial_state: CODER
+
+  states:
+    CODER:
+      kind: Agent
+      agent: "python-coder"
+      input: |
+        Create a Python file 'calculator.py' with functions for add, subtract, multiply, divide.
+        Save it to /workspace/calculator.py
+      timeout: 120s
+      transitions:
+        - condition: on_success
+          target: TESTER
+
+    TESTER:
+      kind: Agent
+      agent: "python-tester"
+      input: |
+        Read /workspace/calculator.py and create comprehensive unit tests.
+        Save tests to /workspace/test_calculator.py
+        Run the tests using pytest and report results.
+      timeout: 120s
+      transitions:
+        - condition: on_success
+          target: COMPLETE
+        - condition: on_failure
+          target: CODER
+
+    COMPLETE:
+      kind: System
+      command: "echo"
+      env:
+        MESSAGE: "Code created and tested successfully!"
+        WORKSPACE_PATH: "/aegis/volumes/{{workflow_execution_id}}/workspace"
+      transitions: []
+```
+
+#### Step 6.5: Deploy and Execute Volume Workflow
+
+```bash
+# Deploy workflow
+cargo run --bin aegis -- --port 8088 workflow deploy demo-agents/workflows/volume-handoff-test.yaml
+
+# Run workflow
+temporal workflow start \
+  --task-queue aegis-task-queue \
+  --type aegis_workflow_volume_handoff_test \
+  --workflow-id test-volume-handoff-001 \
+  --input '{}'
+
+# Watch execution
+temporal workflow show --workflow-id test-volume-handoff-001 --follow
+
+# Check volume in database during execution
+psql -h localhost -U aegis -d aegis -c \
+  "SELECT id, name, remote_path, size_limit_bytes, status, expires_at FROM volumes WHERE ownership->>'type' = 'workflowexecution';"
+
+# Inspect volume contents via SeaweedFS
+WORKFLOW_EXEC_ID=$(psql -h localhost -U aegis -d aegis -t -c \
+  "SELECT id FROM workflow_executions WHERE temporal_workflow_id = 'test-volume-handoff-001';")
+
+curl "http://localhost:8888/aegis/volumes/00000000-0000-0000-0000-000000000001/${WORKFLOW_EXEC_ID}/workspace/" | jq
+
+# Expected files:
+# - calculator.py
+# - test_calculator.py
+# - pytest_output.txt (or similar)
+```
+
+#### Step 6.6: Test Volume Lifecycle Events
+
+```bash
+# Monitor volume events in database
+psql -h localhost -U aegis -d aegis -c \
+  "SELECT event_type, event_data->>'volume_id' as volume_id, created_at 
+   FROM domain_events 
+   WHERE event_type LIKE 'Volume%' 
+   ORDER BY created_at DESC 
+   LIMIT 10;"
+
+# Expected events:
+# - VolumeCreated
+# - VolumeAttached (CODER state)
+# - VolumeDetached (CODER state)
+# - VolumeAttached (TESTER state)
+# - VolumeDetached (TESTER state)
+# - VolumeDeleted (or VolumeExpired after TTL)
+```
+
+#### Step 6.7: Test Volume Quota Enforcement
+
+```bash
+# Create workflow that exceeds quota
+# (Requires modifying agent to write large files)
+
+# Expected behavior:
+# - Agent execution fails with quota exceeded error
+# - VolumeQuotaExceeded event published
+# - Workflow transitions to failure state
+```
+
+#### Step 6.8: Test Ephemeral Volume Cleanup
+
+```bash
+# Create volume with 1 minute TTL
+# Wait 90 seconds
+# Run cleanup job (in production, runs every 60 minutes)
+
+# Check expired volumes
+psql -h localhost -U aegis -d aegis -c \
+  "SELECT id, name, expires_at, status FROM volumes WHERE expires_at < NOW();"
+
+# Expected: Volumes past expiration timestamp
+
+# Trigger manual cleanup (when VolumeManager is implemented)
+# curl -X POST http://localhost:8088/v1/volumes/cleanup
+
+# Verify deletion
+psql -h localhost -U aegis -d aegis -c \
+  "SELECT COUNT(*) FROM volumes WHERE status->>'type' = 'deleted';"
+```
+
+**Expected Flow:**
+
+1. Workflow starts → VolumeManager creates workspace volume
+2. Volume metadata saved to PostgreSQL
+3. SeaweedFS directory created at `/aegis/volumes/{tenant_id}/{volume_id}`
+4. Quota set on SeaweedFS filer
+5. CODER agent spawns → Docker container mounts volume via NFS
+6. Agent writes files to `/workspace` (mapped to SeaweedFS)
+7. CODER completes → Volume detached
+8. TESTER agent spawns → Same volume attached
+9. TESTER reads files from `/workspace` (sees CODER's output)
+10. Workflow completes → Volume marked for cleanup
+11. TTL expires → Volume deleted from SeaweedFS and PostgreSQL
+
+**Performance Expectations:**
+
+| Operation | Target | Acceptable |
+| ------------------------- | -------- | ---------- |
+| Volume creation | < 2s | < 5s |
+| Volume attach | < 3s | < 10s |
+| File write (1MB) | < 500ms | < 2s |
+| File read (1MB) | < 300ms | < 1s |
+| Volume detach | < 1s | < 3s |
+| Volume deletion | < 5s | < 15s |
+| Multi-agent file handoff | < 10s | < 30s |
+
+**Troubleshooting Volume Issues:**
+
+```bash
+# Check SeaweedFS master logs
+docker logs aegis-seaweedfs-master
+
+# Check filer logs
+docker logs aegis-seaweedfs-filer
+
+# Verify NFS mount inside container
+docker exec -it <agent-container> df -h
+
+# Check volume server status
+curl http://localhost:8080/status | jq
+
+# Inspect filer metadata
+psql -h localhost -U aegis -d seaweedfs -c "SELECT * FROM seaweedfs_meta LIMIT 10;"
+
+# List all volumes
+curl "http://localhost:8888/dir/?path=/aegis/volumes" | jq
+```
 
 ---
 
@@ -930,7 +1228,7 @@ psql -h localhost -U aegis -d aegis -c \
   "SELECT name, status FROM agents WHERE name = 'coder';"
 
 # Check execution service
-curl http://localhost:8080/health
+curl http://localhost:8088/health
 
 # Increase activity timeout in workflow
 # Edit workflow YAML: timeout: 120s
@@ -960,10 +1258,10 @@ curl http://localhost:8080/health
 
 **Action:** No action needed - stubbed methods return empty results gracefully.
 
-### "Connection Refused" on Port 8080
+### "Connection Refused" on Port 8088
 
-- Is the daemon running? (`cargo run --bin aegis -- --daemon --port 8080`)
-- Is something else using port 8080?
+- Is the daemon running? (`cargo run --bin aegis -- --daemon --port 8088`)
+- Is something else using port 8088?
 
 ### Temporal Workflow Stays "Running"
 
@@ -1038,7 +1336,7 @@ Use the `100monkeys-classic` workflow, which triggers the validation loop where 
 
 ```bash
 # Run workflow (if not already running)
-cargo run --bin aegis -- --port 8080 workflow run 100monkeys-classic \
+cargo run --bin aegis -- --port 8088 workflow run 100monkeys-classic \
   --input '{
     "agent_id": "coder",
     "task": "Write a Python function to calculate factorial",
@@ -1052,7 +1350,7 @@ Watch the console output. You should see "Cortex Event" logs interleaved with ex
 
 ```bash
 # Watch logs
-cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
+cargo run --bin aegis -- --port 8088 workflow logs <EXECUTION_ID> --follow
 ```
 
 **Expected Output:**
@@ -1066,10 +1364,10 @@ cargo run --bin aegis -- --port 8080 workflow logs <EXECUTION_ID> --follow
 
 #### Step 6.3: Verify via HTTP Stream (Optional)
 
-You can also connect to the raw **agent execution** event stream (not the workflow logs) to see the JSON structure of the Cortex event. Use the agent execution ID associated with the `/api/executions/...` resource, not the workflow execution ID returned by `/api/workflows/:name/run`.
+You can also connect to the raw **agent execution** event stream (not the workflow logs) to see the JSON structure of the Cortex event. Use the agent execution ID associated with the `/v1/executions/...` resource, not the workflow execution ID returned by `/v1/workflows/:name/run`.
 
 ```bash
-curl -N http://localhost:8080/api/executions/<AGENT_EXECUTION_ID>/events
+curl -N http://localhost:8088/v1/executions/<AGENT_EXECUTION_ID>/events
 ```
 
 **Expected JSON:**

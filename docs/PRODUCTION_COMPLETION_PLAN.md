@@ -5737,7 +5737,7 @@ docker_config:
 
 # Network bindings
 grpc_bind_address: "0.0.0.0:50051"
-http_bind_address: "0.0.0.0:8080"  # NEW FOR PHASE 5
+http_bind_address: "0.0.0.0:8088"  # NEW FOR PHASE 5
 
 # Cortex configuration (NEW FOR PHASE 4)
 cortex:
@@ -5980,7 +5980,7 @@ Output:
 **Solution:** Check gradient scores. If below threshold repeatedly, approve with feedback manually.
 
 **Issue:** Human approval not showing  
-**Solution:** Check HTTP API on localhost:8080/api/human-inputs/pending
+**Solution:** Check HTTP API on localhost:8088/v1/human-inputs/pending
 
 **Issue:** Tests failing repeatedly  
 **Solution:** Check Cortex for similar patterns. coder-ai should learn from past fixes.

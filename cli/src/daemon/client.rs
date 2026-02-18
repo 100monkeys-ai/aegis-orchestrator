@@ -42,7 +42,7 @@ impl DaemonClient {
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
         let response = self
             .client
-            .post(&format!("{}/api/agents", self.base_url))
+            .post(&format!("{}/v1/agents", self.base_url))
             .json(&manifest)
             .send()
             .await
@@ -78,7 +78,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/api/agents/{}/execute", self.base_url, agent_id))
+            .post(&format!("{}/v1/agents/{}/execute", self.base_url, agent_id))
             .json(&ExecuteRequest { input })
             .send()
             .await
@@ -105,7 +105,7 @@ impl DaemonClient {
     pub async fn get_execution(&self, execution_id: Uuid) -> Result<ExecutionInfo> {
         let response = self
             .client
-            .get(&format!("{}/api/executions/{}", self.base_url, execution_id))
+            .get(&format!("{}/v1/executions/{}", self.base_url, execution_id))
             .send()
             .await
             .context("Failed to get execution")?;
@@ -125,7 +125,7 @@ impl DaemonClient {
         let response = self
             .client
             .post(&format!(
-                "{}/api/executions/{}/cancel",
+                "{}/v1/executions/{}/cancel",
                 self.base_url, execution_id
             ))
             .send()
@@ -145,7 +145,7 @@ impl DaemonClient {
         agent_id: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<ExecutionInfo>> {
-        let mut url = format!("{}/api/executions?limit={}", self.base_url, limit);
+        let mut url = format!("{}/v1/executions?limit={}", self.base_url, limit);
         if let Some(aid) = agent_id {
             url.push_str(&format!("&agent_id={}", aid));
         }
@@ -176,7 +176,7 @@ impl DaemonClient {
         verbose: bool,
     ) -> Result<()> {
         let mut url = format!(
-            "{}/api/executions/{}/events",
+            "{}/v1/executions/{}/events",
             self.base_url, execution_id
         );
         if follow {
@@ -227,7 +227,7 @@ impl DaemonClient {
         verbose: bool,
     ) -> Result<()> {
         let mut url = format!(
-            "{}/api/agents/{}/events",
+            "{}/v1/agents/{}/events",
             self.base_url, agent_id
         );
         if follow {
@@ -275,7 +275,7 @@ impl DaemonClient {
         let response = self
             .client
             .delete(&format!(
-                "{}/api/executions/{}",
+                "{}/v1/executions/{}",
                 self.base_url, execution_id
             ))
             .send()
@@ -293,7 +293,7 @@ impl DaemonClient {
     pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         let response = self
             .client
-            .get(&format!("{}/api/agents", self.base_url))
+            .get(&format!("{}/v1/agents", self.base_url))
             .send()
             .await
             .context("Failed to list agents")?;
@@ -312,7 +312,7 @@ impl DaemonClient {
     pub async fn get_agent(&self, agent_id: Uuid) -> Result<AgentManifest> {
         let response = self
             .client
-            .get(&format!("{}/api/agents/{}", self.base_url, agent_id))
+            .get(&format!("{}/v1/agents/{}", self.base_url, agent_id))
             .send()
             .await
             .context("Failed to get agent")?;
@@ -331,7 +331,7 @@ impl DaemonClient {
     pub async fn delete_agent(&self, agent_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .delete(&format!("{}/api/agents/{}", self.base_url, agent_id))
+            .delete(&format!("{}/v1/agents/{}", self.base_url, agent_id))
             .send()
             .await
             .context("Failed to delete agent")?;
@@ -346,7 +346,7 @@ impl DaemonClient {
     pub async fn lookup_agent(&self, name: &str) -> Result<Option<Uuid>> {
         let response = self
             .client
-            .get(&format!("{}/api/agents/lookup/{}", self.base_url, name))
+            .get(&format!("{}/v1/agents/lookup/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to lookup agent")?;
@@ -560,7 +560,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/api/workflows", self.base_url))
+            .post(&format!("{}/v1/workflows", self.base_url))
             .header("Content-Type", "application/x-yaml")
             .body(workflow_yaml)
             .send()
@@ -588,7 +588,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/api/workflows/{}/run", self.base_url, name))
+            .post(&format!("{}/v1/workflows/{}/run", self.base_url, name))
             .json(&RunRequest { input })
             .send()
             .await
@@ -616,7 +616,7 @@ impl DaemonClient {
     pub async fn list_workflows(&self) -> Result<Vec<serde_json::Value>> {
         let response = self
             .client
-            .get(&format!("{}/api/workflows", self.base_url))
+            .get(&format!("{}/v1/workflows", self.base_url))
             .send()
             .await
             .context("Failed to list workflows")?;
@@ -643,7 +643,7 @@ impl DaemonClient {
     pub async fn describe_workflow(&self, name: &str) -> Result<String> {
         let response = self
             .client
-            .get(&format!("{}/api/workflows/{}", self.base_url, name))
+            .get(&format!("{}/v1/workflows/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to describe workflow")?;
@@ -665,7 +665,7 @@ impl DaemonClient {
     pub async fn delete_workflow(&self, name: &str) -> Result<()> {
         let response = self
             .client
-            .delete(&format!("{}/api/workflows/{}", self.base_url, name))
+            .delete(&format!("{}/v1/workflows/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to delete workflow")?;
@@ -683,7 +683,7 @@ impl DaemonClient {
         let response = self
             .client
             .get(&format!(
-                "{}/api/workflows/executions/{}/logs",
+                "{}/v1/workflows/executions/{}/logs",
                 self.base_url, execution_id
             ))
             .send()
@@ -711,7 +711,7 @@ impl DaemonClient {
         let response = self
             .client
             .get(&format!(
-                "{}/api/workflows/executions/{}/logs",
+                "{}/v1/workflows/executions/{}/logs",
                 self.base_url, execution_id
             ))
             .send()

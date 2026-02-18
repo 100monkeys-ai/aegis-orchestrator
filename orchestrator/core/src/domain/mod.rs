@@ -12,4 +12,6 @@ pub mod repository;
 pub mod llm;
 pub mod workflow;
 pub mod validation;
+pub mod volume;
+pub mod storage;
 

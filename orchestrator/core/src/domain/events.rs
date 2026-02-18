@@ -6,6 +6,7 @@ use serde::{Serialize, Deserialize};
 use crate::domain::agent::{AgentId, AgentManifest};
 use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
 use crate::domain::runtime::InstanceId;
+use crate::domain::volume::{VolumeId, StorageClass};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,6 +158,50 @@ pub enum ValidationEvent {
         final_score: f64,
         confidence: f64,
         reached_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum VolumeEvent {
+    VolumeCreated {
+        volume_id: VolumeId,
+        execution_id: Option<ExecutionId>,
+        storage_class: StorageClass,
+        remote_path: String,
+        size_limit_bytes: u64,
+        created_at: DateTime<Utc>,
+    },
+    VolumeAttached {
+        volume_id: VolumeId,
+        instance_id: InstanceId,
+        mount_point: String,
+        access_mode: String,
+        attached_at: DateTime<Utc>,
+    },
+    VolumeDetached {
+        volume_id: VolumeId,
+        instance_id: InstanceId,
+        detached_at: DateTime<Utc>,
+    },
+    VolumeDeleted {
+        volume_id: VolumeId,
+        deleted_at: DateTime<Utc>,
+    },
+    VolumeExpired {
+        volume_id: VolumeId,
+        expired_at: DateTime<Utc>,
+    },
+    VolumeMountFailed {
+        volume_id: VolumeId,
+        instance_id: InstanceId,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+    VolumeQuotaExceeded {
+        volume_id: VolumeId,
+        size_limit_bytes: u64,
+        actual_bytes: u64,
+        exceeded_at: DateTime<Utc>,
     },
 }
 

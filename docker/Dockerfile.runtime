@@ -72,7 +72,7 @@ COPY aegis-config.yaml ./
 COPY assets ./assets
 
 # Expose gRPC ports
-EXPOSE 8080 50051
+EXPOSE 8088 50051
 
 # Run as non-root user with Docker socket access
 # Create docker group (use build arg for custom GID) and add aegis user to it
@@ -83,4 +83,4 @@ RUN groupadd -g ${DOCKER_GID} docker || true && \
 USER aegis
 
 # Start the AEGIS daemon with gRPC enabled
-CMD ["aegis-runtime", "--daemon", "--port", "8080"]
+CMD ["aegis-runtime", "--daemon", "--port", "8088"]

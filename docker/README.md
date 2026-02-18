@@ -49,7 +49,7 @@ docker compose down -v
 - **7233** - Temporal gRPC (primary endpoint)
 - **8233** - Temporal Web UI (<http://localhost:8233>)
 - **3000** - Temporal Worker HTTP API
-- **8080** - AEGIS Runtime orchestrator API
+- **8088** - AEGIS Runtime orchestrator API
 - **50051** - AEGIS Runtime gRPC (for worker activities)
 
 ## Environment Variables
@@ -153,4 +153,4 @@ The container is configured to add the `aegis` user to the `docker` group (GID 9
 
 ## Testing
 
-Verify the setup using the Testing Guide at `../TEMPORAL_TESTING_GUIDE.md`.
+Verify the setup using the Testing Guide at `../DEV_TESTING_GUIDE.md`.

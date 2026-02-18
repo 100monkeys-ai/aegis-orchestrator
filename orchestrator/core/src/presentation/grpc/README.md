@@ -256,7 +256,7 @@ aegis-runtime:
     dockerfile: Dockerfile
   ports:
     - "50051:50051"  # gRPC
-    - "8080:8080"    # HTTP (health checks)
+    - "8088:8088"    # HTTP (health checks)
   environment:
     - GRPC_PORT=50051
 ```

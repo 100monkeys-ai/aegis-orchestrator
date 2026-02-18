@@ -14,5 +14,6 @@ pub mod context_loader;
 pub mod temporal_client;
 pub mod temporal_proto;
 pub mod human_input_service;
+pub mod storage;
 
 pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};

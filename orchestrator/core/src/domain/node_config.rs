@@ -231,7 +231,7 @@ pub struct RuntimeConfig {
     /// Used by agent bootstrap scripts to reach the LLM proxy endpoint
     /// Supports env:VAR_NAME syntax for environment variable substitution
     /// Default: "http://localhost:8000" (local development)
-    /// Docker deployments should override to "http://aegis-runtime:8080"
+    /// Docker deployments should override to "http://aegis-runtime:8088"
     #[serde(default = "default_orchestrator_url")]
     pub orchestrator_url: String,
 }

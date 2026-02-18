@@ -30,7 +30,7 @@ impl AegisClient {
 
     /// Deploy an agent to the AEGIS cloud.
     pub async fn deploy_agent(&self, manifest: &crate::AgentManifest) -> Result<DeploymentResponse> {
-        let url = format!("{}/api/v1/agents", self.base_url);
+        let url = format!("{}/v1/agents", self.base_url);
         
         let mut req = self.client.post(&url).json(manifest);
         
@@ -50,7 +50,7 @@ impl AegisClient {
         agent_id: &str,
         input: TaskInput,
     ) -> Result<TaskOutput> {
-        let url = format!("{}/api/v1/agents/{}/execute", self.base_url, agent_id);
+        let url = format!("{}/v1/agents/{}/execute", self.base_url, agent_id);
         
         let mut req = self.client.post(&url).json(&input);
         
@@ -66,7 +66,7 @@ impl AegisClient {
 
     /// Get the status of an agent.
     pub async fn get_agent_status(&self, agent_id: &str) -> Result<AgentStatus> {
-        let url = format!("{}/api/v1/agents/{}/status", self.base_url, agent_id);
+        let url = format!("{}/v1/agents/{}/status", self.base_url, agent_id);
         
         let mut req = self.client.get(&url);
         
@@ -82,7 +82,7 @@ impl AegisClient {
 
     /// Terminate an agent instance.
     pub async fn terminate_agent(&self, agent_id: &str) -> Result<()> {
-        let url = format!("{}/api/v1/agents/{}", self.base_url, agent_id);
+        let url = format!("{}/v1/agents/{}", self.base_url, agent_id);
         
         let mut req = self.client.delete(&url);
         
@@ -107,7 +107,7 @@ impl AegisClient {
         model: Option<&str>,
         execution_id: Option<&str>,
     ) -> Result<String> {
-        let url = format!("{}/api/llm/generate", self.base_url);
+        let url = format!("{}/v1/llm/generate", self.base_url);
         
         let payload = serde_json::json!({
             "prompt": prompt,

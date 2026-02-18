@@ -9,3 +9,4 @@ pub mod validation_service;
 pub mod policy;
 pub mod workflow_engine;
 pub mod temporal_mapper;
+pub mod volume_manager;

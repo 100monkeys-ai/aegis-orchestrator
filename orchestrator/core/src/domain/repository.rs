@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::workflow::{Workflow, WorkflowId};
+use crate::domain::volume::{Volume, VolumeId, TenantId, VolumeOwnership};
 
 /// Storage backend enum for pluggable persistence
 #[derive(Debug, Clone)]
@@ -103,6 +104,28 @@ pub trait WorkflowExecutionRepository: Send + Sync {
     async fn find_active(&self) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
 }
 
+/// Repository interface for Volume aggregates
+/// One repository per aggregate root (Infrastructure & Hosting Context)
+#[async_trait]
+pub trait VolumeRepository: Send + Sync {
+    /// Save volume (create or update)
+    async fn save(&self, volume: &Volume) -> Result<(), RepositoryError>;
+    
+    /// Find volume by ID
+    async fn find_by_id(&self, id: VolumeId) -> Result<Option<Volume>, RepositoryError>;
+    
+    /// Find volumes by tenant
+    async fn find_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>, RepositoryError>;
+    
+    /// Find expired volumes (for garbage collection)
+    async fn find_expired(&self) -> Result<Vec<Volume>, RepositoryError>;
+    
+    /// Find volumes by ownership pattern
+    async fn find_by_ownership(&self, ownership: &VolumeOwnership) -> Result<Vec<Volume>, RepositoryError>;
+    
+    /// Delete volume by ID
+    async fn delete(&self, id: VolumeId) -> Result<(), RepositoryError>;
+}
 
 
 /// Repository errors
@@ -125,6 +148,7 @@ use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecu
 use crate::infrastructure::repositories::postgres_agent::PostgresAgentRepository;
 use crate::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
 use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
+use crate::infrastructure::repositories::postgres_volume::PostgresVolumeRepository;
 
 /// Factory for creating repositories from storage backend
 pub fn create_agent_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn AgentRepository> {
@@ -157,6 +181,18 @@ pub fn create_workflow_execution_repository(backend: &StorageBackend, pool: sqlx
         }
         StorageBackend::PostgreSQL(_) => {
              Arc::new(PostgresWorkflowExecutionRepository::new(pool))
+        }
+    }
+}
+
+pub fn create_volume_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn VolumeRepository> {
+    match backend {
+        StorageBackend::InMemory => {
+            // TODO: Implement InMemoryVolumeRepository for testing
+            todo!("InMemoryVolumeRepository not yet implemented")
+        }
+        StorageBackend::PostgreSQL(_) => {
+            Arc::new(PostgresVolumeRepository::new(pool))
         }
     }
 }

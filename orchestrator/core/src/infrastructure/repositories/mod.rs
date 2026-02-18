@@ -53,6 +53,7 @@ pub mod postgres_agent;
 pub mod postgres_execution;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
+pub mod postgres_volume;
 
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;

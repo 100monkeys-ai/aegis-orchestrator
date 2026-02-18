@@ -439,29 +439,29 @@ async fn shutdown_signal() {
 fn create_router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
-        .route("/api/agents/:agent_id/execute", post(execute_agent_handler))
-        .route("/api/executions/:execution_id", get(get_execution_handler))
+        .route("/v1/agents/:agent_id/execute", post(execute_agent_handler))
+        .route("/v1/executions/:execution_id", get(get_execution_handler))
         .route(
-            "/api/executions/:execution_id/cancel",
+            "/v1/executions/:execution_id/cancel",
             post(cancel_execution_handler),
         )
-        .route("/api/executions/:execution_id/events", get(stream_events_handler))
-        .route("/api/agents/:agent_id/events", get(stream_agent_events_handler))
-        .route("/api/executions", get(list_executions_handler))
-        .route("/api/executions/:execution_id", axum::routing::delete(delete_execution_handler))
-        .route("/api/agents", post(deploy_agent_handler).get(list_agents_handler))
-        .route("/api/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
-        .route("/api/agents/lookup/:name", get(lookup_agent_handler))
-        .route("/api/llm/generate", post(llm_generate_handler))
-        .route("/api/workflows", post(deploy_workflow_handler).get(list_workflows_handler))
-        .route("/api/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
-        .route("/api/workflows/:name/run", post(run_workflow_handler))
-        .route("/api/workflows/executions/:execution_id", get(get_workflow_execution_handler))
-        .route("/api/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
-        .route("/api/human-approvals", get(list_pending_approvals_handler))
-        .route("/api/human-approvals/:id", get(get_pending_approval_handler))
-        .route("/api/human-approvals/:id/approve", post(approve_request_handler))
-        .route("/api/human-approvals/:id/reject", post(reject_request_handler))
+        .route("/v1/executions/:execution_id/events", get(stream_events_handler))
+        .route("/v1/agents/:agent_id/events", get(stream_agent_events_handler))
+        .route("/v1/executions", get(list_executions_handler))
+        .route("/v1/executions/:execution_id", axum::routing::delete(delete_execution_handler))
+        .route("/v1/agents", post(deploy_agent_handler).get(list_agents_handler))
+        .route("/v1/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
+        .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
+        .route("/v1/llm/generate", post(llm_generate_handler))
+        .route("/v1/workflows", post(deploy_workflow_handler).get(list_workflows_handler))
+        .route("/v1/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
+        .route("/v1/workflows/:name/run", post(run_workflow_handler))
+        .route("/v1/workflows/executions/:execution_id", get(get_workflow_execution_handler))
+        .route("/v1/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
+        .route("/v1/human-approvals", get(list_pending_approvals_handler))
+        .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
+        .route("/v1/human-approvals/:id/approve", post(approve_request_handler))
+        .route("/v1/human-approvals/:id/reject", post(reject_request_handler))
         .with_state(app_state)
 }
 
@@ -1257,7 +1257,7 @@ async fn llm_generate_handler(
 // Workflow API Handlers
 // ========================================
 
-/// POST /api/workflows - Deploy a workflow from YAML
+/// POST /v1/workflows - Deploy a workflow from YAML
 async fn deploy_workflow_handler(
     State(state): State<Arc<AppState>>,
     body: String,
@@ -1290,7 +1290,7 @@ async fn deploy_workflow_handler(
     }
 }
 
-/// GET /api/workflows - List all workflows
+/// GET /v1/workflows - List all workflows
 async fn list_workflows_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
@@ -1309,7 +1309,7 @@ async fn list_workflows_handler(
     (StatusCode::OK, Json(workflow_list))
 }
 
-/// GET /api/workflows/:name - Get workflow YAML
+/// GET /v1/workflows/:name - Get workflow YAML
 async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1333,7 +1333,7 @@ async fn get_workflow_handler(
     }
 }
 
-/// DELETE /api/workflows/:name - Delete workflow
+/// DELETE /v1/workflows/:name - Delete workflow
 async fn delete_workflow_handler(
     State(_state): State<Arc<AppState>>,
     Path(_name): Path<String>,
@@ -1344,7 +1344,7 @@ async fn delete_workflow_handler(
     })))
 }
 
-/// POST /api/workflows/:name/run - Execute a workflow
+/// POST /v1/workflows/:name/run - Execute a workflow
 #[derive(serde::Deserialize)]
 struct RunWorkflowRequest {
     input: serde_json::Value,
@@ -1384,7 +1384,7 @@ async fn run_workflow_handler(
     }
 }
 
-/// GET /api/workflows/executions/:execution_id - Get execution details
+/// GET /v1/workflows/executions/:execution_id - Get execution details
 async fn get_workflow_execution_handler(
     State(_state): State<Arc<AppState>>,
     Path(_execution_id): Path<Uuid>,
@@ -1395,8 +1395,8 @@ async fn get_workflow_execution_handler(
     })))
 }
 
-/// GET /api/workflows/executions/:execution_id/logs - Stream workflow logs
-/// GET /api/workflows/executions/:execution_id/logs - Stream workflow logs
+/// GET /v1/workflows/executions/:execution_id/logs - Stream workflow logs
+/// GET /v1/workflows/executions/:execution_id/logs - Stream workflow logs
 async fn stream_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
     Path(execution_id): Path<Uuid>,
@@ -1446,7 +1446,7 @@ async fn stream_workflow_logs_handler(
 // Human Approval Handlers
 // ============================================================================
 
-/// GET /api/human-approvals - List all pending approval requests
+/// GET /v1/human-approvals - List all pending approval requests
 async fn list_pending_approvals_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
@@ -1457,7 +1457,7 @@ async fn list_pending_approvals_handler(
     }))
 }
 
-/// GET /api/human-approvals/:id - Get a specific pending approval request
+/// GET /v1/human-approvals/:id - Get a specific pending approval request
 async fn get_pending_approval_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1479,7 +1479,7 @@ struct ApprovalRequest {
     approved_by: Option<String>,
 }
 
-/// POST /api/human-approvals/:id/approve - Approve a pending request
+/// POST /v1/human-approvals/:id/approve - Approve a pending request
 async fn approve_request_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1508,7 +1508,7 @@ struct RejectionRequest {
     rejected_by: Option<String>,
 }
 
-/// POST /api/human-approvals/:id/reject - Reject a pending request
+/// POST /v1/human-approvals/:id/reject - Reject a pending request
 async fn reject_request_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,

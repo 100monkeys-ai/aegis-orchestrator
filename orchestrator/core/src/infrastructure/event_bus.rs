@@ -9,7 +9,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent};
 use aegis_cortex::domain::events::CortexEvent;
 use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,7 @@ pub enum DomainEvent {
     Learning(LearningEvent),
     Cortex(CortexEvent),
     Policy(crate::domain::events::PolicyEvent),
+    Volume(VolumeEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -63,6 +64,11 @@ impl EventBus {
     /// Publish a learning event
     pub fn publish_learning_event(&self, event: LearningEvent) {
         self.publish(DomainEvent::Learning(event));
+    }
+
+    /// Publish a volume event
+    pub fn publish_volume_event(&self, event: VolumeEvent) {
+        self.publish(DomainEvent::Volume(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -270,6 +276,7 @@ impl AgentEventReceiver {
             DomainEvent::Learning(_) => false, // TODO: Link learning to agent
             DomainEvent::Cortex(_) => false,
             DomainEvent::Policy(_) => false, // TODO: Link policy to agent
+            DomainEvent::Volume(_) => false, // TODO: Link volume events to agent if needed
         }
     }
 }

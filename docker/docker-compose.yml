@@ -8,7 +8,7 @@ services:
     image: postgres:15-alpine
     container_name: aegis-postgres
     environment:
-      POSTGRES_MULTIPLE_DATABASES: "temporal,aegis"
+      POSTGRES_MULTIPLE_DATABASES: "temporal,aegis,seaweedfs"
       POSTGRES_USER: aegis
       POSTGRES_PASSWORD: aegis
       POSTGRES_DB: aegis
@@ -131,10 +131,10 @@ services:
       - AEGIS_DOCKER_NETWORK=aegis-network
       # Agent bootstrap orchestrator callback URL (used by assets/bootstrap.py)
       # Referenced in node config via: runtime.orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
-      - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8080
+      - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8088
       - RUST_LOG=debug
     ports:
-      - "8080:8080"   # gRPC server for orchestrator API
+      - "8088:8088"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities
     networks:
       - aegis-network
@@ -144,7 +144,7 @@ services:
       - ../aegis-config.yaml:/app/aegis-config.yaml  # Mount config file
       - aegis-runtime-data:/app/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -176,6 +176,86 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    restart: unless-stopped
+
+  # ============================================================================
+  # Storage Services (Unified Volume Management - ADR-032)
+  # ============================================================================
+
+  # SeaweedFS Master (Metadata & Leader Election)
+  seaweedfs-master:
+    image: chrislusf/seaweedfs:latest
+    container_name: aegis-seaweedfs-master
+    command: "master -ip=seaweedfs-master -mdir=/data"
+    ports:
+      - "9333:9333"  # HTTP API
+      - "19333:19333" # gRPC
+    volumes:
+      - seaweedfs-master-data:/data
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9333/cluster/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # SeaweedFS Volume Server (Data Storage)
+  seaweedfs-volume:
+    image: chrislusf/seaweedfs:latest
+    container_name: aegis-seaweedfs-volume
+    command: "volume -mserver=seaweedfs-master:9333 -dir=/data -max=10"
+    depends_on:
+      - seaweedfs-master
+    ports:
+      - "8080:8080"  # HTTP API
+    volumes:
+      - seaweedfs-volume-data:/data
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  # SeaweedFS Filer (Filesystem Metadata + POSIX API)
+  seaweedfs-filer:
+    image: chrislusf/seaweedfs:latest
+    container_name: aegis-seaweedfs-filer
+    command: >
+      filer 
+      -master=seaweedfs-master:9333
+      -dbType=postgres
+      -postgres.hostname=postgres
+      -postgres.port=5432
+      -postgres.username=aegis
+      -postgres.password=aegis_dev_password
+      -postgres.database=seaweedfs
+      -postgres.schema=public
+      -defaultReplicaPlacement=000
+      -disableDirListing=false
+    depends_on:
+      - postgres
+      - seaweedfs-master
+      - seaweedfs-volume
+    ports:
+      - "8888:8888"  # HTTP API (main interface for AEGIS)
+      - "18888:18888" # gRPC
+      - "8333:8333"  # S3 Gateway (optional external access)
+    volumes:
+      - seaweedfs-filer-data:/data
+    networks:
+      - aegis-network
+    environment:
+      - WEED_LEVELDB2_ENABLED=false
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8888/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
     restart: unless-stopped
 
   # ============================================================================
@@ -246,4 +326,10 @@ volumes:
   neo4j-data:
     driver: local
   neo4j-logs:
+    driver: local
+  seaweedfs-master-data:
+    driver: local
+  seaweedfs-volume-data:
+    driver: local
+  seaweedfs-filer-data:
     driver: local

@@ -169,7 +169,7 @@ spec:
     # Supports env:VAR_NAME syntax for environment variable substitution
     # Examples:
     #   - Local development: "http://localhost:8000"
-    #   - Docker deployment: "http://aegis-runtime:8080"
+    #   - Docker deployment: "http://aegis-runtime:8088"
     #   - Remote deployment: "https://orchestrator.example.com"
     #   - Environment var: "env:AEGIS_ORCHESTRATOR_URL"
     # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
@@ -221,12 +221,35 @@ spec:
   # --------------------------------------------------------------------------
   # Storage (Optional)
   # --------------------------------------------------------------------------
-  # storage:
-  #   # Backend: InMemory (default) or PostgreSQL
-  #   backend: "InMemory"
-  #   
-  #   # For PostgreSQL backend:
-  #   # postgres:
-  #   #   connection_string: "env:DATABASE_URL"
-  #   #   max_connections: 10
+  # Distributed storage for agent file system volumes
+  # See: ADR-032 Unified Storage via SeaweedFS
+  storage:
+    # Backend: "seaweedfs" (distributed) or "local" (single-node)
+    # Default: "local" (no distributed storage)
+    backend: "local"
+    
+    # SeaweedFS configuration (production multi-node deployments)
+    # Requires SeaweedFS Filer + PostgreSQL
+    # seaweedfs:
+    #   filer_url: "http://seaweedfs-filer:8888"  # Filer endpoint
+    #   mount_point: "/var/lib/aegis/storage"     # Host mount location
+    #   
+    #   # Volume defaults
+    #   default_ttl_hours: 24                       # Ephemeral volume lifetime
+    #   default_size_limit_mb: 1000                 # 1GB default quota
+    #   max_size_limit_mb: 10000                    # 10GB maximum quota
+    #   
+    #   # Garbage collection
+    #   gc_interval_minutes: 60                     # Check for expired volumes
+    #   
+    #   # S3 gateway (optional, for external access)
+    #   # s3_endpoint: "http://seaweedfs-s3:8333"
+    #   # s3_region: "us-east-1"
+    
+    # Local filesystem configuration (development/single-node)
+    local:
+      base_path: "/var/lib/aegis/local-volumes"  # Volume storage directory
+      default_ttl_hours: 24                        # Ephemeral volume lifetime
+      default_size_limit_mb: 1000                  # 1GB default quota
+      max_size_limit_mb: 10000                     # 10GB maximum quota
 
