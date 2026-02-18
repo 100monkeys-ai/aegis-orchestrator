@@ -186,76 +186,52 @@ services:
   seaweedfs-master:
     image: chrislusf/seaweedfs:latest
     container_name: aegis-seaweedfs-master
-    command: "master -ip=seaweedfs-master -mdir=/data"
+    command: 'master -ip=seaweedfs-master -ip.bind=0.0.0.0 -metricsPort=9324'
     ports:
       - "9333:9333"  # HTTP API
       - "19333:19333" # gRPC
+      - "9324:9324"  # Metrics
     volumes:
       - seaweedfs-master-data:/data
     networks:
       - aegis-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9333/cluster/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
     restart: unless-stopped
 
   # SeaweedFS Volume Server (Data Storage)
   seaweedfs-volume:
     image: chrislusf/seaweedfs:latest
     container_name: aegis-seaweedfs-volume
-    command: "volume -mserver=seaweedfs-master:9333 -dir=/data -max=10"
+    command: 'volume -ip=seaweedfs-volume -master="seaweedfs-master:9333" -ip.bind=0.0.0.0 -port=8080 -metricsPort=9325'
     depends_on:
       - seaweedfs-master
     ports:
-      - "8080:8080"  # HTTP API
+      - "8080:8080"   # HTTP API
+      - "18080:18080" # gRPC
+      - "9325:9325"   # Metrics
     volumes:
       - seaweedfs-volume-data:/data
     networks:
       - aegis-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
     restart: unless-stopped
 
   # SeaweedFS Filer (Filesystem Metadata + POSIX API)
   seaweedfs-filer:
     image: chrislusf/seaweedfs:latest
     container_name: aegis-seaweedfs-filer
-    command: >
-      filer 
-      -master=seaweedfs-master:9333
-      -dbType=postgres
-      -postgres.hostname=postgres
-      -postgres.port=5432
-      -postgres.username=aegis
-      -postgres.password=aegis_dev_password
-      -postgres.database=seaweedfs
-      -postgres.schema=public
-      -defaultReplicaPlacement=000
-      -disableDirListing=false
+    command: 'filer -ip=seaweedfs-filer -master="seaweedfs-master:9333" -ip.bind=0.0.0.0 -metricsPort=9326'
+    tty: true
+    stdin_open: true
     depends_on:
-      - postgres
       - seaweedfs-master
       - seaweedfs-volume
     ports:
-      - "8888:8888"  # HTTP API (main interface for AEGIS)
+      - "8888:8888"   # HTTP API (main interface for AEGIS)
       - "18888:18888" # gRPC
-      - "8333:8333"  # S3 Gateway (optional external access)
+      - "9326:9326"   # Metrics
     volumes:
       - seaweedfs-filer-data:/data
     networks:
       - aegis-network
-    environment:
-      - WEED_LEVELDB2_ENABLED=false
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8888/"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
     restart: unless-stopped
 
   # ============================================================================

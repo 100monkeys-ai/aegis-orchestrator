@@ -10,6 +10,13 @@ function create_user_and_database() {
 	# Create Database (ignore error if exists)
 	echo "  Creating database '$database' owned by '$POSTGRES_USER'"
 	psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" -c "CREATE DATABASE $database OWNER $POSTGRES_USER;" || echo "Database $database creation skipped (may already exist)"
+	
+	# Grant schema permissions (needed for SeaweedFS to create tables)
+	echo "  Granting schema permissions on '$database'"
+	psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" -d "$database" -c "ALTER SCHEMA public OWNER TO $POSTGRES_USER;"
+	psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" -d "$database" -c "GRANT ALL PRIVILEGES ON SCHEMA public TO $POSTGRES_USER;"
+	psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" -d "$database" -c "GRANT ALL ON ALL TABLES IN SCHEMA public TO $POSTGRES_USER;"
+	psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" -d "$database" -c "GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO $POSTGRES_USER;"
 }
 
 if [ -n "$POSTGRES_MULTIPLE_DATABASES" ]; then
