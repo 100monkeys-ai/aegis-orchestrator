@@ -123,7 +123,7 @@ Persistent semantic memory for agents using vector embeddings.
 
 **Components:**
 
-- Vector store (LanceDB / Sqlite-Vec)
+- Vector store (Qdrant / Sqlite-Vec)
 - Embedding service (OpenAI, local models)
 - Auto-indexing pipeline
 - Query optimizer
@@ -244,7 +244,7 @@ Cold → Warm → Hot → Terminated
                         ▼
             ┌───────────────────────┐
             │   Vector Store        │
-            │   (LanceDB)           │
+            │   (Qdrant)           │
             └───────────────────────┘
 ```
 
@@ -410,7 +410,7 @@ Developer Machine
 - **Async Runtime**: Tokio
 - **Web Framework**: Axum + Tower
 - **Database**: PostgreSQL (metadata), Sled (embedded logs)
-- **Vector Store**: LanceDB / Sqlite-Vec
+- **Vector Store**: Qdrant / Sqlite-Vec
 - **Containerization**: Bollard (Docker), Firecracker
 - **Message Bus**: NATS / Redis
 - **Monitoring**: Prometheus + Grafana

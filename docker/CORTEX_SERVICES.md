@@ -8,7 +8,7 @@
 - **Model**: all-MiniLM-L6-v2 (384-dim)
 - **Purpose**: Generate semantic embeddings for pattern storage
 
-### 2. LanceDB
+### 2. Qdrant
 
 - **Port**: 8765
 - **Purpose**: Vector store for pattern similarity search
@@ -32,7 +32,7 @@ docker-compose up -d
 
 # View logs
 docker-compose logs -f embedding-service
-docker-compose logs -f lancedb
+docker-compose logs -f qdrant
 docker-compose logs -f neo4j
 
 # Stop services
@@ -48,7 +48,7 @@ docker-compose down -v
 # Embedding service
 grpcurl -plaintext localhost:50052 embedding.EmbeddingService/HealthCheck
 
-# LanceDB
+# Qdrant
 curl http://localhost:8765/health
 
 # Neo4j
@@ -61,7 +61,7 @@ cypher-shell -u neo4j -p aegis_dev_password "RETURN 1"
 
 - `MODEL_NAME`: Sentence transformer model (default: all-MiniLM-L6-v2)
 
-### LanceDB
+### Qdrant
 
 - `LANCE_DB_PATH`: Data directory (default: /data)
 

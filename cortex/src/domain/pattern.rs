@@ -80,7 +80,7 @@ pub struct CortexPattern {
     pub solution_code: String,
     pub task_category: String,
     
-    // Vector embedding is stored separately in LanceDB
+    // Vector embedding is stored separately in Qdrant
     // We only store metadata here
     
     // Gradient metrics (ADR-018)

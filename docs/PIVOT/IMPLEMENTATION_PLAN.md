@@ -1803,7 +1803,7 @@ states:
 **Changes:**
 
 ```python
-from lancedb.pydantic import LanceModel, Vector
+from qdrant.pydantic import LanceModel, Vector
 from datetime import datetime
 from typing import Optional
 
@@ -1845,7 +1845,7 @@ class CortexPattern(LanceModel):
 ```python
 class CortexStorage:
     def __init__(self, db_path: str):
-        self.db = lancedb.connect(db_path)
+        self.db = qdrant.connect(db_path)
         self.table = self.db.open_table("patterns")
     
     async def store_pattern(
@@ -3314,7 +3314,7 @@ Each phase is complete when:
 ### External Resources
 
 - [Finite State Machines](https://en.wikipedia.org/wiki/Finite-state_machine)
-- [LanceDB Documentation](https://lancedb.github.io/lancedb/)
+- [Qdrant Documentation](https://qdrant.github.io/qdrant/)
 - [Firecracker Documentation](https://firecracker-microvm.github.io/)
 - [Domain-Driven Design](https://www.domainlanguage.com/ddd/)
 

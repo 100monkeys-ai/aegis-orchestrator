@@ -34,7 +34,7 @@ This document provides the complete implementation roadmap to bring AEGIS Orches
 
 **Critical Gaps to Address:**
 
-1. **Cortex Persistence:** LanceDB blocked by dependency conflicts → switching to Qdrant
+1. **Cortex Persistence:** Qdrant blocked by dependency conflicts → switching to Qdrant
 2. **The Forge:** Complete 7-agent constitutional development pipeline
 3. **Stimulus-Response:** Router agent and workflow selection logic
 4. **Integrations:** Wire Cortex into WorkflowEngine, complete human-in-the-loop infrastructure
@@ -137,7 +137,7 @@ All event categories implemented and publishing:
 
 1. **Cortex Persistence**
    - **File:** `cortex/KNOWN_ISSUES.md`
-   - **Issue:** LanceDB arrow-arith dependency conflicts
+   - **Issue:** Qdrant arrow-arith dependency conflicts
    - **Solution:** Replace with Qdrant vector database
    - **Impact:** Learning doesn't persist across restarts
 
@@ -254,7 +254,7 @@ All implementation must adhere to these principles from [AGENTS.md](../../../aeg
 
 ## Phase 4: Cortex Persistence & Integration
 
-**Goal:** Complete Cortex implementation from 60% → 100% by replacing LanceDB with Qdrant and wiring pattern injection into WorkflowEngine.
+**Goal:** Complete Cortex implementation from 60% → 100% by replacing Qdrant with Qdrant and wiring pattern injection into WorkflowEngine.
 
 **Current State:**
 
@@ -262,12 +262,12 @@ All implementation must adhere to these principles from [AGENTS.md](../../../aeg
 - ✅ In-memory repository working (29/29 tests passing)
 - ✅ Application service complete (`CortexService` with search, store, update)
 - ✅ Event streaming operational
-- ❌ LanceDB blocked by arrow-arith dependency conflicts
+- ❌ Qdrant blocked by arrow-arith dependency conflicts
 - ❌ gRPC endpoints stubbed
 - ❌ WorkflowEngine doesn't inject patterns
 - ❌ No time-decay background job
 
-### Step 1: Replace LanceDB with Qdrant Vector Database
+### Step 1: Replace Qdrant with Qdrant Vector Database
 
 **Objective:** Implement persistent vector storage for semantic pattern retrieval.
 
@@ -762,13 +762,13 @@ cortex:
 ```markdown
 # Cortex Known Issues
 
-## ✅ RESOLVED: LanceDB Dependency Conflicts
+## ✅ RESOLVED: Qdrant Dependency Conflicts
 
 **Status:** RESOLVED (February 14, 2026)  
-**Resolution:** Replaced LanceDB with Qdrant vector database
+**Resolution:** Replaced Qdrant with Qdrant vector database
 
 **Original Issue:**
-LanceDB Rust client had incompatible arrow-arith dependencies (0.3.x vs 0.4.x) preventing compilation.
+Qdrant Rust client had incompatible arrow-arith dependencies (0.3.x vs 0.4.x) preventing compilation.
 
 **Solution:**
 Switched to Qdrant (`qdrant-client` crate 1.7+) which has:
@@ -6873,14 +6873,14 @@ pub mod fixtures {
 
 1. Stop orchestrator immediately
 2. Restore PostgreSQL from backup (patterns also stored there)
-3. Revert to LanceDB if necessary (code still exists)
+3. Revert to Qdrant if necessary (code still exists)
 4. Re-index patterns from PostgreSQL to vector store
 
 **Prevention:**
 
 - Dual-write to both PostgreSQL and Qdrant during migration
 - Verify data consistency before removing PostgreSQL pattern storage
-- Keep LanceDB code for 1 month after Qdrant deployment
+- Keep Qdrant code for 1 month after Qdrant deployment
 
 ---
 

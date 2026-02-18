@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-//! LanceDB vector store implementation for pattern storage
+//! Qdrant vector store implementation for pattern storage
 //! Implements ADR-018 (Weighted Cortex Memory)
 
 use async_trait::async_trait;
@@ -14,7 +14,7 @@ use crate::domain::{CortexPattern, PatternId, ErrorSignature};
 use crate::infrastructure::repository::PatternRepository;
 
 /// In-memory implementation of PatternRepository for testing
-/// TODO: Replace with actual LanceDB implementation
+/// TODO: Replace with actual Qdrant implementation
 pub struct InMemoryPatternRepository {
     patterns: Arc<RwLock<HashMap<PatternId, (CortexPattern, Vec<f32>)>>>,
 }
@@ -125,29 +125,29 @@ impl PatternRepository for InMemoryPatternRepository {
     }
 }
 
-// TODO: Implement actual LanceDB repository
+// TODO: Implement actual Qdrant repository
 // This will require:
-// 1. Add lancedb dependency to Cargo.toml
-// 2. Create LanceDB connection and table
-// 3. Implement vector search using LanceDB API
+// 1. Add qdrant dependency to Cargo.toml
+// 2. Create Qdrant connection and table
+// 3. Implement vector search using Qdrant API
 // 4. Handle schema migrations
 
 /*
-pub struct LanceDBPatternRepository {
-    connection: lancedb::Connection,
+pub struct QdrantPatternRepository {
+    connection: qdrant::Connection,
     table_name: String,
 }
 
-impl LanceDBPatternRepository {
+impl QdrantPatternRepository {
     pub async fn new(db_path: &str, table_name: &str) -> Result<Self> {
-        let connection = lancedb::connect(db_path).execute().await?;
+        let connection = qdrant::connect(db_path).execute().await?;
         Ok(Self {
             connection,
             table_name: table_name.to_string(),
         })
     }
     
-    async fn ensure_table_exists(&self) -> Result<lancedb::Table> {
+    async fn ensure_table_exists(&self) -> Result<qdrant::Table> {
         // Create table if it doesn't exist
         // Schema: 
         // - id: UUID
@@ -162,17 +162,17 @@ impl LanceDBPatternRepository {
 }
 
 #[async_trait]
-impl PatternRepository for LanceDBPatternRepository {
+impl PatternRepository for QdrantPatternRepository {
     async fn store_pattern(&self, pattern: &CortexPattern, embedding: Vec<f32>) -> Result<PatternId> {
         let table = self.ensure_table_exists().await?;
         
         // Serialize pattern to JSON
         let pattern_json = serde_json::to_string(pattern)?;
         
-        // Insert into LanceDB
+        // Insert into Qdrant
         // table.add(...)
         
-        todo!("Implement LanceDB storage")
+        todo!("Implement Qdrant storage")
     }
     
     async fn search_similar(
@@ -182,10 +182,10 @@ impl PatternRepository for LanceDBPatternRepository {
     ) -> Result<Vec<(CortexPattern, f64)>> {
         let table = self.ensure_table_exists().await?;
         
-        // Vector search using LanceDB
+        // Vector search using Qdrant
         // let results = table.search(&query_embedding).limit(limit).execute().await?;
         
-        todo!("Implement LanceDB vector search")
+        todo!("Implement Qdrant vector search")
     }
     
     // ... implement other methods

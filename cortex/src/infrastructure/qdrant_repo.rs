@@ -1,14 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-//! LanceDB production implementation for pattern storage
+//! Qdrant production implementation for pattern storage
 //! 
-//! This module provides a production-ready vector store using LanceDB
+//! This module provides a production-ready vector store using Qdrant
 //! for semantic similarity search of cortex patterns.
 
 use async_trait::async_trait;
 use anyhow::{Result, Context as _};
-use lancedb::{Connection, Table};
+use qdrant::{Connection, Table};
 use arrow::array::{ArrayRef, Float32Array, StringArray, UInt64Array, RecordBatch};
 use arrow::datatypes::{Schema, Field, DataType};
 use std::sync::Arc;
@@ -16,18 +16,18 @@ use std::sync::Arc;
 use crate::domain::{CortexPattern, PatternId, ErrorSignature};
 use crate::infrastructure::repository::PatternRepository;
 
-pub struct LanceDBPatternRepository {
+pub struct QdrantPatternRepository {
     connection: Connection,
     table_name: String,
 }
 
-impl LanceDBPatternRepository {
-    /// Create a new LanceDB pattern repository
+impl QdrantPatternRepository {
+    /// Create a new Qdrant pattern repository
     pub async fn new(db_path: &str, table_name: &str) -> Result<Self> {
-        let connection = lancedb::connect(db_path)
+        let connection = qdrant::connect(db_path)
             .execute()
             .await
-            .context("Failed to connect to LanceDB")?;
+            .context("Failed to connect to Qdrant")?;
         
         Ok(Self {
             connection,
@@ -100,7 +100,7 @@ impl LanceDBPatternRepository {
 }
 
 #[async_trait]
-impl PatternRepository for LanceDBPatternRepository {
+impl PatternRepository for QdrantPatternRepository {
     async fn store_pattern(&self, pattern: &CortexPattern, embedding: Vec<f32>) -> Result<PatternId> {
         let table = self.ensure_table().await?;
         
@@ -109,7 +109,7 @@ impl PatternRepository for LanceDBPatternRepository {
         table.add(vec![batch])
             .execute()
             .await
-            .context("Failed to store pattern in LanceDB")?;
+            .context("Failed to store pattern in Qdrant")?;
         
         Ok(pattern.id)
     }
@@ -191,7 +191,7 @@ impl PatternRepository for LanceDBPatternRepository {
     }
     
     async fn update_pattern(&self, pattern: &CortexPattern) -> Result<()> {
-        // LanceDB doesn't support in-place updates
+        // Qdrant doesn't support in-place updates
         // We need to delete and re-insert
         // For production, consider using versioning or merge strategies
         
@@ -201,7 +201,7 @@ impl PatternRepository for LanceDBPatternRepository {
         // 2. Delete the old record
         // 3. Insert the updated pattern with same embedding
         
-        anyhow::bail!("Update not yet implemented for LanceDB - use delete + store")
+        anyhow::bail!("Update not yet implemented for Qdrant - use delete + store")
     }
     
     async fn delete_pattern(&self, id: PatternId) -> Result<()> {

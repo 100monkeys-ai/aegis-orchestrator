@@ -73,7 +73,7 @@ Prototype       Cloud           Platform        Scale
   - Throughput testing (agents/second)
   - Memory efficiency analysis
 - [ ] **M2.4**: Memory system (Cortex)
-  - LanceDB integration
+  - Qdrant integration
   - Embedding pipeline (OpenAI)
   - Query optimization
 - [ ] **M2.5**: Swarm coordination
