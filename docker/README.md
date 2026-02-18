@@ -60,10 +60,6 @@ docker compose down -v
 - **RUST_LOG**: Logging level (default: `info,aegis_orchestrator=debug`)
 - **TEMPORAL_ADDRESS**: Temporal server address (default: `temporal:7233`)
 - **TEMPORAL_WORKER_URL**: Temporal worker HTTP API URL (default: `http://temporal-worker:3000`)
-- **AEGIS_ENABLE_DISK_QUOTAS**: Enable/disable Docker disk quotas (default: `true`)
-  - Set to `false` on WSL/macOS where XFS+pquota is unavailable
-  - Overrides the `spec.runtime.enable_disk_quotas` setting in config file
-  - Accepts: `true`, `false`, `1`, `0`, `yes`, `no`, `on`, `off`
 
 ## Development
 

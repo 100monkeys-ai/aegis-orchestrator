@@ -46,7 +46,6 @@ spec:
   runtime:
     # bootstrap_script: "assets/bootstrap.py"  # Optional (default)
     # default_isolation: "inherit"             # Optional (default: inherit)
-    # enable_disk_quotas: false                # Optional (default: true, set false for WSL/macOS)
     # Agent container networking (Docker deployments)
     # docker_network_mode: "env:AEGIS_DOCKER_NETWORK"  # Optional, read from environment
     # Orchestrator URL for agent bootstrap callbacks

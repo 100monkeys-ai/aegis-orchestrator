@@ -41,6 +41,7 @@ aegis-cortex = { path = "../../cortex" }
 
 [dev-dependencies]
 tokio-test = "0.4"
+tempfile = "3.10"
 
 [build-dependencies]
 tonic-build = "0.13"

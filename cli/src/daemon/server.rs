@@ -215,7 +215,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         DockerRuntime::new(
             config.spec.runtime.bootstrap_script.clone(),
             config.spec.runtime.docker_socket_path.clone(),
-            config.spec.runtime.enable_disk_quotas,
             network_mode,
             orchestrator_url
         )

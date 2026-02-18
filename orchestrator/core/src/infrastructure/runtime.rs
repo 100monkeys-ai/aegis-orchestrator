@@ -19,13 +19,12 @@ use std::path::PathBuf;
 pub struct DockerRuntime {
     docker: Docker,
     bootstrap_script_path: PathBuf,  // Store as PathBuf for better path handling
-    enable_disk_quotas: bool,
     network_mode: Option<String>,
     orchestrator_url: String,
 }
 
 impl DockerRuntime {
-    pub fn new(bootstrap_script: String, socket_path: Option<String>, enable_disk_quotas: bool, network_mode: Option<String>, orchestrator_url: String) -> Result<Self, RuntimeError> {
+    pub fn new(bootstrap_script: String, socket_path: Option<String>, network_mode: Option<String>, orchestrator_url: String) -> Result<Self, RuntimeError> {
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
             PathBuf::from(&bootstrap_script)
@@ -85,7 +84,6 @@ impl DockerRuntime {
         Ok(Self { 
             docker, 
             bootstrap_script_path: bootstrap_path,
-            enable_disk_quotas, 
             network_mode, 
             orchestrator_url 
         })
@@ -185,20 +183,6 @@ impl AgentRuntime for DockerRuntime {
             // Docker nano_cpus: 1 CPU = 1e9 nano CPUs, 1 milli CPU = 1e6 nano CPUs
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
         }
-        
-        // Try to apply disk quotas if enabled and disk limit is specified
-        // Disk quotas require: overlay2 storage driver + XFS with pquota mount option
-        // Most systems (WSL, macOS, standard Linux) don't support this
-        let mut disk_quota_requested = false;
-        if self.enable_disk_quotas {
-            if let Some(disk_bytes) = config.resources.disk_bytes {
-                host_config.storage_opt = Some([("size".to_string(), disk_bytes.to_string())].into());
-                disk_quota_requested = true;
-            }
-        } else if config.resources.disk_bytes.is_some() {
-            // Disk quota requested but disabled in config
-            tracing::debug!("Disk quota requested in agent manifest but disabled in node config (enable_disk_quotas=false)");
-        }
 
         // Removed container_config that was causing move issues and unused var warning
 
@@ -224,47 +208,21 @@ impl AgentRuntime for DockerRuntime {
         // Keep container alive - actual agent execution happens via bootstrap script in execute()
         let cmd = vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()];
 
-        // Try to create container with disk quotas if requested
+        // Create container configuration
         let container_config = Config {
             image: Some(image.clone()),
             tty: Some(true),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
-            cmd: Some(cmd.clone()),
-            env: Some(env_vars.clone()),
-            host_config: Some(host_config.clone()),
+            cmd: Some(cmd),
+            env: Some(env_vars),
+            host_config: Some(host_config),
             ..Default::default()
         };
         
-        let res = match self.docker.create_container(Some(options.clone()), container_config).await {
-            Ok(res) => res,
-            Err(e) if disk_quota_requested && e.to_string().contains("storage-opt") => {
-                // Disk quotas not supported on this system - retry without them
-                tracing::warn!(
-                    "Disk quotas requested but not supported by Docker on this system. \
-                     Error: {}. Continuing without disk limits. \
-                     (Requires overlay2 storage driver + XFS with pquota mount option)",
-                    e
-                );
-                
-                // Retry without storage_opt
-                host_config.storage_opt = None;
-                let retry_config = Config {
-                    image: Some(image.clone()),
-                    tty: Some(true),
-                    attach_stdout: Some(true),
-                    attach_stderr: Some(true),
-                    cmd: Some(cmd),
-                    env: Some(env_vars),
-                    host_config: Some(host_config),
-                    ..Default::default()
-                };
-                
-                self.docker.create_container(Some(options), retry_config).await
-                    .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?
-            }
-            Err(e) => return Err(RuntimeError::SpawnFailed(e.to_string())),
-        };
+        // Create the container
+        let res = self.docker.create_container(Some(options), container_config).await
+            .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
 
         let id = res.id;
 

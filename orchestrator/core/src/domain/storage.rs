@@ -119,6 +119,9 @@ pub enum StorageError {
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),
+    
+    #[error("IO error: {0}")]
+    IoError(String),
 
     #[error("Serialization error: {0}")]
     Serialization(String),
@@ -142,6 +145,12 @@ impl From<reqwest::Error> for StorageError {
 impl From<serde_json::Error> for StorageError {
     fn from(err: serde_json::Error) -> Self {
         StorageError::Serialization(err.to_string())
+    }
+}
+
+impl From<std::io::Error> for StorageError {
+    fn from(err: std::io::Error) -> Self {
+        StorageError::IoError(err.to_string())
     }
 }
 

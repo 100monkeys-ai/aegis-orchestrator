@@ -148,12 +148,6 @@ spec:
     #   - Remote: "tcp://192.168.1.100:2375"
     # docker_socket_path: "/var/run/docker.sock"
     
-    # Enable Docker disk quotas via --storage-opt
-    # Default: true (attempts, gracefully degrades if unsupported)
-    # Set to false for WSL/macOS (no XFS+pquota support)
-    # Environment variable: AEGIS_ENABLE_DISK_QUOTAS
-    # enable_disk_quotas: false
-    
     # Docker network for agent containers (Docker deployments only)
     # Optional: If not specified, uses Docker's default network
     # Supports env:VAR_NAME syntax for environment variable substitution

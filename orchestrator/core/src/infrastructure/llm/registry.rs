@@ -268,6 +268,7 @@ mod tests {
                 runtime: crate::domain::node_config::RuntimeConfig::default(),
                 network: None,
                 observability: None,
+                storage: None, // Optional storage configuration (ADR-032)
             },
         };
 

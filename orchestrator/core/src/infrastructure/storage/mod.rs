@@ -7,8 +7,10 @@
 //! for distributed file system backends.
 
 pub mod seaweedfs;
+pub mod local;
 
 pub use seaweedfs::SeaweedFSAdapter;
+pub use local::LocalStorageProvider;
 
 use std::sync::Arc;
 use crate::domain::storage::StorageProvider;
@@ -16,10 +18,13 @@ use crate::domain::storage::StorageProvider;
 /// Storage backend configuration
 #[derive(Debug, Clone)]
 pub enum StorageBackend {
-    /// SeaweedFS distributed storage
+    /// SeaweedFS distributed storage (production)
     SeaweedFS { filer_url: String },
     
-    /// Mock storage for testing
+    /// Local filesystem storage (development/testing)
+    Local { base_path: String },
+    
+    /// Mock storage for unit testing
     Mock,
 }
 
@@ -28,6 +33,10 @@ pub fn create_storage_provider(backend: StorageBackend) -> Arc<dyn StorageProvid
     match backend {
         StorageBackend::SeaweedFS { filer_url } => {
             Arc::new(SeaweedFSAdapter::new(filer_url))
+        }
+        StorageBackend::Local { base_path } => {
+            Arc::new(LocalStorageProvider::new(base_path)
+                .expect("Failed to create LocalStorageProvider"))
         }
         StorageBackend::Mock => {
             // Return mock implementation
@@ -114,6 +123,19 @@ mod tests {
     fn test_factory_seaweedfs() {
         let provider = create_storage_provider(StorageBackend::SeaweedFS {
             filer_url: "http://localhost:8888".to_string(),
+        });
+        
+        // Should not panic
+        assert!(Arc::strong_count(&provider) == 1);
+    }
+    
+    #[test]
+    fn test_factory_local() {
+        use tempfile::TempDir;
+        
+        let temp_dir = TempDir::new().unwrap();
+        let provider = create_storage_provider(StorageBackend::Local {
+            base_path: temp_dir.path().to_string_lossy().to_string(),
         });
         
         // Should not panic

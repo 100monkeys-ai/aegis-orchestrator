@@ -72,6 +72,10 @@ pub struct NodeConfigSpec {
     /// Observability configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observability: Option<ObservabilityConfig>,
+    
+    /// Distributed storage configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,12 +218,6 @@ pub struct RuntimeConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_socket_path: Option<String>,
     
-    /// Enable Docker disk quotas via storage_opt (requires overlay2 + XFS with pquota)
-    /// Default: true (will attempt and gracefully degrade if not supported)
-    /// Set to false to skip disk quota attempts entirely for efficiency
-    #[serde(default = "default_enable_disk_quotas")]
-    pub enable_disk_quotas: bool,
-    
     /// Docker network to attach agent containers to (e.g., "aegis-network", "bridge")
     /// If None, uses Docker's default network behavior
     /// Supports env:VAR_NAME syntax for environment variable substitution
@@ -242,7 +240,6 @@ impl Default for RuntimeConfig {
             bootstrap_script: default_bootstrap_script(),
             default_isolation: default_isolation_mode(),
             docker_socket_path: None,
-            enable_disk_quotas: default_enable_disk_quotas(),
             docker_network_mode: None,
             orchestrator_url: default_orchestrator_url(),
         }
@@ -345,6 +342,125 @@ pub struct TracingConfig {
     pub otlp_endpoint: Option<String>,
 }
 
+/// Storage configuration for distributed agent file systems
+/// Related: ADR-032 Unified Storage via SeaweedFS
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageConfig {
+    /// Storage backend: "seaweedfs" or "local"
+    /// Default: "local"
+    #[serde(default = "default_storage_backend")]
+    pub backend: String,
+    
+    /// SeaweedFS configuration (required if backend: "seaweedfs")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seaweedfs: Option<SeaweedFSConfig>,
+    
+    /// Local filesystem configuration (used if backend: "local")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local: Option<LocalStorageConfig>,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_storage_backend(),
+            seaweedfs: None,
+            local: Some(LocalStorageConfig::default()),
+        }
+    }
+}
+
+/// SeaweedFS distributed storage configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeaweedFSConfig {
+    /// Filer endpoint URL (e.g., "http://seaweedfs-filer:8888")
+    pub filer_url: String,
+    
+    /// Host mount location for volumes
+    /// Default: "/var/lib/aegis/storage"
+    #[serde(default = "default_seaweedfs_mount_point")]
+    pub mount_point: String,
+    
+    /// Default TTL for ephemeral volumes (hours)
+    /// Default: 24
+    #[serde(default = "default_ttl_hours")]
+    pub default_ttl_hours: u32,
+    
+    /// Default size limit for volumes (MB)
+    /// Default: 1000
+    #[serde(default = "default_size_limit_mb")]
+    pub default_size_limit_mb: u64,
+    
+    /// Maximum allowed size limit (MB)
+    /// Default: 10000
+    #[serde(default = "default_max_size_limit_mb")]
+    pub max_size_limit_mb: u64,
+    
+    /// Garbage collection interval (minutes)
+    /// Default: 60
+    #[serde(default = "default_gc_interval_minutes")]
+    pub gc_interval_minutes: u32,
+    
+    /// Optional S3 gateway endpoint
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub s3_endpoint: Option<String>,
+    
+    /// S3 region for gateway
+    /// Default: "us-east-1"
+    #[serde(default = "default_s3_region")]
+    pub s3_region: String,
+}
+
+impl Default for SeaweedFSConfig {
+    fn default() -> Self {
+        Self {
+            filer_url: "http://localhost:8888".to_string(),
+            mount_point: default_seaweedfs_mount_point(),
+            default_ttl_hours: default_ttl_hours(),
+            default_size_limit_mb: default_size_limit_mb(),
+            max_size_limit_mb: default_max_size_limit_mb(),
+            gc_interval_minutes: default_gc_interval_minutes(),
+            s3_endpoint: None,
+            s3_region: default_s3_region(),
+        }
+    }
+}
+
+/// Local filesystem storage configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LocalStorageConfig {
+    /// Base directory for volume storage
+    /// Default: "/var/lib/aegis/local-volumes"
+    #[serde(default = "default_local_base_path")]
+    pub base_path: String,
+    
+    /// Default TTL for ephemeral volumes (hours)
+    /// Default: 24
+    #[serde(default = "default_ttl_hours")]
+    pub default_ttl_hours: u32,
+    
+    /// Default size limit for volumes (MB)
+    /// Default: 1000
+    #[serde(default = "default_size_limit_mb")]
+    pub default_size_limit_mb: u64,
+    
+    /// Maximum allowed size limit (MB)
+    /// Default: 10000
+    #[serde(default = "default_max_size_limit_mb")]
+    pub max_size_limit_mb: u64,
+}
+
+impl Default for LocalStorageConfig {
+    fn default() -> Self {
+        Self {
+            base_path: default_local_base_path(),
+            default_ttl_hours: default_ttl_hours(),
+            default_size_limit_mb: default_size_limit_mb(),
+            max_size_limit_mb: default_max_size_limit_mb(),
+        }
+    }
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -394,6 +510,38 @@ fn default_grpc_port() -> u16 {
     50051
 }
 
+fn default_storage_backend() -> String {
+    "local".to_string()
+}
+
+fn default_seaweedfs_mount_point() -> String {
+    "/var/lib/aegis/storage".to_string()
+}
+
+fn default_local_base_path() -> String {
+    "/var/lib/aegis/local-volumes".to_string()
+}
+
+fn default_ttl_hours() -> u32 {
+    24
+}
+
+fn default_size_limit_mb() -> u64 {
+    1000
+}
+
+fn default_max_size_limit_mb() -> u64 {
+    10000
+}
+
+fn default_gc_interval_minutes() -> u32 {
+    60
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
 impl Default for LLMSelectionStrategy {
     fn default() -> Self {
         Self::PreferLocal
@@ -427,6 +575,7 @@ impl Default for NodeConfigSpec {
             runtime: RuntimeConfig::default(),
             network: None,
             observability: None,
+            storage: None,
         }
     }
 }
@@ -542,27 +691,7 @@ impl NodeConfigManifest {
     /// Apply environment variable overrides to configuration
     /// This allows container deployments to override config via env vars
     pub fn apply_env_overrides(&mut self) {
-        // Runtime configuration overrides
-        if let Ok(val) = std::env::var("AEGIS_ENABLE_DISK_QUOTAS") {
-            match val.to_lowercase().as_str() {
-                "true" | "1" | "yes" | "on" => {
-                    tracing::info!("Environment override: AEGIS_ENABLE_DISK_QUOTAS=true");
-                    self.spec.runtime.enable_disk_quotas = true;
-                }
-                "false" | "0" | "no" | "off" => {
-                    tracing::info!("Environment override: AEGIS_ENABLE_DISK_QUOTAS=false");
-                    self.spec.runtime.enable_disk_quotas = false;
-                }
-                _ => {
-                    tracing::warn!(
-                        "Invalid value for AEGIS_ENABLE_DISK_QUOTAS: '{}'. Expected true/false. Ignoring.",
-                        val
-                    );
-                }
-            }
-        }
-        
-        // Add more environment variable overrides here as needed
+        // Add environment variable overrides here as needed
     }
     
     /// Validate configuration
@@ -693,6 +822,7 @@ mod tests {
                 runtime: RuntimeConfig::default(),
                 network: None,
                 observability: None,
+                storage: None, // Optional storage configuration (ADR-032)
             },
         };
         
@@ -753,8 +883,4 @@ fn default_bootstrap_script() -> String {
 
 fn default_isolation_mode() -> String {
     "inherit".to_string()
-}
-
-fn default_enable_disk_quotas() -> bool {
-    true
 }
