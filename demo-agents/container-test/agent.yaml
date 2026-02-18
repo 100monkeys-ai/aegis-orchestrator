@@ -1,0 +1,43 @@
+apiVersion: 100monkeys.ai/v1
+kind: AgentManifest
+
+metadata:
+  name: "container-test"
+  version: "1.0.0"
+  description: "An agent that spins up a container just for testing ephemeral filesystem capabilities."
+  labels:
+    role: "worker"
+    category: "demo"
+    specialty: "containerization"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: /workspace
+      access_mode: read-write
+      size_limit: "1Gi"
+      ttl_hours: 1
+
+  task:
+    instruction: |
+      You are awesome.
+      
+    prompt_template: |
+      {{instruction}}
+      
+      User Request: {{input}}
+  
+  execution:
+    mode: "iterative"
+    max_iterations: 3
+    memory: true
+    
+    resources:
+      cpu: 1000
+      memory: "1Gi"
+      timeout: "120s"
