@@ -181,14 +181,20 @@ services:
   # ============================================================================
   # Storage Services (Unified Volume Management - ADR-032)
   # ============================================================================
+  # 
+  # Web UIs:
+  # - Master Admin UI: http://localhost:9333 (cluster topology, volume allocation)
+  # - WebDAV File Browser: http://localhost:7333 (browse and manage files)
+  # - Filer API: http://localhost:8888 (REST API for AEGIS)
 
   # SeaweedFS Master (Metadata & Leader Election)
+  # Web UI available at: http://localhost:9333
   seaweedfs-master:
     image: chrislusf/seaweedfs:latest
     container_name: aegis-seaweedfs-master
     command: 'master -ip=seaweedfs-master -ip.bind=0.0.0.0 -metricsPort=9324'
     ports:
-      - "9333:9333"  # HTTP API
+      - "9333:9333"  # HTTP API + Admin Web UI
       - "19333:19333" # gRPC
       - "9324:9324"  # Metrics
     volumes:
@@ -230,6 +236,20 @@ services:
       - "9326:9326"   # Metrics
     volumes:
       - seaweedfs-filer-data:/data
+    networks:
+      - aegis-network
+    restart: unless-stopped
+
+  # SeaweedFS WebDAV (File Browser UI)
+  # Web UI available at: http://localhost:7333
+  seaweedfs-webdav:
+    image: chrislusf/seaweedfs:latest
+    container_name: aegis-seaweedfs-webdav
+    command: 'webdav -filer="seaweedfs-filer:8888" -ip.bind=0.0.0.0'
+    depends_on:
+      - seaweedfs-filer
+    ports:
+      - "7333:7333"   # WebDAV + Web UI
     networks:
       - aegis-network
     restart: unless-stopped
