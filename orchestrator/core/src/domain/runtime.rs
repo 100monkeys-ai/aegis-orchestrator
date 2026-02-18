@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
 use chrono::{DateTime, Utc};
+use crate::domain::volume::VolumeMount;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
@@ -15,6 +16,9 @@ pub struct RuntimeConfig {
     pub env: HashMap<String, String>,
     pub autopull: bool,
     pub resources: ResourceLimits,
+    /// Volume mounts to attach to the runtime instance
+    #[serde(default)]
+    pub volumes: Vec<VolumeMount>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

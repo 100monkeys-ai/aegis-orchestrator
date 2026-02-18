@@ -351,6 +351,12 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_backend")]
     pub backend: String,
     
+    /// Fallback to local storage if SeaweedFS is unreachable
+    /// Only applies when backend is "seaweedfs"
+    /// Default: true (graceful degradation for development/edge scenarios)
+    #[serde(default = "default_fallback_to_local")]
+    pub fallback_to_local: bool,
+    
     /// SeaweedFS configuration (required if backend: "seaweedfs")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seaweedfs: Option<SeaweedFSConfig>,
@@ -364,6 +370,7 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_storage_backend(),
+            fallback_to_local: default_fallback_to_local(),
             seaweedfs: None,
             local: Some(LocalStorageConfig::default()),
         }
@@ -512,6 +519,10 @@ fn default_grpc_port() -> u16 {
 
 fn default_storage_backend() -> String {
     "local".to_string()
+}
+
+fn default_fallback_to_local() -> bool {
+    true  // Default: graceful degradation for dev/edge scenarios
 }
 
 fn default_seaweedfs_mount_point() -> String {

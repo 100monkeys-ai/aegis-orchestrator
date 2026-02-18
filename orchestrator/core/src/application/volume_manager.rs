@@ -18,6 +18,8 @@ use crate::domain::repository::VolumeRepository;
 use crate::domain::storage::StorageProvider;
 use crate::domain::runtime::InstanceId;
 use crate::domain::events::VolumeEvent;
+use crate::domain::execution::ExecutionId;
+use crate::domain::agent::VolumeSpec;
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Result, Context};
 use async_trait::async_trait;
@@ -76,6 +78,19 @@ pub trait VolumeService: Send + Sync {
     /// Cleanup expired ephemeral volumes (garbage collection)
     /// Returns count of volumes cleaned up
     async fn cleanup_expired_volumes(&self) -> Result<usize>;
+    
+    /// Create volumes from agent manifest specs for an execution
+    /// Parses manifest volume specs and creates corresponding volumes
+    /// Returns Vec of Volumes with resolved host paths
+    async fn create_volumes_for_execution(
+        &self,
+        execution_id: ExecutionId,
+        tenant_id: TenantId,
+        volume_specs: &[VolumeSpec],
+        storage_mode: &str,
+        fallback_to_local: bool,
+        local_path: &str,
+    ) -> Result<Vec<Volume>>;
 }
 
 // ============================================================================
@@ -423,6 +438,165 @@ impl VolumeService for StandardVolumeService {
         info!("Cleanup completed: {} volumes deleted", count);
         Ok(count)
     }
+    
+    async fn create_volumes_for_execution(
+        &self,
+        execution_id: ExecutionId,
+        tenant_id: TenantId,
+        volume_specs: &[VolumeSpec],
+        storage_mode: &str,
+        fallback_to_local: bool,
+        _local_path: &str, // Prefixed with _ to suppress unused warning
+    ) -> Result<Vec<Volume>> {
+        if volume_specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        
+        info!(
+            "Creating {} volumes for execution {} (storage_mode: {}, fallback: {})",
+            volume_specs.len(),
+            execution_id,
+            storage_mode,
+            fallback_to_local
+        );
+        
+        let mut volumes = Vec::new();
+        
+        for spec in volume_specs {
+            // Parse size limit from string (e.g., "1Gi", "500Mi")
+            let size_limit_bytes = parse_size_string(&spec.size_limit)
+                .context(format!("Invalid size_limit '{}' in volume spec '{}'", spec.size_limit, spec.name))?;
+            
+            // Parse storage class
+            let storage_class = match spec.storage_class.as_str() {
+                "ephemeral" => {
+                    let ttl_hours = spec.ttl_hours.unwrap_or(24) as i64;
+                    StorageClass::ephemeral_hours(ttl_hours)
+                }
+                "persistent" => StorageClass::persistent(),
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid storage_class '{}' in volume spec '{}'. Expected 'ephemeral' or 'persistent'",
+                        other,
+                        spec.name
+                    ));
+                }
+            };
+            
+            // Create volume ownership tied to execution
+            let ownership = VolumeOwnership::execution(execution_id);
+            
+            // Attempt to create volume
+            let volume_id = match storage_mode {
+                "seaweedfs" => {
+                    // Try SeaweedFS first
+                    match self
+                        .create_volume(
+                            spec.name.clone(),
+                            tenant_id,
+                            storage_class.clone(),
+                            size_limit_bytes / (1024 * 1024), // Convert bytes to MB
+                            ownership.clone(),
+                        )
+                        .await
+                    {
+                        Ok(id) => id,
+                        Err(e) if fallback_to_local => {
+                            warn!(
+                                "SeaweedFS volume creation failed for '{}', falling back to local storage: {}",
+                                spec.name, e
+                            );
+                            // Create local volume instead (not using SeaweedFS adapter)
+                            return Err(anyhow::anyhow!(
+                                "Local storage fallback not yet implemented. SeaweedFS error: {}",
+                                e
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(anyhow::anyhow!(
+                                "SeaweedFS volume creation failed for '{}' and fallback is disabled: {}",
+                                spec.name,
+                                e
+                            ));
+                        }
+                    }
+                }
+                "local" => {
+                    // Local storage mode (not using SeaweedFS)
+                    warn!("Local storage mode not yet fully implemented, using SeaweedFS adapter anyway");
+                    self.create_volume(
+                        spec.name.clone(),
+                        tenant_id,
+                        storage_class.clone(),
+                        size_limit_bytes / (1024 * 1024),
+                        ownership.clone(),
+                    )
+                    .await?
+                }
+                other => {
+                    return Err(anyhow::anyhow!(
+                        "Invalid storage mode '{}'. Expected 'seaweedfs' or 'local'",
+                        other
+                    ));
+                }
+            };
+            
+            // Fetch created volume
+            let volume = self.get_volume(volume_id).await?;
+            volumes.push(volume);
+            
+            info!(
+                "Volume '{}' created successfully (id: {}, size: {} bytes)",
+                spec.name, volume_id, size_limit_bytes
+            );
+        }
+        
+        info!(
+            "Successfully created {} volumes for execution {}",
+            volumes.len(),
+            execution_id
+        );
+        
+        Ok(volumes)
+    }
+}
+
+/// Parse size string like "1Gi", "500Mi", "100Ki" to bytes
+fn parse_size_string(size: &str) -> Result<u64> {
+    let size = size.trim();
+    
+    // Find where digits end and unit begins
+    let (number_part, unit_part) = size
+        .split_at(
+            size
+                .find(|c: char| c.is_alphabetic())
+                .unwrap_or(size.len())
+        );
+    
+    let number: u64 = number_part
+        .trim()
+        .parse()
+        .context(format!("Invalid number in size '{}'", size))?;
+    
+    let multiplier: u64 = match unit_part.trim().to_lowercase().as_str() {
+        "ki" => 1024,
+        "mi" => 1024 * 1024,
+        "gi" => 1024 * 1024 * 1024,
+        "ti" => 1024 * 1024 * 1024 * 1024,
+        "k" => 1000,
+        "m" => 1000 * 1000,
+        "g" => 1000 * 1000 * 1000,
+        "t" => 1000 * 1000 * 1000 * 1000,
+        "" => 1, // No unit = bytes
+        unknown => {
+            return Err(anyhow::anyhow!(
+                "Unknown size unit '{}'. Supported: Ki, Mi, Gi, Ti (binary) or K, M, G, T (decimal)",
+                unknown
+            ));
+        }
+    };
+    
+    Ok(number * multiplier)
 }
 
 #[cfg(test)]

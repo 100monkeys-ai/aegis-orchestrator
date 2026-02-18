@@ -337,6 +337,7 @@ mod tests {
                     schedule: None,
                     tools: vec![],
                     env: std::collections::HashMap::new(),
+                    volumes: vec![],
                     advanced: None,
                 },
             },

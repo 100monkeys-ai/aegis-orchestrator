@@ -11,6 +11,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, sse::{Event, Sse}},
 };
+use sqlx::postgres::PgPool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -96,16 +97,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Initialize repositories 
     let database_url = std::env::var("AEGIS_DATABASE_URL").ok();
     
-    let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): (
-        Arc<dyn AgentRepository>,
-        Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
-        Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
-        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>
-    ) = if let Some(url) = database_url {
+    // Store pool separately for later volume repo initialization
+    let pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
         println!("Initializing repositories with PostgreSQL: {}", url);
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(5)
-            .connect(&url)
+            .connect(url)
             .await 
         {
             Ok(pool) => {
@@ -146,27 +143,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 } else {
                     println!("INFO: Database is up to date.");
                 }
-
-                (
-                    Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
-                    Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
-                    Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
-                    Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool)),
-                )
+                
+                Some(pool)
             },
             Err(e) => {
                 tracing::error!("Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
                 println!("ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
-                (
-                    Arc::new(InMemoryAgentRepository::new()),
-                    Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
-                    Arc::new(InMemoryExecutionRepository::new()),
-                    Arc::new(InMemoryWorkflowExecutionRepository::new()),
-                )
+                None
             }
         }
     } else {
         println!("AEGIS_DATABASE_URL not set. Using InMemory repositories.");
+        None
+    };
+    
+    let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): (
+        Arc<dyn AgentRepository>,
+        Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
+        Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
+        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>
+    ) = if let Some(pool) = pool.as_ref() {
+        (
+            Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
+            Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
+            Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
+            Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool.clone())),
+        )
+    } else {
         (
             Arc::new(InMemoryAgentRepository::new()),
             Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
@@ -233,9 +236,66 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
+    // Initialize volume service (with SeaweedFS or fallback to local)
+    println!("Initializing volume service...");
+    let storage_config = config.spec.storage.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Storage configuration not found in node config"))?;
+    
+    let filer_url = if storage_config.backend == "seaweedfs" {
+        storage_config.seaweedfs.as_ref()
+            .map(|s| s.filer_url.clone())
+            .unwrap_or_else(|| "http://localhost:8888".to_string())
+    } else {
+        "http://localhost:8888".to_string() // Fallback even for local mode
+    };
+    
+    // Reuse existing pool for volume repository (avoid redundant connection)
+    let volume_repo: Arc<dyn aegis_core::domain::repository::VolumeRepository> = if let Some(pool) = pool.as_ref() {
+        Arc::new(aegis_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
+    } else {
+        println!("WARNING: Volume persistence disabled (no database pool available)");
+        return Err(anyhow::anyhow!("Database connection required for volume management"));
+    };
+    
+    let storage_provider: Arc<dyn aegis_core::domain::storage::StorageProvider> = 
+        Arc::new(aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()));
+    
+    let volume_service = Arc::new(aegis_core::application::volume_manager::StandardVolumeService::new(
+        volume_repo,
+        storage_provider,
+        event_bus.clone(),
+        filer_url,
+    )?);
+    
+    println!("✓ Volume service initialized (mode: {}, fallback: {})", 
+             storage_config.backend, 
+             storage_config.fallback_to_local);
+    
+    // Spawn TTL cleanup background task for ephemeral volumes
+    let volume_service_cleanup = volume_service.clone();
+    tokio::spawn(async move {
+        use aegis_core::application::volume_manager::VolumeService as _;
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
+        loop {
+            interval.tick().await;
+            match volume_service_cleanup.cleanup_expired_volumes().await {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!("Volume cleanup: {} expired volumes deleted", count);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Volume cleanup failed: {}", e);
+                }
+            }
+        }
+    });
+    println!("✓ Volume cleanup background task spawned (interval: 5 minutes)");
+
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(
         agent_service.clone(),
+        volume_service.clone(),
         supervisor,
         execution_repo.clone(),
         event_bus.clone(),

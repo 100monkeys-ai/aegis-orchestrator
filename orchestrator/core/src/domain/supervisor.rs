@@ -282,6 +282,7 @@ mod tests {
                 memory_bytes: None,
                 disk_bytes: None,
             },
+            volumes: Vec::new(),
         }
     }
     

@@ -170,7 +170,7 @@ impl AgentRuntime for DockerRuntime {
         debug!("Preparing to copy bootstrap script into container");
         
         let mut host_config = bollard::service::HostConfig {
-            binds: None,  // No bind mounts needed - we'll copy the file instead
+            binds: None,  // Will be set below if volumes are specified
             network_mode: self.network_mode.clone(),  // Optional Docker network (None = default)
             ..Default::default()
         };
@@ -182,6 +182,27 @@ impl AgentRuntime for DockerRuntime {
         if let Some(cpu_millis) = config.resources.cpu_millis {
             // Docker nano_cpus: 1 CPU = 1e9 nano CPUs, 1 milli CPU = 1e6 nano CPUs
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
+        }
+        
+        // Apply volume bind mounts if specified
+        if !config.volumes.is_empty() {
+            let binds: Vec<String> = config.volumes.iter().map(|mount| {
+                // Derive host path from volume_id
+                // Convention: /var/lib/aegis/storage/<volume-id>
+                let host_path = format!("/var/lib/aegis/storage/{}", mount.volume_id);
+                let container_path = mount.mount_point.display();
+                let mode = match mount.access_mode {
+                    crate::domain::volume::AccessMode::ReadOnly => "ro",
+                    crate::domain::volume::AccessMode::ReadWrite => "rw",
+                };
+                
+                let bind_spec = format!("{}:{}:{}", host_path, container_path, mode);
+                debug!("Mounting volume: {}", bind_spec);
+                bind_spec
+            }).collect();
+            
+            host_config.binds = Some(binds);
+            info!("Configured {} volume mount(s) for container", config.volumes.len());
         }
 
         // Removed container_config that was causing move issues and unused var warning

@@ -28,7 +28,7 @@ tokio-stream = "0.1.18"
 tower-http.workspace = true
 hostname = "0.4"
 dirs = "5.0"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 walkdir = "2.4"
 tonic = { workspace = true }
 prost = { workspace = true }

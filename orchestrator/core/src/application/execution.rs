@@ -6,7 +6,9 @@ use crate::domain::repository::ExecutionRepository;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
+use crate::domain::volume::{VolumeMount, TenantId, AccessMode};
 use crate::application::agent::AgentLifecycleService;
+use crate::application::volume_manager::VolumeService;
 use crate::infrastructure::event_bus::{EventBus, DomainEvent, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptTemplateEngine, PromptContext};
 use anyhow::{Result, anyhow};
@@ -14,6 +16,7 @@ use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::path::PathBuf;
 use chrono::Utc;
 
 #[async_trait]
@@ -31,6 +34,7 @@ pub trait ExecutionService: Send + Sync {
 
 pub struct StandardExecutionService {
     agent_service: Arc<dyn AgentLifecycleService>,
+    volume_service: Arc<dyn VolumeService>,
     supervisor: Arc<Supervisor>,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
@@ -40,6 +44,7 @@ pub struct StandardExecutionService {
 impl StandardExecutionService {
     pub fn new(
         agent_service: Arc<dyn AgentLifecycleService>,
+        volume_service: Arc<dyn VolumeService>,
         supervisor: Arc<Supervisor>,
         repository: Arc<dyn ExecutionRepository>,
         event_bus: Arc<EventBus>,
@@ -47,6 +52,7 @@ impl StandardExecutionService {
     ) -> Self {
         Self {
             agent_service,
+            volume_service,
             supervisor,
             repository,
             event_bus,
@@ -322,6 +328,56 @@ impl ExecutionService for StandardExecutionService {
             }
         };
         
+        // Create volumes from manifest if specified
+        tracing::info!("Checking for volumes in agent manifest: {} volume(s) specified", agent.manifest.spec.volumes.len());
+        let volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
+            tracing::info!("Creating volumes for execution {}", execution_id.0);
+            
+            // Get storage config from node config
+            let storage_config = self.config.spec.storage.as_ref()
+                .ok_or_else(|| anyhow!("Storage configuration not found in node config"))?;
+            
+            tracing::debug!("Storage config: backend={}, fallback={}", storage_config.backend, storage_config.fallback_to_local);
+            
+            // Create volumes using volume service
+            let tenant_id = TenantId::default_tenant(); // TODO: Multi-tenancy
+            let volumes = self.volume_service.create_volumes_for_execution(
+                execution_id,
+                tenant_id,
+                &agent.manifest.spec.volumes,
+                &storage_config.backend,
+                storage_config.fallback_to_local,
+                storage_config.local.as_ref()
+                    .map(|l| l.base_path.as_str())
+                    .unwrap_or("/var/lib/aegis/local-volumes"),
+            ).await?;
+            
+            tracing::info!("Successfully created {} volume(s)", volumes.len());
+            
+            // Build VolumeMount objects from created volumes
+            volumes.iter().map(|volume| {
+                // Find corresponding spec to get mount_path and access_mode
+                let spec = agent.manifest.spec.volumes.iter()
+                    .find(|s| s.name == volume.name)
+                    .expect("Volume spec not found for created volume");
+                
+                let access_mode = match spec.access_mode.as_str() {
+                    "read-only" => AccessMode::ReadOnly,
+                    "read-write" | _ => AccessMode::ReadWrite,
+                };
+                
+                VolumeMount::new(
+                    volume.id,
+                    PathBuf::from(&spec.mount_path),
+                    access_mode,
+                    volume.filer_endpoint.clone(),
+                    volume.remote_path.clone(),
+                )
+            }).collect()
+        } else {
+            Vec::new()
+        };
+        
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             language: agent.manifest.spec.runtime.language.clone(),
             version: agent.manifest.spec.runtime.version.clone(),
@@ -329,6 +385,7 @@ impl ExecutionService for StandardExecutionService {
             env,
             autopull: agent.manifest.spec.runtime.autopull,
             resources,
+            volumes: volume_mounts,
         };
 
         // NOTE: We no longer spawn the instance here.

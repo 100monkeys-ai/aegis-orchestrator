@@ -109,6 +109,10 @@ pub struct AgentSpec {
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
     
+    /// Optional volume mounts
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<VolumeSpec>,
+    
     /// Optional advanced configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advanced: Option<AdvancedConfig>,
@@ -130,6 +134,29 @@ pub struct RuntimeConfig {
     /// Optional autopull
     #[serde(default = "default_true")]
     pub autopull: bool,
+}
+
+/// Volume specification in agent manifest
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VolumeSpec {
+    /// Volume name (used as identifier)
+    pub name: String,
+    
+    /// Storage class: "ephemeral" or "persistent"
+    pub storage_class: String,
+    
+    /// Mount path inside container
+    pub mount_path: String,
+    
+    /// Access mode: "read-only" or "read-write"
+    pub access_mode: String,
+    
+    /// Size limit (e.g., "1Gi", "500Mi")
+    pub size_limit: String,
+    
+    /// TTL in hours (only for ephemeral volumes)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_hours: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

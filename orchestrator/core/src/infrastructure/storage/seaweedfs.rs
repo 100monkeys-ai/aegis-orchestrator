@@ -22,7 +22,7 @@
 //! - `GET /` - Health check
 
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode};
+use reqwest::{Client, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use crate::domain::storage::{StorageProvider, StorageError};
@@ -89,16 +89,21 @@ impl StorageProvider for SeaweedFSAdapter {
         // But we can explicitly create them via POST to /dir/
         let url = self.build_url("/dir/");
         
+        let form = multipart::Form::new()
+            .text("path", path.to_string());
+        
         let response = self.client
             .post(&url)
-            .query(&[("path", path)])
+            .multipart(form)
             .send()
             .await?;
 
         match response.status() {
             StatusCode::CREATED | StatusCode::OK => Ok(()),
             StatusCode::CONFLICT => {
-                Err(StorageError::AlreadyExists(path.to_string()))
+                // Directory already exists - treat as success (idempotent operation)
+                tracing::debug!("Directory {} already exists, treating as success", path);
+                Ok(())
             }
             status => {
                 let error_msg = response.text().await
@@ -153,9 +158,13 @@ impl StorageProvider for SeaweedFSAdapter {
 
         let url = self.build_url("/quota");
         
+        let form = multipart::Form::new()
+            .text("path", path.to_string())
+            .text("bytes", bytes.to_string());
+        
         let response = self.client
             .post(&url)
-            .query(&[("path", path), ("bytes", &bytes.to_string())])
+            .multipart(form)
             .send()
             .await?;
 
@@ -351,6 +360,9 @@ mod tests {
         
         // Create directory
         let path = "/test/integration/dir";
+        adapter.create_directory(path).await.unwrap();
+        
+        // Test idempotency - creating same directory again should succeed
         adapter.create_directory(path).await.unwrap();
         
         // Set quota

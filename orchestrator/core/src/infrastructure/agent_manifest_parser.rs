@@ -265,6 +265,7 @@ spec:
                 schedule: None,
                 tools: vec![],
                 env: HashMap::new(),
+                volumes: vec![],
                 advanced: None,
             },
         };

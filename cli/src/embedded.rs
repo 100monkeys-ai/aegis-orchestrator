@@ -18,13 +18,10 @@ use aegis_core::{
         node_config::NodeConfigManifest,
         agent::AgentId,
         execution::{ExecutionInput, ExecutionId},
-        supervisor::Supervisor,
     },
     infrastructure::{
         event_bus::EventBus,
         llm::registry::ProviderRegistry,
-        repositories::{InMemoryAgentRepository, InMemoryExecutionRepository},
-        runtime::DockerRuntime,
     },
 };
 use aegis_sdk::AgentManifest;
@@ -46,60 +43,8 @@ impl EmbeddedExecutor {
             .validate()
             .context("Configuration validation failed")?;
 
-        // Initialize services
-        let agent_repo = Arc::new(InMemoryAgentRepository::new());
-        let execution_repo = Arc::new(InMemoryExecutionRepository::new());
-        let event_bus = Arc::new(EventBus::new(100));
-        let llm_registry = Arc::new(
-            ProviderRegistry::from_config(&config)
-                .context("Failed to initialize LLM providers")?,
-        );
-        
-        // Resolve orchestrator URL (supports env:VAR_NAME syntax)
-        let orchestrator_url = if config.spec.runtime.orchestrator_url.starts_with("env:") {
-            let env_var = config.spec.runtime.orchestrator_url.strip_prefix("env:").unwrap();
-            std::env::var(env_var)
-                .unwrap_or_else(|_| "http://localhost:8000".to_string())
-        } else {
-            config.spec.runtime.orchestrator_url.clone()
-        };
-        
-        // Resolve Docker network mode (supports env:VAR_NAME syntax)
-        let network_mode = config.spec.runtime.docker_network_mode.as_ref().map(|nm| {
-            if nm.starts_with("env:") {
-                let env_var = nm.strip_prefix("env:").unwrap();
-                std::env::var(env_var).unwrap_or_else(|_| String::new())
-            } else {
-                nm.clone()
-            }
-        }).filter(|s| !s.is_empty());
-        
-        let runtime = Arc::new(
-            DockerRuntime::new(
-                config.spec.runtime.bootstrap_script.clone(),
-                config.spec.runtime.docker_socket_path.clone(),
-                network_mode,
-                orchestrator_url
-            )
-            .context("Failed to initialize Docker runtime")?
-        );
-        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
-
-        let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
-        let execution_service = Arc::new(StandardExecutionService::new(
-            agent_service.clone(),
-            supervisor,
-            execution_repo.clone(),
-            event_bus.clone(),
-            Arc::new(config.clone()),
-        ));
-
-        Ok(Self {
-            agent_service,
-            execution_service,
-            event_bus,
-            _llm_registry: llm_registry,
-        })
+        // Embedded mode does not support volumes yet (requires InMemoryVolumeRepository)
+        return Err(anyhow::anyhow!("Embedded mode does not yet support volume management. Please use daemon mode by starting the daemon with 'aegis-cli daemon start'"));
     }
 
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
