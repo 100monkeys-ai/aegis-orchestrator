@@ -1,7 +1,0 @@
-# SeaweedFS Filer Configuration
-# Storage backend: LevelDB (local development)
-# For production, consider PostgreSQL backend (see ADR-032)
-
-[leveldb2]
-enabled = true
-dir = "/data/filerldb2"
