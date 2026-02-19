@@ -127,6 +127,23 @@ pub trait VolumeRepository: Send + Sync {
     async fn delete(&self, id: VolumeId) -> Result<(), RepositoryError>;
 }
 
+/// Repository interface for StorageEvent audit trail (ADR-036)
+/// Persists file-level operations for forensic analysis
+#[async_trait]
+pub trait StorageEventRepository: Send + Sync {
+    /// Save storage event to audit log
+    async fn save(&self, event: &crate::domain::events::StorageEvent) -> Result<(), RepositoryError>;
+    
+    /// Find events by execution ID (ordered by timestamp descending)
+    async fn find_by_execution(&self, execution_id: ExecutionId, limit: Option<usize>) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError>;
+    
+    /// Find events by volume ID
+    async fn find_by_volume(&self, volume_id: VolumeId, limit: Option<usize>) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError>;
+    
+    /// Find security violation events (forensic analysis)
+    async fn find_violations(&self, execution_id: Option<ExecutionId>) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError>;
+}
+
 
 /// Repository errors
 #[derive(Debug, thiserror::Error)]
@@ -144,11 +161,12 @@ pub enum RepositoryError {
     Unknown(String),
 }
 
-use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecutionRepository};
+use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryStorageEventRepository};
 use crate::infrastructure::repositories::postgres_agent::PostgresAgentRepository;
 use crate::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
 use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
 use crate::infrastructure::repositories::postgres_volume::PostgresVolumeRepository;
+use crate::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository;
 
 /// Factory for creating repositories from storage backend
 pub fn create_agent_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn AgentRepository> {
@@ -193,6 +211,17 @@ pub fn create_volume_repository(backend: &StorageBackend, pool: sqlx::PgPool) ->
         }
         StorageBackend::PostgreSQL(_) => {
             Arc::new(PostgresVolumeRepository::new(pool))
+        }
+    }
+}
+
+pub fn create_storage_event_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn StorageEventRepository> {
+    match backend {
+        StorageBackend::InMemory => {
+            Arc::new(InMemoryStorageEventRepository::new())
+        }
+        StorageBackend::PostgreSQL(_) => {
+            Arc::new(PostgresStorageEventRepository::new(pool))
         }
     }
 }

@@ -343,7 +343,7 @@ pub struct TracingConfig {
 }
 
 /// Storage configuration for distributed agent file systems
-/// Related: ADR-032 Unified Storage via SeaweedFS
+/// Related: ADR-032 Unified Storage via SeaweedFS, ADR-036 NFS Server Gateway
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
     /// Storage backend: "seaweedfs" or "local"
@@ -356,6 +356,11 @@ pub struct StorageConfig {
     /// Default: true (graceful degradation for development/edge scenarios)
     #[serde(default = "default_fallback_to_local")]
     pub fallback_to_local: bool,
+    
+    /// NFS Server Gateway port (ADR-036)
+    /// Default: 2049 (standard NFS port)
+    #[serde(default = "default_nfs_port")]
+    pub nfs_port: Option<u16>,
     
     /// SeaweedFS configuration (required if backend: "seaweedfs")
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -371,6 +376,7 @@ impl Default for StorageConfig {
         Self {
             backend: default_storage_backend(),
             fallback_to_local: default_fallback_to_local(),
+            nfs_port: default_nfs_port(),
             seaweedfs: None,
             local: Some(LocalStorageConfig::default()),
         }
@@ -523,6 +529,10 @@ fn default_storage_backend() -> String {
 
 fn default_fallback_to_local() -> bool {
     true  // Default: graceful degradation for dev/edge scenarios
+}
+
+fn default_nfs_port() -> Option<u16> {
+    Some(2049)  // Standard NFS port (ADR-036)
 }
 
 fn default_seaweedfs_mount_point() -> String {

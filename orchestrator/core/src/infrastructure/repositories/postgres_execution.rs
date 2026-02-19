@@ -105,15 +105,18 @@ impl ExecutionRepository for PostgresExecutionRepository {
             INSERT INTO executions (
                 id, agent_id, input, status, iterations, 
                 current_iteration, max_iterations, final_output, error_message, 
+                container_uid, container_gid,
                 started_at, completed_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 iterations = EXCLUDED.iterations,
                 current_iteration = EXCLUDED.current_iteration,
                 final_output = EXCLUDED.final_output,
                 error_message = EXCLUDED.error_message,
+                container_uid = EXCLUDED.container_uid,
+                container_gid = EXCLUDED.container_gid,
                 completed_at = EXCLUDED.completed_at
             "#
         )
@@ -126,6 +129,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(execution.max_iterations as i32)
         .bind(final_output)
         .bind(error_message)
+        .bind(execution.container_uid as i32)
+        .bind(execution.container_gid as i32)
         .bind(execution.started_at)
         .bind(execution.ended_at)
         .execute(&self.pool)
@@ -140,6 +145,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             r#"
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
+                container_uid, container_gid,
                 started_at, completed_at, error_message
             FROM executions
             WHERE id = $1
@@ -157,6 +163,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let input_val: serde_json::Value = row.get("input");
             let iterations_val: serde_json::Value = row.get("iterations");
             let max_iterations: i32 = row.get("max_iterations");
+            let container_uid: i32 = row.get("container_uid");
+            let container_gid: i32 = row.get("container_gid");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
@@ -190,6 +198,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                             // Ensure it is pub or we have a way to reconstruct it.
                             // I need to check `execution.rs` again.
                 max_iterations: max_iterations as u8,
+                container_uid: container_uid as u32,
+                container_gid: container_gid as u32,
                 input,
                 started_at,
                 ended_at: completed_at,
@@ -206,6 +216,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             r#"
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
+                container_uid, container_gid,
                 started_at, completed_at, error_message
             FROM executions
             WHERE agent_id = $1
@@ -227,6 +238,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let input_val: serde_json::Value = row.get("input");
             let iterations_val: serde_json::Value = row.get("iterations");
             let max_iterations: i32 = row.get("max_iterations");
+            let container_uid: i32 = row.get("container_uid");
+            let container_gid: i32 = row.get("container_gid");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
@@ -249,6 +262,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 status,
                 iterations,
                 max_iterations: max_iterations as u8,
+                container_uid: container_uid as u32,
+                container_gid: container_gid as u32,
                 input,
                 started_at,
                 ended_at: completed_at,
@@ -265,6 +280,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             r#"
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
+                container_uid, container_gid,
                 started_at, completed_at, error_message
             FROM executions
             ORDER BY started_at DESC
@@ -284,6 +300,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let input_val: serde_json::Value = row.get("input");
             let iterations_val: serde_json::Value = row.get("iterations");
             let max_iterations: i32 = row.get("max_iterations");
+            let container_uid: i32 = row.get("container_uid");
+            let container_gid: i32 = row.get("container_gid");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
@@ -306,6 +324,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 status,
                 iterations,
                 max_iterations: max_iterations as u8,
+                container_uid: container_uid as u32,
+                container_gid: container_gid as u32,
                 input,
                 started_at,
                 ended_at: completed_at,

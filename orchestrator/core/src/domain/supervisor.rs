@@ -277,6 +277,8 @@ mod tests {
             isolation: "process".to_string(),
             env: HashMap::new(),
             autopull: false,
+            container_uid: 1000,
+            container_gid: 1000,
             resources: ResourceLimits {
                 cpu_millis: None,
                 memory_bytes: None,

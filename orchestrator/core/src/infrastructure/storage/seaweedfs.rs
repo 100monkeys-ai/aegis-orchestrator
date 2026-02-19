@@ -25,7 +25,8 @@ use async_trait::async_trait;
 use reqwest::{Client, StatusCode, multipart};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use crate::domain::storage::{StorageProvider, StorageError};
+use chrono;
+use crate::domain::storage::{StorageProvider, StorageError, FileHandle, OpenMode, FileAttributes, DirEntry, FileType};
 
 /// SeaweedFS Filer adapter
 pub struct SeaweedFSAdapter {
@@ -280,6 +281,288 @@ impl StorageProvider for SeaweedFSAdapter {
                 )))
             }
         }
+    }
+
+    // --- POSIX File Operations (ADR-036) ---
+
+    async fn open_file(&self, path: &str, mode: OpenMode) -> Result<FileHandle, StorageError> {
+        // For SeaweedFS HTTP API, we don't need to actually "open" files
+        // The FileHandle just stores the path for subsequent operations
+        // Real implementations would validate file exists for ReadOnly mode
+        
+        if matches!(mode, OpenMode::ReadOnly) {
+            // Verify file exists via HEAD request
+            let url = self.build_url(path);
+            let response = self.client.head(&url).send().await?;
+            
+            if !response.status().is_success() {
+                return Err(StorageError::FileNotFound(path.to_string()));
+            }
+        }
+        
+        // Create file handle encoding path
+        let handle_data = path.as_bytes().to_vec();
+        Ok(FileHandle(handle_data))
+    }
+
+    async fn read_at(&self, handle: &FileHandle, offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+        // Decode path from handle
+        let path = String::from_utf8(handle.0.clone())
+            .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
+        
+        let url = self.build_url(&path);
+        
+        // Use HTTP Range header for partial reads
+        let range_header = format!("bytes={}-{}", offset, offset + length as u64 - 1);
+        
+        let response = self.client
+            .get(&url)
+            .header("Range", range_header)
+            .send()
+            .await?;
+        
+        match response.status() {
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
+                let bytes = response.bytes().await?;
+                Ok(bytes.to_vec())
+            }
+            StatusCode::NOT_FOUND => {
+                Err(StorageError::FileNotFound(path))
+            }
+            status => {
+                Err(StorageError::Unknown(format!(
+                    "Failed to read file {}: HTTP {}",
+                    path, status
+                )))
+            }
+        }
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+        // Decode path from handle
+        let path = String::from_utf8(handle.0.clone())
+            .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
+        
+        let url = self.build_url(&path);
+        
+        // For simplicity, we'll read existing content, modify, and write back
+        // A production implementation would use proper partial write support
+        // or append-only writes for efficiency
+        
+        let mut content = if offset > 0 {
+            // Read existing content if we're writing at an offset
+            let response = self.client.get(&url).send().await;
+            if let Ok(resp) = response {
+                if resp.status().is_success() {
+                    resp.bytes().await.unwrap_or_default().to_vec()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+        
+        // Extend content if needed
+        if content.len() < offset as usize {
+            content.resize(offset as usize, 0);
+        }
+        
+        // Write data at offset
+        if offset as usize + data.len() > content.len() {
+            content.resize(offset as usize + data.len(), 0);
+        }
+        content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
+        
+        // Write back to SeaweedFS
+        let response = self.client
+            .post(&url)
+            .body(content)
+            .send()
+            .await?;
+        
+        if response.status().is_success() {
+            Ok(data.len())
+        } else {
+            Err(StorageError::Unknown(format!(
+                "Failed to write file {}: HTTP {}",
+                path, response.status()
+            )))
+        }
+    }
+
+    async fn close_file(&self, _handle: &FileHandle) -> Result<(), StorageError> {
+        // HTTP-based storage doesn't need explicit close
+        Ok(())
+    }
+
+    async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
+        let url = self.build_url(path);
+        
+        let response = self.client.head(&url).send().await?;
+        
+        match response.status() {
+            StatusCode::OK => {
+                // Extract metadata from headers
+                let size = response.headers()
+                    .get("content-length")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                
+                let mtime = response.headers()
+                    .get("last-modified")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
+                    .map(|dt| dt.timestamp())
+                    .unwrap_or_else(|| chrono::Utc::now().timestamp());
+                
+                Ok(FileAttributes {
+                    file_type: FileType::File,
+                    size,
+                    mtime,
+                    atime: mtime,
+                    ctime: mtime,
+                    mode: 0o644,
+                    uid: 1000,
+                    gid: 1000,
+                    nlink: 1,
+                })
+            }
+            StatusCode::NOT_FOUND => {
+                Err(StorageError::FileNotFound(path.to_string()))
+            }
+            status => {
+                Err(StorageError::Unknown(format!(
+                    "Failed to stat {}: HTTP {}",
+                    path, status
+                )))
+            }
+        }
+    }
+
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError> {
+        let url = self.build_url(path);
+        
+        let response = self.client.get(&url).send().await?;
+        
+        match response.status() {
+            StatusCode::OK => {
+                let listing: DirectoryListing = response.json().await
+                    .map_err(|e| StorageError::Serialization(e.to_string()))?;
+                
+                let entries = listing.entries
+                    .into_iter()
+                    .map(|e| DirEntry {
+                        name: e.name.rsplit('/').next().unwrap_or(&e.name).to_string(),
+                        file_type: if e.is_directory { FileType::Directory } else { FileType::File },
+                    })
+                    .collect();
+                
+                Ok(entries)
+            }
+            StatusCode::NOT_FOUND => {
+                Err(StorageError::NotFound(path.to_string()))
+            }
+            status => {
+                Err(StorageError::Unknown(format!(
+                    "Failed to readdir {}: HTTP {}",
+                    path, status
+                )))
+            }
+        }
+    }
+
+    async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
+        let url = self.build_url(path);
+        
+        // Create empty file
+        let response = self.client
+            .post(&url)
+            .body(Vec::<u8>::new())
+            .send()
+            .await?;
+        
+        if response.status().is_success() {
+            let handle_data = path.as_bytes().to_vec();
+            Ok(FileHandle(handle_data))
+        } else {
+            Err(StorageError::Unknown(format!(
+                "Failed to create file {}: HTTP {}",
+                path, response.status()
+            )))
+        }
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), StorageError> {
+        let url = self.build_url(path);
+        
+        let response = self.client.delete(&url).send().await?;
+        
+        match response.status() {
+            StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
+            StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
+            status => {
+                Err(StorageError::Unknown(format!(
+                    "Failed to delete file {}: HTTP {}",
+                    path, status
+                )))
+            }
+        }
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        // SeaweedFS doesn't have a native rename operation via HTTP API
+        // We implement it as copy + delete
+        // Note: This is not atomic, but acceptable for Phase 1
+        
+        // 1. Check source exists
+        let from_url = self.build_url(from);
+        let check_response = self.client.head(&from_url).send().await?;
+        
+        if !check_response.status().is_success() {
+            return Err(StorageError::FileNotFound(from.to_string()));
+        }
+        
+        // 2. Read source file
+        let read_response = self.client.get(&from_url).send().await?;
+        
+        if !read_response.status().is_success() {
+            return Err(StorageError::Unknown(format!(
+                "Failed to read source file {}",
+                from
+            )));
+        }
+        
+        let data = read_response.bytes().await?
+            .to_vec();
+        
+        // 3. Write to destination
+        let to_url = self.build_url(to);
+        let write_response = self.client
+            .post(&to_url)
+            .body(data)
+            .send()
+            .await?;
+        
+        if !write_response.status().is_success() {
+            return Err(StorageError::Unknown(format!(
+                "Failed to write destination file {}",
+                to
+            )));
+        }
+        
+        // 4. Delete source
+        let delete_response = self.client.delete(&from_url).send().await?;
+        
+        if !delete_response.status().is_success() {
+            // Log warning but don't fail - destination file was created
+            tracing::warn!("Failed to delete source file {} after rename", from);
+        }
+        
+        Ok(())
     }
 }
 

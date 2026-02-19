@@ -386,6 +386,8 @@ impl ExecutionService for StandardExecutionService {
             autopull: agent.manifest.spec.runtime.autopull,
             resources,
             volumes: volume_mounts,
+            container_uid: 1000,
+            container_gid: 1000,
         };
 
         // NOTE: We no longer spawn the instance here.

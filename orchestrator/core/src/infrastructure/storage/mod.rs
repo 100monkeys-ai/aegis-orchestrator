@@ -9,11 +9,12 @@
 pub mod seaweedfs;
 pub mod local;
 
+use crate::domain::storage::{StorageProvider, FileHandle, OpenMode, FileAttributes, DirEntry, FileType};
+
 pub use seaweedfs::SeaweedFSAdapter;
 pub use local::LocalStorageProvider;
 
 use std::sync::Arc;
-use crate::domain::storage::StorageProvider;
 
 /// Storage backend configuration
 #[derive(Debug, Clone)]
@@ -109,6 +110,53 @@ mod mock {
         }
 
         async fn health_check(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        // POSIX file operations (ADR-036)
+        async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(b"mock-handle".to_vec()))
+        }
+
+        async fn read_at(&self, _handle: &FileHandle, _offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+            Ok(vec![0u8; length])
+        }
+
+        async fn write_at(&self, _handle: &FileHandle, _offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+            Ok(data.len())
+        }
+
+        async fn close_file(&self, _handle: &FileHandle) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn stat(&self, _path: &str) -> Result<FileAttributes, StorageError> {
+            Ok(FileAttributes {
+                file_type: FileType::File,
+                size: 0,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                nlink: 1,
+            })
+        }
+
+        async fn readdir(&self, _path: &str) -> Result<Vec<DirEntry>, StorageError> {
+            Ok(vec![])
+        }
+
+        async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(format!("mock-handle-{}", path).into_bytes()))
+        }
+
+        async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn rename(&self, _from: &str, _to: &str) -> Result<(), StorageError> {
             Ok(())
         }
     }

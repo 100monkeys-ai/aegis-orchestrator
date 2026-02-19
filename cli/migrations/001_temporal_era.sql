@@ -170,6 +170,10 @@ CREATE TABLE executions (
     final_output TEXT,
     error_message TEXT,
     
+    -- Container UID/GID for permission squashing (ADR-036)
+    container_uid INTEGER NOT NULL DEFAULT 1000,
+    container_gid INTEGER NOT NULL DEFAULT 1000,
+    
     -- Timestamps
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,

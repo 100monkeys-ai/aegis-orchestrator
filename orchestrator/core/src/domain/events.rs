@@ -8,6 +8,89 @@ use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
 use crate::domain::runtime::InstanceId;
 use crate::domain::volume::{VolumeId, StorageClass};
 
+/// Storage Gateway file-level events (ADR-036)
+///
+/// These events provide file-level audit trail for NFS Server Gateway operations,
+/// complementing volume lifecycle events (VolumeEvent).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StorageEvent {
+    FileOpened {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        open_mode: String, // "read", "write", "read-write", "create"
+        opened_at: DateTime<Utc>,
+    },
+    FileRead {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        offset: u64,
+        bytes_read: u64,
+        duration_ms: u64,
+        read_at: DateTime<Utc>,
+    },
+    FileWritten {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        offset: u64,
+        bytes_written: u64,
+        duration_ms: u64,
+        written_at: DateTime<Utc>,
+    },
+    FileClosed {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        closed_at: DateTime<Utc>,
+    },
+    DirectoryListed {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        entry_count: usize,
+        listed_at: DateTime<Utc>,
+    },
+    FileCreated {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        created_at: DateTime<Utc>,
+    },
+    FileDeleted {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: String,
+        deleted_at: DateTime<Utc>,
+    },
+    PathTraversalBlocked {
+        execution_id: ExecutionId,
+        attempted_path: String,
+        blocked_at: DateTime<Utc>,
+    },
+    FilesystemPolicyViolation {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        operation: String, // "read", "write", "delete"
+        path: String,
+        policy_rule: String,
+        violated_at: DateTime<Utc>,
+    },
+    QuotaExceeded {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        requested_bytes: u64,
+        available_bytes: u64,
+        exceeded_at: DateTime<Utc>,
+    },
+    UnauthorizedVolumeAccess {
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        attempted_at: DateTime<Utc>,
+    },
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentLifecycleEvent {

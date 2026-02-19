@@ -136,6 +136,24 @@ pub struct Execution {
     /// Enables judge-calling-judge and agent composition patterns
     #[serde(default)]
     pub hierarchy: ExecutionHierarchy,
+    
+    /// Container user ID for permission squashing (ADR-036)
+    /// Default: 1000 (standard non-root user)
+    #[serde(default = "default_container_uid")]
+    pub container_uid: u32,
+    
+    /// Container group ID for permission squashing (ADR-036)
+    /// Default: 1000 (standard non-root group)
+    #[serde(default = "default_container_gid")]
+    pub container_gid: u32,
+}
+
+fn default_container_uid() -> u32 {
+    1000
+}
+
+fn default_container_gid() -> u32 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -260,6 +278,8 @@ impl Execution {
             started_at: Utc::now(),
             ended_at: None,
             error: None,
+            container_uid: 1000,
+            container_gid: 1000,
             hierarchy: ExecutionHierarchy::root(id),
         }
     }
@@ -285,6 +305,8 @@ impl Execution {
             started_at: Utc::now(),
             ended_at: None,
             error: None,
+            container_uid: 1000,
+            container_gid: 1000,
             hierarchy,
         })
     }

@@ -261,8 +261,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()));
     
     let volume_service = Arc::new(aegis_core::application::volume_manager::StandardVolumeService::new(
-        volume_repo,
-        storage_provider,
+        volume_repo.clone(),
+        storage_provider.clone(),
         event_bus.clone(),
         filer_url,
     )?);
@@ -291,6 +291,52 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
     println!("✓ Volume cleanup background task spawned (interval: 5 minutes)");
+
+    // Initialize Storage Event Persister for audit trail (ADR-036)
+    println!("Initializing Storage Event Persister...");
+    let storage_event_repo: Arc<dyn aegis_core::domain::repository::StorageEventRepository> = if let Some(pool) = pool.as_ref() {
+        Arc::new(aegis_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+    } else {
+        println!("WARNING: Storage event persistence disabled (no database pool available)");
+        Arc::new(aegis_core::infrastructure::repositories::InMemoryStorageEventRepository::new())
+    };
+    
+    let storage_event_persister = Arc::new(aegis_core::application::storage_event_persister::StorageEventPersister::new(
+        storage_event_repo,
+        event_bus.clone(),
+    ));
+    
+    // Start background task for event persistence
+    let _persister_handle = storage_event_persister.start();
+    println!("✓ Storage Event Persister started (audit trail enabled)");
+
+    // Initialize NFS Server Gateway (ADR-036)
+    println!("Initializing NFS Server Gateway...");
+    let nfs_bind_port = config.spec.storage.as_ref()
+        .and_then(|s| s.nfs_port)
+        .unwrap_or(2049);
+    
+    // Wrap EventBus in EventBusPublisher adapter for FSAL
+    let event_publisher = Arc::new(aegis_core::application::nfs_gateway::EventBusPublisher::new(
+        event_bus.clone()
+    ));
+    
+    let nfs_gateway = Arc::new(aegis_core::application::nfs_gateway::NfsGatewayService::new(
+        storage_provider,
+        volume_repo,
+        event_publisher,
+        Some(nfs_bind_port),
+    ));
+    
+    // Start NFS server in background
+    let nfs_gateway_clone = nfs_gateway.clone();
+    tokio::spawn(async move {
+        if let Err(e) = nfs_gateway_clone.start_server().await {
+            tracing::error!("NFS Server Gateway failed to start: {}", e);
+            panic!("Critical: NFS Server Gateway startup failed");
+        }
+    });
+    println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(

@@ -27,7 +27,11 @@ use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
-use crate::domain::storage::{StorageProvider, StorageError};
+use std::fs::File;
+use std::io::{Read, Write, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+use crate::domain::storage::{StorageProvider, StorageError, FileHandle, OpenMode, FileAttributes, DirEntry, FileType};
 
 /// Local filesystem storage provider
 ///
@@ -267,6 +271,253 @@ impl StorageProvider for LocalStorageProvider {
         }
         
         Ok(directories)
+    }
+
+    // --- POSIX File Operations (ADR-036) ---
+
+    async fn open_file(&self, path: &str, mode: OpenMode) -> Result<FileHandle, StorageError> {
+        let fs_path = self.resolve_path(path);
+        
+        // Open file based on mode
+        let _file = match mode {
+            OpenMode::ReadOnly => {
+                File::open(&fs_path)
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+            }
+            OpenMode::WriteOnly => {
+                File::options()
+                    .write(true)
+                    .open(&fs_path)
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+            }
+            OpenMode::ReadWrite => {
+                File::options()
+                    .read(true)
+                    .write(true)
+                    .open(&fs_path)
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+            }
+            OpenMode::Create => {
+                File::create(&fs_path)
+                    .map_err(|e| StorageError::IoError(format!("Failed to create {}: {}", path, e)))?
+            }
+        };
+        
+        // Create file handle encoding path
+        // In a real implementation, we might store File in a HashMap<FileHandle, File>
+        // For simplicity, we encode path and reopen on each operation
+        let handle_data = path.as_bytes().to_vec();
+        Ok(FileHandle(handle_data))
+    }
+
+    async fn read_at(&self, handle: &FileHandle, offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+        // Decode path from handle
+        let path = String::from_utf8(handle.0.clone())
+            .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
+        
+        let fs_path = self.resolve_path(&path);
+        
+        let mut file = File::open(&fs_path)
+            .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+        
+        // Seek to offset
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| StorageError::IoError(format!("Seek failed: {}", e)))?;
+        
+        // Read data
+        let mut buffer = vec![0u8; length];
+        let bytes_read = file.read(&mut buffer)
+            .map_err(|e| StorageError::IoError(format!("Read failed: {}", e)))?;
+        
+        buffer.truncate(bytes_read);
+        Ok(buffer)
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+        // Decode path from handle
+        let path = String::from_utf8(handle.0.clone())
+            .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
+        
+        let fs_path = self.resolve_path(&path);
+        
+        let mut file = File::options()
+            .write(true)
+            .open(&fs_path)
+            .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+        
+        // Seek to offset
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| StorageError::IoError(format!("Seek failed: {}", e)))?;
+        
+        // Write data
+        file.write_all(data)
+            .map_err(|e| StorageError::IoError(format!("Write failed: {}", e)))?;
+        
+        Ok(data.len())
+    }
+
+    async fn close_file(&self, _handle: &FileHandle) -> Result<(), StorageError> {
+        // File automatically closed when dropped
+        Ok(())
+    }
+
+    async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
+        let fs_path = self.resolve_path(path);
+        
+        let metadata = std::fs::metadata(&fs_path)
+            .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+        
+        let file_type = if metadata.is_dir() {
+            FileType::Directory
+        } else if metadata.is_symlink() {
+            FileType::Symlink
+        } else {
+            FileType::File
+        };
+        
+        // Use Unix-specific metadata for uid/gid
+        #[cfg(unix)]
+        let (uid, gid) = (metadata.uid(), metadata.gid());
+        
+        #[cfg(not(unix))]
+        let (uid, gid) = (1000, 1000);
+        
+        let mtime = metadata.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        
+        let atime = metadata.accessed()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(mtime);
+        
+        let ctime = metadata.created()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(mtime);
+        
+        #[cfg(unix)]
+        let mode = metadata.mode();
+        
+        #[cfg(not(unix))]
+        let mode = if file_type == FileType::Directory { 0o755 } else { 0o644 };
+        
+        #[cfg(unix)]
+        let nlink = metadata.nlink() as u32;
+        
+        #[cfg(not(unix))]
+        let nlink = 1;
+        
+        Ok(FileAttributes {
+            file_type,
+            size: metadata.len(),
+            mtime,
+            atime,
+            ctime,
+            mode,
+            uid,
+            gid,
+            nlink,
+        })
+    }
+
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError> {
+        let fs_path = self.resolve_path(path);
+        
+        if !fs_path.exists() {
+            return Err(StorageError::NotFound(path.to_string()));
+        }
+        
+        let mut entries = Vec::new();
+        
+        for entry in std::fs::read_dir(&fs_path)
+            .map_err(|e| StorageError::IoError(format!("Failed to read directory {}: {}", path, e)))?
+        {
+            let entry = entry
+                .map_err(|e| StorageError::IoError(format!("Failed to read entry: {}", e)))?;
+            
+            let metadata = entry.metadata()
+                .map_err(|e| StorageError::IoError(format!("Failed to get metadata: {}", e)))?;
+            
+            let file_type = if metadata.is_dir() {
+                FileType::Directory
+            } else if metadata.is_symlink() {
+                FileType::Symlink
+            } else {
+                FileType::File
+            };
+            
+            if let Some(name) = entry.file_name().to_str() {
+                entries.push(DirEntry {
+                    name: name.to_string(),
+                    file_type,
+                });
+            }
+        }
+        
+        Ok(entries)
+    }
+
+    async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
+        let fs_path = self.resolve_path(path);
+        
+        // Create parent directories if needed
+        if let Some(parent) = fs_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::IoError(format!("Failed to create parent dirs: {}", e)))?;
+        }
+        
+        // Create file
+        File::create(&fs_path)
+            .map_err(|e| StorageError::IoError(format!("Failed to create {}: {}", path, e)))?;
+        
+        // Return handle
+        let handle_data = path.as_bytes().to_vec();
+        Ok(FileHandle(handle_data))
+    }
+
+    async fn delete_file(&self, path: &str) -> Result<(), StorageError> {
+        let fs_path = self.resolve_path(path);
+        
+        if !fs_path.exists() {
+            return Err(StorageError::FileNotFound(path.to_string()));
+        }
+        
+        std::fs::remove_file(&fs_path)
+            .map_err(|e| StorageError::IoError(format!("Failed to delete {}: {}", path, e)))?;
+        
+        Ok(())
+    }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
+        let from_path = self.resolve_path(from);
+        let to_path = self.resolve_path(to);
+        
+        if !from_path.exists() {
+            return Err(StorageError::FileNotFound(from.to_string()));
+        }
+        
+        // Create parent directory for destination if needed
+        if let Some(parent) = to_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| StorageError::IoError(format!(
+                    "Failed to create parent directory for {}: {}",
+                    to, e
+                )))?;
+        }
+        
+        // Perform atomic rename
+        std::fs::rename(&from_path, &to_path)
+            .map_err(|e| StorageError::IoError(format!(
+                "Failed to rename {} to {}: {}",
+                from, to, e
+            )))?;
+        
+        Ok(())
     }
 }
 
