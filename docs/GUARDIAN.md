@@ -38,5 +38,5 @@ rust-guardian check
 To save the output to a file for review:
 
 ```bash
-rust-guardian check > guardian_report.txt
+rust-guardian check -f agent > guardian_report.json
 ```

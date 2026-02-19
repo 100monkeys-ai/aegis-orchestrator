@@ -289,7 +289,7 @@ mod tests {
                 assert_eq!(feedback, Some("Looks good!".to_string()));
                 assert_eq!(approved_by, Some("alice".to_string()));
             }
-            _ => panic!("Expected approval, got {:?}", result),
+            other => panic!("Expected approval result, got {:?}", other),
         }
     }
 
@@ -323,7 +323,7 @@ mod tests {
                 assert_eq!(reason, "Security concerns");
                 assert_eq!(rejected_by, Some("bob".to_string()));
             }
-            _ => panic!("Expected rejection, got {:?}", result),
+            other => panic!("Expected rejection result, got {:?}", other),
         }
     }
 
@@ -342,7 +342,7 @@ mod tests {
             HumanInputStatus::TimedOut { .. } => {
                 // Expected
             }
-            _ => panic!("Expected timeout, got {:?}", result),
+            other => panic!("Expected timeout result, got {:?}", other),
         }
     }
 

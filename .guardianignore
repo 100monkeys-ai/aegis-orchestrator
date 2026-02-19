@@ -59,6 +59,8 @@ site/
 *.generated.*
 *.pb.rs
 *.g.rs
+# Temporal protobuf files are generated from upstream Temporal; contain inherited deprecated markers
+proto/temporal/
 
 # === Project Specific ===
 # Exclude demo agents as they might simulate simplified behavior

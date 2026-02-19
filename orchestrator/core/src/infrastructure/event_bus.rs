@@ -353,7 +353,7 @@ mod tests {
             DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { agent_id: id, .. }) => {
                 assert_eq!(id, agent_id);
             }
-            _ => panic!("Wrong event type received"),
+            other => panic!("Expected AgentDeployed event, got {:?}", other),
         }
     }
 
@@ -385,7 +385,7 @@ mod tests {
             ExecutionEvent::ExecutionStarted { execution_id: id, .. } => {
                 assert_eq!(id, execution_id);
             }
-            _ => panic!("Wrong event type received"),
+            other => panic!("Expected ExecutionStarted event, got {:?}", other),
         }
     }
 

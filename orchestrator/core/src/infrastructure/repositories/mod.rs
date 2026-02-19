@@ -411,6 +411,75 @@ impl StorageEventRepository for InMemoryStorageEventRepository {
     }
 }
 
+// ============================================================================
+// In-Memory VolumeRepository (for testing)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct InMemoryVolumeRepository {
+    volumes: Arc<RwLock<HashMap<crate::domain::volume::VolumeId, crate::domain::volume::Volume>>>,
+}
+
+impl InMemoryVolumeRepository {
+    pub fn new() -> Self {
+        Self {
+            volumes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
+    async fn save(&self, volume: &crate::domain::volume::Volume) -> Result<(), RepositoryError> {
+        let mut volumes = self.volumes.write().unwrap();
+        volumes.insert(volume.id, volume.clone());
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: crate::domain::volume::VolumeId) -> Result<Option<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.get(&id).cloned())
+    }
+
+    async fn find_by_tenant(&self, tenant_id: crate::domain::volume::TenantId) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.values()
+            .filter(|v| v.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn find_expired(&self) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        let now = chrono::Utc::now();
+        Ok(volumes.values()
+            .filter(|v| {
+                // Check if volume has an expiration time and it has passed
+                if let Some(expires_at) = v.expires_at {
+                    expires_at < now
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_by_ownership(&self, ownership: &crate::domain::volume::VolumeOwnership) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.values()
+            .filter(|v| v.ownership == *ownership)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete(&self, id: crate::domain::volume::VolumeId) -> Result<(), RepositoryError> {
+        let mut volumes = self.volumes.write().unwrap();
+        volumes.remove(&id);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

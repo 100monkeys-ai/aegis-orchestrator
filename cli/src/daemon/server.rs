@@ -113,9 +113,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 
                 let total_known = MIGRATOR.iter().count();
                 if total_known == 0 {
-                    let msg = "CRITICAL: No migrations found in binary! Check build process.";
-                    tracing::error!("{}", msg);
-                    panic!("{}", msg);
+                    return Err(anyhow::anyhow!("CRITICAL: No migrations found in binary! Check build process."));
                 }
 
                 // Check applied migrations
@@ -135,9 +133,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     match MIGRATOR.run(&pool).await {
                         Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
-                            let msg = format!("ERROR: Failed to apply migrations: {}", e);
-                            tracing::error!("{}", msg);
-                            panic!("{}", msg);
+                            return Err(anyhow::anyhow!("Failed to apply migrations: {}", e));
                         }
                     }
                 } else {
@@ -332,8 +328,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let nfs_gateway_clone = nfs_gateway.clone();
     tokio::spawn(async move {
         if let Err(e) = nfs_gateway_clone.start_server().await {
-            tracing::error!("NFS Server Gateway failed to start: {}", e);
-            panic!("Critical: NFS Server Gateway startup failed");
+            tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
+            // Log to stderr to ensure visibility
+            eprintln!("FATAL: NFS Server Gateway failed: {}", e);
+            // Allow shutdown of daemon via signal
+            std::process::exit(1);
         }
     });
     println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
