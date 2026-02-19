@@ -25,15 +25,22 @@
 //! - Authorization enforced at AegisFSAL layer (execution must own volume)
 //!
 //! ## FileHandle Encoding (ADR-036)
-//! NFSv3 file handles limited to 64 bytes. AegisFileHandle serialized with bincode:
+//! NFSv3 file handles are limited to 64 bytes. `AegisFileHandle` is serialized with
+//! bincode as a fixed-size 48-byte structure:
 //! ```rust
 //! pub struct AegisFileHandle {
-//!     volume_id: VolumeId,      // 16 bytes (UUID)
-//!     execution_id: ExecutionId, // 16 bytes (UUID)
-//!     file_path: String,        // Variable (up to ~30 bytes for short paths)
+//!     /// Execution that owns this handle (16 bytes, UUID)
+//!     execution_id: ExecutionId,
+//!     /// Volume backing this handle (16 bytes, UUID)
+//!     volume_id: VolumeId,
+//!     /// Stable hash of the file path within the volume (8 bytes)
+//!     path_hash: u64,
+//!     /// Creation timestamp for the handle (8 bytes)
+//!     created_at: u64,
 //! }
 //! ```
-//! Current encoding: ~48 bytes for typical paths (safe margin under 64-byte limit).
+//! Total encoding size: 16 (execution_id) + 16 (volume_id) + 8 (path_hash) + 8 (created_at)
+//! = 48 bytes, safely under the 64-byte NFSv3 file handle limit.
 //!
 //! ## Security Model (Orchestrator Proxy Pattern)
 //! - Agent containers require **zero elevated privileges** (no CAP_SYS_ADMIN)

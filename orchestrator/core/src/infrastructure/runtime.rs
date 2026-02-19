@@ -275,10 +275,7 @@ impl AgentRuntime for DockerRuntime {
                 );
                 driver_opts.insert(
                     "device".to_string(),
-                    format!(":/{}/{}", 
-                        volume_mount.filer_endpoint, // tenant_id or volume path
-                        volume_mount.volume_id
-                    )
+                    format!(":{}", volume_mount.remote_path) // remote_path contains /{tenant_id}/{volume_id}
                 );
                 
                 Mount {

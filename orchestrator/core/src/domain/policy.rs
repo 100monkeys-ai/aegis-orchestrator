@@ -52,9 +52,7 @@ pub struct FilesystemPolicy {
 impl Default for FilesystemPolicy {
     fn default() -> Self {
         Self {
-            read: vec
-
-!["/workspace/**".to_string()],
+            read: vec!["/workspace/**".to_string()],
             write: vec!["/workspace/**".to_string()],
         }
     }

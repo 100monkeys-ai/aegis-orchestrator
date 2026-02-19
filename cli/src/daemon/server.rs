@@ -331,12 +331,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Start NFS server in background
     let nfs_gateway_clone = nfs_gateway.clone();
     tokio::spawn(async move {
+        tracing::info!("NFS Server Gateway initialization started on port {} (ADR-036)", nfs_bind_port);
         if let Err(e) = nfs_gateway_clone.start_server().await {
             tracing::error!("NFS Server Gateway failed to start: {}", e);
             panic!("Critical: NFS Server Gateway startup failed");
         }
     });
-    println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
+    println!("✓ NFS Server Gateway initialization task spawned for port {} (ADR-036)", nfs_bind_port);
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(

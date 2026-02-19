@@ -225,10 +225,16 @@ impl AegisFSAL {
     ) -> Result<(), FsalError> {
         // Check if path matches any read allowlist pattern
         let allowed = policy.read.iter().any(|pattern| {
-            // Simple wildcard matching (can be enhanced with glob crate)
-            if pattern.ends_with("/*") {
+            // Wildcard matching: /** matches recursively, /* matches single level
+            if pattern.ends_with("/**") {
+                let prefix = &pattern[..pattern.len() - 3];
+                path == prefix
+                    || (path.starts_with(prefix)
+                        && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+            } else if pattern.ends_with("/*") {
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
+                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 path == pattern
             }
@@ -252,9 +258,16 @@ impl AegisFSAL {
     ) -> Result<(), FsalError> {
         // Check if path matches any write allowlist pattern
         let allowed = policy.write.iter().any(|pattern| {
-            if pattern.ends_with("/*") {
+            // Wildcard matching: /** matches recursively, /* matches single level
+            if pattern.ends_with("/**") {
+                let prefix = &pattern[..pattern.len() - 3];
+                path == prefix
+                    || (path.starts_with(prefix)
+                        && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+            } else if pattern.ends_with("/*") {
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
+                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 path == pattern
             }
