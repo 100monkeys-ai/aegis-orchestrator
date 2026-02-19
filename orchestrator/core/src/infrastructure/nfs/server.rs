@@ -388,7 +388,25 @@ impl NFSFileSystem for AegisFsalAdapter {
             .await
             .map_err(|e| {
                 error!("FSAL write failed: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_IO
+                // Map FSAL errors to appropriate NFS status codes
+                match e {
+                    crate::domain::fsal::FsalError::QuotaExceeded { .. } => {
+                        // Quota exceeded - no space left on device (ADR-036)
+                        nfsserve::nfs::nfsstat3::NFS3ERR_NOSPC
+                    }
+                    crate::domain::fsal::FsalError::PolicyViolation(_) => {
+                        // Policy violation - permission denied
+                        nfsserve::nfs::nfsstat3::NFS3ERR_ACCES
+                    }
+                    crate::domain::fsal::FsalError::UnauthorizedAccess { .. } => {
+                        // Unauthorized access - permission denied
+                        nfsserve::nfs::nfsstat3::NFS3ERR_ACCES
+                    }
+                    _ => {
+                        // Generic I/O error for other failures
+                        nfsserve::nfs::nfsstat3::NFS3ERR_IO
+                    }
+                }
             })?;
 
         // Return updated file attributes after write

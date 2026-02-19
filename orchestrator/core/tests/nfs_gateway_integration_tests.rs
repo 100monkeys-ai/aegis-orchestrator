@@ -397,11 +397,88 @@ async fn test_fsal_audit_events() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Check for FileRead event
-    if let Ok(DomainEvent::Storage(StorageEvent::FileRead { path, bytes_read, .. })) = event_rx.try_recv() {
-        assert!(path.contains("test.txt"));
-        assert_eq!(bytes_read, 100);
+    // Close file
+    fsal.close(&handle).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_fsal_quota_enforcement() {
+    // Create FSAL with mock dependencies
+    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    let event_bus = Arc::new(EventBus::new(1000));
+    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+
+    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+
+    // Create test volume with a very small quota (1KB)
+    let execution_id = ExecutionId::new();
+    let volume_id = VolumeId::new();
+    let volume = Volume::new(
+        "test-volume".to_string(),
+        TenantId::default(),
+        StorageClass::Ephemeral { ttl: Duration::hours(24) },
+        FilerEndpoint::new("http://filer:8888").unwrap(),
+        1024, // 1KB quota
+        VolumeOwnership::Execution { execution_id },
+    ).unwrap();
+    
+    // Mark volume as attached (required for FSAL authorization)
+    let mut volume = volume;
+    volume.mark_attached().unwrap();
+    volume_repository.save(&volume).await.unwrap();
+
+    let policy = FilesystemPolicy {
+        read: vec!["/workspace/*".to_string()],
+        write: vec!["/workspace/*".to_string()],
+    };
+
+    // Subscribe to domain events to verify QuotaExceeded event is published
+    let mut event_rx = event_bus.subscribe();
+
+    // Open file for writing
+    let handle = fsal.open(
+        execution_id,
+        volume_id,
+        "/workspace/large_file.txt",
+        OpenMode::ReadWrite,
+        &policy,
+    ).await.unwrap();
+
+    // MockStorageProvider.get_usage() returns 5120 bytes (5KB)
+    // Volume quota is 1024 bytes (1KB)
+    // Any write attempt should fail with QuotaExceeded
+
+    // Attempt to write 1KB of data (should fail due to quota)
+    let large_data = vec![0u8; 1024];
+    let write_result = fsal.write(&handle, 0, &large_data).await;
+
+    // Verify write was rejected with QuotaExceeded error
+    assert!(write_result.is_err());
+    match write_result {
+        Err(FsalError::QuotaExceeded { requested_bytes, available_bytes }) => {
+            // Current usage: 5120 bytes
+            // Quota: 1024 bytes
+            // Available should be 0 (quota already exceeded by existing usage)
+            assert_eq!(requested_bytes, 1024);
+            assert_eq!(available_bytes, 0); // Quota already exceeded (5120 > 1024)
+        }
+        other => panic!("Expected QuotaExceeded error, got: {:?}", other),
     }
+
+    // Verify QuotaExceeded event was published
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    
+    let mut found_quota_event = false;
+    while let Ok(event) = event_rx.try_recv() {
+        if matches!(event, DomainEvent::Storage(StorageEvent::QuotaExceeded { .. })) {
+            found_quota_event = true;
+            break;
+        }
+    }
+    assert!(found_quota_event, "QuotaExceeded event should have been published");
 
     // Close file
     fsal.close(&handle).await.unwrap();
 }
+

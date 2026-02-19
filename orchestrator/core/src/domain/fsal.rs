@@ -63,6 +63,12 @@ pub enum FsalError {
 
     #[error("File handle deserialization error: {0}")]
     HandleDeserialization(String),
+
+    #[error("Volume quota exceeded: requested {requested_bytes} bytes, available {available_bytes} bytes")]
+    QuotaExceeded {
+        requested_bytes: u64,
+        available_bytes: u64,
+    },
 }
 
 /// Aegis File Handle - encodes execution and volume ownership
@@ -420,8 +426,8 @@ impl AegisFSAL {
     ) -> Result<usize, FsalError> {
         let start = std::time::Instant::now();
 
-        // 1. Authorize
-        let _volume = self.authorize(handle.execution_id, handle.volume_id).await?;
+        // 1. Authorize and get volume for quota checking
+        let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
 
         // 2. Get storage handle and validate mode
         let open_files = self.open_files.read().await;
@@ -434,13 +440,39 @@ impl AegisFSAL {
             ));
         }
 
-        // 3. Write via storage provider
+        // 3. Proactive quota enforcement (ADR-036)
+        // Check if write would exceed volume quota before attempting write
+        let current_usage = self.storage_provider.get_usage(&volume.remote_path).await?;
+        let requested_bytes = data.len() as u64;
+        let projected_usage = current_usage.saturating_add(requested_bytes);
+        
+        if projected_usage > volume.size_limit_bytes {
+            let available_bytes = volume.size_limit_bytes.saturating_sub(current_usage);
+            
+            // Publish quota exceeded event
+            self.event_publisher
+                .publish_storage_event(StorageEvent::QuotaExceeded {
+                    execution_id: handle.execution_id,
+                    volume_id: handle.volume_id,
+                    requested_bytes,
+                    available_bytes,
+                    exceeded_at: Utc::now(),
+                })
+                .await;
+            
+            return Err(FsalError::QuotaExceeded {
+                requested_bytes,
+                available_bytes,
+            });
+        }
+
+        // 4. Write via storage provider
         let bytes_written = self
             .storage_provider
             .write_at(&open_file.storage_handle, offset, data)
             .await?;
 
-        // 4. Publish event
+        // 5. Publish event
         let duration_ms = start.elapsed().as_millis() as u64;
         self.event_publisher
             .publish_storage_event(StorageEvent::FileWritten {
