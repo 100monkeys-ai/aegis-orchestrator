@@ -43,17 +43,16 @@ impl VolumeRepository for PostgresVolumeRepository {
             )
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
-                name = EXCLUDED.name,
-                tenant_id = EXCLUDED.tenant_id,
                 storage_class = EXCLUDED.storage_class,
                 filer_endpoint = EXCLUDED.filer_endpoint,
-                remote_path = EXCLUDED.remote_path,
                 size_limit_bytes = EXCLUDED.size_limit_bytes,
                 status = EXCLUDED.status,
                 ownership = EXCLUDED.ownership,
                 attached_at = EXCLUDED.attached_at,
                 detached_at = EXCLUDED.detached_at,
                 expires_at = EXCLUDED.expires_at
+            -- Note: name and tenant_id are NOT unique - multiple executions can use same logical name
+            -- remote_path is unique and includes volume_id, ensuring true isolation
             "#
         )
         .bind(volume.id.0)

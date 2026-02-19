@@ -34,8 +34,10 @@ CREATE TABLE volumes (
     expires_at TIMESTAMPTZ,            -- NULL for persistent volumes
     
     -- Constraints
-    CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0),
-    CONSTRAINT volumes_unique_per_tenant UNIQUE (tenant_id, name)
+    CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0)
+    -- Note: Volume names are logical labels, NOT globally unique.
+    -- Multiple executions can have volumes with the same name but different volume_ids.
+    -- Uniqueness is enforced by: id (PRIMARY KEY) and remote_path (UNIQUE).
 );
 
 -- Indexes for common queries
