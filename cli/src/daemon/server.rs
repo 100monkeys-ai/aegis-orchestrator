@@ -199,6 +199,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         config.spec.runtime.orchestrator_url.clone()
     };
     
+    // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
+    let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().map(|host| {
+        if host.starts_with("env:") {
+            let env_var = host.strip_prefix("env:").unwrap();
+            std::env::var(env_var)
+                .unwrap_or_else(|_| {
+                    tracing::warn!("Environment variable {} not set, NFS mounts will use orchestrator_url hostname", env_var);
+                    String::new()
+                })
+        } else {
+            host.clone()
+        }
+    }).filter(|s| !s.is_empty());
+    
     // Resolve Docker network mode (supports env:VAR_NAME syntax)
     let network_mode = config.spec.runtime.docker_network_mode.as_ref().map(|nm| {
         if nm.starts_with("env:") {
@@ -218,7 +232,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             config.spec.runtime.bootstrap_script.clone(),
             config.spec.runtime.docker_socket_path.clone(),
             network_mode,
-            orchestrator_url
+            orchestrator_url,
+            nfs_server_host,
         )
         .context("Failed to initialize Docker runtime")?
     );

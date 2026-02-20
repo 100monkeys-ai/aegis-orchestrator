@@ -232,6 +232,16 @@ pub struct RuntimeConfig {
     /// Docker deployments should override to "http://aegis-runtime:8088"
     #[serde(default = "default_orchestrator_url")]
     pub orchestrator_url: String,
+    
+    /// NFS server hostname/IP for volume mounts (ADR-036)
+    /// Used by Docker daemon on host to mount NFS volumes
+    /// Different from orchestrator_url which is used inside containers
+    /// Supports env:VAR_NAME syntax for environment variable substitution
+    /// Examples: "127.0.0.1" (when port exposed), "172.17.0.1" (bridge gateway),
+    ///           "host.docker.internal" (Docker Desktop), container IP
+    /// Default: None (extracts hostname from orchestrator_url as fallback)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nfs_server_host: Option<String>,
 }
 
 impl Default for RuntimeConfig {
@@ -242,6 +252,7 @@ impl Default for RuntimeConfig {
             docker_socket_path: None,
             docker_network_mode: None,
             orchestrator_url: default_orchestrator_url(),
+            nfs_server_host: None,
         }
     }
 }

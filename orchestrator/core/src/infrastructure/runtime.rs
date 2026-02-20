@@ -36,10 +36,17 @@ pub struct DockerRuntime {
     bootstrap_script_path: PathBuf,  // Store as PathBuf for better path handling
     network_mode: Option<String>,
     orchestrator_url: String,
+    nfs_server_host: Option<String>,  // NFS server hostname for volume mounts (ADR-036)
 }
 
 impl DockerRuntime {
-    pub fn new(bootstrap_script: String, socket_path: Option<String>, network_mode: Option<String>, orchestrator_url: String) -> Result<Self, RuntimeError> {
+    pub fn new(
+        bootstrap_script: String,
+        socket_path: Option<String>,
+        network_mode: Option<String>,
+        orchestrator_url: String,
+        nfs_server_host: Option<String>,
+    ) -> Result<Self, RuntimeError> {
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
             PathBuf::from(&bootstrap_script)
@@ -100,7 +107,8 @@ impl DockerRuntime {
             docker, 
             bootstrap_script_path: bootstrap_path,
             network_mode, 
-            orchestrator_url 
+            orchestrator_url,
+            nfs_server_host,
         })
     }
     
@@ -250,13 +258,21 @@ impl AgentRuntime for DockerRuntime {
         
         // Apply NFS volume mounts if specified (ADR-036: Orchestrator Proxy Pattern)
         if !config.volumes.is_empty() {
-            // Extract orchestrator host from orchestrator_url (http://host:port -> host)
-            let orchestrator_host = self.orchestrator_url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .split(':')
-                .next()
-                .unwrap_or("localhost");
+            // Use explicit NFS server host if provided, otherwise extract from orchestrator_url
+            // This separation is needed because:
+            // - orchestrator_url is used by containers (Docker service name works: "aegis-runtime")
+            // - NFS mounts happen at Docker daemon level on host (needs resolvable hostname: "127.0.0.1")
+            let orchestrator_host = self.nfs_server_host
+                .as_deref()
+                .unwrap_or_else(|| {
+                    // Fallback: extract hostname from orchestrator_url for backward compatibility
+                    self.orchestrator_url
+                        .trim_start_matches("http://")
+                        .trim_start_matches("https://")
+                        .split(':')
+                        .next()
+                        .unwrap_or("localhost")
+                });
             
             let mounts: Vec<Mount> = config.volumes.iter().map(|volume_mount| {
                 let container_path = volume_mount.mount_point.display().to_string();

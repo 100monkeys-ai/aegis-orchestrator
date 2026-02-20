@@ -133,10 +133,14 @@ services:
       # Agent bootstrap orchestrator callback URL (used by assets/bootstrap.py)
       # Referenced in node config via: runtime.orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
       - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8088
+      # NFS Server hostname for volume mounts (accessed by Docker daemon on host)
+      # Use 127.0.0.1 when NFS port is exposed (WSL/Linux), host.docker.internal (Docker Desktop)
+      - AEGIS_NFS_HOST=127.0.0.1
       - RUST_LOG=debug
     ports:
       - "8088:8088"   # gRPC server for orchestrator API
       - "50051:50051" # gRPC server for worker activities
+      - "2049:2049"   # NFS Server Gateway (ADR-036)
     networks:
       - aegis-network
     volumes:
