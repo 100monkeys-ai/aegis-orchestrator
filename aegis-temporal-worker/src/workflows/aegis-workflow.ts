@@ -54,12 +54,14 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
     const executionId = info.workflowId; // In AEGIS, Temporal workflowId is the Execution UUID
     let temporalSequenceNumber = 1;
 
+    let workflowId: string | undefined = undefined;
+
     const emit = async (eventType: string, extra: any = {}) => {
         await publishEventActivity({
             event_type: eventType,
             execution_id: executionId,
             temporal_sequence_number: temporalSequenceNumber++,
-            workflow_id: undefined,
+            workflow_id: workflowId,
             timestamp: new Date().toISOString(),
             ...extra
         });
@@ -69,6 +71,7 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
 
     // 1. Fetch Definition
     const definition = await fetchWorkflowDefinition(workflow_name);
+    workflowId = definition.workflow_id;
 
     // 2. Initialize Blackboard
     const blackboard: Blackboard = {
@@ -177,7 +180,7 @@ async function executeState(
             let lastOutput = null;
 
             while (iteration <= maxIterations) {
-                await emit('IterationStarted', { iteration_number: iteration });
+                await emit('WorkflowIterationStarted', { iteration_number: iteration });
 
                 try {
                     const result = await executeAgentActivity({
@@ -187,7 +190,7 @@ async function executeState(
                     });
 
                     lastOutput = result;
-                    await emit('IterationCompleted', {
+                    await emit('WorkflowIterationCompleted', {
                         iteration_number: iteration,
                         output: result.output
                     });
@@ -221,7 +224,7 @@ async function executeState(
                     iteration++;
                 } catch (error) {
                     const errMsg = error instanceof Error ? error.message : String(error);
-                    await emit('IterationFailed', {
+                    await emit('WorkflowIterationFailed', {
                         iteration_number: iteration,
                         error: errMsg
                     });

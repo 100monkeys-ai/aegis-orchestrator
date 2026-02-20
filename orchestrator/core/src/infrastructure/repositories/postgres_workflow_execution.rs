@@ -114,7 +114,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 current_state = EXCLUDED.current_state,
                 blackboard = EXCLUDED.blackboard,
                 state_outputs = EXCLUDED.state_outputs,
-                state_history = EXCLUDED.state_history,
+                state_history = workflow_executions.state_history || EXCLUDED.state_history,
                 last_transition_at = EXCLUDED.last_transition_at,
                 completed_at = EXCLUDED.completed_at
             "#

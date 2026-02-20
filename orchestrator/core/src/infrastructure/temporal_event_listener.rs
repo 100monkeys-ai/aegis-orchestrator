@@ -364,7 +364,7 @@ impl TemporalEventListener {
             execution_id_obj,
             payload.temporal_sequence_number,
             payload.event_type.clone(),
-            serde_json::to_value(&payload).unwrap_or(serde_json::json!({})),
+            serde_json::to_value(&payload)?,
             payload.iteration_number,
         ).await.context("Failed to persist execution event")?;
 
