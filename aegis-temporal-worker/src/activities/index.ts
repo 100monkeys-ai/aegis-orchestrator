@@ -184,6 +184,8 @@ export async function executeParallelAgentsActivity(params: {
   }
 }
 
+import { publishEventActivity } from './event-activities.js';
+
 // Ensure all activities are exported for Temporal Worker
 export const activities = {
   executeAgentActivity,
@@ -191,8 +193,9 @@ export const activities = {
   validateOutputActivity,
   executeParallelAgentsActivity,
   fetchWorkflowDefinition,
+  publishEventActivity,
 };
 
-export { fetchWorkflowDefinition };
+export { fetchWorkflowDefinition, publishEventActivity };
 
 

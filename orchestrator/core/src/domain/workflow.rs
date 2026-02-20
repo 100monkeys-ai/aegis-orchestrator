@@ -599,6 +599,25 @@ impl Blackboard {
             self.data.insert(key.clone(), value.clone());
         }
     }
+
+    /// Reconstruct blackboard from JSONB (for persistence)
+    pub fn from_json(json: &serde_json::Value) -> anyhow::Result<Self> {
+        match json {
+            serde_json::Value::Object(obj) => {
+                let mut data = HashMap::new();
+                for (k, v) in obj {
+                    data.insert(k.clone(), v.clone());
+                }
+                Ok(Self { data })
+            }
+            _ => Ok(Self::new()),
+        }
+    }
+
+    /// Serialize blackboard to JSONB (for persistence)
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.data).unwrap_or(serde_json::json!({}))
+    }
 }
 
 // ============================================================================

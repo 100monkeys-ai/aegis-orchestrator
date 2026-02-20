@@ -232,12 +232,20 @@ impl AegisRuntime for AegisRuntimeService {
         // Convert to Vec<(AgentId, f64)> with default weight of 1.0
         let judge_configs: Vec<(AgentId, f64)> = judge_ids.into_iter().map(|id| (id, 1.0)).collect();
 
+        // Parse context if available
+        let context = if req.context_json.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&req.context_json)
+                .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {}", e)))?)
+        };
+
         // Create validation request
         use crate::domain::validation::ValidationRequest;
         let validation_req = ValidationRequest {
             content: req.output,
             criteria: req.task,
-            context: None,
+            context,
         };
 
         // TODO: Get actual execution_id from context

@@ -218,6 +218,64 @@ pub enum ExecutionEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum WorkflowEvent {
+    WorkflowRegistered {
+        workflow_id: crate::domain::workflow::WorkflowId,
+        name: String,
+        version: String,
+        registered_at: DateTime<Utc>,
+    },
+    WorkflowExecutionStarted {
+        execution_id: ExecutionId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+        started_at: DateTime<Utc>,
+    },
+    WorkflowStateEntered {
+        execution_id: ExecutionId,
+        state_name: String,
+        entered_at: DateTime<Utc>,
+    },
+    WorkflowStateExited {
+        execution_id: ExecutionId,
+        state_name: String,
+        output: serde_json::Value,
+        exited_at: DateTime<Utc>,
+    },
+    WorkflowIterationStarted {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        started_at: DateTime<Utc>,
+    },
+    WorkflowIterationCompleted {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        output: serde_json::Value,
+        completed_at: DateTime<Utc>,
+    },
+    WorkflowIterationFailed {
+        execution_id: ExecutionId,
+        iteration_number: u8,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+    WorkflowExecutionCompleted {
+        execution_id: ExecutionId,
+        final_blackboard: serde_json::Value,
+        artifacts: Option<serde_json::Value>,
+        completed_at: DateTime<Utc>,
+    },
+    WorkflowExecutionFailed {
+        execution_id: ExecutionId,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+    WorkflowExecutionCancelled {
+        execution_id: ExecutionId,
+        cancelled_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LearningEvent {
     // Basic placeholder derived from AGENTS.md
     PatternDiscovered { 
