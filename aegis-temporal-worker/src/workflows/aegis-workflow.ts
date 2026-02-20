@@ -213,7 +213,8 @@ async function executeState(
 
                     await emit('RefinementApplied', {
                         iteration_number: iteration,
-                        code_diff: validationResult.reasoning
+                        code_diff: validationResult.reasoning,
+                        agent_id: state.agent,
                     });
 
                     currentInput = currentInput + `\n\nValidation failed with score ${validationResult.final_score}.\nReasoning: ${validationResult.reasoning}\nPlease refine your response.`;
