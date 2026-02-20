@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Qdrant vector store implementation for pattern storage
 //! Implements ADR-018 (Weighted Cortex Memory)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for qdrant store
 
 use async_trait::async_trait;
 use anyhow::Result;

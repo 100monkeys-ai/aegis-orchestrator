@@ -1,10 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! PostgreSQL implementation of StorageEventRepository (ADR-036)
 //!
 //! Persists file-level operation audit trail for forensic analysis.
 //! Subscribes to in-memory event bus and writes to storage_events table.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for postgres storage event
 
 use crate::domain::repository::{StorageEventRepository, RepositoryError};
 use crate::domain::events::StorageEvent;

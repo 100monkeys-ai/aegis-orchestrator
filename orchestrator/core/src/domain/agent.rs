@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Agent
+//!
+//! Provides agent functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements agent
 
 use uuid::Uuid;
 use chrono::{DateTime, Utc};

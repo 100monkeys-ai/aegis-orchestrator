@@ -1,7 +1,11 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Unix service installation (systemd/launchd)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for install
 
 use anyhow::{Context, Result};
 use colored::Colorize;

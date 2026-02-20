@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Llm
+//!
+//! Provides llm functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements llm
 
 // LLM Provider Domain Interface (Anti-Corruption Layer)
 //

@@ -1,9 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Agent task operations commands
 //!
 //! Commands: deploy, execute, status, logs, cancel
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for task
 
 use anyhow::{Context, Result};
 use clap::Subcommand;

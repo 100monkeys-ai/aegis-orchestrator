@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Temporal.io gRPC Client
 //!
 //! Provides low-level gRPC client for interacting with Temporal.io workflow engine.

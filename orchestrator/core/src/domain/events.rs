@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Events
+//!
+//! Provides events functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements events
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};

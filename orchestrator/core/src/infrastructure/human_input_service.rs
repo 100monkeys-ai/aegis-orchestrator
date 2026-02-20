@@ -1,9 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Human Input Service - Infrastructure for human-in-the-loop workflows
 //! 
 //! Manages human approval gates, collects feedback, and handles timeouts
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for human input service
 
 use std::collections::HashMap;
 use std::sync::Arc;

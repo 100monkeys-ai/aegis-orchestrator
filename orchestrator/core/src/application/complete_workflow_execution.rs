@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Complete Workflow Execution Use Case
 //!
 //! Application service for completing workflow executions and triggering post-execution activities.
@@ -20,6 +19,11 @@
 //! 3. Persist final state to repository
 //! 4. Publish DomainEvent::WorkflowExecutionCompleted
 //! 5. If had refinements: trigger Cortex pattern learning
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for complete workflow execution
 
 use crate::domain::execution::ExecutionId;
 use crate::domain::execution::ExecutionStatus;

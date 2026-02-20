@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Temporal Event Listener
 //!
 //! Infrastructure component that receives workflow events from the Temporal TypeScript worker
@@ -50,6 +49,11 @@
 //!   "timestamp": "RFC3339"
 //! }
 //! ```
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for temporal event listener
 
 use crate::domain::events::WorkflowEvent;
 use crate::domain::execution::ExecutionId;

@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Validation
+//!
+//! Provides validation functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements validation
 
 use serde::{Serialize, Deserialize};
 use thiserror::Error;

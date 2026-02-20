@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Skill
+//!
+//! Provides skill functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements skill
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

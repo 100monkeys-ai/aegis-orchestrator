@@ -1,5 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Smcp
+//!
+//! Provides smcp functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements smcp
+//! - **Related ADRs:** ADR-035: SMCP Implementation
 
 // ============================================================================
 // ADR-035: SMCP (Secure Model Context Protocol) Implementation

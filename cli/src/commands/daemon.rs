@@ -1,9 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Daemon lifecycle management commands
 //!
 //! Commands: start, stop, status, install, uninstall
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for daemon
 
 use anyhow::{Context, Result};
 use clap::Subcommand;

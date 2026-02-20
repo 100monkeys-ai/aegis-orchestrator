@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Storage Event Persister Application Service
 //!
 //! Subscribes to storage events from the event bus and persists them to
@@ -14,6 +13,11 @@
 //! Related ADRs:
 //! - ADR-036: NFS Server Gateway Architecture (audit trail requirement)
 //! - ADR-030: Event Bus Architecture (pub/sub mechanism)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for storage event persister
 
 use crate::domain::repository::StorageEventRepository;
 use crate::infrastructure::event_bus::{EventBus, DomainEvent};

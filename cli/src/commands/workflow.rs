@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Workflow command implementations
 //!
 //! This module provides CLI commands for managing workflow definitions and executions.
@@ -14,6 +13,11 @@
 //! - `aegis workflow list` - List registered workflows
 //! - `aegis workflow describe <name>` - Show workflow details
 //! - `aegis workflow logs <execution_id>` - Stream workflow execution logs
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for workflow
 
 use anyhow::{Context, Result};
 use clap::Subcommand;

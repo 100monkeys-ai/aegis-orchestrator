@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Db
+//!
+//! Provides db functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements db
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use anyhow::Result;

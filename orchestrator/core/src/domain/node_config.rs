@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Node Config
+//!
+//! Provides node config functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements node config
 
 // Node Configuration Types - Implements NODE_CONFIGURATION_SPEC_V1.md
 //

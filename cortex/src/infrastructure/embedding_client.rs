@@ -1,5 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Embedding Client
+//!
+//! Provides embedding client functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements embedding client
+//! - **Related ADRs:** ADR-028: Embedding Model Selection
 
 // ============================================================================
 // ADR-028: Embedding Model Selection (Ollama Integration)

@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! NFS Gateway Application Service
 //!
 //! Manages the lifecycle of the NFS server that provides POSIX-transparent 
@@ -11,6 +10,11 @@
 //! - Routes by export path `/{tenant_id}/{volume_id}`
 //! - Always-on service (starts with orchestrator)
 //! - Uses AegisFSAL for authorization and audit
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for nfs gateway
 
 use crate::domain::{
     fsal::{AegisFSAL, EventPublisher},

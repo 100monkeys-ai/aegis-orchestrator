@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! NFS Server Implementation (ADR-036 Storage Gateway)
 //!
 //! Provides user-space NFSv3 server using nfsserve crate as transport layer
@@ -43,6 +42,11 @@
 //! - Path sanitization prevents `../` traversal attacks
 //! - UID/GID squashing eliminates kernel permission checks
 //! - FilesystemPolicy enforced per manifest (read/write allowlists)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for server
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

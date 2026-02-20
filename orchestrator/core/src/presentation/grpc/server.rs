@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! gRPC Server Implementation for AEGIS Runtime
 //! Exposes ExecuteAgent, ExecuteSystemCommand, ValidateWithJudges, QueryCortexPatterns, StoreCortexPattern
+//!
+//! # Architecture
+//!
+//! - **Layer:** Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for server
 
 use tonic::{Request, Response, Status};
 use tokio_stream::wrappers::ReceiverStream;

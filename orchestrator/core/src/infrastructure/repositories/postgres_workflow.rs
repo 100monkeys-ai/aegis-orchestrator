@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! PostgreSQL Workflow Repository
 //!
 //! Provides PostgreSQL-backed persistence for workflow definitions with versioning

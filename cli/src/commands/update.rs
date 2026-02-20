@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Database Update Command
 //!
 //! This module implements the `aegis update` command for applying database

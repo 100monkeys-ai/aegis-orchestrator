@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Build Script for aegis-core
 //!
 //! This build script compiles Protocol Buffer definitions for gRPC communication
@@ -24,6 +23,11 @@
 //!
 //! - **protoc**: Protocol buffer compiler (vendored via `protoc-bin-vendored`)
 //! - **tonic-build**: Code generator for Rust gRPC stubs
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements internal responsibilities for build
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set PROTOC environment variable to point to the vendored protoc binary

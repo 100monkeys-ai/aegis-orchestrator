@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Repository interfaces for Cortex bounded context
 //! Defines the contracts for pattern and graph storage
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for repository
 
 use async_trait::async_trait;
 use anyhow::Result;

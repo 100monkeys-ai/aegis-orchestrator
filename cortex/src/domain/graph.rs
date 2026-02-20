@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Knowledge Graph entities for the Cortex
 //! Implements ADR-024 (Holographic Cortex Memory Architecture)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for graph
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

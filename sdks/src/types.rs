@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Types
+//!
+//! Provides types functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements types
 
 use serde::{Deserialize, Serialize};
 

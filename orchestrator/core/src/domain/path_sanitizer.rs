@@ -1,11 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Path Sanitizer Domain Service
 //!
 //! Provides path canonicalization and traversal attack prevention per ADR-036.
 //! This is a domain service (not infrastructure) because path validation is
 //! a core business rule for security, not a technical concern.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for path sanitizer
 
 use std::path::{PathBuf, Component};
 use thiserror::Error;

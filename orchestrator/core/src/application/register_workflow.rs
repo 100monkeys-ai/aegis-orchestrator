@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Register Workflow Use Case
 //!
 //! Application service for registering new workflows with the Temporal engine.
@@ -31,6 +30,11 @@
 //! - ValidationError: Workflow invariants violated (missing states, circular references)
 //! - RegistrationError: Temporal server unavailable or registration failed
 //! - PersistenceError: Database save failed
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for register workflow
 
 use crate::domain::repository::WorkflowRepository;
 use crate::infrastructure::event_bus::EventBus;

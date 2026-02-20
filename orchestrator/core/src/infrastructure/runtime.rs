@@ -1,5 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Runtime
+//!
+//! Provides runtime functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements runtime
+//! - **Related ADRs:** ADR-027: Docker Runtime Implementation
 
 // ============================================================================
 // ADR-003: Firecracker Isolation (DEFERRED to Phase 2 - Production Release)

@@ -1,10 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Storage Infrastructure Module
 //!
 //! Provides concrete implementations of the StorageProvider trait
 //! for distributed file system backends.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for mod
 
 pub mod seaweedfs;
 pub mod local;

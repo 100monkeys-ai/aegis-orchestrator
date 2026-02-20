@@ -1,10 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! NFS FileHandle Serialization
 //!
 //! Provides bincode-based serialization for AegisFileHandle to fit within
 //! NFSv3's 64-byte file handle limit.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for file handle
 
 use crate::domain::fsal::AegisFileHandle;
 use thiserror::Error;

@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Lifecycle
+//!
+//! Provides lifecycle functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements lifecycle
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
 use crate::domain::repository::AgentRepository;

@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Agent Manifest YAML Parser
 //!
 //! This module provides infrastructure for parsing agent YAML manifests

@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Workflow Domain Model
 //!
 //! This module defines the core domain entities and value objects for the Workflow Engine.
@@ -19,6 +18,11 @@
 //! 2. **Domain-Driven:** Uses ubiquitous language (State, Transition, Blackboard)
 //! 3. **Type Safety:** Strongly typed transitions and conditions
 //! 4. **Self-Validating:** Constructors enforce invariants
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for workflow
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

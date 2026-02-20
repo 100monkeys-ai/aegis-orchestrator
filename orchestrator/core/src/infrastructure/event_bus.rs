@@ -1,5 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Event Bus
+//!
+//! Provides event bus functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements event bus
+//! - **Related ADRs:** ADR-030: Event Bus Architecture
 
 // Event Bus Implementation - Pub/Sub for Domain Events
 //

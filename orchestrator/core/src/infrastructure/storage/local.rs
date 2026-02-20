@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Local Filesystem Storage Provider
 //!
 //! Simple filesystem-based implementation of StorageProvider for single-node
@@ -22,6 +21,11 @@
 //! - ✅ Edge devices without network access to distributed storage
 //! - ✅ Unit/integration testing
 //! - ❌ Production multi-node clusters (use SeaweedFS per ADR-032)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for local
 
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};

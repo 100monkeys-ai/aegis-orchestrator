@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Postgres Volume
+//!
+//! Provides postgres volume functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements postgres volume
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;

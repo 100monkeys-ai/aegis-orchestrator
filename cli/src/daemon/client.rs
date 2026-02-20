@@ -1,7 +1,11 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! HTTP client for communicating with daemon API
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for client
 
 use anyhow::{Context, Result};
 use reqwest::Client;

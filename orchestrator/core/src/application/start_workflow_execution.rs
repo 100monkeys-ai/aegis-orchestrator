@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Start Workflow Execution Use Case
 //!
 //! Application service for starting workflow executions with Temporal.
@@ -12,6 +11,11 @@
 //! - **Collaborators:**
 //!   - Domain: Workflow, WorkflowExecution aggregates
 //!   - Infrastructure: WorkflowRepository, WorkflowExecutionRepository, TemporalClient, EventBus
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for start workflow execution
 
 use crate::domain::workflow::{WorkflowExecution, WorkflowId};
 use crate::domain::repository::{WorkflowRepository, WorkflowExecutionRepository};

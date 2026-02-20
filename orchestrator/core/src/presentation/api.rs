@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Api
+//!
+//! Provides api functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Presentation Layer
+//! - **Purpose:** Implements api
 
 use axum::{
     routing::{get, post},

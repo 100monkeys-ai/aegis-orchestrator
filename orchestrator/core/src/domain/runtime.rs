@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Runtime
+//!
+//! Provides runtime functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements runtime
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};

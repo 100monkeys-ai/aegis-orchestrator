@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Qdrant Repo
+//!
+//! Provides qdrant repo functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements qdrant repo
 
 // ============================================================================
 // ADR-024: Holographic Cortex Memory Architecture

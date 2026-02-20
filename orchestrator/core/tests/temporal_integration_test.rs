@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Temporal Integration Test
+//!
+//! Provides temporal integration test functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements temporal integration test
 
 use aegis_core::application::register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase};
 use aegis_core::application::start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest};

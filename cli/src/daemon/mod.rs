@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Daemon mode implementation
 //!
 //! Handles:
@@ -8,6 +7,11 @@
 //! - PID file management
 //! - HTTP health checks
 //! - Graceful shutdown
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for mod
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

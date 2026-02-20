@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Client
+//!
+//! Provides client functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements client
 
 use anyhow::Result;
 use reqwest::Client;

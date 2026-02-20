@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Supervisor
+//!
+//! Provides supervisor functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements supervisor
 
 // ============================================================================
 // ADR-005: Iterative Execution Strategy (100monkeys Algorithm)

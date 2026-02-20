@@ -1,7 +1,11 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Infrastructure layer for Cortex bounded context
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for mod
 
 pub mod repository;
 pub mod qdrant_store;

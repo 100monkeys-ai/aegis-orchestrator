@@ -1,9 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Embedded mode execution (when daemon is not running)
 //!
 //! Creates services in-process and executes commands directly.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Interface / Presentation Layer
+//! - **Purpose:** Implements internal responsibilities for embedded
 
 use anyhow::{Context, Result};
 use std::path::PathBuf;

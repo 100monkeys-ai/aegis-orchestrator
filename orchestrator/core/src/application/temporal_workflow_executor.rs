@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Temporal Workflow State Executor with 100monkeys Integration
 //!
 //! This application service bridges workflow FSM states (Agent, System, Human)
@@ -37,6 +36,11 @@
 //!       ├ Wait for human decision
 //!       └ Return human input
 //! ```
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for temporal workflow executor
 
 use crate::domain::workflow::{Workflow, WorkflowState, StateKind, WorkflowExecution, StateName};
 use crate::domain::events::WorkflowEvent;

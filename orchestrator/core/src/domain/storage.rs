@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Storage Provider Trait - Anti-Corruption Layer for SeaweedFS
 //!
 //! Provides abstraction over storage backend (SeaweedFS) to isolate
@@ -10,6 +9,11 @@
 //! Follows DDD Anti-Corruption Layer pattern from AGENTS.md.
 //!
 //! Extended with POSIX file operations per ADR-036 for NFS Server Gateway.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for storage
 
 use async_trait::async_trait;
 use thiserror::Error;

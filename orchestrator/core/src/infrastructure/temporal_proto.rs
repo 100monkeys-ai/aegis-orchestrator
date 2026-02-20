@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Temporal Protocol Buffer Definitions
 //!
 //! This module contains generated Rust code from Protocol Buffer definitions
@@ -33,6 +32,11 @@
 //!
 //! Protocol definitions follow Temporal API versioning (v1). Breaking changes
 //! require updating `.proto` files and regenerating code.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements internal responsibilities for temporal proto
 
 // This file includes the generated protobuf code from tonic/prost
 

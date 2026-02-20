@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Repository Factory - Application Layer
 //!
 //! Creates concrete repository implementations based on storage backend configuration.
@@ -11,6 +10,11 @@
 //! - Domain layer: Defines repository traits (pure interfaces)
 //! - Application layer: Implements factories that create repository instances
 //! - Infrastructure layer: Provides concrete implementations
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for repository factory
 
 use std::sync::Arc;
 use sqlx::PgPool;

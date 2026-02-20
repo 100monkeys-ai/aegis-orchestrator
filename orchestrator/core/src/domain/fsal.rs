@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! AegisFSAL - Transport-Agnostic File System Abstraction Layer
 //!
 //! Core security boundary for all file operations per ADR-036.
@@ -16,6 +15,11 @@
 //! Used by:
 //! - NFS Server Gateway (Phase 1, Docker)
 //! - virtio-fs Gateway (Phase 2+, Firecracker)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for fsal
 
 use crate::domain::{
     execution::ExecutionId,

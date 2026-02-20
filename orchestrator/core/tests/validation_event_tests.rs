@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Validation Event Tests
+//!
+//! Provides validation event tests functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements validation event tests
 
 use aegis_core::application::validation_service::ValidationService;
 use aegis_core::domain::agent::AgentId;

@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Temporal Workflow Mapper
 //!
 //! Anti-Corruption Layer that translates AEGIS Workflow domain objects
@@ -22,6 +21,11 @@
 //! # Related ADR
 //!
 //! - ADR-022: Temporal Workflow Engine Integration
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for temporal mapper
 
 use crate::domain::workflow::*;
 use anyhow::{Context, Result};

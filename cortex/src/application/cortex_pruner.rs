@@ -1,10 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Cortex Pattern Pruner - Background task for time-decay and consolidation
 //! 
 //! Implements the "sleep cycle" from ADR-018 (Weighted Cortex Memory)
 //! Periodically prunes low-weight patterns that haven't been verified recently
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for cortex pruner
+//! - **Related ADRs:** ADR-029: Cortex Time-Decay Parameters
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Integration tests for NFS Server Gateway (ADR-036)
 //!
 //! These tests verify:
@@ -11,6 +10,11 @@
 //!
 //! Note: Full NFS protocol testing requires mounting volumes and is beyond
 //! the scope of these unit/integration tests. These focus on service layer.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements internal responsibilities for nfs gateway integration tests
 
 use aegis_core::application::nfs_gateway::{NfsGatewayService, EventBusPublisher};
 use aegis_core::domain::fsal::{AegisFSAL, FsalError, EventPublisher};

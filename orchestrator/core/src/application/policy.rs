@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Policy
+//!
+//! Provides policy functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements policy
 
 use crate::domain::policy::{SecurityPolicy, NetworkPolicy, FilesystemPolicy, ResourceLimits};
 use anyhow::Result;

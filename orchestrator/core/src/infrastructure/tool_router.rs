@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Tool Router
+//!
+//! Provides tool router functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements tool router
 
 // ============================================================================
 // ADR-033: Orchestrator-Mediated MCP Tool Routing

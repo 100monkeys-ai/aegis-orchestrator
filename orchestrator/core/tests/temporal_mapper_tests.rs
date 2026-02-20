@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Temporal Mapper Tests
+//!
+//! Provides temporal mapper tests functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements temporal mapper tests
 
 use aegis_core::application::temporal_mapper::TemporalWorkflowMapper;
 use aegis_core::domain::workflow::*;

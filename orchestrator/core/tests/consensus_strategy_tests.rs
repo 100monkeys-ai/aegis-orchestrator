@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Unit tests for consensus strategies in the validation service.
 //! 
 //! This module tests the four consensus strategies:
@@ -11,6 +10,11 @@
 //!
 //! These tests validate the mathematical correctness of consensus calculations
 //! and edge case handling (ties, unanimous dissent, N > total judges, etc.).
+//!
+//! # Architecture
+//!
+//! - **Layer:** Core System
+//! - **Purpose:** Implements internal responsibilities for consensus strategy tests
 
 use aegis_core::domain::validation::GradientResult;
 use aegis_core::domain::workflow::{ConsensusConfig, ConsensusStrategy, ConfidenceWeighting};

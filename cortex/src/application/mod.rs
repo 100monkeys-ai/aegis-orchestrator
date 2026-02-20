@@ -1,5 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Mod
+//!
+//! Provides mod functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements mod
 
 use async_trait::async_trait;
 use crate::domain::pattern::CortexPattern;

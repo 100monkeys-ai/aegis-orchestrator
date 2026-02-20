@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Domain events for the Cortex bounded context
 //! Implements event sourcing for learning and memory operations
+//!
+//! # Architecture
+//!
+//! - **Layer:** Domain Layer
+//! - **Purpose:** Implements internal responsibilities for events
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};

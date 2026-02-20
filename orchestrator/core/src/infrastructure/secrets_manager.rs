@@ -1,5 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! Secrets Manager
+//!
+//! Provides secrets manager functionality for the system.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Infrastructure Layer
+//! - **Purpose:** Implements secrets manager
+//! - **Related ADRs:** ADR-034: OpenBao Secrets Management
 
 // ============================================================================
 // ADR-034: OpenBao for Secrets Management (DEFERRED to Phase 4)

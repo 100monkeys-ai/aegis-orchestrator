@@ -1,6 +1,5 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! Volume Manager Application Service
 //!
 //! Orchestrates volume lifecycle operations coordinating:
@@ -9,6 +8,11 @@
 //! - Event bus: Publishing VolumeEvents for observability
 //!
 //! Follows DDD application service pattern per AGENTS.md Section 9.
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for volume manager
 
 use crate::domain::volume::{
     Volume, VolumeId, TenantId, StorageClass, FilerEndpoint, 

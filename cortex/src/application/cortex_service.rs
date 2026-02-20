@@ -1,8 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
 //! CortexService - Application service for pattern storage and retrieval
 //! Implements ADR-018 (Weighted Cortex Memory) and ADR-024 (Holographic Cortex)
+//!
+//! # Architecture
+//!
+//! - **Layer:** Application Layer
+//! - **Purpose:** Implements internal responsibilities for cortex service
 
 use std::sync::Arc;
 use async_trait::async_trait;
