@@ -132,15 +132,27 @@ impl TemporalEventMapper {
             .context("Invalid timestamp format (expected RFC3339)")?
             .with_timezone(&Utc);
 
+        // Parse workflow ID (optional)
+        let workflow_id = match &payload.workflow_id {
+            Some(id_str) => match Uuid::parse_str(id_str) {
+                Ok(uuid) => WorkflowId(uuid),
+                Err(err) => {
+                    eprintln!(
+                        "TemporalEventMapper: invalid workflow_id '{}': {}. Falling back to nil UUID.",
+                        id_str,
+                        err
+                    );
+                    WorkflowId(Uuid::nil())
+                }
+            },
+            None => WorkflowId(Uuid::nil()),
+        };
+
         // Map event type to domain event
         match payload.event_type.as_str() {
             "WorkflowExecutionStarted" => Ok(WorkflowEvent::WorkflowExecutionStarted {
                 execution_id,
-                workflow_id: payload
-                    .workflow_id
-                    .as_ref()
-                    .map(|id| WorkflowId(Uuid::parse_str(id).unwrap_or_else(|_| Uuid::nil())))
-                    .unwrap_or_else(|| WorkflowId(Uuid::nil())),
+                workflow_id,
                 started_at: timestamp,
             }),
 
