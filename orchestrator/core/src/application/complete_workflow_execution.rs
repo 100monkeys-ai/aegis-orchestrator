@@ -156,7 +156,7 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         // Step 6: Publish domain event
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowExecutionCompleted {
-                execution_id: crate::domain::execution::ExecutionId(uuid::Uuid::new_v4()),
+                execution_id,
                 final_blackboard: serde_json::to_value(&execution.blackboard.data()).unwrap_or(serde_json::Value::Null),
                 artifacts: request.artifacts,
                 completed_at: Utc::now(),
