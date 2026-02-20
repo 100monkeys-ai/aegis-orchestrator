@@ -113,9 +113,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 
                 let total_known = MIGRATOR.iter().count();
                 if total_known == 0 {
-                    let msg = "CRITICAL: No migrations found in binary! Check build process.";
-                    tracing::error!("{}", msg);
-                    panic!("{}", msg);
+                    return Err(anyhow::anyhow!("CRITICAL: No migrations found in binary! Check build process."));
                 }
 
                 // Check applied migrations
@@ -135,9 +133,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     match MIGRATOR.run(&pool).await {
                         Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
-                            let msg = format!("ERROR: Failed to apply migrations: {}", e);
-                            tracing::error!("{}", msg);
-                            panic!("{}", msg);
+                            return Err(anyhow::anyhow!("Failed to apply migrations: {}", e));
                         }
                     }
                 } else {
@@ -261,8 +257,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()));
     
     let volume_service = Arc::new(aegis_core::application::volume_manager::StandardVolumeService::new(
-        volume_repo,
-        storage_provider,
+        volume_repo.clone(),
+        storage_provider.clone(),
         event_bus.clone(),
         filer_url,
     )?);
@@ -291,6 +287,52 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
     println!("✓ Volume cleanup background task spawned (interval: 5 minutes)");
+
+    // Initialize Storage Event Persister for audit trail (ADR-036)
+    println!("Initializing Storage Event Persister...");
+    let storage_event_repo: Arc<dyn aegis_core::domain::repository::StorageEventRepository> = if let Some(pool) = pool.as_ref() {
+        Arc::new(aegis_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+    } else {
+        println!("WARNING: Storage event persistence disabled (no database pool available)");
+        Arc::new(aegis_core::infrastructure::repositories::InMemoryStorageEventRepository::new())
+    };
+    
+    let storage_event_persister = Arc::new(aegis_core::application::storage_event_persister::StorageEventPersister::new(
+        storage_event_repo,
+        event_bus.clone(),
+    ));
+    
+    // Start background task for event persistence
+    let _persister_handle = storage_event_persister.start();
+    println!("✓ Storage Event Persister started (audit trail enabled)");
+
+    // Initialize NFS Server Gateway (ADR-036)
+    println!("Initializing NFS Server Gateway...");
+    let nfs_bind_port = config.spec.storage.as_ref()
+        .and_then(|s| s.nfs_port)
+        .unwrap_or(2049);
+    
+    // Wrap EventBus in EventBusPublisher adapter for FSAL
+    let event_publisher = Arc::new(aegis_core::application::nfs_gateway::EventBusPublisher::new(
+        event_bus.clone()
+    ));
+    
+    let nfs_gateway = Arc::new(aegis_core::application::nfs_gateway::NfsGatewayService::new(
+        storage_provider,
+        volume_repo,
+        event_publisher,
+        Some(nfs_bind_port),
+    ));
+    
+    // Start NFS server and await successful startup before continuing
+    if let Err(e) = nfs_gateway.start_server().await {
+        tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
+        // Log to stderr to ensure visibility
+        eprintln!("FATAL: NFS Server Gateway failed: {}", e);
+        // Allow shutdown of daemon via signal
+        std::process::exit(1);
+    }
+    println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(

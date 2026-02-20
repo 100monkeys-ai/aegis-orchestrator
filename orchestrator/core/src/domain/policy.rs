@@ -49,6 +49,15 @@ pub struct FilesystemPolicy {
     pub write: Vec<String>,
 }
 
+impl Default for FilesystemPolicy {
+    fn default() -> Self {
+        Self {
+            read: vec!["/workspace/**".to_string()],
+            write: vec!["/workspace/**".to_string()],
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResourceLimits {
     pub cpu_us: u64, // Microseconds quota? Or shares? Let's use simple generic for now, aligned with typical container specs.

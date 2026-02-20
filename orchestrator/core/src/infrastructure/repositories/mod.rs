@@ -54,6 +54,7 @@ pub mod postgres_execution;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 pub mod postgres_volume;
+pub mod postgres_storage_event;
 
 use std::sync::{Arc, RwLock};
 use std::collections::HashMap;
@@ -61,7 +62,7 @@ use async_trait::async_trait;
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::workflow::{Workflow, WorkflowId};
-use crate::domain::repository::{AgentRepository, ExecutionRepository, WorkflowRepository, RepositoryError};
+use crate::domain::repository::{AgentRepository, ExecutionRepository, WorkflowRepository, StorageEventRepository, RepositoryError};
 
 #[derive(Clone)]
 pub struct InMemoryAgentRepository {
@@ -274,6 +275,208 @@ impl crate::domain::repository::WorkflowExecutionRepository for InMemoryWorkflow
             .filter(|e| e.status == crate::domain::execution::ExecutionStatus::Running)
             .cloned()
             .collect())
+    }
+}
+
+// ============================================================================
+// In-Memory StorageEventRepository (for testing)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct InMemoryStorageEventRepository {
+    events: Arc<RwLock<Vec<crate::domain::events::StorageEvent>>>,
+}
+
+impl InMemoryStorageEventRepository {
+    pub fn new() -> Self {
+        Self {
+            events: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl StorageEventRepository for InMemoryStorageEventRepository {
+    async fn save(&self, event: &crate::domain::events::StorageEvent) -> Result<(), RepositoryError> {
+        let mut events = self.events.write().unwrap();
+        events.push(event.clone());
+        Ok(())
+    }
+
+    async fn find_by_execution(
+        &self,
+        execution_id: ExecutionId,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError> {
+        let events = self.events.read().unwrap();
+        let mut results: Vec<_> = events.iter()
+            .filter(|e| {
+                use crate::domain::events::StorageEvent;
+                match e {
+                    StorageEvent::FileOpened { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FileRead { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FileWritten { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FileClosed { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::DirectoryListed { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FileCreated { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FileDeleted { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::PathTraversalBlocked { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::FilesystemPolicyViolation { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::QuotaExceeded { execution_id: eid, .. } => *eid == execution_id,
+                    StorageEvent::UnauthorizedVolumeAccess { execution_id: eid, .. } => *eid == execution_id,
+                }
+            })
+            .cloned()
+            .collect();
+        
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            results.truncate(limit);
+        }
+        
+        Ok(results)
+    }
+
+    async fn find_by_volume(
+        &self,
+        volume_id: crate::domain::volume::VolumeId,
+        limit: Option<usize>,
+    ) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError> {
+        let events = self.events.read().unwrap();
+        let mut results: Vec<_> = events.iter()
+            .filter(|e| {
+                use crate::domain::events::StorageEvent;
+                match e {
+                    StorageEvent::FileOpened { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FileRead { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FileWritten { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FileClosed { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::DirectoryListed { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FileCreated { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FileDeleted { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::FilesystemPolicyViolation { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::QuotaExceeded { volume_id: vid, .. } => *vid == volume_id,
+                    StorageEvent::UnauthorizedVolumeAccess { volume_id: vid, .. } => *vid == volume_id,
+                    // PathTraversalBlocked doesn't have volume_id
+                    StorageEvent::PathTraversalBlocked { .. } => false,
+                }
+            })
+            .cloned()
+            .collect();
+        
+        // Apply limit if specified
+        if let Some(limit) = limit {
+            results.truncate(limit);
+        }
+        
+        Ok(results)
+    }
+
+    async fn find_violations(
+        &self,
+        execution_id: Option<ExecutionId>,
+    ) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError> {
+        let events = self.events.read().unwrap();
+        let violations: Vec<_> = events.iter()
+            .filter(|e| {
+                use crate::domain::events::StorageEvent;
+                let is_violation = matches!(e,
+                    StorageEvent::PathTraversalBlocked { .. } |
+                    StorageEvent::FilesystemPolicyViolation { .. } |
+                    StorageEvent::QuotaExceeded { .. } |
+                    StorageEvent::UnauthorizedVolumeAccess { .. }
+                );
+
+                if !is_violation {
+                    return false;
+                }
+
+                // If execution_id filter is specified, only include matching events
+                if let Some(eid) = execution_id {
+                    match e {
+                        StorageEvent::PathTraversalBlocked { execution_id: e_eid, .. } => *e_eid == eid,
+                        StorageEvent::FilesystemPolicyViolation { execution_id: e_eid, .. } => *e_eid == eid,
+                        StorageEvent::QuotaExceeded { execution_id: e_eid, .. } => *e_eid == eid,
+                        StorageEvent::UnauthorizedVolumeAccess { execution_id: e_eid, .. } => *e_eid == eid,
+                        _ => false,
+                    }
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+
+        Ok(violations)
+    }
+}
+
+// ============================================================================
+// In-Memory VolumeRepository (for testing)
+// ============================================================================
+
+#[derive(Clone)]
+pub struct InMemoryVolumeRepository {
+    volumes: Arc<RwLock<HashMap<crate::domain::volume::VolumeId, crate::domain::volume::Volume>>>,
+}
+
+impl InMemoryVolumeRepository {
+    pub fn new() -> Self {
+        Self {
+            volumes: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait]
+impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
+    async fn save(&self, volume: &crate::domain::volume::Volume) -> Result<(), RepositoryError> {
+        let mut volumes = self.volumes.write().unwrap();
+        volumes.insert(volume.id, volume.clone());
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: crate::domain::volume::VolumeId) -> Result<Option<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.get(&id).cloned())
+    }
+
+    async fn find_by_tenant(&self, tenant_id: crate::domain::volume::TenantId) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.values()
+            .filter(|v| v.tenant_id == tenant_id)
+            .cloned()
+            .collect())
+    }
+
+    async fn find_expired(&self) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        let now = chrono::Utc::now();
+        Ok(volumes.values()
+            .filter(|v| {
+                // Check if volume has an expiration time and it has passed
+                if let Some(expires_at) = v.expires_at {
+                    expires_at < now
+                } else {
+                    false
+                }
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_by_ownership(&self, ownership: &crate::domain::volume::VolumeOwnership) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes.values()
+            .filter(|v| v.ownership == *ownership)
+            .cloned()
+            .collect())
+    }
+
+    async fn delete(&self, id: crate::domain::volume::VolumeId) -> Result<(), RepositoryError> {
+        let mut volumes = self.volumes.write().unwrap();
+        volumes.remove(&id);
+        Ok(())
     }
 }
 

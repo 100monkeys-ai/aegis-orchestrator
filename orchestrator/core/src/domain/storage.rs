@@ -8,9 +8,80 @@
 //! and potential future migration to different storage systems.
 //!
 //! Follows DDD Anti-Corruption Layer pattern from AGENTS.md.
+//!
+//! Extended with POSIX file operations per ADR-036 for NFS Server Gateway.
 
 use async_trait::async_trait;
 use thiserror::Error;
+use serde::{Serialize, Deserialize};
+
+/// Opaque file handle for POSIX operations
+///
+/// Represents an open file. The internal structure is provider-specific.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct FileHandle(pub Vec<u8>);
+
+/// File open mode
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum OpenMode {
+    /// Read-only access
+    ReadOnly,
+    /// Write-only access
+    WriteOnly,
+    /// Read-write access
+    ReadWrite,
+    /// Create new file (with write access)
+    Create,
+}
+
+/// File type for directory entries and attributes
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum FileType {
+    /// Regular file
+    File,
+    /// Directory
+    Directory,
+    /// Symbolic link
+    Symlink,
+}
+
+/// POSIX file attributes
+///
+/// Represents file metadata returned by stat() operations.
+/// Used by NFS server to provide file information to clients.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttributes {
+    /// File type (file, directory, symlink)
+    pub file_type: FileType,
+    /// File size in bytes
+    pub size: u64,
+    /// Last modification time (Unix timestamp)
+    pub mtime: i64,
+    /// Last access time (Unix timestamp)
+    pub atime: i64,
+    /// Creation time (Unix timestamp)
+    pub ctime: i64,
+    /// POSIX permissions (e.g., 0o755)
+    /// Note: Overridden by UID/GID squashing in NFS gateway
+    pub mode: u32,
+    /// User ID (overridden by container UID in NFS gateway)
+    pub uid: u32,
+    /// Group ID (overridden by container GID in NFS gateway)
+    pub gid: u32,
+    /// Hard link count
+    pub nlink: u32,
+}
+
+/// Directory entry
+///
+/// Represents a single entry in directory listing (readdir).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirEntry {
+    /// File/directory name (not including path)
+    pub name: String,
+    /// File type
+    pub file_type: FileType,
+}
 
 /// Storage provider trait abstracting SeaweedFS operations
 ///
@@ -87,6 +158,105 @@ pub trait StorageProvider: Send + Sync {
         let _ = path; // Suppress unused warning
         Ok(Vec::new())
     }
+
+    // --- POSIX File Operations (ADR-036) ---
+
+    /// Open a file and return a handle
+    ///
+    /// # Arguments
+    /// * `path` - Remote file path
+    /// * `mode` - Open mode (ReadOnly, WriteOnly, ReadWrite, Create)
+    ///
+    /// # Returns
+    /// * `Ok(FileHandle)` - Opaque file handle for subsequent operations
+    /// * `Err(StorageError)` if open failed
+    async fn open_file(&self, path: &str, mode: OpenMode) -> Result<FileHandle, StorageError>;
+
+    /// Read data from file at specific offset
+    ///
+    /// # Arguments
+    /// * `handle` - File handle from open_file
+    /// * `offset` - Byte offset to start reading
+    /// * `length` - Number of bytes to read
+    ///
+    /// # Returns
+    /// * `Ok(Vec<u8>)` - Data read (may be shorter than length at EOF)
+    /// * `Err(StorageError)` if read failed
+    async fn read_at(&self, handle: &FileHandle, offset: u64, length: usize) -> Result<Vec<u8>, StorageError>;
+
+    /// Write data to file at specific offset
+    ///
+    /// # Arguments
+    /// * `handle` - File handle from open_file
+    /// * `offset` - Byte offset to start writing
+    /// * `data` - Data to write
+    ///
+    /// # Returns
+    /// * `Ok(usize)` - Number of bytes written
+    /// * `Err(StorageError)` if write failed
+    async fn write_at(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<usize, StorageError>;
+
+    /// Close file handle
+    ///
+    /// # Arguments
+    /// * `handle` - File handle to close
+    ///
+    /// # Returns
+    /// * `Ok(())` if closed successfully
+    /// * `Err(StorageError)` if close failed
+    async fn close_file(&self, handle: &FileHandle) -> Result<(), StorageError>;
+
+    /// Get file attributes (stat)
+    ///
+    /// # Arguments
+    /// * `path` - Remote file path
+    ///
+    /// # Returns
+    /// * `Ok(FileAttributes)` - File metadata
+    /// * `Err(StorageError)` if stat failed
+    async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError>;
+
+    /// List directory contents (readdir)
+    ///
+    /// # Arguments
+    /// * `path` - Remote directory path
+    ///
+    /// # Returns
+    /// * `Ok(Vec<DirEntry>)` - Directory entries
+    /// * `Err(StorageError)` if readdir failed
+    async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError>;
+
+    /// Create a new file
+    ///
+    /// # Arguments
+    /// * `path` - Remote file path
+    /// * `mode` - POSIX permissions (e.g., 0o644)
+    ///
+    /// # Returns
+    /// * `Ok(FileHandle)` - Handle to newly created file
+    /// * `Err(StorageError)` if create failed
+    async fn create_file(&self, path: &str, mode: u32) -> Result<FileHandle, StorageError>;
+
+    /// Delete a file
+    ///
+    /// # Arguments
+    /// * `path` - Remote file path
+    ///
+    /// # Returns
+    /// * `Ok(())` if deleted successfully
+    /// * `Err(StorageError)` if delete failed
+    async fn delete_file(&self, path: &str) -> Result<(), StorageError>;
+
+    /// Rename/move a file or directory
+    ///
+    /// # Arguments
+    /// * `from` - Source path
+    /// * `to` - Destination path
+    ///
+    /// # Returns
+    /// * `Ok(())` if renamed successfully
+    /// * `Err(StorageError)` if rename failed
+    async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError>;
 }
 
 /// Storage errors
@@ -120,6 +290,9 @@ pub enum StorageError {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
     
+    #[error("File not found: {0}")]
+    FileNotFound(String),
+
     #[error("IO error: {0}")]
     IoError(String),
 
@@ -205,6 +378,10 @@ mod tests {
             Ok(())
         }
 
+        async fn rename(&self, _from_path: &str, _to_path: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+
         async fn get_usage(&self, path: &str) -> Result<u64, StorageError> {
             let dirs = self.directories.lock().unwrap();
             dirs.get(path)
@@ -219,6 +396,49 @@ mod tests {
         async fn list_directories(&self, _path: &str) -> Result<Vec<String>, StorageError> {
             let dirs = self.directories.lock().unwrap();
             Ok(dirs.keys().cloned().collect())
+        }
+
+        // POSIX file operations (ADR-036)
+        async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(b"mock-handle".to_vec()))
+        }
+
+        async fn read_at(&self, _handle: &FileHandle, _offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+            Ok(vec![0u8; length])
+        }
+
+        async fn write_at(&self, _handle: &FileHandle, _offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+            Ok(data.len())
+        }
+
+        async fn close_file(&self, _handle: &FileHandle) -> Result<(), StorageError> {
+            Ok(())
+        }
+
+        async fn stat(&self, _path: &str) -> Result<FileAttributes, StorageError> {
+            Ok(FileAttributes {
+                file_type: FileType::File,
+                size: 0,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+                atime: 0,
+                mtime: 0,
+                ctime: 0,
+                nlink: 1,
+            })
+        }
+
+        async fn readdir(&self, _path: &str) -> Result<Vec<DirEntry>, StorageError> {
+            Ok(vec![])
+        }
+
+        async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(format!("mock-handle-{}", path).into_bytes()))
+        }
+
+        async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
+            Ok(())
         }
     }
 

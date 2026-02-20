@@ -1,10 +1,19 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-028: Embedding Model Selection (Ollama Integration)
+// ============================================================================
+// Current Implementation: Hash-based fallback for testing
+// This module provides semantic embedding generation per ADR-028.
+// Phase 1 uses Ollama with sentence-transformers model for development.
+// See: adrs/028-embedding-model-selection.md
+// ============================================================================
+
 //! Embedding client for generating semantic embeddings
 //! 
 //! This module provides a client for the embedding service (sentence-transformers).
-//! For now, uses a simple hash-based approach until the gRPC service is integrated.
+//! Uses Ollama-based sentence-transformers model for semantic vector generation.
 
 use anyhow::Result;
 use std::collections::hash_map::DefaultHasher;

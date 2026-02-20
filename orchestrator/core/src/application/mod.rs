@@ -10,3 +10,6 @@ pub mod policy;
 pub mod workflow_engine;
 pub mod temporal_mapper;
 pub mod volume_manager;
+pub mod nfs_gateway;
+pub mod storage_event_persister;
+pub mod repository_factory;

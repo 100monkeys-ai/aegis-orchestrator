@@ -19,6 +19,20 @@ pub struct RuntimeConfig {
     /// Volume mounts to attach to the runtime instance
     #[serde(default)]
     pub volumes: Vec<VolumeMount>,
+    /// Container UID for permission squashing (ADR-036)
+    #[serde(default = "default_container_uid")]
+    pub container_uid: u32,
+    /// Container GID for permission squashing (ADR-036)
+    #[serde(default = "default_container_gid")]
+    pub container_gid: u32,
+}
+
+fn default_container_uid() -> u32 {
+    1000
+}
+
+fn default_container_gid() -> u32 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

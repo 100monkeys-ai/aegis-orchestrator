@@ -254,6 +254,12 @@ impl FilerEndpoint {
     }
 }
 
+impl std::fmt::Display for FilerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.url)
+    }
+}
+
 /// Volume mount specification
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VolumeMount {

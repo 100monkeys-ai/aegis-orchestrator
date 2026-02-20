@@ -1,6 +1,19 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-003: Firecracker Isolation (DEFERRED to Phase 2 - Production Release)
+// ============================================================================
+// Current Implementation: Docker runtime only (Bollard client)
+// This module provides agent execution isolation via Docker containers.
+// 
+// Firecracker VM-based isolation deferred to Phase 2 for production hardening.
+// Phase 1 uses Docker for development/testing convenience.
+// 
+// TODO: Implement Firecracker runtime variant when Phase 2 begins.
+// See: adrs/003-firecracker-isolation.md
+// ============================================================================
+
 use crate::domain::runtime::{
     AgentRuntime, InstanceId, TaskInput, TaskOutput, RuntimeError, InstanceStatus, RuntimeConfig
 };
@@ -12,9 +25,11 @@ use bollard::container::{
 };
 use bollard::image::CreateImageOptions;
 use bollard::exec::{CreateExecOptions, StartExecResults, StartExecOptions};
+use bollard::models::{Mount, MountTypeEnum};
 use futures::StreamExt;
 use tracing::{info, debug, warn};
 use std::path::PathBuf;
+use chrono;
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -104,10 +119,59 @@ impl DockerRuntime {
         Ok(())
     }
 
-    async fn get_container_stats(&self, _id: &str) -> Option<(f64, u64, u64)> {
-        // TODO: Implement actual stats collection
-        // For now return dummy values
-        Some((0.0, 0, 0))
+    async fn get_container_stats(&self, id: &str) -> Option<(f64, u64, u64)> {
+        // Get container stats from Docker API
+        match self.docker.inspect_container(id, None).await {
+            Ok(inspect) => {
+                let state = inspect.state.as_ref()?;
+                
+                // Calculate uptime from StartedAt timestamp
+                let uptime = if let Some(started_at) = &state.started_at {
+                    match chrono::DateTime::parse_from_rfc3339(started_at) {
+                        Ok(started) => {
+                            let now = chrono::Utc::now();
+                            let duration = now.signed_duration_since(started);
+                            duration.num_seconds() as u64
+                        }
+                        Err(_) => 0,
+                    }
+                } else {
+                    0
+                };
+
+                // Get CPU and memory stats (requires stats API call)
+                match self.docker.stats(id, Some(bollard::container::StatsOptions { stream: false, one_shot: true })).next().await {
+                    Some(Ok(stats)) => {
+                        // Calculate CPU percentage
+                        let cpu_percent = if let (Some(system_cpu_usage), Some(presystem_cpu_usage)) =
+                            (stats.cpu_stats.system_cpu_usage, stats.precpu_stats.system_cpu_usage) {
+                            let cpu_usage = &stats.cpu_stats.cpu_usage;
+                            let precpu_usage = &stats.precpu_stats.cpu_usage;
+                            let cpu_delta = cpu_usage.total_usage.saturating_sub(precpu_usage.total_usage) as f64;
+                            let system_delta = system_cpu_usage.saturating_sub(presystem_cpu_usage) as f64;
+                            let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+                            if system_delta > 0.0 {
+                                (cpu_delta / system_delta) * num_cpus * 100.0
+                            } else {
+                                0.0
+                            }
+                        } else {
+                            0.0
+                        };
+
+                        // Get memory usage
+                        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
+
+                        Some((cpu_percent, memory_bytes, uptime))
+                    }
+                    _ => Some((0.0, 0, uptime)),  // Return at least uptime if stats fail
+                }
+            }
+            Err(e) => {
+                debug!("Failed to get container stats for {}: {}", id, e);
+                None
+            }
+        }
     }
 }
 
@@ -170,7 +234,7 @@ impl AgentRuntime for DockerRuntime {
         debug!("Preparing to copy bootstrap script into container");
         
         let mut host_config = bollard::service::HostConfig {
-            binds: None,  // Will be set below if volumes are specified
+            mounts: None,  // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
             network_mode: self.network_mode.clone(),  // Optional Docker network (None = default)
             ..Default::default()
         };
@@ -184,25 +248,70 @@ impl AgentRuntime for DockerRuntime {
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
         }
         
-        // Apply volume bind mounts if specified
+        // Apply NFS volume mounts if specified (ADR-036: Orchestrator Proxy Pattern)
         if !config.volumes.is_empty() {
-            let binds: Vec<String> = config.volumes.iter().map(|mount| {
-                // Derive host path from volume_id
-                // Convention: /var/lib/aegis/storage/<volume-id>
-                let host_path = format!("/var/lib/aegis/storage/{}", mount.volume_id);
-                let container_path = mount.mount_point.display();
-                let mode = match mount.access_mode {
-                    crate::domain::volume::AccessMode::ReadOnly => "ro",
-                    crate::domain::volume::AccessMode::ReadWrite => "rw",
-                };
+            // Extract orchestrator host from orchestrator_url (http://host:port -> host)
+            let orchestrator_host = self.orchestrator_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .split(':')
+                .next()
+                .unwrap_or("localhost");
+            
+            let mounts: Vec<Mount> = config.volumes.iter().map(|volume_mount| {
+                let container_path = volume_mount.mount_point.display().to_string();
                 
-                let bind_spec = format!("{}:{}:{}", host_path, container_path, mode);
-                debug!("Mounting volume: {}", bind_spec);
-                bind_spec
+                // ADR-036: NFS Server Gateway configuration via local driver
+                // Mount options: addr={host},nfsvers=3,proto=tcp,soft,timeo=10,nolock
+                // - NFSv3 protocol (not v4, for simplicity)
+                // - nolock: No NLM support in Phase 1 (safe for single-agent-per-volume)
+                // - soft mount with 10-second timeout (fail gracefully on network issues)
+                // - TCP protocol for reliability
+                
+                debug!(
+                    "Configuring NFS mount: volume_id={}, path={}, mode={:?}, host={}",
+                    volume_mount.volume_id,
+                    container_path,
+                    volume_mount.access_mode,
+                    orchestrator_host
+                );
+                
+                // Build NFS mount using local driver (standard Docker approach)
+                use bollard::models::{MountVolumeOptions, MountVolumeOptionsDriverConfig};
+                use std::collections::HashMap;
+                
+                let mut driver_opts = HashMap::new();
+                driver_opts.insert("type".to_string(), "nfs".to_string());
+                driver_opts.insert(
+                    "o".to_string(),
+                    format!("addr={},nfsvers=3,proto=tcp,soft,timeo=10,nolock", orchestrator_host)
+                );
+                driver_opts.insert(
+                    "device".to_string(),
+                    format!(":{}", volume_mount.remote_path) // remote_path contains /{tenant_id}/{volume_id}
+                );
+                
+                Mount {
+                    target: Some(container_path),
+                    source: None,
+                    typ: Some(MountTypeEnum::VOLUME),
+                    read_only: Some(matches!(
+                        volume_mount.access_mode,
+                        crate::domain::volume::AccessMode::ReadOnly
+                    )),
+                    volume_options: Some(MountVolumeOptions {
+                        driver_config: Some(MountVolumeOptionsDriverConfig {
+                            name: Some("local".to_string()),
+                            options: Some(driver_opts),
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }
             }).collect();
             
-            host_config.binds = Some(binds);
-            info!("Configured {} volume mount(s) for container", config.volumes.len());
+            host_config.mounts = Some(mounts);
+            info!("Configured {} NFS volume mount(s) for container (ADR-036)", config.volumes.len());
         }
 
         // Removed container_config that was causing move issues and unused var warning
@@ -268,8 +377,7 @@ impl AgentRuntime for DockerRuntime {
             "Executing bootstrap script in container"
         );
 
-        // simple exec for now - just echo the prompt
-        // Execute via bootstrap script
+        // Execute bootstrap script via Docker exec API
         let exec_config = CreateExecOptions {
             attach_stdout: Some(true),
             attach_stderr: Some(true),

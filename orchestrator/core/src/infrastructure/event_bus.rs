@@ -9,13 +9,13 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent};
 use aegis_cortex::domain::events::CortexEvent;
 use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{debug, warn};
+use tracing::warn;
 
 /// Unified domain event type for the event bus
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +27,7 @@ pub enum DomainEvent {
     Cortex(CortexEvent),
     Policy(crate::domain::events::PolicyEvent),
     Volume(VolumeEvent),
+    Storage(StorageEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -71,17 +72,16 @@ impl EventBus {
         self.publish(DomainEvent::Volume(event));
     }
 
+    /// Publish a storage event (ADR-036)
+    pub fn publish_storage_event(&self, event: StorageEvent) {
+        self.publish(DomainEvent::Storage(event));
+    }
+
     /// Publish a domain event to all subscribers
     fn publish(&self, event: DomainEvent) {
-        debug!("Publishing event: {:?}", event);
-        
         // Send to all subscribers
         // Note: send() returns the number of receivers that received the message
-        let receiver_count = self.sender.send(event.clone()).unwrap_or(0);
-        
-        if receiver_count == 0 {
-            debug!("No subscribers listening to event");
-        }
+        let _receiver_count = self.sender.send(event.clone()).unwrap_or(0);
     }
 
     /// Subscribe to all domain events
@@ -277,6 +277,7 @@ impl AgentEventReceiver {
             DomainEvent::Cortex(_) => false,
             DomainEvent::Policy(_) => false, // TODO: Link policy to agent
             DomainEvent::Volume(_) => false, // TODO: Link volume events to agent if needed
+            DomainEvent::Storage(_) => false, // TODO: Link storage events to agent if needed
         }
     }
 }
@@ -351,7 +352,7 @@ mod tests {
             DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { agent_id: id, .. }) => {
                 assert_eq!(id, agent_id);
             }
-            _ => panic!("Wrong event type received"),
+            other => panic!("Expected AgentDeployed event, got {:?}", other),
         }
     }
 
@@ -383,7 +384,7 @@ mod tests {
             ExecutionEvent::ExecutionStarted { execution_id: id, .. } => {
                 assert_eq!(id, execution_id);
             }
-            _ => panic!("Wrong event type received"),
+            other => panic!("Expected ExecutionStarted event, got {:?}", other),
         }
     }
 
