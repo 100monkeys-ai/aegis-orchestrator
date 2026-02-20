@@ -91,6 +91,7 @@ services:
       - TEMPORAL_TASK_QUEUE=aegis-agents
       - DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
       - AEGIS_RUNTIME_GRPC_URL=aegis-runtime:50051
+      - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8088
       - NODE_ENV=development
       - LOG_LEVEL=info
       - PROTO_PATH=/app/proto/aegis_runtime.proto
