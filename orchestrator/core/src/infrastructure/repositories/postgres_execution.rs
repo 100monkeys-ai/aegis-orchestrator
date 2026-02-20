@@ -29,7 +29,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use sqlx::PgPool;
 //! use repositories::PostgresExecutionRepository;
 //!

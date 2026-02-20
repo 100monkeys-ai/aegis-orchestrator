@@ -8,7 +8,7 @@
 //! enabling transparent POSIX filesystem access for agent containers.
 //!
 //! ## Architecture
-//! ```
+//! ```text
 //! Agent Container (NFS client) → NFSv3 Protocol (port 2049)
 //!   → AegisFsalAdapter (implements nfsserve::NFSFileSystem)
 //!   → AegisFSAL (domain entity, security boundary)

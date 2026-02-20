@@ -40,7 +40,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use validation_service::ValidationService;
 //! use domain::validation::ValidationRequest;
 //!

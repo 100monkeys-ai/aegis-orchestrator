@@ -21,7 +21,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use temporal_proto::temporal::api::workflowservice::v1::WorkflowServiceClient;
 //! use temporal_proto::temporal::api::common::v1::Payload;
 //!

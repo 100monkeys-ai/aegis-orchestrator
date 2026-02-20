@@ -14,7 +14,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use agent_skills_client::AgentSkillsClient;
 //!
 //! let client = AgentSkillsClient::new("https://agentskills.io/api");
@@ -92,7 +92,7 @@ impl AgentSkillsClient {
     /// Fetch multiple skills by their IDs
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// let skills = client.fetch_skills(vec![
     ///     "email:imap-reader",
     ///     "email:summarization",

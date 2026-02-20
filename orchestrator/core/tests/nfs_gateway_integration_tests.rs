@@ -25,6 +25,30 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{Utc, Duration};
 
+// ── Test helper ─────────────────────────────────────────────────────────────
+
+/// Create an Attached volume owned by the given execution and persist it in the repository.
+/// Returns `(volume_id, execution_id)` ready for use with `AegisFSAL`.
+async fn create_attached_test_volume(
+    repository: &Arc<dyn VolumeRepository>,
+    execution_id: ExecutionId,
+    quota_bytes: u64,
+) -> VolumeId {
+    let mut volume = Volume::new(
+        "test-volume".to_string(),
+        TenantId::default(),
+        StorageClass::Ephemeral { ttl: Duration::hours(24) },
+        FilerEndpoint::new("http://filer:8888").unwrap(),
+        quota_bytes,
+        VolumeOwnership::Execution { execution_id },
+    ).unwrap();
+    volume.mark_available().unwrap();
+    volume.mark_attached().unwrap();
+    let volume_id = volume.id;
+    repository.save(&volume).await.unwrap();
+    volume_id
+}
+
 // Mock Storage Provider for testing
 struct MockStorageProvider;
 
@@ -202,20 +226,9 @@ async fn test_fsal_mode_validation() {
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
-    // Create test volume
     let execution_id = ExecutionId::new();
-    let volume_id = VolumeId::new();
-    let volume = Volume::new(
-        "test-volume".to_string(),
-        TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
-        1024 * 1024,
-        VolumeOwnership::Execution { execution_id },
-    ).unwrap();
-    volume_repository.save(&volume).await.unwrap();
+    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
-    // Test: Open file for read-only
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
@@ -254,18 +267,9 @@ async fn test_fsal_path_traversal_prevention() {
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
-    // Create test volume
+    // Create test volume (path traversal check occurs after authorization, so volume must be attached)
     let execution_id = ExecutionId::new();
-    let volume_id = VolumeId::new();
-    let volume = Volume::new(
-        "test-volume".to_string(),
-        TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
-        1024 * 1024,
-        VolumeOwnership::Execution { execution_id },
-    ).unwrap();
-    volume_repository.save(&volume).await.unwrap();
+    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
@@ -298,18 +302,8 @@ async fn test_fsal_policy_enforcement() {
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
-    // Create test volume
     let execution_id = ExecutionId::new();
-    let volume_id = VolumeId::new();
-    let volume = Volume::new(
-        "test-volume".to_string(),
-        TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
-        1024 * 1024,
-        VolumeOwnership::Execution { execution_id },
-    ).unwrap();
-    volume_repository.save(&volume).await.unwrap();
+    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     // Policy: Only allow /workspace/data/* files
     let policy = FilesystemPolicy {
@@ -354,18 +348,8 @@ async fn test_fsal_audit_events() {
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
-    // Create test volume
     let execution_id = ExecutionId::new();
-    let volume_id = VolumeId::new();
-    let volume = Volume::new(
-        "test-volume".to_string(),
-        TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
-        1024 * 1024,
-        VolumeOwnership::Execution { execution_id },
-    ).unwrap();
-    volume_repository.save(&volume).await.unwrap();
+    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
@@ -413,20 +397,7 @@ async fn test_fsal_quota_enforcement() {
 
     // Create test volume with a very small quota (1KB)
     let execution_id = ExecutionId::new();
-    let volume_id = VolumeId::new();
-    let volume = Volume::new(
-        "test-volume".to_string(),
-        TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
-        1024, // 1KB quota
-        VolumeOwnership::Execution { execution_id },
-    ).unwrap();
-    
-    // Mark volume as attached (required for FSAL authorization)
-    let mut volume = volume;
-    volume.mark_attached().unwrap();
-    volume_repository.save(&volume).await.unwrap();
+    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],

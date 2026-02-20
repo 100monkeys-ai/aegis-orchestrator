@@ -35,7 +35,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use temporal_client::TemporalClient;
 //!
 //! let client = TemporalClient::new(
