@@ -184,11 +184,12 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Assert: Event was persisted
+        let volume_id = match &event {
+            StorageEvent::FileOpened { volume_id, .. } => *volume_id,
+            other => panic!("Test setup error: expected FileOpened event, got {:?}", other),
+        };
         let persisted_events = repository.find_by_volume(
-            match &event {
-                StorageEvent::FileOpened { volume_id, .. } => *volume_id,
-                _ => panic!("Unexpected event type"),
-            },
+            volume_id,
             None, // No limit
         ).await.unwrap();
 

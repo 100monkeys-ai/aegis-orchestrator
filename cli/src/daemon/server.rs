@@ -113,9 +113,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 
                 let total_known = MIGRATOR.iter().count();
                 if total_known == 0 {
-                    let msg = "CRITICAL: No migrations found in binary! Check build process.";
-                    tracing::error!("{}", msg);
-                    panic!("{}", msg);
+                    return Err(anyhow::anyhow!("CRITICAL: No migrations found in binary! Check build process."));
                 }
 
                 // Check applied migrations
@@ -135,9 +133,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     match MIGRATOR.run(&pool).await {
                         Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
-                            let msg = format!("ERROR: Failed to apply migrations: {}", e);
-                            tracing::error!("{}", msg);
-                            panic!("{}", msg);
+                            return Err(anyhow::anyhow!("Failed to apply migrations: {}", e));
                         }
                     }
                 } else {
@@ -328,16 +324,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(nfs_bind_port),
     ));
     
-    // Start NFS server in background
-    let nfs_gateway_clone = nfs_gateway.clone();
-    tokio::spawn(async move {
-        tracing::info!("NFS Server Gateway initialization started on port {} (ADR-036)", nfs_bind_port);
-        if let Err(e) = nfs_gateway_clone.start_server().await {
-            tracing::error!("NFS Server Gateway failed to start: {}", e);
-            panic!("Critical: NFS Server Gateway startup failed");
-        }
-    });
-    println!("✓ NFS Server Gateway initialization task spawned for port {} (ADR-036)", nfs_bind_port);
+    // Start NFS server and await successful startup before continuing
+    if let Err(e) = nfs_gateway.start_server().await {
+        tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
+        // Log to stderr to ensure visibility
+        eprintln!("FATAL: NFS Server Gateway failed: {}", e);
+        // Allow shutdown of daemon via signal
+        std::process::exit(1);
+    }
+    println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
     let execution_service = Arc::new(StandardExecutionService::new(

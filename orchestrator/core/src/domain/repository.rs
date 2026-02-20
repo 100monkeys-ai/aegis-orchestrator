@@ -11,7 +11,6 @@
 // Follows DDD Repository Pattern from AGENTS.md
 
 use async_trait::async_trait;
-use std::sync::Arc;
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::workflow::{Workflow, WorkflowId};
@@ -159,71 +158,6 @@ pub enum RepositoryError {
     
     #[error("Unknown error: {0}")]
     Unknown(String),
-}
-
-use crate::infrastructure::repositories::{InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryStorageEventRepository};
-use crate::infrastructure::repositories::postgres_agent::PostgresAgentRepository;
-use crate::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
-use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
-use crate::infrastructure::repositories::postgres_volume::PostgresVolumeRepository;
-use crate::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository;
-
-/// Factory for creating repositories from storage backend
-pub fn create_agent_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn AgentRepository> {
-    match backend {
-        StorageBackend::InMemory => {
-            Arc::new(InMemoryAgentRepository::new())
-        }
-        StorageBackend::PostgreSQL(_) => {
-            Arc::new(PostgresAgentRepository::new(pool))
-        }
-    }
-}
-
-pub fn create_execution_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn ExecutionRepository> {
-    match backend {
-        StorageBackend::InMemory => {
-            Arc::new(InMemoryExecutionRepository::new())
-        }
-        StorageBackend::PostgreSQL(_) => {
-            Arc::new(PostgresExecutionRepository::new(pool))
-        }
-    }
-}
-
-pub fn create_workflow_execution_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn WorkflowExecutionRepository> {
-    match backend {
-        StorageBackend::InMemory => {
-            // Arc::new(InMemoryWorkflowExecutionRepository::new())
-            todo!("InMemoryWorkflowExecutionRepository not yet implemented")
-        }
-        StorageBackend::PostgreSQL(_) => {
-             Arc::new(PostgresWorkflowExecutionRepository::new(pool))
-        }
-    }
-}
-
-pub fn create_volume_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn VolumeRepository> {
-    match backend {
-        StorageBackend::InMemory => {
-            // TODO: Implement InMemoryVolumeRepository for testing
-            todo!("InMemoryVolumeRepository not yet implemented")
-        }
-        StorageBackend::PostgreSQL(_) => {
-            Arc::new(PostgresVolumeRepository::new(pool))
-        }
-    }
-}
-
-pub fn create_storage_event_repository(backend: &StorageBackend, pool: sqlx::PgPool) -> Arc<dyn StorageEventRepository> {
-    match backend {
-        StorageBackend::InMemory => {
-            Arc::new(InMemoryStorageEventRepository::new())
-        }
-        StorageBackend::PostgreSQL(_) => {
-            Arc::new(PostgresStorageEventRepository::new(pool))
-        }
-    }
 }
 
 impl From<sqlx::Error> for RepositoryError {

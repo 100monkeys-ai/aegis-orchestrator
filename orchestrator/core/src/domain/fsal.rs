@@ -225,17 +225,18 @@ impl AegisFSAL {
     ) -> Result<(), FsalError> {
         // Check if path matches any read allowlist pattern
         let allowed = policy.read.iter().any(|pattern| {
-            // Wildcard matching: /** matches recursively, /* matches single level
+            // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
             if pattern.ends_with("/**") {
-                let prefix = &pattern[..pattern.len() - 3];
-                path == prefix
-                    || (path.starts_with(prefix)
-                        && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+                // Recursive glob pattern (/workspace/** matches /workspace and all nested)
+                let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
+                path.starts_with(prefix) && (path == prefix || path.starts_with(&format!("{}/", prefix)))
             } else if pattern.ends_with("/*") {
+                // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
                     && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
+                // Exact match
                 path == pattern
             }
         });
@@ -258,17 +259,18 @@ impl AegisFSAL {
     ) -> Result<(), FsalError> {
         // Check if path matches any write allowlist pattern
         let allowed = policy.write.iter().any(|pattern| {
-            // Wildcard matching: /** matches recursively, /* matches single level
+            // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
             if pattern.ends_with("/**") {
-                let prefix = &pattern[..pattern.len() - 3];
-                path == prefix
-                    || (path.starts_with(prefix)
-                        && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+                // Recursive glob pattern (/workspace/** matches /workspace and all nested)
+                let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
+                path.starts_with(prefix) && (path == prefix || path.starts_with(&format!("{}/", prefix)))
             } else if pattern.ends_with("/*") {
+                // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
                     && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
+                // Exact match
                 path == pattern
             }
         });

@@ -29,18 +29,13 @@
 //! bincode as a fixed-size 48-byte structure:
 //! ```rust
 //! pub struct AegisFileHandle {
-//!     /// Execution that owns this handle (16 bytes, UUID)
-//!     execution_id: ExecutionId,
-//!     /// Volume backing this handle (16 bytes, UUID)
-//!     volume_id: VolumeId,
-//!     /// Stable hash of the file path within the volume (8 bytes)
-//!     path_hash: u64,
-//!     /// Creation timestamp for the handle (8 bytes)
-//!     created_at: u64,
+//!     execution_id: ExecutionId, // 16 bytes (UUID)
+//!     volume_id: VolumeId,       // 16 bytes (UUID)
+//!     path_hash: u64,            // 8 bytes (Hash of file path)
+//!     created_at: i64,           // 8 bytes (Timestamp)
 //! }
 //! ```
-//! Total encoding size: 16 (execution_id) + 16 (volume_id) + 8 (path_hash) + 8 (created_at)
-//! = 48 bytes, safely under the 64-byte NFSv3 file handle limit.
+//! Current encoding: 48 bytes raw + ~4 bytes bincode overhead = 52 bytes (safe margin under 64-byte limit).
 //!
 //! ## Security Model (Orchestrator Proxy Pattern)
 //! - Agent containers require **zero elevated privileges** (no CAP_SYS_ADMIN)

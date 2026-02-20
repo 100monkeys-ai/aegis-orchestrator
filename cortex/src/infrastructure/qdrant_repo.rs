@@ -1,6 +1,17 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-024: Holographic Cortex Memory Architecture
+// ============================================================================
+// This module implements the pattern storage layer using Qdrant vector database.
+// Status: Phase 1 Core Implementation (in progress)
+// 
+// The Qdrant backend provides semantic similarity search for cortex patterns,
+// enabling the learning system to find applicable solutions to novel errors.
+// See: adrs/024-holographic-cortex-memory-architecture.md
+// ============================================================================
+
 //! Qdrant production implementation for pattern storage
 //! 
 //! This module provides a production-ready vector store using Qdrant
