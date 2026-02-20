@@ -16,3 +16,4 @@ pub mod volume;
 pub mod storage;
 pub mod path_sanitizer;
 pub mod fsal;
+pub mod mcp;

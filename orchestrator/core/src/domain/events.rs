@@ -360,6 +360,97 @@ pub enum PolicyEvent {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ViolationType {
+    ToolNotAllowed,
+    ToolExplicitlyDenied,
+    RateLimitExceeded,
+    PathOutsideBoundary,
+    PathTraversalAttempt,
+    DomainNotAllowed,
+    MissingRequiredArgument,
+    TimeoutExceeded,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum MCPToolEvent {
+    // ========== Server Lifecycle Events ==========
+    
+    ServerRegistered {
+        server_id: crate::domain::mcp::ToolServerId,
+        name: String,
+        capabilities: Vec<String>,
+        registered_at: DateTime<Utc>,
+    },
+    
+    ServerStarted {
+        server_id: crate::domain::mcp::ToolServerId,
+        name: String,
+        process_id: u32,
+        started_at: DateTime<Utc>,
+    },
+    
+    ServerStopped {
+        server_id: crate::domain::mcp::ToolServerId,
+        name: String,
+        stopped_at: DateTime<Utc>,
+    },
+    
+    ServerFailed {
+        server_id: crate::domain::mcp::ToolServerId,
+        name: String,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+    
+    ServerUnhealthy {
+        server_id: crate::domain::mcp::ToolServerId,
+        last_healthy: Option<DateTime<Utc>>,
+    },
+    
+    // ========== Tool Invocation Events ==========
+    
+    InvocationRequested {
+        invocation_id: crate::domain::mcp::ToolInvocationId,
+        execution_id: ExecutionId,
+        tool_name: String,
+        arguments: serde_json::Value,
+        requested_at: DateTime<Utc>,
+    },
+    
+    InvocationStarted {
+        invocation_id: crate::domain::mcp::ToolInvocationId,
+        server_id: crate::domain::mcp::ToolServerId,
+        tool_name: String,
+        started_at: DateTime<Utc>,
+    },
+    
+    InvocationCompleted {
+        invocation_id: crate::domain::mcp::ToolInvocationId,
+        execution_id: ExecutionId,
+        result: serde_json::Value,
+        duration_ms: u64,
+        completed_at: DateTime<Utc>,
+    },
+    
+    InvocationFailed {
+        invocation_id: crate::domain::mcp::ToolInvocationId,
+        execution_id: ExecutionId,
+        error: crate::domain::mcp::MCPError,
+        failed_at: DateTime<Utc>,
+    },
+    
+    // ========== Policy Violation Events ==========
+    
+    PolicyViolation {
+        execution_id: ExecutionId,
+        tool_name: String,
+        violation_type: ViolationType,
+        details: String,
+        blocked_at: DateTime<Utc>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

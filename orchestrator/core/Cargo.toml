@@ -43,6 +43,7 @@ parking_lot = "0.12"
 
 # Cortex (Learning & Memory)
 aegis-cortex = { path = "../../cortex" }
+url = "2.5.8"
 
 [dev-dependencies]
 tokio-test = "0.4"
