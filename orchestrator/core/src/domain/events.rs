@@ -364,9 +364,8 @@ pub enum PolicyEvent {
 mod tests {
     use super::*;
     use crate::domain::agent::AgentId;
-    use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
+    use crate::domain::execution::{ExecutionId, IterationError};
     use crate::domain::volume::{VolumeId, StorageClass};
-    use crate::domain::runtime::InstanceId;
     use chrono::Utc;
 
     // ── StorageEvent serialization ────────────────────────────────────────────

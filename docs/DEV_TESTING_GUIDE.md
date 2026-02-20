@@ -777,7 +777,7 @@ psql -h localhost -U aegis -d seaweedfs -c "\dt"
 
 ```bash
 # Apply database migration for volumes table
-psql -h localhost -U aegis -d aegis -f cli/migrations/002_create_volumes_table.sql
+psql -h localhost -U aegis -d aegis -f cli/migrations/001_initial.sql
 
 # Verify table created
 psql -h localhost -U aegis -d aegis -c "\d volumes"

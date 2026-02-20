@@ -302,3 +302,159 @@ BEGIN
     RAISE NOTICE 'Created views: active_workflow_executions, agent_success_rates';
     RAISE NOTICE 'NOTE: Cortex implementation deferred to Vector+RAG iteration';
 END $$;
+
+-- AEGIS Unified Storage Layer Database Schema
+-- Created: February 17, 2026
+-- Description: Volumes table for SeaweedFS-backed persistent and ephemeral storage
+-- ADR Reference: ADR-032 Unified Storage Layer
+
+-- =============================================================================
+-- Volumes Table
+-- Stores volume metadata for distributed storage management
+-- =============================================================================
+
+-- -----------------------------------------------------------------------------
+-- Volumes Table
+-- Represents isolated storage contexts with lifecycle independent of agent execution
+-- -----------------------------------------------------------------------------
+CREATE TABLE volumes (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name TEXT NOT NULL,
+    tenant_id UUID NOT NULL,
+    
+    -- Storage configuration
+    storage_class JSONB NOT NULL,      -- {"type": "ephemeral", "ttl": "PT24H"} or {"type": "persistent"}
+    filer_endpoint JSONB NOT NULL,     -- {"url": "http://localhost:8888"}
+    remote_path TEXT NOT NULL UNIQUE,  -- /aegis/volumes/{tenant_id}/{volume_id}
+    size_limit_bytes BIGINT NOT NULL,
+    
+    -- Lifecycle state
+    status JSONB NOT NULL,             -- {"type": "creating"} | {"type": "available"} etc.
+    ownership JSONB NOT NULL,          -- {"type": "execution", "execution_id": "..."} etc.
+    
+    -- Timestamps
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    attached_at TIMESTAMPTZ,
+    detached_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,            -- NULL for persistent volumes
+    
+    -- Constraints
+    CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0)
+    -- Note: Volume names are logical labels, NOT globally unique.
+    -- Multiple executions can have volumes with the same name but different volume_ids.
+    -- Uniqueness is enforced by: id (PRIMARY KEY) and remote_path (UNIQUE).
+);
+
+-- Indexes for common queries
+CREATE INDEX idx_volumes_tenant_id ON volumes(tenant_id);
+CREATE INDEX idx_volumes_expires_at ON volumes(expires_at) WHERE expires_at IS NOT NULL;
+CREATE INDEX idx_volumes_ownership ON volumes USING GIN (ownership);
+CREATE INDEX idx_volumes_status ON volumes USING GIN (status);
+CREATE INDEX idx_volumes_remote_path ON volumes(remote_path);
+CREATE INDEX idx_volumes_created_at ON volumes(created_at DESC);
+
+-- Composite indexes for ownership queries
+CREATE INDEX idx_volumes_tenant_status ON volumes(tenant_id, (status->>'type'));
+
+-- Add comment for documentation
+COMMENT ON TABLE volumes IS 'Volume metadata for SeaweedFS-backed distributed storage (ADR-032)';
+COMMENT ON COLUMN volumes.tenant_id IS 'Multi-tenant namespace isolation (default: 00000000-0000-0000-0000-000000000001)';
+COMMENT ON COLUMN volumes.storage_class IS 'Ephemeral (TTL-based) or Persistent storage classification';
+COMMENT ON COLUMN volumes.ownership IS 'Execution-scoped, Workflow-scoped, or User-owned persistent';
+COMMENT ON COLUMN volumes.expires_at IS 'Auto-cleanup timestamp for ephemeral volumes (NULL for persistent)';
+COMMENT ON COLUMN volumes.remote_path IS 'Unique SeaweedFS filer path for this volume';
+
+-- =============================================================================
+-- Migration Rollback
+-- =============================================================================
+
+-- To rollback this migration:
+-- DROP TABLE volumes;
+
+-- Storage Events Audit Trail (ADR-036)
+-- Creates table for persisting file-level operations for forensic analysis
+-- Complements in-memory event bus with persistent audit log
+
+CREATE TABLE storage_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    
+    -- Context identifiers
+    execution_id UUID NOT NULL REFERENCES executions(id) ON DELETE CASCADE,
+    volume_id UUID NOT NULL REFERENCES volumes(id) ON DELETE CASCADE,
+    
+    -- Event classification
+    event_type TEXT NOT NULL,
+    path TEXT NOT NULL,
+    
+    -- Operation details (JSONB for flexibility)
+    operation_details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    
+    -- Timestamp
+    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    -- Validation
+    CONSTRAINT storage_events_type_check CHECK (
+        event_type IN (
+            'FileOpened', 'FileRead', 'FileWritten', 'FileClosed',
+            'DirectoryListed', 'FileCreated', 'FileDeleted',
+            'PathTraversalBlocked', 'FilesystemPolicyViolation',
+            'QuotaExceeded', 'UnauthorizedVolumeAccess'
+        )
+    )
+);
+
+-- Performance indexes
+CREATE INDEX idx_storage_events_execution ON storage_events(execution_id);
+CREATE INDEX idx_storage_events_volume ON storage_events(volume_id);
+CREATE INDEX idx_storage_events_timestamp ON storage_events(timestamp DESC);
+CREATE INDEX idx_storage_events_type ON storage_events(event_type);
+
+-- Composite index for common queries (events by execution and type)
+CREATE INDEX idx_storage_events_execution_type ON storage_events(execution_id, event_type);
+
+-- GIN index for JSONB queries
+CREATE INDEX idx_storage_events_details ON storage_events USING GIN (operation_details);
+
+-- Partial index for security violations (fast forensic queries)
+CREATE INDEX idx_storage_events_violations ON storage_events(execution_id, timestamp DESC)
+WHERE event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'UnauthorizedVolumeAccess');
+
+-- AEGIS Temporal Era Database Schema Update
+-- Created: February 19, 2026
+-- Description: Adds execution_events table for event sourcing of Temporal workflow events
+
+-- -----------------------------------------------------------------------------
+-- Execution Events Table
+-- Append-only event store for workflow execution history
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS execution_events (
+    id BIGSERIAL PRIMARY KEY,
+    execution_id UUID NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+    
+    -- Temporal correlation and idempotency
+    temporal_sequence_number BIGINT NOT NULL,
+    
+    -- Event tracking
+    event_type VARCHAR NOT NULL,
+    event_payload JSONB NOT NULL,
+    
+    -- 100monkeys iteration tracking
+    iteration_number SMALLINT,
+    
+    -- Timestamps
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    
+    -- Ensure idempotent delivery from Temporal
+    CONSTRAINT execution_events_unique_seq UNIQUE (execution_id, temporal_sequence_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_execution_events_execution_id ON execution_events(execution_id);
+CREATE INDEX IF NOT EXISTS idx_execution_events_type ON execution_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_execution_events_created_at ON execution_events(created_at DESC);
+
+-- -----------------------------------------------------------------------------
+-- Workflow Executions Updates
+-- Support for iteration counting
+-- -----------------------------------------------------------------------------
+ALTER TABLE workflow_executions 
+ADD COLUMN IF NOT EXISTS iteration_count SMALLINT DEFAULT 0;
