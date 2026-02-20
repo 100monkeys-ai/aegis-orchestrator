@@ -28,12 +28,13 @@
 //! NFSv3 file handles limited to 64 bytes. AegisFileHandle serialized with bincode:
 //! ```rust
 //! pub struct AegisFileHandle {
-//!     volume_id: VolumeId,      // 16 bytes (UUID)
 //!     execution_id: ExecutionId, // 16 bytes (UUID)
-//!     file_path: String,        // Variable (up to ~30 bytes for short paths)
+//!     volume_id: VolumeId,       // 16 bytes (UUID)
+//!     path_hash: u64,            // 8 bytes (Hash of file path)
+//!     created_at: i64,           // 8 bytes (Timestamp)
 //! }
 //! ```
-//! Current encoding: ~48 bytes for typical paths (safe margin under 64-byte limit).
+//! Current encoding: 48 bytes raw + ~4 bytes bincode overhead = 52 bytes (safe margin under 64-byte limit).
 //!
 //! ## Security Model (Orchestrator Proxy Pattern)
 //! - Agent containers require **zero elevated privileges** (no CAP_SYS_ADMIN)

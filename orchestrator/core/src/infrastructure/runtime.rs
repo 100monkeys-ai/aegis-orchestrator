@@ -1,6 +1,19 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-003: Firecracker Isolation (DEFERRED to Phase 2 - Production Release)
+// ============================================================================
+// Current Implementation: Docker runtime only (Bollard client)
+// This module provides agent execution isolation via Docker containers.
+// 
+// Firecracker VM-based isolation deferred to Phase 2 for production hardening.
+// Phase 1 uses Docker for development/testing convenience.
+// 
+// TODO: Implement Firecracker runtime variant when Phase 2 begins.
+// See: adrs/003-firecracker-isolation.md
+// ============================================================================
+
 use crate::domain::runtime::{
     AgentRuntime, InstanceId, TaskInput, TaskOutput, RuntimeError, InstanceStatus, RuntimeConfig
 };
@@ -367,8 +380,7 @@ impl AgentRuntime for DockerRuntime {
             "Executing bootstrap script in container"
         );
 
-        // simple exec for now - just echo the prompt
-        // Execute via bootstrap script
+        // Execute bootstrap script via Docker exec API
         let exec_config = CreateExecOptions {
             attach_stdout: Some(true),
             attach_stderr: Some(true),

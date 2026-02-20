@@ -558,8 +558,12 @@ impl StorageProvider for SeaweedFSAdapter {
         let delete_response = self.client.delete(&from_url).send().await?;
         
         if !delete_response.status().is_success() {
-            // Log warning but don't fail - destination file was created
-            tracing::warn!("Failed to delete source file {} after rename", from);
+            // Rename semantics: if delete fails, both files exist - this is an error
+            // Don't leave orphaned files; fail the rename operation
+            return Err(StorageError::Unknown(format!(
+                "Rename from {} to {} failed on cleanup: source file still exists",
+                from, to
+            )));
         }
         
         Ok(())

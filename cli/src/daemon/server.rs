@@ -324,17 +324,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(nfs_bind_port),
     ));
     
-    // Start NFS server in background
-    let nfs_gateway_clone = nfs_gateway.clone();
-    tokio::spawn(async move {
-        if let Err(e) = nfs_gateway_clone.start_server().await {
-            tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
-            // Log to stderr to ensure visibility
-            eprintln!("FATAL: NFS Server Gateway failed: {}", e);
-            // Allow shutdown of daemon via signal
-            std::process::exit(1);
-        }
-    });
+    // Start NFS server and await successful startup before continuing
+    if let Err(e) = nfs_gateway.start_server().await {
+        tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
+        // Log to stderr to ensure visibility
+        eprintln!("FATAL: NFS Server Gateway failed: {}", e);
+        // Allow shutdown of daemon via signal
+        std::process::exit(1);
+    }
     println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));

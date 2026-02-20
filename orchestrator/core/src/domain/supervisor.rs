@@ -1,6 +1,21 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-005: Iterative Execution Strategy (100monkeys Algorithm)
+// ============================================================================
+// This module implements the core 100monkeys iterative refinement loop:
+// Generate → Execute → Evaluate → Refine (repeat up to max_iterations)
+// 
+// Status: Phase 1 Core Implementation (in progress)
+// The loop is functional but may require refinement in Phase 2 for:
+// - Enhanced error classification (move beyond simple parsing failures)
+// - Smarter code mutation strategies (integrate with Cortex learning)
+// - Dynamic iteration prioritization (ADR-017 Gradient Validation)
+//
+// See: adrs/005-iterative-execution-strategy.md
+// ============================================================================
+
 use crate::domain::execution::ExecutionInput;
 use crate::domain::runtime::{AgentRuntime, InstanceId, TaskInput, RuntimeError, RuntimeConfig};
 use std::sync::Arc;

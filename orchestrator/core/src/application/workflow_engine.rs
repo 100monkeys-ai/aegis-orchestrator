@@ -1,6 +1,20 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+// ============================================================================
+// ADR-022: Temporal Workflow Engine Integration (DEFERRED to Phase 2)
+// ============================================================================
+// Current Implementation: Custom FSM-based workflow engine (~35% complete)
+// This module implements a hand-rolled finite state machine for workflow orchestration.
+// 
+// Production Temporal workflow engine integration is deferred to Phase 2.
+// Custom FSM provided for Phase 1 simplicity and zero external dependencies.
+// 
+// TODO: Replace with Temporal workflow engine when Phase 2 begins.
+// This requires complete redesign of state transition logic and persistence.
+// See: adrs/022-temporal-workflow-engine-integration.md
+// ============================================================================
+
 //! Workflow Engine Application Service
 //!
 //! This module implements the FSM execution engine that drives workflow state transitions.
@@ -473,8 +487,9 @@ impl WorkflowEngine {
             StateKind::System { command, .. } => {
                 debug!(command = %command, "Executing system state");
                 
-                // TODO: Execute system command
-                // For now, return placeholder
+                // TODO: Phase 2 - Execute system command via host
+                // Current: Returns placeholder response
+                // Requires: System command execution API + sandbox/isolation
                 Ok(serde_json::json!({
                     "stdout": "Command output",
                     "stderr": "",
