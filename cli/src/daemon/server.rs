@@ -8,7 +8,7 @@ use axum::{
     extract::{State, Path},
     routing::{get, post},
     Json, Router,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
     response::{IntoResponse, sse::{Event, Sse}},
 };
 use sqlx::postgres::PgPool;
@@ -636,8 +636,30 @@ async fn run_workflow_legacy_handler(
 /// POST /v1/temporal-events - Receive events from Temporal worker
 async fn temporal_events_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(payload): Json<TemporalEventPayload>,
 ) -> impl IntoResponse {
+    // Validate shared secret from X-Temporal-Worker-Secret header
+    let expected_secret = std::env::var("TEMPORAL_WORKER_SECRET").ok();
+    if let Some(secret) = expected_secret {
+        let provided = headers
+            .get("x-temporal-worker-secret")
+            .and_then(|v| v.to_str().ok());
+        match provided {
+            Some(value) if value == secret => {}
+            _ => {
+                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+                    "error": "Unauthorized: invalid or missing X-Temporal-Worker-Secret header"
+                }))).into_response();
+            }
+        }
+    } else {
+        tracing::warn!(
+            "TEMPORAL_WORKER_SECRET is not set; /v1/temporal-events endpoint is unauthenticated. \
+             Set this environment variable in production to restrict access."
+        );
+    }
+
     match state.temporal_event_listener.handle_event(payload).await {
         Ok(execution_id) => {
             (StatusCode::OK, Json(serde_json::json!({
