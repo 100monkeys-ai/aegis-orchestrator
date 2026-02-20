@@ -234,12 +234,16 @@ pub struct RuntimeConfig {
     pub orchestrator_url: String,
     
     /// NFS server hostname/IP for volume mounts (ADR-036)
-    /// Used by Docker daemon on host to mount NFS volumes
-    /// Different from orchestrator_url which is used inside containers
-    /// Supports env:VAR_NAME syntax for environment variable substitution
-    /// Examples: "127.0.0.1" (when port exposed), "172.17.0.1" (bridge gateway),
-    ///           "host.docker.internal" (Docker Desktop), container IP
-    /// Default: None (extracts hostname from orchestrator_url as fallback)
+    /// Used by the Docker daemon on the host operating system to mount NFS volumes.
+    /// CRITICAL: Must be resolvable from the Host Environment where the Docker daemon runs, NOT the container network.
+    /// Supports env:VAR_NAME syntax for environment variable substitution.
+    /// Examples for local development:
+    /// - "127.0.0.1" (WSL2/Linux Native with exposed port 2049)
+    /// - "host.docker.internal" (Docker Desktop on Mac/Windows)
+    /// - "172.17.0.1" (Docker bridge gateway IP)
+    /// Examples for production:
+    /// - "<Physical Host IP>" (Firecracker VMs, Remote Hosts)
+    /// Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nfs_server_host: Option<String>,
 }

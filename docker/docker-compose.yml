@@ -134,7 +134,14 @@ services:
       # Referenced in node config via: runtime.orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
       - AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8088
       # NFS Server hostname for volume mounts (accessed by Docker daemon on host)
-      # Use 127.0.0.1 when NFS port is exposed (WSL/Linux), host.docker.internal (Docker Desktop)
+      # Must be an IP or hostname reachable from the host OS, because volumes are mounted by the Docker daemon, not the container network.
+      # Localhost deployment examples:
+      # - WSL2 / Linux Native (with port 2049 exposed): 127.0.0.1
+      # - Docker Desktop (Windows/Mac): host.docker.internal
+      # - Custom Bridge Gateway: 172.18.0.1
+      # Remote/VM deployment examples:
+      # - Firecracker VM / Remote Host: <Physical Host IP>
+      # Note: 'aegis-runtime' will NOT work here because the Docker daemon cannot resolve container names.
       - AEGIS_NFS_HOST=127.0.0.1
       - RUST_LOG=debug
     ports:

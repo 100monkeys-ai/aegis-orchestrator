@@ -265,13 +265,11 @@ impl AgentRuntime for DockerRuntime {
             let orchestrator_host = self.nfs_server_host
                 .as_deref()
                 .unwrap_or_else(|| {
-                    // Fallback: extract hostname from orchestrator_url for backward compatibility
-                    self.orchestrator_url
-                        .trim_start_matches("http://")
-                        .trim_start_matches("https://")
-                        .split(':')
-                        .next()
-                        .unwrap_or("localhost")
+                    // Fallback: Default to "127.0.0.1" which covers Native Linux and WSL2 deployments.
+                    // Prior behavior extracted the hostname from orchestrator_url (e.g., "aegis-runtime"),
+                    // but this fails for Docker deployments since the Docker Daemon on the host 
+                    // cannot resolve internal container network names.
+                    "127.0.0.1"
                 });
             
             let mounts: Vec<Mount> = config.volumes.iter().map(|volume_mount| {

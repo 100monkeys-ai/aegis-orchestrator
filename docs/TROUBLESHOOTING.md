@@ -487,6 +487,33 @@ Common issues and solutions when working with AEGIS.
      runtime: "python:3.11"  # Ensure valid image
    ```
 
+---
+
+### NFS Volume Mount Errors ("connection refused" / "i/o timeout")
+
+**Symptom:** Task execution fails with a 500 status code from Docker indicating an error while mounting a volume via NFS.
+
+**Solutions:**
+
+1. **Configure `AEGIS_NFS_HOST`**
+   Docker daemon needs to be able to reach the NFS gateway provided by the orchestrator.
+   - For WSL2 or Native Linux (running host network or exposed ports): `AEGIS_NFS_HOST=127.0.0.1`
+   - For Docker Desktop (Mac/Windows): `AEGIS_NFS_HOST=host.docker.internal`
+   - For Linux bridge networking: `AEGIS_NFS_HOST=172.17.0.1` (or your specific docker0 bridge IP)
+   - For Firecracker VMs or remote Docker engines: Replace with the actual host IP where the daemon is accessible.
+   *(Note: The default fallback is `127.0.0.1` if not overridden)*
+
+2. **Verify Configuration in node_config.yaml**
+   Ensure `nfs_server_host` is correctly configured in your node configuration manifest (if overridden from `AEGIS_NFS_HOST`):
+
+   ```yaml
+   runtime:
+     nfs_server_host: "env:AEGIS_NFS_HOST"
+   ```
+
+3. **Check Port Exposure**
+   If running the orchestrator outside of the Docker daemon's network context, ensure port `2049` (NFS) is bound and accessible from the Docker host.
+
 ## LLM Provider Issues
 
 ### Ollama Connection Failed

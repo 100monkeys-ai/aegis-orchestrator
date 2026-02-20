@@ -200,12 +200,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
     
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
+    // Note: The Docker daemon relies on this to mount volumes from the host environment.
     let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().map(|host| {
         if host.starts_with("env:") {
             let env_var = host.strip_prefix("env:").unwrap();
             std::env::var(env_var)
                 .unwrap_or_else(|_| {
-                    tracing::warn!("Environment variable {} not set, NFS mounts will use orchestrator_url hostname", env_var);
+                    tracing::warn!("Environment variable {} not set. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", env_var);
                     String::new()
                 })
         } else {

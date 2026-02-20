@@ -167,6 +167,20 @@ spec:
     #   - Remote deployment: "https://orchestrator.example.com"
     #   - Environment var: "env:AEGIS_ORCHESTRATOR_URL"
     # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
+    
+    # NFS server hostname/IP for volume mounts (ADR-036: NFS Server Gateway)
+    # CRITICAL: Must be resolvable from the Host Environment where the Docker daemon runs, NOT the container network.
+    # Docker's NFS volume mounts happen at the daemon level, NOT inside containers.
+    # Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
+    # 
+    # Platform-specific deployment strategies:
+    #   - WSL2 / Linux Native: "127.0.0.1" (Requires port 2049 exposed to the host)
+    #   - Docker Desktop (Windows/Mac): "host.docker.internal" (Resolves host's internal IP)
+    #   - Linux Bridge Network: "172.17.0.1" (Docker bridge gateway IP)
+    #   - Firecracker VMs / Remote Hosts: <Physical Host IP Address>
+    # 
+    # Note: Docker service names (e.g., 'aegis-runtime') DO NOT WORK - they only resolve inside Docker's embedded DNS.
+    # nfs_server_host: "env:AEGIS_NFS_HOST"
   
   # --------------------------------------------------------------------------
   # Network Configuration
