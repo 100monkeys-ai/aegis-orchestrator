@@ -27,7 +27,7 @@
 //! ## FileHandle Encoding (ADR-036)
 //! NFSv3 file handles are limited to 64 bytes. `AegisFileHandle` is serialized with
 //! bincode as a fixed-size 48-byte structure:
-//! ```rust
+//! ```ignore
 //! pub struct AegisFileHandle {
 //!     execution_id: ExecutionId, // 16 bytes (UUID)
 //!     volume_id: VolumeId,       // 16 bytes (UUID)

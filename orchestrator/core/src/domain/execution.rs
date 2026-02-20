@@ -442,3 +442,251 @@ impl From<Execution> for ExecutionInfo {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+
+    fn make_input(intent: &str) -> ExecutionInput {
+        ExecutionInput {
+            intent: Some(intent.to_string()),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    // ── ExecutionId ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_execution_id_new_unique() {
+        let a = ExecutionId::new();
+        let b = ExecutionId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_execution_id_display() {
+        let id = ExecutionId::new();
+        let s = format!("{}", id);
+        assert_eq!(s, id.0.to_string());
+    }
+
+    #[test]
+    fn test_execution_id_default() {
+        let a = ExecutionId::default();
+        let b = ExecutionId::default();
+        assert_ne!(a, b);
+    }
+
+    // ── Execution state machine ───────────────────────────────────────────────
+
+    #[test]
+    fn test_new_execution_is_pending() {
+        let exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        assert_eq!(exec.status, ExecutionStatus::Pending);
+        assert_eq!(exec.depth(), 0);
+        assert!(exec.parent_id().is_none());
+        assert!(exec.can_spawn_child());
+        assert_eq!(exec.container_uid, 1000);
+        assert_eq!(exec.container_gid, 1000);
+    }
+
+    #[test]
+    fn test_execution_start_changes_status() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        assert_eq!(exec.status, ExecutionStatus::Running);
+    }
+
+    #[test]
+    fn test_execution_complete() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.complete();
+        assert_eq!(exec.status, ExecutionStatus::Completed);
+        assert!(exec.ended_at.is_some());
+    }
+
+    #[test]
+    fn test_execution_fail() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.fail("something broke".to_string());
+        assert_eq!(exec.status, ExecutionStatus::Failed);
+        assert_eq!(exec.error.as_deref(), Some("something broke"));
+        assert!(exec.ended_at.is_some());
+    }
+
+    // ── Iteration management ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_start_iteration() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        let iter = exec.start_iteration("generate".to_string()).unwrap();
+        assert_eq!(iter.number, 1);
+        assert_eq!(iter.status, IterationStatus::Running);
+        assert_eq!(iter.action, "generate");
+    }
+
+    #[test]
+    fn test_complete_iteration() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("generate".to_string()).unwrap();
+        exec.complete_iteration("result".to_string());
+        let iter = &exec.iterations()[0];
+        assert_eq!(iter.status, IterationStatus::Success);
+        assert_eq!(iter.output.as_deref(), Some("result"));
+    }
+
+    #[test]
+    fn test_fail_iteration() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("generate".to_string()).unwrap();
+        exec.fail_iteration(IterationError {
+            message: "compile error".to_string(),
+            details: Some("syntax".to_string()),
+        });
+        let iter = &exec.iterations()[0];
+        assert_eq!(iter.status, IterationStatus::Failed);
+        assert!(iter.error.is_some());
+    }
+
+    #[test]
+    fn test_max_iterations_enforced() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 2);
+        exec.start();
+        exec.start_iteration("iter1".to_string()).unwrap();
+        exec.complete_iteration("out1".to_string());
+        exec.start_iteration("iter2".to_string()).unwrap();
+        exec.complete_iteration("out2".to_string());
+        let err = exec.start_iteration("iter3".to_string()).unwrap_err();
+        assert!(matches!(err, ExecutionError::MaxIterationsReached));
+    }
+
+    #[test]
+    fn test_store_validation_results() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("validate".to_string()).unwrap();
+        let results = ValidationResults {
+            system: None,
+            output: None,
+            semantic: None,
+            gradient: None,
+            consensus: None,
+        };
+        exec.store_validation_results(1, results).unwrap();
+        assert!(exec.iterations()[0].validation_results.is_some());
+    }
+
+    #[test]
+    fn test_store_validation_results_wrong_iteration() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("validate".to_string()).unwrap();
+        let results = ValidationResults {
+            system: None,
+            output: None,
+            semantic: None,
+            gradient: None,
+            consensus: None,
+        };
+        let err = exec.store_validation_results(99, results).unwrap_err();
+        assert!(matches!(err, ExecutionError::IterationNotFound(99)));
+    }
+
+    #[test]
+    fn test_add_llm_interaction() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("generate".to_string()).unwrap();
+        let interaction = LlmInteraction {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            prompt: "write hello world".to_string(),
+            response: "print('hello')".to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        exec.add_llm_interaction(1, interaction).unwrap();
+        assert_eq!(exec.iterations()[0].llm_interactions.len(), 1);
+    }
+
+    #[test]
+    fn test_add_llm_interaction_wrong_iteration() {
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        exec.start();
+        exec.start_iteration("generate".to_string()).unwrap();
+        let interaction = LlmInteraction {
+            provider: "openai".to_string(),
+            model: "gpt-4o".to_string(),
+            prompt: "prompt".to_string(),
+            response: "response".to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        let err = exec.add_llm_interaction(99, interaction).unwrap_err();
+        assert!(matches!(err, ExecutionError::IterationNotFound(99)));
+    }
+
+    // ── ExecutionHierarchy ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hierarchy_root() {
+        let id = ExecutionId::new();
+        let h = ExecutionHierarchy::root(id);
+        assert_eq!(h.depth, 0);
+        assert!(h.parent_id().is_none());
+        assert!(h.can_spawn_child());
+        assert_eq!(h.root_id(), id);
+    }
+
+    #[test]
+    fn test_hierarchy_child() {
+        let root_id = ExecutionId::new();
+        let root_h = ExecutionHierarchy::root(root_id);
+
+        let child_id = ExecutionId::new();
+        let child_h = ExecutionHierarchy::child(&root_h, child_id).unwrap();
+
+        assert_eq!(child_h.depth, 1);
+        assert_eq!(child_h.parent_id(), Some(root_id));
+        assert_eq!(child_h.root_id(), root_id);
+    }
+
+    #[test]
+    fn test_hierarchy_depth_limit() {
+        let root_id = ExecutionId::new();
+        let mut h = ExecutionHierarchy::root(root_id);
+
+        // Go up to MAX_RECURSIVE_DEPTH
+        for _ in 0..MAX_RECURSIVE_DEPTH {
+            let child_id = ExecutionId::new();
+            h = ExecutionHierarchy::child(&h, child_id).unwrap();
+        }
+        assert_eq!(h.depth, MAX_RECURSIVE_DEPTH);
+        assert!(!h.can_spawn_child());
+
+        // One more should fail
+        let err = ExecutionHierarchy::child(&h, ExecutionId::new());
+        assert!(err.is_err());
+    }
+
+    // ── ExecutionInfo ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_execution_info_from_execution() {
+        let agent_id = AgentId::new();
+        let mut exec = Execution::new(agent_id, make_input("task"), 3);
+        exec.start();
+        exec.complete();
+
+        let info = ExecutionInfo::from(exec.clone());
+        assert_eq!(info.id, exec.id);
+        assert_eq!(info.agent_id, agent_id);
+        assert_eq!(info.status, ExecutionStatus::Completed);
+        assert!(info.ended_at.is_some());
+        assert!(info.error.is_none());
+    }
+}

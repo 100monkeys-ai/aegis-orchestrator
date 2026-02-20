@@ -359,3 +359,191 @@ pub enum PolicyEvent {
         blocked_at: DateTime<Utc>,
     },
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+    use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
+    use crate::domain::volume::{VolumeId, StorageClass};
+    use crate::domain::runtime::InstanceId;
+    use chrono::Utc;
+
+    // ── StorageEvent serialization ────────────────────────────────────────────
+
+    #[test]
+    fn test_storage_event_file_opened_serialization() {
+        let exec_id = ExecutionId::new();
+        let vol_id = VolumeId::new();
+        let event = StorageEvent::FileOpened {
+            execution_id: exec_id,
+            volume_id: vol_id,
+            path: "/workspace/file.txt".to_string(),
+            open_mode: "read".to_string(),
+            opened_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
+        if let StorageEvent::FileOpened { path, open_mode, .. } = deserialized {
+            assert_eq!(path, "/workspace/file.txt");
+            assert_eq!(open_mode, "read");
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    #[test]
+    fn test_storage_event_quota_exceeded_serialization() {
+        let event = StorageEvent::QuotaExceeded {
+            execution_id: ExecutionId::new(),
+            volume_id: VolumeId::new(),
+            requested_bytes: 1024,
+            available_bytes: 0,
+            exceeded_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("QuotaExceeded"));
+    }
+
+    // ── ExecutionEvent serialization ──────────────────────────────────────────
+
+    #[test]
+    fn test_execution_event_started_serialization() {
+        let exec_id = ExecutionId::new();
+        let agent_id = AgentId::new();
+        let event = ExecutionEvent::ExecutionStarted {
+            execution_id: exec_id,
+            agent_id,
+            started_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ExecutionEvent = serde_json::from_str(&json).unwrap();
+        if let ExecutionEvent::ExecutionStarted { execution_id, .. } = deserialized {
+            assert_eq!(execution_id, exec_id);
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    #[test]
+    fn test_execution_event_completed_serialization() {
+        let event = ExecutionEvent::ExecutionCompleted {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            final_output: "result".to_string(),
+            total_iterations: 3,
+            completed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("ExecutionCompleted"));
+        assert!(json.contains("result"));
+    }
+
+    #[test]
+    fn test_execution_event_iteration_failed_serialization() {
+        let event = ExecutionEvent::IterationFailed {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            iteration_number: 2,
+            error: IterationError {
+                message: "compile error".to_string(),
+                details: None,
+            },
+            failed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("IterationFailed"));
+    }
+
+    // ── ValidationEvent serialization ─────────────────────────────────────────
+
+    #[test]
+    fn test_validation_event_gradient_serialization() {
+        let event = ValidationEvent::GradientValidationPerformed {
+            execution_id: ExecutionId::new(),
+            iteration_number: 1,
+            score: 0.9,
+            confidence: 0.85,
+            validated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: ValidationEvent = serde_json::from_str(&json).unwrap();
+        if let ValidationEvent::GradientValidationPerformed { score, confidence, .. } = deserialized {
+            assert_eq!(score, 0.9);
+            assert_eq!(confidence, 0.85);
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    #[test]
+    fn test_validation_event_consensus_serialization() {
+        let event = ValidationEvent::MultiJudgeConsensus {
+            execution_id: ExecutionId::new(),
+            judge_scores: vec![(AgentId::new(), 0.9), (AgentId::new(), 0.85)],
+            final_score: 0.875,
+            confidence: 0.9,
+            reached_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("MultiJudgeConsensus"));
+    }
+
+    // ── VolumeEvent serialization ─────────────────────────────────────────────
+
+    #[test]
+    fn test_volume_event_created_serialization() {
+        let event = VolumeEvent::VolumeCreated {
+            volume_id: VolumeId::new(),
+            execution_id: Some(ExecutionId::new()),
+            storage_class: StorageClass::persistent(),
+            remote_path: "/volumes/test".to_string(),
+            size_limit_bytes: 1024 * 1024 * 1024,
+            created_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("VolumeCreated"));
+    }
+
+    #[test]
+    fn test_volume_event_quota_exceeded_serialization() {
+        let event = VolumeEvent::VolumeQuotaExceeded {
+            volume_id: VolumeId::new(),
+            size_limit_bytes: 1024,
+            actual_bytes: 2048,
+            exceeded_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("VolumeQuotaExceeded"));
+    }
+
+    // ── PolicyEvent serialization ─────────────────────────────────────────────
+
+    #[test]
+    fn test_policy_event_violation_serialization() {
+        let event = PolicyEvent::PolicyViolationBlocked {
+            violation_type: "network".to_string(),
+            details: "Attempted access to evil.com".to_string(),
+            blocked_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
+        if let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized {
+            assert_eq!(violation_type, "network");
+        } else {
+            panic!("unexpected variant");
+        }
+    }
+
+    // ── AgentLifecycleEvent ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_agent_lifecycle_event_paused_serialization() {
+        let event = AgentLifecycleEvent::AgentPaused {
+            agent_id: AgentId::new(),
+            paused_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("AgentPaused"));
+    }
+}

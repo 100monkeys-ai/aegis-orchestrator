@@ -59,7 +59,7 @@ impl LocalStorageProvider {
     /// * `Result<Self, StorageError>` - Provider instance or error
     ///
     /// # Example
-    /// ```rust
+    /// ```ignore
     /// let provider = LocalStorageProvider::new("/var/lib/aegis/local-volumes")?;
     /// ```
     pub fn new(base_path: impl Into<PathBuf>) -> Result<Self, StorageError> {

@@ -636,3 +636,215 @@ impl AgentManifest {
         format!("{}:{}", self.spec.runtime.language, self.spec.runtime.version)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_manifest(name: &str) -> AgentManifest {
+        AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "AgentManifest".to_string(),
+            metadata: ManifestMetadata {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                labels: std::collections::HashMap::new(),
+                annotations: std::collections::HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: "python".to_string(),
+                    version: "3.11".to_string(),
+                    isolation: "inherit".to_string(),
+                    autopull: true,
+                },
+                task: None,
+                context: vec![],
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: vec![],
+                env: std::collections::HashMap::new(),
+                volumes: vec![],
+                advanced: None,
+            },
+        }
+    }
+
+    // ── AgentId ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_agent_id_new_is_unique() {
+        let a = AgentId::new();
+        let b = AgentId::new();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn test_agent_id_from_valid_string() {
+        let id = AgentId::new();
+        let s = id.0.to_string();
+        let parsed = AgentId::from_string(&s).expect("should parse valid UUID");
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn test_agent_id_from_invalid_string() {
+        assert!(AgentId::from_string("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn test_agent_id_default() {
+        let a = AgentId::default();
+        let b = AgentId::default();
+        assert_ne!(a, b, "default() should generate unique IDs");
+    }
+
+    // ── Agent lifecycle ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_agent_new_is_active() {
+        let manifest = make_manifest("my-agent");
+        let agent = Agent::new(manifest.clone());
+        assert_eq!(agent.status, AgentStatus::Active);
+        assert_eq!(agent.name, "my-agent");
+        assert_eq!(agent.manifest, manifest);
+    }
+
+    #[test]
+    fn test_agent_pause_and_resume() {
+        let mut agent = Agent::new(make_manifest("test-agent"));
+        agent.pause();
+        assert_eq!(agent.status, AgentStatus::Paused);
+        agent.resume();
+        assert_eq!(agent.status, AgentStatus::Active);
+    }
+
+    #[test]
+    fn test_agent_archive() {
+        let mut agent = Agent::new(make_manifest("test-agent"));
+        agent.archive();
+        assert_eq!(agent.status, AgentStatus::Archived);
+    }
+
+    #[test]
+    fn test_agent_update_manifest() {
+        let mut agent = Agent::new(make_manifest("old-name"));
+        let new_manifest = make_manifest("new-name");
+        agent.update_manifest(new_manifest.clone());
+        assert_eq!(agent.name, "new-name");
+        assert_eq!(agent.manifest, new_manifest);
+    }
+
+    // ── AgentManifest validation ──────────────────────────────────────────────
+
+    #[test]
+    fn test_manifest_valid() {
+        let manifest = make_manifest("my-agent");
+        assert!(manifest.validate().is_ok());
+    }
+
+    #[test]
+    fn test_manifest_invalid_api_version() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.api_version = "wrong/v1".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("apiVersion"));
+    }
+
+    #[test]
+    fn test_manifest_invalid_kind() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.kind = "WrongKind".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("kind"));
+    }
+
+    #[test]
+    fn test_manifest_empty_name() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.metadata.name = "".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("name"));
+    }
+
+    #[test]
+    fn test_manifest_uppercase_name_rejected() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.metadata.name = "MyAgent".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("lowercase"));
+    }
+
+    #[test]
+    fn test_manifest_leading_hyphen_rejected() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.metadata.name = "-agent".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("hyphen"));
+    }
+
+    #[test]
+    fn test_manifest_trailing_hyphen_rejected() {
+        let mut manifest = make_manifest("my-agent");
+        manifest.metadata.name = "agent-".to_string();
+        let err = manifest.validate().unwrap_err();
+        assert!(err.contains("hyphen"));
+    }
+
+    #[test]
+    fn test_manifest_runtime_string() {
+        let manifest = make_manifest("my-agent");
+        assert_eq!(manifest.runtime_string(), "python:3.11");
+    }
+
+    // ── ResourceLimits ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_resource_limits_parse_gibibytes() {
+        assert_eq!(ResourceLimits::parse_size_to_bytes("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(ResourceLimits::parse_size_to_bytes("2Gi"), Some(2 * 1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_resource_limits_parse_mebibytes() {
+        assert_eq!(ResourceLimits::parse_size_to_bytes("512Mi"), Some(512 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_resource_limits_parse_kibibytes() {
+        assert_eq!(ResourceLimits::parse_size_to_bytes("64Ki"), Some(64 * 1024));
+    }
+
+    #[test]
+    fn test_resource_limits_parse_plain_bytes() {
+        assert_eq!(ResourceLimits::parse_size_to_bytes("1024"), Some(1024));
+    }
+
+    #[test]
+    fn test_resource_limits_parse_invalid() {
+        assert_eq!(ResourceLimits::parse_size_to_bytes("invalid"), None);
+    }
+
+    #[test]
+    fn test_resource_limits_memory_bytes() {
+        let limits = ResourceLimits {
+            cpu: 1000,
+            memory: "256Mi".to_string(),
+            disk: "1Gi".to_string(),
+            timeout: None,
+        };
+        assert_eq!(limits.memory_bytes(), Some(256 * 1024 * 1024));
+        assert_eq!(limits.disk_bytes(), Some(1024 * 1024 * 1024));
+    }
+
+    #[test]
+    fn test_resource_limits_default() {
+        let limits = ResourceLimits::default();
+        assert_eq!(limits.cpu, 1000);
+        assert_eq!(limits.memory, "512Mi");
+        assert_eq!(limits.disk, "1Gi");
+        assert!(limits.timeout.is_none());
+    }
+}

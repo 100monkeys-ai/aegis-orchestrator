@@ -164,6 +164,10 @@ impl VolumeService for StandardVolumeService {
             .await
             .context("Failed to set volume quota on storage backend")?;
 
+        // Transition volume from Creating → Available now that storage is provisioned
+        let mut volume = volume;
+        volume.mark_available().context("Failed to mark volume as available")?;
+
         // Persist to database
         self.repository
             .save(&volume)

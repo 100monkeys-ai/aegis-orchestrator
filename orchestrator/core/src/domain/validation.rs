@@ -76,3 +76,133 @@ pub struct ValidationRequest {
     pub criteria: String,
     pub context: Option<serde_json::Value>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+    use std::collections::HashMap;
+
+    fn make_gradient_result(score: f64, confidence: f64) -> GradientResult {
+        GradientResult {
+            score,
+            confidence,
+            reasoning: "test".to_string(),
+            signals: vec![],
+            metadata: HashMap::new(),
+        }
+    }
+
+    // ── GradientResult ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gradient_result_serialization() {
+        let result = make_gradient_result(0.85, 0.9);
+        let json = serde_json::to_string(&result).unwrap();
+        let deserialized: GradientResult = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.score, 0.85);
+        assert_eq!(deserialized.confidence, 0.9);
+    }
+
+    #[test]
+    fn test_gradient_result_with_signals() {
+        let signal = ValidationSignal {
+            category: "security".to_string(),
+            score: 0.4,
+            message: "potential SQL injection".to_string(),
+        };
+        let result = GradientResult {
+            score: 0.4,
+            confidence: 0.95,
+            reasoning: "Found SQL injection risk".to_string(),
+            signals: vec![signal],
+            metadata: HashMap::new(),
+        };
+        assert_eq!(result.signals.len(), 1);
+        assert_eq!(result.signals[0].category, "security");
+    }
+
+    #[test]
+    fn test_gradient_result_with_metadata() {
+        let mut result = make_gradient_result(0.7, 0.8);
+        result.metadata.insert("judge_id".to_string(), serde_json::json!("judge-1"));
+        assert_eq!(result.metadata.len(), 1);
+    }
+
+    // ── MultiJudgeConsensus ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_multi_judge_consensus_serialization() {
+        let consensus = MultiJudgeConsensus {
+            final_score: 0.88,
+            consensus_confidence: 0.92,
+            individual_results: vec![
+                (AgentId::new(), make_gradient_result(0.9, 0.95)),
+                (AgentId::new(), make_gradient_result(0.85, 0.88)),
+            ],
+            strategy: "weighted_average".to_string(),
+            metadata: HashMap::new(),
+        };
+        let json = serde_json::to_string(&consensus).unwrap();
+        let deserialized: MultiJudgeConsensus = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.final_score, 0.88);
+        assert_eq!(deserialized.individual_results.len(), 2);
+        assert_eq!(deserialized.strategy, "weighted_average");
+    }
+
+    // ── ValidationError ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validation_error_display() {
+        let exec_err = ValidationError::Execution("timeout".to_string());
+        assert!(exec_err.to_string().contains("timeout"));
+
+        let consensus_err = ValidationError::NoConsensus("disagreement".to_string());
+        assert!(consensus_err.to_string().contains("disagreement"));
+
+        let req_err = ValidationError::InvalidRequest("missing content".to_string());
+        assert!(req_err.to_string().contains("missing content"));
+    }
+
+    // ── ValidationRequest ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validation_request_creation() {
+        let req = ValidationRequest {
+            content: "fn main() {}".to_string(),
+            criteria: "valid rust".to_string(),
+            context: Some(serde_json::json!({"language": "rust"})),
+        };
+        assert_eq!(req.content, "fn main() {}");
+        assert!(req.context.is_some());
+    }
+
+    #[test]
+    fn test_validation_request_serialization() {
+        let req = ValidationRequest {
+            content: "some code".to_string(),
+            criteria: "quality check".to_string(),
+            context: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let deserialized: ValidationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.content, req.content);
+        assert_eq!(deserialized.criteria, req.criteria);
+        assert!(deserialized.context.is_none());
+    }
+
+    // ── ValidationSignal ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_validation_signal_serialization() {
+        let signal = ValidationSignal {
+            category: "performance".to_string(),
+            score: 0.6,
+            message: "O(n^2) loop detected".to_string(),
+        };
+        let json = serde_json::to_string(&signal).unwrap();
+        let deserialized: ValidationSignal = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.category, "performance");
+        assert_eq!(deserialized.score, 0.6);
+    }
+}

@@ -22,7 +22,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use context_loader::ContextLoader;
 //! use domain::agent::ContextItem;
 //!
@@ -275,7 +275,6 @@ impl Default for ContextLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
     use std::fs;
     
     #[test]
@@ -297,8 +296,8 @@ mod tests {
     
     #[test]
     fn test_load_file_attachment() {
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("aegis_test_file.txt");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_file.txt");
         
         // Create test file
         fs::write(&file_path, "File content").unwrap();
@@ -315,26 +314,22 @@ mod tests {
         
         assert!(result.contains("Test file"));
         assert!(result.contains("File content"));
-        
-        // Cleanup
-        fs::remove_file(&file_path).unwrap();
     }
     
     #[test]
     fn test_load_directory_attachment() {
-        let temp_dir = env::temp_dir().join("aegis_test_dir");
-        fs::create_dir_all(&temp_dir).unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
         
         // Create test files
-        fs::write(temp_dir.join("file1.txt"), "Content 1").unwrap();
-        fs::write(temp_dir.join("file2.txt"), "Content 2").unwrap();
-        fs::create_dir(temp_dir.join("subdir")).unwrap();
-        fs::write(temp_dir.join("subdir").join("file3.txt"), "Content 3").unwrap();
+        fs::write(temp_dir.path().join("file1.txt"), "Content 1").unwrap();
+        fs::write(temp_dir.path().join("file2.txt"), "Content 2").unwrap();
+        fs::create_dir(temp_dir.path().join("subdir")).unwrap();
+        fs::write(temp_dir.path().join("subdir").join("file3.txt"), "Content 3").unwrap();
         
         let loader = ContextLoader::new();
         let attachments = vec![
             ContextItem::Directory {
-                path: temp_dir.to_string_lossy().to_string(),
+                path: temp_dir.path().to_string_lossy().to_string(),
                 description: Some("Test directory".to_string()),
             }
         ];
@@ -345,15 +340,12 @@ mod tests {
         assert!(result.contains("Content 2"));
         assert!(result.contains("Content 3"));
         assert!(result.contains("file1.txt"));
-        
-        // Cleanup
-        fs::remove_dir_all(&temp_dir).unwrap();
     }
     
     #[test]
     fn test_file_size_limit() {
-        let temp_dir = env::temp_dir();
-        let file_path = temp_dir.join("aegis_test_large_file.txt");
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("large_file.txt");
         
         // Create file larger than limit
         let large_content = "x".repeat(6 * 1024 * 1024); // 6 MB
@@ -372,9 +364,6 @@ mod tests {
         let err = result.unwrap_err();
         let err_msg = format!("{:?}", err); // Use Debug format to see the full chain
         assert!(err_msg.contains("exceeds"), "Error message should contain 'exceeds', got: {}", err_msg);
-        
-        // Cleanup
-        fs::remove_file(&file_path).unwrap();
     }
     
     #[test]

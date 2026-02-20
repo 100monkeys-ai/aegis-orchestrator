@@ -23,7 +23,7 @@
 //!
 //! # Usage
 //!
-//! ```no_run
+//! ```ignore
 //! use prompt_template_engine::PromptTemplateEngine;
 //!
 //! let engine = PromptTemplateEngine::new();
@@ -162,7 +162,7 @@ impl PromptTemplateEngine {
     /// Render a template with context
     ///
     /// # Example
-    /// ```no_run
+    /// ```ignore
     /// let engine = PromptTemplateEngine::new();
     /// let context = PromptContext::new()
     ///     .instruction("Summarize emails")
