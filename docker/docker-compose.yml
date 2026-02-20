@@ -142,7 +142,7 @@ services:
       # Remote/VM deployment examples:
       # - Firecracker VM / Remote Host: <Physical Host IP>
       # Note: 'aegis-runtime' will NOT work here because the Docker daemon cannot resolve container names.
-      - AEGIS_NFS_HOST=127.0.0.1
+      # - AEGIS_NFS_HOST=127.0.0.1
       - RUST_LOG=debug
     ports:
       - "8088:8088"   # gRPC server for orchestrator API
