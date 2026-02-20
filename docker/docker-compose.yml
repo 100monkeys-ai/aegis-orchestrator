@@ -123,7 +123,7 @@ services:
     environment:
       - AEGIS_DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
       - RUST_LOG=info,aegis_orchestrator=debug
-      - TEMPORAL_WORKER_URL=http://temporal-worker:3000
+      - AEGIS_WORKER_HTTP_ENDPOINT=http://temporal-worker:3000
       - TEMPORAL_ADDRESS=temporal:7233
       - AEGIS_ENABLE_DISK_QUOTAS=false  # Disable disk quotas on WSL/macOS (no XFS+pquota)
       # Docker network for agent containers
