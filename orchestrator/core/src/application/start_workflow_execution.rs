@@ -175,7 +175,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowExecutionStarted {
-                execution_id: crate::domain::execution::ExecutionId(uuid::Uuid::new_v4()),
+                execution_id,
                 workflow_id: workflow.id,
                 started_at: Utc::now(),
             },
