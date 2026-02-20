@@ -77,7 +77,6 @@ impl EventBus {
         self.publish(DomainEvent::Storage(event));
     }
 
-    /// Publish a 
     /// Publish a domain event to all subscribers
     fn publish(&self, event: DomainEvent) {
         // Send to all subscribers

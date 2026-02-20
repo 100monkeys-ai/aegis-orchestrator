@@ -83,8 +83,6 @@ pub struct DirEntry {
     pub file_type: FileType,
 }
 
-/// std::path::PathBuf;
-
 /// Storage provider trait abstracting SeaweedFS operations
 ///
 /// This trait defines the interface for interacting with the distributed

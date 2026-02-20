@@ -234,6 +234,7 @@ impl AegisFSAL {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
+                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 // Exact match
                 path == pattern
@@ -267,6 +268,7 @@ impl AegisFSAL {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
                 path.starts_with(prefix)
+                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 // Exact match
                 path == pattern

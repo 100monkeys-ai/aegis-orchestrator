@@ -25,7 +25,8 @@
 //! - Authorization enforced at AegisFSAL layer (execution must own volume)
 //!
 //! ## FileHandle Encoding (ADR-036)
-//! NFSv3 file handles limited to 64 bytes. AegisFileHandle serialized with bincode:
+//! NFSv3 file handles are limited to 64 bytes. `AegisFileHandle` is serialized with
+//! bincode as a fixed-size 48-byte structure:
 //! ```rust
 //! pub struct AegisFileHandle {
 //!     execution_id: ExecutionId, // 16 bytes (UUID)

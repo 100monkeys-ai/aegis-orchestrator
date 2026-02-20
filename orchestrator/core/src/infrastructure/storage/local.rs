@@ -278,28 +278,29 @@ impl StorageProvider for LocalStorageProvider {
     async fn open_file(&self, path: &str, mode: OpenMode) -> Result<FileHandle, StorageError> {
         let fs_path = self.resolve_path(path);
         
-        // Open file based on mode
-        let _file = match mode {
+        // Validate the file is accessible based on mode
+        match mode {
             OpenMode::ReadOnly => {
-                File::open(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+                // Check path accessibility via metadata without consuming a file descriptor
+                std::fs::metadata(&fs_path)
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
             }
             OpenMode::WriteOnly => {
                 File::options()
                     .write(true)
                     .open(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
             }
             OpenMode::ReadWrite => {
                 File::options()
                     .read(true)
                     .write(true)
                     .open(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?
+                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
             }
             OpenMode::Create => {
                 File::create(&fs_path)
-                    .map_err(|e| StorageError::IoError(format!("Failed to create {}: {}", path, e)))?
+                    .map_err(|e| StorageError::IoError(format!("Failed to create {}: {}", path, e)))?;
             }
         };
         
