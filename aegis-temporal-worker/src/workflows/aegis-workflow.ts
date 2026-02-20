@@ -1,4 +1,4 @@
-import { proxyActivities, setHandler, defineSignal, condition } from '@temporalio/workflow';
+import { proxyActivities, setHandler, defineSignal, condition, workflowInfo } from '@temporalio/workflow';
 import Handlebars from 'handlebars';
 import type {
     TemporalWorkflowDefinition,
@@ -17,6 +17,7 @@ const {
     validateOutputActivity,
     executeParallelAgentsActivity,
     fetchWorkflowDefinition,
+    publishEventActivity,
 } = proxyActivities<typeof activities>({
     startToCloseTimeout: '10 minutes',
     retry: {
@@ -49,6 +50,22 @@ interface GenericWorkflowInput {
  */
 export async function aegis_workflow(args: GenericWorkflowInput): Promise<WorkflowResult> {
     const { workflow_name, input } = args;
+    const info = workflowInfo();
+    const executionId = info.workflowId; // In AEGIS, Temporal workflowId is the Execution UUID
+    let temporalSequenceNumber = 1;
+
+    const emit = async (eventType: string, extra: any = {}) => {
+        await publishEventActivity({
+            event_type: eventType,
+            execution_id: executionId,
+            temporal_sequence_number: temporalSequenceNumber++,
+            workflow_id: undefined,
+            timestamp: new Date().toISOString(),
+            ...extra
+        });
+    };
+
+    await emit('WorkflowExecutionStarted');
 
     // 1. Fetch Definition
     const definition = await fetchWorkflowDefinition(workflow_name);
@@ -73,18 +90,25 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
         const state = definition.states[currentState];
 
         if (!state) {
-            throw new Error(`State "${currentState}" not found in definition`);
+            const err = `State "${currentState}" not found in definition`;
+            await emit('WorkflowExecutionFailed', { error: err });
+            throw new Error(err);
         }
 
         try {
+            await emit('WorkflowStateEntered', { state_name: currentState });
+
             // Execute State
-            const stateOutput = await executeState(state, currentState, blackboard);
+            const stateOutput = await executeState(state, currentState, blackboard, emit, executionId);
+
+            await emit('WorkflowStateExited', { state_name: currentState, output: stateOutput });
 
             // Update Blackboard
             blackboard[currentState] = stateOutput;
 
             // Check Terminal
             if (!state.transitions || state.transitions.length === 0) {
+                await emit('WorkflowExecutionCompleted', { final_blackboard: blackboard });
                 return {
                     status: 'completed',
                     output: stateOutput,
@@ -98,6 +122,7 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
             currentState = await evaluateTransitions(state.transitions, stateOutput, blackboard);
 
             if (currentState === null) {
+                await emit('WorkflowExecutionCompleted', { final_blackboard: blackboard });
                 return {
                     status: 'completed',
                     output: stateOutput,
@@ -108,9 +133,11 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
             }
 
         } catch (error) {
+            const errMsg = error instanceof Error ? error.message : String(error);
+            await emit('WorkflowExecutionFailed', { error: errMsg, final_blackboard: blackboard });
             return {
                 status: 'failed',
-                error: error instanceof Error ? error.message : String(error),
+                error: errMsg,
                 iterations: iterationCount,
                 final_state: currentState ?? undefined,
                 blackboard,
@@ -118,9 +145,11 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
         }
     }
 
+    const err = 'Max iterations exceeded';
+    await emit('WorkflowExecutionFailed', { error: err, final_blackboard: blackboard });
     return {
         status: 'failed',
-        error: 'Max iterations exceeded',
+        error: err,
         iterations: iterationCount,
         final_state: currentState ?? undefined,
         blackboard,
@@ -134,17 +163,72 @@ export async function aegis_workflow(args: GenericWorkflowInput): Promise<Workfl
 async function executeState(
     state: WorkflowState,
     stateName: string,
-    blackboard: Blackboard
+    blackboard: Blackboard,
+    emit: (eventType: string, extra?: any) => Promise<void>,
+    executionId: string
 ): Promise<any> {
     switch (state.kind) {
         case 'Agent':
-            // Validation moved to generic level provided we trust the definition schema
             if (!state.agent || !state.input) throw new Error("Invalid Agent State");
-            return await executeAgentActivity({
-                agentId: state.agent,
-                input: renderTemplate(state.input, blackboard),
-                context: blackboard,
-            });
+
+            let iteration = 1;
+            let currentInput = renderTemplate(state.input, blackboard);
+            const maxIterations = 3; // Temporal-level iteration bound
+            let lastOutput = null;
+
+            while (iteration <= maxIterations) {
+                await emit('IterationStarted', { iteration_number: iteration });
+
+                try {
+                    const result = await executeAgentActivity({
+                        agentId: state.agent,
+                        input: currentInput,
+                        context: blackboard,
+                    });
+
+                    lastOutput = result;
+                    await emit('IterationCompleted', {
+                        iteration_number: iteration,
+                        output: result.output
+                    });
+
+                    if (result.status !== 'completed') {
+                        throw new Error(`Agent execution failed: ${result.error}`);
+                    }
+
+                    const judges = blackboard.judges as Array<{ agent_id: string; weight?: number }>;
+
+                    if (!judges || judges.length === 0) {
+                        break;
+                    }
+
+                    const validationResult = await validateOutputActivity({
+                        output: result.output,
+                        judges: judges,
+                    });
+
+                    if (validationResult.binary_valid || validationResult.final_score > 0.8) {
+                        break;
+                    }
+
+                    await emit('RefinementApplied', {
+                        iteration_number: iteration,
+                        code_diff: validationResult.reasoning
+                    });
+
+                    currentInput = currentInput + `\n\nValidation failed with score ${validationResult.final_score}.\nReasoning: ${validationResult.reasoning}\nPlease refine your response.`;
+                    iteration++;
+                } catch (error) {
+                    const errMsg = error instanceof Error ? error.message : String(error);
+                    await emit('IterationFailed', {
+                        iteration_number: iteration,
+                        error: errMsg
+                    });
+                    throw error;
+                }
+            }
+
+            return lastOutput;
 
         case 'System':
             if (!state.command) throw new Error("Invalid System State");
@@ -163,6 +247,9 @@ async function executeState(
 
         case 'Human':
             if (!state.prompt) throw new Error("Invalid Human State");
+
+            await emit('HumanInputRequested', { prompt: state.prompt, default_response: state.default_response });
+
             const humanInputSignal = defineSignal<[string]>('humanInput');
             let humanResponse: string | null = null;
             setHandler(humanInputSignal, (response) => { humanResponse = response; });

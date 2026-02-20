@@ -41,7 +41,8 @@
 //! let client = TemporalClient::new(
 //!     "localhost:7233",
 //!     "default",
-//!     "aegis-task-queue"
+//!     "aegis-task-queue",
+//!     "http://temporal-worker:3000"
 //! ).await?;
 //!
 //! let run_id = client.start_workflow(
@@ -63,6 +64,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
 use uuid::Uuid;
+use reqwest::Client as HttpClient;
 
 // Import generated protos
 use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::workflow_service_client::WorkflowServiceClient;
@@ -71,35 +73,48 @@ use crate::infrastructure::temporal_proto::temporal::api::common::v1::{WorkflowT
 
 #[derive(Clone)]
 pub struct TemporalClient {
-    // We store the channel or client? Client is Clone but Channel is easier to manage?
-    // Tonic clients are cheap to clone.
     client: WorkflowServiceClient<Channel>,
+    http_client: HttpClient,
     namespace: String,
     task_queue: String,
+    #[allow(dead_code)]
+    temporal_endpoint: String,
+    worker_http_endpoint: String,
 }
 
 impl TemporalClient {
-    pub async fn new(address: &str, namespace: &str, task_queue: &str) -> Result<Self> {
+    pub async fn new(
+        address: &str,
+        namespace: &str,
+        task_queue: &str,
+        worker_http_endpoint: &str,
+    ) -> Result<Self> {
         // Ensure address has scheme
-         let addr = if address.contains("://") {
+        let addr = if address.contains("://") {
             address.to_string()
         } else {
             format!("http://{}", address)
         };
 
-        let endpoint = Channel::from_shared(addr)
+        let endpoint = Channel::from_shared(addr.clone())
             .context("Invalid Temporal address")?
             .timeout(Duration::from_secs(10));
-            
-        let channel = endpoint.connect().await
+
+        let channel = endpoint
+            .connect()
+            .await
             .context("Failed to connect to Temporal server")?;
 
         let client = WorkflowServiceClient::new(channel);
+        let http_client = HttpClient::new();
 
         Ok(Self {
             client,
+            http_client,
             namespace: namespace.to_string(),
             task_queue: task_queue.to_string(),
+            temporal_endpoint: address.to_string(),
+            worker_http_endpoint: worker_http_endpoint.to_string(),
         })
     }
 
@@ -197,5 +212,46 @@ impl TemporalClient {
             .context("Failed to get workflow history")?;
             
         Ok(response.into_inner().history.map(|h| h.events).unwrap_or_default())
+    }
+
+    /// Register a workflow definition with the Temporal worker
+    ///
+    /// This calls the TypeScript worker HTTP API to register a new workflow definition.
+    /// The worker stores the definition in PostgreSQL for dynamic runtime interpretation.
+    ///
+    /// # HTTP Endpoint
+    ///
+    /// POST /{worker_http_endpoint}/register-workflow
+    /// Body: JSON serialized TemporalWorkflowDefinition
+    /// Response: 200 OK {status: "registered"} or error
+    pub async fn register_temporal_workflow(
+        &self,
+        definition: &crate::application::temporal_mapper::TemporalWorkflowDefinition,
+    ) -> Result<()> {
+        let url = format!("{}/register-workflow", self.worker_http_endpoint);
+
+        let response = self
+            .http_client
+            .post(&url)
+            .json(definition)
+            .timeout(Duration::from_secs(30))
+            .send()
+            .await
+            .context("Failed to send workflow registration request to Temporal worker")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "(no body)".to_string());
+            anyhow::bail!(
+                "Failed to register workflow with Temporal worker: {} - {}",
+                status,
+                body
+            );
+        }
+
+        Ok(())
     }
 }

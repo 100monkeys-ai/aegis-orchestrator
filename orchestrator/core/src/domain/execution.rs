@@ -400,6 +400,24 @@ impl Execution {
         self.error = Some(reason);
         self.ended_at = Some(Utc::now());
     }
+
+    /// Check if execution is completed (success, failure, or cancellation)
+    pub fn is_completed(&self) -> bool {
+        matches!(
+            self.status,
+            ExecutionStatus::Completed | ExecutionStatus::Failed | ExecutionStatus::Cancelled
+        )
+    }
+
+    /// Get the current (most recent) iteration
+    pub fn current_iteration(&self) -> Option<&Iteration> {
+        self.iterations.last()
+    }
+
+    /// Get the total number of attempts (iterations)
+    pub fn total_attempts(&self) -> u8 {
+        self.iterations.len() as u8
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

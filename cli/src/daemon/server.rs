@@ -23,7 +23,9 @@ use aegis_core::{
     application::{
         execution::StandardExecutionService, execution::ExecutionService,
         lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
-        workflow_engine::WorkflowEngine, validation_service::ValidationService,
+        validation_service::ValidationService,
+        register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
+        start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest},
     },
     domain::{
         node_config::NodeConfigManifest,
@@ -41,6 +43,7 @@ use aegis_core::{
         },
         runtime::DockerRuntime,
         temporal_client::TemporalClient,
+        TemporalEventListener, TemporalEventPayload,
     },
 };
 
@@ -349,7 +352,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Create Cortex repositories (in-memory for now)
     let pattern_repo = Arc::new(InMemoryPatternRepository::new());
 
-    // Create Cortex service
     let cortex_service: Arc<dyn CortexService> = Arc::new(
         StandardCortexService::new(
             pattern_repo,
@@ -357,20 +359,46 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
     );
 
+    // Subscribe to EventBus to capture RefinementApplied for Cortex learning
+    let cortex_listener_service = cortex_service.clone();
+    let mut cortex_subscriber = event_bus.subscribe();
+    tokio::spawn(async move {
+        while let Ok(event) = cortex_subscriber.recv().await {
+            if let aegis_core::infrastructure::event_bus::DomainEvent::Execution(
+                aegis_core::domain::events::ExecutionEvent::RefinementApplied {
+                    execution_id, code_diff, ..
+                }
+            ) = event {
+                let signature = aegis_cortex::domain::ErrorSignature::new(
+                    "refinement_feedback".to_string(),
+                    &code_diff.diff,
+                );
+                let _ = cortex_listener_service.store_pattern(
+                    Some(execution_id.0),
+                    signature,
+                    String::new(),
+                    "validation_failed".to_string(),
+                    vec![0.0; 384],
+                ).await;
+            }
+        }
+    });
+
     println!("Cortex service initialized.");
     println!("Initializing workflow engine...");
     
     // Initialize Temporal Client
     let temporal_address = std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "temporal:7233".to_string());
-    println!("Initializing Temporal Client (Address: {})...", temporal_address);
-    
-    // Initialize Temporal Client (Async / Non-blocking)
-    let temporal_address = std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "temporal:7233".to_string());
+    let worker_http_endpoint = std::env::var("AEGIS_WORKER_HTTP_ENDPOINT").unwrap_or_else(|_| "http://localhost:3000".to_string());
     println!("Initializing Temporal Client (Address: {})...", temporal_address);
     
     // Create a shared container for the client that relies on interior mutability
     let temporal_client_container = Arc::new(tokio::sync::RwLock::new(None));
     let temporal_client_container_clone = temporal_client_container.clone();
+    
+    // Clone for async task
+    let temporal_address_clone = temporal_address.clone();
+    let worker_http_endpoint_clone = worker_http_endpoint.clone();
     
     // Spawn background task to connect
     tokio::spawn(async move {
@@ -378,7 +406,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let max_retries = 30; // Try for 1 minute (2s * 30) or indefinitely? User said "eventually timeout/quit trying"
         
         loop {
-            match TemporalClient::new(&temporal_address, "default", "aegis-agents").await {
+            match TemporalClient::new(&temporal_address_clone, "default", "aegis-agents", &worker_http_endpoint_clone).await {
                 Ok(client) => {
                     println!("Async: Temporal Client connected successfully.");
                     let mut lock = temporal_client_container_clone.write().await;
@@ -412,24 +440,44 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Create human input service
     let human_input_service = Arc::new(aegis_core::infrastructure::HumanInputService::new());
     
-    let workflow_engine = Arc::new(WorkflowEngine::new(
-        workflow_repo,
-        workflow_execution_repo, 
-        event_bus.clone(), 
-        execution_service.clone(),
-        temporal_client_container,
-        Some(cortex_service),
-        human_input_service.clone(),
+    // Legacy WorkflowEngine removed as part of Temporal migration
+
+
+    let temporal_event_listener = Arc::new(TemporalEventListener::new(
+        event_bus.clone(),
+        workflow_execution_repo.clone(),
     ));
-    println!("Workflow engine initialized.");
+    
+    println!("Temporal event listener initialized.");
+
+    let workflow_parser = Arc::new(aegis_core::infrastructure::workflow_parser::WorkflowParser);
+    
+    let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
+        workflow_parser.clone(),
+        workflow_repo.clone(),
+        temporal_client_container.clone(),
+        event_bus.clone(),
+    ));
+
+    let start_workflow_execution_use_case = Arc::new(StandardStartWorkflowExecutionUseCase::new(
+        workflow_repo.clone(),
+        workflow_execution_repo.clone(),
+        temporal_client_container.clone(),
+        event_bus.clone(),
+        Some(cortex_service.clone()),
+    ));
 
     let app_state = AppState {
         agent_service,
         execution_service: execution_service.clone(),
         event_bus,
         _llm_registry: llm_registry,
-        workflow_engine,
         human_input_service: human_input_service.clone(),
+        temporal_event_listener,
+        register_workflow_use_case,
+        start_workflow_execution_use_case,
+        workflow_repo: workflow_repo.clone(),
+        temporal_client_container: temporal_client_container.clone(),
         start_time: std::time::Instant::now(),
     };
 
@@ -536,6 +584,75 @@ async fn shutdown_signal() {
     }
 }
 
+// Temporal Workflow HTTP Handlers
+
+/// POST /v1/workflows/temporal/register - Register a workflow with Temporal
+/// Phase 2: Uses StandardRegisterWorkflowUseCase with Temporal
+async fn register_temporal_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    match state.register_workflow_use_case.register_workflow(&body).await {
+        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Failed to register workflow: {}", e)
+        }))).into_response(),
+    }
+}
+
+/// POST /v1/workflows/temporal/execute - Start a workflow execution
+/// Phase 2: Uses StandardStartWorkflowExecutionUseCase with Temporal
+async fn execute_temporal_workflow_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<StartWorkflowExecutionRequest>,
+) -> impl IntoResponse {
+    match state.start_workflow_execution_use_case.start_execution(request).await {
+        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "error": format!("Failed to start workflow execution: {}", e)
+        }))).into_response(),
+    }
+}
+
+/// POST /v1/workflows/:name/run - Execute a workflow (Legacy endpoint for CLI)
+#[derive(serde::Deserialize)]
+struct RunWorkflowLegacyRequest {
+    input: serde_json::Value,
+}
+
+async fn run_workflow_legacy_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(request): Json<RunWorkflowLegacyRequest>,
+) -> impl IntoResponse {
+    let req = StartWorkflowExecutionRequest {
+        workflow_id: name,
+        input: request.input,
+        blackboard: None,
+    };
+    execute_temporal_workflow_handler(State(state), Json(req)).await
+}
+
+/// POST /v1/temporal-events - Receive events from Temporal worker
+async fn temporal_events_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<TemporalEventPayload>,
+) -> impl IntoResponse {
+    match state.temporal_event_listener.handle_event(payload).await {
+        Ok(execution_id) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "execution_id": execution_id,
+                "status": "received"
+            }))).into_response()
+        },
+        Err(e) => {
+            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": format!("Failed to process event: {}", e)
+            }))).into_response()
+        }
+    }
+}
+
 /// Create the HTTP router with all routes
 fn create_router(app_state: Arc<AppState>) -> Router {
     Router::new()
@@ -554,11 +671,14 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/v1/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
         .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
         .route("/v1/llm/generate", post(llm_generate_handler))
-        .route("/v1/workflows", post(deploy_workflow_handler).get(list_workflows_handler))
+        .route("/v1/workflows", post(register_temporal_workflow_handler).get(list_workflows_handler))
         .route("/v1/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
-        .route("/v1/workflows/:name/run", post(run_workflow_handler))
+        .route("/v1/workflows/:name/run", post(run_workflow_legacy_handler))
+        .route("/v1/workflows/temporal/register", post(register_temporal_workflow_handler))
+        .route("/v1/workflows/temporal/execute", post(execute_temporal_workflow_handler))
         .route("/v1/workflows/executions/:execution_id", get(get_workflow_execution_handler))
         .route("/v1/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
+        .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
         .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
         .route("/v1/human-approvals/:id/approve", post(approve_request_handler))
@@ -573,8 +693,12 @@ struct AppState {
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
     _llm_registry: Arc<ProviderRegistry>,
-    workflow_engine: Arc<WorkflowEngine>,
     human_input_service: Arc<aegis_core::infrastructure::HumanInputService>,
+    temporal_event_listener: Arc<TemporalEventListener>,
+    register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
+    start_workflow_execution_use_case: Arc<StandardStartWorkflowExecutionUseCase>,
+    workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
+    temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>>>,
     start_time: std::time::Instant,
 }
 
@@ -1358,50 +1482,19 @@ async fn llm_generate_handler(
 // Workflow API Handlers
 // ========================================
 
-/// POST /v1/workflows - Deploy a workflow from YAML
-async fn deploy_workflow_handler(
-    State(state): State<Arc<AppState>>,
-    body: String,
-) -> impl IntoResponse {
-    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
-
-    // Parse YAML
-    match WorkflowParser::parse_yaml(&body) {
-        Ok(workflow) => {
-            // Register in engine
-            match state.workflow_engine.register_workflow(workflow).await {
-                Ok(workflow_id) => {
-                    (StatusCode::OK, Json(serde_json::json!({
-                        "workflow_id": workflow_id,
-                        "message": "Workflow deployed successfully"
-                    })))
-                }
-                Err(e) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "error": format!("Failed to register workflow: {}", e)
-                    })))
-                }
-            }
-        }
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-                "error": format!("Failed to parse workflow YAML: {}", e)
-            })))
-        }
-    }
-}
-
 /// GET /v1/workflows - List all workflows
 async fn list_workflows_handler(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let workflows = state.workflow_engine.list_workflows().await;
+    let workflows = state.workflow_repo.list_all().await.unwrap_or_default();
     
     let workflow_list: Vec<serde_json::Value> = workflows
         .iter()
-        .map(|name| {
+        .map(|w| {
             serde_json::json!({
-                "name": name,
+                "name": w.metadata.name,
+                "version": w.metadata.version,
+                "description": w.metadata.description,
                 "status": "active"
             })
         })
@@ -1417,8 +1510,8 @@ async fn get_workflow_handler(
 ) -> impl IntoResponse {
     use aegis_core::infrastructure::workflow_parser::WorkflowParser;
 
-    match state.workflow_engine.get_workflow(&name).await {
-        Some(workflow) => {
+    match state.workflow_repo.find_by_name(&name).await {
+        Ok(Some(workflow)) => {
             match WorkflowParser::to_yaml(&workflow) {
                 Ok(yaml) => {
                     (StatusCode::OK, yaml)
@@ -1428,7 +1521,7 @@ async fn get_workflow_handler(
                 }
             }
         }
-        None => {
+        _ => {
             (StatusCode::NOT_FOUND, format!("Workflow '{}' not found", name))
         }
     }
@@ -1436,54 +1529,22 @@ async fn get_workflow_handler(
 
 /// DELETE /v1/workflows/:name - Delete workflow
 async fn delete_workflow_handler(
-    State(_state): State<Arc<AppState>>,
-    Path(_name): Path<String>,
-) -> impl IntoResponse {
-    // TODO: Implement workflow deletion once WorkflowEngine has remove method
-    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
-        "error": "Workflow deletion not yet implemented"
-    })))
-}
-
-/// POST /v1/workflows/:name/run - Execute a workflow
-#[derive(serde::Deserialize)]
-struct RunWorkflowRequest {
-    input: serde_json::Value,
-}
-
-async fn run_workflow_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
-    Json(request): Json<RunWorkflowRequest>,
 ) -> impl IntoResponse {
-    use aegis_core::application::workflow_engine::WorkflowInput;
-    use aegis_core::domain::execution::ExecutionId;
-
-    let execution_id = ExecutionId(Uuid::new_v4());
-
-    let parameters = request.input
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
-
-    let input = WorkflowInput { parameters };
-
-    match state.workflow_engine.start_execution(&name, execution_id, input).await {
-        Ok(()) => {
-            (StatusCode::OK, Json(serde_json::json!({
-                "execution_id": execution_id.0,
-                "status": "running"
-            })))
+    match state.workflow_repo.find_by_name(&name).await {
+        Ok(Some(workflow)) => {
+            if let Err(e) = state.workflow_repo.delete(workflow.id).await {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})));
+            }
+            (StatusCode::OK, Json(serde_json::json!({"success": true})))
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                "error": format!("Failed to start workflow execution: {}", e)
-            })))
+        _ => {
+            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
         }
     }
 }
+
 
 /// GET /v1/workflows/executions/:execution_id - Get execution details
 async fn get_workflow_execution_handler(
@@ -1505,7 +1566,8 @@ async fn stream_workflow_logs_handler(
     use std::fmt::Write;
 
     // Get Temporal Client
-    let client = match state.workflow_engine.get_temporal_client().await {
+    let client_opt = state.temporal_client_container.read().await;
+    let client = match &*client_opt {
         Some(c) => c,
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Temporal client not available".to_string()),
     };

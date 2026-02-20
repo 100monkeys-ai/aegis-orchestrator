@@ -276,6 +276,18 @@ impl crate::domain::repository::WorkflowExecutionRepository for InMemoryWorkflow
             .cloned()
             .collect())
     }
+
+    async fn append_event(
+        &self, 
+        _execution_id: ExecutionId, 
+        _temporal_sequence_number: i64, 
+        _event_type: String, 
+        _payload: serde_json::Value, 
+        _iteration_number: Option<u8>
+    ) -> Result<(), RepositoryError> {
+        // No-op for in memory for now
+        Ok(())
+    }
 }
 
 // ============================================================================

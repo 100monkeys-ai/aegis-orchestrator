@@ -101,6 +101,16 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         
     /// Find active workflow executions
     async fn find_active(&self) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
+    
+    /// Append an execution event to the event sourcing audit trail (idempotent)
+    async fn append_event(
+        &self, 
+        execution_id: ExecutionId, 
+        temporal_sequence_number: i64, 
+        event_type: String, 
+        payload: serde_json::Value, 
+        iteration_number: Option<u8>
+    ) -> Result<(), RepositoryError>;
 }
 
 /// Repository interface for Volume aggregates

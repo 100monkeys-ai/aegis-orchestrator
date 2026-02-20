@@ -160,6 +160,7 @@ message ValidateRequest {
   string task = 2;
   repeated JudgeConfig judges = 3;
   ConsensusConfig consensus = 4;
+  string context_json = 5;
 }
 
 message JudgeConfig {

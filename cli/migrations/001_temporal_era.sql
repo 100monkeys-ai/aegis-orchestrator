@@ -61,6 +61,8 @@ CREATE TRIGGER trigger_workflows_updated_at
 -- -----------------------------------------------------------------------------
 -- Workflow Executions Table
 -- Links AEGIS workflow executions to Temporal workflow runs
+-- Tracks FSM state transitions, blackboard data, and state outputs
+-- ADR-022: Temporal Workflow Engine Integration (Phase 2)
 -- -----------------------------------------------------------------------------
 CREATE TABLE workflow_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -74,17 +76,24 @@ CREATE TABLE workflow_executions (
     input_params JSONB,
     status TEXT NOT NULL DEFAULT 'running',
     
+    -- FSM State Tracking (ADR-022 Phase 2)
+    current_state TEXT NOT NULL DEFAULT 'start',       -- Active state in workflow graph
+    state_history JSONB DEFAULT '[]'::jsonb,          -- Ordered list of visited states
+    blackboard JSONB DEFAULT '{}'::jsonb,             -- Shared context data between states
+    state_outputs JSONB DEFAULT '{}'::jsonb,          -- Outputs from each state execution
+    
     -- Results
     final_output JSONB,
     error_message TEXT,
     
     -- Timestamps
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_transition_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
     
     -- Validation
     CONSTRAINT workflow_executions_status_check CHECK (
-        status IN ('running', 'completed', 'failed', 'cancelled', 'timed_out')
+        status IN ('running', 'completed', 'failed', 'cancelled', 'timed_out', 'pending')
     )
 );
 
@@ -92,6 +101,7 @@ CREATE INDEX idx_workflow_executions_workflow_id ON workflow_executions(workflow
 CREATE INDEX idx_workflow_executions_temporal_workflow_id ON workflow_executions(temporal_workflow_id);
 CREATE INDEX idx_workflow_executions_status ON workflow_executions(status);
 CREATE INDEX idx_workflow_executions_started_at ON workflow_executions(started_at DESC);
+CREATE INDEX idx_workflow_executions_current_state ON workflow_executions(current_state);
 
 -- Composite index for common queries
 CREATE INDEX idx_workflow_executions_workflow_temporal ON workflow_executions(workflow_id, temporal_workflow_id);
