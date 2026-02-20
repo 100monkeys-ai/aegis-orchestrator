@@ -41,7 +41,7 @@
 //!
 //! ```json
 //! {
-//!   "event_type": "WorkflowExecutionStarted|StateEntered|StateExited|...",
+//!   "event_type": "WorkflowExecutionStarted|WorkflowStateEntered|WorkflowStateExited|...",
 //!   "execution_id": "uuid",
 //!   "workflow_id": "uuid (optional)",
 //!   "state_name": "string (optional)",
