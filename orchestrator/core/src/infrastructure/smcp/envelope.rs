@@ -20,6 +20,18 @@ pub struct ContextClaims {
     pub agent_id: String,
     pub execution_id: String,
     pub security_context: String,
+
+    /// Expiration time (as seconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exp: Option<i64>,
+
+    /// Issued-at time (as seconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iat: Option<i64>,
+
+    /// Not-before time (as seconds since Unix epoch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<i64>,
 }
 
 impl EnvelopeVerifier for SmcpEnvelope {
