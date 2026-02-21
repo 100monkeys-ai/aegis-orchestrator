@@ -97,7 +97,7 @@ pub enum InvocationStatus {
 }
 
 /// Policy violation types
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyViolation {
     ToolNotAllowed {
         tool_name: String,
