@@ -76,7 +76,7 @@ impl Capability {
         }
         
         // Check domain constraints for web search
-        if tool_name.starts_with("web.*") || tool_name.starts_with("web-search.") {
+        if tool_name.starts_with("web.") || tool_name.starts_with("web-search.") {
             if let Some(ref allowlist) = self.domain_allowlist {
                 if let Some(url) = args.get("url").and_then(|u| u.as_str()) {
                     let domain = Self::extract_domain(url);
