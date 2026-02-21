@@ -433,6 +433,28 @@ impl NFSFileSystem for AegisFsalAdapter {
         // Get context for this volume
         let context = self.get_context(handle.volume_id);
 
+        // For the volume root path "/", return synthetic directory attributes.
+        // The volume's existence is already proven by the DB authorization in the FSAL.
+        // SeaweedFS may not yet have the directory (it's created lazily on first write),
+        // so avoid the stat call here — same pattern as for structural dirs above.
+        if path == "/" {
+            return Ok(fattr3 {
+                ftype: ftype3::NF3DIR,
+                mode: 0o755,
+                nlink: 2,
+                uid: context.container_uid,
+                gid: context.container_gid,
+                size: 4096,
+                used: 4096,
+                rdev: specdata3 { specdata1: 0, specdata2: 0 },
+                fsid: 0,
+                fileid: id,
+                atime: nfstime3 { seconds: 0, nseconds: 0 },
+                mtime: nfstime3 { seconds: 0, nseconds: 0 },
+                ctime: nfstime3 { seconds: 0, nseconds: 0 },
+            });
+        }
+
         // Get attributes via FSAL (with UID/GID squashing)
         let attrs = self.fsal.getattr(
                 context.execution_id,
