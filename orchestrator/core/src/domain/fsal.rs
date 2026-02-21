@@ -181,8 +181,15 @@ impl AegisFSAL {
             .map_err(|_| FsalError::VolumeNotFound(volume_id))?
             .ok_or(FsalError::VolumeNotFound(volume_id))?;
 
-        // Check volume is attached
-        if volume.status != VolumeStatus::Attached {
+        // Check volume is in a usable state.
+        // Volumes created for an execution start as Available and are never individually
+        // transitioned to Attached (that state is used for explicit attach_volume calls).
+        // Real access control is the execution ownership check below.
+        let is_usable = matches!(
+            volume.status,
+            VolumeStatus::Available | VolumeStatus::Attached
+        );
+        if !is_usable {
             return Err(FsalError::VolumeNotAttached(volume_id));
         }
 
