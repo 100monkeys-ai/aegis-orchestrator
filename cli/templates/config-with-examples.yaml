@@ -181,6 +181,14 @@ spec:
     # 
     # Note: Docker service names (e.g., 'aegis-runtime') DO NOT WORK - they only resolve inside Docker's embedded DNS.
     # nfs_server_host: "env:AEGIS_NFS_HOST"
+
+    # NFS server port for volume mounts (ADR-036)
+    # Default: 2049
+    # nfs_port: 2049
+
+    # NFS server mountport for volume mounts (ADR-036)
+    # Default: 2049
+    # nfs_mountport: 2049
   
   # --------------------------------------------------------------------------
   # Network Configuration

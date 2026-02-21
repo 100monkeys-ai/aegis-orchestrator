@@ -25,7 +25,7 @@ use crate::domain::{
     execution::ExecutionId,
     volume::{VolumeId, Volume, VolumeStatus},
     repository::VolumeRepository,
-    storage::{StorageProvider, FileHandle, FileAttributes, DirEntry, OpenMode, StorageError},
+    storage::{StorageProvider, FileAttributes, DirEntry, OpenMode, StorageError},
     events::StorageEvent,
     policy::FilesystemPolicy,
     path_sanitizer::{PathSanitizer, PathSanitizerError},
@@ -35,8 +35,7 @@ use chrono::Utc;
 use std::sync::Arc;
 use thiserror::Error;
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
-use tokio::sync::RwLock;
+
 
 /// AegisFSAL errors
 #[derive(Debug, Error)]
@@ -132,13 +131,6 @@ impl AegisFileHandle {
     }
 }
 
-/// Open file tracking
-struct OpenFile {
-    handle: AegisFileHandle,
-    storage_handle: FileHandle,
-    path: String,
-    mode: OpenMode,
-}
 
 /// AegisFSAL - File System Abstraction Layer
 ///
@@ -153,8 +145,6 @@ pub struct AegisFSAL {
     path_sanitizer: PathSanitizer,
     /// Event publisher (injected, not owned)
     event_publisher: Arc<dyn EventPublisher>,
-    /// Open file handles (in-memory tracking)
-    open_files: Arc<RwLock<HashMap<AegisFileHandle, OpenFile>>>,
 }
 
 /// Event publisher trait (abstraction for event bus)
@@ -175,7 +165,6 @@ impl AegisFSAL {
             volume_repository,
             path_sanitizer: PathSanitizer::new(),
             event_publisher,
-            open_files: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -293,6 +282,7 @@ impl AegisFSAL {
     pub async fn lookup(
         &self,
         handle: &AegisFileHandle,
+        parent_path: &str,
         name: &str,
     ) -> Result<AegisFileHandle, FsalError> {
         // 1. Authorize
@@ -300,124 +290,58 @@ impl AegisFSAL {
             .authorize(handle.execution_id, handle.volume_id)
             .await?;
 
-        // 2. Get parent directory path from open files
-        let open_files = self.open_files.read().await;
-        let parent = open_files
-            .get(handle)
-            .ok_or(FsalError::InvalidFileHandle)?;
+        // 2. Build child path
+        let child_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
 
-        // 3. Build child path
-        let child_path = format!("{}/{}", parent.path, name);
-
-        // 4. Sanitize path
+        // 3. Sanitize path
         let canonical = self
             .path_sanitizer
-            .canonicalize(&child_path, Some(&parent.path))?;
+            .canonicalize(&child_path, Some(parent_path))?;
 
-        // 5. Create new handle
+        let canonical_str = canonical.to_str().unwrap().replace("\\", "/");
+
+        // 4. Create new handle
         let new_handle = AegisFileHandle::new(
             handle.execution_id,
             handle.volume_id,
-            canonical.to_str().unwrap(),
+            &canonical_str,
         );
 
         Ok(new_handle)
-    }
-
-    /// Open a file (NFS OPEN or storage backend open)
-    pub async fn open(
-        &self,
-        execution_id: ExecutionId,
-        volume_id: VolumeId,
-        path: &str,
-        mode: OpenMode,
-        policy: &FilesystemPolicy,
-    ) -> Result<AegisFileHandle, FsalError> {
-        let _start = std::time::Instant::now();
-
-        // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
-
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
-        let path_str = canonical.to_str().unwrap();
-
-        // 3. Enforce policy
-        match mode {
-            OpenMode::ReadOnly => self.enforce_read_policy(policy, path_str)?,
-            OpenMode::WriteOnly | OpenMode::ReadWrite | OpenMode::Create => {
-                self.enforce_write_policy(policy, path_str)?
-            }
-        }
-
-        // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
-
-        // 5. Open file via storage provider
-        let storage_handle = self.storage_provider.open_file(&full_path, mode).await?;
-
-        // 6. Create Aegis file handle
-        let aegis_handle = AegisFileHandle::new(execution_id, volume_id, path_str);
-        aegis_handle.validate_size()?;
-
-        // 7. Track open file
-        let open_file = OpenFile {
-            handle: aegis_handle.clone(),
-            storage_handle,
-            path: path_str.to_string(),
-            mode,
-        };
-        self.open_files.write().await.insert(aegis_handle.clone(), open_file);
-
-        // 8. Publish event
-        let mode_str = match mode {
-            OpenMode::ReadOnly => "read",
-            OpenMode::WriteOnly => "write",
-            OpenMode::ReadWrite => "read-write",
-            OpenMode::Create => "create",
-        };
-
-        self.event_publisher
-            .publish_storage_event(StorageEvent::FileOpened {
-                execution_id,
-                volume_id,
-                path: path_str.to_string(),
-                open_mode: mode_str.to_string(),
-                opened_at: Utc::now(),
-            })
-            .await;
-
-        Ok(aegis_handle)
     }
 
     /// Read from file at offset
     pub async fn read(
         &self,
         handle: &AegisFileHandle,
+        path: &str,
+        policy: &FilesystemPolicy,
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, FsalError> {
         let start = std::time::Instant::now();
 
         // 1. Authorize
-        let _volume = self.authorize(handle.execution_id, handle.volume_id).await?;
+        let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
 
-        // 2. Get storage handle and validate mode
-        let open_files = self.open_files.read().await;
-        let open_file = open_files.get(handle).ok_or(FsalError::InvalidFileHandle)?;
-
-        // Validate file is open for reading
-        if !matches!(open_file.mode, OpenMode::ReadOnly | OpenMode::ReadWrite) {
-            return Err(FsalError::PolicyViolation(
-                format!("Cannot read from file opened in {:?} mode", open_file.mode)
-            ));
-        }
+        // 2. Sanitize and enforce policy
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        let path_string = canonical.to_str().unwrap().replace("\\", "/");
+        let path_str = path_string.as_str();
+        self.enforce_read_policy(policy, path_str)?;
+        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
 
         // 3. Read via storage provider
+        let storage_handle = self.storage_provider.open_file(&full_path, OpenMode::ReadOnly).await?;
         let data = self
             .storage_provider
-            .read_at(&open_file.storage_handle, offset, length)
+            .read_at(&storage_handle, offset, length)
             .await?;
+        let _ = self.storage_provider.close_file(&storage_handle).await;
 
         // 4. Publish event
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -425,7 +349,7 @@ impl AegisFSAL {
             .publish_storage_event(StorageEvent::FileRead {
                 execution_id: handle.execution_id,
                 volume_id: handle.volume_id,
-                path: open_file.path.clone(),
+                path: path_str.to_string(),
                 offset,
                 bytes_read: data.len() as u64,
                 duration_ms,
@@ -440,6 +364,8 @@ impl AegisFSAL {
     pub async fn write(
         &self,
         handle: &AegisFileHandle,
+        path: &str,
+        policy: &FilesystemPolicy,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, FsalError> {
@@ -448,16 +374,12 @@ impl AegisFSAL {
         // 1. Authorize and get volume for quota checking
         let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
 
-        // 2. Get storage handle and validate mode
-        let open_files = self.open_files.read().await;
-        let open_file = open_files.get(handle).ok_or(FsalError::InvalidFileHandle)?;
-
-        // Validate file is open for writing
-        if !matches!(open_file.mode, OpenMode::WriteOnly | OpenMode::ReadWrite | OpenMode::Create) {
-            return Err(FsalError::PolicyViolation(
-                format!("Cannot write to file opened in {:?} mode", open_file.mode)
-            ));
-        }
+        // 2. Sanitize and enforce policy
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        let path_string = canonical.to_str().unwrap().replace("\\", "/");
+        let path_str = path_string.as_str();
+        self.enforce_write_policy(policy, path_str)?;
+        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
 
         // 3. Proactive quota enforcement (ADR-036)
         // Check if write would exceed volume quota before attempting write
@@ -486,10 +408,12 @@ impl AegisFSAL {
         }
 
         // 4. Write via storage provider
+        let storage_handle = self.storage_provider.open_file(&full_path, OpenMode::WriteOnly).await?;
         let bytes_written = self
             .storage_provider
-            .write_at(&open_file.storage_handle, offset, data)
+            .write_at(&storage_handle, offset, data)
             .await?;
+        let _ = self.storage_provider.close_file(&storage_handle).await;
 
         // 5. Publish event
         let duration_ms = start.elapsed().as_millis() as u64;
@@ -497,7 +421,7 @@ impl AegisFSAL {
             .publish_storage_event(StorageEvent::FileWritten {
                 execution_id: handle.execution_id,
                 volume_id: handle.volume_id,
-                path: open_file.path.clone(),
+                path: path_str.to_string(),
                 offset,
                 bytes_written: bytes_written as u64,
                 duration_ms,
@@ -508,34 +432,47 @@ impl AegisFSAL {
         Ok(bytes_written)
     }
 
-    /// Close file handle
-    pub async fn close(&self, handle: &AegisFileHandle) -> Result<(), FsalError> {
+    /// Create a file
+    pub async fn create_file(
+        &self,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: &str,
+        policy: &FilesystemPolicy,
+    ) -> Result<AegisFileHandle, FsalError> {
         // 1. Authorize
-        let _volume = self.authorize(handle.execution_id, handle.volume_id).await?;
+        let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Remove from tracking and validate handle matches
-        let mut open_files = self.open_files.write().await;
-        let open_file = open_files.remove(handle).ok_or(FsalError::InvalidFileHandle)?;
-        
-        // Validate handle consistency
-        if &open_file.handle != handle {
-            return Err(FsalError::InvalidFileHandle);
-        }
+        // 2. Sanitize path
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        let path_string = canonical.to_str().unwrap().replace("\\", "/");
+        let path_str = path_string.as_str();
 
-        // 3. Close via storage provider
-        self.storage_provider.close_file(&open_file.storage_handle).await?;
+        // 3. Enforce write policy
+        self.enforce_write_policy(policy, path_str)?;
 
-        // 4. Publish event
+        // 4. Build full remote path
+        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+
+        // 5. Create file via storage provider (using default mode 0o644)
+        let handle = self.storage_provider.create_file(&full_path, 0o644).await?;
+        let _ = self.storage_provider.close_file(&handle).await; // Close immediately
+
+        // 6. Create Aegis file handle
+        let aegis_handle = AegisFileHandle::new(execution_id, volume_id, path_str);
+        aegis_handle.validate_size()?;
+
+        // 7. Publish event
         self.event_publisher
-            .publish_storage_event(StorageEvent::FileClosed {
-                execution_id: handle.execution_id,
-                volume_id: handle.volume_id,
-                path: open_file.path.clone(),
-                closed_at: Utc::now(),
+            .publish_storage_event(StorageEvent::FileCreated {
+                execution_id,
+                volume_id,
+                path: path_str.to_string(),
+                created_at: Utc::now(),
             })
             .await;
 
-        Ok(())
+        Ok(aegis_handle)
     }
 
     /// Get file attributes (stat)

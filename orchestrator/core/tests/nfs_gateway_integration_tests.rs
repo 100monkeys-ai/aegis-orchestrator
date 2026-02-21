@@ -235,30 +235,22 @@ async fn test_fsal_mode_validation() {
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
-        write: vec!["/workspace/*".to_string()],
+        write: vec![], // Read-only policy
     };
 
-    let handle = fsal.open(
-        execution_id,
-        volume_id,
-        "/workspace/test.txt",
-        OpenMode::ReadOnly,
-        &policy,
-    ).await.unwrap();
+    let path = "/workspace/test.txt";
+    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
-    // Test: Read from read-only file (should succeed)
-    let read_result = fsal.read(&handle, 0, 100).await;
+    // Test: Read from allowed file (should succeed)
+    let read_result = fsal.read(&handle, path, &policy, 0, 100).await;
     assert!(read_result.is_ok());
 
     // Test: Write to read-only file (should fail)
-    let write_result = fsal.write(&handle, 0, b"test").await;
+    let write_result = fsal.write(&handle, path, &policy, 0, b"test").await;
     assert!(write_result.is_err());
     if let Err(FsalError::PolicyViolation(msg)) = write_result {
-        assert!(msg.contains("Cannot write to file opened in ReadOnly mode"));
+        assert!(msg.contains("Write not allowed"));
     }
-
-    // Close file
-    fsal.close(&handle).await.unwrap();
 }
 
 #[tokio::test]
@@ -281,12 +273,13 @@ async fn test_fsal_path_traversal_prevention() {
     };
 
     // Test: Attempt path traversal attack
-    let traversal_result = fsal.open(
-        execution_id,
-        volume_id,
+    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/../etc/passwd");
+    let traversal_result = fsal.read(
+        &handle,
         "/workspace/../etc/passwd", // Path traversal attempt
-        OpenMode::ReadOnly,
         &policy,
+        0,
+        100,
     ).await;
 
     // Should be rejected by path sanitizer
@@ -315,13 +308,14 @@ async fn test_fsal_policy_enforcement() {
         write: vec!["/workspace/data/*".to_string()],
     };
 
-    // Test: Attempt to open file outside allowlist
-    let denied_result = fsal.open(
-        execution_id,
-        volume_id,
+    // Test: Attempt to write outside allowlist
+    let handle1 = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/config.yaml");
+    let denied_result = fsal.read(
+        &handle1,
         "/workspace/config.yaml", // Not in /workspace/data/*
-        OpenMode::ReadOnly,
         &policy,
+        0,
+        100,
     ).await;
 
     // Should be rejected by policy enforcement
@@ -331,12 +325,13 @@ async fn test_fsal_policy_enforcement() {
     }
 
     // Test: Open file within allowlist
-    let allowed_result = fsal.open(
-        execution_id,
-        volume_id,
+    let handle2 = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/data/file.txt");
+    let allowed_result = fsal.read(
+        &handle2,
         "/workspace/data/file.txt",
-        OpenMode::ReadOnly,
         &policy,
+        0,
+        100,
     ).await;
 
     assert!(allowed_result.is_ok());
@@ -363,30 +358,31 @@ async fn test_fsal_audit_events() {
     // Subscribe to domain events (filter for storage events)
     let mut event_rx = event_bus.subscribe();
 
-    // Open, read, write, close file
-    let handle = fsal.open(
+    // Create, write file
+    let path = "/workspace/test.txt";
+    let handle = fsal.create_file(
         execution_id,
         volume_id,
-        "/workspace/test.txt",
-        OpenMode::ReadWrite,
+        path,
         &policy,
     ).await.unwrap();
 
     // Give event bus time to process
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    // Check for FileOpened event
-    if let Ok(DomainEvent::Storage(StorageEvent::FileOpened { path, .. })) = event_rx.try_recv() {
+    // Check for FileCreated event
+    if let Ok(DomainEvent::Storage(StorageEvent::FileCreated { path, .. })) = event_rx.try_recv() {
         assert!(path.contains("test.txt"));
     }
 
-    // Read file
-    let _ = fsal.read(&handle, 0, 100).await.unwrap();
+    // Write file
+    let _ = fsal.write(&handle, path, &policy, 0, b"data").await.unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    // Check for FileRead event
-    // Close file
-    fsal.close(&handle).await.unwrap();
+    // Check for FileWritten event
+    if let Ok(DomainEvent::Storage(StorageEvent::FileWritten { path, .. })) = event_rx.try_recv() {
+        assert!(path.contains("test.txt"));
+    }
 }
 
 #[tokio::test]
@@ -412,13 +408,8 @@ async fn test_fsal_quota_enforcement() {
     let mut event_rx = event_bus.subscribe();
 
     // Open file for writing
-    let handle = fsal.open(
-        execution_id,
-        volume_id,
-        "/workspace/large_file.txt",
-        OpenMode::ReadWrite,
-        &policy,
-    ).await.unwrap();
+    let path = "/workspace/large_file.txt";
+    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
     // MockStorageProvider.get_usage() returns 5120 bytes (5KB)
     // Volume quota is 1024 bytes (1KB)
@@ -426,7 +417,7 @@ async fn test_fsal_quota_enforcement() {
 
     // Attempt to write 1KB of data (should fail due to quota)
     let large_data = vec![0u8; 1024];
-    let write_result = fsal.write(&handle, 0, &large_data).await;
+    let write_result = fsal.write(&handle, path, &policy, 0, &large_data).await;
 
     // Verify write was rejected with QuotaExceeded error
     assert!(write_result.is_err());
@@ -452,8 +443,5 @@ async fn test_fsal_quota_enforcement() {
         }
     }
     assert!(found_quota_event, "QuotaExceeded event should have been published");
-
-    // Close file
-    fsal.close(&handle).await.unwrap();
 }
 

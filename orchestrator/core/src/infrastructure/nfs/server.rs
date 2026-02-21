@@ -279,31 +279,82 @@ impl NFSFileSystem for AegisFsalAdapter {
     }
 
     async fn lookup(&self, dirid: fileid3, filename: &filename3) -> Result<fileid3, nfsserve::nfs::nfsstat3> {
-        debug!("NFS LOOKUP: dirid={}, filename={:?}", dirid, filename);
-            // Decode parent directory handle
-            let (parent_handle, parent_path) = self.decode_handle(dirid)
-                .map_err(|e| {
-                    warn!("Invalid parent handle: {}", e);
-                    nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
-                })?;
+        let name = std::str::from_utf8(filename)
+            .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_INVAL)?;
 
-            // Lookup via FSAL
-            let name = std::str::from_utf8(filename)
-                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_INVAL)?;
+        debug!("NFS LOOKUP: dirid={}, filename={}", dirid, name);
 
-            let child_handle = self.fsal.lookup(&parent_handle, name)
-                .await
-                .map_err(|e| {
-                    warn!("FSAL lookup failed: {}", e);
+        // Handle virtual root (dirid = 1)
+        if dirid == 1 {
+            // In the virtual root, any lookup is intercepted to build the path.
+            // The Docker mount path is `/{tenant_id}/{volume_id}`.
+            // The NFS client will lookup `{tenant_id}`, then lookup `{volume_id}` inside it.
+            
+            // For the first level (tenant_id), we create a synthetic directory fileid.
+            // We use a deterministic hash of the tenant_id, mapped in a special way, 
+            // but for simplicity we can just register it with a dummy handle.
+            // Wait, we need to know when we are at the volume_id level.
+            // Let's create a special FileHandleTable entry for tenant directories.
+            // Since we don't have a specific VolumeId yet, we can use a dummy one and
+            // encode the path.
+            
+            let dummy_exec_id = ExecutionId::new(); // Or all zeros
+            let dummy_vol_id = VolumeId::new();
+            
+            let synthetic_path = format!("/{}", name);
+            let handle = AegisFileHandle::new(dummy_exec_id, dummy_vol_id, &synthetic_path);
+            
+            let fileid = self.encode_handle(&handle, synthetic_path)
+                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+            
+            return Ok(fileid);
+        }
+
+        // Decode parent directory handle
+        let (parent_handle, parent_path) = self.decode_handle(dirid)
+            .map_err(|e| {
+                warn!("Invalid parent handle: {}", e);
+                nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
+            })?;
+
+        // Check if we are at the `{tenant_id}` level (path is just `/{tenant_id}`)
+        let path_parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
+        if path_parts.len() == 1 {
+            // Parent is `/{tenant_id}`. The current lookup is for `{volume_id}`.
+            let volume_id_str = name;
+            
+            let volume_id = uuid::Uuid::parse_str(volume_id_str)
+                .map(VolumeId)
+                .map_err(|_| {
+                    warn!("Invalid volume ID format in lookup: {}", volume_id_str);
                     nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
                 })?;
+                
+            // Get context for this volume (this validates it exists in registry)
+            let context = self.get_context(volume_id);
+            
+            // Now we have a real volume! Create the proper root handle for it.
+            let root_handle = AegisFileHandle::new(context.execution_id, volume_id, "/");
+            let fileid = self.encode_handle(&root_handle, "/".to_string())
+                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+                
+            return Ok(fileid);
+        }
 
-            // Build child path
-            let child_path = if parent_path == "/" {
-                format!("/{}", name)
-            } else {
-                format!("{}/{}", parent_path, name)
-            };
+        // Lookup via FSAL (for paths inside the volume)
+        let child_handle = self.fsal.lookup(&parent_handle, &parent_path, name)
+            .await
+            .map_err(|e| {
+                warn!("FSAL lookup failed: {}", e);
+                nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
+            })?;
+
+        // Build child path relative to volume root
+        let child_path = if parent_path == "/" {
+            format!("/{}", name)
+        } else {
+            format!("{}/{}", parent_path, name)
+        };
 
         // Encode child handle with path
         self.encode_handle(&child_handle, child_path)
@@ -341,9 +392,32 @@ impl NFSFileSystem for AegisFsalAdapter {
                 });
             }
 
-            // Decode handle to get path and volume
-            let (handle, path) = self.decode_handle(id)
-                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
+        // Handle synthetic attributes for tenant_id directories (depth 1)
+        if let Ok((_handle, path)) = self.decode_handle(id) {
+            let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+            if path_parts.len() == 1 {
+                // Return synthetic directory attributes
+                return Ok(fattr3 {
+                    ftype: ftype3::NF3DIR,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: 1000,
+                    gid: 1000,
+                    size: 4096,
+                    used: 4096,
+                    rdev: specdata3 { specdata1: 0, specdata2: 0 },
+                    fsid: 0,
+                    fileid: id,
+                    atime: nfstime3 { seconds: 0, nseconds: 0 },
+                    mtime: nfstime3 { seconds: 0, nseconds: 0 },
+                    ctime: nfstime3 { seconds: 0, nseconds: 0 },
+                });
+            }
+        }
+
+        // Decode handle to get path and volume
+        let (handle, path) = self.decode_handle(id)
+            .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
             // Get context for this volume
             let context = self.get_context(handle.volume_id);
@@ -370,10 +444,12 @@ impl NFSFileSystem for AegisFsalAdapter {
     async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsserve::nfs::nfsstat3> {
         debug!("NFS READ: id={}, offset={}, count={}", id, offset, count);
 
-        let (handle, _path) = self.decode_handle(id)
+        let (handle, path) = self.decode_handle(id)
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
-        let data = self.fsal.read(&handle, offset, count as usize)
+        let context = self.get_context(handle.volume_id);
+
+        let data = self.fsal.read(&handle, &path, &context.policy, offset, count as usize)
             .await
             .map_err(|e| {
                 error!("FSAL read failed: {}", e);
@@ -387,10 +463,12 @@ impl NFSFileSystem for AegisFsalAdapter {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsserve::nfs::nfsstat3> {
         debug!("NFS WRITE: id={}, offset={}, len={}", id, offset, data.len());
 
-        let (handle, _path) = self.decode_handle(id)
+        let (handle, path) = self.decode_handle(id)
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
-        let _bytes_written = self.fsal.write(&handle, offset, data)
+        let context = self.get_context(handle.volume_id);
+
+        let _bytes_written = self.fsal.write(&handle, &path, &context.policy, offset, data)
             .await
             .map_err(|e| {
                 error!("FSAL write failed: {}", e);
@@ -488,12 +566,11 @@ impl NFSFileSystem for AegisFsalAdapter {
                 format!("{}/{}", parent_path, name)
             };
 
-            // Create file via FSAL (open with Create mode)
-            let handle = self.fsal.open(
+            // Create file via FSAL
+            let handle = self.fsal.create_file(
                 context.execution_id,
                 context.volume_id,
                 &file_path,
-                crate::domain::storage::OpenMode::Create,
                 &context.policy,
             )
             .await
@@ -501,9 +578,6 @@ impl NFSFileSystem for AegisFsalAdapter {
                 error!("FSAL create failed: {}", e);
                 nfsserve::nfs::nfsstat3::NFS3ERR_IO
             })?;
-
-        // Close the file immediately (NFS CREATE returns handle but file is created)
-        let _ = self.fsal.close(&handle).await;
 
         // Register and return fileid with attributes
         let fileid = self.encode_handle(&handle, file_path.clone())

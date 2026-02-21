@@ -46,6 +46,8 @@ pub struct DockerRuntime {
     network_mode: Option<String>,
     orchestrator_url: String,
     nfs_server_host: Option<String>,  // NFS server hostname for volume mounts (ADR-036)
+    nfs_port: u16,
+    nfs_mountport: u16,
 }
 
 impl DockerRuntime {
@@ -55,6 +57,8 @@ impl DockerRuntime {
         network_mode: Option<String>,
         orchestrator_url: String,
         nfs_server_host: Option<String>,
+        nfs_port: u16,
+        nfs_mountport: u16,
     ) -> Result<Self, RuntimeError> {
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
@@ -111,13 +115,14 @@ impl DockerRuntime {
                     e
                 )))?
         };
-        
         Ok(Self { 
             docker, 
             bootstrap_script_path: bootstrap_path,
             network_mode, 
             orchestrator_url,
             nfs_server_host,
+            nfs_port,
+            nfs_mountport,
         })
     }
     
@@ -307,7 +312,7 @@ impl AgentRuntime for DockerRuntime {
                 driver_opts.insert("type".to_string(), "nfs".to_string());
                 driver_opts.insert(
                     "o".to_string(),
-                    format!("addr={},nfsvers=3,proto=tcp,soft,timeo=10,nolock", orchestrator_host)
+                    format!("addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock", orchestrator_host, self.nfs_port, self.nfs_mountport)
                 );
                 driver_opts.insert(
                     "device".to_string(),

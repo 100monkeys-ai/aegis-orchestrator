@@ -254,6 +254,20 @@ pub struct RuntimeConfig {
     /// Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nfs_server_host: Option<String>,
+
+    /// NFS server port (ADR-036)
+    /// Default: 2049
+    #[serde(default = "default_nfs_port")]
+    pub nfs_port: u16,
+
+    /// NFS server mountport (ADR-036)
+    /// Default: 2049
+    #[serde(default = "default_nfs_port")]
+    pub nfs_mountport: u16,
+}
+
+fn default_nfs_port() -> u16 {
+    2049
 }
 
 impl Default for RuntimeConfig {
@@ -265,6 +279,8 @@ impl Default for RuntimeConfig {
             docker_network_mode: None,
             orchestrator_url: default_orchestrator_url(),
             nfs_server_host: None,
+            nfs_port: default_nfs_port(),
+            nfs_mountport: default_nfs_port(),
         }
     }
 }
@@ -382,7 +398,7 @@ pub struct StorageConfig {
     
     /// NFS Server Gateway port (ADR-036)
     /// Default: 2049 (standard NFS port)
-    #[serde(default = "default_nfs_port")]
+    #[serde(default = "default_storage_nfs_port")]
     pub nfs_port: Option<u16>,
     
     /// SeaweedFS configuration (required if backend: "seaweedfs")
@@ -399,7 +415,7 @@ impl Default for StorageConfig {
         Self {
             backend: default_storage_backend(),
             fallback_to_local: default_fallback_to_local(),
-            nfs_port: default_nfs_port(),
+            nfs_port: default_storage_nfs_port(),
             seaweedfs: None,
             local: Some(LocalStorageConfig::default()),
         }
@@ -554,7 +570,7 @@ fn default_fallback_to_local() -> bool {
     true  // Default: graceful degradation for dev/edge scenarios
 }
 
-fn default_nfs_port() -> Option<u16> {
+fn default_storage_nfs_port() -> Option<u16> {
     Some(2049)  // Standard NFS port (ADR-036)
 }
 

@@ -273,7 +273,7 @@ npm test
 ```rust
 #[tokio::test]
 async fn test_docker_runtime_spawn() {
-    let runtime = DockerRuntime::new();
+    let runtime = DockerRuntime::new("assets/bootstrap.py".to_string(), None, None, "http://localhost:8000".to_string(), None, 2049, 2049).unwrap();
     let config = AgentConfig {
         name: "test-agent".to_string(),
         runtime: "python:3.11".to_string(),
