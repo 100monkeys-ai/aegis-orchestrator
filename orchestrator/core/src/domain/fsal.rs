@@ -131,7 +131,6 @@ impl AegisFileHandle {
     }
 }
 
-
 /// AegisFSAL - File System Abstraction Layer
 ///
 /// Domain entity that enforces security policies and provides audit trail
@@ -335,8 +334,8 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
 
-        // 2. Sanitize and enforce policy
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_read_policy(policy, path_str)?;
@@ -381,8 +380,8 @@ impl AegisFSAL {
         // 1. Authorize and get volume for quota checking
         let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
 
-        // 2. Sanitize and enforce policy
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_write_policy(policy, path_str)?;
@@ -450,8 +449,8 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
 
@@ -494,17 +493,17 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_str = canonical.to_str().unwrap();
 
-        // 3. Build full remote path
+        // 4. Build full remote path
         let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
 
-        // 4. Get attributes from storage provider
+        // 5. Get attributes from storage provider
         let mut attrs = self.storage_provider.stat(&full_path).await?;
 
-        // 5. Override UID/GID (permission squashing per ADR-036)
+        // 6. Override UID/GID (permission squashing per ADR-036)
         attrs.uid = container_uid;
         attrs.gid = container_gid;
 
@@ -522,8 +521,8 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce read policy
@@ -560,8 +559,8 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy (directory creation is a write operation)
@@ -597,8 +596,8 @@ impl AegisFSAL {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 
-        // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        // 2. Sanitize path — NFS paths are volume-local (root = "/")
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy

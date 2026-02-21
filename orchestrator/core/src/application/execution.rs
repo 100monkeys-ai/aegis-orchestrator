@@ -402,8 +402,8 @@ impl ExecutionService for StandardExecutionService {
         if let Some(ref gw) = self.nfs_gateway {
             for mount in &volume_mounts {
                 let policy = FilesystemPolicy {
-                    read: vec!["/workspace/*".to_string()],
-                    write: vec!["/workspace/*".to_string()],
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
                 };
                 gw.register_volume(
                     mount.volume_id,
