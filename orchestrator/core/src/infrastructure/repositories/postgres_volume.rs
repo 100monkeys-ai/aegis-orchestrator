@@ -141,6 +141,7 @@ impl VolumeRepository for PostgresVolumeRepository {
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE expires_at IS NOT NULL AND expires_at < $1
+              AND status NOT IN ('"deleted"', '"deleting"')
             ORDER BY expires_at ASC
             "#
         )

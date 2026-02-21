@@ -17,6 +17,7 @@ use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::volume::{VolumeMount, TenantId, AccessMode};
 use crate::application::agent::AgentLifecycleService;
 use crate::application::volume_manager::VolumeService;
+use crate::application::nfs_gateway::NfsGatewayService;
 use crate::infrastructure::event_bus::{EventBus, DomainEvent, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptTemplateEngine, PromptContext};
 use anyhow::{Result, anyhow};
@@ -26,6 +27,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::path::PathBuf;
 use chrono::Utc;
+use crate::domain::policy::FilesystemPolicy;
 
 #[async_trait]
 pub trait ExecutionService: Send + Sync {
@@ -47,6 +49,8 @@ pub struct StandardExecutionService {
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
     config: Arc<crate::domain::node_config::NodeConfigManifest>,
+    /// Optional NFS gateway for registering volume contexts before container spawn (ADR-036)
+    nfs_gateway: Option<Arc<NfsGatewayService>>,
 }
 
 impl StandardExecutionService {
@@ -65,7 +69,14 @@ impl StandardExecutionService {
             repository,
             event_bus,
             config,
+            nfs_gateway: None,
         }
+    }
+
+    /// Attach an NFS gateway so volume contexts are registered before agent containers spawn
+    pub fn with_nfs_gateway(mut self, gateway: Arc<NfsGatewayService>) -> Self {
+        self.nfs_gateway = Some(gateway);
+        self
     }
 }
 
@@ -381,10 +392,29 @@ impl ExecutionService for StandardExecutionService {
                     volume.filer_endpoint.clone(),
                     volume.remote_path.clone(),
                 )
-            }).collect()
+            }).collect::<Vec<VolumeMount>>()
         } else {
             Vec::new()
         };
+
+        // Register each volume with the NFS gateway BEFORE the container mounts it (ADR-036)
+        // This populates the in-memory volume_registry so the NFS server can authorize requests.
+        if let Some(ref gw) = self.nfs_gateway {
+            for mount in &volume_mounts {
+                let policy = FilesystemPolicy {
+                    read: vec!["/workspace/*".to_string()],
+                    write: vec!["/workspace/*".to_string()],
+                };
+                gw.register_volume(
+                    mount.volume_id,
+                    execution_id,
+                    1000, // container_uid
+                    1000, // container_gid
+                    policy,
+                );
+                tracing::info!("Registered volume {} with NFS gateway for execution {}", mount.volume_id, execution_id);
+            }
+        }
         
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             language: agent.manifest.spec.runtime.language.clone(),

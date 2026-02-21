@@ -367,7 +367,44 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_repo.clone(),
         event_bus.clone(),
         Arc::new(config.clone()),
-    ));
+    ).with_nfs_gateway(nfs_gateway.clone()));
+
+    // ADR-036: Event-driven NFS volume deregistration (security requirement)
+    // Listen for VolumeExpired and VolumeDeleted events and immediately remove
+    // the volume from the NFS gateway registry so the path becomes inaccessible.
+    // This prevents orphaned volume registrations from remaining accessible after
+    // their corresponding storage has been cleaned up.
+    {
+        let nfs_deregister_gateway = nfs_gateway.clone();
+        let mut nfs_deregister_sub = event_bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match nfs_deregister_sub.recv().await {
+                    Ok(aegis_core::infrastructure::event_bus::DomainEvent::Volume(vol_event)) => {
+                        let volume_id = match &vol_event {
+                            aegis_core::domain::events::VolumeEvent::VolumeExpired { volume_id, .. } => Some(*volume_id),
+                            aegis_core::domain::events::VolumeEvent::VolumeDeleted { volume_id, .. } => Some(*volume_id),
+                            _ => None,
+                        };
+                        if let Some(vid) = volume_id {
+                            nfs_deregister_gateway.deregister_volume(vid);
+                            tracing::info!("NFS: Deregistered volume {} from gateway (volume expired/deleted)", vid);
+                        }
+                    }
+                    Ok(_) => {} // Ignore non-volume events
+                    Err(aegis_core::infrastructure::event_bus::EventBusError::Lagged(n)) => {
+                        tracing::warn!("NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed", n);
+                    }
+                    Err(aegis_core::infrastructure::event_bus::EventBusError::Closed) => {
+                        tracing::info!("NFS deregistration listener: event bus closed, shutting down");
+                        break;
+                    }
+                    Err(_) => {}
+                }
+            }
+        });
+        tracing::info!("NFS deregistration listener started (ADR-036)");
+    }
 
     println!("Initializing Cortex service...");
     

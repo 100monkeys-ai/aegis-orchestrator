@@ -422,6 +422,7 @@ impl VolumeService for StandardVolumeService {
         info!("Found {} expired volumes to clean up", count);
 
         // Delete each expired volume
+        let mut deleted_count = 0usize;
         for volume in expired_volumes {
             let volume_id = volume.id;
             
@@ -435,6 +436,7 @@ impl VolumeService for StandardVolumeService {
             match self.delete_volume(volume_id).await {
                 Ok(_) => {
                     info!("Expired volume {} cleaned up successfully", volume_id);
+                    deleted_count += 1;
                 }
                 Err(e) => {
                     error!("Failed to clean up expired volume {}: {}", volume_id, e);
@@ -443,8 +445,8 @@ impl VolumeService for StandardVolumeService {
             }
         }
 
-        info!("Cleanup completed: {} volumes deleted", count);
-        Ok(count)
+        info!("Cleanup completed: {}/{} expired volumes deleted", deleted_count, count);
+        Ok(deleted_count)
     }
     
     async fn create_volumes_for_execution(
