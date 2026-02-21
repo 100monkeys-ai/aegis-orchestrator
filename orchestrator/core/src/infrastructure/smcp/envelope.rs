@@ -21,6 +21,14 @@ pub struct ContextClaims {
     pub execution_id: String,
     pub security_context: String,
 
+    /// Issuer of the token (e.g. the orchestrator instance).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+
+    /// Intended audience(s) for the token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<Vec<String>>,
+
     /// Expiration time (as seconds since Unix epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
