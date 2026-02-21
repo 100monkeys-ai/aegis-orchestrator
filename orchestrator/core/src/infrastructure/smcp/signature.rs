@@ -6,11 +6,11 @@ use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm, TokenData};
 use crate::infrastructure::smcp::envelope::ContextClaims;
 
 /// Token verifier abstracting cryptographic setup for JWT tokens (OpenBao integration placeholder)
-pub struct ContextTokenVerifier {
+pub struct SecurityTokenVerifier {
     decoding_key: DecodingKey,
 }
 
-impl ContextTokenVerifier {
+impl SecurityTokenVerifier {
     pub fn new(pem: &str) -> Result<Self> {
         let decoding_key = DecodingKey::from_rsa_pem(pem.as_bytes())?;
         Ok(Self { decoding_key })

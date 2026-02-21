@@ -14,7 +14,7 @@ pub struct AttestationRequest {
 
 #[derive(Debug, Clone)]
 pub struct AttestationResponse {
-    pub context_token: String,
+    pub security_token: String,
 }
 
 #[async_trait]

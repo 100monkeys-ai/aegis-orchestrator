@@ -78,8 +78,8 @@ pub struct SmcpSession {
     /// Agent's public key bytes (for signature verification)
     pub agent_public_key: Vec<u8>,
     
-    /// Issued ContextToken raw string (abstracted)
-    pub context_token_raw: String,
+    /// Issued SecurityToken raw string (abstracted)
+    pub security_token_raw: String,
     
     /// Assigned SecurityContext
     pub security_context: SecurityContext,
@@ -98,7 +98,7 @@ impl SmcpSession {
         agent_id: AgentId,
         execution_id: ExecutionId,
         agent_public_key: Vec<u8>,
-        context_token_raw: String,
+        security_token_raw: String,
         security_context: SecurityContext,
     ) -> Self {
         let now = Utc::now();
@@ -107,7 +107,7 @@ impl SmcpSession {
             agent_id,
             execution_id,
             agent_public_key,
-            context_token_raw,
+            security_token_raw,
             security_context,
             status: SessionStatus::Active,
             created_at: now,

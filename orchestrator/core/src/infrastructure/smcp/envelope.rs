@@ -10,7 +10,7 @@ use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpEnvelope {
-    pub context_token: String,
+    pub security_token: String,
     pub signature: String,
     pub inner_mcp: Vec<u8>,
 }
@@ -103,7 +103,7 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
         
         let envelope = SmcpEnvelope {
-            context_token: "mock-jwt.token.here".to_string(),
+            security_token: "mock-jwt.token.here".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes.clone(),
         };
@@ -133,7 +133,7 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
         
         let envelope = SmcpEnvelope {
-            context_token: "mock.jwt".to_string(),
+            security_token: "mock.jwt".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes,
         };
