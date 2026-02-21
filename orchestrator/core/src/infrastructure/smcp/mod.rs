@@ -9,6 +9,6 @@ pub mod signature;
 pub mod audit;
 
 pub use attestation::{AttestationRequest, AttestationResponse, AttestationService};
-pub use envelope::{SmcpEnvelope, ContextClaims};
+pub use envelope::{SmcpEnvelope, ContextClaims, AudienceClaim};
 pub use middleware::SmcpMiddleware;
 pub use policy_engine::PolicyEngine;
