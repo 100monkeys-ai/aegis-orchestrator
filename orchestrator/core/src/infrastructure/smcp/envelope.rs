@@ -15,6 +15,14 @@ pub struct SmcpEnvelope {
     pub inner_mcp: Vec<u8>,
 }
 
+/// Represents the JWT `aud` claim, which may be either a single string or an array of strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AudienceClaim {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClaims {
     pub agent_id: String,
@@ -26,8 +34,9 @@ pub struct ContextClaims {
     pub iss: Option<String>,
 
     /// Intended audience(s) for the token.
+    /// The JWT spec allows `aud` to be either a single string or an array of strings.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub aud: Option<Vec<String>>,
+    pub aud: Option<AudienceClaim>,
 
     /// Expiration time (as seconds since Unix epoch).
     #[serde(skip_serializing_if = "Option::is_none")]
