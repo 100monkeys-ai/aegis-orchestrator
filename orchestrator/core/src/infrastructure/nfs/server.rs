@@ -285,60 +285,74 @@ impl NFSFileSystem for AegisFsalAdapter {
         debug!("NFS LOOKUP: dirid={}, filename={}", dirid, name);
 
         // Handle virtual root (dirid = 1)
-        if dirid == 1 {
-            // In the virtual root, any lookup is intercepted to build the path.
-            // The Docker mount path is `/{tenant_id}/{volume_id}`.
-            // The NFS client will lookup `{tenant_id}`, then lookup `{volume_id}` inside it.
+        let (parent_handle, parent_path) = if dirid == 1 {
+            (
+                AegisFileHandle::new(crate::domain::execution::ExecutionId(uuid::Uuid::nil()), VolumeId(uuid::Uuid::nil()), "/"),
+                "/".to_string()
+            )
+        } else {
+            self.decode_handle(dirid)
+                .map_err(|e| {
+                    warn!("Invalid parent handle: {}", e);
+                    nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
+                })?
+        };
+
+        // If parent is a structural directory (identified by nil volume ID)
+        if parent_handle.volume_id.0.is_nil() {
+            let path_parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
             
-            // For the first level (tenant_id), we create a synthetic directory fileid.
-            // We use a deterministic hash of the tenant_id, mapped in a special way, 
-            // but for simplicity we can just register it with a dummy handle.
-            // Wait, we need to know when we are at the volume_id level.
-            // Let's create a special FileHandleTable entry for tenant directories.
-            // Since we don't have a specific VolumeId yet, we can use a dummy one and
-            // encode the path.
+            // Expected path: /aegis/volumes/{tenant_id}/{volume_id}
+            // Navigate down to depth 3: /aegis/volumes/{tenant_id}
+            if path_parts.len() < 3 {
+                let synthetic_path = if parent_path == "/" {
+                    format!("/{}", name)
+                } else {
+                    format!("{}/{}", parent_path, name)
+                };
+                
+                let dummy_exec = crate::domain::execution::ExecutionId(uuid::Uuid::nil());
+                let dummy_vol = VolumeId(uuid::Uuid::nil());
+                let handle = AegisFileHandle::new(dummy_exec, dummy_vol, &synthetic_path);
+                
+                let fileid = self.encode_handle(&handle, synthetic_path)
+                    .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+                return Ok(fileid);
+            }
             
-            let dummy_exec_id = ExecutionId::new(); // Or all zeros
-            let dummy_vol_id = VolumeId::new();
-            
-            let synthetic_path = format!("/{}", name);
-            let handle = AegisFileHandle::new(dummy_exec_id, dummy_vol_id, &synthetic_path);
-            
-            let fileid = self.encode_handle(&handle, synthetic_path)
-                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
-            
-            return Ok(fileid);
+            // At depth 3, the child name is {volume_id}
+            if path_parts.len() == 3 {
+                let volume_id_str = name;
+                let volume_id = uuid::Uuid::parse_str(volume_id_str)
+                    .map(VolumeId)
+                    .map_err(|_| {
+                        warn!("Invalid volume ID format in lookup: {}", volume_id_str);
+                        nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
+                    })?;
+
+                // Retrieve context ensuring it exists
+                let context = self.get_context(volume_id);
+                if context.volume_id != volume_id {
+                    warn!("Volume {} not registered in NFS Gateway", volume_id_str);
+                    return Err(nfsserve::nfs::nfsstat3::NFS3ERR_NOENT);
+                }
+                
+                // Now we have a real volume! Create the proper root handle for it.
+                let child_path = "/".to_string();
+                let root_handle = AegisFileHandle::new(context.execution_id, volume_id, &child_path);
+                let fileid = self.encode_handle(&root_handle, child_path)
+                    .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+                    
+                return Ok(fileid);
+            }
         }
 
-        // Decode parent directory handle
-        let (parent_handle, parent_path) = self.decode_handle(dirid)
-            .map_err(|e| {
-                warn!("Invalid parent handle: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
-            })?;
-
-        // Check if we are at the `{tenant_id}` level (path is just `/{tenant_id}`)
-        let path_parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
-        if path_parts.len() == 1 {
-            // Parent is `/{tenant_id}`. The current lookup is for `{volume_id}`.
-            let volume_id_str = name;
-            
-            let volume_id = uuid::Uuid::parse_str(volume_id_str)
-                .map(VolumeId)
-                .map_err(|_| {
-                    warn!("Invalid volume ID format in lookup: {}", volume_id_str);
-                    nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
-                })?;
-                
-            // Get context for this volume (this validates it exists in registry)
-            let context = self.get_context(volume_id);
-            
-            // Now we have a real volume! Create the proper root handle for it.
-            let root_handle = AegisFileHandle::new(context.execution_id, volume_id, "/");
-            let fileid = self.encode_handle(&root_handle, "/".to_string())
-                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
-                
-            return Ok(fileid);
+        // We are inside a real volume.
+        // Get context to ensure volume is valid
+        let context = self.get_context(parent_handle.volume_id);
+        if context.volume_id != parent_handle.volume_id {
+            warn!("Volume {} context missing", parent_handle.volume_id);
+            return Err(nfsserve::nfs::nfsstat3::NFS3ERR_STALE);
         }
 
         // Lookup via FSAL (for paths inside the volume)
@@ -363,67 +377,64 @@ impl NFSFileSystem for AegisFsalAdapter {
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsserve::nfs::nfsstat3> {
         debug!("NFS GETATTR: id={}", id);
-            // For root directory, return synthetic attributes with default context
-            if id == 1 {
-                // Use first registered volume context or defaults
-                let default_context = self.volume_registry.read().values().next().cloned()
-                    .unwrap_or_else(|| NfsVolumeContext {
-                        execution_id: ExecutionId::new(),
-                        volume_id: VolumeId::new(),
-                        container_uid: 1000,
-                        container_gid: 1000,
-                        policy: FilesystemPolicy::default(),
-                    });
-                
-                return Ok(fattr3 {
-                    ftype: ftype3::NF3DIR,
-                    mode: 0o755,
-                    nlink: 2,
-                    uid: default_context.container_uid,
-                    gid: default_context.container_gid,
-                    size: 4096,
-                    used: 4096,
-                    rdev: specdata3 { specdata1: 0, specdata2: 0 },
-                    fsid: 0,
-                    fileid: 1,
-                    atime: nfstime3 { seconds: 0, nseconds: 0 },
-                    mtime: nfstime3 { seconds: 0, nseconds: 0 },
-                    ctime: nfstime3 { seconds: 0, nseconds: 0 },
+        // For root directory (dirid=1)
+        if id == 1 {
+            // Use defaults
+            let default_context = self.volume_registry.read().values().next().cloned()
+                .unwrap_or_else(|| NfsVolumeContext {
+                    execution_id: ExecutionId::new(),
+                    volume_id: VolumeId::new(),
+                    container_uid: 1000,
+                    container_gid: 1000,
+                    policy: FilesystemPolicy::default(),
                 });
-            }
-
-        // Handle synthetic attributes for tenant_id directories (depth 1)
-        if let Ok((_handle, path)) = self.decode_handle(id) {
-            let path_parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if path_parts.len() == 1 {
-                // Return synthetic directory attributes
-                return Ok(fattr3 {
-                    ftype: ftype3::NF3DIR,
-                    mode: 0o755,
-                    nlink: 2,
-                    uid: 1000,
-                    gid: 1000,
-                    size: 4096,
-                    used: 4096,
-                    rdev: specdata3 { specdata1: 0, specdata2: 0 },
-                    fsid: 0,
-                    fileid: id,
-                    atime: nfstime3 { seconds: 0, nseconds: 0 },
-                    mtime: nfstime3 { seconds: 0, nseconds: 0 },
-                    ctime: nfstime3 { seconds: 0, nseconds: 0 },
-                });
-            }
+            
+            return Ok(fattr3 {
+                ftype: ftype3::NF3DIR,
+                mode: 0o755,
+                nlink: 2,
+                uid: default_context.container_uid,
+                gid: default_context.container_gid,
+                size: 4096,
+                used: 4096,
+                rdev: specdata3 { specdata1: 0, specdata2: 0 },
+                fsid: 0,
+                fileid: 1,
+                atime: nfstime3 { seconds: 0, nseconds: 0 },
+                mtime: nfstime3 { seconds: 0, nseconds: 0 },
+                ctime: nfstime3 { seconds: 0, nseconds: 0 },
+            });
         }
 
         // Decode handle to get path and volume
         let (handle, path) = self.decode_handle(id)
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
-            // Get context for this volume
-            let context = self.get_context(handle.volume_id);
+        // Handle synthetic attributes for structural dummy directories (identified by nil volume ID)
+        if handle.volume_id.0.is_nil() {
+            // Return synthetic directory attributes
+            return Ok(fattr3 {
+                ftype: ftype3::NF3DIR,
+                mode: 0o755,
+                nlink: 2,
+                uid: 1000,
+                gid: 1000,
+                size: 4096,
+                used: 4096,
+                rdev: specdata3 { specdata1: 0, specdata2: 0 },
+                fsid: 0,
+                fileid: id,
+                atime: nfstime3 { seconds: 0, nseconds: 0 },
+                mtime: nfstime3 { seconds: 0, nseconds: 0 },
+                ctime: nfstime3 { seconds: 0, nseconds: 0 },
+            });
+        }
 
-            // Get attributes via FSAL (with UID/GID squashing)
-            let attrs = self.fsal.getattr(
+        // Get context for this volume
+        let context = self.get_context(handle.volume_id);
+
+        // Get attributes via FSAL (with UID/GID squashing)
+        let attrs = self.fsal.getattr(
                 context.execution_id,
                 context.volume_id,
                 &path,
