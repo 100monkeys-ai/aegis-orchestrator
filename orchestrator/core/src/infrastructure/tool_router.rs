@@ -446,8 +446,15 @@ impl ToolServerManager {
     fn is_process_alive(pid: u32) -> bool {
         #[cfg(unix)]
         {
-            // Send signal 0 to check if process exists (no signal actually sent)
-            unsafe { libc::kill(pid as i32, 0) == 0 }
+            // Send signal 0 to check if process exists (no signal actually sent).
+            // Uses `kill -0` via Command to avoid requiring the libc crate.
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
         }
         
         #[cfg(windows)]
