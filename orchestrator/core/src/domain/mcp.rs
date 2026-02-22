@@ -77,6 +77,13 @@ pub struct MCPError {
     pub data: Option<Value>, // Additional context
 }
 
+/// Execution mode for a tool server
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ExecutionMode {
+    Local,  // Executed natively via FSAL on the agent's mounted volume
+    Remote, // Executed via SMCP envelope to an external MCP server
+}
+
 /// Tool server status (enum value object)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolServerStatus {
@@ -162,6 +169,7 @@ pub struct ToolServer {
     pub name: String,
     
     // Configuration
+    pub execution_mode: ExecutionMode,
     pub executable_path: PathBuf,
     pub args: Vec<String>,
     pub capabilities: Vec<String>,
@@ -182,6 +190,40 @@ pub struct ToolServer {
 }
 
 impl ToolServer {
+    pub fn from_config(config: &crate::domain::node_config::McpServerConfig) -> Self {
+        let execution_mode = ExecutionMode::Local;
+
+        let credentials = config.credentials.iter().next().map(|(_, v)| {
+            if let Some(env_val) = v.strip_prefix("env:") {
+                CredentialRef::from_env(env_val)
+            } else if let Some(vault_val) = v.strip_prefix("vault:") {
+                CredentialRef::from_vault(vault_val)
+            } else {
+                CredentialRef::from_env(v) 
+            }
+        });
+
+        Self {
+            id: ToolServerId::new(),
+            name: config.name.clone(),
+            execution_mode,
+            executable_path: PathBuf::from(&config.executable),
+            args: config.args.clone(),
+            capabilities: config.capabilities.clone(),
+            status: ToolServerStatus::Stopped,
+            process_id: None,
+            health_check_interval: Duration::from_secs(config.health_check.interval_seconds),
+            last_health_check: None,
+            credentials,
+            resource_limits: ResourceLimits {
+                max_memory_mb: Some(config.resource_limits.memory_mb),
+                max_cpu_shares: Some(config.resource_limits.cpu_millicores),
+            },
+            started_at: None,
+            stopped_at: None,
+        }
+    }
+
     pub fn start(&mut self) -> Result<MCPToolEvent, DomainError> {
         if self.status != ToolServerStatus::Stopped {
             return Err(DomainError::InvalidStateTransition {
@@ -339,6 +381,15 @@ impl ToolInvocation {
             failed_at: self.completed_at.unwrap(),
         })
     }
+}
+
+#[async_trait::async_trait]
+pub trait ToolRegistry: Send + Sync {
+    /// Retrieve all registered tool servers for a specific agent execution
+    async fn get_tools_for_agent(&self, execution_id: ExecutionId) -> Result<Vec<ToolServer>, DomainError>;
+    
+    /// Register a new tool server
+    async fn register_tool(&self, server: ToolServer) -> Result<(), DomainError>;
 }
 
 fn extract_domain(url: &str) -> String {
@@ -530,6 +581,7 @@ mod tests {
         let mut server = ToolServer {
             id: ToolServerId::new(),
             name: "test-server".to_string(),
+            execution_mode: ExecutionMode::Remote,
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test.*".to_string()],

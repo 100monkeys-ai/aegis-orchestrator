@@ -25,7 +25,9 @@ pub mod temporal_event_listener;
 pub mod human_input_service;
 pub mod storage;
 pub mod nfs;
+pub mod security_context;
 pub mod smcp;
+pub mod tool_router;
 
 pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};
 pub use temporal_event_listener::{TemporalEventListener, TemporalEventPayload, TemporalEventMapper};

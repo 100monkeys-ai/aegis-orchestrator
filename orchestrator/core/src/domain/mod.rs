@@ -27,3 +27,4 @@ pub mod fsal;
 pub mod mcp;
 pub mod security_context;
 pub mod smcp_session;
+pub mod smcp_session_repository;

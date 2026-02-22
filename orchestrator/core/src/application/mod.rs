@@ -11,6 +11,8 @@
 
 pub mod lifecycle;
 pub mod agent;
+pub mod attestation_service;
+pub mod tool_invocation_service;
 pub mod execution;
 pub mod validation_service;
 

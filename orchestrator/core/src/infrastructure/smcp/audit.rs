@@ -1,18 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-use std::sync::Arc;
-use tracing::{warn, info};
-use crate::infrastructure::event_bus::EventBus;
 use crate::domain::mcp::PolicyViolation;
+use tracing::{info, warn};
 
 pub struct SmcpAuditLogger {
-    event_bus: Arc<EventBus>,
 }
 
 impl SmcpAuditLogger {
-    pub fn new(event_bus: Arc<EventBus>) -> Self {
-        Self { event_bus }
+    pub fn new() -> Self {
+        Self {}
     }
     
     pub async fn log_violation(&self, violation: &PolicyViolation) {

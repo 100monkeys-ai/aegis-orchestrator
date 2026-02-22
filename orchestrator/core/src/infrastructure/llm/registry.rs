@@ -277,6 +277,7 @@ mod tests {
                 network: None,
                 observability: None,
                 storage: None, // Optional storage configuration (ADR-032)
+                mcp_servers: None,
             },
         };
 

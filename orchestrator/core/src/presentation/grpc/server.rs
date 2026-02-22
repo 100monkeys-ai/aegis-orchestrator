@@ -33,6 +33,8 @@ pub struct AegisRuntimeService {
     validation_service: Arc<ValidationService>,
     cortex_service: Option<Arc<dyn aegis_cortex::application::CortexService>>,
     embedding_client: Option<Arc<aegis_cortex::infrastructure::EmbeddingClient>>,
+    attestation_service: Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+    tool_invocation_service: Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
 }
 
 impl AegisRuntimeService {
@@ -45,6 +47,8 @@ impl AegisRuntimeService {
             validation_service,
             cortex_service: None,
             embedding_client: None,
+            attestation_service: None,
+            tool_invocation_service: None,
         }
     }
 
@@ -56,6 +60,17 @@ impl AegisRuntimeService {
     ) -> Self {
         self.cortex_service = Some(cortex_service);
         self.embedding_client = Some(embedding_client);
+        self
+    }
+
+    /// Set the SMCP services (optional)
+    pub fn with_smcp(
+        mut self,
+        attestation_service: Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>,
+        tool_invocation_service: Arc<crate::application::tool_invocation_service::ToolInvocationService>,
+    ) -> Self {
+        self.attestation_service = Some(attestation_service);
+        self.tool_invocation_service = Some(tool_invocation_service);
         self
     }
 
@@ -427,6 +442,87 @@ impl AegisRuntime for AegisRuntimeService {
             new_frequency,
         }))
     }
+
+    /// Attest an agent to receive an SMCP Security Token
+    async fn attest_agent(
+        &self,
+        request: Request<AttestAgentRequest>,
+    ) -> Result<Response<AttestAgentResponse>, Status> {
+        let req = request.into_inner();
+        
+        let attestation_service = self.attestation_service.as_ref().ok_or_else(|| {
+            Status::unimplemented("SMCP attestation service is not configured")
+        })?;
+
+        let attestation_req = crate::infrastructure::smcp::attestation::AttestationRequest {
+            agent_id: req.agent_id,
+            execution_id: req.execution_id,
+            container_id: req.container_id,
+            public_key_pem: req.public_key_pem,
+        };
+
+        match attestation_service.attest(attestation_req).await {
+            Ok(res) => Ok(Response::new(AttestAgentResponse {
+                security_token: res.security_token,
+            })),
+            Err(e) => Err(Status::internal(format!("Attestation failed: {}", e))),
+        }
+    }
+
+    /// Invoke a tool via orchestrator mediation (SMCP)
+    async fn invoke_tool(
+        &self,
+        request: Request<InvokeToolRequest>,
+    ) -> Result<Response<InvokeToolResponse>, Status> {
+        let req = request.into_inner();
+
+        let tool_invocation_service = self.tool_invocation_service.as_ref().ok_or_else(|| {
+            Status::unimplemented("SMCP tool invocation service is not configured")
+        })?;
+
+        // Construct SmcpEnvelope
+        let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
+            security_token: req.security_token,
+            signature: req.signature,
+            inner_mcp: req.inner_mcp,
+        };
+
+        // We need the agent_id to route appropriately. This would typically be extracted 
+        // from the security token (JWT) by the middleware, but for the sake of the API
+        // if we need it here, we should perhaps peek the token or let the service do it.
+        // Wait, ToolInvocationService takes agent_id in its arguments. Let's decode it.
+        // The middleware `verify_and_unwrap` happens inside `invoke_tool`.
+        // The service uses `agent_id` to lookup the session. 
+        // We can peek the sub (agent_id) from the unverified token right now to pass it to the service, 
+        // and the service will securely verify it anyway.
+        
+        let token_parts: Vec<&str> = envelope.security_token.split('.').collect();
+        if token_parts.len() != 3 {
+             return Err(Status::unauthenticated("Invalid security token format"));
+        }
+        use base64::Engine;
+        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(token_parts[1])
+             .map_err(|_| Status::unauthenticated("Invalid token payload base64"))?;
+        
+        let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+             .map_err(|_| Status::unauthenticated("Invalid token payload JSON"))?;
+             
+        let agent_id_str = claims.get("agent_id")
+             .and_then(|v| v.as_str())
+             .ok_or_else(|| Status::unauthenticated("Token missing agent_id claim"))?;
+             
+        let agent_id = crate::domain::agent::AgentId::from_string(agent_id_str)
+             .map_err(|e| Status::internal(format!("Invalid agent_id in token: {}", e)))?;
+
+        match tool_invocation_service.invoke_tool(&agent_id, &envelope).await {
+            Ok(result) => {
+                let bytes = serde_json::to_vec(&result)
+                    .map_err(|e| Status::internal(format!("Failed to serialize tool result: {}", e)))?;
+                Ok(Response::new(InvokeToolResponse { result_json: bytes }))
+            },
+            Err(e) => Err(Status::permission_denied(format!("Tool invocation rejected: {}", e))),
+        }
+    }
 }
 
 /// Convert domain ExecutionEvent to protobuf ExecutionEvent
@@ -519,8 +615,21 @@ pub async fn start_grpc_server(
     addr: std::net::SocketAddr,
     execution_service: Arc<dyn ExecutionService>,
     validation_service: Arc<ValidationService>,
+    cortex_service: Option<Arc<dyn aegis_cortex::application::CortexService>>,
+    embedding_client: Option<Arc<aegis_cortex::infrastructure::EmbeddingClient>>,
+    attestation_service: Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+    tool_invocation_service: Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let service = AegisRuntimeService::new(execution_service, validation_service);
+    let mut service = AegisRuntimeService::new(execution_service, validation_service);
+    
+    if let (Some(c), Some(e)) = (cortex_service, embedding_client) {
+        service = service.with_cortex(c, e);
+    }
+    
+    if let (Some(a), Some(t)) = (attestation_service, tool_invocation_service) {
+        service = service.with_smcp(a, t);
+    }
+
     let server = service.into_server();
 
     tracing::info!("Starting AEGIS gRPC server on {}", addr);

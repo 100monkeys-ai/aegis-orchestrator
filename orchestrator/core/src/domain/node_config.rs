@@ -84,6 +84,10 @@ pub struct NodeConfigSpec {
     /// Distributed storage configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConfig>,
+
+    /// MCP tool servers configurations
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_servers: Option<Vec<McpServerConfig>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -513,6 +517,89 @@ impl Default for LocalStorageConfig {
     }
 }
 
+/// MCP Server configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    /// Server identifier (unique on this node)
+    pub name: String,
+    
+    /// Whether to start this server
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    
+    /// Path to executable (absolute or relative to /usr/local/bin)
+    pub executable: String,
+    
+    /// Command-line arguments
+    #[serde(default)]
+    pub args: Vec<String>,
+    
+    /// Tool names this server provides
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    
+    /// API keys/tokens for external services
+    #[serde(default)]
+    pub credentials: HashMap<String, String>,
+    
+    /// Health monitoring configuration
+    #[serde(default)]
+    pub health_check: McpHealthCheckConfig,
+    
+    /// Process resource constraints
+    #[serde(default)]
+    pub resource_limits: McpResourceLimitsConfig,
+    
+    /// Additional environment variables
+    #[serde(default)]
+    pub environment: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpHealthCheckConfig {
+    /// Check interval in seconds
+    #[serde(default = "default_health_check_interval_seconds")]
+    pub interval_seconds: u64,
+    
+    /// Health check timeout in seconds
+    #[serde(default = "default_health_check_timeout_seconds")]
+    pub timeout_seconds: u64,
+    
+    /// Health check method
+    #[serde(default = "default_health_check_method")]
+    pub method: String,
+}
+
+impl Default for McpHealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            interval_seconds: default_health_check_interval_seconds(),
+            timeout_seconds: default_health_check_timeout_seconds(),
+            method: default_health_check_method(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpResourceLimitsConfig {
+    /// CPU limit (1000 = 1 core)
+    #[serde(default = "default_cpu_millicores")]
+    pub cpu_millicores: u32,
+    
+    /// Memory limit in MB
+    #[serde(default = "default_memory_mb")]
+    pub memory_mb: u32,
+}
+
+impl Default for McpResourceLimitsConfig {
+    fn default() -> Self {
+        Self {
+            cpu_millicores: default_cpu_millicores(),
+            memory_mb: default_memory_mb(),
+        }
+    }
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -602,6 +689,12 @@ fn default_s3_region() -> String {
     "us-east-1".to_string()
 }
 
+fn default_health_check_interval_seconds() -> u64 { 60 }
+fn default_health_check_timeout_seconds() -> u64 { 5 }
+fn default_health_check_method() -> String { "tools/list".to_string() }
+fn default_cpu_millicores() -> u32 { 1000 }
+fn default_memory_mb() -> u32 { 512 }
+
 impl Default for LLMSelectionStrategy {
     fn default() -> Self {
         Self::PreferLocal
@@ -636,6 +729,7 @@ impl Default for NodeConfigSpec {
             network: None,
             observability: None,
             storage: None,
+            mcp_servers: None,
         }
     }
 }
@@ -883,6 +977,7 @@ mod tests {
                 network: None,
                 observability: None,
                 storage: None, // Optional storage configuration (ADR-032)
+                mcp_servers: None,
             },
         };
         

@@ -7,6 +7,7 @@ pub mod middleware;
 pub mod policy_engine;
 pub mod signature;
 pub mod audit;
+pub mod session_repository;
 
 pub use attestation::{AttestationRequest, AttestationResponse, AttestationService};
 pub use envelope::{SmcpEnvelope, ContextClaims, AudienceClaim};

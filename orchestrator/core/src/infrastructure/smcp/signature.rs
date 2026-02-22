@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 use anyhow::Result;
-use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm, TokenData};
+use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation, Algorithm, TokenData};
 use crate::infrastructure::smcp::envelope::ContextClaims;
 
 /// Token verifier abstracting cryptographic setup for JWT tokens (OpenBao integration placeholder)
@@ -43,10 +43,35 @@ impl SecurityTokenVerifier {
     }
 }
 
+/// Token issuer abstracting cryptographic setup for JWT tokens (OpenBao integration placeholder)
+pub struct SecurityTokenIssuer {
+    encoding_key: EncodingKey,
+    issuer: String,
+}
+
+impl SecurityTokenIssuer {
+    pub fn new(pem: &str, issuer: &str) -> Result<Self> {
+        if issuer.is_empty() {
+            return Err(anyhow::anyhow!("issuer must not be empty"));
+        }
+        let encoding_key = EncodingKey::from_rsa_pem(pem.as_bytes())?;
+        Ok(Self {
+            encoding_key,
+            issuer: issuer.to_string(),
+        })
+    }
+
+    pub fn issue(&self, claims: &mut ContextClaims) -> Result<String> {
+        claims.iss = Some(self.issuer.clone());
+        let header = Header::new(Algorithm::RS256);
+        let token_str = encode(&header, claims, &self.encoding_key)?;
+        Ok(token_str)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use jsonwebtoken::{encode, EncodingKey, Header};
     use crate::infrastructure::smcp::envelope::AudienceClaim;
 
     // Minimal 2048-bit RSA key pair for testing only – never use in production.
