@@ -1,13 +1,40 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Agent
+//! # Agent Domain Types (BC-1, AGENTS.md §Agent Domain)
 //!
-//! Provides agent functionality for the system.
+//! Defines the `Agent` aggregate root and the `AgentManifest` value object that
+//! declares all agent capabilities, constraints, and execution strategy.
 //!
-//! # Architecture
+//! ## Key Types
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements agent
+//! | Type | Description |
+//! |------|-------------|
+//! | [`AgentId`] | UUID newtype uniquely identifying an agent definition |
+//! | [`Agent`] | Aggregate root tracking manifest + lifecycle status |
+//! | [`AgentManifest`] | Kubernetes-style YAML config (`apiVersion/kind/metadata/spec`) |
+//! | [`AgentSpec`] | Parsed `spec` stanza: runtime, security, validation, resources |
+//! | [`SecurityConfig`] | Inline security policy from the manifest |
+//! | [`VolumeSpec`] | Volume declaration in `spec.volumes[]` |
+//!
+//! ## Manifest Schema
+//!
+//! ```yaml
+//! apiVersion: aegis.ai/v1
+//! kind: Agent
+//! metadata:
+//!   name: code-reviewer
+//! spec:
+//!   runtime:
+//!     model: gpt-4o
+//!   security:
+//!     network:
+//!       allowlist: ["github.com"]
+//!   resources:
+//!     max_iterations: 5
+//!     timeout_seconds: 300
+//! ```
+//!
+//! See AGENTS.md §Agent Domain ubiquitous language.
 
 use uuid::Uuid;
 use chrono::{DateTime, Utc};

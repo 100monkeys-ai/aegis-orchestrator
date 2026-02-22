@@ -1,13 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Ollama
+//! # Ollama Local Model Adapter — ADR-009
 //!
-//! Provides ollama functionality for the system.
+//! Implements the `LLMProvider` domain trait for Ollama-served local models.
+//! Useful for offline development and air-gapped deployments. Translates AEGIS
+//! domain types into Ollama's `/api/chat` (streaming) and `/api/generate`
+//! endpoints.
 //!
-//! # Architecture
+//! Default base URL: `http://localhost:11434` (configurable via node config).
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements ollama
+//! See ADR-009 (BYOLLM Provider Strategy).
 
 // Ollama LLM Provider Adapter
 //

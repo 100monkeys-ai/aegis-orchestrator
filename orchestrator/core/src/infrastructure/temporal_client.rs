@@ -76,7 +76,7 @@ pub struct TemporalClient {
     http_client: HttpClient,
     namespace: String,
     task_queue: String,
-    #[allow(dead_code)]
+    /// Original Temporal server address (used for diagnostics/reconnection)
     temporal_endpoint: String,
     worker_http_endpoint: String,
 }

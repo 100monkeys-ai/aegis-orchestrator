@@ -1,13 +1,30 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Events
+//! # Domain Event Catalog (ADR-030)
 //!
-//! Provides events functionality for the system.
+//! Single source of truth for all domain events emitted by AEGIS. Every bounded
+//! context publishes events through the [`crate::infrastructure::event_bus::EventBus`]
+//! using the [`crate::infrastructure::event_bus::DomainEvent`] wrapper enum.
 //!
-//! # Architecture
+//! ## Event Groups
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements events
+//! | Enum | Bounded Context | Description |
+//! |---|---|---|
+//! | [`StorageEvent`] | BC-7 Storage Gateway | File-level audit trail from NFS FSAL (ADR-036) |
+//! | [`AgentLifecycleEvent`] | BC-1 Agent Lifecycle | Agent manifest deploy/update/remove lifecycle |
+//! | [`ExecutionEvent`] | BC-2 Execution | 100monkeys iteration loop progress and console I/O |
+//! | [`WorkflowEvent`] | BC-3 Workflow | Temporal-backed FSM state transitions (ADR-015) |
+//! | [`LearningEvent`] | BC-5 Cortex | Pattern weight reinforcement/decay signals |
+//! | [`ValidationEvent`] | BC-2 Execution | Gradient validation scores and multi-judge consensus |
+//! | [`VolumeEvent`] | BC-7 Storage Gateway | Volume lifecycle (create/attach/detach/delete/expire) |
+//! | [`PolicyEvent`] | BC-4 Security Policy | Runtime policy violation records |
+//! | [`ViolationType`] | BC-4 / BC-12 | Structured violation classification |
+//! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
+//!
+//! ## Phase 2 Note
+//!
+//! The EventBus is currently **in-memory only** (tokio broadcast channel). Persistent
+//! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
 use chrono::{DateTime, Utc};
 use serde::{Serialize, Deserialize};
@@ -16,10 +33,17 @@ use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
 use crate::domain::runtime::InstanceId;
 use crate::domain::volume::{VolumeId, StorageClass};
 
-/// Storage Gateway file-level events (ADR-036)
+/// File-level audit events published by the NFS Server Gateway FSAL (ADR-036).
 ///
-/// These events provide file-level audit trail for NFS Server Gateway operations,
-/// complementing volume lifecycle events (VolumeEvent).
+/// These complement [`VolumeEvent`] (which tracks volume lifecycle) by recording
+/// individual POSIX file operations. Every variant is persisted to Postgres via
+/// [`crate::application::storage_event_persister::StorageEventPersister`] and
+/// consumed by the Cortex for file-access pattern learning.
+///
+/// # Security
+///
+/// `PathTraversalBlocked` and `FilesystemPolicyViolation` variants are the primary
+/// forensic signal for detecting malicious or misconfigured agent behaviour.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StorageEvent {
     FileOpened {
@@ -100,6 +124,10 @@ pub enum StorageEvent {
 }
 
 
+/// Agent manifest lifecycle events (BC-1 Agent Lifecycle Context).
+///
+/// Published by [`crate::application::lifecycle::StandardAgentLifecycleService`].
+/// Consumers: Control Plane gRPC stream, Cortex (tracks agent version history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentLifecycleEvent {
     AgentDeployed {
@@ -132,6 +160,25 @@ pub enum AgentLifecycleEvent {
     },
 }
 
+/// Execution and iteration-level events (BC-2 Execution Context / 100monkeys loop).
+///
+/// Published by [`crate::application::execution::StandardExecutionService`] via
+/// [`crate::domain::supervisor::SupervisorObserver`] callbacks.
+///
+/// Key flow:
+/// ```text
+/// ExecutionStarted
+///   └─ IterationStarted (N=1)
+///       ├─ ConsoleOutput* (streaming)
+///       ├─ LlmInteraction (one per LLM call)
+///       ├─ InstanceSpawned / InstanceTerminated
+///       └─ IterationCompleted | IterationFailed
+///           └─ RefinementApplied? → IterationStarted (N+1)
+/// ExecutionCompleted | ExecutionFailed | ExecutionCancelled
+/// ```
+///
+/// The `Validation` and `Cortex` variants wrap sub-events from the validation
+/// and cortex bounded contexts to keep this enum as the single stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionEvent {
     ExecutionStarted {
@@ -225,6 +272,10 @@ pub enum ExecutionEvent {
     Cortex(aegis_cortex::domain::events::CortexEvent),
 }
 
+/// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).
+///
+/// Published by Temporal event listener ([`crate::infrastructure::temporal_event_listener`])
+/// as Temporal signals workflow progress. See ADR-015 (Workflow Engine Architecture).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorkflowEvent {
     WorkflowRegistered {
@@ -283,19 +334,43 @@ pub enum WorkflowEvent {
     },
 }
 
+/// Cortex pattern weight change events (BC-5 Cortex / Learning & Memory Context).
+///
+/// Published when the Cortex service updates a pattern's success score after
+/// an execution completes. See ADR-018 (Weighted Cortex Memory) and
+/// ADR-029 (Cortex Time-Decay Parameters).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LearningEvent {
-    // Basic placeholder derived from AGENTS.md
-    PatternDiscovered { 
+    PatternDiscovered {
         execution_id: ExecutionId,
-        discovered_at: DateTime<Utc>
-    } 
+        agent_id: AgentId,
+        pattern_category: String,
+        discovered_at: DateTime<Utc>,
+    },
+    PatternReinforced {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        delta: f64,
+        reinforced_at: DateTime<Utc>,
+    },
+    PatternDecayed {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        delta: f64,
+        decayed_at: DateTime<Utc>,
+    },
 }
 
+/// Gradient validation events (BC-2 Execution Context, ADR-017).
+///
+/// Published by [`crate::application::validation_service::ValidationService`] after each
+/// iteration is evaluated. `score` and `confidence` are both in `[0.0, 1.0]`.
+/// For multi-judge runs, individual judge scores are aggregated into `MultiJudgeConsensus`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ValidationEvent {
     GradientValidationPerformed {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         iteration_number: u8,
         score: f64,
         confidence: f64,
@@ -303,6 +378,7 @@ pub enum ValidationEvent {
     },
     MultiJudgeConsensus {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         judge_scores: Vec<(AgentId, f64)>,
         final_score: f64,
         confidence: f64,
@@ -310,6 +386,11 @@ pub enum ValidationEvent {
     },
 }
 
+/// Volume lifecycle events (BC-7 Storage Gateway Context, ADR-032).
+///
+/// Published by [`crate::application::volume_manager::VolumeService`] during volume
+/// create/attach/detach/delete and TTL expiry. For per-file-operation events,
+/// see [`StorageEvent`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VolumeEvent {
     VolumeCreated {
@@ -354,32 +435,57 @@ pub enum VolumeEvent {
     },
 }
 
+/// Infrastructure-level security policy violation events (BC-4 Security Policy).
+///
+/// Published by the runtime policy enforcer when an agent container attempts to
+/// violate its manifest-declared [`crate::domain::policy::SecurityPolicy`].
+/// Distinct from [`MCPToolEvent::PolicyViolation`] which covers SMCP/MCP-level violations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PolicyEvent {
     PolicyViolationAttempted {
+        agent_id: AgentId,
         violation_type: String,
         details: String,
         attempted_at: DateTime<Utc>,
     },
     PolicyViolationBlocked {
+        agent_id: AgentId,
         violation_type: String,
         details: String,
         blocked_at: DateTime<Utc>,
     },
 }
 
+/// Structured classification of policy violation types used in [`MCPToolEvent::PolicyViolation`]
+/// and [`crate::domain::smcp_session::SmcpSessionError`] audit records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViolationType {
+    /// The requested MCP tool is not declared in the agent's `SecurityContext` capabilities.
     ToolNotAllowed,
+    /// The requested tool is explicitly listed in the `deny` section of the `SecurityContext`.
     ToolExplicitlyDenied,
+    /// The agent has exceeded the per-tool rate limit defined in its `Capability`.
     RateLimitExceeded,
+    /// The requested filesystem path falls outside the FSAL-enforced `FilesystemPolicy` boundaries.
     PathOutsideBoundary,
+    /// A `../` traversal sequence was detected in the requested path before canonicalization.
     PathTraversalAttempt,
+    /// The target network domain is not in the `NetworkPolicy` allowlist.
     DomainNotAllowed,
+    /// A required argument was missing from the tool invocation payload.
     MissingRequiredArgument,
+    /// The tool call exceeded the per-invocation timeout declared in the `Capability`.
     TimeoutExceeded,
 }
 
+/// MCP Tool server lifecycle and invocation audit events (BC-12 SMCP / Tool Routing, ADR-033).
+///
+/// Published by [`crate::application::tool_invocation_service::ToolInvocationService`] and
+/// [`crate::infrastructure::tool_router::ToolRouter`]. Consumed by:
+/// - The Cortex for tool-usage pattern learning (e.g. "always run `npm install`
+///   after modifying `package.json`")
+/// - The Control Plane for real-time execution visualization
+/// - Security analytics for anomalous tool usage detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MCPToolEvent {
     // ========== Server Lifecycle Events ==========
@@ -421,6 +527,7 @@ pub enum MCPToolEvent {
     InvocationRequested {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
+        agent_id: AgentId,
         tool_name: String,
         arguments: serde_json::Value,
         requested_at: DateTime<Utc>,
@@ -436,6 +543,7 @@ pub enum MCPToolEvent {
     InvocationCompleted {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
+        agent_id: AgentId,
         result: serde_json::Value,
         duration_ms: u64,
         completed_at: DateTime<Utc>,
@@ -444,6 +552,7 @@ pub enum MCPToolEvent {
     InvocationFailed {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
+        agent_id: AgentId,
         error: crate::domain::mcp::MCPError,
         failed_at: DateTime<Utc>,
     },
@@ -452,6 +561,7 @@ pub enum MCPToolEvent {
     
     PolicyViolation {
         execution_id: ExecutionId,
+        agent_id: AgentId,
         tool_name: String,
         violation_type: ViolationType,
         details: String,
@@ -559,6 +669,7 @@ mod tests {
     fn test_validation_event_gradient_serialization() {
         let event = ValidationEvent::GradientValidationPerformed {
             execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
             iteration_number: 1,
             score: 0.9,
             confidence: 0.85,
@@ -578,6 +689,7 @@ mod tests {
     fn test_validation_event_consensus_serialization() {
         let event = ValidationEvent::MultiJudgeConsensus {
             execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
             judge_scores: vec![(AgentId::new(), 0.9), (AgentId::new(), 0.85)],
             final_score: 0.875,
             confidence: 0.9,
@@ -620,6 +732,7 @@ mod tests {
     #[test]
     fn test_policy_event_violation_serialization() {
         let event = PolicyEvent::PolicyViolationBlocked {
+            agent_id: AgentId::new(),
             violation_type: "network".to_string(),
             details: "Attempted access to evil.com".to_string(),
             blocked_at: Utc::now(),

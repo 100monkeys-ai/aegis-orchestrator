@@ -1,16 +1,27 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Lib
+//! # `aegis-sdk` — Rust SDK for AEGIS Agent Development (BC-10)
 //!
-//! Provides lib functionality for the system.
+//! Provides a fluent, type-safe API for declaring agent manifests, submitting
+//! executions, and watching iteration progress from Rust applications.
 //!
-//! # Architecture
+//! ## Crate Layout
 //!
-//! - **Layer:** Core System
-//! - **Purpose:** Implements lib
+//! | Module | Contents |
+//! |--------|----------|
+//! | [`client`] | [`AegisClient`] — HTTP/gRPC orchestrator client |
+//! | [`types`] | SDK-specific value objects (execution watchers, etc.) |
+//!
+//! ## Manifest Re-exports
+//!
+//! The SDK re-exports all manifest types directly from `aegis-core` so that
+//! SDK consumers have a single import path (e.g. `aegis_sdk::AgentManifest`)
+//! and always stay in sync with the orchestrator's canonical type definitions.
+//!
+//! See AGENTS.md §BC-10 Client SDK Context.
 
 /// AEGIS Rust SDK
-/// 
+///
 /// Build secure, autonomous agents with the AEGIS runtime.
 
 pub mod client;

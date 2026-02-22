@@ -1,13 +1,26 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Repository
+//! # Domain Repository Interfaces (AGENTS.md §Repository Patterns)
 //!
-//! Provides repository functionality for the system.
+//! Persistence contracts for each aggregate root, following the DDD Repository
+//! pattern: one repository per aggregate, interface defined in the domain layer,
+//! implemented in `crate::infrastructure::repositories`.
 //!
-//! # Architecture
+//! | Trait | Aggregate | Implementations |
+//! |-------|-----------|----------------|
+//! | `AgentRepository` | `Agent` | `InMemoryAgentRepository`, `PostgresAgentRepository` |
+//! | `ExecutionRepository` | `Execution` | `InMemoryExecutionRepository` |
+//! | `WorkflowRepository` | `Workflow` | `InMemoryWorkflowRepository` |
+//! | `VolumeRepository` | `Volume` | `InMemoryVolumeRepository`, `PostgresVolumeRepository` |
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements repository
+//! ## Storage Backend Abstraction
+//!
+//! Concrete implementations are selected at orchestrator startup based on
+//! configuration (`aegis-config.yaml`). In-memory implementations are used
+//! for development and testing; PostgreSQL implementations (ADR-025) for
+//! production.
+//!
+//! See AGENTS.md §Repository Patterns, ADR-025 (PostgreSQL Schema).
 
 // Repository Pattern - Storage Backend Abstraction
 //

@@ -1,13 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Db
+//! # PostgreSQL Connection Pool (ADR-025)
 //!
-//! Provides db functionality for the system.
+//! Wraps `sqlx::postgres::PgPool` in a thin `Database` newtype that can be
+//! injected into all PostgreSQL repository implementations.
 //!
-//! # Architecture
+//! ⚠️ Phase 1 — Most repositories use in-memory implementations. This module
+//! is required only for Phase 2+ production deployments where PostgreSQL
+//! persistence is enabled via `aegis-config.yaml`.
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements db
+//! See ADR-025 (PostgreSQL Schema Design).
 
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use anyhow::Result;

@@ -117,11 +117,14 @@ async fn test_validation_event_streaming() {
     
     // Updated to use tuples with weights (judge_id, weight)
     let judges = vec![(AgentId::new(), 1.0)];
+    let test_agent_id = AgentId::new();
     
     // Spawn validation in background
     let handle = tokio::spawn(async move {
         val_service.validate_with_judges(
             execution_id,
+            test_agent_id,
+            1, // iteration_number
             request,
             judges,
             None,  // Use default consensus config

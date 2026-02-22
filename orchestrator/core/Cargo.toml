@@ -45,9 +45,15 @@ parking_lot = "0.12"
 aegis-cortex = { path = "../../cortex" }
 url = "2.5.8"
 
+# Cryptography & Security (SMCP)
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+base64 = "0.22"
+jsonwebtoken = "9.3.0"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.10"
+rand = "0.8"
 
 [build-dependencies]
 tonic-build = "0.13"

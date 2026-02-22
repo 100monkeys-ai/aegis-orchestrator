@@ -1,13 +1,22 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Supervisor
+//! # Execution Supervisor Domain Service — BC-2 (ADR-005)
 //!
-//! Provides supervisor functionality for the system.
+//! Orchestrates the top-level execution loop for the **100monkeys Algorithm**:
+//! evaluate each `ValidationResult` returned by judge agents, decide whether
+//! to continue iterating (refine → retry) or terminate (success/exhausted),
+//! and apply refinement code diffs between iterations.
 //!
-//! # Architecture
+//! Called from `StandardExecutionService` after each iteration completes.
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements supervisor
+//! ## Loop Decision Table
+//! | Validation Score | Action |
+//! |-----------------|--------|
+//! | ≥ success threshold | Mark `Success`, stop loop |
+//! | < threshold, iterations remaining | Apply `Refinement`, continue |
+//! | < threshold, max iterations reached | Mark `Failed` |
+//!
+//! See ADR-005 (Iterative Execution Strategy).
 
 // ============================================================================
 // ADR-005: Iterative Execution Strategy (100monkeys Algorithm)
@@ -78,7 +87,7 @@ impl Supervisor {
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
-        // TODO: Handle payload merge into context if needed
+        // Payload merge into context is handled by ExecutionService::prepare_execution_input
         
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
@@ -177,7 +186,8 @@ impl Supervisor {
             }));
             
             // For now, we return the first successful execution.
-            // TODO: In workflow mode, the workflow FSM decides when to stop iterating.
+            // Workflow-driven iteration is handled by WorkflowEngine.tick() which
+            // controls when to invoke Supervisor.run_loop(). See ADR-015.
             return Ok(stdout);
         }
 

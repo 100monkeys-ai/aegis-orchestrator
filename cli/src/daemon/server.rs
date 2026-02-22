@@ -526,10 +526,78 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(cortex_service.clone()),
     ));
 
+    // --- Initialize SMCP / Tool Routing Services ---
+    println!("Initializing SMCP & Tool Routing services...");
+    
+    // Repositories
+    let security_context_repo: Arc<dyn aegis_core::domain::security_context::repository::SecurityContextRepository> = 
+        Arc::new(aegis_core::infrastructure::security_context::InMemorySecurityContextRepository::new());
+        
+    let smcp_session_repo: Arc<dyn aegis_core::domain::smcp_session_repository::SmcpSessionRepository> = 
+        Arc::new(aegis_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new());
+        
+    // Token Issuer (using a hardcoded dev key for MVP as per ADR-035/ADR-034 delay)
+    let dev_private_key = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----";
+    let token_issuer = Arc::new(aegis_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(dev_private_key, "aegis-orchestrator").unwrap());
+    
+    // Application Services
+    let attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService> = 
+        Arc::new(aegis_core::application::attestation_service::AttestationServiceImpl::new(
+            security_context_repo.clone(),
+            smcp_session_repo.clone(),
+            token_issuer,
+        ));
+        
+    let smcp_middleware = Arc::new(aegis_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
+    let tool_registry = Arc::new(aegis_core::infrastructure::tool_router::InMemoryToolRegistry::new());
+    
+    // Shared tool servers state
+    let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    
+    // Load configured servers from NodeConfig
+    if let Some(mcp_configs) = &config.spec.mcp_servers {
+        let mut servers_lock = tool_servers.write().await;
+        for srv_cfg in mcp_configs {
+            if srv_cfg.enabled {
+                let tool_server = aegis_core::domain::mcp::ToolServer::from_config(srv_cfg);
+                servers_lock.insert(tool_server.id, tool_server);
+            }
+        }
+    }
+    
+    let tool_router = Arc::new(aegis_core::infrastructure::tool_router::ToolRouter::new(
+        tool_registry.clone(),
+        tool_servers.clone()
+    ));
+    
+    // Build initial capabilities index
+    tool_router.rebuild_index().await;
+    
+    let tool_manager = Arc::new(aegis_core::infrastructure::tool_router::ToolServerManager::new(
+        tool_registry,
+        tool_servers.clone(),
+        event_bus.clone()
+    ));
+    
+    // Start MCP servers and spawn health check loop
+    let tool_manager_clone = tool_manager.clone();
+    tokio::spawn(async move {
+        if let Err(e) = tool_manager_clone.start_all().await {
+            tracing::error!("Failed to start some MCP servers: {}", e);
+        }
+        tool_manager_clone.health_check_loop().await;
+    });
+    
+    let tool_invocation_service = Arc::new(aegis_core::application::tool_invocation_service::ToolInvocationService::new(
+        smcp_session_repo.clone(),
+        smcp_middleware,
+        tool_router,
+    ));
+
     let app_state = AppState {
         agent_service,
         execution_service: execution_service.clone(),
-        event_bus,
+        event_bus: event_bus.clone(),
         _llm_registry: llm_registry,
         human_input_service: human_input_service.clone(),
         temporal_event_listener,
@@ -537,6 +605,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         start_workflow_execution_use_case,
         workflow_repo: workflow_repo.clone(),
         temporal_client_container: temporal_client_container.clone(),
+        tool_invocation_service: tool_invocation_service.clone(),
         start_time: std::time::Instant::now(),
     };
 
@@ -571,9 +640,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let grpc_addr: std::net::SocketAddr = grpc_addr_str.parse()
         .with_context(|| format!("Failed to parse gRPC address: {}", grpc_addr_str))?;
 
+    // Tool routing services moved above AppState!
+
+    // Seed default security context for testing
+    tokio::spawn({
+        let sec_repo = security_context_repo.clone();
+        async move {
+            let default_context = aegis_core::domain::security_context::SecurityContext {
+                name: "default".to_string(),
+                description: "Default unrestricted context for MVP testing".to_string(),
+                capabilities: vec![
+                    aegis_core::domain::security_context::capability::Capability {
+                        tool_pattern: "*".to_string(),
+                        path_allowlist: None,
+                        command_allowlist: None,
+                        domain_allowlist: None,
+                        rate_limit: None,
+                        max_response_size: None,
+                    }
+                ],
+                deny_list: vec![],
+                metadata: aegis_core::domain::security_context::SecurityContextMetadata {
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    version: 1,
+                },
+            };
+            let _ = sec_repo.save(default_context).await;
+        }
+    });
+
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
+    let cortex_service_clone = cortex_service.clone();
     
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -581,7 +681,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         if let Err(e) = aegis_core::presentation::grpc::server::start_grpc_server(
             grpc_addr,
             exec_service_clone,
-            val_service_clone
+            val_service_clone,
+            Some(cortex_service_clone),
+            None, // embedding client not passed through app state yet in this snippet
+            Some(attestation_service),
+            Some(tool_invocation_service),
         ).await {
              tracing::error!("gRPC server failed: {}", e);
              eprintln!("gRPC server failed: {}", e);
@@ -782,6 +886,7 @@ struct AppState {
     start_workflow_execution_use_case: Arc<StandardStartWorkflowExecutionUseCase>,
     workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
     temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>>>,
+    tool_invocation_service: Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
     start_time: std::time::Instant,
 }
 
@@ -1476,89 +1581,124 @@ async fn llm_generate_handler(
         aegis_core::domain::agent::AgentId(Uuid::nil())
     };
     
-    match registry.generate(alias, &req.prompt, &options).await {
-        Ok(response) => {
-            if agent_id.0 != Uuid::nil() {
-                if let Some(exec_id) = req.execution_id {
-                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
-                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
-                        agent_id: agent_id.clone(),
-                        iteration_number: req.iteration_number.unwrap_or(0),
-                        provider: response.provider.clone(),
-                        model: response.model.clone(),
-                        input_tokens: Some(response.usage.prompt_tokens),
-                        output_tokens: Some(response.usage.completion_tokens),
-                        prompt: req.prompt.clone(),
-                        response: response.text.clone(),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    state.event_bus.publish_execution_event(event);
-                    
-                    // Persist interaction
-                    let interaction = aegis_core::domain::execution::LlmInteraction {
-                        provider: response.provider.clone(),
-                        model: response.model.clone(),
-                        prompt: req.prompt.clone(),
-                        response: response.text.clone(),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    let _ = state.execution_service.record_llm_interaction(
-                        aegis_core::domain::execution::ExecutionId(exec_id), 
-                        req.iteration_number.unwrap_or(0), 
-                        interaction
-                    ).await;
-                }
-            }
-            
-            (StatusCode::OK, Json(serde_json::json!({
-                "content": response.text,
-                "usage": {
-                    "prompt_tokens": response.usage.prompt_tokens,
-                    "completion_tokens": response.usage.completion_tokens,
-                    "total_tokens": response.usage.total_tokens
-                },
-                "provider": response.provider,
-                "model": response.model
-            })))
-        },
-        Err(e) => {
-            tracing::error!("LLM generation failed: {}", e);
+    let mut current_prompt = req.prompt.clone();
+    let mut final_response_text = String::new();
+    let mut final_usage = aegis_core::domain::llm::TokenUsage::default();
+    let mut final_provider = "unknown".to_string();
+    let mut final_model = alias.to_string();
 
-            if agent_id.0 != Uuid::nil() {
-                if let Some(exec_id) = req.execution_id {
-                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
-                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
-                        agent_id: agent_id.clone(),
-                        iteration_number: req.iteration_number.unwrap_or(0),
-                        provider: "unknown".to_string(),
-                        model: alias.to_string(),
-                        input_tokens: None,
-                        output_tokens: None,
-                        prompt: req.prompt.clone(),
-                        response: format!("ERROR: {}", e),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    state.event_bus.publish_execution_event(event);
-
-                    // Persist interaction
-                    let interaction = aegis_core::domain::execution::LlmInteraction {
-                        provider: "unknown".to_string(),
-                        model: alias.to_string(),
-                        prompt: req.prompt.clone(),
-                        response: format!("ERROR: {}", e),
-                        timestamp: chrono::Utc::now(),
-                    };
-                    let _ = state.execution_service.record_llm_interaction(
-                        aegis_core::domain::execution::ExecutionId(exec_id), 
-                        req.iteration_number.unwrap_or(0), 
-                        interaction
-                    ).await;
-                }
-            }
-
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
+    // Inject Tool Schemas for Gateway Tool Routing
+    if let Ok(tools) = state.tool_invocation_service.get_available_tools().await {
+        if !tools.is_empty() {
+            let tools_json = serde_json::to_string_pretty(&tools).unwrap_or_default();
+            current_prompt.push_str(&format!(
+                "\n\n[SYSTEM: You have access to the following tools]\n{}\n[To use a tool, you MUST output EXACTLY the following format and nothing else in that block:]\n<tool_call>{{\"name\": \"tool_name\", \"args\": {{\"arg1\": \"value\"}}}}</tool_call>",
+                tools_json
+            ));
         }
     }
+
+    for _loop_idx in 0..10 {
+        match registry.generate(alias, &current_prompt, &options).await {
+            Ok(response) => {
+                // Record usage and provider info
+                final_usage.prompt_tokens += response.usage.prompt_tokens;
+                final_usage.completion_tokens += response.usage.completion_tokens;
+                final_usage.total_tokens += response.usage.total_tokens;
+                final_provider = response.provider.clone();
+                final_model = response.model.clone();
+
+                let text = response.text.clone();
+                let mut tool_called = false;
+
+                // Log the interaction
+                if agent_id.0 != Uuid::nil() {
+                    if let Some(exec_id) = req.execution_id {
+                        let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                            execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                            agent_id: agent_id.clone(),
+                            iteration_number: req.iteration_number.unwrap_or(0),
+                            provider: response.provider.clone(),
+                            model: response.model.clone(),
+                            input_tokens: Some(response.usage.prompt_tokens),
+                            output_tokens: Some(response.usage.completion_tokens),
+                            prompt: current_prompt.clone(),
+                            response: response.text.clone(),
+                            timestamp: chrono::Utc::now(),
+                        };
+                        state.event_bus.publish_execution_event(event);
+                        
+                        let interaction = aegis_core::domain::execution::LlmInteraction {
+                            provider: response.provider.clone(),
+                            model: response.model.clone(),
+                            prompt: current_prompt.clone(),
+                            response: response.text.clone(),
+                            timestamp: chrono::Utc::now(),
+                        };
+                        let _ = state.execution_service.record_llm_interaction(
+                            aegis_core::domain::execution::ExecutionId(exec_id), 
+                            req.iteration_number.unwrap_or(0), 
+                            interaction
+                        ).await;
+                    }
+                }
+
+                // Parse for tool output block: <tool_call>{"name": "...", "args": {...}}</tool_call>
+                if let Some(start) = text.find("<tool_call>") {
+                    if let Some(end) = text[start..].find("</tool_call>") {
+                        let json_str = &text[start + 11..start + end];
+                        if let Ok(tool_data) = serde_json::from_str::<serde_json::Value>(json_str) {
+                            if let (Some(name), Some(args)) = (tool_data.get("name").and_then(|n| n.as_str()), tool_data.get("args")) {
+                                if let Some(exec_id_uuid) = req.execution_id {
+                                    tracing::info!("Gateway intercepted tool call: {}", name);
+                                    let execution_id = aegis_core::domain::execution::ExecutionId(exec_id_uuid);
+                                    let result = state.tool_invocation_service.invoke_tool_internal(
+                                        &agent_id,
+                                        execution_id,
+                                        name.to_string(),
+                                        args.clone()
+                                    ).await;
+                                    
+                                    let tool_result_str = match result {
+                                        Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_string()),
+                                        Err(e) => format!("{{\"error\": \"{}\"}}", e),
+                                    };
+                                    
+                                    current_prompt.push_str(&format!("\n\nAssistant generated tool call:\n{}\n\nTool Execution Result:\n{}\n", text, tool_result_str));
+                                    tool_called = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !tool_called {
+                    // This is the final answer!
+                    final_response_text = text;
+                    break;
+                }
+            },
+            Err(e) => {
+                tracing::error!("LLM generation failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})));
+            }
+        }
+    }
+
+    if final_response_text.is_empty() {
+        final_response_text = "ERROR: Exceeded maximum tool call loop iterations".to_string();
+    }
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "content": final_response_text,
+        "usage": {
+            "prompt_tokens": final_usage.prompt_tokens,
+            "completion_tokens": final_usage.completion_tokens,
+            "total_tokens": final_usage.total_tokens
+        },
+        "provider": final_provider,
+        "model": final_model
+    })))
 }
 
 // ========================================

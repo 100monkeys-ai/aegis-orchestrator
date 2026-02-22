@@ -24,6 +24,12 @@ service AegisRuntime {
   
   // Store a learned pattern in Cortex
   rpc StoreCortexPattern(StoreCortexPatternRequest) returns (StoreCortexPatternResponse);
+  
+  // Attest an agent to receive an SMCP Security Token
+  rpc AttestAgent(AttestAgentRequest) returns (AttestAgentResponse);
+  
+  // Invoke a tool via orchestrator mediation (SMCP)
+  rpc InvokeTool(InvokeToolRequest) returns (InvokeToolResponse);
 }
 
 // =============================================================================
@@ -241,4 +247,29 @@ message StoreCortexPatternResponse {
   string pattern_id = 1;
   bool deduplicated = 2; // true if pattern already existed and weight was incremented
   uint32 new_frequency = 3;
+}
+
+// =============================================================================
+// SMCP / MCP Routing RPCs
+// =============================================================================
+
+message AttestAgentRequest {
+  string agent_id = 1;
+  string execution_id = 2;
+  string container_id = 3;
+  string public_key_pem = 4;
+}
+
+message AttestAgentResponse {
+  string security_token = 1;
+}
+
+message InvokeToolRequest {
+  string security_token = 1;
+  string signature = 2;
+  bytes inner_mcp = 3; // The JSON-RPC payload representing the MCP tool call
+}
+
+message InvokeToolResponse {
+  bytes result_json = 1; // Success or failure JSON result wrapped
 }

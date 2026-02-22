@@ -1,14 +1,31 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Volume
+//! # Volume Domain Aggregate (BC-7, ADR-032/036)
 //!
-//! Provides volume functionality for the system.
+//! Defines the `Volume` aggregate root and its associated value objects for
+//! the Storage Gateway bounded context.
 //!
-//! # Architecture
+//! ## Storage Classes
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements volume
-//! - **Related ADRs:** ADR-032: Unified Storage via SeaweedFS
+//! | Class | Lifecycle | Notes |
+//! |-------|-----------|-------|
+//! | `Ephemeral` | TTL-based; GC on schedule | Created and destroyed per execution |
+//! | `Persistent` | Manual deletion only | Survives execution; referenced by name |
+//!
+//! ## Volume Ownership
+//!
+//! `VolumeOwnership` tracks whether a volume belongs to a specific `Execution`
+//! (ephemeral) or is a named persistent volume. Used by `VolumeService` to
+//! resolve volumes during execution provisioning.
+//!
+//! ## NFS Integration
+//!
+//! Volumes are mounted into agent containers via the NFS Server Gateway
+//! (ADR-036). The `Volume.remote_path` field is the NFS export path;
+//! `VolumeMount.mount_point` is the path inside the container.
+//!
+//! See ADR-032 (Unified Storage via SeaweedFS), ADR-036 (NFS Server Gateway),
+//! AGENTS.md §Volume, AGENTS.md §StorageClass.
 
 use uuid::Uuid;
 use chrono::{DateTime, Duration, Utc};

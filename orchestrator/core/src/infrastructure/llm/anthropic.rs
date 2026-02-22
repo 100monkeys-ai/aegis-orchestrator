@@ -1,13 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Anthropic
+//! # Anthropic Adapter — ADR-009
 //!
-//! Provides anthropic functionality for the system.
+//! Implements the `LLMProvider` domain trait for Anthropic `claude-*` models.
+//! Acts as an **Anti-Corruption Layer** (ACL): translates AEGIS domain types
+//! into Anthropic's Messages API payloads and back.
 //!
-//! # Architecture
+//! ## Supported Model Aliases
+//! `claude-3-5-sonnet`, `claude-3-5-haiku`, `claude-3-opus`
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements anthropic
+//! See ADR-009 (BYOLLM Provider Strategy).
 
 // Anthropic LLM Provider Adapter
 //

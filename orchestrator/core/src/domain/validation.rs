@@ -1,13 +1,27 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Validation
+//! # Gradient Validation Domain (BC-4, ADR-017)
 //!
-//! Provides validation functionality for the system.
+//! Implements the Gradient Validation System: instead of binary pass/fail,
+//! agent outputs are scored on a continuous `0.0 – 1.0` scale allowing ranking,
+//! threshold-based acceptance, and multi-judge consensus.
 //!
-//! # Architecture
+//! ## Key Concepts
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements validation
+//! | Type | Description |
+//! |------|-------------|
+//! | `ValidationScore` | `f64` between 0.0 (reject) and 1.0 (perfect) |
+//! | `ValidationResult` | Score + confidence + optional judge breakdown |
+//! | `ValidationConfig` | Threshold + validators declared in agent manifest |
+//!
+//! ## Judge Agent Integration
+//!
+//! Judge agents (ADR-016) produce `ValidationResult`s that feed into this
+//! module. Multiple judges’ scores are aggregated via weighted average
+//! (consensus) to produce the final gradient score for an iteration.
+//!
+//! See ADR-016 (Agent-as-Judge Pattern), ADR-017 (Gradient Validation System),
+//! AGENTS.md §Gradient Validation Domain.
 
 use serde::{Serialize, Deserialize};
 use thiserror::Error;

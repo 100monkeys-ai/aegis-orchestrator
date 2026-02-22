@@ -1,13 +1,16 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Mod
+//! # Cortex Application Layer (BC-5, ADR-018/024)
 //!
-//! Provides mod functionality for the system.
+//! Use-case interfaces and supporting traits for the learning and memory subsystem.
 //!
-//! # Architecture
+//! | Symbol | Purpose |
+//! |--------|---------|
+//! | [`VectorStore`] | Abstraction over vector similarity search backends |
+//! | [`CortexService`] | Main use-case trait: store, search, reinforce patterns |
+//! | [`CortexPruner`] | Scheduled garbage collection of low-weight patterns |
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements mod
+//! See ADR-018 (Weighted Memory), ADR-024 (Holographic Memory).
 
 use async_trait::async_trait;
 use crate::domain::pattern::CortexPattern;

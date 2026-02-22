@@ -1,13 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Postgres Agent
+//! # PostgreSQL Agent Repository — ADR-025
 //!
-//! Provides postgres agent functionality for the system.
+//! Production `AgentRepository` implementation backed by the `agents` table
+//! in PostgreSQL via `sqlx`. Translates between the `Agent` domain aggregate
+//! and the `agents` / `agent_manifests` relational schema.
 //!
-//! # Architecture
+//! ⚠️ Phase 2 — In-memory repository (`InMemoryAgentRepository`) is used in
+//! Phase 1. This implementation requires an active `PgPool` connection.
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements postgres agent
+//! See ADR-025 (PostgreSQL Schema Design and Migration Strategy).
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;

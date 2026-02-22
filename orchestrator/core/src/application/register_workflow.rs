@@ -79,7 +79,7 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
 
 /// Standard implementation of RegisterWorkflowUseCase
 pub struct StandardRegisterWorkflowUseCase {
-    #[allow(dead_code)]
+    /// WorkflowParser instance (static method currently used; held for future config-driven parsing)
     workflow_parser: Arc<WorkflowParser>,
     workflow_repository: Arc<dyn WorkflowRepository>,
     temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
