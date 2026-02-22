@@ -1,13 +1,22 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Node Config
+//! # Node Configuration Domain Types
 //!
-//! Provides node config functionality for the system.
+//! Represents the runtime configuration of an **Aegis Node** — the machine
+//! running the orchestrator host service. Loaded from `aegis-config.yaml`
+//! at startup and validated before any other subsystem initialises.
 //!
-//! # Architecture
+//! ## Top-Level Sections
+//! | Section | Purpose |
+//! |---------|---------|
+//! | `runtime` | Docker socket path, Firecracker binary (Phase 2) |
+//! | `storage` | SeaweedFS filer endpoints, local volume root |
+//! | `nfs_gateway` | Bind address / port for NFS Server Gateway |
+//! | `llm` | Provider credentials and model aliases |
+//! | `openbao` | Secrets backend connection (Phase 4) |
+//! | `telemetry` | OTLP exporter endpoints |
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements node config
+//! See AGENTS.md §Aegis Node, §Aegis Host.
 
 // Node Configuration Types - Implements NODE_CONFIGURATION_SPEC_V1.md
 //

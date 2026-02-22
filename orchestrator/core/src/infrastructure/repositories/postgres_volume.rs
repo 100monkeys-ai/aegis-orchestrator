@@ -1,13 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Postgres Volume
+//! # PostgreSQL Volume Repository — ADR-025/032
 //!
-//! Provides postgres volume functionality for the system.
+//! Production `VolumeRepository` implementation backed by the `volumes` table
+//! in PostgreSQL via `sqlx`. Handles `StorageClass` serialisation, TTL
+//! persistence for ephemeral volumes, and VolumeEvent reconstruction.
 //!
-//! # Architecture
+//! ⚠️ Phase 2 — In-memory repository is used in Phase 1. This implementation
+//! requires an active `PgPool` connection.
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements postgres volume
+//! See ADR-025 (PostgreSQL Schema), ADR-032 (Unified Storage via SeaweedFS).
 
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;

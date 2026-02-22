@@ -1,14 +1,45 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Event Bus
+//! # Domain Event Bus (ADR-030)
 //!
-//! Provides event bus functionality for the system.
+//! In-memory pub/sub event bus based on `tokio::sync::broadcast`. Every domain
+//! aggregate publishes [`DomainEvent`]s here; infrastructure adapters (CLI
+//! streamer, SSE endpoint, Cortex indexer) subscribe independently.
 //!
-//! # Architecture
+//! ## Event Flow
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements event bus
-//! - **Related ADRs:** ADR-030: Event Bus Architecture
+//! ```text
+//! Execution aggregate
+//!   │  publish_execution_event(IterationCompleted { .. })
+//!   ▼
+//! EventBus  (broadcast channel, capacity 1000)
+//!   ├── CLI subscriber  →  prints progress to terminal
+//!   ├── SSE subscriber  →  streams to Control Plane WebSocket
+//!   └── Cortex subscriber → indexes RefinementApplied patterns
+//! ```
+//!
+//! ## Bounded Context Coverage
+//!
+//! The [`DomainEvent`] enum wraps events from **all** bounded contexts so a
+//! single subscriber type can observe the whole system:
+//!
+//! | Variant | Source BC | ADR |
+//! |---------|-----------|-----|
+//! | `AgentLifecycle` | BC-1 | — |
+//! | `Execution` | BC-2 | ADR-005 |
+//! | `Workflow` | BC-3 | ADR-015 |
+//! | `Volume` | BC-7 | ADR-032 |
+//! | `Storage` | BC-7 | ADR-036 |
+//! | `MCP` | BC-4/Tools | ADR-033 |
+//! | `Learning` / `Cortex` | BC-5 | ADR-018 |
+//! | `Policy` | BC-4 | — |
+//!
+//! ## Phase Notes
+//!
+//! ⚠️ Phase 1 — In-memory only; events are lost on orchestrator restart.
+//! Phase 2 will add a persistent event store for replay capability (ADR-030).
+//!
+//! See ADR-030 (Event Bus Architecture).
 
 // Event Bus Implementation - Pub/Sub for Domain Events
 //
@@ -18,7 +49,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent};
 use aegis_cortex::domain::events::CortexEvent;
 use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
@@ -291,16 +322,38 @@ impl AgentEventReceiver {
                 ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
-                ExecutionEvent::Validation(_) => false, // TODO: Add agent_id to ValidationEvent for filtering
-                ExecutionEvent::Cortex(_) => false,
+                ExecutionEvent::Validation(v) => match v {
+                    ValidationEvent::GradientValidationPerformed { agent_id, .. } => agent_id == &self.agent_id,
+                    ValidationEvent::MultiJudgeConsensus { agent_id, .. } => agent_id == &self.agent_id,
+                },
+                ExecutionEvent::Cortex(_) => false, // Cortex events are global, not agent-filterable
             },
-            DomainEvent::Learning(_) => false, // TODO: Link learning to agent
-            DomainEvent::Workflow(_) => false, // TODO: Link workflow events to agent if needed
-            DomainEvent::Cortex(_) => false,
-            DomainEvent::Policy(_) => false, // TODO: Link policy to agent
-            DomainEvent::Volume(_) => false, // TODO: Link volume events to agent if needed
-            DomainEvent::Storage(_) => false, // TODO: Link storage events to agent if needed
-            DomainEvent::MCP(_) => false, // TODO: Link MCP events to agent if needed
+            DomainEvent::Learning(e) => match e {
+                LearningEvent::PatternDiscovered { agent_id, .. } => agent_id == &self.agent_id,
+                LearningEvent::PatternReinforced { agent_id, .. } => agent_id == &self.agent_id,
+                LearningEvent::PatternDecayed { agent_id, .. } => agent_id == &self.agent_id,
+            },
+            DomainEvent::Workflow(_) => false, // Workflow events are system-wide, not per-agent
+            DomainEvent::Cortex(_) => false, // Cortex events are global
+            DomainEvent::Policy(e) => match e {
+                PolicyEvent::PolicyViolationAttempted { agent_id, .. } => agent_id == &self.agent_id,
+                PolicyEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
+            },
+            DomainEvent::Volume(_) => false, // Not agent-filterable: carries execution_id, not agent_id
+            DomainEvent::Storage(_) => false, // Not agent-filterable: carries execution_id, not agent_id
+            DomainEvent::MCP(e) => match e {
+                MCPToolEvent::InvocationRequested { agent_id, .. } => agent_id == &self.agent_id,
+                MCPToolEvent::InvocationCompleted { agent_id, .. } => agent_id == &self.agent_id,
+                MCPToolEvent::InvocationFailed { agent_id, .. } => agent_id == &self.agent_id,
+                MCPToolEvent::PolicyViolation { agent_id, .. } => agent_id == &self.agent_id,
+                // Server lifecycle and InvocationStarted events are global (no agent_id)
+                MCPToolEvent::ServerRegistered { .. }
+                | MCPToolEvent::ServerStarted { .. }
+                | MCPToolEvent::ServerStopped { .. }
+                | MCPToolEvent::ServerFailed { .. }
+                | MCPToolEvent::ServerUnhealthy { .. }
+                | MCPToolEvent::InvocationStarted { .. } => false,
+            },
         }
     }
 }

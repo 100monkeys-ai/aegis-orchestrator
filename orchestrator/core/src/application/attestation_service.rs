@@ -1,5 +1,36 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! # Attestation Service (BC-12, ADR-035 §4.1)
+//!
+//! Application service that implements the SMCP attestation ceremony:
+//! the one-time handshake by which an agent proves its identity and receives
+//! a `SecurityToken` that authorises future MCP tool calls.
+//!
+//! ## Attestation Flow
+//!
+//! ```text
+//! Agent container
+//!   │  AttestationRequest { agent_id, execution_id, public_key_pem }
+//!   ▼
+//! AttestationServiceImpl.attest()
+//!   1. Resolve SecurityContext for execution (loads from registry)
+//!   2. Build ContextClaims (agent/exec IDs, 1hr expiry)
+//!   3. SecurityTokenIssuer.issue()  →  RS256 JWT signed by orchestrator key
+//!   4. Create SmcpSession  (stores session + public key)
+//!   5. SmcpSessionRepository.save(session)
+//!   ──────────────────────────────────────────────────────────────────────────
+//!   AttestationResponse { security_token: JWT }
+//!   ▼
+//! Agent container  ← uses JWT in every subsequent SmcpEnvelope
+//! ```
+//!
+//! ## Phase Note
+//!
+//! ⚠️ Phase 1 — Context resolution hard-codes `"default"` as the security context
+//! name. Phase 2 will look up the context name from the agent manifest via the
+//! `ExecutionRepository`.
+//!
+//! See ADR-035 §4.1, AGENTS.md §Attestation.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -14,6 +45,11 @@ use crate::infrastructure::smcp::attestation::{AttestationRequest, AttestationRe
 use crate::infrastructure::smcp::envelope::ContextClaims;
 use crate::infrastructure::smcp::signature::SecurityTokenIssuer;
 
+/// Concrete implementation of the SMCP attestation ceremony.
+///
+/// Orchestrates the three domain/infrastructure dependencies needed to
+/// complete a full attestation: context lookup, JWT issuance, and session
+/// persistence.
 pub struct AttestationServiceImpl {
     security_context_repo: Arc<dyn SecurityContextRepository>,
     smcp_session_repo: Arc<dyn SmcpSessionRepository>,

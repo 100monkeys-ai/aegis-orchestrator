@@ -1,12 +1,28 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! CortexService - Application service for pattern storage and retrieval
-//! Implements ADR-018 (Weighted Cortex Memory) and ADR-024 (Holographic Cortex)
+//! # CortexService — Pattern Storage & Retrieval (BC-5, ADR-018/024)
 //!
-//! # Architecture
+//! Application service implementing the 100monkeys learning loop:
+//! every failed→refined iteration is stored as a [`CortexPattern`], enabling
+//! semantic retrieval at the start of future executions that encounter the same
+//! error class.
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements internal responsibilities for cortex service
+//! ## Deduplication
+//!
+//! When a new pattern's embedding similarity to an existing pattern exceeds
+//! `deduplication_threshold` (default 0.95), the existing pattern's `weight`
+//! is incremented instead of creating a duplicate. This prevents the store
+//! from growing unboundedly on common errors (ADR-018 §Weight).
+//!
+//! ## Reinforcement Signals
+//!
+//! - **Dopamine** (`apply_dopamine`): Boost `success_rate` and `weight` when
+//!   a pattern led to a successful execution.
+//! - **Cortisol** (`apply_cortisol`): Penalise `success_rate` when a pattern
+//!   was tried and failed, marking it less likely to be retrieved again.
+//!
+//! See ADR-018 (Weighted Cortex Memory), ADR-024 (Holographic Cortex Memory),
+//! ADR-029 (Time-Decay Parameters).
 
 use std::sync::Arc;
 use async_trait::async_trait;

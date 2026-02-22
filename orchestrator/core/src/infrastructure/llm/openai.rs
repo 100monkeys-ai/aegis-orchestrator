@@ -1,13 +1,16 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Openai
+//! # OpenAI / Azure OpenAI Adapter — ADR-009
 //!
-//! Provides openai functionality for the system.
+//! Implements the `LLMProvider` domain trait for OpenAI `gpt-*` models and
+//! Azure OpenAI deployments. Acts as an **Anti-Corruption Layer** (ACL):
+//! translates AEGIS domain types (`CodeGenerationRequest`, `LLMResponse`) into
+//! OpenAI Chat Completions API payloads and back.
 //!
-//! # Architecture
+//! ## Supported Model Aliases
+//! `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o3-mini`
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements openai
+//! See ADR-009 (BYOLLM Provider Strategy).
 
 // OpenAI LLM Provider Adapter
 //

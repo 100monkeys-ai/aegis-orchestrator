@@ -1,13 +1,22 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Api
+//! # HTTP/SSE Presentation Layer — Axum (BC-2, BC-1)
 //!
-//! Provides api functionality for the system.
+//! Axum-based HTTP handlers for the orchestrator REST API and the
+//! Server-Sent Events (SSE) endpoint consumed by the Control Plane UI
+//! (`aegis-control-plane`) for real-time execution streaming (ADR-026).
 //!
-//! # Architecture
+//! All handlers delegate immediately to application-layer use cases.
+//! No business logic lives here — see AGENTS.md §Anti-Patterns §Smart UI.
 //!
-//! - **Layer:** Presentation Layer
-//! - **Purpose:** Implements api
+//! ## Route Surface
+//! | Method | Path | Handler |
+//! |--------|------|---------|
+//! | `POST` | `/agents` | deploy agent |
+//! | `POST` | `/agents/{id}/execute` | start execution |
+//! | `GET` | `/executions/{id}/stream` | SSE event stream |
+//! | `DELETE` | `/executions/{id}` | cancel execution |
+//! | `GET` | `/health` | liveness probe |
 
 use axum::{
     routing::{get, post},

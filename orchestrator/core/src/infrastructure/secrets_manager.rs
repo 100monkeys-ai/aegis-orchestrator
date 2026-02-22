@@ -1,14 +1,31 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Secrets Manager
+//! # Secrets Manager Stub (BC-11, ADR-034)
 //!
-//! Provides secrets manager functionality for the system.
+//! ⚠️ Phase 4 stub — **not yet implemented.**
 //!
-//! # Architecture
+//! This module is a forward-declaration placeholder for the OpenBao
+//! secrets management integration described in ADR-034. In Phase 1 all
+//! credentials are passed as environment variables to agent containers —
+//! no encryption at rest, no dynamic secrets, no audit trail.
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements secrets manager
-//! - **Related ADRs:** ADR-034: OpenBao Secrets Management
+//! ## Phase 4 Implementation Plan
+//!
+//! 1. **OpenBao Deployment** — HA cluster with Raft backend.
+//! 2. **AppRole Auth** — orchestrator nodes authenticate with Role ID + Secret ID.
+//! 3. **KV Engine** — static API keys stored at `<tenant>/kv/<name>`.
+//! 4. **Dynamic Secrets** — database credentials auto-rotated per `DynamicSecret.ttl`.
+//! 5. **Transit Engine** — `sign()` and `encrypt()` without key distribution.
+//! 6. **Keymaster Pattern** — only the orchestrator accesses OpenBao;
+//!    agents receive credentials via `spec.environment` injection, never via 
+//!    direct vault calls.
+//!
+//! ## Panics
+//!
+//! **Every method on [`SecretsManager`] panics** with `todo!()`. Do not call
+//! any method until Phase 4 is implemented.
+//!
+//! See ADR-034 (OpenBao Secrets Management), AGENTS.md §BC-11.
 
 // ============================================================================
 // ADR-034: OpenBao for Secrets Management (DEFERRED to Phase 4)
@@ -35,10 +52,14 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-/// Placeholder for OpenBao/Vault integration
-/// TODO: ADR-034 implementation for Phase 4
+/// ⚠️ Phase 4 stub — placeholder for ADR-034 OpenBao integration.
+///
+/// # Panics
+///
+/// `SecretsManager::new()` and all instance methods unconditionally panic
+/// with `todo!()`. Do not construct this type until Phase 4 is implemented.
 pub struct SecretsManager {
-    // TODO: VaultClient connection
+    // TODO: VaultClient connection (ADR-034)
 }
 
 impl SecretsManager {

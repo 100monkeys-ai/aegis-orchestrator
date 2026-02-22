@@ -1,13 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Mod
+//! # Swarm Domain Layer (BC-6)
 //!
-//! Provides mod functionality for the system.
+//! Pure domain types for multi-agent coordination. No I/O dependencies.
 //!
-//! # Architecture
+//! | Module | Key Types |
+//! |--------|-----------|
+//! | [`swarm`] | `Swarm`, `SwarmId`, `ResourceLock` |
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements mod
+//! See AGENTS.md §BC-6 Swarm Coordination Context.
 
 pub mod swarm;
 

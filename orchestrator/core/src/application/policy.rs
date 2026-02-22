@@ -1,13 +1,20 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Policy
+//! # Policy Application Service — BC-4
 //!
-//! Provides policy functionality for the system.
+//! Application service for validating and enforcing agent security policies.
+//! Bridges the manifest's `spec.security` stanza to the infrastructure-level
+//! runtime enforcement (container network rules, filesystem mount constraints).
 //!
-//! # Architecture
+//! Also acts as the orchestrator's entry point for **SMCP `SecurityContext`**
+//! management (create, update, list named permission boundaries).
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements policy
+//! ## Relationships
+//! - Consumes `PolicyValidator` domain service for structural validation
+//! - Consumes `PolicyEnforcer` infrastructure service for runtime enforcement
+//! - Publishes `PolicyViolationAttempted` / `PolicyViolationBlocked` events
+//!
+//! See AGENTS.md §BC-4 Security Policy Context, ADR-035 (SMCP).
 
 use crate::domain::policy::{SecurityPolicy, NetworkPolicy, FilesystemPolicy, ResourceLimits};
 use anyhow::Result;

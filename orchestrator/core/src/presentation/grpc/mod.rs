@@ -1,12 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Mod
+//! # gRPC Presentation Layer (ADR-026)
 //!
-//! Provides mod functionality for the system.
+//! Tonic-based gRPC service implementations.
 //!
-//! # Architecture
+//! | Module | Service | Notes |
+//! |--------|---------|-------|
+//! | [`server`] | `OrchestratorService` | Agent/execution/workflow management + event streaming |
 //!
-//! - **Layer:** Presentation Layer
-//! - **Purpose:** Implements mod
+//! The Control Plane UI (`aegis-control-plane`) and Zaru product
+//! (`aegis-zaru-deployment`) connect to this service for real-time
+//! execution event streaming (ADR-026 gRPC server-stream).
 
 pub mod server;

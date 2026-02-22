@@ -1,17 +1,54 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+//! # SMCP Envelope and JWT Claims (ADR-035 §3)
+//!
+//! Infrastructure implementation of the SMCP envelope format. An `SmcpEnvelope`
+//! is the outer wrapper that every MCP message from an agent must be wrapped in
+//! before the orchestrator will forward it to a tool server.
+//!
+//! ## Envelope Structure
+//!
+//! ```text
+//! SmcpEnvelope {
+//!     security_token: JWT (ContextClaims, signed by orchestrator)
+//!     signature:      base64(Ed25519_sign(inner_mcp, agent_private_key))
+//!     inner_mcp:      raw MCP JSON-RPC payload bytes
+//! }
+//! ```
+//!
+//! ## Verification
+//!
+//! `SmcpEnvelope` implements [`crate::domain::smcp_session::EnvelopeVerifier`]:
+//! - `verify_signature` decodes the signature and verifies it against `inner_mcp`
+//!   using the Ed25519 public key stored in the `SmcpSession`.
+//! - `extract_tool_name` / `extract_arguments` parse the `inner_mcp` JSON-RPC payload.
+//!
+//! See ADR-035 §3 (Protocol Wire Format).
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 
+/// The outer SMCP wrapper applied to every MCP message from an agent container.
+///
+/// An immutable value object: once constructed the fields must not be modified
+/// (the signature covers `inner_mcp` and would be invalidated by any change).
+///
+/// # Security
+///
+/// The envelope achieves **non-repudiation**: the agent cannot deny having sent
+/// a particular tool call because the `signature` is an Ed25519 signature over
+/// `inner_mcp` with a key that was bound during attestation. See ADR-035 §5.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpEnvelope {
+    /// Signed JWT (`SecurityToken`) issued during attestation. Encodes `ContextClaims`.
     pub security_token: String,
+    /// Base64-encoded Ed25519 signature over `inner_mcp` bytes.
     pub signature: String,
+    /// Raw MCP JSON-RPC payload bytes (method + params).
     pub inner_mcp: Vec<u8>,
 }
 
@@ -23,30 +60,34 @@ pub enum AudienceClaim {
     Multiple(Vec<String>),
 }
 
+/// JWT claims payload used in SMCP `SecurityToken`s.
+///
+/// The `ContextClaims` are signed by the orchestrator during attestation and
+/// embedded in every `SmcpEnvelope.security_token`. They bind the token to a
+/// specific agent execution and `SecurityContext`.
+///
+/// Standard JWT fields (`iss`, `aud`, `exp`, `iat`, `nbf`) follow RFC 7519.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClaims {
+    /// AEGIS `AgentId` (UUID string) — identifies the agent that was attested.
     pub agent_id: String,
+    /// AEGIS `ExecutionId` (UUID string) — binds the token to a single execution.
     pub execution_id: String,
+    /// Name of the `SecurityContext` assigned to this execution (e.g. `"research-safe"`).
     pub security_context: String,
-
     /// Issuer of the token (e.g. the orchestrator instance).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>,
-
-    /// Intended audience(s) for the token.
-    /// The JWT spec allows `aud` to be either a single string or an array of strings.
+    /// Intended audience(s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<AudienceClaim>,
-
-    /// Expiration time (as seconds since Unix epoch).
+    /// Expiration time (Unix epoch seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exp: Option<i64>,
-
-    /// Issued-at time (as seconds since Unix epoch).
+    /// Issued-at time (Unix epoch seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iat: Option<i64>,
-
-    /// Not-before time (as seconds since Unix epoch).
+    /// Not-before time (Unix epoch seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbf: Option<i64>,
 }

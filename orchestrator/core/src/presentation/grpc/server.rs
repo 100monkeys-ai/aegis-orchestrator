@@ -267,12 +267,15 @@ impl AegisRuntime for AegisRuntimeService {
             context,
         };
 
-        // TODO: Get actual execution_id from context
+        // TODO: Get actual execution_id and agent_id from context
         let dummy_exec_id = crate::domain::execution::ExecutionId::new();
+        let dummy_agent_id = crate::domain::agent::AgentId::new();
 
         // Call validation service with default configuration
         match self.validation_service.validate_with_judges(
-            dummy_exec_id, 
+            dummy_exec_id,
+            dummy_agent_id,
+            0, // iteration_number: not tracked in gRPC validation endpoint
             validation_req, 
             judge_configs,
             None, // Use default consensus config

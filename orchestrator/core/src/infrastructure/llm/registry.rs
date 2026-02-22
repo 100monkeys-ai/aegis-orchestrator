@@ -1,13 +1,21 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Registry
+//! # LLM Provider Registry — ADR-009
 //!
-//! Provides registry functionality for the system.
+//! `ProviderRegistry` selects the active `LLMProvider` implementation at
+//! runtime based on the `spec.runtime.model` field in the agent manifest.  
+//! Model-alias → adapter mapping:
 //!
-//! # Architecture
+//! | Alias prefix | Adapter |
+//! |--------------|-------------------|
+//! | `gpt-*`, `o1`, `o3-*` | `OpenAIAdapter` |
+//! | `claude-*` | `AnthropicAdapter` |
+//! | anything else | `OllamaAdapter` |
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements registry
+//! Credentials are resolved from node config at registration time and never
+//! stored on the `LLMProvider` trait object (Credential Isolation).
+//!
+//! See ADR-009 (BYOLLM Provider Strategy).
 
 // LLM Provider Registry - Model Alias Resolution and Provider Management
 //

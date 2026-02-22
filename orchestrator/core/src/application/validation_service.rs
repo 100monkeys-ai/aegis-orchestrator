@@ -96,6 +96,8 @@ impl ValidationService {
     pub async fn validate_with_judges(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
         request: ValidationRequest,
         judges: Vec<(AgentId, f64)>, // (judge_id, weight)
         config: Option<ConsensusConfig>,
@@ -147,7 +149,8 @@ impl ValidationService {
                         crate::domain::events::ExecutionEvent::Validation(
                             crate::domain::events::ValidationEvent::GradientValidationPerformed {
                                 execution_id,
-                                iteration_number: 0, // TODO: Pass iteration number from caller
+                                agent_id,
+                                iteration_number,
                                 score: result.score,
                                 confidence: result.confidence,
                                 validated_at: chrono::Utc::now(),
@@ -178,6 +181,7 @@ impl ValidationService {
             crate::domain::events::ExecutionEvent::Validation(
                 crate::domain::events::ValidationEvent::MultiJudgeConsensus {
                     execution_id,
+                    agent_id,
                     judge_scores: consensus.individual_results.iter().map(|(id, r)| (*id, r.score)).collect(),
                     final_score: consensus.final_score,
                     confidence: consensus.consensus_confidence,

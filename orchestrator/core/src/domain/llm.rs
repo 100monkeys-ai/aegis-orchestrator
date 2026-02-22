@@ -1,13 +1,20 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Llm
+//! # LLM Provider Domain Interface (ADR-009)
 //!
-//! Provides llm functionality for the system.
+//! Defines the `LLMProvider` domain trait (Anti-Corruption Layer) that insulates
+//! the orchestrator's business logic from vendor-specific LLM APIs.
 //!
-//! # Architecture
+//! Implementations live in `crate::infrastructure::llm`:
+//! - `openai.rs` — OpenAI `gpt-*` / Azure OpenAI
+//! - `anthropic.rs` — Anthropic `claude-*`
+//! - `ollama.rs` — Ollama local models (dev/offline)
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements llm
+//! The active provider is selected at runtime by
+//! `crate::infrastructure::llm::registry::ProviderRegistry` based on the
+//! agent manifest's `spec.runtime.model` field.
+//!
+//! See ADR-009 (BYOLLM Provider Strategy), AGENTS.md §Anti-Corruption Layer.
 
 // LLM Provider Domain Interface (Anti-Corruption Layer)
 //

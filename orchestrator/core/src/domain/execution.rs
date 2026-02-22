@@ -1,13 +1,32 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Execution
+//! # Execution Domain Aggregate (BC-2, ADR-005)
 //!
-//! Provides execution functionality for the system.
+//! Defines the `Execution` aggregate root and the `Iteration` entity that
+//! together implement the **100monkeys Algorithm** iterative refinement loop:
 //!
-//! # Architecture
+//! ```text
+//! start_execution
+//!   ▼
+//! Iteration 1: generate → execute → evaluate
+//!   ├─ success → ExecutionCompleted
+//!   └─ failure → RefinementApplied → Iteration 2 → … → Iteration N
+//!                                                    └─ max_iterations reached → ExecutionFailed
+//! ```
 //!
-//! - **Layer:** Domain Layer
-//! - **Purpose:** Implements execution
+//! ## Aggregate Invariants (see AGENTS.md §Execution Aggregate)
+//!
+//! - An `Execution` must have at least 1 `Iteration`.
+//! - At most `max_iterations` iterations (default 10).
+//! - Only one `Iteration` may be `Running` at a time.
+//! - Iteration numbers are sequential starting from 1.
+//!
+//! ## Recursive Execution
+//!
+//! Agents may spawn child agents. `Execution.depth` tracks the nesting level;
+//! `MAX_RECURSIVE_DEPTH` (defined in this module) prevents infinite recursion.
+//!
+//! See ADR-005 (Iterative Execution Strategy), AGENTS.md §Execution Context.
 
 use uuid::Uuid;
 use chrono::{DateTime, Utc};

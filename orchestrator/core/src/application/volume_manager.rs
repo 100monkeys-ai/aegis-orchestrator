@@ -1,18 +1,32 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Volume Manager Application Service
+//! # Volume Manager Application Service (BC-7, ADR-032)
 //!
-//! Orchestrates volume lifecycle operations coordinating:
-//! - Domain layer: Volume aggregate, StorageProvider trait
-//! - Infrastructure layer: VolumeRepository, SeaweedFSAdapter
-//! - Event bus: Publishing VolumeEvents for observability
+//! Orchestrates the full lifecycle of `Volume` aggregates: creation, mounting,
+//! detachment, deletion, and periodic garbage-collection of expired ephemeral
+//! volumes.
 //!
-//! Follows DDD application service pattern per AGENTS.md Section 9.
+//! ## Orchestrator Proxy Pattern
 //!
-//! # Architecture
+//! The volume manager follows the same Orchestrator Proxy Pattern established
+//! for MCP tool routing (ADR-033). Agent containers **never** access storage
+//! directly — all I/O flows through the NFS Server Gateway, which in turn calls
+//! the `StorageProvider` abstraction over SeaweedFS (ADR-032).
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements internal responsibilities for volume manager
+//! ## Storage Classes
+//!
+//! | Class | Lifecycle | NFS mount |
+//! |-------|-----------|---------------------|
+//! | `Ephemeral` | TTL-based; GC runs on schedule | Unmounted on execution end |
+//! | `Persistent` | Manual deletion only | Re-mounted by name |
+//!
+//! ## Usage
+//!
+//! Inject `Arc<dyn VolumeService>` wherever volumes need to be provisioned.
+//! The concrete implementation is `VolumeServiceImpl` below.
+//!
+//! See ADR-032 (Unified Storage via SeaweedFS), ADR-036 (NFS Gateway),
+//! AGENTS.md §BC-7 Storage Gateway.
 
 use crate::domain::volume::{
     Volume, VolumeId, TenantId, StorageClass, FilerEndpoint, 
@@ -36,9 +50,21 @@ use tracing::{info, warn, error, debug};
 // Service Trait
 // ============================================================================
 
+/// Application service trait for volume lifecycle management (BC-7, ADR-032).
+///
+/// All volume operations are mediated by the orchestrator. Agent containers
+/// access volumes exclusively via the NFS Server Gateway; direct bind mounts
+/// are an anti-pattern (see AGENTS.md Anti-Patterns §Bypassing Storage Gateway).
 #[async_trait]
 pub trait VolumeService: Send + Sync {
-    /// Create a new volume with specified configuration
+    /// Create a new volume with the specified storage class and size.
+    ///
+    /// Publishes a [`crate::domain::events::VolumeEvent::VolumeCreated`] event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the SeaweedFS backend is unavailable or the
+    /// `size_limit_mb` exceeds per-tenant quota.
     async fn create_volume(
         &self,
         name: String,
@@ -48,16 +74,35 @@ pub trait VolumeService: Send + Sync {
         ownership: VolumeOwnership,
     ) -> Result<VolumeId>;
 
-    /// Get volume by ID
+    /// Retrieve volume metadata by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` if no volume with `id` exists or the repository is unavailable.
     async fn get_volume(&self, id: VolumeId) -> Result<Volume>;
 
-    /// List all volumes for a tenant
+    /// List all volumes belonging to `tenant_id`.
     async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>>;
 
-    /// List volumes by ownership (e.g., all volumes for an execution)
+    /// List volumes filtered by their ownership record.
+    ///
+    /// Use `VolumeOwnership::Execution(id)` to find all volumes mounted in a
+    /// specific execution.
     async fn list_volumes_by_ownership(&self, ownership: &VolumeOwnership) -> Result<Vec<Volume>>;
 
-    /// Attach volume to a running instance
+    /// Attach a volume to a running instance, mounting it at `mount_point`.
+    ///
+    /// For `StorageClass::Persistent` with `AccessMode::ReadWrite`, this call
+    /// reserves the volume exclusively (only one execution at a time, Phase 1
+    /// NFS `nolock` constraint).
+    ///
+    /// Publishes [`crate::domain::events::VolumeEvent::VolumeAttached`].
+    ///
+    /// # Errors
+    ///
+    /// - Volume not found.
+    /// - Volume already exclusively mounted (persistent ReadWrite).
+    /// - NFS mount failed.
     async fn attach_volume(
         &self,
         volume_id: VolumeId,
@@ -66,26 +111,52 @@ pub trait VolumeService: Send + Sync {
         access_mode: AccessMode,
     ) -> Result<VolumeMount>;
 
-    /// Detach volume from an instance
+    /// Detach a volume from an instance.
+    ///
+    /// Publishes [`crate::domain::events::VolumeEvent::VolumeDetached`].
     async fn detach_volume(
         &self,
         volume_id: VolumeId,
         instance_id: InstanceId,
     ) -> Result<()>;
 
-    /// Delete a volume (marks for deletion, actual cleanup is async)
+    /// Mark a volume for deletion.
+    ///
+    /// Actual data removal is performed asynchronously by the storage backend.
+    /// Publishes [`crate::domain::events::VolumeEvent::VolumeDeleted`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the volume is currently attached to a running instance.
     async fn delete_volume(&self, volume_id: VolumeId) -> Result<()>;
 
-    /// Get current storage usage for a volume in bytes
+    /// Return the current used-bytes count for `volume_id`.
+    ///
+    /// Used by the NFS FSAL layer to enforce `VolumeQuotaExceeded` limits.
     async fn get_volume_usage(&self, volume_id: VolumeId) -> Result<u64>;
 
-    /// Cleanup expired ephemeral volumes (garbage collection)
-    /// Returns count of volumes cleaned up
+    /// Garbage-collect expired ephemeral volumes (`StorageClass::Ephemeral`).
+    ///
+    /// Should be called on a scheduled interval (e.g. every 60 s). Volumes
+    /// whose TTL has elapsed are deleted; their NFS exports are removed.
+    ///
+    /// Returns the number of volumes purged.
     async fn cleanup_expired_volumes(&self) -> Result<usize>;
-    
-    /// Create volumes from agent manifest specs for an execution
-    /// Parses manifest volume specs and creates corresponding volumes
-    /// Returns Vec of Volumes with resolved host paths
+
+    /// Provision volumes declared in an agent manifest for a new execution.
+    ///
+    /// Parses the `spec.volumes` field, creates each volume according to its
+    /// spec, and returns the full `Volume` list with resolved host paths.
+    ///
+    /// # Arguments
+    ///
+    /// * `execution_id` — The execution that will own the volumes.
+    /// * `tenant_id` — Tenant namespace for quota and NFS export isolation.
+    /// * `volume_specs` — Parsed from `agent.yaml` `spec.volumes[]`.
+    /// * `storage_mode` — `"seaweedfs"` or `"local"` (test/dev only).
+    /// * `fallback_to_local` — If `true`, fall back to local fs when SeaweedFS
+    ///   is unreachable (safe for dev, never for prod).
+    /// * `local_path` — Base path for local fallback volumes.
     async fn create_volumes_for_execution(
         &self,
         execution_id: ExecutionId,

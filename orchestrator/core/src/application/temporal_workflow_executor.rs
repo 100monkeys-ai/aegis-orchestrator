@@ -70,7 +70,6 @@ pub trait WorkflowStateExecutor: Send + Sync {
 }
 
 /// Standard implementation coordinating Temporal + 100monkeys
-#[allow(dead_code)] // Fields used in Phase 2 implementation
 pub struct StandardWorkflowStateExecutor {
     execution_service: Arc<dyn ExecutionService>,
     workflow_repository: Arc<dyn WorkflowRepository>,

@@ -768,22 +768,24 @@ impl NFSFileSystem for AegisFsalAdapter {
     async fn symlink(&self, dirid: fileid3, linkname: &filename3, symlink_data: &nfspath3, _attr: &nfsserve::nfs::sattr3) -> Result<(fileid3, fattr3), nfsserve::nfs::nfsstat3> {
         debug!("NFS SYMLINK: dirid={}, linkname={:?}, target={:?}", dirid, linkname, symlink_data);
         
-        // TODO: Implement symlink creation
+        // Symlinks are explicitly unsupported per ADR-036: agent workspaces
+        // are flat file trees; symlinks would enable escape from the sandbox.
         Err(nfsserve::nfs::nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsserve::nfs::nfsstat3> {
         debug!("NFS READLINK: id={}", id);
         
-        // TODO: Implement symlink reading
+        // Symlink reading unsupported per ADR-036 — symlinks are not created.
         Err(nfsserve::nfs::nfsstat3::NFS3ERR_NOTSUPP)
     }
 
     async fn setattr(&self, id: fileid3, _setattr: nfsserve::nfs::sattr3) -> Result<fattr3, nfsserve::nfs::nfsstat3> {
         debug!("NFS SETATTR: id={}", id);
         
-        // TODO: Implement attribute setting
-        // For now, return current attributes unchanged
+        // setattr is intentionally a no-op: UID/GID squashing (ADR-036) means
+        // the orchestrator controls file ownership, not the agent container.
+        // For now, return current attributes unchanged.
         self.getattr(id).await
     }
 }

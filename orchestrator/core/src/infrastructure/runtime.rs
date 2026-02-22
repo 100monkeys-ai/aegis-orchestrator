@@ -1,14 +1,22 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Runtime
+//! # Docker Runtime Adapter — BC-2 (ADR-027)
 //!
-//! Provides runtime functionality for the system.
+//! Implements the [`crate::domain::runtime::AgentRuntime`] domain trait using
+//! the Docker Engine API via `bollard`. Provides container lifecycle management
+//! with configurable resource limits, network policies, and NFS volume mounts.
 //!
-//! # Architecture
+//! ⚠️ Phase 1 — Docker is the only supported runtime. Firecracker microVM
+//! isolation is deferred to Phase 2 (ADR-003).
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements runtime
-//! - **Related ADRs:** ADR-027: Docker Runtime Implementation
+//! ## Responsibilities
+//! - Pull or reuse agent container image
+//! - Apply `ResourceLimits` (CPU, memory) and `NetworkPolicy` (iptables allowlist)
+//! - Mount volumes via NFS (orchestrator-side NFS Server Gateway — ADR-036)
+//! - Stream container stdout/stderr to the execution event bus
+//! - Destroy container on execution completion or cancellation
+//!
+//! See ADR-027 (Docker Runtime Implementation Details), ADR-003 (Firecracker, deferred).
 
 // ============================================================================
 // ADR-003: Firecracker Isolation (DEFERRED to Phase 2 - Production Release)

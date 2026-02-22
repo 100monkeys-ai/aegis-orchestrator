@@ -1,11 +1,37 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
+//! # SMCP JWT Signing Utilities (BC-12, ADR-035 §3.3)
+//!
+//! Provides RSA-256 JWT issuance and verification for SMCP SecurityTokens.
+//! Two structs mirror the split between who creates tokens (orchestrator)
+//! and who verifies them (also orchestrator, but potentially from multiple
+//! code paths):
+//!
+//! - [`SecurityTokenIssuer`] — signs new JWTs with the orchestrator's private RSA key.
+//! - [`SecurityTokenVerifier`] — validates incoming JWTs against the public key.
+//!
+//! ## Key Management (Phase 1)
+//!
+//! ⚠️ Phase 1 — RSA PEM keys are loaded from disk at startup. Phase 3 will
+//! replace this with OpenBao Transit Engine key management so the private key
+//! never touches the orchestrator process memory (see ADR-034 §Transit Engine).
+//!
+//! ## Token Lifetime
+//!
+//! Tokens are issued with a 1-hour `exp` claim. Agents must re-attest after
+//! expiry; the session is automatically revoked when the matching `Execution`
+//! completes, whichever comes first.
+//!
+//! See ADR-035 §3.3, AGENTS.md §SecurityToken.
 
 use anyhow::Result;
 use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation, Algorithm, TokenData};
 use crate::infrastructure::smcp::envelope::ContextClaims;
 
-/// Token verifier abstracting cryptographic setup for JWT tokens (OpenBao integration placeholder)
+/// Validates RSA-256 signed SMCP SecurityTokens (JWTs).
+///
+/// ⚠️ Phase 1 — Uses a static RSA public key loaded from PEM. Phase 3 will
+/// use OpenBao's Transit Engine so the key is never held in process memory.
 pub struct SecurityTokenVerifier {
     decoding_key: DecodingKey,
     expected_issuer: String,
@@ -28,6 +54,14 @@ impl SecurityTokenVerifier {
         })
     }
 
+    /// Validate `token_str` and return the decoded [`ContextClaims`].
+    ///
+    /// Checks `exp`, `iss`, and `aud` claims as required spec claims.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token signature is invalid, the token has
+    /// expired, or the issuer/audience do not match the configured values.
     pub fn verify(&self, token_str: &str) -> Result<TokenData<ContextClaims>> {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
@@ -43,7 +77,10 @@ impl SecurityTokenVerifier {
     }
 }
 
-/// Token issuer abstracting cryptographic setup for JWT tokens (OpenBao integration placeholder)
+/// Issues RSA-256 signed SMCP SecurityTokens (JWTs).
+///
+/// ⚠️ Phase 1 — Uses a static RSA private key loaded from PEM. Phase 3 will
+/// use OpenBao's Transit Engine so the private key is never held in process memory.
 pub struct SecurityTokenIssuer {
     encoding_key: EncodingKey,
     issuer: String,
@@ -61,6 +98,15 @@ impl SecurityTokenIssuer {
         })
     }
 
+    /// Sign and encode `claims` as an RS256 JWT string.
+    ///
+    /// Sets `claims.iss` to the configured issuer before encoding.
+    /// The returned string is the raw JWT (three base64url-encoded segments
+    /// separated by `.`) suitable for embedding in an [`crate::infrastructure::smcp::envelope::SmcpEnvelope`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the `EncodingKey` is invalid or serialization fails.
     pub fn issue(&self, claims: &mut ContextClaims) -> Result<String> {
         claims.iss = Some(self.issuer.clone());
         let header = Header::new(Algorithm::RS256);

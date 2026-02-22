@@ -1,13 +1,34 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Execution
+//! # Execution Application Service (BC-2)
 //!
-//! Provides execution functionality for the system.
+//! Defines [`ExecutionService`] and provides [`StandardExecutionService`], the
+//! production implementation of the 100monkeys iteration loop (ADR-005).
 //!
-//! # Architecture
+//! ## Execution Lifecycle
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements execution
+//! ```text
+//! start_execution(agent_id, input)
+//!   └─ resolve agent manifest (AgentLifecycleService)
+//!   └─ ensure workspace volume exists (VolumeService)
+//!   └─ register NFS volume context (NfsGatewayService, ADR-036)
+//!   └─ Supervisor::run_loop
+//!         └─ spawn container (AgentRuntime)
+//!         └─ execute task (AgentRuntime)
+//!         └─ evaluate output (ValidationService)
+//!         └─ apply refinement or complete
+//! ```
+//!
+//! All state transitions emit [`crate::domain::events::ExecutionEvent`]s onto the
+//! [`crate::infrastructure::event_bus::EventBus`] via the `ExecutionMonitor` observer.
+//!
+//! ## NFS Gateway Integration
+//!
+//! Attach an NFS gateway using [`StandardExecutionService::with_nfs_gateway`] so that
+//! volume contexts are registered *before* the first container spawns. Without this,
+//! NFS mounts in the container will fail with `ESTALE`.
+//!
+//! See Also: ADR-005 (Iterative Execution Strategy), ADR-036 (NFS Server Gateway)
 
 use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput, ExecutionError};
 use crate::domain::repository::ExecutionRepository;
@@ -29,16 +50,80 @@ use std::path::PathBuf;
 use chrono::Utc;
 use crate::domain::policy::FilesystemPolicy;
 
+/// Primary interface for running agents through the 100monkeys iteration loop (BC-2).
+///
+/// The concrete implementation is [`StandardExecutionService`]. Callers interact with
+/// executions by ID; the service manages all state persistence and event emission.
+///
+/// # Invariants
+///
+/// - An execution runs up to `max_iterations` (default 10, per ADR-005) before failing.
+/// - Only one iteration is active at a time per execution.
+/// - Executions are persisted atomically; partial state is not visible to callers.
 #[async_trait]
 pub trait ExecutionService: Send + Sync {
+    /// Start a new agent execution for `agent_id` with the given `input`.
+    ///
+    /// Spawns asynchronously; the returned [`ExecutionId`] can be polled via
+    /// [`ExecutionService::get_execution`] or streamed via [`ExecutionService::stream_execution`].
+    ///
+    /// # Errors
+    ///
+    /// - Agent not found
+    /// - Volume provisioning failure
+    /// - Container spawn failure
     async fn start_execution(&self, agent_id: AgentId, input: ExecutionInput) -> Result<ExecutionId>;
+
+    /// Retrieve the current state of an execution by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution does not exist.
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution>;
+
+    /// Return all [`Iteration`]s for a given execution in order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution does not exist.
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>>;
+
+    /// Request cancellation of a running execution.
+    ///
+    /// The execution may not terminate immediately; monitor via
+    /// [`ExecutionService::stream_execution`] for the `ExecutionCancelled` event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution does not exist or is already terminal.
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()>;
+
+    /// Open a live server-sent event stream of [`ExecutionEvent`]s for a single execution.
+    ///
+    /// The stream ends when the execution reaches a terminal state
+    /// (`ExecutionCompleted`, `ExecutionFailed`, or `ExecutionCancelled`).
     async fn stream_execution(&self, id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>>;
+
+    /// Open a live stream of all [`DomainEvent`]s associated with a given agent.
+    ///
+    /// This includes events from all executions of the agent, not just a single one.
+    /// Used by the Control Plane to power per-agent monitoring views.
     async fn stream_agent_events(&self, id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
+
+    /// List executions, optionally filtered by `agent_id`, newest first, capped at `limit`.
     async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>>;
+
+    /// Permanently delete an execution record and all its iterations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the execution does not exist or is currently running.
     async fn delete_execution(&self, id: ExecutionId) -> Result<()>;
+
+    /// Append an LLM interaction record to an existing iteration.
+    ///
+    /// Called by the Supervisor during execution to preserve the full prompt/response
+    /// history for transparency and Cortex learning.
     async fn record_llm_interaction(&self, execution_id: ExecutionId, iteration: u8, interaction: crate::domain::execution::LlmInteraction) -> Result<()>;
 }
 
@@ -536,9 +621,9 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn stream_agent_events(&self, _id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        // Agent event streaming is implemented in daemon/server.rs::stream_agent_events_handler
+        // which subscribes to EventBus directly. This trait method returns empty for interface compliance.
         Ok(Box::pin(futures::stream::empty()))
-        // The implementation will be done in the server handler for now because `Stream` requires `'static` usually or intricate lifetimes.
-        // Or we can implement it here properly.
     }
 
     async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>> {

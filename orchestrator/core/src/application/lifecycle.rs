@@ -1,13 +1,19 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Lifecycle
+//! # Agent Lifecycle Application Service — BC-1
 //!
-//! Provides lifecycle functionality for the system.
+//! Use-case implementations for the **Agent Lifecycle** bounded context:
+//! deploy, update, pause, resume, and delete agent definitions.
 //!
-//! # Architecture
+//! Orchestrates:
+//! 1. Manifest validation via the `ManifestValidator` domain service
+//! 2. Persistence via [`crate::domain::repository::AgentRepository`]
+//! 3. Event publication (`AgentLifecycleEvent`) via the `EventBus`
 //!
-//! - **Layer:** Application Layer
-//! - **Purpose:** Implements lifecycle
+//! Implements the `AgentLifecycleService` trait from
+//! [`crate::application::agent`].
+//!
+//! See AGENTS.md §BC-1 Agent Lifecycle Context.
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
 use crate::domain::repository::AgentRepository;

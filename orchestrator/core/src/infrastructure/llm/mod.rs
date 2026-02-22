@@ -1,13 +1,21 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Mod
+//! # LLM Provider Anti-Corruption Layer (ADR-009)
 //!
-//! Provides mod functionality for the system.
+//! Adapter implementations translating between the orchestrator's internal
+//! `LLMProvider` domain trait and vendor-specific APIs.
+//! Following the Anti-Corruption Layer pattern (AGENTS.md §Anti-Corruption Layer),
+//! external LLM concepts (model names, message formats, rate limits) are
+//! translated at this boundary and never leak into domain types.
 //!
-//! # Architecture
+//! | Module | Provider | Notes |
+//! |--------|----------|-------|
+//! | [`openai`] | OpenAI `gpt-*` / Azure OpenAI | Default provider |
+//! | [`anthropic`] | Anthropic `claude-*` | |
+//! | [`ollama`] | Ollama local models | Dev/offline use |
+//! | [`registry`] | `ProviderRegistry` | Selects provider by manifest `spec.runtime.model` |
 //!
-//! - **Layer:** Infrastructure Layer
-//! - **Purpose:** Implements mod
+//! See ADR-009 (LLM Provider Strategy).
 
 // LLM Provider Infrastructure - Anti-Corruption Layer Implementations
 //
