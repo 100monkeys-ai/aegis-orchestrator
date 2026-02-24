@@ -97,6 +97,14 @@ pub struct NodeConfigSpec {
     /// MCP tool servers configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+
+    /// SMCP protocol configuration (ADR-035)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smcp: Option<SmcpConfig>,
+
+    /// Named security contexts for SMCP (ADR-035)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_contexts: Option<Vec<SecurityContextDefinition>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,6 +617,91 @@ impl Default for McpResourceLimitsConfig {
     }
 }
 
+/// SMCP protocol configuration (ADR-035 §6)
+///
+/// Defines the RSA key material used by the orchestrator to sign and verify
+/// SecurityTokens (JWTs) during the SMCP attestation handshake.
+///
+/// ⚠️ Phase 1 — keys are loaded from PEM files on disk. Phase 3 will use OpenBao
+///   Transit Engine so that the private key never touches process memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmcpConfig {
+    /// Path to RSA private key PEM file (for signing SecurityTokens).
+    pub private_key_path: String,
+    /// Path to RSA public key PEM file (for verifying SecurityTokens).
+    pub public_key_path: String,
+    /// JWT issuer claim (e.g. `"aegis-orchestrator"`).
+    #[serde(default = "default_smcp_issuer")]
+    pub issuer: String,
+    /// JWT audience claim(s).
+    #[serde(default = "default_smcp_audiences")]
+    pub audiences: Vec<String>,
+    /// SecurityToken TTL in seconds. Default: 3600 (1 hour).
+    #[serde(default = "default_smcp_token_ttl")]
+    pub token_ttl_seconds: u64,
+}
+
+impl Default for SmcpConfig {
+    fn default() -> Self {
+        Self {
+            private_key_path: String::new(),
+            public_key_path: String::new(),
+            issuer: default_smcp_issuer(),
+            audiences: default_smcp_audiences(),
+            token_ttl_seconds: default_smcp_token_ttl(),
+        }
+    }
+}
+
+/// Declarative security context definition for YAML configuration (ADR-035 §2).
+///
+/// Allows security contexts to be defined in `aegis-config.yaml` and loaded
+/// into the `InMemorySecurityContextRepository` at startup. Each definition
+/// specifies a named permission boundary with capabilities and deny lists.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecurityContextDefinition {
+    /// Unique context name (e.g. `"research-safe"`, `"coder-unrestricted"`).
+    pub name: String,
+    /// Human-readable description.
+    #[serde(default)]
+    pub description: String,
+    /// Tool capabilities granted by this context.
+    #[serde(default)]
+    pub capabilities: Vec<CapabilityDefinition>,
+    /// Explicit tool deny list (overrides any matching capability).
+    #[serde(default)]
+    pub deny_list: Vec<String>,
+}
+
+/// YAML-serializable capability definition within a `SecurityContextDefinition`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityDefinition {
+    /// Tool name pattern (e.g. `"fs.*"`, `"web-search.search"`, `"*"`).
+    pub tool_pattern: String,
+    /// Allowed filesystem path prefixes for `fs.*` tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_allowlist: Option<Vec<String>>,
+    /// Allowed shell commands for `cmd.run`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_allowlist: Option<Vec<String>>,
+    /// Allowed network domain suffixes for `web.*` tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain_allowlist: Option<Vec<String>>,
+    /// Per-capability rate limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitDefinition>,
+    /// Max response size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_size: Option<u64>,
+}
+
+/// YAML-serializable rate limit for a capability definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitDefinition {
+    pub calls: u32,
+    pub per_seconds: u32,
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -703,6 +796,9 @@ fn default_health_check_timeout_seconds() -> u64 { 5 }
 fn default_health_check_method() -> String { "tools/list".to_string() }
 fn default_cpu_millicores() -> u32 { 1000 }
 fn default_memory_mb() -> u32 { 512 }
+fn default_smcp_issuer() -> String { "aegis-orchestrator".to_string() }
+fn default_smcp_audiences() -> Vec<String> { vec!["aegis-agents".to_string()] }
+fn default_smcp_token_ttl() -> u64 { 3600 }
 
 impl Default for LLMSelectionStrategy {
     fn default() -> Self {
@@ -739,6 +835,8 @@ impl Default for NodeConfigSpec {
             observability: None,
             storage: None,
             mcp_servers: None,
+            smcp: None,
+            security_contexts: None,
         }
     }
 }
@@ -987,6 +1085,8 @@ mod tests {
                 observability: None,
                 storage: None, // Optional storage configuration (ADR-032)
                 mcp_servers: None,
+                smcp: None,
+                security_contexts: None,
             },
         };
         

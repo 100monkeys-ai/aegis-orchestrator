@@ -49,7 +49,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent, SmcpEvent};
 use aegis_cortex::domain::events::CortexEvent;
 use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,7 @@ pub enum DomainEvent {
     Volume(VolumeEvent),
     Storage(StorageEvent),
     MCP(MCPToolEvent),
+    Smcp(SmcpEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -127,6 +128,11 @@ impl EventBus {
     /// Publish an MCP event (ADR-033/035)
     pub fn publish_mcp_event(&self, event: MCPToolEvent) {
         self.publish(DomainEvent::MCP(event));
+    }
+
+    /// Publish an SMCP session/security event (ADR-035)
+    pub fn publish_smcp_event(&self, event: SmcpEvent) {
+        self.publish(DomainEvent::Smcp(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -353,6 +359,12 @@ impl AgentEventReceiver {
                 | MCPToolEvent::ServerFailed { .. }
                 | MCPToolEvent::ServerUnhealthy { .. }
                 | MCPToolEvent::InvocationStarted { .. } => false,
+            },
+            DomainEvent::Smcp(e) => match e {
+                SmcpEvent::AttestationCompleted { agent_id, .. } => agent_id == &self.agent_id,
+                SmcpEvent::SessionCreated { agent_id, .. } => agent_id == &self.agent_id,
+                SmcpEvent::SessionRevoked { agent_id, .. } => agent_id == &self.agent_id,
+                SmcpEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
             },
         }
     }

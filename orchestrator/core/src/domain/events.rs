@@ -569,6 +569,50 @@ pub enum MCPToolEvent {
     },
 }
 
+/// SMCP session lifecycle and security events (BC-12 SMCP Protocol, ADR-035 §5).
+///
+/// Published by [`crate::application::attestation_service::AttestationServiceImpl`]
+/// and [`crate::infrastructure::smcp::audit::SmcpAuditLogger`].
+/// Consumed by:
+/// - Cortex for security pattern learning (e.g. detecting attestation storms)
+/// - Control Plane for real-time security dashboard
+/// - SOC 2 audit trail export (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SmcpEvent {
+    /// Agent completed the SMCP attestation handshake and received a SecurityToken.
+    AttestationCompleted {
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        security_context_name: String,
+        attested_at: DateTime<Utc>,
+    },
+    /// A new SmcpSession was created for an agent execution.
+    SessionCreated {
+        session_id: String,
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        security_context_name: String,
+        expires_at: DateTime<Utc>,
+        created_at: DateTime<Utc>,
+    },
+    /// An SmcpSession was revoked (execution complete or security incident).
+    SessionRevoked {
+        session_id: String,
+        agent_id: AgentId,
+        reason: String,
+        revoked_at: DateTime<Utc>,
+    },
+    /// A tool call was blocked by the SecurityContext policy engine.
+    PolicyViolationBlocked {
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        tool_name: String,
+        violation_type: ViolationType,
+        details: String,
+        blocked_at: DateTime<Utc>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
