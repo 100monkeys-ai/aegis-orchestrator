@@ -379,7 +379,7 @@ mod tests {
             agent_id,
             manifest: crate::domain::agent::AgentManifest {
                 api_version: "100monkeys.ai/v1".to_string(),
-                kind: "AgentManifest".to_string(),
+                kind: "Agent".to_string(),
                 metadata: crate::domain::agent::ManifestMetadata {
                     name: "test-agent".to_string(),
                     version: "1.0.0".to_string(),

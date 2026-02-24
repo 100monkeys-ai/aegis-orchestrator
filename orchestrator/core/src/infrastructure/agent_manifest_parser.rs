@@ -15,7 +15,7 @@
 //!
 //! ```yaml
 //! apiVersion: 100monkeys.ai/v1
-//! kind: AgentManifest
+//! kind: Agent
 //! metadata:
 //!   name: email-summarizer
 //!   version: "1.0.0"
@@ -81,7 +81,7 @@ mod tests {
     fn test_parse_minimal_manifest() {
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: test-agent
   version: "1.0.0"
@@ -93,7 +93,7 @@ spec:
         
         let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
         assert_eq!(manifest.api_version, "100monkeys.ai/v1");
-        assert_eq!(manifest.kind, "AgentManifest");
+        assert_eq!(manifest.kind, "Agent");
         assert_eq!(manifest.metadata.name, "test-agent");
         assert_eq!(manifest.spec.runtime.language, "python");
         assert_eq!(manifest.spec.runtime.version, "3.11");
@@ -103,7 +103,7 @@ spec:
     fn test_parse_full_manifest() {
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: email-summarizer
   version: "1.0.0"
@@ -183,7 +183,7 @@ spec:
     fn test_validate_api_version() {
         let yaml = r#"
 apiVersion: invalid/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: test
   version: "1.0.0"
@@ -221,7 +221,7 @@ spec:
     fn test_validate_name_format() {
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: INVALID_NAME
   version: "1.0.0"
@@ -242,7 +242,7 @@ spec:
         
         let manifest = AgentManifest {
             api_version: "100monkeys.ai/v1".to_string(),
-            kind: "AgentManifest".to_string(),
+            kind: "Agent".to_string(),
             metadata: ManifestMetadata {
                 name: "test-agent".to_string(),
                 version: "1.0.0".to_string(),

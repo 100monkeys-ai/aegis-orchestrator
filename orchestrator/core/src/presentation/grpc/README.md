@@ -329,7 +329,7 @@ The TypeScript worker activities will automatically test these endpoints when wo
 
 - [ADR-022: Temporal Workflow Engine Integration](../../aegis-architecture/adrs/022-temporal-workflow-engine-integration.md)
 - [Proto Definitions](../../proto/aegis_runtime.proto)
-- [TypeScript gRPC Client](../aegis-temporal-worker/src/grpc/client.ts)
+- [TypeScript gRPC Client](https://github.com/100monkeys-ai/aegis-temporal-worker/blob/main/src/grpc/client.ts)
 - [Tonic Documentation](https://github.com/hyperium/tonic)
 
 ---

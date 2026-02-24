@@ -13,7 +13,7 @@
 //! # Code Generation
 //!
 //! Uses `tonic-build` to generate Rust code from `.proto` files located in:
-//! - `../../proto/aegis_runtime.proto` - AEGIS-specific protocols
+//! - `../../aegis-proto/proto/aegis_runtime.proto` - AEGIS-specific protocols (git submodule: aegis-proto)
 //! - `../../proto/temporal/api/**/*.proto` - Temporal API definitions
 //!
 //! Generated code is placed in `OUT_DIR` and included via `tonic::include_proto!`
@@ -37,8 +37,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = "../../proto/temporal/api";
     let mut protos = Vec::new();
     
-    // Add aegis_runtime manually
-    protos.push("../../proto/aegis_runtime.proto".to_string());
+    // Add aegis_runtime from the aegis-proto submodule
+    protos.push("../../aegis-proto/proto/aegis_runtime.proto".to_string());
     
     // Walk directory to find all .proto files
     if let Ok(_) = std::fs::read_dir(proto_root) {
@@ -113,10 +113,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build_client(true)
         .compile_protos(
             &protos,
-            &["../../proto"], 
+            &["../../proto", "../../aegis-proto/proto"],
         )?;
 
-    println!("cargo:rerun-if-changed=../../proto/aegis_runtime.proto");
+    println!("cargo:rerun-if-changed=../../aegis-proto/proto/aegis_runtime.proto");
 
     Ok(())
 }

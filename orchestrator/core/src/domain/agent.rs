@@ -78,7 +78,7 @@ pub struct AgentManifest {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
     
-    /// Resource kind (must be "AgentManifest")
+    /// Resource kind (must be "Agent")
     pub kind: String,
     
     /// Kubernetes-style metadata
@@ -622,8 +622,8 @@ impl AgentManifest {
         }
         
         // Validate kind
-        if self.kind != "AgentManifest" {
-            return Err(format!("Invalid kind: expected 'AgentManifest', got '{}'", self.kind));
+        if self.kind != "Agent" {
+            return Err(format!("Invalid kind: expected 'Agent', got '{}'", self.kind));
         }
         
         // Validate name format (DNS label: lowercase alphanumeric with hyphens)
@@ -679,7 +679,7 @@ mod tests {
     fn make_manifest(name: &str) -> AgentManifest {
         AgentManifest {
             api_version: "100monkeys.ai/v1".to_string(),
-            kind: "AgentManifest".to_string(),
+            kind: "Agent".to_string(),
             metadata: ManifestMetadata {
                 name: name.to_string(),
                 version: "1.0.0".to_string(),

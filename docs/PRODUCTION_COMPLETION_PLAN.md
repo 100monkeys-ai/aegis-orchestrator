@@ -131,7 +131,7 @@ All event categories implemented and publishing:
 #### 🔴 HIGH PRIORITY (Blockers)
 
 1. **RouterAgent & Stimulus-Response** (Phase 6)
-   - **Missing:** `demo-agents/router/router-agent.yaml`
+   - **Missing:** `agents/router/router-agent.yaml`
    - **Missing:** `domain/workflow_registry.rs`, `application/stimulus_handler.rs`
    - **Missing:** `cli/commands/sense.rs`
    - **Impact:** Cannot build AGI-style always-on systems
@@ -495,7 +495,7 @@ mod tests {
 
 #### 12.1 RouterAgent Manifest
 
-**File:** `demo-agents/router/router-agent.yaml` (NEW)
+**File:** `agents/router/router-agent.yaml` (NEW)
 
 ```yaml
 version: "1.0"
@@ -843,7 +843,7 @@ mod tests {
 
 #### 14.1 Conversation Workflow
 
-**File:** `demo-agents/workflows/conversation.yaml` (NEW)
+**File:** `agents/workflows/conversation.yaml` (NEW)
 
 ```yaml
 version: "1.0"
@@ -886,7 +886,7 @@ config:
 
 #### 14.2 Debug Workflow
 
-**File:** `demo-agents/workflows/debug.yaml` (NEW)
+**File:** `agents/workflows/debug.yaml` (NEW)
 
 ```yaml
 version: "1.0"
@@ -964,7 +964,7 @@ config:
 
 #### 14.3 Develop Workflow (Simplified)
 
-**File:** `demo-agents/workflows/develop.yaml` (NEW)
+**File:** `agents/workflows/develop.yaml` (NEW)
 
 ```yaml
 version: "1.0"
@@ -2043,19 +2043,19 @@ features:
 1. **All 7 Forge agents deployed:**
 
    ```bash
-   aegis agent deploy demo-agents/forge/requirements-ai.yaml
-   aegis agent deploy demo-agents/forge/architect-ai.yaml
-   aegis agent deploy demo-agents/forge/tester-ai.yaml
-   aegis agent deploy demo-agents/forge/coder-ai.yaml
-   aegis agent deploy demo-agents/forge/reviewer-ai.yaml
-   aegis agent deploy demo-agents/forge/critic-ai.yaml
-   aegis agent deploy demo-agents/forge/security-ai.yaml
+   aegis agent deploy agents/forge/requirements-ai.yaml
+   aegis agent deploy agents/forge/architect-ai.yaml
+   aegis agent deploy agents/forge/tester-ai.yaml
+   aegis agent deploy agents/forge/coder-ai.yaml
+   aegis agent deploy agents/forge/reviewer-ai.yaml
+   aegis agent deploy agents/forge/critic-ai.yaml
+   aegis agent deploy agents/forge/security-ai.yaml
    ```
 
 2. **Forge workflow deployed:**
 
    ```bash
-   aegis workflow deploy demo-agents/workflows/forge.yaml
+   aegis workflow deploy agents/workflows/forge.yaml
    ```
 
 ---
@@ -2260,16 +2260,16 @@ Every component follows the cyber-biological membrane principle: agents operate 
 
 2. **RouterAgent deployed:**
    ```bash
-   aegis agent deploy demo-agents/router/router-agent.yaml
+   aegis agent deploy agents/router/router-agent.yaml
    ```
 
 1. **Example workflows deployed:**
 
    ```bash
-   aegis workflow deploy demo-agents/workflows/conversation.yaml
-   aegis workflow deploy demo-agents/workflows/debug.yaml
-   aegis workflow deploy demo-agents/workflows/develop.yaml
-   aegis workflow deploy demo-agents/workflows/forge.yaml
+   aegis workflow deploy agents/workflows/conversation.yaml
+   aegis workflow deploy agents/workflows/debug.yaml
+   aegis workflow deploy agents/workflows/develop.yaml
+   aegis workflow deploy agents/workflows/forge.yaml
    ```
 
 2. **Workflow registry configured:**

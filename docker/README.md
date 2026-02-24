@@ -1,47 +1,31 @@
 # AEGIS Docker Infrastructure
 
-All Docker-related files for AEGIS are organized in this directory.
+This directory contains the **build tooling** (Dockerfiles) for the AEGIS runtime images.
+
+> **Looking for the Docker Compose stack to run AEGIS locally?**
+> It has moved to [aegis-examples/deploy/](https://github.com/100monkeys-ai/aegis-examples/tree/main/deploy).
+> Clone `aegis-examples` and follow the [Getting Started guide](https://docs.aegis.ai/docs/getting-started).
 
 ## Files
 
-- **docker-compose.yml** - Main compose file with all 5 services
-- **Dockerfile.runtime** - Multi-stage build for Rust gRPC server
-- **Dockerfile.worker** - Multi-stage build for TypeScript Temporal worker
+- **Dockerfile.runtime** - Multi-stage build for the AEGIS Rust runtime (`ghcr.io/100monkeys-ai/aegis-runtime`)
+- **CORTEX_SERVICES.md** - Notes on the Cortex embedding and Neo4j services
 
-## Services
+> **Temporal Worker image** moved to its own repo: [aegis-temporal-worker](https://github.com/100monkeys-ai/aegis-temporal-worker).
+> Its Docker image (`ghcr.io/100monkeys-ai/aegis-temporal-worker`) is built and published there via GitHub Actions.
 
-1. **postgres** - PostgreSQL 15 database for Temporal and AEGIS
-2. **temporal** - Temporal server (v1.23.0 with auto-setup)
-3. **temporal-ui** - Temporal Web UI (v2.21.3)
-4. **temporal-worker** - TypeScript worker for workflow execution
-5. **aegis-runtime** - Rust gRPC server providing ExecutionService, ValidationService, etc.
+These Dockerfiles are used by CI/CD to build and publish images to the GitHub Container Registry. End-users consume the published images via the compose stack in `aegis-examples`.
 
-## Usage
+## Building images locally
 
-Start all services:
+From the repo root:
 
 ```bash
-cd docker
-docker compose up -d
+# Build the Rust runtime image
+docker build -f docker/Dockerfile.runtime -t aegis-runtime:local .
 ```
 
-View logs:
-
-```bash
-docker compose logs -f
-```
-
-Stop all services:
-
-```bash
-docker compose down
-```
-
-Stop and remove volumes:
-
-```bash
-docker compose down -v
-```
+To build the Temporal Worker image locally, clone [aegis-temporal-worker](https://github.com/100monkeys-ai/aegis-temporal-worker) and run `docker build -t aegis-temporal-worker:local .` from that repo root.
 
 ## Ports
 
@@ -65,7 +49,7 @@ docker compose down -v
 
 For development with hot-reload:
 
-- The worker source is mounted at `../aegis-temporal-worker/src:/app/src`
+- The worker source is mounted from the [aegis-temporal-worker](https://github.com/100monkeys-ai/aegis-temporal-worker) repo (clone it as a sibling directory)
 - Changes to TypeScript files will require rebuilding: `docker compose build temporal-worker`
 
 For Rust development:

@@ -11,8 +11,8 @@ RUN apt-get update && apt-get install -y \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy proto files and generate Python code
-COPY proto/ ./proto/
+# Copy proto file from aegis-proto submodule and generate Python code
+COPY aegis-proto/proto/embedding.proto ./proto/embedding.proto
 RUN python -m grpc_tools.protoc \
     -I./proto \
     --python_out=. \

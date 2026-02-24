@@ -188,8 +188,8 @@ target/debug/aegis daemon start
 target/debug/aegis daemon status
 
 # Deploy demo agents
-target/debug/aegis agent deploy ./demo-agents/echo/agent.yaml
-target/debug/aegis agent deploy ./demo-agents/greeter/agent.yaml
+cd ../aegis-examples && aegis agent deploy ./agents/echo/agent.yaml
+cd ../aegis-examples && aegis agent deploy ./agents/greeter/agent.yaml
 
 # List deployed agents
 target/debug/aegis agent list

@@ -927,7 +927,7 @@ impl WorkflowEngine {
 
 **Files:**
 
-- `demo-agents/workflows/100monkeys-classic.yaml` (NEW)
+- `agents/workflows/100monkeys-classic.yaml` (NEW)
 
 **Content:**
 
@@ -1108,7 +1108,7 @@ impl RunCommand {
 - ✅ `domain/workflow.rs` with complete domain model (777 lines)
 - ✅ `infrastructure/workflow_parser.rs` with YAML parsing (complete)
 - ✅ `application/workflow_engine.rs` with FSM tick() logic (639 lines)
-- ✅ `demo-agents/workflows/100monkeys-classic.yaml` default workflow (230 lines, 6 states)
+- ✅ `agents/workflows/100monkeys-classic.yaml` default workflow (230 lines, 6 states)
 - ✅ CLI `aegis workflow run` command (implemented in `commands/workflow.rs`)
 - ✅ Integration tests for WorkflowEngine (7 tests, all passing)
 
@@ -1148,7 +1148,7 @@ impl RunCommand {
 - `orchestrator/core/src/domain/workflow.rs` (777 lines)
 - `orchestrator/core/src/infrastructure/workflow_parser.rs` (complete)
 - `orchestrator/core/src/application/workflow_engine.rs` (639 lines)
-- `demo-agents/workflows/100monkeys-classic.yaml` (230 lines)
+- `agents/workflows/100monkeys-classic.yaml` (230 lines)
 - `orchestrator/core/tests/workflow_integration_tests.rs` (287 lines, 7 tests)
 - `orchestrator/core/tests/recursive_execution_tests.rs` (updated, 5 tests)
 - Removed: `orchestrator/core/src/domain/judge.rs` (deleted - judges are agents now)
@@ -1183,7 +1183,7 @@ impl RunCommand {
 **Documentation:**
 
 - See [PHASE_2_COMPLETE.md](PHASE_2_COMPLETE.md) for full details
-- See `demo-agents/judges/README.md` for usage examples
+- See `agents/judges/README.md` for usage examples
 
 **Next Phase:** Phase 3 - Gradient Validation System
 
@@ -1209,13 +1209,13 @@ impl RunCommand {
 
 **Files:**
 
-- `demo-agents/judges/basic-judge.yaml` (NEW)
+- `agents/judges/basic-judge.yaml` (NEW)
 
 **Content:**
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: basic-judge-v1
   version: "1.0.0"
@@ -1447,7 +1447,7 @@ impl ExecutionService {
 
 **Files:**
 
-- `demo-agents/workflows/100monkeys-classic.yaml` (UPDATE)
+- `agents/workflows/100monkeys-classic.yaml` (UPDATE)
 
 **Changes:**
 
@@ -1797,13 +1797,13 @@ states:
 
 **Files:**
 
-- `demo-agents/router/router-agent.yaml` (NEW)
+- `agents/router/router-agent.yaml` (NEW)
 
 **Content:**
 
 ```yaml
 apiVersion: 100monkeys.ai/v1
-kind: AgentManifest
+kind: Agent
 metadata:
   name: router-agent-v1
   version: "1.0.0"
@@ -2042,9 +2042,9 @@ pub enum StimulusSource {
 
 **Files:**
 
-- `demo-agents/workflows/conversation.yaml` (NEW)
-- `demo-agents/workflows/debug.yaml` (NEW)
-- `demo-agents/workflows/develop.yaml` (NEW)
+- `agents/workflows/conversation.yaml` (NEW)
+- `agents/workflows/debug.yaml` (NEW)
+- `agents/workflows/develop.yaml` (NEW)
 
 ##### Example: conversation.yaml
 
