@@ -50,8 +50,6 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent, SmcpEvent};
-use aegis_cortex::domain::events::CortexEvent;
-use aegis_cortex::application::EventBus as CortexEventBus;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -65,7 +63,6 @@ pub enum DomainEvent {
     Execution(ExecutionEvent),
     Workflow(WorkflowEvent),
     Learning(LearningEvent),
-    Cortex(CortexEvent),
     Policy(crate::domain::events::PolicyEvent),
     Volume(VolumeEvent),
     Storage(StorageEvent),
@@ -174,13 +171,7 @@ impl EventBus {
     }
 }
 
-#[async_trait::async_trait]
-impl CortexEventBus for EventBus {
-    async fn publish(&self, event: CortexEvent) -> anyhow::Result<()> {
-        let _ = self.sender.send(DomainEvent::Cortex(event));
-        Ok(())
-    }
-}
+
 
 /// Receiver for all domain events
 pub struct EventReceiver {
@@ -238,11 +229,6 @@ impl ExecutionEventReceiver {
                         return Ok(exec_event);
                     }
                 },
-                DomainEvent::Cortex(cortex_event) => {
-                    if self.matches_cortex(&cortex_event) {
-                        return Ok(ExecutionEvent::Cortex(cortex_event));
-                    }
-                },
                 _ => {}
             }
             // Continue loop if event doesn't match
@@ -267,19 +253,10 @@ impl ExecutionEventReceiver {
                 ValidationEvent::GradientValidationPerformed { execution_id, .. } => execution_id == &self.execution_id,
                 ValidationEvent::MultiJudgeConsensus { execution_id, .. } => execution_id == &self.execution_id,
             },
-            ExecutionEvent::Cortex(e) => self.matches_cortex(e),
         }
     }
-    
-    fn matches_cortex(&self, event: &CortexEvent) -> bool {
-        match event {
-            CortexEvent::PatternDiscovered { execution_id, .. } => *execution_id == Some(self.execution_id.0),
-            CortexEvent::PatternWeightIncreased { execution_id, .. } => *execution_id == Some(self.execution_id.0),
-            CortexEvent::PatternSuccessUpdated { execution_id, .. } => *execution_id == Some(self.execution_id.0),
-            _ => false,
-        }
     }
-}
+
 
 /// Receiver for agent-specific events (filtered)
 pub struct AgentEventReceiver {
@@ -332,7 +309,6 @@ impl AgentEventReceiver {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. } => agent_id == &self.agent_id,
                     ValidationEvent::MultiJudgeConsensus { agent_id, .. } => agent_id == &self.agent_id,
                 },
-                ExecutionEvent::Cortex(_) => false, // Cortex events are global, not agent-filterable
             },
             DomainEvent::Learning(e) => match e {
                 LearningEvent::PatternDiscovered { agent_id, .. } => agent_id == &self.agent_id,
@@ -340,7 +316,6 @@ impl AgentEventReceiver {
                 LearningEvent::PatternDecayed { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Workflow(_) => false, // Workflow events are system-wide, not per-agent
-            DomainEvent::Cortex(_) => false, // Cortex events are global
             DomainEvent::Policy(e) => match e {
                 PolicyEvent::PolicyViolationAttempted { agent_id, .. } => agent_id == &self.agent_id,
                 PolicyEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,

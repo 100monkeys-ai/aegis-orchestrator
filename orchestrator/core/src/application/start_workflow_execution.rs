@@ -81,7 +81,6 @@ pub struct StandardStartWorkflowExecutionUseCase {
     execution_repository: Arc<dyn WorkflowExecutionRepository>,
     temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
     event_bus: Arc<EventBus>,
-    cortex_service: Option<Arc<dyn aegis_cortex::application::CortexService>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -90,14 +89,12 @@ impl StandardStartWorkflowExecutionUseCase {
         execution_repository: Arc<dyn WorkflowExecutionRepository>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         event_bus: Arc<EventBus>,
-        cortex_service: Option<Arc<dyn aegis_cortex::application::CortexService>>,
     ) -> Self {
         Self {
             workflow_repository,
             execution_repository,
             temporal_client,
             event_bus,
-            cortex_service,
         }
     }
 }
@@ -131,16 +128,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             }
         }
 
-        // Optional Step 3.5: Cortex pattern pre-population
-        if let Some(cortex) = &self.cortex_service {
-            // For MVP, if we don't have an embedding client we can query with zeros to get recent patterns
-            if let Ok(patterns) = cortex.search_patterns(vec![0.0; 384], 3).await {
-                if !patterns.is_empty() {
-                    let patterns_json = serde_json::to_value(patterns).unwrap_or(serde_json::json!([]));
-                    workflow_execution.blackboard.set("cortex_prepopulated_patterns".to_string(), patterns_json);
-                }
-            }
-        }
+
 
         // Step 4: Persist execution to repository (establishes idempotency key)
         self.execution_repository

@@ -51,16 +51,6 @@ use aegis_core::{
     },
 };
 
-// Cortex imports for pattern learning
-use aegis_cortex::{
-    application::{CortexService, StandardCortexService},
-    infrastructure::{
-        InMemoryPatternRepository,
-
-
-    },
-};
-
 use super::{remove_pid_file, write_pid_file};
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
@@ -406,44 +396,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tracing::info!("NFS deregistration listener started (ADR-036)");
     }
 
-    println!("Initializing Cortex service...");
-    
-    // Create Cortex repositories (in-memory for now)
-    let pattern_repo = Arc::new(InMemoryPatternRepository::new());
-
-    let cortex_service: Arc<dyn CortexService> = Arc::new(
-        StandardCortexService::new(
-            pattern_repo,
-            event_bus.clone(),
-        )
-    );
-
-    // Subscribe to EventBus to capture RefinementApplied for Cortex learning
-    let cortex_listener_service = cortex_service.clone();
-    let mut cortex_subscriber = event_bus.subscribe();
-    tokio::spawn(async move {
-        while let Ok(event) = cortex_subscriber.recv().await {
-            if let aegis_core::infrastructure::event_bus::DomainEvent::Execution(
-                aegis_core::domain::events::ExecutionEvent::RefinementApplied {
-                    execution_id, code_diff, ..
-                }
-            ) = event {
-                let signature = aegis_cortex::domain::ErrorSignature::new(
-                    "refinement_feedback".to_string(),
-                    &code_diff.diff,
-                );
-                let _ = cortex_listener_service.store_pattern(
-                    Some(execution_id.0),
-                    signature,
-                    String::new(),
-                    "validation_failed".to_string(),
-                    vec![0.0; 384],
-                ).await;
-            }
-        }
-    });
-
-    println!("Cortex service initialized.");
     println!("Initializing workflow engine...");
     
     // Initialize Temporal Client
@@ -493,7 +445,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let validation_service = Arc::new(ValidationService::new(
         event_bus.clone(), 
         execution_service.clone(),
-        Some(cortex_service.clone()),
     ));
     
     // Create human input service
@@ -520,7 +471,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_execution_repo.clone(),
         temporal_client_container.clone(),
         event_bus.clone(),
-        Some(cortex_service.clone()),
     ));
 
     // --- Initialize SMCP / Tool Routing Services ---
@@ -671,7 +621,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
-    let cortex_service_clone = cortex_service.clone();
     
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -680,8 +629,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             grpc_addr,
             exec_service_clone,
             val_service_clone,
-            Some(cortex_service_clone),
-            None, // embedding client not passed through app state yet in this snippet
             Some(attestation_service),
             Some(tool_invocation_service),
         ).await {

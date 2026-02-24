@@ -177,8 +177,8 @@ pub enum AgentLifecycleEvent {
 /// ExecutionCompleted | ExecutionFailed | ExecutionCancelled
 /// ```
 ///
-/// The `Validation` and `Cortex` variants wrap sub-events from the validation
-/// and cortex bounded contexts to keep this enum as the single stream.
+/// The `Validation` variant wraps sub-events from the validation
+/// bounded context to keep this enum as the single stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecutionEvent {
     ExecutionStarted {
@@ -269,7 +269,6 @@ pub enum ExecutionEvent {
         terminated_at: DateTime<Utc>,
     },
     Validation(ValidationEvent),
-    Cortex(aegis_cortex::domain::events::CortexEvent),
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

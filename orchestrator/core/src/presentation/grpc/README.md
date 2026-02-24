@@ -220,7 +220,9 @@ let addr = "0.0.0.0:50051".parse()?;
 start_grpc_server(
     addr,
     execution_service,
-    validation_service
+    validation_service,
+    None, // AttestationService
+    None, // ToolInvocationService
 ).await?;
 ```
 

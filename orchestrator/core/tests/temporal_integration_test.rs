@@ -46,10 +46,8 @@ async fn test_register_and_start_temporal_workflow() {
     let workflow_exec_repo = Arc::new(MockWorkflowExecRepo);
     let event_bus = Arc::new(EventBus::new(100));
     let temporal_container = Arc::new(RwLock::new(None));
-    let parser = Arc::new(aegis_core::infrastructure::workflow_parser::WorkflowParser);
 
     let register_use_case = StandardRegisterWorkflowUseCase::new(
-        parser.clone(),
         workflow_repo.clone(),
         temporal_container.clone(),
         event_bus.clone()
@@ -60,7 +58,6 @@ async fn test_register_and_start_temporal_workflow() {
         workflow_exec_repo.clone(),
         temporal_container.clone(),
         event_bus.clone(),
-        None,
     );
 
     let workflow_yaml = r#"
