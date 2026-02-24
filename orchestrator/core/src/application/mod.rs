@@ -22,7 +22,6 @@
 //! | [`start_workflow_execution`] | BC-3 Workflow | `StartWorkflowExecutionUseCase` — submit workflow to Temporal |
 //! | [`complete_workflow_execution`] | BC-3 Workflow | `CompleteWorkflowExecutionUseCase` — handle Temporal completion |
 //! | [`temporal_mapper`] | BC-3 Workflow | Maps AEGIS workflow types to/from Temporal gRPC proto types |
-//! | [`temporal_workflow_executor`] | BC-3 Workflow | Spawns Temporal workflow activities |
 //! | [`volume_manager`] | BC-7 Storage Gateway | `VolumeService` trait, volume lifecycle management |
 //! | [`nfs_gateway`] | BC-7 Storage Gateway | `NfsGatewayService` — manages the user-space NFS server lifecycle (ADR-036) |
 //! | [`storage_event_persister`] | BC-7 Storage Gateway | Subscribes to `StorageEvent`s and persists them for audit trail |
@@ -31,8 +30,9 @@
 //!
 //! ## Removed Modules
 //!
-//! `workflow_engine` was removed when Temporal integration replaced the in-process FSM
-//! executor. Workflow execution now routes through [`temporal_workflow_executor`].
+//! `workflow_engine` and `temporal_workflow_executor` were removed when Temporal integration
+//! replaced the in-process FSM executor. The TypeScript `aegis_workflow` worker function
+//! drives all FSM execution; Rust interacts with it exclusively via gRPC (`TemporalClient`).
 
 pub mod lifecycle;
 pub mod agent;
@@ -47,7 +47,6 @@ pub mod temporal_mapper;
 pub mod register_workflow;
 pub mod start_workflow_execution;
 pub mod complete_workflow_execution;
-pub mod temporal_workflow_executor;
 pub mod volume_manager;
 pub mod nfs_gateway;
 pub mod storage_event_persister;

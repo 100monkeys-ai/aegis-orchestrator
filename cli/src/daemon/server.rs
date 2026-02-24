@@ -509,10 +509,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     
     println!("Temporal event listener initialized.");
 
-    let workflow_parser = Arc::new(aegis_core::infrastructure::workflow_parser::WorkflowParser);
-    
     let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
-        workflow_parser.clone(),
         workflow_repo.clone(),
         temporal_client_container.clone(),
         event_bus.clone(),
@@ -866,6 +863,7 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/v1/workflows/temporal/execute", post(execute_temporal_workflow_handler))
         .route("/v1/workflows/executions/:execution_id", get(get_workflow_execution_handler))
         .route("/v1/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
+        .route("/v1/workflows/executions/:execution_id/signal", post(signal_workflow_execution_handler))
         .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
         .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
@@ -1782,6 +1780,62 @@ async fn get_workflow_execution_handler(
     (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
         "error": "Workflow execution retrieval not yet implemented"
     })))
+}
+
+#[derive(serde::Deserialize)]
+struct WorkflowSignalRequest {
+    response: String,
+}
+
+/// POST /v1/workflows/executions/:execution_id/signal
+///
+/// Injects a `humanInput` Temporal signal into a workflow that is paused at a
+/// `Human` state. The workflow resumes with the provided `response` string.
+///
+/// # Body
+/// ```json
+/// { "response": "approved" }
+/// ```
+///
+/// # Returns
+/// - `202 Accepted` on success
+/// - `503 Service Unavailable` if the Temporal client is not yet connected
+/// - `500 Internal Server Error` if the signal delivery fails
+async fn signal_workflow_execution_handler(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<String>,
+    Json(request): Json<WorkflowSignalRequest>,
+) -> impl IntoResponse {
+    let guard = state.temporal_client_container.read().await;
+    let client = match guard.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Temporal client not yet connected"
+                })),
+            )
+            .into_response();
+        }
+    };
+    drop(guard);
+
+    match client.send_human_signal(&execution_id, request.response).await {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({
+                "status": "signal_sent",
+                "execution_id": execution_id
+            })),
+        )
+        .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+        .into_response(),
+    }
 }
 
 /// GET /v1/workflows/executions/:execution_id/logs - Stream workflow logs

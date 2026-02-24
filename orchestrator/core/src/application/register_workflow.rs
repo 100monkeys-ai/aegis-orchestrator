@@ -79,8 +79,6 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
 
 /// Standard implementation of RegisterWorkflowUseCase
 pub struct StandardRegisterWorkflowUseCase {
-    /// WorkflowParser instance (static method currently used; held for future config-driven parsing)
-    workflow_parser: Arc<WorkflowParser>,
     workflow_repository: Arc<dyn WorkflowRepository>,
     temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
     event_bus: Arc<EventBus>,
@@ -88,13 +86,11 @@ pub struct StandardRegisterWorkflowUseCase {
 
 impl StandardRegisterWorkflowUseCase {
     pub fn new(
-        workflow_parser: Arc<WorkflowParser>,
         workflow_repository: Arc<dyn WorkflowRepository>,
         temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
         event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
-            workflow_parser,
             workflow_repository,
             temporal_client,
             event_bus,

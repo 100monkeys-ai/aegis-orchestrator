@@ -1,0 +1,209 @@
+# the-forge.yaml
+#
+# The Forge multi-agent constitutional development workflow (ADR-020, ADR-022).
+#
+# This workflow implements the Forge Reference Pattern: a full constitutional
+# development lifecycle where an architect designs a solution, a worker
+# implements it, a panel of judges evaluates the quality via gradient scoring,
+# automated tests verify correctness, and a human approves the final output.
+#
+# State machine:
+#
+#   DESIGN ──on_success──► GENERATE ──on_success──► REVIEW
+#                              ▲                        │
+#                              │         score < 0.8    │ score >= 0.8
+#                              ◄────────────────────────┘
+#                              ▲
+#                              │ test failed
+#                            TEST ──exit_code_zero──► APPROVE
+#                                                        │
+#                              ◄─── input_equals_no ────┘
+#                                                        │ input_equals_yes
+#                                                        ▼
+#                                                    (complete)
+#
+# Required input at workflow start:
+#   task         — High-level description of what to build or implement.
+#   architect_id — UUID of the registered architect/design agent.
+#   agent_id     — UUID of the registered worker/implementation agent.
+#   judge_ids    — Array: UUIDs of judge agents (minimum 2 recommended).
+#   test_command — Shell command to run automated tests (e.g. "python -m pytest").
+#
+# Usage (SDK or REST):
+#   POST /v1/workflows/temporal/execute
+#   {
+#     "workflow_name": "the-forge",
+#     "input": {
+#       "task": "Implement a thread-safe LRU cache in Python with tests",
+#       "architect_id": "<architect-agent-uuid>",
+#       "agent_id": "<worker-agent-uuid>",
+#       "test_command": "python -m pytest /workspace/tests/ -v"
+#     },
+#     "blackboard": {
+#       "judges": [
+#         { "agent_id": "<judge-1-uuid>", "weight": 0.5 },
+#         { "agent_id": "<judge-2-uuid>", "weight": 0.5 }
+#       ],
+#       "validation_threshold": 0.8
+#     }
+#   }
+#
+# Human signal (after APPROVE gate appears):
+#   POST /v1/workflows/executions/<execution_id>/signal
+#   { "response": "yes" }   — accept and complete
+#   { "response": "no" }    — reject and loop back to GENERATE
+
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+
+metadata:
+  name: the-forge
+  version: "1.0.0"
+  description: |-
+    Multi-agent constitutional development lifecycle (ADR-020).
+    An architect designs the approach, a worker implements it, judge agents
+    evaluate quality via gradient scoring, automated tests verify correctness,
+    and a human provides a final approval gate before the workflow completes.
+  labels:
+    pattern: forge
+    requires-human: "true"
+
+spec:
+  initial_state: DESIGN
+
+  context:
+    # Gradient validation threshold (0.0–1.0). REVIEW advances to TEST only
+    # when the consensus score meets or exceeds this value.
+    validation_threshold: 0.8
+
+    # Judge agents for REVIEW state. At least two judges are recommended to
+    # produce a meaningful consensus score. Weight values sum should equal 1.0.
+    # Required — must be provided via the `blackboard` field at execution start.
+    judges: []
+
+  states:
+    # ---------------------------------------------------------------------------
+    # DESIGN: Architect agent produces a structured implementation plan.
+    #
+    # Output is stored in the blackboard as "DESIGN" and available to subsequent
+    # states via Handlebars templates (e.g. {{DESIGN.output}}).
+    # ---------------------------------------------------------------------------
+    DESIGN:
+      kind: Agent
+      agent: "{{workflow.architect_id}}"
+      input: |-
+        Design a detailed implementation plan for the following task:
+
+        {{workflow.task}}
+
+        Produce:
+        1. A high-level architecture description.
+        2. A list of files to create or modify.
+        3. Step-by-step implementation instructions for the worker agent.
+        4. Acceptance criteria that the automated tests must satisfy.
+      isolation: docker
+      timeout: 15m
+      transitions:
+        - condition: on_success
+          target: GENERATE
+        - condition: on_failure
+          target: ~
+
+    # ---------------------------------------------------------------------------
+    # GENERATE: Worker agent implements the solution according to the design.
+    #
+    # Judge agents (if present in blackboard.judges) score the output via
+    # gradient validation inside the Temporal activity. The inner refinement
+    # loop runs until the output satisfies judges or retries are exhausted.
+    # ---------------------------------------------------------------------------
+    GENERATE:
+      kind: Agent
+      agent: "{{workflow.agent_id}}"
+      input: |-
+        Implement the solution according to the following design plan:
+
+        {{DESIGN.output}}
+
+        Original task:
+        {{workflow.task}}
+
+        Write all code to the /workspace directory.
+        Ensure the implementation satisfies the acceptance criteria in the plan.
+      isolation: docker
+      timeout: 30m
+      transitions:
+        - condition: on_success
+          target: REVIEW
+        - condition: on_failure
+          target: ~
+
+    # ---------------------------------------------------------------------------
+    # REVIEW: Panel of judge agents evaluates the implementation quality.
+    #
+    # Uses the weighted consensus strategy — each judge scores independently
+    # and the weighted average determines the final score. If the consensus
+    # score >= validation_threshold, the workflow advances to TEST.
+    # Otherwise it loops back to GENERATE with the judge reasoning as feedback.
+    # ---------------------------------------------------------------------------
+    REVIEW:
+      kind: ParallelAgents
+      agents: "{{blackboard.judges}}"
+      consensus:
+        strategy: weighted_average
+        threshold: 0.8
+      timeout: 20m
+      transitions:
+        - condition: score_above
+          threshold: 0.8
+          target: TEST
+        - condition: score_below
+          threshold: 0.8
+          target: GENERATE
+
+    # ---------------------------------------------------------------------------
+    # TEST: Run automated tests to verify correctness of the implementation.
+    #
+    # The test command is provided in the workflow input. A zero exit code
+    # advances to the human APPROVE gate; a non-zero code loops back to GENERATE
+    # with the test stdout/stderr available in the blackboard as TEST.stderr.
+    # ---------------------------------------------------------------------------
+    TEST:
+      kind: System
+      command: "{{workflow.test_command}}"
+      workdir: /workspace
+      timeout: 10m
+      transitions:
+        - condition: exit_code_zero
+          target: APPROVE
+        - condition: exit_code_non_zero
+          target: GENERATE
+
+    # ---------------------------------------------------------------------------
+    # APPROVE: Human gate before final acceptance.
+    #
+    # The workflow pauses here and waits for a humanInput Temporal signal.
+    # Send the signal via:
+    #   POST /v1/workflows/executions/<execution_id>/signal
+    #   { "response": "yes" }   — accept and complete the workflow
+    #   { "response": "no" }    — reject and loop back to GENERATE
+    #
+    # After 1 hour without a signal the default_response ("yes") is used.
+    # ---------------------------------------------------------------------------
+    APPROVE:
+      kind: Human
+      prompt: |-
+        The Forge has completed a development cycle. Please review the output
+        and approve or reject.
+
+        Task: {{workflow.task}}
+
+        Test results: {{TEST.stdout}}
+
+        Type "yes" to accept and complete, or "no" to send back for refinement.
+      default_response: "yes"
+      timeout: 1h
+      transitions:
+        - condition: input_equals_yes
+          target: ~
+        - condition: input_equals_no
+          target: GENERATE

@@ -180,7 +180,10 @@ impl TemporalClient {
 
         let mut client = self.client.clone();
         let response = client.start_workflow_execution(request).await
-            .context("Failed to start workflow execution via gRPC")?;
+            .context(format!(
+                "Failed to start workflow execution via gRPC (Temporal: {})",
+                self.temporal_endpoint
+            ))?;
             
         Ok(response.into_inner().run_id)
     }
@@ -211,6 +214,61 @@ impl TemporalClient {
             .context("Failed to get workflow history")?;
             
         Ok(response.into_inner().history.map(|h| h.events).unwrap_or_default())
+    }
+
+    /// Send a `humanInput` Temporal signal to a workflow paused at a Human state.
+    ///
+    /// Workflows using `StateKind::Human` call `defineSignal('humanInput')` and
+    /// `await condition(...)` — they resume only when this signal arrives.
+    /// The `response` string is JSON-encoded and forwarded as the signal payload.
+    ///
+    /// # gRPC Endpoint
+    ///
+    /// `WorkflowService.SignalWorkflowExecution` — the signal is sent directly to
+    /// Temporal Server without an extra HTTP hop through the TypeScript worker.
+    pub async fn send_human_signal(
+        &self,
+        execution_id: &str,
+        response: String,
+    ) -> Result<()> {
+        use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest;
+        use crate::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution;
+
+        let json_bytes = serde_json::to_vec(&response)?;
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "encoding".to_string(),
+            "json/plain".as_bytes().to_vec(),
+        );
+
+        let payload = Payload {
+            metadata,
+            data: json_bytes,
+            ..Default::default()
+        };
+
+        let request = SignalWorkflowExecutionRequest {
+            namespace: self.namespace.clone(),
+            workflow_execution: Some(WorkflowExecution {
+                workflow_id: execution_id.to_string(),
+                run_id: String::new(),
+            }),
+            signal_name: "humanInput".to_string(),
+            input: Some(Payloads {
+                payloads: vec![payload],
+            }),
+            identity: "aegis-orchestrator".to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            ..Default::default()
+        };
+
+        let mut client = self.client.clone();
+        client
+            .signal_workflow_execution(request)
+            .await
+            .context("Failed to send humanInput signal to workflow execution")?;
+
+        Ok(())
     }
 
     /// Register a workflow definition with the Temporal worker
