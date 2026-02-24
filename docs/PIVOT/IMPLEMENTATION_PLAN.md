@@ -174,18 +174,28 @@ Hardcoded loops are brittle. Declarative workflows are evolvable.
 # Thoughts are just state transitions
 apiVersion: 100monkeys.ai/v1
 kind: Workflow
-states:
-  THINK:
-    agent: planner-v1
-    transitions: [{on: success, target: ACT}]
-  ACT:
-    agent: coder-v1
-    transitions: [{on: success, target: EVALUATE}]
-  EVALUATE:
-    agent: judge-v1
-    transitions:
-      - {on: approved, target: COMPLETE}
-      - {on: rejected, target: THINK}
+
+metadata:
+  name: cognitive-loop
+
+spec:
+  initial_state: THINK
+
+  states:
+    THINK:
+      kind: Agent
+      agent: planner-v1
+      transitions: [{condition: success, target: ACT}]
+    ACT:
+      kind: Agent
+      agent: coder-v1
+      transitions: [{condition: success, target: EVALUATE}]
+    EVALUATE:
+      kind: Agent
+      agent: judge-v1
+      transitions:
+        - {condition: approved, target: COMPLETE}
+        - {condition: rejected, target: THINK}
 ```
 
 **Implementation:** WorkflowEngine with FSM tick() method, YAML manifest parser.
