@@ -618,10 +618,36 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
 
+    // Connect to the standalone Cortex service if configured (ADR-042).
+    // Absence of CORTEX_GRPC_URL means memoryless mode — no error, no retry.
+    let cortex_client: Option<std::sync::Arc<aegis_core::infrastructure::CortexGrpcClient>> =
+        match std::env::var("CORTEX_GRPC_URL") {
+            Ok(url) => {
+                match aegis_core::infrastructure::CortexGrpcClient::new(url.clone()).await {
+                    Ok(client) => {
+                        tracing::info!(url = %url, "Connected to Cortex gRPC service");
+                        Some(std::sync::Arc::new(client))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            url = %url,
+                            error = %e,
+                            "Failed to connect to Cortex gRPC service; running in memoryless mode"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(_) => {
+                tracing::info!("CORTEX_GRPC_URL not set — Orchestrator running in memoryless mode");
+                None
+            }
+        };
+
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
-    
+
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
         println!("Starting gRPC server on {}", grpc_addr);
@@ -631,6 +657,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             val_service_clone,
             Some(attestation_service),
             Some(tool_invocation_service),
+            cortex_client,
         ).await {
              tracing::error!("gRPC server failed: {}", e);
              eprintln!("gRPC server failed: {}", e);

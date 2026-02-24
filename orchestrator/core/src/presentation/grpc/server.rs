@@ -19,13 +19,10 @@ use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionInput;
 
-// Generated protobuf code
-pub mod aegis_runtime {
-    tonic::include_proto!("aegis.runtime.v1");
-}
-
-use aegis_runtime::aegis_runtime_server::{AegisRuntime, AegisRuntimeServer};
-use aegis_runtime::*;
+// Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
+// so that both the server and the CortexGrpcClient client share the same Rust types.
+use crate::infrastructure::aegis_runtime_proto::aegis_runtime_server::{AegisRuntime, AegisRuntimeServer};
+use crate::infrastructure::aegis_runtime_proto::*;
 
 /// Implementation of the AegisRuntime gRPC service
 pub struct AegisRuntimeService {
@@ -33,6 +30,7 @@ pub struct AegisRuntimeService {
     validation_service: Arc<ValidationService>,
     attestation_service: Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
     tool_invocation_service: Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
+    cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
 }
 
 impl AegisRuntimeService {
@@ -45,6 +43,7 @@ impl AegisRuntimeService {
             validation_service,
             attestation_service: None,
             tool_invocation_service: None,
+            cortex_client: None,
         }
     }
 
@@ -58,6 +57,15 @@ impl AegisRuntimeService {
     ) -> Self {
         self.attestation_service = Some(attestation_service);
         self.tool_invocation_service = Some(tool_invocation_service);
+        self
+    }
+
+    /// Set the Cortex gRPC client (optional — omit for memoryless mode, per ADR-042)
+    pub fn with_cortex(
+        mut self,
+        cortex_client: Arc<crate::infrastructure::CortexGrpcClient>,
+    ) -> Self {
+        self.cortex_client = Some(cortex_client);
         self
     }
 
@@ -293,34 +301,44 @@ impl AegisRuntime for AegisRuntimeService {
         }
     }
 
-    /// Query Cortex for patterns based on error signature or embedding similarity
+    /// Query Cortex for patterns based on error signature or embedding similarity.
+    /// Forwards the call to the standalone `aegis-cortex` service when configured;
+    /// returns an empty result set in memoryless mode (no warning per ADR-042).
     async fn query_cortex_patterns(
         &self,
         request: Request<QueryCortexRequest>,
     ) -> Result<Response<QueryCortexResponse>, Status> {
-        let _req = request.into_inner();
-        
-        // TODO: Implement gRPC client forwarding to standalone aegis-cortex service
-        tracing::warn!("QueryCortexPatterns called but standalone Cortex gRPC client is not yet implemented (returning stub)");
-        Ok(Response::new(QueryCortexResponse {
-            patterns: vec![],
-        }))
+        let req = request.into_inner();
+
+        match &self.cortex_client {
+            Some(client) => client
+                .query_patterns(req)
+                .await
+                .map(Response::new),
+            None => Ok(Response::new(QueryCortexResponse { patterns: vec![] })),
+        }
     }
 
-    /// Store a learned pattern in Cortex with automatic deduplication
+    /// Store a learned pattern in Cortex with automatic deduplication.
+    /// Forwards the call to the standalone `aegis-cortex` service when configured;
+    /// returns a no-op response in memoryless mode (no warning per ADR-042).
     async fn store_cortex_pattern(
         &self,
         request: Request<StoreCortexPatternRequest>,
     ) -> Result<Response<StoreCortexPatternResponse>, Status> {
-        let _req = request.into_inner();
-        
-        // TODO: Implement gRPC client forwarding to standalone aegis-cortex service
-        tracing::warn!("StoreCortexPattern called but standalone Cortex gRPC client is not yet implemented (returning stub)");
-        Ok(Response::new(StoreCortexPatternResponse {
-            pattern_id: uuid::Uuid::new_v4().to_string(),
-            deduplicated: false,
-            new_frequency: 1,
-        }))
+        let req = request.into_inner();
+
+        match &self.cortex_client {
+            Some(client) => client
+                .store_pattern(req)
+                .await
+                .map(Response::new),
+            None => Ok(Response::new(StoreCortexPatternResponse {
+                pattern_id: String::new(),
+                deduplicated: false,
+                new_frequency: 0,
+            })),
+        }
     }
 
     /// Attest an agent to receive an SMCP Security Token
@@ -496,12 +514,16 @@ pub async fn start_grpc_server(
     validation_service: Arc<ValidationService>,
     attestation_service: Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
     tool_invocation_service: Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
+    cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut service = AegisRuntimeService::new(execution_service, validation_service);
 
-    
     if let (Some(a), Some(t)) = (attestation_service, tool_invocation_service) {
         service = service.with_smcp(a, t);
+    }
+
+    if let Some(c) = cortex_client {
+        service = service.with_cortex(c);
     }
 
     let server = service.into_server();

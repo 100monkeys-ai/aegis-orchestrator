@@ -4,6 +4,7 @@ The core runtime and orchestrator for Project AEGIS - a secure, serverless runti
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
+[![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
 ## Overview
 
@@ -265,23 +266,17 @@ For details, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
-### Getting Started
+Full documentation is available at **[docs.100monkeys.ai](https://docs.100monkeys.ai)**.
 
-- [Getting Started Guide](docs/GETTING_STARTED.md) - Complete setup walkthrough
-- [Local Testing Guide](docs/LOCAL_TESTING.md) - Build and test workflow
-- [CLI Reference](docs/CLI_REFERENCE.md) - Complete command documentation
-- [Troubleshooting](docs/TROUBLESHOOTING.md) - Common issues and solutions
-
-### Development Guides
-
-- [Agent Development Guide](docs/AGENT_DEVELOPMENT.md) - Creating custom agents
-- [Architecture](docs/ARCHITECTURE.md) - System design
-- [Contributing](docs/CONTRIBUTING.md) - Development guide
-
-### Security & Operations
-
-- [Security Model](docs/SECURITY.md) - Threat analysis
-- [Roadmap](docs/ROADMAP.md) - Future plans
+| Section | Description |
+| --- | --- |
+| [Getting Started](https://docs.100monkeys.ai/docs/getting-started) | Install, configure, and run your first agent |
+| [Core Concepts](https://docs.100monkeys.ai/docs/concepts) | Agents, executions, workflows, swarms, security model |
+| [Guides](https://docs.100monkeys.ai/docs/guides) | Writing agents, building workflows, configuring storage |
+| [Architecture](https://docs.100monkeys.ai/docs/architecture) | Execution engine, SMCP, storage gateway, event bus |
+| [Deployment](https://docs.100monkeys.ai/docs/deployment) | Docker, Firecracker, IAM, secrets, configuration reference |
+| [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) | Complete `aegis` CLI command reference |
+| [gRPC API](https://docs.100monkeys.ai/docs/reference/grpc-api) | `aegis.runtime.v1` service methods and message types |
 
 ### References
 
