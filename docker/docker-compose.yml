@@ -8,7 +8,7 @@ services:
     image: postgres:15-alpine
     container_name: aegis-postgres
     environment:
-      POSTGRES_MULTIPLE_DATABASES: "temporal,aegis,seaweedfs"
+      POSTGRES_MULTIPLE_DATABASES: "temporal,aegis,seaweedfs,keycloak"
       POSTGRES_USER: aegis
       POSTGRES_PASSWORD: aegis
       POSTGRES_DB: aegis
@@ -160,6 +160,55 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
+
+  # ============================================================================
+  # IAM Services (ADR-041: Keycloak Central IAM Integration)
+  # ============================================================================
+  #
+  # Keycloak is the single trusted OIDC issuer for all human and service-account
+  # authentication across AEGIS, Zaru, and the Control Plane.
+  # Realms:
+  #   - aegis-system  : operators (Control Plane UI), SDK service accounts, CI/CD
+  #   - zaru-consumer : consumer users at myzaru.com (social login via Google/GitHub)
+  #   - tenant-{slug} : per-enterprise realms (federated SAML IdPs, Phase 2 automation)
+  #
+  # Admin UI: http://localhost:8090
+  # OIDC discovery (aegis-system):  http://localhost:8090/realms/aegis-system/.well-known/openid-configuration
+  # OIDC discovery (zaru-consumer): http://localhost:8090/realms/zaru-consumer/.well-known/openid-configuration
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: aegis-keycloak
+    # "start-dev" enables dev mode (HTTP, auto-build) — replace with "start --optimized"
+    # and a production-built image when deploying to staging/production.
+    command: ["start-dev"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # Database backend — shares the aegis-postgres instance via the keycloak DB
+      # created by init-multiple-dbs.sh from POSTGRES_MULTIPLE_DATABASES.
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: aegis
+      KC_DB_PASSWORD: aegis
+      # Bind on all interfaces so the container is reachable on the Docker network.
+      KC_HOSTNAME_STRICT: "false"
+      KC_HTTP_ENABLED: "true"
+      # Bootstrap admin credentials — rotate immediately in any non-dev environment.
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: "${KEYCLOAK_ADMIN_PASSWORD:-admin}"
+    ports:
+      - "8090:8080"   # Admin UI + OIDC endpoints (mapped to 8090 to avoid conflicts)
+    networks:
+      - aegis-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     restart: unless-stopped
 
   # ============================================================================

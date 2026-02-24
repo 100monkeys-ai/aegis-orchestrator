@@ -606,6 +606,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_repo: workflow_repo.clone(),
         temporal_client_container: temporal_client_container.clone(),
         tool_invocation_service: tool_invocation_service.clone(),
+        attestation_service: attestation_service.clone(),
         start_time: std::time::Instant::now(),
     };
 
@@ -870,6 +871,8 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
         .route("/v1/human-approvals/:id/approve", post(approve_request_handler))
         .route("/v1/human-approvals/:id/reject", post(reject_request_handler))
+        .route("/v1/smcp/attest", post(attest_smcp_handler))
+        .route("/v1/smcp/invoke", post(invoke_smcp_handler))
         .with_state(app_state)
 }
 
@@ -887,6 +890,7 @@ struct AppState {
     workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
     temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>>>,
     tool_invocation_service: Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
+    attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService>,
     start_time: std::time::Instant,
 }
 
@@ -1914,6 +1918,80 @@ async fn reject_request_handler(
             "request_id": id
         })),
         Err(e) => Json(serde_json::json!({ "error": e.to_string() })),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct HttpAttestationRequest {
+    pub agent_id: String,
+    pub execution_id: Option<String>,
+    pub container_id: String,
+    pub public_key: String,
+}
+
+async fn attest_smcp_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HttpAttestationRequest>,
+) -> impl IntoResponse {
+    let internal_req = aegis_core::infrastructure::smcp::attestation::AttestationRequest {
+        agent_id: request.agent_id.clone(),
+        execution_id: request.execution_id.unwrap_or_else(|| request.agent_id.clone()),
+        container_id: request.container_id.clone(),
+        public_key_pem: request.public_key.clone(),
+    };
+    
+    match state.attestation_service.attest(internal_req).await {
+        Ok(res) => (StatusCode::OK, Json(serde_json::json!({
+            "security_token": res.security_token
+        }))).into_response(),
+        Err(e) => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
+            "error": e.to_string()
+        }))).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct HttpSmcpEnvelope {
+    pub security_token: String,
+    pub signature: String,
+    pub payload: serde_json::Value,
+}
+
+async fn invoke_smcp_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HttpSmcpEnvelope>,
+) -> impl IntoResponse {
+    let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
+    
+    let envelope = aegis_core::infrastructure::smcp::envelope::SmcpEnvelope {
+        security_token: request.security_token,
+        signature: request.signature,
+        inner_mcp: payload_bytes,
+    };
+    
+    let payload_b64 = envelope.security_token.split('.').nth(1).unwrap_or("");
+    let payload_bytes = match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload_b64) {
+        Ok(b) => b,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Malformed security token base64" }))).into_response(),
+    };
+    
+    let token_data: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
+        Ok(d) => d,
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Malformed security token JSON" }))).into_response(),
+    };
+    
+    let agent_id_str = token_data.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+    
+    let agent_id = match uuid::Uuid::parse_str(agent_id_str) {
+        Ok(uid) => AgentId(uid),
+        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "agent_id in token is missing or not a valid UUID" }))).into_response(),
+    };
+    
+    match state.tool_invocation_service.invoke_tool(&agent_id, &envelope).await {
+         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+             "error": e.to_string()
+         }))).into_response(),
     }
 }
 
