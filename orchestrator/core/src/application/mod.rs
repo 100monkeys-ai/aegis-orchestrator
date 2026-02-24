@@ -26,6 +26,7 @@
 //! | [`volume_manager`] | BC-7 Storage Gateway | `VolumeService` trait, volume lifecycle management |
 //! | [`nfs_gateway`] | BC-7 Storage Gateway | `NfsGatewayService` — manages the user-space NFS server lifecycle (ADR-036) |
 //! | [`storage_event_persister`] | BC-7 Storage Gateway | Subscribes to `StorageEvent`s and persists them for audit trail |
+//! | [`inner_loop_service`] | BC-2 Execution | Inner loop gateway: LLM ↔ tool call cycle (ADR-038) |
 //! | [`repository_factory`] | Cross-cutting | Builds concrete repository implementations from config |
 //!
 //! ## Removed Modules
@@ -51,6 +52,7 @@ pub mod volume_manager;
 pub mod nfs_gateway;
 pub mod storage_event_persister;
 pub mod repository_factory;
+pub mod inner_loop_service;
 
 // Re-export use cases for convenience
 pub use register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase, RegisteredWorkflow};
