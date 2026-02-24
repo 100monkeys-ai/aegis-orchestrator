@@ -3,12 +3,12 @@
 //! PostgreSQL Workflow Execution Repository
 //!
 //! Provides PostgreSQL-backed persistence for workflow execution state tracking
-//! including FSM state transitions, blackboard data, and integration with Temporal.
+//! including Temporal run linkage, final blackboard capture, and state history.
 //!
 //! # Architecture
 //!
 //! - **Layer:** Infrastructure
-//! - **Purpose:** Track workflow execution state and FSM progress
+//! - **Purpose:** Track workflow execution state and Temporal run linkage
 //! - **Integration:** Domain WorkflowExecutionRepository → PostgreSQL workflow_executions table
 //!
 //! # Schema
@@ -18,16 +18,17 @@
 //! - Temporal integration IDs (workflow ID, run ID)
 //! - Input parameters (JSONB)
 //! - Current FSM state and state history
-//! - Blackboard data (shared state between workflow steps)
+//! - Final blackboard snapshot (captured from Temporal on WorkflowExecutionCompleted)
 //! - Execution timestamps
 //!
-//! # FSM State Tracking
+//! # Execution State Tracking
 //!
-//! Workflow executions follow a finite state machine model:
-//! - **Current State**: Active state in the workflow graph
-//! - **State History**: Ordered list of visited states
-//! - **Blackboard**: Key-value storage for passing data between states
-//! - **Transitions**: State transitions evaluated based on conditions
+//! Execution state is driven by the TypeScript `aegis_workflow` Temporal worker.
+//! Rust mirrors high-level progress from Temporal event callbacks:
+//! - **Current State**: Last reported active state (updated by `TemporalEventListener`)
+//! - **State History**: Ordered list of visited states (for audit/Cortex)
+//! - **Final Blackboard**: Snapshot captured from `WorkflowExecutionCompleted` (not mutated mid-run)
+//! - **Transitions**: Evaluated inside the TypeScript worker, not by this repository
 //!
 //! # Temporal Integration
 //!

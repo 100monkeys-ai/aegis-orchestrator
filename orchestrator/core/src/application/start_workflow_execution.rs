@@ -37,7 +37,10 @@ pub struct StartWorkflowExecutionRequest {
     /// Input context/parameters for workflow
     pub input: serde_json::Value,
     
-    /// Optional blackboard initial state
+    /// Optional blackboard seed: key-value context forwarded to the TypeScript worker at startup.
+    /// Values are included in the `StartWorkflowExecution` Temporal payload and accessible
+    /// inside the worker via Handlebars templates (e.g. `{{blackboard.judges}}`).
+    /// Rust does not mutate the blackboard during workflow execution.
     pub blackboard: Option<serde_json::Value>,
 }
 

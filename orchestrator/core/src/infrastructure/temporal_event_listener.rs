@@ -84,7 +84,8 @@ pub struct TemporalEventPayload {
     /// State name (optional, for StateEntered/StateExited events)
     pub state_name: Option<String>,
 
-    /// Output or blackboard state (optional)
+    /// State output or final blackboard snapshot (optional).
+    /// Populated from `WorkflowExecutionCompleted` events; stored on `WorkflowExecution` for audit.
     pub output: Option<serde_json::Value>,
 
     /// Error message (optional, for failure events)

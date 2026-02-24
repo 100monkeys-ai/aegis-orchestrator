@@ -548,13 +548,23 @@ pub enum TransitionCondition {
 }
 
 // ============================================================================
-// Value Objects: Blackboard (Shared Context)
+// Value Objects: Blackboard (Boundary Object)
 // ============================================================================
 
-/// Blackboard: Shared mutable state for workflow execution
+/// Blackboard: Boundary object for workflow execution context.
 ///
-/// The blackboard stores execution context that can be read/written by states.
-/// Values are accessible via Handlebars templates: {{blackboard.key}}
+/// The live execution context is owned by the TypeScript `aegis_workflow` Temporal worker
+/// and persisted by Temporal's event-sourcing. Rust interacts with the blackboard at two
+/// boundary points only — it never mutates the blackboard during execution.
+///
+/// - **Input (seed):** `StartWorkflowExecutionRequest.blackboard` supplies initial key-value
+///   context (e.g. `judges`, `validation_threshold`) before the TypeScript worker starts.
+///   Values are forwarded in the `StartWorkflowExecution` Temporal payload and accessible
+///   inside the worker via Handlebars templates: `{{blackboard.key}}`.
+///
+/// - **Output (capture):** `TemporalEventListener` reads the `final_blackboard` from
+///   `WorkflowExecutionCompleted` events and stores it on `WorkflowExecution` in PostgreSQL
+///   for audit and Cortex learning.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Blackboard {
     data: HashMap<String, serde_json::Value>,
@@ -646,7 +656,8 @@ pub struct WorkflowExecution {
     /// Current state name
     pub current_state: StateName,
 
-    /// Shared context (blackboard)
+    /// Blackboard state: seeded from `StartWorkflowExecutionRequest` before the Temporal worker
+    /// starts; overwritten with the final snapshot captured from `WorkflowExecutionCompleted`.
     pub blackboard: Blackboard,
 
     /// Input parameters
