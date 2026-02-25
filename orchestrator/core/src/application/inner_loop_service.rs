@@ -387,6 +387,9 @@ mod tests {
                 mcp_servers: None,
                 smcp: None,
                 security_contexts: None,
+                database: None,
+                temporal: None,
+                cortex: None,
             },
         };
         Arc::new(ProviderRegistry::from_config(&config).unwrap())

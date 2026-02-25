@@ -32,7 +32,7 @@ use aegis_core::{
         start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest},
     },
     domain::{
-        node_config::NodeConfigManifest,
+        node_config::{NodeConfigManifest, resolve_env_value},
         agent::AgentId,
         execution::ExecutionId,
         execution::ExecutionInput,
@@ -91,14 +91,25 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Configuration loaded. Initializing services...");
 
-    // Initialize repositories 
-    let database_url = std::env::var("AEGIS_DATABASE_URL").ok();
+    // Initialize repositories — resolve database URL from config (spec.database)
+    let database_url: Option<String> = config.spec.database.as_ref().and_then(|db| {
+        match resolve_env_value(&db.url) {
+            Ok(url) => Some(url),
+            Err(e) => {
+                tracing::warn!("Failed to resolve database URL: {}. Falling back to InMemory.", e);
+                None
+            }
+        }
+    });
+    let db_max_connections: u32 = config.spec.database.as_ref()
+        .map(|db| db.max_connections)
+        .unwrap_or(5);
     
     // Store pool separately for later volume repo initialization
     let pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
         println!("Initializing repositories with PostgreSQL: {}", url);
         match sqlx::postgres::PgPoolOptions::new()
-            .max_connections(5)
+            .max_connections(db_max_connections)
             .connect(url)
             .await 
         {
@@ -146,7 +157,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     } else {
-        println!("AEGIS_DATABASE_URL not set. Using InMemory repositories.");
+        println!("No database configured (spec.database omitted). Using InMemory repositories.");
         None
     };
     
@@ -181,46 +192,37 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Initializing Docker runtime...");
     
-    // Resolve orchestrator URL (supports env:VAR_NAME syntax)
-    let orchestrator_url = if config.spec.runtime.orchestrator_url.starts_with("env:") {
-        let env_var = config.spec.runtime.orchestrator_url.strip_prefix("env:").unwrap();
-        std::env::var(env_var)
-            .unwrap_or_else(|_| {
-                tracing::warn!("Environment variable {} not set, using default orchestrator URL", env_var);
-                "http://localhost:8000".to_string()
-            })
-    } else {
-        config.spec.runtime.orchestrator_url.clone()
-    };
+    // Resolve orchestrator URL (supports env:VAR_NAME syntax via resolve_env_value)
+    let orchestrator_url = resolve_env_value(&config.spec.runtime.orchestrator_url)
+        .unwrap_or_else(|e| {
+            tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
+            "http://localhost:8000".to_string()
+        });
     
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
     // Note: The Docker daemon relies on this to mount volumes from the host environment.
-    let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().map(|host| {
-        if host.starts_with("env:") {
-            let env_var = host.strip_prefix("env:").unwrap();
-            std::env::var(env_var)
-                .unwrap_or_else(|_| {
-                    tracing::warn!("Environment variable {} not set. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", env_var);
-                    String::new()
-                })
-        } else {
-            host.clone()
+    let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().and_then(|host| {
+        match resolve_env_value(host) {
+            Ok(resolved) if !resolved.is_empty() => Some(resolved),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!("Failed to resolve NFS server host: {}. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", e);
+                None
+            }
         }
-    }).filter(|s| !s.is_empty());
+    });
     
     // Resolve Docker network mode (supports env:VAR_NAME syntax)
-    let network_mode = config.spec.runtime.docker_network_mode.as_ref().map(|nm| {
-        if nm.starts_with("env:") {
-            let env_var = nm.strip_prefix("env:").unwrap();
-            std::env::var(env_var)
-                .unwrap_or_else(|_| {
-                    tracing::debug!("Environment variable {} not set, using no explicit Docker network", env_var);
-                    String::new()
-                })
-        } else {
-            nm.clone()
+    let network_mode = config.spec.runtime.docker_network_mode.as_ref().and_then(|nm| {
+        match resolve_env_value(nm) {
+            Ok(resolved) if !resolved.is_empty() => Some(resolved),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::debug!("Failed to resolve Docker network mode: {}. Using no explicit Docker network.", e);
+                None
+            }
         }
-    }).filter(|s| !s.is_empty());
+    });
     
     let runtime = Arc::new(
         DockerRuntime::new(
@@ -398,9 +400,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Initializing workflow engine...");
     
-    // Initialize Temporal Client
-    let temporal_address = std::env::var("TEMPORAL_ADDRESS").unwrap_or_else(|_| "temporal:7233".to_string());
-    let worker_http_endpoint = std::env::var("AEGIS_WORKER_HTTP_ENDPOINT").unwrap_or_else(|_| "http://localhost:3000".to_string());
+    // Initialize Temporal Client — read from config (spec.temporal)
+    let temporal_config = config.spec.temporal.clone().unwrap_or_default();
+    let temporal_address = resolve_env_value(&temporal_config.address)
+        .unwrap_or_else(|_| "temporal:7233".to_string());
+    let worker_http_endpoint = resolve_env_value(&temporal_config.worker_http_endpoint)
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
+    let temporal_namespace = temporal_config.namespace.clone();
+    let temporal_task_queue = temporal_config.task_queue.clone();
     println!("Initializing Temporal Client (Address: {})...", temporal_address);
     
     // Create a shared container for the client that relies on interior mutability
@@ -417,7 +424,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let max_retries = 30; // Try for 1 minute (2s * 30) or indefinitely? User said "eventually timeout/quit trying"
         
         loop {
-            match TemporalClient::new(&temporal_address_clone, "default", "aegis-agents", &worker_http_endpoint_clone).await {
+            match TemporalClient::new(&temporal_address_clone, &temporal_namespace, &temporal_task_queue, &worker_http_endpoint_clone).await {
                 Ok(client) => {
                     println!("Async: Temporal Client connected successfully.");
                     let mut lock = temporal_client_container_clone.write().await;
@@ -561,6 +568,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         temporal_client_container: temporal_client_container.clone(),
         tool_invocation_service: tool_invocation_service.clone(),
         attestation_service: attestation_service.clone(),
+        config: config.clone(),
         start_time: std::time::Instant::now(),
     };
 
@@ -626,10 +634,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     });
 
     // Connect to the standalone Cortex service if configured (ADR-042).
-    // Absence of CORTEX_GRPC_URL means memoryless mode — no error, no retry.
+    // Absence of spec.cortex.grpc_url means memoryless mode — no error, no retry.
+    let cortex_grpc_url: Option<String> = config.spec.cortex.as_ref()
+        .and_then(|c| c.grpc_url.as_ref())
+        .and_then(|url| resolve_env_value(url).ok());
     let cortex_client: Option<std::sync::Arc<aegis_core::infrastructure::CortexGrpcClient>> =
-        match std::env::var("CORTEX_GRPC_URL") {
-            Ok(url) => {
+        match cortex_grpc_url {
+            Some(url) => {
                 match aegis_core::infrastructure::CortexGrpcClient::new(url.clone()).await {
                     Ok(client) => {
                         tracing::info!(url = %url, "Connected to Cortex gRPC service");
@@ -645,8 +656,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     }
                 }
             }
-            Err(_) => {
-                tracing::info!("CORTEX_GRPC_URL not set — Orchestrator running in memoryless mode");
+            None => {
+                tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
                 None
             }
         };
@@ -782,7 +793,11 @@ async fn temporal_events_handler(
     Json(payload): Json<TemporalEventPayload>,
 ) -> impl IntoResponse {
     // Validate shared secret from X-Temporal-Worker-Secret header
-    let expected_secret = std::env::var("TEMPORAL_WORKER_SECRET").ok();
+    // Read from config (spec.temporal.worker_secret) instead of direct env var
+    let temporal_config_for_secret = state.config.spec.temporal.as_ref();
+    let expected_secret = temporal_config_for_secret
+        .and_then(|tc| tc.worker_secret.as_ref())
+        .and_then(|s| resolve_env_value(s).ok());
     if let Some(secret) = expected_secret {
         let provided = headers
             .get("x-temporal-worker-secret")
@@ -797,8 +812,8 @@ async fn temporal_events_handler(
         }
     } else {
         tracing::warn!(
-            "TEMPORAL_WORKER_SECRET is not set; /v1/temporal-events endpoint is unauthenticated. \
-             Set this environment variable in production to restrict access."
+            "spec.temporal.worker_secret not configured; /v1/temporal-events endpoint is unauthenticated. \
+             Set spec.temporal.worker_secret in aegis-config.yaml for production."
         );
     }
 
@@ -870,6 +885,7 @@ struct AppState {
     temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>>>,
     tool_invocation_service: Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
     attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService>,
+    config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
 

@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
             commands::workflow::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Update { command }) => {
-            commands::update::execute(command).await
+            commands::update::execute(command, cli.config).await
         }
         None => {
             // No command provided - show help

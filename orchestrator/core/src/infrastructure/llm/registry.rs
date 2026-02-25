@@ -10,7 +10,7 @@ use crate::domain::llm::{
     ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
     ToolSchema,
 };
-use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest};
+use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest, resolve_env_value};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,15 +133,10 @@ impl ProviderRegistry {
     }
 
     /// Resolve API key from config (supports "env:VAR_NAME" syntax)
+    /// Delegates to the centralized `resolve_env_value()` utility.
     fn resolve_api_key(key: &Option<String>) -> anyhow::Result<String> {
         match key {
-            Some(k) if k.starts_with("env:") => {
-                let var_name = k.strip_prefix("env:").unwrap();
-                std::env::var(var_name).map_err(|_| {
-                    anyhow::anyhow!("Environment variable not set: {}", var_name)
-                })
-            }
-            Some(k) => Ok(k.clone()),
+            Some(k) => resolve_env_value(k),
             None => Ok(String::new()), // For local providers without auth
         }
     }
@@ -330,6 +325,9 @@ mod tests {
                 mcp_servers: None,
                 smcp: None,
                 security_contexts: None,
+                database: None,
+                temporal: None,
+                cortex: None,
             },
         };
 

@@ -98,6 +98,21 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
+    /// Database configuration (PostgreSQL)
+    /// If omitted, the orchestrator uses InMemory repositories (development mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub database: Option<DatabaseConfig>,
+
+    /// Temporal workflow engine configuration (ADR-022)
+    /// If omitted, Temporal connection uses defaults (address: "temporal:7233").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub temporal: Option<TemporalConfig>,
+
+    /// Cortex (Learning & Memory) gRPC service configuration (ADR-042)
+    /// If omitted, the orchestrator runs in memoryless mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cortex: Option<CortexConfig>,
+
     /// SMCP protocol configuration (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smcp: Option<SmcpConfig>,
@@ -617,6 +632,94 @@ impl Default for McpResourceLimitsConfig {
     }
 }
 
+/// Database configuration.
+///
+/// Defines the PostgreSQL connection used for persistent repositories.
+/// If this section is omitted from the node config, the orchestrator uses
+/// InMemory repositories (suitable for development / testing only).
+///
+/// The `url` field supports the `env:VAR_NAME` credential resolution pattern
+/// (see §Credential Resolution Patterns in NODE_CONFIGURATION_SPEC_V1.md).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DatabaseConfig {
+    /// PostgreSQL connection URL.
+    /// Supports `env:VAR_NAME` for environment variable resolution
+    /// and `vault:namespace/mount/path` for OpenBao secrets (Phase 2).
+    /// Example: `"env:AEGIS_DATABASE_URL"` or `"postgresql://user:pass@host:5432/db"`
+    pub url: String,
+
+    /// Maximum connection pool size.
+    #[serde(default = "default_db_max_connections")]
+    pub max_connections: u32,
+
+    /// Connection timeout in seconds.
+    #[serde(default = "default_db_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+}
+
+/// Temporal workflow engine configuration (ADR-022).
+///
+/// Configures the connection to the Temporal server used for durable workflow
+/// execution. If this section is omitted, the orchestrator uses default values.
+///
+/// All string fields support the `env:VAR_NAME` credential resolution pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalConfig {
+    /// Temporal server address (host:port).
+    /// Example: `"temporal:7233"` (Docker), `"localhost:7233"` (local dev)
+    #[serde(default = "default_temporal_address")]
+    pub address: String,
+
+    /// HTTP endpoint of the Temporal worker service.
+    /// Used for workflow activity callbacks.
+    /// Example: `"http://temporal-worker:3000"`
+    #[serde(default = "default_temporal_worker_http_endpoint")]
+    pub worker_http_endpoint: String,
+
+    /// Shared HMAC secret for authenticating Temporal event callbacks.
+    /// Supports `env:VAR_NAME` and `vault:` credential resolution patterns.
+    /// If omitted, the `/v1/temporal-events` endpoint is unauthenticated (warns at startup).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_secret: Option<String>,
+
+    /// Temporal namespace.
+    #[serde(default = "default_temporal_namespace")]
+    pub namespace: String,
+
+    /// Temporal task queue.
+    #[serde(default = "default_temporal_task_queue")]
+    pub task_queue: String,
+}
+
+impl Default for TemporalConfig {
+    fn default() -> Self {
+        Self {
+            address: default_temporal_address(),
+            worker_http_endpoint: default_temporal_worker_http_endpoint(),
+            worker_secret: None,
+            namespace: default_temporal_namespace(),
+            task_queue: default_temporal_task_queue(),
+        }
+    }
+}
+
+/// Cortex (Learning & Memory) gRPC service configuration (ADR-042).
+///
+/// Configures the connection to the standalone Cortex service for pattern
+/// storage and semantic search. If this section is omitted (or `grpc_url`
+/// is `None`), the orchestrator runs in **memoryless mode** — no error,
+/// no retry, patterns are simply not stored.
+///
+/// The `grpc_url` field supports the `env:VAR_NAME` credential resolution pattern.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CortexConfig {
+    /// gRPC URL of the Cortex service.
+    /// Example: `"http://cortex:50052"`, `"env:CORTEX_GRPC_URL"`
+    /// If `None`, the orchestrator runs in memoryless mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_url: Option<String>,
+}
+
 /// SMCP protocol configuration (ADR-035 §6)
 ///
 /// Defines the RSA key material used by the orchestrator to sign and verify
@@ -799,6 +902,12 @@ fn default_memory_mb() -> u32 { 512 }
 fn default_smcp_issuer() -> String { "aegis-orchestrator".to_string() }
 fn default_smcp_audiences() -> Vec<String> { vec!["aegis-agents".to_string()] }
 fn default_smcp_token_ttl() -> u64 { 3600 }
+fn default_db_max_connections() -> u32 { 5 }
+fn default_db_connect_timeout_seconds() -> u64 { 5 }
+fn default_temporal_address() -> String { "temporal:7233".to_string() }
+fn default_temporal_worker_http_endpoint() -> String { "http://localhost:3000".to_string() }
+fn default_temporal_namespace() -> String { "default".to_string() }
+fn default_temporal_task_queue() -> String { "aegis-agents".to_string() }
 
 impl Default for LLMSelectionStrategy {
     fn default() -> Self {
@@ -834,6 +943,9 @@ impl Default for NodeConfigSpec {
             network: None,
             observability: None,
             storage: None,
+            database: None,
+            temporal: None,
+            cortex: None,
             mcp_servers: None,
             smcp: None,
             security_contexts: None,
@@ -949,10 +1061,63 @@ impl NodeConfigManifest {
         }
     }
     
-    /// Apply environment variable overrides to configuration
-    /// This allows container deployments to override config via env vars
+    /// Apply environment variable overrides to configuration.
+    ///
+    /// Standard precedence: explicit YAML value > env var override > default.
+    /// Only overrides fields that are still at their default values.
     pub fn apply_env_overrides(&mut self) {
-        // Add environment variable overrides here as needed
+        // AEGIS_PORT → spec.network.port (only if network config uses default port)
+        if let Ok(port_str) = std::env::var("AEGIS_PORT") {
+            if let Ok(port) = port_str.parse::<u16>() {
+                let network = self.spec.network.get_or_insert_with(|| NetworkConfig {
+                    bind_address: default_bind_address(),
+                    port: default_api_port(),
+                    grpc_port: default_grpc_port(),
+                    orchestrator_endpoint: None,
+                    heartbeat_interval_seconds: default_heartbeat(),
+                    tls: None,
+                });
+                if network.port == default_api_port() {
+                    network.port = port;
+                }
+            }
+        }
+
+        // AEGIS_HOST → spec.network.bind_address (only if at default)
+        if let Ok(host) = std::env::var("AEGIS_HOST") {
+            if !host.is_empty() {
+                let network = self.spec.network.get_or_insert_with(|| NetworkConfig {
+                    bind_address: default_bind_address(),
+                    port: default_api_port(),
+                    grpc_port: default_grpc_port(),
+                    orchestrator_endpoint: None,
+                    heartbeat_interval_seconds: default_heartbeat(),
+                    tls: None,
+                });
+                if network.bind_address == default_bind_address() {
+                    network.bind_address = host;
+                }
+            }
+        }
+
+        // AEGIS_LOG_LEVEL → spec.observability.logging.level (only if at default)
+        if let Ok(level) = std::env::var("AEGIS_LOG_LEVEL") {
+            if !level.is_empty() {
+                let obs = self.spec.observability.get_or_insert_with(|| ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(|| LoggingConfig {
+                    level: default_log_level(),
+                    format: default_log_format(),
+                    file: None,
+                });
+                if logging.level == default_log_level() {
+                    logging.level = level;
+                }
+            }
+        }
     }
     
     /// Validate configuration
@@ -1022,6 +1187,41 @@ impl NodeConfigManifest {
     }
 }
 
+/// Resolve a configuration value that may use the `env:VAR_NAME` pattern.
+///
+/// The `env:` prefix is the canonical way to inject secrets and deployment-specific
+/// values into YAML configuration without hardcoding them. See
+/// NODE_CONFIGURATION_SPEC_V1.md §Credential Resolution Patterns.
+///
+/// # Resolution patterns
+///
+/// | Pattern | Example | Behaviour |
+/// |---------|---------|----------|
+/// | `env:VAR` | `env:OPENAI_API_KEY` | Read `$OPENAI_API_KEY` from process env |
+/// | literal | `sk-abcdef...` | Return as-is |
+///
+/// Phase 2 will add `vault:namespace/mount/path` for OpenBao secrets.
+pub fn resolve_env_value(raw: &str) -> anyhow::Result<String> {
+    if let Some(var_name) = raw.strip_prefix("env:") {
+        std::env::var(var_name).map_err(|_| {
+            anyhow::anyhow!(
+                "Environment variable '{}' not set (referenced via 'env:{}' in config)",
+                var_name,
+                var_name,
+            )
+        })
+    } else {
+        Ok(raw.to_string())
+    }
+}
+
+/// Resolve an optional configuration value that may use the `env:VAR_NAME` pattern.
+///
+/// Returns `None` if the input is `None` or if the env var is not set.
+pub fn resolve_env_value_optional(raw: &Option<String>) -> Option<String> {
+    raw.as_ref().and_then(|v| resolve_env_value(v).ok())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1084,6 +1284,9 @@ mod tests {
                 network: None,
                 observability: None,
                 storage: None, // Optional storage configuration (ADR-032)
+                database: None,
+                temporal: None,
+                cortex: None,
                 mcp_servers: None,
                 smcp: None,
                 security_contexts: None,

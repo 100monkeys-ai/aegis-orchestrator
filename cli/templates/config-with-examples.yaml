@@ -269,3 +269,45 @@ spec:
       default_size_limit_mb: 1000                  # 1GB default quota
       max_size_limit_mb: 10000                     # 10GB maximum quota
 
+  # --------------------------------------------------------------------------
+  # Database Configuration (Optional)
+  # --------------------------------------------------------------------------
+  # PostgreSQL database for persistent state (executions, patterns, workflows).
+  # If omitted, the daemon starts without database connectivity.
+  # database:
+  #   # Connection URL (supports "env:VAR_NAME" syntax)
+  #   url: "env:AEGIS_DATABASE_URL"
+  #   # Maximum connections in the pool (default: 5)
+  #   max_connections: 5
+  #   # Connection timeout in seconds (default: 5)
+  #   connect_timeout_seconds: 5
+
+  # --------------------------------------------------------------------------
+  # Temporal Workflow Engine (Optional)
+  # --------------------------------------------------------------------------
+  # Temporal integration for durable workflow execution.
+  # If omitted, workflow orchestration features are unavailable.
+  # See: ADR-022 Temporal Workflow Integration
+  # temporal:
+  #   # Temporal gRPC server address (default: "temporal:7233")
+  #   address: "temporal:7233"
+  #   # HTTP endpoint for Temporal worker callbacks (default: "http://localhost:3000")
+  #   worker_http_endpoint: "http://localhost:3000"
+  #   # Shared secret for worker callback authentication (supports "env:VAR_NAME")
+  #   # If omitted, worker callback authentication is disabled (dev only)
+  #   worker_secret: "env:TEMPORAL_WORKER_SECRET"
+  #   # Temporal namespace (default: "default")
+  #   namespace: "default"
+  #   # Temporal task queue (default: "aegis-agents")
+  #   task_queue: "aegis-agents"
+
+  # --------------------------------------------------------------------------
+  # Cortex Memory Service (Optional)
+  # --------------------------------------------------------------------------
+  # Cortex gRPC service for pattern learning and semantic search.
+  # If omitted, Cortex integration is disabled (warning logged at startup).
+  # See: ADR-018 Weighted Cortex Memory, ADR-024 Holographic Cortex Memory
+  # cortex:
+  #   # Cortex gRPC service URL (supports "env:VAR_NAME")
+  #   grpc_url: "http://cortex:50052"
+

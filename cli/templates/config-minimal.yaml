@@ -72,3 +72,18 @@ spec:
   # storage:
   #   backend: "local"  # Local filesystem (default) or "seaweedfs" for distributed storage
   #   # For SeaweedFS configuration, see config-with-examples.yaml
+
+  # database:
+  #   url: "env:AEGIS_DATABASE_URL"       # PostgreSQL connection URL (supports env:VAR_NAME)
+  #   max_connections: 5                   # Connection pool size (default: 5)
+  #   connect_timeout_seconds: 5           # Connection timeout (default: 5)
+
+  # temporal:
+  #   address: "temporal:7233"             # Temporal server address
+  #   worker_http_endpoint: "http://localhost:3000"  # Worker HTTP callback endpoint
+  #   worker_secret: "env:TEMPORAL_WORKER_SECRET"    # Worker callback auth secret
+  #   namespace: "default"                 # Temporal namespace
+  #   task_queue: "aegis-agents"           # Temporal task queue
+
+  # cortex:
+  #   grpc_url: "http://cortex:50052"      # Cortex gRPC service URL

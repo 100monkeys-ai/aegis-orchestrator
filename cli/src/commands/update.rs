@@ -28,14 +28,17 @@
 //! aegis update --dry-run
 //! ```
 //!
-//! # Environment
+//! # Configuration
 //!
-//! Requires `AEGIS_DATABASE_URL` environment variable to be set.
+//! Requires `spec.database.url` to be set in `aegis-config.yaml`.
+//! The URL supports `env:VAR_NAME` syntax for environment-based resolution.
 
 use clap::Args;
 use anyhow::{Result, Context};
 use colored::Colorize;
 use sqlx::postgres::PgPoolOptions;
+use std::path::PathBuf;
+use aegis_core::domain::node_config::{NodeConfigManifest, resolve_env_value};
 
 #[derive(Args)]
 pub struct UpdateCommand {
@@ -44,14 +47,18 @@ pub struct UpdateCommand {
     dry_run: bool,
 }
 
-pub async fn execute(cmd: UpdateCommand) -> Result<()> {
+pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result<()> {
     println!("{}", "AEGIS Update".bold().green());
     
-    // Load config (we need database URL)
-    // We can just check environment or load config.
-    // server.rs logic checks env var first.
-    let database_url = std::env::var("AEGIS_DATABASE_URL")
-        .context("AEGIS_DATABASE_URL environment variable not set. Cannot run updates.")?;
+    // Load node configuration
+    let config = NodeConfigManifest::load_or_default(config_path)?;
+
+    let db_config = config.spec.database
+        .as_ref()
+        .context("spec.database is not configured in aegis-config.yaml. Cannot run updates.")?;
+
+    let database_url = resolve_env_value(&db_config.url)
+        .context("Failed to resolve spec.database.url (supports env:VAR_NAME syntax)")?;
 
     println!("Connecting to database...");
     let pool = PgPoolOptions::new()
