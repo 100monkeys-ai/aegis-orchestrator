@@ -12,12 +12,14 @@
 //! ## Route Surface
 //! | Method | Path | Handler |
 //! |--------|------|---------|
-//! | `POST` | `/agents` | deploy agent |
-//! | `POST` | `/agents/{id}/execute` | start execution |
-//! | `GET` | `/executions/{id}/stream` | SSE event stream |
-//! | `DELETE` | `/executions/{id}` | cancel execution |
-//! | `POST` | `/smcp/attest` | SMCP attestation handshake (ADR-035) |
-//! | `POST` | `/smcp/tools/invoke` | SMCP tool invocation (ADR-033) |
+//! | `POST` | `/v1/executions` | start execution |
+//! | `GET` | `/v1/executions/{id}/stream` | SSE event stream |
+//! | `GET` | `/v1/human-approvals` | list pending approvals |
+//! | `GET` | `/v1/human-approvals/{id}` | get pending approval |
+//! | `POST` | `/v1/human-approvals/{id}/approve` | approve request |
+//! | `POST` | `/v1/human-approvals/{id}/reject` | reject request |
+//! | `POST` | `/v1/smcp/attest` | SMCP attestation handshake (ADR-035) |
+//! | `POST` | `/v1/smcp/invoke` | SMCP tool invocation (ADR-033) |
 //! | `POST` | `/v1/llm/generate` | Inner loop gateway (ADR-038) |
 //! | `POST` | `/v1/stimuli` | Stimulus ingestion — Keycloak Bearer auth (ADR-021) |
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
@@ -74,15 +76,15 @@ pub fn app(
     });
     
     Router::new()
-        .route("/executions", post(start_execution))
-        .route("/executions/:id/stream", get(stream_execution))
-        .route("/human-approvals", get(list_pending_approvals))
-        .route("/human-approvals/:id", get(get_pending_approval))
-        .route("/human-approvals/:id/approve", post(approve_request))
-        .route("/human-approvals/:id/reject", post(reject_request))
+        .route("/v1/executions", post(start_execution))
+        .route("/v1/executions/:id/stream", get(stream_execution))
+        .route("/v1/human-approvals", get(list_pending_approvals))
+        .route("/v1/human-approvals/:id", get(get_pending_approval))
+        .route("/v1/human-approvals/:id/approve", post(approve_request))
+        .route("/v1/human-approvals/:id/reject", post(reject_request))
         // SMCP endpoints (ADR-035 §4.1)
-        .route("/smcp/attest", post(smcp_attestation))
-        .route("/smcp/tools/invoke", post(smcp_tool_invoke))
+        .route("/v1/smcp/attest", post(smcp_attestation))
+        .route("/v1/smcp/invoke", post(smcp_tool_invoke))
         // Inner loop gateway (ADR-038)
         .route("/v1/llm/generate", post(inner_loop_generate))
         // BC-8 Stimulus-Response (ADR-021)
@@ -108,14 +110,14 @@ pub fn app_with_inner_loop(
     });
 
     Router::new()
-        .route("/executions", post(start_execution))
-        .route("/executions/:id/stream", get(stream_execution))
-        .route("/human-approvals", get(list_pending_approvals))
-        .route("/human-approvals/:id", get(get_pending_approval))
-        .route("/human-approvals/:id/approve", post(approve_request))
-        .route("/human-approvals/:id/reject", post(reject_request))
-        .route("/smcp/attest", post(smcp_attestation))
-        .route("/smcp/tools/invoke", post(smcp_tool_invoke))
+        .route("/v1/executions", post(start_execution))
+        .route("/v1/executions/:id/stream", get(stream_execution))
+        .route("/v1/human-approvals", get(list_pending_approvals))
+        .route("/v1/human-approvals/:id", get(get_pending_approval))
+        .route("/v1/human-approvals/:id/approve", post(approve_request))
+        .route("/v1/human-approvals/:id/reject", post(reject_request))
+        .route("/v1/smcp/attest", post(smcp_attestation))
+        .route("/v1/smcp/invoke", post(smcp_tool_invoke))
         .route("/v1/llm/generate", post(inner_loop_generate))
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))

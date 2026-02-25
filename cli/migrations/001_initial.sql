@@ -199,8 +199,6 @@ CREATE INDEX idx_executions_workflow_execution_id ON executions(workflow_executi
 CREATE INDEX idx_executions_status ON executions(status);
 CREATE INDEX idx_executions_started_at ON executions(started_at DESC);
 
--- NOTE: Cortex patterns table removed - will be implemented with Vector+RAG in future iteration
-
 -- =============================================================================
 -- Temporal Worker Schema
 -- Stores workflow definitions for multi-worker coordination
@@ -300,7 +298,6 @@ BEGIN
     RAISE NOTICE 'AEGIS Temporal Era Schema Migration Complete';
     RAISE NOTICE 'Created tables: workflows, workflow_executions, agents, executions, workflow_definitions';
     RAISE NOTICE 'Created views: active_workflow_executions, agent_success_rates';
-    RAISE NOTICE 'NOTE: Cortex implementation deferred to Vector+RAG iteration';
 END $$;
 
 -- AEGIS Unified Storage Layer Database Schema
