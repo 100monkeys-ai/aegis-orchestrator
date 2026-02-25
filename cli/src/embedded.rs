@@ -45,7 +45,7 @@ impl EmbeddedExecutor {
             .context("Configuration validation failed")?;
 
         // Embedded mode does not support volumes yet (requires InMemoryVolumeRepository)
-        return Err(anyhow::anyhow!("Embedded mode does not yet support volume management. Please use daemon mode by starting the daemon with 'aegis-cli daemon start'"));
+        Err(anyhow::anyhow!("Embedded mode does not yet support volume management. Please use daemon mode by starting the daemon with 'aegis-cli daemon start'"))
     }
 
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {

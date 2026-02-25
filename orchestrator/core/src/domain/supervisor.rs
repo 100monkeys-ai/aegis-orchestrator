@@ -115,7 +115,8 @@ impl Supervisor {
         let per_iteration_timeout = Duration::from_secs(
             overall_timeout_secs
                 .checked_div((max_retries as u64).max(1))
-                .unwrap_or(overall_timeout_secs),
+                .unwrap_or(overall_timeout_secs)
+                .max(1),
         );
 
         info!(

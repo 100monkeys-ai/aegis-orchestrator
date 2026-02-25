@@ -40,7 +40,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         let filer_endpoint_json = serde_json::to_value(&volume.filer_endpoint)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
-        let status_json = serde_json::to_value(&volume.status)
+        let status_json = serde_json::to_value(volume.status)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         let ownership_json = serde_json::to_value(&volume.ownership)

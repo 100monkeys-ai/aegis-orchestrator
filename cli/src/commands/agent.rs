@@ -140,7 +140,7 @@ async fn list_agents(client: DaemonClient) -> Result<()> {
     }
 
     println!("{} agents found:", agents.len());
-    println!("{:<38} {:<20} {:<10} {}", "ID", "NAME", "VERSION", "STATUS");
+    println!("{:<38} {:<20} {:<10} STATUS", "ID", "NAME", "VERSION");
 
     for agent in agents {
         println!(

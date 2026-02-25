@@ -18,9 +18,17 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use std::sync::Arc;
+
+// Type alias for repository tuple to avoid clippy "very complex type" lint
+type RepositoryTuple = (
+    Arc<dyn AgentRepository>,
+    Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
+    Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
+    Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>,
+);
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tracing::{info, warn};
@@ -190,12 +198,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         None
     };
 
-    let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): (
-        Arc<dyn AgentRepository>,
-        Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
-        Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
-        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>,
-    ) = if let Some(pool) = pool.as_ref() {
+    let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
+        if let Some(pool) = pool.as_ref() {
         (
             Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
             Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
@@ -1284,13 +1288,9 @@ async fn stream_events_handler(
 
         // 4. Stream new events if following
         if follow {
-            loop {
-                // TODO: Deduplication?
-                // For now, assume the user accepts potential slight overlap if the execution was active during replay.
-                match receiver.recv().await {
-                    Ok(event) => {
-                         // Convert domain event to JSON (Same logic as before)
-                         let json = match event {
+            while let Ok(event) = receiver.recv().await {
+                // Convert domain event to JSON (Same logic as before)
+                let json = match event {
                             aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
                                 // Skip if we already replayed it?
                                 // Simple filter: check timestamp?
@@ -1364,11 +1364,6 @@ async fn stream_events_handler(
                         };
 
                         yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
             }
         }
     };
@@ -1561,11 +1556,9 @@ async fn stream_agent_events_handler(
 
         // 4. Stream new events if following
         if follow {
-            loop {
-                match receiver.recv().await {
-                    Ok(event) => {
-                        use aegis_core::infrastructure::event_bus::DomainEvent;
-                        let json = match event {
+            while let Ok(event) = receiver.recv().await {
+                use aegis_core::infrastructure::event_bus::DomainEvent;
+                let json = match event {
                             DomainEvent::Execution(exec_event) => {
                                 match exec_event {
                                     aegis_core::domain::events::ExecutionEvent::ExecutionStarted { execution_id, agent_id, .. } => {
@@ -1654,12 +1647,7 @@ async fn stream_agent_events_handler(
                             }
                         };
 
-                        yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
-                    }
-                    Err(_) => {
-                        break;
-                    }
-                }
+                yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
             }
         }
     };
@@ -1841,7 +1829,7 @@ async fn llm_generate_handler(
                 if let Some(exec_id) = req.execution_id {
                     let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
                         execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
-                        agent_id: agent_id.clone(),
+                        agent_id,
                         iteration_number: req.iteration_number.unwrap_or(0),
                         provider: "orchestrator".to_string(),
                         model: model_alias.clone(),

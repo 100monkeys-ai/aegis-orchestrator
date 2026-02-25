@@ -116,6 +116,12 @@ impl NfsVolumeRegistry {
     }
 }
 
+impl Default for NfsVolumeRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// NFS Gateway application service
 ///
 /// Provides lifecycle management for the NFS server gateway.

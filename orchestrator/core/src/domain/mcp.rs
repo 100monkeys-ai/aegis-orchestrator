@@ -54,6 +54,12 @@ impl ToolServerId {
     }
 }
 
+impl Default for ToolServerId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Unique identifier for a single MCP tool invocation.
 ///
 /// Spans the lifetime of one `tool/invoke` JSON-RPC call. Used in
@@ -66,6 +72,12 @@ impl ToolInvocationId {
     /// Generate a new random `ToolInvocationId`.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+}
+
+impl Default for ToolInvocationId {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

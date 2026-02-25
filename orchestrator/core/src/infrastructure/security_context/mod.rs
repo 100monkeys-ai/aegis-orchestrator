@@ -22,6 +22,12 @@ impl InMemorySecurityContextRepository {
     }
 }
 
+impl Default for InMemorySecurityContextRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl SecurityContextRepository for InMemorySecurityContextRepository {
     async fn find_by_name(&self, name: &str) -> Result<Option<SecurityContext>> {

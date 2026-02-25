@@ -40,7 +40,7 @@ impl DaemonClient {
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
         let response = self
             .client
-            .post(&format!("{}/v1/agents", self.base_url))
+            .post(format!("{}/v1/agents", self.base_url))
             .json(&manifest)
             .send()
             .await
@@ -72,7 +72,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/v1/agents/{}/execute", self.base_url, agent_id))
+            .post(format!("{}/v1/agents/{}/execute", self.base_url, agent_id))
             .json(&ExecuteRequest { input })
             .send()
             .await
@@ -99,7 +99,7 @@ impl DaemonClient {
     pub async fn get_execution(&self, execution_id: Uuid) -> Result<ExecutionInfo> {
         let response = self
             .client
-            .get(&format!("{}/v1/executions/{}", self.base_url, execution_id))
+            .get(format!("{}/v1/executions/{}", self.base_url, execution_id))
             .send()
             .await
             .context("Failed to get execution")?;
@@ -118,7 +118,7 @@ impl DaemonClient {
     pub async fn cancel_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .post(&format!(
+            .post(format!(
                 "{}/v1/executions/{}/cancel",
                 self.base_url, execution_id
             ))
@@ -195,8 +195,7 @@ impl DaemonClient {
             let text = String::from_utf8_lossy(&chunk);
 
             for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let json_str = &line[6..];
+                if let Some(json_str) = line.strip_prefix("data: ") {
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
                         if errors_only && !is_error_event(&event) {
                             continue;
@@ -243,8 +242,7 @@ impl DaemonClient {
             let text = String::from_utf8_lossy(&chunk);
 
             for line in text.lines() {
-                if line.starts_with("data: ") {
-                    let json_str = &line[6..];
+                if let Some(json_str) = line.strip_prefix("data: ") {
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
                         // Reuse the print logic? Yes.
                         if errors_only && !is_error_event(&event) {
@@ -262,7 +260,7 @@ impl DaemonClient {
     pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .delete(&format!("{}/v1/executions/{}", self.base_url, execution_id))
+            .delete(format!("{}/v1/executions/{}", self.base_url, execution_id))
             .send()
             .await
             .context("Failed to delete execution")?;
@@ -278,7 +276,7 @@ impl DaemonClient {
     pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         let response = self
             .client
-            .get(&format!("{}/v1/agents", self.base_url))
+            .get(format!("{}/v1/agents", self.base_url))
             .send()
             .await
             .context("Failed to list agents")?;
@@ -297,7 +295,7 @@ impl DaemonClient {
     pub async fn get_agent(&self, agent_id: Uuid) -> Result<AgentManifest> {
         let response = self
             .client
-            .get(&format!("{}/v1/agents/{}", self.base_url, agent_id))
+            .get(format!("{}/v1/agents/{}", self.base_url, agent_id))
             .send()
             .await
             .context("Failed to get agent")?;
@@ -316,7 +314,7 @@ impl DaemonClient {
     pub async fn delete_agent(&self, agent_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .delete(&format!("{}/v1/agents/{}", self.base_url, agent_id))
+            .delete(format!("{}/v1/agents/{}", self.base_url, agent_id))
             .send()
             .await
             .context("Failed to delete agent")?;
@@ -331,7 +329,7 @@ impl DaemonClient {
     pub async fn lookup_agent(&self, name: &str) -> Result<Option<Uuid>> {
         let response = self
             .client
-            .get(&format!("{}/v1/agents/lookup/{}", self.base_url, name))
+            .get(format!("{}/v1/agents/lookup/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to lookup agent")?;
@@ -552,7 +550,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/v1/workflows", self.base_url))
+            .post(format!("{}/v1/workflows", self.base_url))
             .header("Content-Type", "application/x-yaml")
             .body(workflow_yaml)
             .send()
@@ -576,7 +574,7 @@ impl DaemonClient {
 
         let response = self
             .client
-            .post(&format!("{}/v1/workflows/{}/run", self.base_url, name))
+            .post(format!("{}/v1/workflows/{}/run", self.base_url, name))
             .json(&RunRequest { input })
             .send()
             .await
@@ -604,7 +602,7 @@ impl DaemonClient {
     pub async fn list_workflows(&self) -> Result<Vec<serde_json::Value>> {
         let response = self
             .client
-            .get(&format!("{}/v1/workflows", self.base_url))
+            .get(format!("{}/v1/workflows", self.base_url))
             .send()
             .await
             .context("Failed to list workflows")?;
@@ -631,7 +629,7 @@ impl DaemonClient {
     pub async fn describe_workflow(&self, name: &str) -> Result<String> {
         let response = self
             .client
-            .get(&format!("{}/v1/workflows/{}", self.base_url, name))
+            .get(format!("{}/v1/workflows/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to describe workflow")?;
@@ -653,7 +651,7 @@ impl DaemonClient {
     pub async fn delete_workflow(&self, name: &str) -> Result<()> {
         let response = self
             .client
-            .delete(&format!("{}/v1/workflows/{}", self.base_url, name))
+            .delete(format!("{}/v1/workflows/{}", self.base_url, name))
             .send()
             .await
             .context("Failed to delete workflow")?;
@@ -670,7 +668,7 @@ impl DaemonClient {
     pub async fn stream_workflow_logs(&self, execution_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .get(&format!(
+            .get(format!(
                 "{}/v1/workflows/executions/{}/logs",
                 self.base_url, execution_id
             ))
@@ -698,7 +696,7 @@ impl DaemonClient {
     pub async fn get_workflow_logs(&self, execution_id: Uuid) -> Result<String> {
         let response = self
             .client
-            .get(&format!(
+            .get(format!(
                 "{}/v1/workflows/executions/{}/logs",
                 self.base_url, execution_id
             ))

@@ -73,6 +73,12 @@ mod mock {
         }
     }
 
+    impl Default for MockStorageProvider {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
     #[async_trait]
     impl StorageProvider for MockStorageProvider {
         async fn create_directory(&self, path: &str) -> Result<(), StorageError> {

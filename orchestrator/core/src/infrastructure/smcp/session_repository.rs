@@ -24,6 +24,12 @@ impl InMemorySmcpSessionRepository {
     }
 }
 
+impl Default for InMemorySmcpSessionRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl SmcpSessionRepository for InMemorySmcpSessionRepository {
     async fn save(&self, session: SmcpSession) -> Result<()> {

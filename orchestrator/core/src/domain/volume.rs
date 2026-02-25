@@ -233,24 +233,19 @@ mod duration_serialization {
 }
 
 /// Volume access mode
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AccessMode {
     /// Read-only access
     ReadOnly,
     /// Read-write access
+    #[default]
     ReadWrite,
 }
 
 impl AccessMode {
     pub fn is_writable(&self) -> bool {
         matches!(self, Self::ReadWrite)
-    }
-}
-
-impl Default for AccessMode {
-    fn default() -> Self {
-        Self::ReadWrite
     }
 }
 

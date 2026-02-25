@@ -324,10 +324,11 @@ pub enum StateKind {
 }
 
 /// Isolation mode for agent execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationMode {
     /// Inherit from node configuration
+    #[default]
     Inherit,
     /// Force Firecracker micro-VM
     Firecracker,
@@ -335,12 +336,6 @@ pub enum IsolationMode {
     Docker,
     /// No isolation (dangerous, for debugging only)
     Process,
-}
-
-impl Default for IsolationMode {
-    fn default() -> Self {
-        Self::Inherit
-    }
 }
 
 /// Configuration for a single agent in parallel execution

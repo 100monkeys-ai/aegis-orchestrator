@@ -61,6 +61,7 @@ use tracing::warn;
 
 /// Unified domain event type for the event bus
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DomainEvent {
     AgentLifecycle(AgentLifecycleEvent),
@@ -232,13 +233,10 @@ impl ExecutionEventReceiver {
             })?;
 
             // Filter for execution events matching our ID
-            match event {
-                DomainEvent::Execution(exec_event) => {
-                    if self.matches_execution(&exec_event) {
-                        return Ok(exec_event);
-                    }
+            if let DomainEvent::Execution(exec_event) = event {
+                if self.matches_execution(&exec_event) {
+                    return Ok(exec_event);
                 }
-                _ => {}
             }
             // Continue loop if event doesn't match
         }

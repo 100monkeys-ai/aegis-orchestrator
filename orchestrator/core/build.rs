@@ -41,7 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     protos.push("../../aegis-proto/proto/aegis_runtime.proto".to_string());
 
     // Walk directory to find all .proto files
-    if let Ok(_) = std::fs::read_dir(proto_root) {
+    if std::fs::read_dir(proto_root).is_ok() {
         fn visit_dirs(dir: &std::path::Path, protos: &mut Vec<String>) -> std::io::Result<()> {
             if dir.is_dir() {
                 for entry in std::fs::read_dir(dir)? {

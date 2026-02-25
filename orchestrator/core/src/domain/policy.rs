@@ -178,8 +178,8 @@ fn matches_pattern(pattern: &str, value: &str) -> bool {
     if pattern == value {
         return true;
     }
-    if pattern.starts_with("*.") {
-        return value.ends_with(&pattern[2..]);
+    if let Some(stripped) = pattern.strip_prefix("*.") {
+        return value.ends_with(stripped);
     }
     false
 }

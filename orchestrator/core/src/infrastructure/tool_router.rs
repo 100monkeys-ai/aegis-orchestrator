@@ -62,6 +62,12 @@ impl InMemoryToolRegistry {
     }
 }
 
+impl Default for InMemoryToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl ToolRegistry for InMemoryToolRegistry {
     async fn get_tools_for_agent(

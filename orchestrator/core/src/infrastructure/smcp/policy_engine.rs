@@ -46,3 +46,9 @@ impl PolicyEngine {
         security_context.evaluate(tool_name, args)
     }
 }
+
+impl Default for PolicyEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}

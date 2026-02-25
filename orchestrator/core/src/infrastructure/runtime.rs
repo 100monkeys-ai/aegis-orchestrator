@@ -506,35 +506,32 @@ impl AgentRuntime for DockerRuntime {
             "Starting bootstrap.py execution"
         );
 
-        match res {
-            StartExecResults::Attached { mut output, .. } => {
-                while let Some(msg) = output.next().await {
-                    match msg {
-                        Ok(LogOutput::StdOut { message }) => {
-                            let content = String::from_utf8_lossy(&message).to_string();
-                            debug!(
-                                container_id = container_id,
-                                stream = "stdout",
-                                "Bootstrap output: {}",
-                                content
-                            );
-                            stdout_logs.push(content);
-                        }
-                        Ok(LogOutput::StdErr { message }) => {
-                            let content = String::from_utf8_lossy(&message).to_string();
-                            warn!(
-                                container_id = container_id,
-                                stream = "stderr",
-                                "Bootstrap stderr: {}",
-                                content
-                            );
-                            stderr_logs.push(content);
-                        }
-                        _ => {}
+        if let StartExecResults::Attached { mut output, .. } = res {
+            while let Some(msg) = output.next().await {
+                match msg {
+                    Ok(LogOutput::StdOut { message }) => {
+                        let content = String::from_utf8_lossy(&message).to_string();
+                        debug!(
+                            container_id = container_id,
+                            stream = "stdout",
+                            "Bootstrap output: {}",
+                            content
+                        );
+                        stdout_logs.push(content);
                     }
+                    Ok(LogOutput::StdErr { message }) => {
+                        let content = String::from_utf8_lossy(&message).to_string();
+                        warn!(
+                            container_id = container_id,
+                            stream = "stderr",
+                            "Bootstrap stderr: {}",
+                            content
+                        );
+                        stderr_logs.push(content);
+                    }
+                    _ => {}
                 }
             }
-            _ => {}
         }
 
         // Get exit code from exec

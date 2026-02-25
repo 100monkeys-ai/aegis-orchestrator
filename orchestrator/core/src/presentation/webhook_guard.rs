@@ -67,8 +67,7 @@ impl WebhookSecretProvider for EnvWebhookSecretProvider {
             "AEGIS_WEBHOOK_SECRET_{}",
             source_name
                 .to_uppercase()
-                .replace('-', "_")
-                .replace('.', "_")
+                .replace(['-', '.'], "_")
         );
         std::env::var(&env_key).ok().map(|s| s.into_bytes())
     }
@@ -182,8 +181,7 @@ where
             .uri()
             .path()
             .split('/')
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or("unknown")
             .to_string();
 

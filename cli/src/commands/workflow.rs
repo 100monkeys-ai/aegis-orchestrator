@@ -288,7 +288,7 @@ async fn run_workflow(
 
         // Try to parse as JSON, fall back to string
         let json_value =
-            serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value));
+            serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
 
         input_params.insert(key, json_value);
     }

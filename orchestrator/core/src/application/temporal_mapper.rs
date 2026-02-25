@@ -187,7 +187,7 @@ impl TemporalWorkflowMapper {
                 "Agent".to_string(),
                 Some(agent.clone()),
                 Some(input.clone()),
-                isolation.map(|i| Self::map_isolation_mode(i)),
+                isolation.map(Self::map_isolation_mode),
                 None,
                 None,
                 None,
@@ -269,7 +269,7 @@ impl TemporalWorkflowMapper {
         let transitions = state
             .transitions
             .iter()
-            .map(|tr| Self::map_transition_rule(tr))
+            .map(Self::map_transition_rule)
             .collect::<Result<Vec<_>>>()?;
 
         Ok(TemporalWorkflowState {

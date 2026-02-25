@@ -39,7 +39,7 @@ pub struct NodeConfigManifest {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
 
-    /// Resource kind (must be "NodeConfig")
+    ///   Resource kind (must be "NodeConfig")
     pub kind: String,
 
     /// Node metadata (name, labels, version)
@@ -55,7 +55,7 @@ pub struct ManifestMetadata {
     /// Human-readable node name (unique identifier)
     pub name: String,
 
-    /// Optional: Configuration version for tracking
+    ///   Optional: Configuration version for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 
@@ -235,9 +235,10 @@ pub struct LLMSelection {
     pub retry_delay_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum LLMSelectionStrategy {
+    #[default]
     PreferLocal,
     PreferCloud,
     CostOptimized,
@@ -285,9 +286,9 @@ pub struct RuntimeConfig {
     /// - "127.0.0.1" (WSL2/Linux Native with exposed port 2049)
     /// - "host.docker.internal" (Docker Desktop on Mac/Windows)
     /// - "172.17.0.1" (Docker bridge gateway IP)
-    /// Examples for production:
+    ///   Examples for production:
     /// - "<Physical Host IP>" (Firecracker VMs, Remote Hosts)
-    /// Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
+    ///   Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nfs_server_host: Option<String>,
 
@@ -937,12 +938,6 @@ fn default_temporal_task_queue() -> String {
     "aegis-agents".to_string()
 }
 
-impl Default for LLMSelectionStrategy {
-    fn default() -> Self {
-        Self::PreferLocal
-    }
-}
-
 impl Default for LLMSelection {
     fn default() -> Self {
         Self {
@@ -1136,14 +1131,11 @@ impl NodeConfigManifest {
         // AEGIS_LOG_LEVEL → spec.observability.logging.level (only if at default)
         if let Ok(level) = std::env::var("AEGIS_LOG_LEVEL") {
             if !level.is_empty() {
-                let obs = self
-                    .spec
-                    .observability
-                    .get_or_insert_with(|| ObservabilityConfig {
-                        logging: None,
-                        metrics: None,
-                        tracing: None,
-                    });
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
                 let logging = obs.logging.get_or_insert_with(|| LoggingConfig {
                     level: default_log_level(),
                     format: default_log_format(),

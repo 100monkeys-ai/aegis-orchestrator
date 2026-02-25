@@ -1040,7 +1040,7 @@ impl NfsServer {
         self.server_handle
             .lock()
             .as_ref()
-            .map_or(false, |h| !h.is_finished())
+            .is_some_and(|h| !h.is_finished())
     }
 
     /// Get bind port

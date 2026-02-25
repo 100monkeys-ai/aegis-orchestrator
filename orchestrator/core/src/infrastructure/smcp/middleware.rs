@@ -78,3 +78,9 @@ impl SmcpMiddleware {
         }
     }
 }
+
+impl Default for SmcpMiddleware {
+    fn default() -> Self {
+        Self::new()
+    }
+}

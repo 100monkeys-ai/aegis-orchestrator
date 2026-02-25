@@ -22,6 +22,7 @@
 
 pub mod capability;
 pub mod repository;
+#[allow(clippy::module_inception)]
 pub mod security_context;
 
 pub use capability::{Capability, RateLimit};

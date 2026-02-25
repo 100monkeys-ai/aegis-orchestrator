@@ -40,6 +40,11 @@
 
 // This file includes the generated protobuf code from tonic/prost
 
+#[allow(
+    clippy::doc_lazy_continuation,
+    clippy::doc_overindented_list_items,
+    clippy::large_enum_variant
+)]
 pub mod temporal {
     pub mod api {
         pub mod workflowservice {

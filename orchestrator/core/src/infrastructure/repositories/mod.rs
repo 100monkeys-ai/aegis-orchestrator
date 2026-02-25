@@ -79,6 +79,12 @@ impl InMemoryAgentRepository {
     }
 }
 
+impl Default for InMemoryAgentRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl AgentRepository for InMemoryAgentRepository {
     async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
@@ -109,7 +115,7 @@ impl AgentRepository for InMemoryAgentRepository {
     }
 }
 
-// Keep the AgentLifecycleService implementation for backward compatibility
+// AgentLifecycleService implementation for in-memory use
 use crate::application::agent::AgentLifecycleService;
 use crate::domain::agent::AgentManifest;
 
@@ -173,6 +179,12 @@ impl InMemoryExecutionRepository {
     }
 }
 
+impl Default for InMemoryExecutionRepository {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl ExecutionRepository for InMemoryExecutionRepository {
     async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
@@ -220,6 +232,12 @@ impl InMemoryWorkflowRepository {
         Self {
             workflows: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl Default for InMemoryWorkflowRepository {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -273,6 +291,12 @@ impl InMemoryWorkflowExecutionRepository {
         Self {
             executions: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl Default for InMemoryWorkflowExecutionRepository {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -335,6 +359,12 @@ impl InMemoryStorageEventRepository {
         Self {
             events: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+}
+
+impl Default for InMemoryStorageEventRepository {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -513,6 +543,12 @@ impl InMemoryVolumeRepository {
         Self {
             volumes: Arc::new(RwLock::new(HashMap::new())),
         }
+    }
+}
+
+impl Default for InMemoryVolumeRepository {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

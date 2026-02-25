@@ -324,17 +324,13 @@ impl StandardExecutionService {
             // Object - check for special keys in priority order
             serde_json::Value::Object(map) => {
                 // Priority 1: workflow_input (from WorkflowEngine)
-                if let Some(workflow_input) = map.get("workflow_input") {
-                    if let serde_json::Value::String(s) = workflow_input {
-                        return Ok(s.clone());
-                    }
+                if let Some(serde_json::Value::String(s)) = map.get("workflow_input") {
+                    return Ok(s.clone());
                 }
 
                 // Priority 2: input (from CLI/direct calls)
-                if let Some(input_val) = map.get("input") {
-                    if let serde_json::Value::String(s) = input_val {
-                        return Ok(s.clone());
-                    }
+                if let Some(serde_json::Value::String(s)) = map.get("input") {
+                    return Ok(s.clone());
                 }
 
                 // Fallback: serialize the whole object as JSON string
@@ -370,12 +366,12 @@ impl StandardExecutionService {
             .spec
             .task
             .as_ref()
-            .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
+            .ok_or(ExecutionError::MissingPromptTemplate)?;
 
         let prompt_template = task_spec
             .prompt_template
             .as_ref()
-            .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
+            .ok_or(ExecutionError::MissingPromptTemplate)?;
 
         // Get agent instruction
         let agent_instruction = task_spec
@@ -551,7 +547,7 @@ impl ExecutionService for StandardExecutionService {
 
                     let access_mode = match spec.access_mode.as_str() {
                         "read-only" => AccessMode::ReadOnly,
-                        "read-write" | _ => AccessMode::ReadWrite,
+                        _ => AccessMode::ReadWrite,
                     };
 
                     VolumeMount::new(
@@ -648,83 +644,73 @@ impl ExecutionService for StandardExecutionService {
             match result {
                 Ok(final_output) => {
                     // Update to completed
-                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
-                        if let Some(mut exec) = exec_opt {
-                            exec.complete();
-                            let total_iterations = exec.iterations().len() as u8;
-                            let _ = repository.save(&exec).await;
+                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                        exec.complete();
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
 
-                            event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
-                                execution_id,
-                                agent_id,
-                                final_output: final_output.clone(),
-                                total_iterations,
-                                completed_at: Utc::now(),
-                            });
-                        }
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
+                            execution_id,
+                            agent_id,
+                            final_output: final_output.clone(),
+                            total_iterations,
+                            completed_at: Utc::now(),
+                        });
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
                     // Execution timed out — emit specific timeout event
-                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
-                        if let Some(mut exec) = exec_opt {
-                            exec.fail(format!(
-                                "Execution timed out after {} seconds",
-                                timeout_secs
-                            ));
-                            let total_iterations = exec.iterations().len() as u8;
-                            let _ = repository.save(&exec).await;
+                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                        exec.fail(format!(
+                            "Execution timed out after {} seconds",
+                            timeout_secs
+                        ));
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
 
-                            event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
-                                execution_id,
-                                agent_id,
-                                timeout_seconds: timeout_secs,
-                                total_iterations,
-                                timed_out_at: Utc::now(),
-                            });
-                        }
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
+                            execution_id,
+                            agent_id,
+                            timeout_seconds: timeout_secs,
+                            total_iterations,
+                            timed_out_at: Utc::now(),
+                        });
                     }
                 }
                 Err(RuntimeError::Cancelled) => {
                     // Execution was cancelled — status already set by cancel_execution(),
                     // but ensure we mark it if the token was triggered externally.
-                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
-                        if let Some(mut exec) = exec_opt {
-                            if exec.status != ExecutionStatus::Cancelled {
-                                exec.status = ExecutionStatus::Cancelled;
-                                exec.ended_at = Some(Utc::now());
-                                let _ = repository.save(&exec).await;
+                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                        if exec.status != ExecutionStatus::Cancelled {
+                            exec.status = ExecutionStatus::Cancelled;
+                            exec.ended_at = Some(Utc::now());
+                            let _ = repository.save(&exec).await;
 
-                                event_bus.publish_execution_event(
-                                    ExecutionEvent::ExecutionCancelled {
-                                        execution_id,
-                                        agent_id,
-                                        reason: Some(
-                                            "Cancelled via cancellation token".to_string(),
-                                        ),
-                                        cancelled_at: Utc::now(),
-                                    },
-                                );
-                            }
+                            event_bus.publish_execution_event(
+                                ExecutionEvent::ExecutionCancelled {
+                                    execution_id,
+                                    agent_id,
+                                    reason: Some("Cancelled via cancellation token".to_string()),
+                                    cancelled_at: Utc::now(),
+                                },
+                            );
                         }
                     }
                 }
                 Err(e) => {
                     // Update to failed (generic failure)
-                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
-                        if let Some(mut exec) = exec_opt {
-                            exec.fail(e.to_string());
-                            let total_iterations = exec.iterations().len() as u8;
-                            let _ = repository.save(&exec).await;
+                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                        exec.fail(e.to_string());
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
 
-                            event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
-                                execution_id,
-                                agent_id,
-                                reason: e.to_string(),
-                                total_iterations,
-                                failed_at: Utc::now(),
-                            });
-                        }
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+                            execution_id,
+                            agent_id,
+                            reason: e.to_string(),
+                            total_iterations,
+                            failed_at: Utc::now(),
+                        });
                     }
                 }
             }

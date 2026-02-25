@@ -83,41 +83,42 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
             // Existing `DaemonStatus::Running` requires `pid: u32`. Let's use 0 if unknown/remote.
             let pid = local_pid.unwrap_or(0);
 
-            return Ok(DaemonStatus::Running { pid, uptime });
+            Ok(DaemonStatus::Running { pid, uptime })
         }
         Ok(resp) => {
             // HTTP reached but returned error
             if let Some(pid) = local_pid {
-                return Ok(DaemonStatus::Unhealthy {
+                Ok(DaemonStatus::Unhealthy {
                     pid,
                     error: format!("HTTP {}", resp.status()),
-                });
+                })
+            } else {
+                // If no PID file and unhealthy HTTP, it's ambiguous but likely "Running but broken" or incompatible version?
+                // Let's treat as Unhealthy with PID 0
+                Ok(DaemonStatus::Unhealthy {
+                    pid: 0,
+                    error: format!("HTTP {}", resp.status()),
+                })
             }
-            // If no PID file and unhealthy HTTP, it's ambiguous but likely "Running but broken" or incompatible version?
-            // Let's treat as Unhealthy with PID 0
-            return Ok(DaemonStatus::Unhealthy {
-                pid: 0,
-                error: format!("HTTP {}", resp.status()),
-            });
         }
         Err(e) => {
             // HTTP failed. Check if local PID exists to determine if it SHOULD be running.
             if let Some(pid) = local_pid {
                 if process_exists(pid) {
                     // PID exists, Process exists, but HTTP failed -> Unhealthy
-                    return Ok(DaemonStatus::Unhealthy {
+                    Ok(DaemonStatus::Unhealthy {
                         pid,
                         error: e.to_string(),
-                    });
+                    })
                 } else {
                     // Stale PID file
                     let _ = std::fs::remove_file(&pid_file);
-                    return Ok(DaemonStatus::Stopped);
+                    Ok(DaemonStatus::Stopped)
                 }
+            } else {
+                // No PID file, HTTP failed -> Stopped
+                Ok(DaemonStatus::Stopped)
             }
-
-            // No PID file, HTTP failed -> Stopped
-            return Ok(DaemonStatus::Stopped);
         }
     }
 }

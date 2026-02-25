@@ -73,8 +73,8 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(agent.manifest.metadata.version.clone())
         .bind(manifest_yaml)
         .bind(manifest_json)
-        .bind(&agent.manifest.runtime_string())
-        .bind(300 as i32) // Default timeout, can be extracted from spec.security.resources.timeout if present
+        .bind(agent.manifest.runtime_string())
+        .bind(300_i32) // Default timeout, can be extracted from spec.security.resources.timeout if present
         .bind(security_policy)
         .bind(status_str)
         .bind(agent.created_at)

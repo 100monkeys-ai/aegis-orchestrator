@@ -67,6 +67,7 @@ impl ValidationService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn validate_with_judges(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
@@ -82,7 +83,7 @@ impl ValidationService {
             return Err(anyhow!("No judges provided for validation"));
         }
 
-        let config = config.unwrap_or_else(|| ConsensusConfig {
+        let config = config.unwrap_or(ConsensusConfig {
             strategy: ConsensusStrategy::WeightedAverage,
             threshold: None,
             min_agreement_confidence: None,

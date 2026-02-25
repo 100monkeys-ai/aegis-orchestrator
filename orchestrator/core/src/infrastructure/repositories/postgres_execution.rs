@@ -65,7 +65,7 @@ impl PostgresExecutionRepository {
 #[async_trait]
 impl ExecutionRepository for PostgresExecutionRepository {
     async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
-        let iterations_json = serde_json::to_value(&execution.iterations())
+        let iterations_json = serde_json::to_value(execution.iterations())
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         let input_json = serde_json::to_value(&execution.input)

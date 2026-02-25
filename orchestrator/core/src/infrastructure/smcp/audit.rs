@@ -47,3 +47,9 @@ impl SmcpAuditLogger {
         info!("[Phase 2] policy violation events will be forwarded to the event bus for auditing");
     }
 }
+
+impl Default for SmcpAuditLogger {
+    fn default() -> Self {
+        Self::new()
+    }
+}

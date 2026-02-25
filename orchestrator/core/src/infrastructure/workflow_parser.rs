@@ -259,7 +259,7 @@ impl WorkflowParser {
             let transitions = state_yaml
                 .transitions
                 .into_iter()
-                .map(|t| Self::convert_transition(t))
+                .map(Self::convert_transition)
                 .collect::<Result<Vec<_>, _>>()?;
 
             states.insert(
@@ -423,7 +423,7 @@ impl WorkflowParser {
                     transitions: state
                         .transitions
                         .iter()
-                        .map(|t| Self::transition_to_yaml(t))
+                        .map(Self::transition_to_yaml)
                         .collect(),
                     timeout: state.timeout,
                 },

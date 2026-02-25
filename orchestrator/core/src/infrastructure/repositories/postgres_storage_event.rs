@@ -533,7 +533,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
         // Deserialize each violation event
         let mut events = Vec::new();
         for row in rows.iter() {
-            match Self::deserialize_row(&row) {
+            match Self::deserialize_row(row) {
                 Ok(event) => events.push(event),
                 Err(e) => {
                     warn!("Failed to deserialize violation event: {}", e);

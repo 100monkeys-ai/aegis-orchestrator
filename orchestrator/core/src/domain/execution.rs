@@ -323,7 +323,7 @@ impl Execution {
     ) -> Result<Self, ExecutionError> {
         let child_id = ExecutionId::new();
         let hierarchy = ExecutionHierarchy::child(&parent.hierarchy, child_id)
-            .map_err(|e| ExecutionError::MaxDepthExceeded(e))?;
+            .map_err(ExecutionError::MaxDepthExceeded)?;
 
         Ok(Self {
             id: child_id,

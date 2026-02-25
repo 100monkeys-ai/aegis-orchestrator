@@ -128,6 +128,7 @@ pub enum StorageEvent {
 /// Published by [`crate::application::lifecycle::StandardAgentLifecycleService`].
 /// Consumers: Control Plane gRPC stream, Cortex (tracks agent version history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(clippy::large_enum_variant)]
 pub enum AgentLifecycleEvent {
     AgentDeployed {
         agent_id: AgentId,

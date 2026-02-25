@@ -162,7 +162,7 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowExecutionCompleted {
                 execution_id,
-                final_blackboard: serde_json::to_value(&execution.blackboard.data())
+                final_blackboard: serde_json::to_value(execution.blackboard.data())
                     .unwrap_or(serde_json::Value::Null),
                 artifacts: request.artifacts,
                 completed_at: Utc::now(),
