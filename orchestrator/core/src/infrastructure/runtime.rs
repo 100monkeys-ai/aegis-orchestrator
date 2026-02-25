@@ -550,6 +550,16 @@ impl AgentRuntime for DockerRuntime {
             "Bootstrap execution completed"
         );
 
+        // Check exit code and return error if bootstrap failed
+        if exit_code != 0 {
+            let error_msg = if !stderr_logs.is_empty() {
+                stderr_logs.join("\n")
+            } else {
+                format!("Bootstrap script exited with code {}", exit_code)
+            };
+            return Err(RuntimeError::ExecutionFailed(error_msg));
+        }
+
         let result = serde_json::Value::String(stdout_logs.join(""));
 
         Ok(TaskOutput {

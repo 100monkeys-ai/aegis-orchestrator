@@ -42,6 +42,24 @@ use tracing::{info, warn};
 
 use async_trait::async_trait;
 
+/// Parse human-readable duration strings like "30s", "5m", "1h"
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    let s = s.trim();
+
+    // Try parsing with duration_str crate if available, or implement basic parsing
+    if let Ok(seconds) = s.trim_end_matches('s').parse::<u64>() {
+        return Ok(Duration::from_secs(seconds));
+    }
+    if let Ok(minutes) = s.trim_end_matches('m').parse::<u64>() {
+        return Ok(Duration::from_secs(minutes * 60));
+    }
+    if let Ok(hours) = s.trim_end_matches('h').parse::<u64>() {
+        return Ok(Duration::from_secs(hours * 3600));
+    }
+
+    Err(format!("Invalid duration format: {}", s))
+}
+
 /// Global default execution timeout when the manifest specifies none.
 /// 30 minutes is generous enough for complex tasks while preventing indefinite runs.
 pub const DEFAULT_EXECUTION_TIMEOUT_SECONDS: u64 = 1800;
@@ -110,14 +128,14 @@ impl Supervisor {
             .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
         let overall_timeout = Duration::from_secs(overall_timeout_secs);
 
-        // Per-iteration timeout: overall budget divided by max attempts.
-        // Ensures a single hanging iteration cannot exhaust the entire deadline.
-        let per_iteration_timeout = Duration::from_secs(
-            overall_timeout_secs
-                .checked_div((max_retries as u64).max(1))
-                .unwrap_or(overall_timeout_secs)
-                .max(1),
-        );
+        // Per-iteration timeout: explicitly configured in manifest, or 300 seconds default.
+        // This ensures each iteration has sufficient time for LLM calls + tool invocations.
+        let per_iteration_timeout = runtime_config
+            .execution
+            .iteration_timeout
+            .as_deref()
+            .and_then(|s| parse_duration(s).ok())
+            .unwrap_or_else(|| Duration::from_secs(300));
 
         info!(
             overall_timeout_secs = overall_timeout_secs,
@@ -199,6 +217,9 @@ impl Supervisor {
                     .insert("AEGIS_ITERATION_HISTORY".to_string(), history_json);
             }
 
+            // Save keep_container flag before moving config
+            let keep_on_failure = current_config.keep_container_on_failure;
+
             let instance_id = match self.runtime.spawn(current_config).await {
                 Ok(id) => {
                     observer.on_instance_spawned(attempts as u8, &id).await;
@@ -248,18 +269,32 @@ impl Supervisor {
                 }
             };
 
-            // ALWAYS terminate the instance after execution (success or failure)
-            let terminate_result = self.runtime.terminate(&instance_id).await;
-            if let Err(e) = terminate_result {
-                warn!(
-                    "Failed to terminate instance {}: {}",
-                    instance_id.as_str(),
-                    e
-                );
+            // Terminate the instance after execution (unless keep_on_failure is set)
+            let should_terminate = if keep_on_failure {
+                execution_result.is_ok()
             } else {
-                observer
-                    .on_instance_terminated(attempts as u8, &instance_id)
-                    .await;
+                true
+            };
+
+            if should_terminate {
+                let terminate_result = self.runtime.terminate(&instance_id).await;
+                if let Err(e) = terminate_result {
+                    warn!(
+                        "Failed to terminate instance {}: {}",
+                        instance_id.as_str(),
+                        e
+                    );
+                } else {
+                    observer
+                        .on_instance_terminated(attempts as u8, &instance_id)
+                        .await;
+                }
+            } else {
+                info!(
+                    "Keeping failed container {} alive for debugging (manual cleanup required: docker rm -f {})",
+                    instance_id.as_str(),
+                    instance_id.as_str()
+                );
             }
 
             // Process execution result
@@ -464,7 +499,16 @@ mod tests {
                 disk_bytes: None,
                 timeout_seconds: None,
             },
+            execution: crate::domain::agent::ExecutionStrategy {
+                mode: crate::domain::agent::ExecutionMode::Iterative,
+                max_retries: 5,
+                iteration_timeout: None, // Use default 300s
+                llm_timeout_seconds: 300,
+                validation: None,
+                delivery: None,
+            },
             volumes: Vec::new(),
+            keep_container_on_failure: false,
         }
     }
 

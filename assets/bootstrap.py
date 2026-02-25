@@ -20,8 +20,18 @@ def main():
     iteration_env = os.environ.get("AEGIS_ITERATION")
     iteration_number = int(iteration_env) if iteration_env else None
     
+    # LLM timeout (HTTP socket timeout for orchestrator requests)
+    # Default: 300 seconds (5 minutes), configurable via AEGIS_LLM_TIMEOUT_SECONDS
+    llm_timeout_seconds_env = os.environ.get("AEGIS_LLM_TIMEOUT_SECONDS", "300")
+    try:
+        llm_timeout_seconds = int(llm_timeout_seconds_env)
+    except ValueError:
+        debug_print(f"Warning: Invalid AEGIS_LLM_TIMEOUT_SECONDS value '{llm_timeout_seconds_env}', using default 300 seconds")
+        llm_timeout_seconds = 300
+    
     debug_print(f"Bootstrap starting - execution_id={execution_id}, iteration={iteration_number}")
     debug_print(f"Orchestrator URL: {orchestrator_url}")
+    debug_print(f"LLM timeout: {llm_timeout_seconds} seconds")
     
     # Previous iteration history (JSON array of {iteration, output, error})
     iteration_history_json = os.environ.get("AEGIS_ITERATION_HISTORY", "[]")
@@ -113,7 +123,7 @@ def main():
                 headers=headers
             )
             debug_print(f"Sending request with {len(payload_data)} bytes")
-            with urllib.request.urlopen(req, timeout=10) as response:
+            with urllib.request.urlopen(req, timeout=llm_timeout_seconds) as response:
                 if 200 <= response.status < 300:
                     body = response.read().decode('utf-8')
                     debug_print(f"Received response: {response.status}, {len(body)} bytes")

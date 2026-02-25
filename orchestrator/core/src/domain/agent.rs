@@ -259,11 +259,26 @@ pub struct ExecutionStrategy {
     #[serde(default = "default_max_retries", alias = "max_iterations")]
     pub max_retries: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub timeout_per_iteration: Option<u64>,
+    pub iteration_timeout: Option<String>,
+    #[serde(default = "default_llm_timeout")]
+    pub llm_timeout_seconds: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryConfig>,
+}
+
+impl Default for ExecutionStrategy {
+    fn default() -> Self {
+        Self {
+            mode: ExecutionMode::OneShot,
+            max_retries: default_max_retries(),
+            iteration_timeout: None,
+            llm_timeout_seconds: default_llm_timeout(),
+            validation: None,
+            delivery: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -650,6 +665,9 @@ fn default_true() -> bool {
 fn default_max_retries() -> u32 {
     5
 }
+fn default_llm_timeout() -> u64 {
+    300
+}
 fn default_system_timeout() -> u64 {
     90
 }
@@ -758,7 +776,8 @@ impl AgentManifest {
             .get_or_insert_with(|| ExecutionStrategy {
                 mode: ExecutionMode::default(),
                 max_retries: default_max_retries(),
-                timeout_per_iteration: None,
+                iteration_timeout: None,
+                llm_timeout_seconds: default_llm_timeout(),
                 validation: None,
                 delivery: None,
             });

@@ -479,6 +479,17 @@ impl ExecutionService for StandardExecutionService {
             });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
+        // Inject LLM timeout for bootstrap.py (default 300 seconds)
+        let llm_timeout_seconds = if let Some(exec_strategy) = &agent.manifest.spec.execution {
+            exec_strategy.llm_timeout_seconds
+        } else {
+            300
+        };
+        env.insert(
+            "AEGIS_LLM_TIMEOUT_SECONDS".to_string(),
+            llm_timeout_seconds.to_string(),
+        );
+
         // Convert resource limits from domain format to runtime format
         let resources = if let Some(security) = &agent.manifest.spec.security {
             crate::domain::runtime::ResourceLimits {
@@ -599,9 +610,13 @@ impl ExecutionService for StandardExecutionService {
             env,
             autopull: agent.manifest.spec.runtime.autopull,
             resources,
+            execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
             volumes: volume_mounts,
             container_uid: 1000,
             container_gid: 1000,
+            keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
         };
 
         // NOTE: We no longer spawn the instance here.

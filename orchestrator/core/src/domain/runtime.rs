@@ -54,6 +54,8 @@ pub struct RuntimeConfig {
     pub autopull: bool,
     /// CPU, memory, and disk resource limits applied to the container.
     pub resources: ResourceLimits,
+    /// Execution strategy from the agent manifest (iteration settings, validation, etc.)
+    pub execution: crate::domain::agent::ExecutionStrategy,
     /// Volume mounts to attach to the runtime instance.
     /// Each entry is fulfilled by the NFS Server Gateway before the container starts (ADR-036).
     #[serde(default)]
@@ -67,6 +69,11 @@ pub struct RuntimeConfig {
     /// Defaults to 1000. See `container_uid` for rationale.
     #[serde(default = "default_container_gid")]
     pub container_gid: u32,
+    /// If `true`, keep failed containers alive for post-mortem debugging.
+    /// Successful containers are always cleaned up. Manual cleanup required:
+    /// `docker rm -f <container_id>`
+    #[serde(default)]
+    pub keep_container_on_failure: bool,
 }
 
 fn default_container_uid() -> u32 {
