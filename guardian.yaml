@@ -153,6 +153,8 @@ patterns:
           file_patterns:
             - "**/infrastructure/**"
             - "**/application/**"      # Application can import infrastructure (interfaces/impls)
+            - "**/presentation/**"     # Presentation can import infrastructure
+            - "**/cli/**"              # CLI is presentation layer
             - "**/main.rs"             # Main wires everything
             - "**/bin/**"
             - "**/tests/**"
@@ -166,6 +168,8 @@ patterns:
           file_patterns:
             - "**/infrastructure/**"   # Infrastructure might use application
             - "**/application/**"
+            - "**/presentation/**"     # Presentation can import application
+            - "**/cli/**"              # CLI is presentation layer
             - "**/main.rs"
             - "**/bin/**"
             - "**/tests/**"
@@ -260,6 +264,8 @@ patterns:
           file_patterns:
             - "**/examples/**"         # Examples might show usage
             - "**/*.example"           # Example configs
+            - "**/Cargo.toml"          # Dependency names often contain "key", "token", etc
+            - "**/package.json"        # NPM package names
       
       - id: missing_error_handling
         type: ast
@@ -309,5 +315,7 @@ patterns:
             - "**/examples/**"
             - "**/cli/src/commands/**"      # CLI commands need println for user output
             - "**/cli/src/daemon/**"        # Daemon CLI interaction
+            - "**/cli/src/embedded.rs"      # Embedded mode output
             - "**/bin/**"                   # Binary entry points
             - "**/main.rs"                  # Main entry points
+            - "**/build.rs"                 # Build scripts use println for cargo directives

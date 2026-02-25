@@ -715,8 +715,12 @@ mod tests {
         );
 
         let bytes = handle.to_bytes().unwrap();
-        println!("FileHandle size: {} bytes", bytes.len());
-        assert!(bytes.len() <= 64, "FileHandle exceeds NFSv3 64-byte limit");
+        // Verify NFSv3 64-byte limit per ADR-036
+        assert!(
+            bytes.len() <= 64,
+            "FileHandle size {} bytes exceeds NFSv3 64-byte limit",
+            bytes.len()
+        );
     }
 
     #[test]
