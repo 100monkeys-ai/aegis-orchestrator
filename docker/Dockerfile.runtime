@@ -81,4 +81,4 @@ RUN groupadd -g ${DOCKER_GID} docker || true && \
 USER aegis
 
 # Start the AEGIS daemon with gRPC enabled
-CMD ["aegis-runtime", "--daemon", "--port", "8088"]
+CMD ["aegis-runtime", "--daemon"]

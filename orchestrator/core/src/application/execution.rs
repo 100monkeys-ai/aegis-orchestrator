@@ -38,6 +38,7 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{
     Execution, ExecutionError, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
 };
+use crate::domain::node_config::resolve_env_value;
 use crate::domain::policy::FilesystemPolicy;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
@@ -462,16 +463,21 @@ impl ExecutionService for StandardExecutionService {
         env.insert("AEGIS_EXECUTION_ID".to_string(), execution_id.0.to_string());
 
         // Inject Orchestrator URL
-        // We use host.docker.internal as the generic host, but port comes from config.
-        let port = self
-            .config
-            .spec
-            .network
-            .as_ref()
-            .map(|n| n.port)
-            .unwrap_or(8088);
-        let url = format!("http://host.docker.internal:{}", port);
-        env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
+        // Resolve from config (supports env:VAR_NAME), fallback to host.docker.internal
+        let orchestrator_url = resolve_env_value(&self.config.spec.runtime.orchestrator_url)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| {
+                let port = self
+                    .config
+                    .spec
+                    .network
+                    .as_ref()
+                    .map(|n| n.port)
+                    .unwrap_or(8088);
+                format!("http://host.docker.internal:{}", port)
+            });
+        env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
         // Convert resource limits from domain format to runtime format
         let resources = if let Some(security) = &agent.manifest.spec.security {
