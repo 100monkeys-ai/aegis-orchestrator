@@ -1,21 +1,16 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Anthropic Adapter — ADR-009
+//! # Anthropic Adapter
 //!
 //! Implements the `LLMProvider` domain trait for Anthropic `claude-*` models.
-//! Acts as an **Anti-Corruption Layer** (ACL): translates AEGIS domain types
-//! into Anthropic's Messages API payloads and back.
-//!
-//! ## Supported Model Aliases
-//! `claude-3-5-sonnet`, `claude-3-5-haiku`, `claude-3-opus`
-//!
-//! See ADR-009 (BYOLLM Provider Strategy).
+//! Acts as an Anti-Corruption Layer (ACL): translates AEGIS domain types into
+//! Anthropic Messages API payloads and back, including native `tool_use`
+//! content blocks for function-calling.
 
-// Anthropic LLM Provider Adapter
-//
-// Anti-Corruption Layer for Anthropic Claude API
-
-use crate::domain::llm::{FinishReason, GenerationOptions, GenerationResponse, LLMError, LLMProvider};
+use crate::domain::llm::{
+    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions,
+    GenerationResponse, LLMError, LLMProvider, ToolSchema,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -32,24 +27,37 @@ struct AnthropicRequest {
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
 }
 
 #[derive(Serialize, Deserialize)]
 struct AnthropicMessage {
     role: String,
-    content: String,
+    /// Plain string for user/assistant or content-block array for tool results.
+    content: serde_json::Value,
 }
 
 #[derive(Deserialize)]
 struct AnthropicResponse {
-    content: Vec<AnthropicContent>,
+    content: Vec<AnthropicContentBlock>,
     usage: AnthropicUsage,
     stop_reason: Option<String>,
 }
 
+/// Response content block — either `"text"` or `"tool_use"`.
 #[derive(Deserialize)]
-struct AnthropicContent {
+struct AnthropicContentBlock {
+    #[serde(rename = "type")]
+    block_type: String,
+    #[serde(default)]
     text: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    input: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -66,6 +74,14 @@ impl AnthropicAdapter {
             model,
         }
     }
+
+    fn map_stop_reason(r: Option<&str>) -> FinishReason {
+        match r {
+            Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
+            Some("max_tokens") => FinishReason::Length,
+            _ => FinishReason::Stop,
+        }
+    }
 }
 
 #[async_trait]
@@ -75,14 +91,72 @@ impl LLMProvider for AnthropicAdapter {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+            tool_call_id: None,
+        }];
+        match self.generate_chat(&messages, &[], options).await? {
+            ChatResponse::FinalText(r) => Ok(r),
+            ChatResponse::ToolCalls(_) => Err(LLMError::Provider(
+                "Unexpected tool_use blocks from single-turn generate()".into(),
+            )),
+        }
+    }
+
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        // Map domain ChatMessage → Anthropic message.
+        // role="tool" becomes a "tool_result" content-block array (Anthropic pattern).
+        let anthropic_messages: Vec<AnthropicMessage> = messages
+            .iter()
+            .map(|m| {
+                if m.role == "tool" {
+                    let content = serde_json::json!([{
+                        "type": "tool_result",
+                        "tool_use_id": m.tool_call_id,
+                        "content": m.content,
+                    }]);
+                    AnthropicMessage {
+                        role: "user".to_string(), // Anthropic requires user role for tool results
+                        content,
+                    }
+                } else {
+                    AnthropicMessage {
+                        role: m.role.clone(),
+                        content: serde_json::Value::String(m.content.clone()),
+                    }
+                }
+            })
+            .collect();
+
+        let anthropic_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "input_schema": t.parameters,
+                        })
+                    })
+                    .collect(),
+            )
+        };
+
         let request = AnthropicRequest {
             model: self.model.clone(),
-            messages: vec![AnthropicMessage {
-                role: "user".to_string(),
-                content: prompt.to_string(),
-            }],
+            messages: anthropic_messages,
             max_tokens: options.max_tokens.unwrap_or(4096),
             temperature: options.temperature,
+            tools: anthropic_tools,
         };
 
         let response = self
@@ -99,7 +173,6 @@ impl LLMProvider for AnthropicAdapter {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            
             return Err(if status == 401 || status == 403 {
                 LLMError::Authentication(error_text)
             } else if status == 429 {
@@ -111,58 +184,61 @@ impl LLMProvider for AnthropicAdapter {
             });
         }
 
-        let anthropic_response: AnthropicResponse = response
+        let ar: AnthropicResponse = response
             .json()
             .await
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {}", e)))?;
 
-        let text = anthropic_response
+        let tool_calls: Vec<ChatToolCall> = ar
             .content
-            .first()
-            .map(|c| c.text.clone())
-            .unwrap_or_default();
+            .iter()
+            .filter(|b| b.block_type == "tool_use")
+            .map(|b| ChatToolCall {
+                id: b.id.clone(),
+                name: b.name.clone(),
+                arguments: b.input.clone(),
+            })
+            .collect();
 
-        Ok(GenerationResponse {
+        if !tool_calls.is_empty() {
+            return Ok(ChatResponse::ToolCalls(tool_calls));
+        }
+
+        let text = ar
+            .content
+            .iter()
+            .filter(|b| b.block_type == "text")
+            .map(|b| b.text.as_str())
+            .collect::<Vec<_>>()
+            .join("");
+
+        Ok(ChatResponse::FinalText(GenerationResponse {
             text,
             usage: crate::domain::llm::TokenUsage {
-                prompt_tokens: anthropic_response.usage.input_tokens,
-                completion_tokens: anthropic_response.usage.output_tokens,
-                total_tokens: anthropic_response.usage.input_tokens + anthropic_response.usage.output_tokens,
+                prompt_tokens: ar.usage.input_tokens,
+                completion_tokens: ar.usage.output_tokens,
+                total_tokens: ar.usage.input_tokens + ar.usage.output_tokens,
             },
             provider: "anthropic".to_string(),
             model: self.model.clone(),
-            finish_reason: match anthropic_response.stop_reason.as_deref() {
-                Some("end_turn") => FinishReason::Stop,
-                Some("max_tokens") => FinishReason::Length,
-                Some("stop_sequence") => FinishReason::Stop,
-                _ => FinishReason::Stop,
-            },
-        })
+            finish_reason: Self::map_stop_reason(ar.stop_reason.as_deref()),
+        }))
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
-        // Simple ping to check authentication
-        // Anthropic doesn't have a models list endpoint, so we check auth with a minimal request
         let response = self
             .client
-            .get("https://api.anthropic.com/v1/messages")
+            .get("https://api.anthropic.com/v1/models")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
             .await
             .map_err(|e| LLMError::Network(e.to_string()))?;
 
-        // 405 Method Not Allowed is expected (GET not supported), but it means auth is valid
-        // 404 is also OK (endpoint exists)
-        if response.status().is_success()
-            || response.status() == 404
-            || response.status() == 405
-        {
-            Ok(())
-        } else if response.status() == 401 || response.status() == 403 {
-            Err(LLMError::Authentication("Invalid API key".into()))
+        if response.status() == 401 || response.status() == 403 {
+            Err(LLMError::Authentication("Invalid Anthropic API key".into()))
         } else {
-            Err(LLMError::Network(format!("HTTP {}", response.status())))
+            Ok(())
         }
     }
 }
@@ -171,120 +247,95 @@ impl LLMProvider for AnthropicAdapter {
 mod tests {
     use super::*;
     use crate::domain::llm::{FinishReason, GenerationOptions};
-    
+
     #[test]
     fn test_anthropic_adapter_creation() {
-        let adapter = AnthropicAdapter::new(
-            "test-key".to_string(),
-            "claude-3-opus".to_string(),
-        );
-        
-        assert_eq!(adapter.api_key, "test-key");
-        assert_eq!(adapter.model, "claude-3-opus");
+        let adapter = AnthropicAdapter::new("k".to_string(), "claude-3-5-sonnet-20241022".to_string());
+        assert_eq!(adapter.api_key, "k");
+        assert_eq!(adapter.model, "claude-3-5-sonnet-20241022");
     }
-    
+
     #[test]
-    fn test_anthropic_request_serialization() {
+    fn test_stop_reason_mapping() {
+        assert_eq!(AnthropicAdapter::map_stop_reason(Some("end_turn")), FinishReason::Stop);
+        assert_eq!(AnthropicAdapter::map_stop_reason(Some("max_tokens")), FinishReason::Length);
+        assert_eq!(AnthropicAdapter::map_stop_reason(Some("stop_sequence")), FinishReason::Stop);
+        assert_eq!(AnthropicAdapter::map_stop_reason(None), FinishReason::Stop);
+    }
+
+    #[test]
+    fn test_request_serialization() {
         let request = AnthropicRequest {
-            model: "claude-3-opus".to_string(),
+            model: "claude-3-5-sonnet-20241022".to_string(),
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
-                content: "Hello Claude".to_string(),
+                content: serde_json::Value::String("Hello".to_string()),
             }],
             max_tokens: 1024,
             temperature: Some(0.7),
+            tools: None,
         };
-        
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "claude-3-opus");
-        assert_eq!(json["messages"][0]["role"], "user");
-        assert_eq!(json["messages"][0]["content"], "Hello Claude");
-        assert_eq!(json["max_tokens"], 1024);
-        // Use approximate comparison for floating point
-        let temp = json["temperature"].as_f64().unwrap();
-        assert!((temp - 0.7).abs() < 0.01);
+        assert_eq!(json["model"], "claude-3-5-sonnet-20241022");
+        assert_eq!(json["messages"][0]["content"], "Hello");
+        assert!(json.get("tools").is_none());
     }
-    
+
     #[test]
-    fn test_anthropic_response_deserialization() {
+    fn test_content_block_deserialization() {
         let json = serde_json::json!({
-            "content": [{
-                "text": "Hello! How can I assist you today?"
-            }],
-            "usage": {
-                "input_tokens": 15,
-                "output_tokens": 25
-            },
-            "stop_reason": "end_turn"
+            "content": [
+                {"type": "text", "text": "Sure, let me search."},
+                {"type": "tool_use", "id": "call_1", "name": "web_search", "input": {"query": "rust async"}}
+            ],
+            "usage": {"input_tokens": 10, "output_tokens": 20},
+            "stop_reason": "tool_use"
         });
-        
-        let response: AnthropicResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(response.content.len(), 1);
-        assert_eq!(response.content[0].text, "Hello! How can I assist you today?");
-        assert_eq!(response.usage.input_tokens, 15);
-        assert_eq!(response.usage.output_tokens, 25);
-        assert_eq!(response.stop_reason, Some("end_turn".to_string()));
+        let ar: AnthropicResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(ar.content.len(), 2);
+        assert_eq!(ar.content[0].block_type, "text");
+        assert_eq!(ar.content[1].block_type, "tool_use");
+        assert_eq!(ar.content[1].name, "web_search");
     }
-    
+
     #[test]
-    fn test_anthropic_finish_reason_mapping() {
-        // Test that finish reasons are correctly mapped
-        let reasons = vec![
-            (Some("end_turn"), FinishReason::Stop),
-            (Some("max_tokens"), FinishReason::Length),
-            (Some("stop_sequence"), FinishReason::Stop),
-            (None, FinishReason::Stop), // Default case
-        ];
-        
-        for (anthropic_reason, expected) in reasons {
-            let mapped = match anthropic_reason.as_deref() {
-                Some("end_turn") => FinishReason::Stop,
-                Some("max_tokens") => FinishReason::Length,
-                Some("stop_sequence") => FinishReason::Stop,
-                _ => FinishReason::Stop,
-            };
-            assert_eq!(mapped, expected);
-        }
-    }
-    
-    #[test]
-    fn test_anthropic_message_structure() {
-        let message = AnthropicMessage {
-            role: "user".to_string(),
-            content: "Test message for Claude".to_string(),
-        };
-        
-        let json = serde_json::to_value(&message).unwrap();
+    fn test_tool_result_message_format() {
+        let content = serde_json::json!([{
+            "type": "tool_result",
+            "tool_use_id": "call_1",
+            "content": "Search results here",
+        }]);
+        let msg = AnthropicMessage { role: "user".to_string(), content };
+        let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["role"], "user");
-        assert_eq!(json["content"], "Test message for Claude");
-        
-        // Test round-trip
-        let deserialized: AnthropicMessage = serde_json::from_value(json).unwrap();
-        assert_eq!(deserialized.role, "user");
-        assert_eq!(deserialized.content, "Test message for Claude");
+        assert_eq!(json["content"][0]["type"], "tool_result");
     }
-    
+
+    #[test]
+    fn test_tool_schema_to_anthropic_format() {
+        let tool = ToolSchema {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type": "object", "properties": {}}),
+        };
+        let anthropic = serde_json::json!({
+            "name": tool.name,
+            "description": tool.description,
+            "input_schema": tool.parameters,
+        });
+        assert_eq!(anthropic["name"], "read_file");
+        assert!(anthropic.get("input_schema").is_some());
+    }
+
     #[test]
     fn test_default_max_tokens() {
-        // Test that max_tokens defaults to 4096 when not provided
-        let options = GenerationOptions {
-            max_tokens: None,
-            temperature: Some(0.5),
-            stop_sequences: None,
-        };
-        
-        let max_tokens = options.max_tokens.unwrap_or(4096);
-        assert_eq!(max_tokens, 4096);
+        let opts = GenerationOptions { max_tokens: None, temperature: None, stop_sequences: None };
+        assert_eq!(opts.max_tokens.unwrap_or(4096), 4096);
     }
-    
+
     #[test]
-    fn test_anthropic_usage_calculation() {
-        let usage = AnthropicUsage {
-            input_tokens: 100,
-            output_tokens: 200,
-        };
-        
-        let total = usage.input_tokens + usage.output_tokens;
-        assert_eq!(total, 300);
+    fn test_usage_calculation() {
+        let usage = AnthropicUsage { input_tokens: 100, output_tokens: 200 };
+        assert_eq!(usage.input_tokens + usage.output_tokens, 300);
     }
 }

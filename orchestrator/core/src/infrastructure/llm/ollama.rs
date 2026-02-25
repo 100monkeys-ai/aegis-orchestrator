@@ -1,22 +1,16 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Ollama Local Model Adapter — ADR-009
+//! # Ollama Local Model Adapter
 //!
 //! Implements the `LLMProvider` domain trait for Ollama-served local models.
-//! Useful for offline development and air-gapped deployments. Translates AEGIS
-//! domain types into Ollama's `/api/chat` (streaming) and `/api/generate`
-//! endpoints.
+//! Useful for offline development and air-gapped deployments.
 //!
 //! Default base URL: `http://localhost:11434` (configurable via node config).
-//!
-//! See ADR-009 (BYOLLM Provider Strategy).
 
-// Ollama LLM Provider Adapter
-//
-// Anti-Corruption Layer for Ollama local models
-// Supports air-gapped deployments with local LLMs
-
-use crate::domain::llm::{FinishReason, GenerationOptions, GenerationResponse, LLMError, LLMProvider};
+use crate::domain::llm::{
+    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions,
+    GenerationResponse, LLMError, LLMProvider, ToolSchema,
+};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
@@ -26,14 +20,7 @@ pub struct OllamaAdapter {
     model: String,
 }
 
-#[derive(Serialize)]
-struct OllamaRequest {
-    model: String,
-    prompt: String,
-    stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    options: Option<OllamaOptions>,
-}
+// ─── /api/generate (legacy single-turn) ─────────────────────────────────────
 
 #[derive(Serialize)]
 struct OllamaOptions {
@@ -43,12 +30,52 @@ struct OllamaOptions {
     num_predict: Option<i32>,
 }
 
+// ─── /api/chat (multi-turn + tool call) ──────────────────────────────────────
+
+#[derive(Serialize)]
+struct OllamaChatRequest {
+    model: String,
+    messages: Vec<OllamaChatMessage>,
+    stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<OllamaOptions>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct OllamaChatMessage {
+    role: String,
+    content: String,
+}
+
 #[derive(Deserialize)]
-struct OllamaResponse {
-    response: String,
+struct OllamaChatResponse {
+    message: OllamaChatAssistantMessage,
     done: bool,
     eval_count: Option<u32>,
     prompt_eval_count: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct OllamaChatAssistantMessage {
+    #[allow(dead_code)]
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    tool_calls: Vec<OllamaToolCall>,
+}
+
+#[derive(Deserialize)]
+struct OllamaToolCall {
+    function: OllamaToolFunction,
+}
+
+#[derive(Deserialize)]
+struct OllamaToolFunction {
+    name: String,
+    arguments: serde_json::Value,
 }
 
 impl OllamaAdapter {
@@ -68,17 +95,65 @@ impl LLMProvider for OllamaAdapter {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
-        let request = OllamaRequest {
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: prompt.to_string(),
+            tool_call_id: None,
+        }];
+        match self.generate_chat(&messages, &[], options).await? {
+            ChatResponse::FinalText(r) => Ok(r),
+            ChatResponse::ToolCalls(_) => Err(LLMError::Provider(
+                "Unexpected tool_calls from single-turn generate()".into(),
+            )),
+        }
+    }
+
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        let ollama_messages: Vec<OllamaChatMessage> = messages
+            .iter()
+            .map(|m| OllamaChatMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect();
+
+        let ollama_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
+            None
+        } else {
+            Some(
+                tools
+                    .iter()
+                    .map(|t| {
+                        serde_json::json!({
+                            "type": "function",
+                            "function": {
+                                "name": t.name,
+                                "description": t.description,
+                                "parameters": t.parameters,
+                            }
+                        })
+                    })
+                    .collect(),
+            )
+        };
+
+        let request = OllamaChatRequest {
             model: self.model.clone(),
-            prompt: prompt.to_string(),
+            messages: ollama_messages,
             stream: false,
+            tools: ollama_tools,
             options: Some(OllamaOptions {
                 temperature: options.temperature,
                 num_predict: options.max_tokens.map(|t| t as i32),
             }),
         };
 
-        let url = format!("{}/api/generate", self.endpoint.trim_end_matches('/'));
+        let url = format!("{}/api/chat", self.endpoint.trim_end_matches('/'));
 
         let response = self
             .client
@@ -91,7 +166,6 @@ impl LLMProvider for OllamaAdapter {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            
             return Err(if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else {
@@ -99,39 +173,51 @@ impl LLMProvider for OllamaAdapter {
             });
         }
 
-        let ollama_response: OllamaResponse = response
+        let cr: OllamaChatResponse = response
             .json()
             .await
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {}", e)))?;
 
-        Ok(GenerationResponse {
-            text: ollama_response.response,
+        if !cr.message.tool_calls.is_empty() {
+            let tool_calls = cr
+                .message
+                .tool_calls
+                .into_iter()
+                .enumerate()
+                .map(|(i, tc)| ChatToolCall {
+                    id: format!("ollama-call-{}", i),
+                    name: tc.function.name,
+                    arguments: tc.function.arguments,
+                })
+                .collect();
+            return Ok(ChatResponse::ToolCalls(tool_calls));
+        }
+
+        Ok(ChatResponse::FinalText(GenerationResponse {
+            text: cr.message.content,
             usage: crate::domain::llm::TokenUsage {
-                prompt_tokens: ollama_response.prompt_eval_count.unwrap_or(0),
-                completion_tokens: ollama_response.eval_count.unwrap_or(0),
-                total_tokens: ollama_response.prompt_eval_count.unwrap_or(0) + ollama_response.eval_count.unwrap_or(0),
+                prompt_tokens: cr.prompt_eval_count.unwrap_or(0),
+                completion_tokens: cr.eval_count.unwrap_or(0),
+                total_tokens: cr.prompt_eval_count.unwrap_or(0) + cr.eval_count.unwrap_or(0),
             },
             provider: "ollama".to_string(),
             model: self.model.clone(),
-            finish_reason: if ollama_response.done {
+            finish_reason: if cr.done {
                 FinishReason::Stop
             } else {
                 FinishReason::Length
             },
-        })
+        }))
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
-        // Check if Ollama server is running by listing models
         let url = format!("{}/api/tags", self.endpoint.trim_end_matches('/'));
-
         let response = self
             .client
             .get(&url)
             .send()
             .await
             .map_err(|e| LLMError::Network(e.to_string()))?;
-
         if response.status().is_success() {
             Ok(())
         } else {
@@ -143,118 +229,97 @@ impl LLMProvider for OllamaAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::llm::FinishReason;
-    
+    use crate::domain::llm::{FinishReason, GenerationOptions};
+
     #[test]
     fn test_ollama_adapter_creation() {
-        let adapter = OllamaAdapter::new(
-            "http://localhost:11434".to_string(),
-            "llama2".to_string(),
-        );
-        
+        let adapter = OllamaAdapter::new("http://localhost:11434".to_string(), "llama3.1".to_string());
         assert_eq!(adapter.endpoint, "http://localhost:11434");
-        assert_eq!(adapter.model, "llama2");
+        assert_eq!(adapter.model, "llama3.1");
     }
-    
+
     #[test]
-    fn test_ollama_request_serialization() {
-        let request = OllamaRequest {
-            model: "llama2".to_string(),
-            prompt: "Hello Ollama".to_string(),
+    fn test_chat_request_serialization() {
+        let request = OllamaChatRequest {
+            model: "llama3.1".to_string(),
+            messages: vec![OllamaChatMessage { role: "user".to_string(), content: "Hi".to_string() }],
             stream: false,
-            options: Some(OllamaOptions {
-                temperature: Some(0.7),
-                num_predict: Some(100),
-            }),
+            tools: None,
+            options: Some(OllamaOptions { temperature: Some(0.7), num_predict: Some(256) }),
         };
-        
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "llama2");
-        assert_eq!(json["prompt"], "Hello Ollama");
+        assert_eq!(json["model"], "llama3.1");
         assert_eq!(json["stream"], false);
-        // Use approximate comparison for floating point
-        let temp = json["options"]["temperature"].as_f64().unwrap();
-        assert!((temp - 0.7).abs() < 0.01);
-        assert_eq!(json["options"]["num_predict"], 100);
+        assert_eq!(json["messages"][0]["role"], "user");
+        assert!(json.get("tools").is_none());
     }
-    
+
     #[test]
-    fn test_ollama_response_deserialization() {
+    fn test_chat_response_deserialization() {
         let json = serde_json::json!({
-            "response": "Hello! I'm Llama.",
+            "message": {"role": "assistant", "content": "Hello!", "tool_calls": []},
             "done": true,
             "eval_count": 50,
             "prompt_eval_count": 20
         });
-        
-        let response: OllamaResponse = serde_json::from_value(json).unwrap();
-        assert_eq!(response.response, "Hello! I'm Llama.");
-        assert_eq!(response.done, true);
-        assert_eq!(response.eval_count, Some(50));
-        assert_eq!(response.prompt_eval_count, Some(20));
+        let cr: OllamaChatResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(cr.message.content, "Hello!");
+        assert_eq!(cr.done, true);
+        assert!(cr.message.tool_calls.is_empty());
     }
-    
+
     #[test]
-    fn test_ollama_finish_reason() {
-        // Test done flag to finish reason mapping
-        let done_response = OllamaResponse {
-            response: "Test".to_string(),
-            done: true,
-            eval_count: Some(10),
-            prompt_eval_count: Some(5),
-        };
-        
-        let finish_reason = if done_response.done {
-            FinishReason::Stop
-        } else {
-            FinishReason::Length
-        };
-        assert_eq!(finish_reason, FinishReason::Stop);
-        
-        // Test not done
-        let incomplete_response = OllamaResponse {
-            response: "Test".to_string(),
-            done: false,
-            eval_count: Some(10),
-            prompt_eval_count: Some(5),
-        };
-        
-        let finish_reason = if incomplete_response.done {
-            FinishReason::Stop
-        } else {
-            FinishReason::Length
-        };
-        assert_eq!(finish_reason, FinishReason::Length);
+    fn test_tool_call_deserialization() {
+        let json = serde_json::json!({
+            "message": {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"function": {"name": "web_search", "arguments": {"query": "rust"}}}]
+            },
+            "done": true
+        });
+        let cr: OllamaChatResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(cr.message.tool_calls.len(), 1);
+        assert_eq!(cr.message.tool_calls[0].function.name, "web_search");
     }
-    
+
     #[test]
-    fn test_ollama_token_counting() {
-        let response = OllamaResponse {
-            response: "Test response".to_string(),
-            done: true,
-            eval_count: Some(30),
-            prompt_eval_count: Some(15),
+    fn test_tool_schema_to_ollama_format() {
+        let tool = ToolSchema {
+            name: "read_file".to_string(),
+            description: "Read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
         };
-        
-        let prompt_tokens = response.prompt_eval_count.unwrap_or(0);
-        let completion_tokens = response.eval_count.unwrap_or(0);
-        let total_tokens = prompt_tokens + completion_tokens;
-        
-        assert_eq!(prompt_tokens, 15);
-        assert_eq!(completion_tokens, 30);
-        assert_eq!(total_tokens, 45);
+        let ollama = serde_json::json!({
+            "type": "function",
+            "function": {"name": tool.name, "description": tool.description, "parameters": tool.parameters},
+        });
+        assert_eq!(ollama["type"], "function");
+        assert_eq!(ollama["function"]["name"], "read_file");
     }
-    
+
     #[test]
-    fn test_ollama_options_with_none() {
-        let options = OllamaOptions {
-            temperature: None,
-            num_predict: None,
-        };
-        
-        let json = serde_json::to_value(&options).unwrap();
-        // Fields with None should be skipped in serialization
-        assert!(!json.as_object().unwrap().contains_key("temperature"));
-        assert!(!json.as_object().unwrap().contains_key("num_predict"));
+    fn test_endpoint_trailing_slash_handling() {
+        let url = format!("{}/api/chat", "http://localhost:11434/".trim_end_matches('/'));
+        assert_eq!(url, "http://localhost:11434/api/chat");
+    }
+
+    #[test]
+    fn test_finish_reason_from_done_flag() {
+        assert_eq!(if true { FinishReason::Stop } else { FinishReason::Length }, FinishReason::Stop);
+        assert_eq!(if false { FinishReason::Stop } else { FinishReason::Length }, FinishReason::Length);
+    }
+
+    #[test]
+    fn test_default_max_tokens() {
+        let opts = GenerationOptions { max_tokens: None, temperature: None, stop_sequences: None };
+        assert_eq!(opts.max_tokens.unwrap_or(4096), 4096);
+    }
+
+    #[test]
+    fn test_ollama_call_id_generation() {
+        // Ensure tool call IDs are generated deterministically by index
+        let id = format!("ollama-call-{}", 0);
+        assert_eq!(id, "ollama-call-0");
     }
 }

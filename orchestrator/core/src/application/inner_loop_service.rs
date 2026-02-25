@@ -66,6 +66,12 @@ use std::sync::Arc;
 use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
+use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
+use crate::infrastructure::llm::registry::ProviderRegistry;
+
+fn default_model_alias() -> String {
+    "default".to_string()
+}
 
 /// Maximum number of tool-call iterations before the inner loop is forcibly
 /// terminated. Prevents runaway loops from consuming unbounded resources.
@@ -80,6 +86,10 @@ pub struct InnerLoopRequest {
     pub execution_id: String,
     /// The agent's prompt / system message.
     pub prompt: String,
+    /// Model alias to use (from `spec.runtime.model` in the agent manifest).
+    /// Defaults to `"default"` if omitted.
+    #[serde(default = "default_model_alias")]
+    pub model_alias: String,
     /// Conversation history (optional, for multi-turn).
     #[serde(default)]
     pub messages: Vec<ConversationMessage>,
@@ -135,12 +145,17 @@ pub enum LlmOutput {
 /// interacts with — agents never call tool servers or LLM providers directly.
 pub struct InnerLoopService {
     tool_invocation_service: Arc<ToolInvocationService>,
+    provider_registry: Arc<ProviderRegistry>,
 }
 
 impl InnerLoopService {
-    pub fn new(tool_invocation_service: Arc<ToolInvocationService>) -> Self {
+    pub fn new(
+        tool_invocation_service: Arc<ToolInvocationService>,
+        provider_registry: Arc<ProviderRegistry>,
+    ) -> Self {
         Self {
             tool_invocation_service,
+            provider_registry,
         }
     }
 
@@ -197,7 +212,7 @@ impl InnerLoopService {
         // 3. Inner loop: call LLM, execute tools, repeat
         for _iteration in 0..MAX_INNER_LOOP_ITERATIONS {
             // Call LLM with current conversation and tool schemas
-            let llm_output = self.call_llm(&conversation, &tool_schemas).await?;
+            let llm_output = self.call_llm(&request.model_alias, &conversation, &tool_schemas).await?;
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
@@ -274,27 +289,62 @@ impl InnerLoopService {
         )
     }
 
-    /// Call the LLM proxy and parse the response.
+    /// Call the LLM provider and parse the response into `LlmOutput`.
     ///
-    /// ⚠️ Phase 1 — Returns a placeholder FinalText. The actual LLM proxy
-    /// integration will use the existing `LlmClient` infrastructure once
-    /// the inner loop is wired into the execution pipeline.
+    /// Maps `ConversationMessage` → `ChatMessage` and `tool_schemas` (OpenAI-format
+    /// JSON) → `ToolSchema` domain objects, then delegates to the `ProviderRegistry`.
     async fn call_llm(
         &self,
-        _conversation: &[ConversationMessage],
-        _tool_schemas: &[Value],
+        model_alias: &str,
+        conversation: &[ConversationMessage],
+        tool_schemas: &[Value],
     ) -> anyhow::Result<LlmOutput> {
-        // Phase 1: Return final text immediately.
-        // Phase 2 will integrate with the LLM proxy via
-        // `crate::infrastructure::llm::LlmClient::generate()`.
-        //
-        // The actual implementation will:
-        // 1. Build the LLM API request with conversation + tool schemas
-        // 2. Parse the response for tool_calls vs content
-        // 3. Return LlmOutput::ToolCalls or LlmOutput::FinalText
-        Ok(LlmOutput::FinalText(
-            "[Inner Loop Gateway: LLM proxy integration pending Phase 2]".to_string()
-        ))
+        // Map ConversationMessage → ChatMessage (same fields, different type)
+        let chat_messages: Vec<ChatMessage> = conversation
+            .iter()
+            .map(|m| ChatMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+            })
+            .collect();
+
+        // Extract ToolSchema from OpenAI-format {"type":"function","function":{...}} objects
+        let schemas: Vec<ToolSchema> = tool_schemas
+            .iter()
+            .filter_map(|v| {
+                let f = v.get("function")?;
+                Some(ToolSchema {
+                    name: f.get("name")?.as_str()?.to_string(),
+                    description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    parameters: f.get("parameters")?.clone(),
+                })
+            })
+            .collect();
+
+        let options = GenerationOptions::default();
+
+        match self
+            .provider_registry
+            .generate_chat(model_alias, &chat_messages, &schemas, &options)
+            .await
+        {
+            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => {
+                Ok(LlmOutput::FinalText(r.text))
+            }
+            Ok(crate::domain::llm::ChatResponse::ToolCalls(calls)) => {
+                let tool_calls = calls
+                    .into_iter()
+                    .map(|c| ToolCall {
+                        id: c.id,
+                        name: c.name,
+                        arguments: c.arguments,
+                    })
+                    .collect();
+                Ok(LlmOutput::ToolCalls(tool_calls))
+            }
+            Err(e) => Err(anyhow::anyhow!("LLM call failed: {}", e)),
+        }
     }
 }
 
@@ -302,9 +352,45 @@ impl InnerLoopService {
 mod tests {
     use super::*;
     use crate::domain::mcp::ToolRegistry;
+    use crate::infrastructure::llm::registry::ProviderRegistry;
     use crate::infrastructure::smcp::middleware::SmcpMiddleware;
     use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
     use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+
+    fn make_empty_registry() -> Arc<ProviderRegistry> {
+        use crate::domain::node_config::{
+            LLMSelection, ManifestMetadata, NodeConfigManifest, NodeConfigSpec, NodeIdentity,
+            NodeType,
+        };
+        let config = NodeConfigManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "NodeConfig".to_string(),
+            metadata: ManifestMetadata {
+                name: "test".to_string(),
+                version: None,
+                labels: None,
+            },
+            spec: NodeConfigSpec {
+                node: NodeIdentity {
+                    id: "test".to_string(),
+                    node_type: NodeType::Edge,
+                    region: None,
+                    tags: vec![],
+                    resources: None,
+                },
+                llm_providers: vec![],
+                llm_selection: LLMSelection::default(),
+                runtime: crate::domain::node_config::RuntimeConfig::default(),
+                network: None,
+                observability: None,
+                storage: None,
+                mcp_servers: None,
+                smcp: None,
+                security_contexts: None,
+            },
+        };
+        Arc::new(ProviderRegistry::from_config(&config).unwrap())
+    }
 
     fn make_service() -> InnerLoopService {
         let repo: Arc<dyn crate::domain::smcp_session_repository::SmcpSessionRepository> =
@@ -313,28 +399,24 @@ mod tests {
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let router = Arc::new(ToolRouter::new(registry, servers));
         let middleware = Arc::new(SmcpMiddleware::new());
-
         let tool_service = Arc::new(ToolInvocationService::new(repo, middleware, router));
-        InnerLoopService::new(tool_service)
+        InnerLoopService::new(tool_service, make_empty_registry())
     }
 
+    /// Without a configured LLM provider the inner loop should fail gracefully.
     #[tokio::test]
-    async fn test_inner_loop_returns_final_text() {
+    async fn test_inner_loop_fails_without_provider() {
         let service = make_service();
         let request = InnerLoopRequest {
             agent_id: uuid::Uuid::new_v4().to_string(),
             execution_id: uuid::Uuid::new_v4().to_string(),
             prompt: "Hello, world!".to_string(),
+            model_alias: "default".to_string(),
             messages: vec![],
         };
-
-        let response = service.generate(request).await.unwrap();
-        assert!(!response.content.is_empty());
-        assert_eq!(response.tool_calls_executed, 0);
-        // Conversation should have user message + assistant response
-        assert_eq!(response.conversation.len(), 2);
-        assert_eq!(response.conversation[0].role, "user");
-        assert_eq!(response.conversation[1].role, "assistant");
+        // Expect an error because no providers are registered
+        let result = service.generate(request).await;
+        assert!(result.is_err(), "Expected error without LLM provider configured");
     }
 
     #[tokio::test]
@@ -343,18 +425,49 @@ mod tests {
             agent_id: "test-agent-id".to_string(),
             execution_id: "test-exec-id".to_string(),
             prompt: "Test prompt".to_string(),
-            messages: vec![
-                ConversationMessage {
-                    role: "system".to_string(),
-                    content: "You are a helpful assistant.".to_string(),
-                    tool_call_id: None,
-                },
-            ],
+            model_alias: "default".to_string(),
+            messages: vec![ConversationMessage {
+                role: "system".to_string(),
+                content: "You are a helpful assistant.".to_string(),
+                tool_call_id: None,
+            }],
         };
-
         let json = serde_json::to_string(&request).unwrap();
         let deserialized: InnerLoopRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.agent_id, "test-agent-id");
+        assert_eq!(deserialized.model_alias, "default");
         assert_eq!(deserialized.messages.len(), 1);
+    }
+
+    #[test]
+    fn test_model_alias_default() {
+        let json = r#"{"agent_id":"a","execution_id":"b","prompt":"hi"}"#;
+        let req: InnerLoopRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.model_alias, "default");
+    }
+
+    #[test]
+    fn test_tool_schema_extraction_from_json() {
+        let tool_json = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read a file from the workspace",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let schemas: Vec<ToolSchema> = vec![&tool_json]
+            .into_iter()
+            .filter_map(|v| {
+                let f = v.get("function")?;
+                Some(ToolSchema {
+                    name: f.get("name")?.as_str()?.to_string(),
+                    description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    parameters: f.get("parameters")?.clone(),
+                })
+            })
+            .collect();
+        assert_eq!(schemas.len(), 1);
+        assert_eq!(schemas[0].name, "read_file");
     }
 }

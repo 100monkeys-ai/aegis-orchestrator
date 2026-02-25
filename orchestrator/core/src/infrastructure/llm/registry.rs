@@ -1,28 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # LLM Provider Registry — ADR-009
+//! # LLM Provider Registry
 //!
-//! `ProviderRegistry` selects the active `LLMProvider` implementation at
-//! runtime based on the `spec.runtime.model` field in the agent manifest.  
-//! Model-alias → adapter mapping:
-//!
-//! | Alias prefix | Adapter |
-//! |--------------|-------------------|
-//! | `gpt-*`, `o1`, `o3-*` | `OpenAIAdapter` |
-//! | `claude-*` | `AnthropicAdapter` |
-//! | anything else | `OllamaAdapter` |
-//!
-//! Credentials are resolved from node config at registration time and never
-//! stored on the `LLMProvider` trait object (Credential Isolation).
-//!
-//! See ADR-009 (BYOLLM Provider Strategy).
+//! `ProviderRegistry` resolves model aliases (e.g. `"default"`, `"fast"`,
+//! `"smart"`) to real `LLMProvider` adapters at runtime based on node config.
+//! Includes retry-with-exponential-backoff and one-level fallback.
 
-// LLM Provider Registry - Model Alias Resolution and Provider Management
-//
-// Manages LLM providers and resolves model aliases to actual providers.
-// Implements fallback and retry strategies per ADR-009.
-
-use crate::domain::llm::{GenerationOptions, GenerationResponse, LLMError, LLMProvider};
+use crate::domain::llm::{
+    ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
+    ToolSchema,
+};
 use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -157,6 +144,61 @@ impl ProviderRegistry {
             Some(k) => Ok(k.clone()),
             None => Ok(String::new()), // For local providers without auth
         }
+    }
+
+    /// Generate using a model alias, multi-turn messages, and optional tools.
+    /// Includes retry logic and fallback to secondary provider.
+    pub async fn generate_chat(
+        &self,
+        alias: &str,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        let (provider_name, _model_config) = self
+            .alias_map
+            .get(alias)
+            .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
+
+        let provider = self.providers.get(provider_name).ok_or_else(|| {
+            LLMError::Provider(format!("Provider '{}' not found", provider_name))
+        })?;
+
+        let mut last_error = None;
+
+        for attempt in 0..self.max_retries {
+            match provider.generate_chat(messages, tools, options).await {
+                Ok(response) => {
+                    info!("generate_chat successful on attempt {}", attempt + 1);
+                    return Ok(response);
+                }
+                Err(e) => {
+                    warn!(
+                        "generate_chat failed (attempt {}/{}): {:?}",
+                        attempt + 1,
+                        self.max_retries,
+                        e
+                    );
+                    last_error = Some(e);
+
+                    if attempt == self.max_retries - 1 {
+                        if let Some(fallback) = &self.fallback_provider {
+                            if let Some(fb) = self.providers.get(fallback) {
+                                info!("Trying fallback provider: {}", fallback);
+                                return fb.generate_chat(messages, tools, options).await;
+                            }
+                        }
+                    }
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(
+                        self.retry_delay_ms * 2_u64.pow(attempt),
+                    ))
+                    .await;
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
     }
 
     /// Generate text using a model alias
@@ -306,16 +348,19 @@ impl LLMProvider for ProviderRegistry {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
-        // Use the default provider alias for domain-level calls
-        // The registry's generate() method requires an alias for routing
-        let alias = "default";
-        
-        // Call the registry's generate method with the default alias
-        self.generate(alias, prompt, options).await
+        self.generate("default", prompt, options).await
+    }
+
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        self.generate_chat("default", messages, tools, options).await
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
-        // Check if default alias exists and its provider is healthy
         let (provider_name, _) = self
             .alias_map
             .get("default")
