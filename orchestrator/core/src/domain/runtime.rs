@@ -114,6 +114,7 @@ impl RuntimeConfig {
     ///
     /// ```
     /// # use aegis_core::domain::runtime::{RuntimeConfig, ResourceLimits};
+    /// # use aegis_core::domain::agent::ExecutionStrategy;
     /// # use std::collections::HashMap;
     /// let cfg = RuntimeConfig {
     ///     language: "python".to_string(),
@@ -127,9 +128,11 @@ impl RuntimeConfig {
     ///         disk_bytes: None,
     ///         timeout_seconds: None,
     ///     },
+    ///     execution: ExecutionStrategy::default(),
     ///     volumes: vec![],
     ///     container_uid: 1000,
     ///     container_gid: 1000,
+    ///     keep_container_on_failure: false,
     /// };
     /// assert_eq!(cfg.to_image(), "python:3.12");
     /// ```
