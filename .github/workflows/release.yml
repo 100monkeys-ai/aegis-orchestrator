@@ -105,7 +105,7 @@ jobs:
 
   build-macos-intel:
     name: Build macOS (Intel)
-    runs-on: macos-13  # Intel runner
+    runs-on: macos-12  # Intel runner
     
     steps:
       - uses: actions/checkout@v4
