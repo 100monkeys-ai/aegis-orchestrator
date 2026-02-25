@@ -4,13 +4,13 @@
 //!
 //! Application service implementing the Agent Inner Loop described in ADR-038.
 //! This is the single entry-point for agent code: `bootstrap.py` makes one
-//! long-running `POST /v1/llm/generate` request and the orchestrator handles
+//! long-running `POST /v1/dispatch-gateway` request and the orchestrator handles
 //! the entire tool-call cycle internally.
 //!
 //! ## Inner Loop Flow
 //!
 //! ```text
-//! bootstrap.py ─── POST /v1/llm/generate ───►  InnerLoopService::generate()
+//! bootstrap.py ─── POST /v1/dispatch-gateway ───►  InnerLoopService::generate()
 //!                                                 │
 //!                                           ┌─────┴─────┐
 //!                                           │ 1. Inject  │
@@ -77,7 +77,7 @@ fn default_model_alias() -> String {
 /// terminated. Prevents runaway loops from consuming unbounded resources.
 const MAX_INNER_LOOP_ITERATIONS: usize = 50;
 
-/// Request from `bootstrap.py` to the `/v1/llm/generate` endpoint.
+/// Request from `bootstrap.py` to the `/v1/dispatch-gateway` endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InnerLoopRequest {
     /// AEGIS `AgentId` (UUID string) of the calling agent.

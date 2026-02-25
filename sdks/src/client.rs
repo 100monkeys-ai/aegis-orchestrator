@@ -115,7 +115,7 @@ impl AegisClient {
         model: Option<&str>,
         execution_id: Option<&str>,
     ) -> Result<String> {
-        let url = format!("{}/v1/llm/generate", self.base_url);
+        let url = format!("{}/v1/dispatch-gateway", self.base_url);
         
         let payload = serde_json::json!({
             "prompt": prompt,

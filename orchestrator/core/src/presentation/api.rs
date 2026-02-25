@@ -20,7 +20,7 @@
 //! | `POST` | `/v1/human-approvals/{id}/reject` | reject request |
 //! | `POST` | `/v1/smcp/attest` | SMCP attestation handshake (ADR-035) |
 //! | `POST` | `/v1/smcp/invoke` | SMCP tool invocation (ADR-033) |
-//! | `POST` | `/v1/llm/generate` | Inner loop gateway (ADR-038) |
+//! | `POST` | `/v1/dispatch-gateway` | Dispatch gateway — inner loop orchestration (ADR-038) |
 //! | `POST` | `/v1/stimuli` | Stimulus ingestion — Keycloak Bearer auth (ADR-021) |
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
@@ -85,8 +85,8 @@ pub fn app(
         // SMCP endpoints (ADR-035 §4.1)
         .route("/v1/smcp/attest", post(smcp_attestation))
         .route("/v1/smcp/invoke", post(smcp_tool_invoke))
-        // Inner loop gateway (ADR-038)
-        .route("/v1/llm/generate", post(inner_loop_generate))
+        // Dispatch gateway (ADR-038)
+        .route("/v1/dispatch-gateway", post(dispatch_gateway))
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))
         .route("/v1/webhooks/:source", post(webhook_handler))
@@ -118,7 +118,7 @@ pub fn app_with_inner_loop(
         .route("/v1/human-approvals/:id/reject", post(reject_request))
         .route("/v1/smcp/attest", post(smcp_attestation))
         .route("/v1/smcp/invoke", post(smcp_tool_invoke))
-        .route("/v1/llm/generate", post(inner_loop_generate))
+        .route("/v1/dispatch-gateway", post(dispatch_gateway))
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))
         .route("/v1/webhooks/:source", post(webhook_handler))
@@ -349,12 +349,12 @@ async fn smcp_tool_invoke(
 // Inner Loop Gateway (ADR-038)
 // ============================================================================
 
-/// Handle inner loop LLM generation request (ADR-038).
+/// Handle dispatch gateway request (ADR-038).
 ///
 /// This is the single entry point for agent code. `bootstrap.py` calls
-/// `POST /v1/llm/generate` and the orchestrator handles the entire
-/// LLM → tool call → LLM cycle internally.
-async fn inner_loop_generate(
+/// `POST /v1/dispatch-gateway` and the orchestrator handles the entire
+/// LLM → tool call → LLM cycle internally via the Dispatch Protocol.
+async fn dispatch_gateway(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<InnerLoopRequest>,
 ) -> impl IntoResponse {

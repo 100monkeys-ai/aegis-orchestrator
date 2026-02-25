@@ -855,7 +855,7 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         .route("/v1/agents", post(deploy_agent_handler).get(list_agents_handler))
         .route("/v1/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
         .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
-        .route("/v1/llm/generate", post(llm_generate_handler))
+        .route("/v1/dispatch-gateway", post(llm_generate_handler))
         .route("/v1/workflows", post(register_temporal_workflow_handler).get(list_workflows_handler))
         .route("/v1/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
         .route("/v1/workflows/:name/run", post(run_workflow_legacy_handler))
