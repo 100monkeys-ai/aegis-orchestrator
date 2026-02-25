@@ -42,6 +42,7 @@ COPY cli/templates ./cli/templates
 COPY cli/migrations ./cli/migrations
 COPY sdks/src ./sdks/src
 COPY proto ./proto
+COPY aegis-proto ./aegis-proto
 
 # Build the actual binary with all real source
 RUN cargo build --release --bin aegis --locked
