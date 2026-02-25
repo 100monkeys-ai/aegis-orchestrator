@@ -145,7 +145,7 @@ pub async fn handle_command(
 
 /// Validate a workflow manifest file
 async fn validate_workflow(file: PathBuf) -> Result<()> {
-    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 
     println!("{}", "📋 Validating workflow manifest...".cyan());
     println!("   File: {}", file.display());
@@ -156,7 +156,7 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
         WorkflowParser::parse_file(&file).context("Failed to parse workflow manifest")?;
 
     // Validate for cycles
-    use aegis_core::domain::workflow::WorkflowValidator;
+    use aegis_orchestrator_core::domain::workflow::WorkflowValidator;
     WorkflowValidator::check_for_cycles(&workflow).context("Workflow validation failed")?;
 
     // Success
@@ -218,7 +218,7 @@ async fn deploy_workflow(file: PathBuf, host: &str, port: u16) -> Result<()> {
     println!();
 
     // First validate locally
-    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
     let workflow =
         WorkflowParser::parse_file(&file).context("Failed to parse workflow manifest")?;
 

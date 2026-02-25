@@ -10,7 +10,7 @@
 //! | [`SwarmService`] | Application service trait for swarm lifecycle and coordination |
 
 use crate::domain::SwarmId;
-use aegis_core::domain::agent::{AgentId, AgentManifest};
+use aegis_orchestrator_core::domain::agent::{AgentId, AgentManifest};
 use anyhow::Result;
 use async_trait::async_trait;
 

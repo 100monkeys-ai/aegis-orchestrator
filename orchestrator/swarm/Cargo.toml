@@ -1,10 +1,12 @@
 [package]
-name = "aegis-swarm"
+name = "aegis-orchestrator-swarm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
+repository.workspace = true
+description = "Swarm coordination for the 100monkeys.ai AEGIS orchestrator"
 
 [dependencies]
 tokio = { workspace = true }
@@ -14,9 +16,9 @@ chrono = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 async-trait = "0.1"
-aegis-core = { path = "../core" } 
+aegis-orchestrator-core = { path = "../core", version = "0.1.0-pre-alpha" }
 
-# We might need agent-core to refer to AgentId? 
-# "aegis-core" is the new name for orchestrator/core crate from my implementation plan (Step 1).
-# I need to verify if I renamed it in Cargo.toml. 
-# Yes, I saw in a previous view_file that the name was "aegis-core".
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]

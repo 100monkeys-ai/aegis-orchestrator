@@ -1,0 +1,237 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 100monkeys.ai
+
+name: Publish crates.io
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'   # Publishes semver tags (e.g. v0.1.0 → 0.1.0, 0.1, 0)
+    # Allow manual triggering for debugging
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Perform a dry run (no actual publishing)'
+        required: false
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  # Verify the project builds before attempting to publish
+  verify:
+    name: Verify build and tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Verify workspace builds
+        run: cargo build --workspace --locked
+
+      - name: Run tests
+        run: cargo test --workspace --locked --lib
+
+  # Publish in dependency order: core → swarm → sdk → cli
+  publish-core:
+    name: Publish aegis-orchestrator-core
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish aegis-orchestrator-core
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "🔍 DRY RUN: Would publish aegis-orchestrator-core"
+            cargo publish -p aegis-orchestrator-core --locked --dry-run --token ${{ secrets.CRATES_TOKEN }}
+          else
+            echo "📦 Publishing aegis-orchestrator-core to crates.io..."
+            cargo publish -p aegis-orchestrator-core --locked --token ${{ secrets.CRATES_TOKEN }}
+          fi
+
+      - name: Wait for crates.io index to update
+        run: sleep 20
+
+  publish-swarm:
+    name: Publish aegis-orchestrator-swarm
+    needs: publish-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish aegis-orchestrator-swarm
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "🔍 DRY RUN: Would publish aegis-orchestrator-swarm"
+            cargo publish -p aegis-orchestrator-swarm --locked --dry-run --token ${{ secrets.CRATES_TOKEN }}
+          else
+            echo "📦 Publishing aegis-orchestrator-swarm to crates.io..."
+            cargo publish -p aegis-orchestrator-swarm --locked --token ${{ secrets.CRATES_TOKEN }}
+          fi
+
+      - name: Wait for crates.io index to update
+        run: sleep 20
+
+  publish-sdk:
+    name: Publish aegis-orchestrator-sdk
+    needs: publish-core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish aegis-orchestrator-sdk
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "🔍 DRY RUN: Would publish aegis-orchestrator-sdk"
+            cargo publish -p aegis-orchestrator-sdk --locked --dry-run --token ${{ secrets.CRATES_TOKEN }}
+          else
+            echo "📦 Publishing aegis-orchestrator-sdk to crates.io..."
+            cargo publish -p aegis-orchestrator-sdk --locked --token ${{ secrets.CRATES_TOKEN }}
+          fi
+
+      - name: Wait for crates.io index to update
+        run: sleep 20
+
+  publish-cli:
+    name: Publish aegis-orchestrator (CLI)
+    needs: [publish-sdk, publish-swarm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Publish aegis-orchestrator (CLI)
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
+            echo "🔍 DRY RUN: Would publish aegis-orchestrator"
+            cargo publish -p aegis-orchestrator --locked --dry-run --token ${{ secrets.CRATES_TOKEN }}
+          else
+            echo "📦 Publishing aegis-orchestrator to crates.io..."
+            cargo publish -p aegis-orchestrator --locked --token ${{ secrets.CRATES_TOKEN }}
+          fi
+
+  # Generate and publish documentation
+  publish-docs:
+    name: Publish documentation to docs.rs
+    needs: [publish-core, publish-sdk]
+    runs-on: ubuntu-latest
+    # This job documents the docs.rs publishing (happens automatically after crates.io publish)
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate documentation
+        run: |
+          RUSTDOCFLAGS="--cfg docsrs" cargo doc --workspace --locked --no-deps --document-private-items
+
+      - name: Log documentation URLs
+        run: |
+          echo "📚 Documentation will be available at:"
+          echo "  - https://docs.rs/aegis-orchestrator-core"
+          echo "  - https://docs.rs/aegis-orchestrator-swarm"
+          echo "  - https://docs.rs/aegis-orchestrator-sdk"
+          echo "  - https://docs.rs/aegis-orchestrator"
+          echo ""
+          echo "Note: docs.rs automatically publishes documentation ~5 minutes after crates.io publish"
+
+  publish-summary:
+    name: Publish Summary
+    needs: [publish-cli, publish-docs]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Check publish status
+        run: |
+          echo "✅ Publishing workflow completed"
+          echo ""
+          echo "📦 Published packages:"
+          echo "  - aegis-orchestrator-core"
+          echo "  - aegis-orchestrator-swarm"
+          echo "  - aegis-orchestrator-sdk"
+          echo "  - aegis-orchestrator"
+          echo ""
+          echo "🔗 Links:"
+          echo "  - Crates.io: https://crates.io/crates/aegis-orchestrator"
+          echo "  - Docs.rs: https://docs.rs/aegis-orchestrator"
+          echo "  - Repository: https://github.com/100monkeys-ai/aegis-orchestrator"

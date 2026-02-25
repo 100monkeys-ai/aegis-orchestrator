@@ -166,7 +166,7 @@ async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClie
         .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
 
     // Parse with SDK types (now using core domain re-exports)
-    let agent_manifest: aegis_sdk::AgentManifest =
+    let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
         serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
 
     // Use domain validation (comprehensive checks including DNS labels, timeouts, etc.)

@@ -16,7 +16,7 @@ aegis-sdk = "0.1"
 ## Quick Start
 
 ```rust
-use aegis_sdk::{AegisClient, AgentManifest, TaskInput};
+use aegis_orchestrator_sdk::{AegisClient, AgentManifest, TaskInput};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

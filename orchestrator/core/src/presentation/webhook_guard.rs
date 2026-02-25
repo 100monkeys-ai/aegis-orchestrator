@@ -9,7 +9,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use aegis_core::presentation::webhook_guard::WebhookHmacGuard;
+//! use aegis_orchestrator_core::presentation::webhook_guard::WebhookHmacGuard;
 //! use axum::response::IntoResponse;
 //!
 //! async fn my_handler(

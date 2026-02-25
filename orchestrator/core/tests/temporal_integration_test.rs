@@ -9,19 +9,19 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements temporal integration test
 
-use aegis_core::application::register_workflow::{
+use aegis_orchestrator_core::application::register_workflow::{
     RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase,
 };
-use aegis_core::application::start_workflow_execution::{
+use aegis_orchestrator_core::application::start_workflow_execution::{
     StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
     StartWorkflowExecutionUseCase,
 };
-use aegis_core::domain::execution::ExecutionId;
-use aegis_core::domain::repository::{
+use aegis_orchestrator_core::domain::execution::ExecutionId;
+use aegis_orchestrator_core::domain::repository::{
     RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
 };
-use aegis_core::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
-use aegis_core::infrastructure::event_bus::EventBus;
+use aegis_orchestrator_core::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
+use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;

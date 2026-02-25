@@ -14,7 +14,7 @@ use clap::Subcommand;
 use colored::Colorize;
 use std::path::PathBuf;
 
-use aegis_core::domain::node_config::NodeConfigManifest;
+use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {

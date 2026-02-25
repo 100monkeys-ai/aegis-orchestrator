@@ -23,9 +23,9 @@ use std::sync::Arc;
 // Type alias for repository tuple to avoid clippy "very complex type" lint
 type RepositoryTuple = (
     Arc<dyn AgentRepository>,
-    Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
-    Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
-    Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>,
+    Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowRepository>,
+    Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
+    Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository>,
 );
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
@@ -34,7 +34,7 @@ use tokio::signal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
-use aegis_core::{
+use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService,
         execution::ExecutionService,
@@ -201,16 +201,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
         if let Some(pool) = pool.as_ref() {
             (
-            Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
-            Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
-            Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
-            Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool.clone())),
         )
         } else {
             (
                 Arc::new(InMemoryAgentRepository::new()),
                 Arc::new(
-                    aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new(),
+                    aegis_orchestrator_core::infrastructure::repositories::InMemoryWorkflowRepository::new(),
                 ),
                 Arc::new(InMemoryExecutionRepository::new()),
                 Arc::new(InMemoryWorkflowExecutionRepository::new()),
@@ -310,10 +310,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     // Reuse existing pool for volume repository (avoid redundant connection)
-    let volume_repo: Arc<dyn aegis_core::domain::repository::VolumeRepository> = if let Some(pool) =
+    let volume_repo: Arc<dyn aegis_orchestrator_core::domain::repository::VolumeRepository> = if let Some(pool) =
         pool.as_ref()
     {
-        Arc::new(aegis_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
+        Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
     } else {
         println!("WARNING: Volume persistence disabled (no database pool available)");
         return Err(anyhow::anyhow!(
@@ -321,12 +321,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ));
     };
 
-    let storage_provider: Arc<dyn aegis_core::domain::storage::StorageProvider> = Arc::new(
-        aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()),
+    let storage_provider: Arc<dyn aegis_orchestrator_core::domain::storage::StorageProvider> = Arc::new(
+        aegis_orchestrator_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()),
     );
 
     let volume_service = Arc::new(
-        aegis_core::application::volume_manager::StandardVolumeService::new(
+        aegis_orchestrator_core::application::volume_manager::StandardVolumeService::new(
             volume_repo.clone(),
             storage_provider.clone(),
             event_bus.clone(),
@@ -342,7 +342,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Spawn TTL cleanup background task for ephemeral volumes
     let volume_service_cleanup = volume_service.clone();
     tokio::spawn(async move {
-        use aegis_core::application::volume_manager::VolumeService as _;
+        use aegis_orchestrator_core::application::volume_manager::VolumeService as _;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // 5 minutes
         loop {
             interval.tick().await;
@@ -362,18 +362,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
     println!("Initializing Storage Event Persister...");
-    let storage_event_repo: Arc<dyn aegis_core::domain::repository::StorageEventRepository> =
+    let storage_event_repo: Arc<dyn aegis_orchestrator_core::domain::repository::StorageEventRepository> =
         if let Some(pool) = pool.as_ref() {
-            Arc::new(aegis_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
         } else {
             println!("WARNING: Storage event persistence disabled (no database pool available)");
             Arc::new(
-                aegis_core::infrastructure::repositories::InMemoryStorageEventRepository::new(),
+                aegis_orchestrator_core::infrastructure::repositories::InMemoryStorageEventRepository::new(),
             )
         };
 
     let storage_event_persister = Arc::new(
-        aegis_core::application::storage_event_persister::StorageEventPersister::new(
+        aegis_orchestrator_core::application::storage_event_persister::StorageEventPersister::new(
             storage_event_repo,
             event_bus.clone(),
         ),
@@ -394,10 +394,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Wrap EventBus in EventBusPublisher adapter for FSAL
     let event_publisher =
-        Arc::new(aegis_core::application::nfs_gateway::EventBusPublisher::new(event_bus.clone()));
+        Arc::new(aegis_orchestrator_core::application::nfs_gateway::EventBusPublisher::new(event_bus.clone()));
 
     let nfs_gateway = Arc::new(
-        aegis_core::application::nfs_gateway::NfsGatewayService::new(
+        aegis_orchestrator_core::application::nfs_gateway::NfsGatewayService::new(
             storage_provider,
             volume_repo,
             event_publisher,
@@ -445,13 +445,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tokio::spawn(async move {
             loop {
                 match nfs_deregister_sub.recv().await {
-                    Ok(aegis_core::infrastructure::event_bus::DomainEvent::Volume(vol_event)) => {
+                    Ok(aegis_orchestrator_core::infrastructure::event_bus::DomainEvent::Volume(vol_event)) => {
                         let volume_id = match &vol_event {
-                            aegis_core::domain::events::VolumeEvent::VolumeExpired {
+                            aegis_orchestrator_core::domain::events::VolumeEvent::VolumeExpired {
                                 volume_id,
                                 ..
                             } => Some(*volume_id),
-                            aegis_core::domain::events::VolumeEvent::VolumeDeleted {
+                            aegis_orchestrator_core::domain::events::VolumeEvent::VolumeDeleted {
                                 volume_id,
                                 ..
                             } => Some(*volume_id),
@@ -466,10 +466,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         }
                     }
                     Ok(_) => {} // Ignore non-volume events
-                    Err(aegis_core::infrastructure::event_bus::EventBusError::Lagged(n)) => {
+                    Err(aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Lagged(n)) => {
                         tracing::warn!("NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed", n);
                     }
-                    Err(aegis_core::infrastructure::event_bus::EventBusError::Closed) => {
+                    Err(aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Closed) => {
                         tracing::info!(
                             "NFS deregistration listener: event bus closed, shutting down"
                         );
@@ -555,7 +555,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     // Create human input service
-    let human_input_service = Arc::new(aegis_core::infrastructure::HumanInputService::new());
+    let human_input_service = Arc::new(aegis_orchestrator_core::infrastructure::HumanInputService::new());
 
     // Legacy WorkflowEngine removed as part of Temporal migration
 
@@ -584,15 +584,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Repositories
     let security_context_repo: Arc<
-        dyn aegis_core::domain::security_context::repository::SecurityContextRepository,
+        dyn aegis_orchestrator_core::domain::security_context::repository::SecurityContextRepository,
     > = Arc::new(
-        aegis_core::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new(),
     );
 
     let smcp_session_repo: Arc<
-        dyn aegis_core::domain::smcp_session_repository::SmcpSessionRepository,
+        dyn aegis_orchestrator_core::domain::smcp_session_repository::SmcpSessionRepository,
     > = Arc::new(
-        aegis_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new(),
+        aegis_orchestrator_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new(),
     );
 
     // Token Issuer (using env var for security; falls back to dev key for local dev)
@@ -604,7 +604,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----".to_string()
     });
     let token_issuer = Arc::new(
-        aegis_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
+        aegis_orchestrator_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
             &private_key,
             "aegis-orchestrator",
         )
@@ -613,9 +613,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Application Services
     let attestation_service: Arc<
-        dyn aegis_core::infrastructure::smcp::attestation::AttestationService,
+        dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService,
     > = Arc::new(
-        aegis_core::application::attestation_service::AttestationServiceImpl::new(
+        aegis_orchestrator_core::application::attestation_service::AttestationServiceImpl::new(
             security_context_repo.clone(),
             smcp_session_repo.clone(),
             token_issuer,
@@ -623,9 +623,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     let smcp_middleware =
-        Arc::new(aegis_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
+        Arc::new(aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
     let tool_registry =
-        Arc::new(aegis_core::infrastructure::tool_router::InMemoryToolRegistry::new());
+        Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
 
     // Shared tool servers state
     let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
@@ -635,13 +635,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let mut servers_lock = tool_servers.write().await;
         for srv_cfg in mcp_configs {
             if srv_cfg.enabled {
-                let tool_server = aegis_core::domain::mcp::ToolServer::from_config(srv_cfg);
+                let tool_server = aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
                 servers_lock.insert(tool_server.id, tool_server);
             }
         }
     }
 
-    let tool_router = Arc::new(aegis_core::infrastructure::tool_router::ToolRouter::new(
+    let tool_router = Arc::new(aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
         tool_registry.clone(),
         tool_servers.clone(),
     ));
@@ -650,7 +650,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tool_router.rebuild_index().await;
 
     let tool_manager = Arc::new(
-        aegis_core::infrastructure::tool_router::ToolServerManager::new(
+        aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
             tool_registry,
             tool_servers.clone(),
             event_bus.clone(),
@@ -667,7 +667,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     });
 
     let tool_invocation_service = Arc::new(
-        aegis_core::application::tool_invocation_service::ToolInvocationService::new(
+        aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             smcp_session_repo.clone(),
             smcp_middleware,
             tool_router,
@@ -675,7 +675,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     let inner_loop_service = Arc::new(
-        aegis_core::application::inner_loop_service::InnerLoopService::new(
+        aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
             tool_invocation_service.clone(),
             llm_registry,
         ),
@@ -736,11 +736,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tokio::spawn({
         let sec_repo = security_context_repo.clone();
         async move {
-            let default_context = aegis_core::domain::security_context::SecurityContext {
+            let default_context = aegis_orchestrator_core::domain::security_context::SecurityContext {
                 name: "default".to_string(),
                 description: "Default unrestricted context for MVP testing".to_string(),
                 capabilities: vec![
-                    aegis_core::domain::security_context::capability::Capability {
+                    aegis_orchestrator_core::domain::security_context::capability::Capability {
                         tool_pattern: "*".to_string(),
                         path_allowlist: None,
                         command_allowlist: None,
@@ -750,7 +750,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     },
                 ],
                 deny_list: vec![],
-                metadata: aegis_core::domain::security_context::SecurityContextMetadata {
+                metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
                     created_at: chrono::Utc::now(),
                     updated_at: chrono::Utc::now(),
                     version: 1,
@@ -768,10 +768,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .as_ref()
         .and_then(|c| c.grpc_url.as_ref())
         .and_then(|url| resolve_env_value(url).ok());
-    let cortex_client: Option<std::sync::Arc<aegis_core::infrastructure::CortexGrpcClient>> =
+    let cortex_client: Option<std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>> =
         match cortex_grpc_url {
             Some(url) => {
-                match aegis_core::infrastructure::CortexGrpcClient::new(url.clone()).await {
+                match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await {
                     Ok(client) => {
                         tracing::info!(url = %url, "Connected to Cortex gRPC service");
                         Some(std::sync::Arc::new(client))
@@ -799,7 +799,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
         println!("Starting gRPC server on {}", grpc_addr);
-        if let Err(e) = aegis_core::presentation::grpc::server::start_grpc_server(
+        if let Err(e) = aegis_orchestrator_core::presentation::grpc::server::start_grpc_server(
             grpc_addr,
             exec_service_clone,
             val_service_clone,
@@ -1074,20 +1074,20 @@ struct AppState {
     agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
-    inner_loop_service: Arc<aegis_core::application::inner_loop_service::InnerLoopService>,
-    human_input_service: Arc<aegis_core::infrastructure::HumanInputService>,
+    inner_loop_service: Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
+    human_input_service: Arc<aegis_orchestrator_core::infrastructure::HumanInputService>,
     temporal_event_listener: Arc<TemporalEventListener>,
     register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
     start_workflow_execution_use_case: Arc<StandardStartWorkflowExecutionUseCase>,
-    workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
+    workflow_repo: Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowRepository>,
     temporal_client_container: Arc<
         tokio::sync::RwLock<
-            Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>,
+            Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
         >,
     >,
     tool_invocation_service:
-        Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
-    attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService>,
+        Arc<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService>,
+    attestation_service: Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
@@ -1102,7 +1102,7 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
 
 async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
-    Json(manifest): Json<aegis_sdk::AgentManifest>,
+    Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
     // SDK now re-exports core types, so no conversion needed
     match state.agent_service.deploy_agent(manifest).await {
@@ -1185,7 +1185,7 @@ async fn stream_events_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
-    let exec_id = aegis_core::domain::execution::ExecutionId(execution_id);
+    let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
 
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_execution(exec_id);
@@ -1255,7 +1255,7 @@ async fn stream_events_handler(
             // Execution Terminal State
             if let Some(ended_at) = execution.ended_at {
                 match execution.status {
-                    aegis_core::domain::execution::ExecutionStatus::Completed => {
+                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
                          // Need final result? It's usually the last iteration output or not stored directly in Execution struct root except implicitly?
                          // The ExecutionEvent::ExecutionCompleted has `final_output`.
                          // The Execution struct doesn't seem to have `final_output` field in the previous view, just iterations.
@@ -1270,7 +1270,7 @@ async fn stream_events_handler(
                         });
                         yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
                     },
-                    aegis_core::domain::execution::ExecutionStatus::Failed => {
+                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Failed => {
                         let reason = execution.error.clone().unwrap_or_else(|| "Execution failed".to_string());
                         let exec_fail = serde_json::json!({
                             "event_type": "ExecutionFailed",
@@ -1280,7 +1280,7 @@ async fn stream_events_handler(
                         });
                         yield Ok::<_, anyhow::Error>(Event::default().data(exec_fail.to_string()));
                     },
-                    aegis_core::domain::execution::ExecutionStatus::Cancelled => {
+                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Cancelled => {
                          // Add Cancelled event if needed
                     },
                     _ => {}
@@ -1293,7 +1293,7 @@ async fn stream_events_handler(
             while let Ok(event) = receiver.recv().await {
                 // Convert domain event to JSON (Same logic as before)
                 let json = match event {
-                            aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
+                            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
                                 // Skip if we already replayed it?
                                 // Simple filter: check timestamp?
                                 // For now, just stream it.
@@ -1303,7 +1303,7 @@ async fn stream_events_handler(
                                     "data": {}
                                 })
                             },
-                             aegis_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
+                             aegis_orchestrator_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
                                 serde_json::json!({
                                     "event_type": "IterationStarted",
                                     "iteration_number": iteration_number,
@@ -1312,7 +1312,7 @@ async fn stream_events_handler(
                                     "data": { "action": action }
                                 })
                             },
-                             aegis_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
+                             aegis_orchestrator_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
                                 serde_json::json!({
                                     "event_type": "IterationCompleted",
                                     "iteration_number": iteration_number,
@@ -1320,7 +1320,7 @@ async fn stream_events_handler(
                                     "data": { "output": output }
                                 })
                             },
-                            aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
                                 serde_json::json!({
                                     "event_type": "ExecutionCompleted",
                                     "total_iterations": 0,
@@ -1328,7 +1328,7 @@ async fn stream_events_handler(
                                     "data": { "result": final_output }
                                 })
                             },
-                             aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
+                             aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
                                 serde_json::json!({
                                     "event_type": "ExecutionFailed",
                                     "reason": reason,
@@ -1336,7 +1336,7 @@ async fn stream_events_handler(
                                     "data": { "error": reason }
                                 })
                             },
-                            aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
+                            aegis_orchestrator_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
                                 serde_json::json!({
                                     "event_type": "ConsoleOutput",
                                     "stream": stream,
@@ -1344,7 +1344,7 @@ async fn stream_events_handler(
                                     "data": { "output": content }
                                 })
                             },
-                            aegis_core::domain::events::ExecutionEvent::LlmInteraction { provider, model, prompt, response, .. } => {
+                            aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction { provider, model, prompt, response, .. } => {
                                 serde_json::json!({
                                     "event_type": "LlmInteraction",
                                     "timestamp": chrono::Utc::now().to_rfc3339(),
@@ -1379,7 +1379,7 @@ async fn stream_agent_events_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
-    let aid = aegis_core::domain::agent::AgentId(agent_id);
+    let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
 
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_agent(aid);
@@ -1528,7 +1528,7 @@ async fn stream_agent_events_handler(
                 // Execution Terminal State
                 if let Some(ended_at) = execution.ended_at {
                     match execution.status {
-                        aegis_core::domain::execution::ExecutionStatus::Completed => {
+                        aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
                             let result = execution.iterations().last().and_then(|i| i.output.clone()).unwrap_or_default();
                             let exec_end = serde_json::json!({
                                 "event_type": "ExecutionCompleted",
@@ -1539,7 +1539,7 @@ async fn stream_agent_events_handler(
                             });
                             yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
                         },
-                        aegis_core::domain::execution::ExecutionStatus::Failed => {
+                        aegis_orchestrator_core::domain::execution::ExecutionStatus::Failed => {
                             let reason = execution.error.clone().unwrap_or_else(|| "Execution failed".to_string());
                             let exec_fail = serde_json::json!({
                                 "event_type": "ExecutionFailed",
@@ -1559,11 +1559,11 @@ async fn stream_agent_events_handler(
         // 4. Stream new events if following
         if follow {
             while let Ok(event) = receiver.recv().await {
-                use aegis_core::infrastructure::event_bus::DomainEvent;
+                use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
                 let json = match event {
                             DomainEvent::Execution(exec_event) => {
                                 match exec_event {
-                                    aegis_core::domain::events::ExecutionEvent::ExecutionStarted { execution_id, agent_id, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionStarted { execution_id, agent_id, .. } => {
                                         serde_json::json!({
                                             "event_type": "ExecutionStarted",
                                             "execution_id": execution_id.0,
@@ -1572,7 +1572,7 @@ async fn stream_agent_events_handler(
                                             "data": {}
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::IterationStarted { execution_id, iteration_number, action, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::IterationStarted { execution_id, iteration_number, action, .. } => {
                                         serde_json::json!({
                                             "event_type": "IterationStarted",
                                             "execution_id": execution_id.0,
@@ -1582,7 +1582,7 @@ async fn stream_agent_events_handler(
                                             "data": { "action": action }
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::IterationCompleted { execution_id, iteration_number, output, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::IterationCompleted { execution_id, iteration_number, output, .. } => {
                                         serde_json::json!({
                                             "event_type": "IterationCompleted",
                                             "execution_id": execution_id.0,
@@ -1591,7 +1591,7 @@ async fn stream_agent_events_handler(
                                             "data": { "output": output }
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { execution_id, final_output, total_iterations, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted { execution_id, final_output, total_iterations, .. } => {
                                         serde_json::json!({
                                             "event_type": "ExecutionCompleted",
                                             "execution_id": execution_id.0,
@@ -1600,7 +1600,7 @@ async fn stream_agent_events_handler(
                                             "data": { "result": final_output }
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::ExecutionFailed { execution_id, reason, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { execution_id, reason, .. } => {
                                         serde_json::json!({
                                             "event_type": "ExecutionFailed",
                                             "execution_id": execution_id.0,
@@ -1609,7 +1609,7 @@ async fn stream_agent_events_handler(
                                             "data": { "error": reason }
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::ConsoleOutput { execution_id, stream, content, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ConsoleOutput { execution_id, stream, content, .. } => {
                                         serde_json::json!({
                                             "event_type": "ConsoleOutput",
                                             "execution_id": execution_id.0,
@@ -1618,7 +1618,7 @@ async fn stream_agent_events_handler(
                                             "data": { "output": content }
                                         })
                                     },
-                                    aegis_core::domain::events::ExecutionEvent::LlmInteraction { execution_id, provider, model, prompt, response, .. } => {
+                                    aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction { execution_id, provider, model, prompt, response, .. } => {
                                         serde_json::json!({
                                             "event_type": "LlmInteraction",
                                             "execution_id": execution_id.0,
@@ -1781,11 +1781,11 @@ async fn llm_generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LlmGenerateRequest>,
 ) -> impl IntoResponse {
-    use aegis_core::application::inner_loop_service::{ConversationMessage, InnerLoopRequest};
+    use aegis_orchestrator_core::application::inner_loop_service::{ConversationMessage, InnerLoopRequest};
 
     // Resolve agent_id for event logging and inner loop request
     let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
-        let execution_id = aegis_core::domain::execution::ExecutionId(exec_id);
+        let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
         if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
             let id = exec.agent_id;
             let s = id.0.to_string();
@@ -1793,13 +1793,13 @@ async fn llm_generate_handler(
         } else {
             tracing::warn!("Could not find execution {} for LLM event", exec_id);
             (
-                aegis_core::domain::agent::AgentId(Uuid::nil()),
+                aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
                 Uuid::nil().to_string(),
             )
         }
     } else {
         (
-            aegis_core::domain::agent::AgentId(Uuid::nil()),
+            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
             Uuid::nil().to_string(),
         )
     };
@@ -1829,8 +1829,8 @@ async fn llm_generate_handler(
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
                 if let Some(exec_id) = req.execution_id {
-                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
-                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                    let event = aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
+                        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
                         agent_id,
                         iteration_number: req.iteration_number.unwrap_or(0),
                         provider: "orchestrator".to_string(),
@@ -1843,7 +1843,7 @@ async fn llm_generate_handler(
                     };
                     state.event_bus.publish_execution_event(event);
 
-                    let interaction = aegis_core::domain::execution::LlmInteraction {
+                    let interaction = aegis_orchestrator_core::domain::execution::LlmInteraction {
                         provider: "orchestrator".to_string(),
                         model: model_alias.clone(),
                         prompt: req.prompt.clone(),
@@ -1853,7 +1853,7 @@ async fn llm_generate_handler(
                     let _ = state
                         .execution_service
                         .record_llm_interaction(
-                            aegis_core::domain::execution::ExecutionId(exec_id),
+                            aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
                             req.iteration_number.unwrap_or(0),
                             interaction,
                         )
@@ -1907,7 +1907,7 @@ async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    use aegis_core::infrastructure::workflow_parser::WorkflowParser;
+    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 
     match state.workflow_repo.find_by_name(&name).await {
         Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {
@@ -2188,7 +2188,7 @@ async fn attest_smcp_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
-    let internal_req = aegis_core::infrastructure::smcp::attestation::AttestationRequest {
+    let internal_req = aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
         agent_id: request.agent_id.clone(),
         execution_id: request
             .execution_id
@@ -2228,7 +2228,7 @@ async fn invoke_smcp_handler(
 ) -> impl IntoResponse {
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
 
-    let envelope = aegis_core::infrastructure::smcp::envelope::SmcpEnvelope {
+    let envelope = aegis_orchestrator_core::infrastructure::smcp::envelope::SmcpEnvelope {
         security_token: request.security_token,
         signature: request.signature,
         inner_mcp: payload_bytes,

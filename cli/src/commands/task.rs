@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tracing::info;
 use uuid::Uuid;
 
-use aegis_core::domain::{agent::AgentId, execution::ExecutionId};
+use aegis_orchestrator_core::domain::{agent::AgentId, execution::ExecutionId};
 
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
 use crate::embedded::EmbeddedExecutor;
@@ -209,7 +209,7 @@ async fn execute_daemon(
                 let manifest_content = std::fs::read_to_string(&manifest_path)
                     .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
 
-                let agent_manifest: aegis_sdk::AgentManifest =
+                let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
                     serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
 
                 // Deploy (will fail if name exists, so user sees error, which is good)
@@ -327,7 +327,7 @@ async fn execute_embedded(
             let manifest_path = PathBuf::from(&agent);
             if manifest_path.exists() {
                 let manifest_content = std::fs::read_to_string(&manifest_path)?;
-                let agent_manifest: aegis_sdk::AgentManifest =
+                let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
                     serde_yaml::from_str(&manifest_content)?;
                 executor.deploy_agent(agent_manifest).await?
             } else {

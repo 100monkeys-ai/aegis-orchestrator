@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
-use aegis_sdk::AgentManifest;
+use aegis_orchestrator_sdk::AgentManifest;
 
 #[derive(Debug, Clone)]
 pub struct DaemonClient {

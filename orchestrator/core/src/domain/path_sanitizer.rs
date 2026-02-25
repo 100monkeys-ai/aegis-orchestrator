@@ -68,7 +68,7 @@ impl PathSanitizer {
     ///
     /// # Examples
     /// ```
-    /// use aegis_core::domain::path_sanitizer::PathSanitizer;
+    /// use aegis_orchestrator_core::domain::path_sanitizer::PathSanitizer;
     /// use std::path::PathBuf;
     ///
     /// let sanitizer = PathSanitizer::new();

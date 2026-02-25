@@ -214,7 +214,7 @@ The `convert_domain_event_to_proto()` function maps domain events to protobuf:
 ## Starting the Server
 
 ```rust
-use aegis_core::presentation::grpc::server::start_grpc_server;
+use aegis_orchestrator_core::presentation::grpc::server::start_grpc_server;
 
 let addr = "0.0.0.0:50051".parse()?;
 start_grpc_server(

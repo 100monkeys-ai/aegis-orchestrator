@@ -33,7 +33,7 @@
 //! Requires `spec.database.url` to be set in `aegis-config.yaml`.
 //! The URL supports `env:VAR_NAME` syntax for environment-based resolution.
 
-use aegis_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
 use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;

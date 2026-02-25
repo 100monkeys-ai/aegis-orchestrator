@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use aegis_core::{
+use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService, execution::ExecutionService,
         execution::StandardExecutionService, lifecycle::StandardAgentLifecycleService,
@@ -25,7 +25,7 @@ use aegis_core::{
     },
     infrastructure::{event_bus::EventBus, llm::registry::ProviderRegistry},
 };
-use aegis_sdk::AgentManifest;
+use aegis_orchestrator_sdk::AgentManifest;
 
 pub struct EmbeddedExecutor {
     agent_service: Arc<StandardAgentLifecycleService>,
@@ -49,7 +49,7 @@ impl EmbeddedExecutor {
     }
 
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
-        let core_manifest: aegis_core::domain::agent::AgentManifest =
+        let core_manifest: aegis_orchestrator_core::domain::agent::AgentManifest =
             serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
         self.agent_service.deploy_agent(core_manifest).await
     }
@@ -151,7 +151,7 @@ pub struct ExecutionInfo {
     pub status: String,
 }
 
-use aegis_core::domain::execution::Execution;
+use aegis_orchestrator_core::domain::execution::Execution;
 
 impl From<Execution> for ExecutionInfo {
     fn from(exec: Execution) -> Self {
@@ -163,16 +163,16 @@ impl From<Execution> for ExecutionInfo {
     }
 }
 
-use aegis_core::infrastructure::event_bus::DomainEvent;
+use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
 
 fn is_error_event(event: &DomainEvent) -> bool {
     matches!(
         event,
         DomainEvent::Execution(
-            aegis_core::domain::events::ExecutionEvent::IterationFailed { .. }
-                | aegis_core::domain::events::ExecutionEvent::ExecutionFailed { .. }
+            aegis_orchestrator_core::domain::events::ExecutionEvent::IterationFailed { .. }
+                | aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { .. }
         ) | DomainEvent::Policy(
-            aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted { .. }
+            aegis_orchestrator_core::domain::events::PolicyEvent::PolicyViolationAttempted { .. }
         )
     )
 }
@@ -181,9 +181,9 @@ fn is_terminal_event(event: &DomainEvent) -> bool {
     matches!(
         event,
         DomainEvent::Execution(
-            aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { .. }
-                | aegis_core::domain::events::ExecutionEvent::ExecutionFailed { .. }
-                | aegis_core::domain::events::ExecutionEvent::ExecutionCancelled { .. }
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted { .. }
+                | aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { .. }
+                | aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCancelled { .. }
         )
     )
 }
@@ -193,10 +193,10 @@ fn print_event(event: &DomainEvent, verbose: bool) {
 
     match event {
         DomainEvent::Execution(exec_event) => match exec_event {
-            aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
                 println!("{}", "Execution started".bold());
             }
-            aegis_core::domain::events::ExecutionEvent::IterationStarted {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::IterationStarted {
                 iteration_number,
                 action,
                 ..
@@ -207,7 +207,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     println!("{} {}", "Iteration".yellow(), iteration_number,);
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::IterationCompleted {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::IterationCompleted {
                 iteration_number,
                 output,
                 ..
@@ -229,7 +229,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     );
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::IterationFailed {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::IterationFailed {
                 iteration_number,
                 error,
                 ..
@@ -242,7 +242,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     error
                 );
             }
-            aegis_core::domain::events::ExecutionEvent::RefinementApplied {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::RefinementApplied {
                 iteration_number,
                 ..
             } => {
@@ -253,7 +253,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     "refinement applied".cyan()
                 );
             }
-            aegis_core::domain::events::ExecutionEvent::ExecutionCompleted {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted {
                 total_iterations,
                 final_output,
                 ..
@@ -273,13 +273,13 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     );
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
                 println!("{} - {}", "Execution failed".bold().red(), reason);
             }
-            aegis_core::domain::events::ExecutionEvent::ExecutionCancelled { .. } => {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCancelled { .. } => {
                 println!("{}", "Execution cancelled".bold().yellow());
             }
-            aegis_core::domain::events::ExecutionEvent::ConsoleOutput {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ConsoleOutput {
                 stream, content, ..
             } => {
                 if verbose {
@@ -291,7 +291,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     println!("{} {}", prefix, content.trim_end());
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
                 model,
                 prompt,
                 response,
@@ -308,7 +308,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     println!("{} [{}]", "LLM".purple(), model);
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::InstanceSpawned {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::InstanceSpawned {
                 iteration_number,
                 instance_id,
                 ..
@@ -321,7 +321,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     instance_id.as_str().chars().take(12).collect::<String>()
                 );
             }
-            aegis_core::domain::events::ExecutionEvent::InstanceTerminated {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::InstanceTerminated {
                 iteration_number,
                 instance_id,
                 ..
@@ -334,8 +334,8 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     instance_id.as_str().chars().take(12).collect::<String>()
                 );
             }
-            aegis_core::domain::events::ExecutionEvent::Validation(val_event) => match val_event {
-                aegis_core::domain::events::ValidationEvent::GradientValidationPerformed {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::Validation(val_event) => match val_event {
+                aegis_orchestrator_core::domain::events::ValidationEvent::GradientValidationPerformed {
                     score,
                     confidence,
                     ..
@@ -348,7 +348,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                         confidence
                     );
                 }
-                aegis_core::domain::events::ValidationEvent::MultiJudgeConsensus {
+                aegis_orchestrator_core::domain::events::ValidationEvent::MultiJudgeConsensus {
                     final_score,
                     confidence,
                     ..
@@ -362,7 +362,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     );
                 }
             },
-            aegis_core::domain::events::ExecutionEvent::ExecutionTimedOut {
+            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionTimedOut {
                 timeout_seconds,
                 total_iterations,
                 ..
@@ -376,7 +376,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
             }
         },
         DomainEvent::Policy(policy_event) => match policy_event {
-            aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted {
+            aegis_orchestrator_core::domain::events::PolicyEvent::PolicyViolationAttempted {
                 violation_type,
                 details,
                 ..
@@ -388,7 +388,7 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     details
                 );
             }
-            aegis_core::domain::events::PolicyEvent::PolicyViolationBlocked {
+            aegis_orchestrator_core::domain::events::PolicyEvent::PolicyViolationBlocked {
                 violation_type,
                 ..
             } => {

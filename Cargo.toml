@@ -8,10 +8,10 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-pre-alpha"
 edition = "2021"
 rust-version = "1.75"
-authors = ["AEGIS Core Team"]
+authors = ["100monkeys AI, Inc."]
 license = "AGPL-3.0"
 repository = "https://github.com/100monkeys-ai/aegis-orchestrator"
 

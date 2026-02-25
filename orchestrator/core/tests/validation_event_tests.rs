@@ -9,14 +9,14 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements validation event tests
 
-use aegis_core::application::execution::ExecutionService;
-use aegis_core::application::validation_service::ValidationService;
-use aegis_core::domain::agent::AgentId;
-use aegis_core::domain::events::{ExecutionEvent, ValidationEvent};
-use aegis_core::domain::execution::{
+use aegis_orchestrator_core::application::execution::ExecutionService;
+use aegis_orchestrator_core::application::validation_service::ValidationService;
+use aegis_orchestrator_core::domain::agent::AgentId;
+use aegis_orchestrator_core::domain::events::{ExecutionEvent, ValidationEvent};
+use aegis_orchestrator_core::domain::execution::{
     Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction,
 };
-use aegis_core::infrastructure::event_bus::{DomainEvent, EventBus};
+use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
@@ -77,7 +77,7 @@ impl ExecutionService for MockExecutionService {
 "#;
         let iteration = Iteration {
             number: 1,
-            status: aegis_core::domain::execution::IterationStatus::Success,
+            status: aegis_orchestrator_core::domain::execution::IterationStatus::Success,
             action: "validate".to_string(),
             output: Some(output.to_string()),
             validation_results: None,
@@ -149,7 +149,7 @@ async fn test_validation_event_streaming() {
     let execution_id = ExecutionId::new();
     let mut receiver = event_bus.subscribe_execution(execution_id);
 
-    let request = aegis_core::domain::validation::ValidationRequest {
+    let request = aegis_orchestrator_core::domain::validation::ValidationRequest {
         content: "fn test() {}".to_string(),
         criteria: "valid rust".to_string(),
         context: None,

@@ -92,7 +92,7 @@ impl NetworkPolicy {
     /// # Examples
     ///
     /// ```
-    /// # use aegis_core::domain::policy::{NetworkPolicy, PolicyMode};
+    /// # use aegis_orchestrator_core::domain::policy::{NetworkPolicy, PolicyMode};
     /// let p = NetworkPolicy::new(PolicyMode::Allow, vec!["api.github.com".into(), "*.openai.com".into()]);
     /// assert!(p.allows("api.github.com"));
     /// assert!(p.allows("api.openai.com"));

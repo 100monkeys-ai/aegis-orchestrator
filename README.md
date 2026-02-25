@@ -180,10 +180,10 @@ RUST_LOG=debug cargo run -p aegis-orchestrator -- daemon start
 cargo run -p aegis-orchestrator -- task execute my-agent --input "test"
 
 # You'll see in the orchestrator logs:
-# DEBUG aegis_core::infrastructure::runtime: Starting bootstrap.py execution container_id="abc123"
-# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "Attempting to connect to Orchestrator at http://host.docker.internal:8088..."
-# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Bootstrap starting - execution_id=xxx, iteration=1"
-# DEBUG aegis_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Received prompt (1234 chars)"
+# DEBUG aegis_orchestrator_core::infrastructure::runtime: Starting bootstrap.py execution container_id="abc123"
+# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "Attempting to connect to Orchestrator at http://host.docker.internal:8088..."
+# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Bootstrap starting - execution_id=xxx, iteration=1"
+# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Received prompt (1234 chars)"
 ```
 
 **Troubleshooting Bootstrap Issues:**

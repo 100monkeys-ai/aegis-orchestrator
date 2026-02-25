@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::daemon::{check_daemon_running, stop_daemon, DaemonStatus};
-use aegis_core::domain::node_config::NodeConfigManifest;
+use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]
 pub enum DaemonCommand {

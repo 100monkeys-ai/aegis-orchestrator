@@ -113,8 +113,8 @@ impl RuntimeConfig {
     /// # Examples
     ///
     /// ```
-    /// # use aegis_core::domain::runtime::{RuntimeConfig, ResourceLimits};
-    /// # use aegis_core::domain::agent::ExecutionStrategy;
+    /// # use aegis_orchestrator_core::domain::runtime::{RuntimeConfig, ResourceLimits};
+    /// # use aegis_orchestrator_core::domain::agent::ExecutionStrategy;
     /// # use std::collections::HashMap;
     /// let cfg = RuntimeConfig {
     ///     language: "python".to_string(),

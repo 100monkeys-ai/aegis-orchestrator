@@ -10,7 +10,7 @@
 //!
 //! See AGENTS.md §Swarm Coordination Context.
 
-use aegis_core::domain::agent::AgentId;
+use aegis_orchestrator_core::domain::agent::AgentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # `aegis-sdk` — Rust SDK for AEGIS Agent Development (BC-10)
+//! # `aegis-orchestrator-sdk` — Rust SDK for AEGIS Agent Development (BC-10)
 //!
 //! Provides a fluent, type-safe API for declaring agent manifests, submitting
 //! executions, and watching iteration progress from Rust applications.
@@ -14,8 +14,8 @@
 //!
 //! ## Manifest Re-exports
 //!
-//! The SDK re-exports all manifest types directly from `aegis-core` so that
-//! SDK consumers have a single import path (e.g. `aegis_sdk::AgentManifest`)
+//! The SDK re-exports all manifest types directly from `aegis-orchestrator-core` so that
+//! SDK consumers have a single import path (e.g. `aegis_orchestrator_sdk::AgentManifest`)
 //! and always stay in sync with the orchestrator's canonical type definitions.
 //!
 //! See AGENTS.md §BC-10 Client SDK Context.
@@ -27,7 +27,7 @@ pub mod client;
 pub mod types;
 
 // Re-export core domain types for manifest (single source of truth)
-pub use aegis_core::domain::agent::{
+pub use aegis_orchestrator_core::domain::agent::{
     AdvancedConfig, AgentManifest, AgentSpec, ContextItem, DeliveryConfig, DeliveryDestination,
     ExecutionStrategy, FallbackBehavior, FilesystemPolicy, ManifestMetadata, NetworkPolicy,
     OutputValidation, ResourceLimits, RuntimeConfig, ScriptValidation, SecurityConfig,

@@ -1,0 +1,74 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 100monkeys.ai
+
+name: Verify Documentation
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'orchestrator/**'
+      - 'sdks/**'
+      - 'cli/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+  pull_request:
+    paths:
+      - 'orchestrator/**'
+      - 'sdks/**'
+      - 'cli/**'
+      - 'Cargo.toml'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTDOCFLAGS: "--cfg docsrs -D warnings"
+
+permissions:
+  contents: read
+
+jobs:
+  verify-docs:
+    name: Verify Documentation Builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build documentation
+        run: |
+          cargo doc \
+            --workspace \
+            --locked \
+            --no-deps \
+            --document-private-items \
+            -p aegis-orchestrator-core \
+            -p aegis-orchestrator-swarm \
+            -p aegis-orchestrator-sdk \
+            -p aegis-orchestrator
+
+      - name: Verify documentation
+        run: |
+          echo "✅ Documentation built successfully"
+          echo ""
+          echo "📚 When you publish releases, docs.rs will automatically:"
+          echo "  - Build documentation for all packages"
+          echo "  - Publish at: https://docs.rs/aegis-orchestrator"
+          echo ""
+          echo "Available packages:"
+          echo "  - aegis-orchestrator-core"
+          echo "  - aegis-orchestrator-swarm"
+          echo "  - aegis-orchestrator-sdk"
+          echo "  - aegis-orchestrator"

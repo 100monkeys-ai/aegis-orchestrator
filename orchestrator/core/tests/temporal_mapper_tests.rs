@@ -9,8 +9,8 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements temporal mapper tests
 
-use aegis_core::application::temporal_mapper::TemporalWorkflowMapper;
-use aegis_core::domain::workflow::*;
+use aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowMapper;
+use aegis_orchestrator_core::domain::workflow::*;
 use std::collections::HashMap;
 
 #[test]

@@ -16,19 +16,19 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements internal responsibilities for nfs gateway integration tests
 
-use aegis_core::application::nfs_gateway::{EventBusPublisher, NfsGatewayService};
-use aegis_core::domain::events::StorageEvent;
-use aegis_core::domain::execution::ExecutionId;
-use aegis_core::domain::fsal::{AegisFSAL, EventPublisher, FsalError};
-use aegis_core::domain::policy::FilesystemPolicy;
-use aegis_core::domain::repository::{RepositoryError, VolumeRepository};
-use aegis_core::domain::storage::{
+use aegis_orchestrator_core::application::nfs_gateway::{EventBusPublisher, NfsGatewayService};
+use aegis_orchestrator_core::domain::events::StorageEvent;
+use aegis_orchestrator_core::domain::execution::ExecutionId;
+use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher, FsalError};
+use aegis_orchestrator_core::domain::policy::FilesystemPolicy;
+use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
+use aegis_orchestrator_core::domain::storage::{
     DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
 };
-use aegis_core::domain::volume::{
+use aegis_orchestrator_core::domain::volume::{
     FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeOwnership,
 };
-use aegis_core::infrastructure::event_bus::{DomainEvent, EventBus};
+use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
 use std::sync::Arc;
@@ -262,7 +262,7 @@ async fn test_fsal_mode_validation() {
     };
 
     let path = "/workspace/test.txt";
-    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
+    let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
     // Test: Read from allowed file (should succeed)
     let read_result = fsal.read(&handle, path, &policy, 0, 100).await;
@@ -298,7 +298,7 @@ async fn test_fsal_path_traversal_prevention() {
     };
 
     // Test: Attempt path traversal attack
-    let handle = aegis_core::domain::fsal::AegisFileHandle::new(
+    let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
         execution_id,
         volume_id,
         "/workspace/../etc/passwd",
@@ -342,7 +342,7 @@ async fn test_fsal_policy_enforcement() {
     };
 
     // Test: Attempt to write outside allowlist
-    let handle1 = aegis_core::domain::fsal::AegisFileHandle::new(
+    let handle1 = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
         execution_id,
         volume_id,
         "/workspace/config.yaml",
@@ -364,7 +364,7 @@ async fn test_fsal_policy_enforcement() {
     }
 
     // Test: Open file within allowlist
-    let handle2 = aegis_core::domain::fsal::AegisFileHandle::new(
+    let handle2 = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
         execution_id,
         volume_id,
         "/workspace/data/file.txt",
@@ -452,7 +452,7 @@ async fn test_fsal_quota_enforcement() {
 
     // Open file for writing
     let path = "/workspace/large_file.txt";
-    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
+    let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
     // MockStorageProvider.get_usage() returns 5120 bytes (5KB)
     // Volume quota is 1024 bytes (1KB)

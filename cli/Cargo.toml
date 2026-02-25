@@ -1,8 +1,12 @@
 [package]
 name = "aegis-orchestrator"
-version = "0.1.0-pre-alpha"
-edition = "2021"
-license = "AGPL-3.0"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "100monkeys.ai AEGIS orchestrator CLI and daemon"
 
 [lib]
 name = "aegis_orchestrator"
@@ -45,8 +49,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Internal [dependencies]
-aegis-core = { path = "../orchestrator/core" }
-aegis-sdk = { path = "../sdks" }
+aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.1.0-pre-alpha" }
+aegis-orchestrator-sdk = { path = "../sdks", version = "0.1.0-pre-alpha" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
 
@@ -54,3 +58,8 @@ base64 = "0.22.1"
 [target.'cfg(unix)'.dependencies]
 daemonize = "0.5"
 libc = "0.2"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = ["x86_64-unknown-linux-gnu"]
