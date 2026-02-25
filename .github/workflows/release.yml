@@ -1,0 +1,206 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026 100monkeys.ai
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag (e.g., v0.1.0)'
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: aegis
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux x86_64
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo build --release --bin aegis --locked
+          
+      - name: Create tarball
+        run: |
+          cd target/release
+          tar -czf aegis-linux-x86_64.tar.gz aegis
+          cd ../..
+          mv target/release/aegis-linux-x86_64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-linux-x86_64
+          path: aegis-linux-x86_64.tar.gz
+          retention-days: 1
+
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install protobuf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo build --release --bin aegis --locked --target aarch64-apple-darwin
+          
+      - name: Create tarball
+        run: |
+          cd target/aarch64-apple-darwin/release
+          tar -czf aegis-macos-aarch64.tar.gz aegis
+          cd ../../..
+          mv target/aarch64-apple-darwin/release/aegis-macos-aarch64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-macos-aarch64
+          path: aegis-macos-aarch64.tar.gz
+          retention-days: 1
+
+  build-macos-intel:
+    name: Build macOS (Intel)
+    runs-on: macos-13  # Intel runner
+    
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install protobuf
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: |
+          cargo build --release --bin aegis --locked --target x86_64-apple-darwin
+          
+      - name: Create tarball
+        run: |
+          cd target/x86_64-apple-darwin/release
+          tar -czf aegis-macos-x86_64.tar.gz aegis
+          cd ../../..
+          mv target/x86_64-apple-darwin/release/aegis-macos-x86_64.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegis-macos-x86_64
+          path: aegis-macos-x86_64.tar.gz
+          retention-days: 1
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-linux, build-macos, build-macos-intel]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Display structure
+        run: ls -R artifacts
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "VERSION=${{ inputs.version }}" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=false" >> $GITHUB_OUTPUT
+          else
+            # Main branch push - create pre-release with commit SHA
+            SHORT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+            VERSION="v0.0.0-main.${SHORT_SHA}"
+            echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+            echo "IS_PRERELEASE=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            cd "$dir"
+            for file in *.tar.gz; do
+              sha256sum "$file" > "$file.sha256"
+            done
+            cd ..
+          done
+          cd ..
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.VERSION }}
+          name: AEGIS ${{ steps.version.outputs.VERSION }}
+          draft: false
+          prerelease: ${{ steps.version.outputs.IS_PRERELEASE }}
+          generate_release_notes: true
+          files: |
+            artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz
+            artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz.sha256
+            artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz
+            artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz.sha256
+            artifacts/aegis-macos-x86_64/aegis-macos-x86_64.tar.gz
+            artifacts/aegis-macos-x86_64/aegis-macos-x86_64.tar.gz.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
