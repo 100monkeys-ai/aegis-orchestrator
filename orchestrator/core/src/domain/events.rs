@@ -234,6 +234,16 @@ pub enum ExecutionEvent {
         reason: Option<String>,
         cancelled_at: DateTime<Utc>,
     },
+    /// The execution exceeded its wall-clock timeout and was forcibly terminated.
+    /// Published by [`crate::application::execution::StandardExecutionService`]
+    /// when `tokio::time::timeout` fires around the Supervisor loop.
+    ExecutionTimedOut {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        timeout_seconds: u64,
+        total_iterations: u8,
+        timed_out_at: DateTime<Utc>,
+    },
     ConsoleOutput {
         execution_id: ExecutionId,
         agent_id: AgentId,

@@ -509,6 +509,28 @@ pub struct ResourceLimits {
 }
 
 impl ResourceLimits {
+    /// Parse the `timeout` field (e.g., "60s", "5m", "1h") to seconds.
+    ///
+    /// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours).
+    /// Bare integers are treated as seconds.
+    /// Returns `None` if `timeout` is unset or cannot be parsed.
+    pub fn parse_timeout_seconds(&self) -> Option<u64> {
+        let raw = self.timeout.as_deref()?;
+        let raw = raw.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        if raw.ends_with('h') {
+            raw.trim_end_matches('h').trim().parse::<u64>().ok().map(|v| v * 3600)
+        } else if raw.ends_with('m') {
+            raw.trim_end_matches('m').trim().parse::<u64>().ok().map(|v| v * 60)
+        } else if raw.ends_with('s') {
+            raw.trim_end_matches('s').trim().parse::<u64>().ok()
+        } else {
+            raw.parse::<u64>().ok()
+        }
+    }
+
     /// Parse memory/disk string (e.g., "512Mi", "1Gi") to bytes
     /// Returns None if parsing fails
     pub fn parse_size_to_bytes(size_str: &str) -> Option<u64> {

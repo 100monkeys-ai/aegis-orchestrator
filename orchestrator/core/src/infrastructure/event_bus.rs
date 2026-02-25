@@ -257,6 +257,7 @@ impl ExecutionEventReceiver {
             ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::InstanceSpawned { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::InstanceTerminated { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::ExecutionTimedOut { execution_id, .. } => execution_id == &self.execution_id,
             ExecutionEvent::Validation(e) => match e {
                 ValidationEvent::GradientValidationPerformed { execution_id, .. } => execution_id == &self.execution_id,
                 ValidationEvent::MultiJudgeConsensus { execution_id, .. } => execution_id == &self.execution_id,
@@ -313,6 +314,7 @@ impl AgentEventReceiver {
                 ExecutionEvent::LlmInteraction { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ExecutionTimedOut { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::Validation(v) => match v {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. } => agent_id == &self.agent_id,
                     ValidationEvent::MultiJudgeConsensus { agent_id, .. } => agent_id == &self.agent_id,
