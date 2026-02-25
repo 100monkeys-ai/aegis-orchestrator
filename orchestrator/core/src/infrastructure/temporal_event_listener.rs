@@ -15,7 +15,7 @@
 //!
 //! # Event Flow
 //!
-//! ```
+//! ```text
 //! Temporal Worker (TypeScript)
 //!   |
 //!   | HTTP POST /temporal-events

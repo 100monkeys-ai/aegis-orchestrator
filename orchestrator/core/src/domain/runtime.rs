@@ -106,8 +106,24 @@ impl RuntimeConfig {
     /// # Examples
     ///
     /// ```
-    /// # use aegis_core::domain::runtime::RuntimeConfig;
-    /// let cfg = RuntimeConfig { language: "python".to_string(), version: "3.12".to_string(), ..Default::default() };
+    /// # use aegis_core::domain::runtime::{RuntimeConfig, ResourceLimits};
+    /// # use std::collections::HashMap;
+    /// let cfg = RuntimeConfig {
+    ///     language: "python".to_string(),
+    ///     version: "3.12".to_string(),
+    ///     isolation: "docker".to_string(),
+    ///     env: HashMap::new(),
+    ///     autopull: false,
+    ///     resources: ResourceLimits {
+    ///         cpu_millis: None,
+    ///         memory_bytes: None,
+    ///         disk_bytes: None,
+    ///         timeout_seconds: None,
+    ///     },
+    ///     volumes: vec![],
+    ///     container_uid: 1000,
+    ///     container_gid: 1000,
+    /// };
     /// assert_eq!(cfg.to_image(), "python:3.12");
     /// ```
     pub fn to_image(&self) -> String {

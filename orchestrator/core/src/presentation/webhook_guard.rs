@@ -9,9 +9,15 @@
 //! ## Usage
 //!
 //! ```rust,no_run
+//! use aegis_core::presentation::webhook_guard::WebhookHmacGuard;
+//! use axum::response::IntoResponse;
+//!
 //! async fn my_handler(
 //!     WebhookHmacGuard { source, body }: WebhookHmacGuard,
-//! ) -> impl IntoResponse { ... }
+//! ) -> impl IntoResponse {
+//!     // Process webhook payload
+//!     format!("Received webhook from {}", source)
+//! }
 //! ```
 //!
 //! The handler receives the verified raw body bytes. If verification fails,
