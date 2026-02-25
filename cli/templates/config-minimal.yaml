@@ -27,15 +27,18 @@ spec:
     - name: "local"
       type: "ollama"
       endpoint: "http://localhost:11434"
+      enabled: true
       models:
         - alias: "default"
           model: "llama3.2:latest"
           capabilities: ["code", "reasoning"]
           context_window: 8192
+          cost_per_1k_tokens: 0.0
         - alias: "fast"
           model: "qwen2.5-coder:7b"
           capabilities: ["code"]
           context_window: 4096
+          cost_per_1k_tokens: 0.0
 
   llm_selection:
     strategy: "prefer-local"

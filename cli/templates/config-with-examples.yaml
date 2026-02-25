@@ -61,6 +61,7 @@ spec:
     - name: "local"
       type: "ollama"
       endpoint: "http://localhost:11434"
+      enabled: true              # Provider is active (default: true)
       # No API key required for Ollama
       models:
         - alias: "default"
@@ -79,6 +80,7 @@ spec:
     - name: "openai"
       type: "openai"
       endpoint: "https://api.openai.com/v1"  # Default OpenAI endpoint
+      enabled: true
       api_key: "env:OPENAI_API_KEY"  # Read from environment variable
       models:
         - alias: "smart"
@@ -97,6 +99,7 @@ spec:
     - name: "anthropic"
       type: "anthropic"
       # Endpoint is implicit for Anthropic (https://api.anthropic.com/v1)
+      enabled: true
       api_key: "env:ANTHROPIC_API_KEY"
       models:
         - alias: "smart"

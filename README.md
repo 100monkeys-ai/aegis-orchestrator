@@ -105,20 +105,36 @@ cargo build --release -p aegis-cli
 Create or edit `aegis-config.yaml`:
 
 ```yaml
-node:
-  id: "my-node-001"
-  type: "edge"
+apiVersion: 100monkeys.ai/v1
+kind: NodeConfig
+
+metadata:
   name: "my-aegis-node"
 
-llm_providers:
-  - name: "local"
-    type: "ollama"
-    endpoint: "http://localhost:11434"
-    models:
-      - alias: "default"
-        model: "phi3:mini"
-        capabilities: ["code", "reasoning"]
-        context_window: 4096
+spec:
+  node:
+    id: "my-node-001"
+    type: "edge"
+
+  llm_providers:
+    - name: "local"
+      type: "ollama"
+      endpoint: "http://localhost:11434"
+      enabled: true
+      models:
+        - alias: "default"
+          model: "phi3:mini"
+          capabilities: ["code", "reasoning"]
+          context_window: 4096
+          cost_per_1k_tokens: 0.0
+
+  llm_selection:
+    strategy: "prefer-local"
+    default_provider: "local"
+
+  observability:
+    logging:
+      level: "info"
 ```
 
 See [aegis-config.yaml](aegis-config.yaml) for a complete example.
