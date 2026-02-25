@@ -310,20 +310,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     // Reuse existing pool for volume repository (avoid redundant connection)
-    let volume_repo: Arc<dyn aegis_orchestrator_core::domain::repository::VolumeRepository> = if let Some(pool) =
-        pool.as_ref()
-    {
-        Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
-    } else {
-        println!("WARNING: Volume persistence disabled (no database pool available)");
-        return Err(anyhow::anyhow!(
-            "Database connection required for volume management"
-        ));
-    };
+    let volume_repo: Arc<dyn aegis_orchestrator_core::domain::repository::VolumeRepository> =
+        if let Some(pool) = pool.as_ref() {
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
+        } else {
+            println!("WARNING: Volume persistence disabled (no database pool available)");
+            return Err(anyhow::anyhow!(
+                "Database connection required for volume management"
+            ));
+        };
 
-    let storage_provider: Arc<dyn aegis_orchestrator_core::domain::storage::StorageProvider> = Arc::new(
-        aegis_orchestrator_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()),
-    );
+    let storage_provider: Arc<dyn aegis_orchestrator_core::domain::storage::StorageProvider> =
+        Arc::new(
+            aegis_orchestrator_core::infrastructure::storage::SeaweedFSAdapter::new(
+                filer_url.clone(),
+            ),
+        );
 
     let volume_service = Arc::new(
         aegis_orchestrator_core::application::volume_manager::StandardVolumeService::new(
@@ -362,15 +364,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
     println!("Initializing Storage Event Persister...");
-    let storage_event_repo: Arc<dyn aegis_orchestrator_core::domain::repository::StorageEventRepository> =
-        if let Some(pool) = pool.as_ref() {
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
-        } else {
-            println!("WARNING: Storage event persistence disabled (no database pool available)");
-            Arc::new(
+    let storage_event_repo: Arc<
+        dyn aegis_orchestrator_core::domain::repository::StorageEventRepository,
+    > = if let Some(pool) = pool.as_ref() {
+        Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+    } else {
+        println!("WARNING: Storage event persistence disabled (no database pool available)");
+        Arc::new(
                 aegis_orchestrator_core::infrastructure::repositories::InMemoryStorageEventRepository::new(),
             )
-        };
+    };
 
     let storage_event_persister = Arc::new(
         aegis_orchestrator_core::application::storage_event_persister::StorageEventPersister::new(
@@ -393,8 +396,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or(2049);
 
     // Wrap EventBus in EventBusPublisher adapter for FSAL
-    let event_publisher =
-        Arc::new(aegis_orchestrator_core::application::nfs_gateway::EventBusPublisher::new(event_bus.clone()));
+    let event_publisher = Arc::new(
+        aegis_orchestrator_core::application::nfs_gateway::EventBusPublisher::new(
+            event_bus.clone(),
+        ),
+    );
 
     let nfs_gateway = Arc::new(
         aegis_orchestrator_core::application::nfs_gateway::NfsGatewayService::new(
@@ -445,7 +451,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tokio::spawn(async move {
             loop {
                 match nfs_deregister_sub.recv().await {
-                    Ok(aegis_orchestrator_core::infrastructure::event_bus::DomainEvent::Volume(vol_event)) => {
+                    Ok(
+                        aegis_orchestrator_core::infrastructure::event_bus::DomainEvent::Volume(
+                            vol_event,
+                        ),
+                    ) => {
                         let volume_id = match &vol_event {
                             aegis_orchestrator_core::domain::events::VolumeEvent::VolumeExpired {
                                 volume_id,
@@ -466,10 +476,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         }
                     }
                     Ok(_) => {} // Ignore non-volume events
-                    Err(aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Lagged(n)) => {
+                    Err(
+                        aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Lagged(
+                            n,
+                        ),
+                    ) => {
                         tracing::warn!("NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed", n);
                     }
-                    Err(aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Closed) => {
+                    Err(
+                        aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Closed,
+                    ) => {
                         tracing::info!(
                             "NFS deregistration listener: event bus closed, shutting down"
                         );
@@ -555,7 +571,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     // Create human input service
-    let human_input_service = Arc::new(aegis_orchestrator_core::infrastructure::HumanInputService::new());
+    let human_input_service =
+        Arc::new(aegis_orchestrator_core::infrastructure::HumanInputService::new());
 
     // Legacy WorkflowEngine removed as part of Temporal migration
 
@@ -635,16 +652,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         let mut servers_lock = tool_servers.write().await;
         for srv_cfg in mcp_configs {
             if srv_cfg.enabled {
-                let tool_server = aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
+                let tool_server =
+                    aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
                 servers_lock.insert(tool_server.id, tool_server);
             }
         }
     }
 
-    let tool_router = Arc::new(aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
-        tool_registry.clone(),
-        tool_servers.clone(),
-    ));
+    let tool_router = Arc::new(
+        aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
+            tool_registry.clone(),
+            tool_servers.clone(),
+        ),
+    );
 
     // Build initial capabilities index
     tool_router.rebuild_index().await;
@@ -736,26 +756,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     tokio::spawn({
         let sec_repo = security_context_repo.clone();
         async move {
-            let default_context = aegis_orchestrator_core::domain::security_context::SecurityContext {
-                name: "default".to_string(),
-                description: "Default unrestricted context for MVP testing".to_string(),
-                capabilities: vec![
-                    aegis_orchestrator_core::domain::security_context::capability::Capability {
-                        tool_pattern: "*".to_string(),
-                        path_allowlist: None,
-                        command_allowlist: None,
-                        domain_allowlist: None,
-                        rate_limit: None,
-                        max_response_size: None,
-                    },
-                ],
-                deny_list: vec![],
-                metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
-                    created_at: chrono::Utc::now(),
-                    updated_at: chrono::Utc::now(),
-                    version: 1,
-                },
-            };
+            let default_context =
+                aegis_orchestrator_core::domain::security_context::SecurityContext {
+                    name: "default".to_string(),
+                    description: "Default unrestricted context for MVP testing".to_string(),
+                    capabilities: vec![
+                        aegis_orchestrator_core::domain::security_context::capability::Capability {
+                            tool_pattern: "*".to_string(),
+                            path_allowlist: None,
+                            command_allowlist: None,
+                            domain_allowlist: None,
+                            rate_limit: None,
+                            max_response_size: None,
+                        },
+                    ],
+                    deny_list: vec![],
+                    metadata:
+                        aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
+                            created_at: chrono::Utc::now(),
+                            updated_at: chrono::Utc::now(),
+                            version: 1,
+                        },
+                };
             let _ = sec_repo.save(default_context).await;
         }
     });
@@ -768,29 +790,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .as_ref()
         .and_then(|c| c.grpc_url.as_ref())
         .and_then(|url| resolve_env_value(url).ok());
-    let cortex_client: Option<std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>> =
-        match cortex_grpc_url {
-            Some(url) => {
-                match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await {
-                    Ok(client) => {
-                        tracing::info!(url = %url, "Connected to Cortex gRPC service");
-                        Some(std::sync::Arc::new(client))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            url = %url,
-                            error = %e,
-                            "Failed to connect to Cortex gRPC service; running in memoryless mode"
-                        );
-                        None
-                    }
+    let cortex_client: Option<
+        std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>,
+    > = match cortex_grpc_url {
+        Some(url) => {
+            match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await
+            {
+                Ok(client) => {
+                    tracing::info!(url = %url, "Connected to Cortex gRPC service");
+                    Some(std::sync::Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        url = %url,
+                        error = %e,
+                        "Failed to connect to Cortex gRPC service; running in memoryless mode"
+                    );
+                    None
                 }
             }
-            None => {
-                tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
-                None
-            }
-        };
+        }
+        None => {
+            tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
+            None
+        }
+    };
 
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
@@ -1074,7 +1098,8 @@ struct AppState {
     agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
-    inner_loop_service: Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
+    inner_loop_service:
+        Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
     human_input_service: Arc<aegis_orchestrator_core::infrastructure::HumanInputService>,
     temporal_event_listener: Arc<TemporalEventListener>,
     register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
@@ -1087,7 +1112,8 @@ struct AppState {
     >,
     tool_invocation_service:
         Arc<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService>,
-    attestation_service: Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
+    attestation_service:
+        Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
@@ -1781,7 +1807,9 @@ async fn llm_generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LlmGenerateRequest>,
 ) -> impl IntoResponse {
-    use aegis_orchestrator_core::application::inner_loop_service::{ConversationMessage, InnerLoopRequest};
+    use aegis_orchestrator_core::application::inner_loop_service::{
+        ConversationMessage, InnerLoopRequest,
+    };
 
     // Resolve agent_id for event logging and inner loop request
     let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
@@ -1829,18 +1857,21 @@ async fn llm_generate_handler(
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
                 if let Some(exec_id) = req.execution_id {
-                    let event = aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
-                        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
-                        agent_id,
-                        iteration_number: req.iteration_number.unwrap_or(0),
-                        provider: "orchestrator".to_string(),
-                        model: model_alias.clone(),
-                        input_tokens: None,
-                        output_tokens: None,
-                        prompt: req.prompt.clone(),
-                        response: response.content.clone(),
-                        timestamp: chrono::Utc::now(),
-                    };
+                    let event =
+                        aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
+                            execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(
+                                exec_id,
+                            ),
+                            agent_id,
+                            iteration_number: req.iteration_number.unwrap_or(0),
+                            provider: "orchestrator".to_string(),
+                            model: model_alias.clone(),
+                            input_tokens: None,
+                            output_tokens: None,
+                            prompt: req.prompt.clone(),
+                            response: response.content.clone(),
+                            timestamp: chrono::Utc::now(),
+                        };
                     state.event_bus.publish_execution_event(event);
 
                     let interaction = aegis_orchestrator_core::domain::execution::LlmInteraction {
@@ -2188,14 +2219,15 @@ async fn attest_smcp_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
-    let internal_req = aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
-        agent_id: request.agent_id.clone(),
-        execution_id: request
-            .execution_id
-            .unwrap_or_else(|| request.agent_id.clone()),
-        container_id: request.container_id.clone(),
-        public_key_pem: request.public_key.clone(),
-    };
+    let internal_req =
+        aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
+            agent_id: request.agent_id.clone(),
+            execution_id: request
+                .execution_id
+                .unwrap_or_else(|| request.agent_id.clone()),
+            container_id: request.container_id.clone(),
+            public_key_pem: request.public_key.clone(),
+        };
 
     match state.attestation_service.attest(internal_req).await {
         Ok(res) => (

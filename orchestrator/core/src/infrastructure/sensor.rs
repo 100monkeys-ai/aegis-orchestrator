@@ -139,7 +139,7 @@ impl SensorService {
         }
     }
 
-    /// Register a sensor that will be started with [`start`].
+    /// Register a sensor that will be started with [`SensorService::start`].
     pub fn add_sensor(mut self, sensor: impl Sensor + 'static) -> Self {
         self.sensors.push(Box::new(sensor));
         self

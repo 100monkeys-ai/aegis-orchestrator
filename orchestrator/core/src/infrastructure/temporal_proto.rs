@@ -43,7 +43,8 @@
 #[allow(
     clippy::doc_lazy_continuation,
     clippy::doc_overindented_list_items,
-    clippy::large_enum_variant
+    clippy::large_enum_variant,
+    rustdoc::invalid_html_tags
 )]
 pub mod temporal {
     pub mod api {

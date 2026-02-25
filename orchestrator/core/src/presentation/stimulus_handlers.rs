@@ -13,7 +13,7 @@
 //! - Return `202 Accepted` with `{ stimulus_id, workflow_execution_id }` and `Location` header
 //! - Return `409 Conflict` for idempotent duplicates
 //! - Return `422 Unprocessable Entity` for low-confidence classification
-//! - Return `503 Service Unavailable` if [`StimulusService`] is not wired in [`AppState`]
+//! - Return `503 Service Unavailable` if stimulus service is not wired in app state
 
 use axum::{
     extract::{Path, State},

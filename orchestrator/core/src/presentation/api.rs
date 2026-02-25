@@ -57,7 +57,7 @@ pub struct AppState {
     pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
 }
 
-/// Enable [`WebhookHmacGuard`] Axum extractor to pull its state from [`AppState`].
+/// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
 impl FromRef<Arc<AppState>> for WebhookHmacState {
     fn from_ref(state: &Arc<AppState>) -> Self {
         WebhookHmacState {

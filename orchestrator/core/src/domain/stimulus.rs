@@ -142,8 +142,8 @@ impl Stimulus {
 
 /// The outcome of the two-stage hybrid routing pipeline.
 ///
-/// Produced by [`crate::application::stimulus::StandardStimulusService::route`]
-/// after either a deterministic direct-route hit or a successful LLM classification.
+/// Produced by the stimulus routing service after either a deterministic direct-route hit
+/// or a successful LLM classification (see ADR-021 for details).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoutingDecision {
     /// The workflow that will handle this stimulus.

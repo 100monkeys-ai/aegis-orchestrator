@@ -17,7 +17,9 @@
 //! - **Purpose:** Implements internal responsibilities for consensus strategy tests
 
 use aegis_orchestrator_core::domain::validation::GradientResult;
-use aegis_orchestrator_core::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
+use aegis_orchestrator_core::domain::workflow::{
+    ConfidenceWeighting, ConsensusConfig, ConsensusStrategy,
+};
 use std::collections::HashMap;
 
 fn create_gradient_result(score: f64, confidence: f64, reasoning: &str) -> GradientResult {

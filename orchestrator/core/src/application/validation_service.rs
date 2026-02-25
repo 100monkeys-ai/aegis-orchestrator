@@ -30,7 +30,7 @@
 //! - Confidence score (0.0 - 1.0)
 //! - Detailed reasoning
 //!
-//!
+//! ```rust
 //! let consensus = service.validate_with_judges(
 //!     execution_id,
 //!     request,

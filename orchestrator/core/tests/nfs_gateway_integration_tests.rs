@@ -262,7 +262,8 @@ async fn test_fsal_mode_validation() {
     };
 
     let path = "/workspace/test.txt";
-    let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
+    let handle =
+        aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
     // Test: Read from allowed file (should succeed)
     let read_result = fsal.read(&handle, path, &policy, 0, 100).await;
@@ -452,7 +453,8 @@ async fn test_fsal_quota_enforcement() {
 
     // Open file for writing
     let path = "/workspace/large_file.txt";
-    let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
+    let handle =
+        aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
     // MockStorageProvider.get_usage() returns 5120 bytes (5KB)
     // Volume quota is 1024 bytes (1KB)
