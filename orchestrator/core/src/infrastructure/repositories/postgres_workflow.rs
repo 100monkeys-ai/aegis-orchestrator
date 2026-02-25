@@ -59,10 +59,6 @@ pub struct PostgresWorkflowRepository {
 }
 
 impl PostgresWorkflowRepository {
-    pub fn new(_connection_string: String) -> Self {
-        panic!("PostgresWorkflowRepository::new() is deprecated. Use new_with_pool(pool) instead.")
-    }
-
     pub fn new_with_pool(pool: PgPool) -> Self {
         Self { pool }
     }

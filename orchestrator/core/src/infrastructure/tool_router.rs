@@ -581,11 +581,14 @@ mod tests {
         // Agent is only authorized for filesystem.read, not gmail.send
         let result = router.route_tool(exec_id, "gmail.send").await;
         assert!(result.is_err());
-        match result.unwrap_err() {
-            RoutingError::AgentNotAuthorized { tool_name, .. } => {
-                assert_eq!(tool_name, "gmail.send");
-            }
-            other => panic!("Expected AgentNotAuthorized, got {:?}", other),
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, RoutingError::AgentNotAuthorized { .. }),
+            "Expected AgentNotAuthorized, got {:?}",
+            err
+        );
+        if let RoutingError::AgentNotAuthorized { tool_name, .. } = err {
+            assert_eq!(tool_name, "gmail.send");
         }
     }
 

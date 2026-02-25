@@ -690,12 +690,11 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
-        if let StorageEvent::FileOpened { path, open_mode, .. } = deserialized {
-            assert_eq!(path, "/workspace/file.txt");
-            assert_eq!(open_mode, "read");
-        } else {
-            panic!("unexpected variant");
-        }
+        let StorageEvent::FileOpened { path, open_mode, .. } = deserialized else {
+            panic!("Expected FileOpened variant, got: {:?}", deserialized);
+        };
+        assert_eq!(path, "/workspace/file.txt");
+        assert_eq!(open_mode, "read");
     }
 
     #[test]
@@ -724,11 +723,10 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ExecutionEvent = serde_json::from_str(&json).unwrap();
-        if let ExecutionEvent::ExecutionStarted { execution_id, .. } = deserialized {
-            assert_eq!(execution_id, exec_id);
-        } else {
-            panic!("unexpected variant");
-        }
+        let ExecutionEvent::ExecutionStarted { execution_id, .. } = deserialized else {
+            panic!("Expected ExecutionStarted variant, got: {:?}", deserialized);
+        };
+        assert_eq!(execution_id, exec_id);
     }
 
     #[test]
@@ -775,12 +773,11 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ValidationEvent = serde_json::from_str(&json).unwrap();
-        if let ValidationEvent::GradientValidationPerformed { score, confidence, .. } = deserialized {
-            assert_eq!(score, 0.9);
-            assert_eq!(confidence, 0.85);
-        } else {
-            panic!("unexpected variant");
-        }
+        let ValidationEvent::GradientValidationPerformed { score, confidence, .. } = deserialized else {
+            panic!("Expected GradientValidationPerformed variant, got: {:?}", deserialized);
+        };
+        assert_eq!(score, 0.9);
+        assert_eq!(confidence, 0.85);
     }
 
     #[test]
@@ -837,11 +834,10 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
-        if let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized {
-            assert_eq!(violation_type, "network");
-        } else {
-            panic!("unexpected variant");
-        }
+        let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized else {
+            panic!("Expected PolicyViolationBlocked variant, got: {:?}", deserialized);
+        };
+        assert_eq!(violation_type, "network");
     }
 
     // ── AgentLifecycleEvent ───────────────────────────────────────────────────

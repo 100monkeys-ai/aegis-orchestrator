@@ -49,6 +49,9 @@ site/
 *.jpeg
 *.svg
 *.pdf
+*.zip
+*.exe
+*.md
 
 # === Database ===
 *.db
@@ -59,8 +62,10 @@ site/
 *.generated.*
 *.pb.rs
 *.g.rs
-# Temporal protobuf files are generated from upstream Temporal; contain inherited deprecated markers
-proto/temporal/
+
+# Vendor protobuf files
+proto/
+*.proto
 
 # === Project Specific ===
 # Exclude demo agents as they might simulate simplified behavior

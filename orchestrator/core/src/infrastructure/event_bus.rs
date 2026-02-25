@@ -423,12 +423,10 @@ mod tests {
         event_bus.publish_agent_event(event.clone());
 
         let received = receiver.recv().await.unwrap();
-        match received {
-            DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { agent_id: id, .. }) => {
-                assert_eq!(id, agent_id);
-            }
-            other => panic!("Expected AgentDeployed event, got {:?}", other),
-        }
+        let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { agent_id: id, .. }) = received else {
+            panic!("Expected AgentDeployed event, got {:?}", received);
+        };
+        assert_eq!(id, agent_id);
     }
 
     #[tokio::test]
@@ -455,12 +453,10 @@ mod tests {
         });
 
         let received = receiver.recv().await.unwrap();
-        match received {
-            ExecutionEvent::ExecutionStarted { execution_id: id, .. } => {
-                assert_eq!(id, execution_id);
-            }
-            other => panic!("Expected ExecutionStarted event, got {:?}", other),
-        }
+        let ExecutionEvent::ExecutionStarted { execution_id: id, .. } = received else {
+            panic!("Expected ExecutionStarted event, got {:?}", received);
+        };
+        assert_eq!(id, execution_id);
     }
 
     #[tokio::test]

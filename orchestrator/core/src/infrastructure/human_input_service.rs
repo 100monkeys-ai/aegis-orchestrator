@@ -288,13 +288,11 @@ mod tests {
             .await
             .unwrap();
 
-        match result {
-            HumanInputStatus::Approved { feedback, approved_by, .. } => {
-                assert_eq!(feedback, Some("Looks good!".to_string()));
-                assert_eq!(approved_by, Some("alice".to_string()));
-            }
-            other => panic!("Expected approval result, got {:?}", other),
-        }
+        let HumanInputStatus::Approved { feedback, approved_by, .. } = result else {
+            panic!("Expected approval result, got {:?}", result);
+        };
+        assert_eq!(feedback, Some("Looks good!".to_string()));
+        assert_eq!(approved_by, Some("alice".to_string()));
     }
 
     #[tokio::test]
@@ -322,13 +320,11 @@ mod tests {
             .await
             .unwrap();
 
-        match result {
-            HumanInputStatus::Rejected { reason, rejected_by, .. } => {
-                assert_eq!(reason, "Security concerns");
-                assert_eq!(rejected_by, Some("bob".to_string()));
-            }
-            other => panic!("Expected rejection result, got {:?}", other),
-        }
+        let HumanInputStatus::Rejected { reason, rejected_by, .. } = result else {
+            panic!("Expected rejection result, got {:?}", result);
+        };
+        assert_eq!(reason, "Security concerns");
+        assert_eq!(rejected_by, Some("bob".to_string()));
     }
 
     #[tokio::test]
@@ -342,12 +338,11 @@ mod tests {
             .await
             .unwrap();
 
-        match result {
-            HumanInputStatus::TimedOut { .. } => {
-                // Expected
-            }
-            other => panic!("Expected timeout result, got {:?}", other),
-        }
+        assert!(
+            matches!(result, HumanInputStatus::TimedOut { .. }),
+            "Expected timeout result, got {:?}",
+            result
+        );
     }
 
     #[tokio::test]

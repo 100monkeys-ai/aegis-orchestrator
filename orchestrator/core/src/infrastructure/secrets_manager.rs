@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Secrets Manager Stub (BC-11, ADR-034)
 //!
-//! ⚠️ Phase 4 stub — **not yet implemented.**
+//! ⚠️ **Phase 4 stub — not yet implemented.**
 //!
 //! This module is a forward-declaration placeholder for the OpenBao
 //! secrets management integration described in ADR-034. In Phase 1 all
@@ -20,75 +20,103 @@
 //!    agents receive credentials via `spec.environment` injection, never via 
 //!    direct vault calls.
 //!
-//! ## Panics
+//! ## Error Behavior
 //!
-//! **Every method on [`SecretsManager`] panics** with `todo!()`. Do not call
-//! any method until Phase 4 is implemented.
+//! **All methods return `SecretsError::NotImplemented`** until Phase 4 is complete.
+//! Do not call any method in production until OpenBao integration is implemented.
 //!
 //! See ADR-034 (OpenBao Secrets Management), AGENTS.md §BC-11.
 
-// ============================================================================
-// ADR-034: OpenBao for Secrets Management (DEFERRED to Phase 4)
-// ============================================================================
-// Purpose: Centralized secrets storage, dynamic credential generation, encryption-as-a-service
-// Current Status: Not implemented - Phase 1 uses environment variables only
-// 
-// Phase 1 Workaround:
-// - Credentials passed as environment variables to agent containers
-// - No encryption at rest
-// - No dynamic secret generation
-// - No audit trail
-//
-// Phase 4 Implementation Plan:
-// 1. OpenBao Deployment: HA setup with Raft backend
-// 2. Orchestrator Integration: AppRole authentication (Role ID + Secret ID)
-// 3. Dynamic Secrets: Database credentials with auto-rotation
-// 4. Transit Engine: Encryption-as-a-service for signing/encryption
-// 5. Keymaster Pattern: Only orchestrator accesses vault, agents never do
-//
-// See: adrs/034-openbao-secrets-management.md
-// ============================================================================
-
 use anyhow::Result;
-use async_trait::async_trait;
+use thiserror::Error;
+
+/// Error types for secrets management operations.
+#[derive(Debug, Error)]
+pub enum SecretsError {
+    /// OpenBao integration not yet implemented (Phase 4).
+    #[error("ADR-034: OpenBao secrets integration not yet implemented (Phase 4)")]
+    NotImplemented,
+    
+    /// Secret not found at the specified path.
+    #[error("Secret not found: {path}")]
+    SecretNotFound { path: String },
+    
+    /// Failed to communicate with OpenBao.
+    #[error("OpenBao connection error: {0}")]
+    ConnectionError(String),
+    
+    /// Invalid secret path or format.
+    #[error("Invalid secret path: {0}")]
+    InvalidPath(String),
+}
 
 /// ⚠️ Phase 4 stub — placeholder for ADR-034 OpenBao integration.
 ///
-/// # Panics
+/// # Current Behavior
 ///
-/// `SecretsManager::new()` and all instance methods unconditionally panic
-/// with `todo!()`. Do not construct this type until Phase 4 is implemented.
+/// All methods return `SecretsError::NotImplemented` until Phase 4 OpenBao
+/// integration is complete. This prevents runtime panics while clearly
+/// indicating that the functionality is not yet available.
 pub struct SecretsManager {
-    // TODO: VaultClient connection (ADR-034)
+    // Phase 4: VaultClient connection will be added here
+    _phantom: std::marker::PhantomData<()>,
 }
 
 impl SecretsManager {
+    /// Creates a new stub instance that returns NotImplemented errors.
+    ///
+    /// # Phase 4
+    /// This will initialize OpenBao client with AppRole authentication.
     pub fn new() -> Self {
-        // TODO: Initialize OpenBao client
-        todo!("ADR-034: OpenBao secrets integration not yet implemented")
+        Self {
+            _phantom: std::marker::PhantomData,
+        }
     }
 
-    /// Read a secret from OpenBao
-    pub async fn read_secret(&self, path: &str) -> Result<String> {
-        // TODO: Implement secret read with caching
-        todo!("ADR-034: Secret read not implemented")
+    /// Read a secret from OpenBao.
+    ///
+    /// # Phase 4 Implementation
+    /// - Query OpenBao KV engine at `<tenant>/kv/<path>`
+    /// - Cache secrets in memory with TTL
+    /// - Publish SecretAccessed event to audit trail
+    pub async fn read_secret(&self, _path: &str) -> Result<String, SecretsError> {
+        Err(SecretsError::NotImplemented)
     }
 
-    /// Generate a dynamic secret (e.g., database credentials with TTL)
-    pub async fn generate_dynamic_secret(&self, engine: &str, role: &str) -> Result<String> {
-        // TODO: Implement dynamic secret generation with lease management
-        todo!("ADR-034: Dynamic secret generation not implemented")
+    /// Generate a dynamic secret (e.g., database credentials with TTL).
+    ///
+    /// # Phase 4 Implementation
+    /// - Request dynamic secret from OpenBao engine (e.g., `database/creds/<role>`)
+    /// - Track lease ID for renewal and revocation
+    /// - Auto-refresh before expiry
+    /// - Publish DynamicSecretGenerated event
+    pub async fn generate_dynamic_secret(&self, _engine: &str, _role: &str) -> Result<String, SecretsError> {
+        Err(SecretsError::NotImplemented)
     }
 
-    /// Sign data using OpenBao Transit Engine
-    pub async fn sign(&self, key_name: &str, data: &[u8]) -> Result<String> {
-        // TODO: Implement signing for SMCP/non-repudiation
-        todo!("ADR-034: Transit engine signing not implemented")
+    /// Sign data using OpenBao Transit Engine.
+    ///
+    /// # Phase 4 Implementation
+    /// - Use Transit Engine for Ed25519 signing (SMCP non-repudiation)
+    /// - Never expose private keys to orchestrator
+    /// - Return base64-encoded signature
+    pub async fn sign(&self, _key_name: &str, _data: &[u8]) -> Result<String, SecretsError> {
+        Err(SecretsError::NotImplemented)
     }
 
-    /// Encrypt data using OpenBao Transit Engine
-    pub async fn encrypt(&self, key_name: &str, plaintext: &[u8]) -> Result<String> {
-        // TODO: Implement encryption for at-rest storage
-        todo!("ADR-034: Transit engine encryption not implemented")
+    /// Encrypt data using OpenBao Transit Engine.
+    ///
+    /// # Phase 4 Implementation
+    /// - Use Transit Engine for at-rest encryption (Blackboard state, sensitive logs)
+    /// - Return ciphertext with version prefix (e.g., `vault:v1:ciphertext`)
+    /// - Support key rotation without re-encrypting all data
+    pub async fn encrypt(&self, _key_name: &str, _plaintext: &[u8]) -> Result<String, SecretsError> {
+        Err(SecretsError::NotImplemented)
+    }
+}
+
+impl Default for SecretsManager {
+    fn default() -> Self {
+        Self::new()
     }
 }

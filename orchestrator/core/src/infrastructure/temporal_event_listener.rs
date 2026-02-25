@@ -404,12 +404,10 @@ mod tests {
         };
 
         let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
-        match event {
-            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => {
-                assert_eq!(execution_id.0.to_string(), "550e8400-e29b-41d4-a716-446655440000");
-            }
-            _ => panic!("Expected WorkflowExecutionStarted"),
-        }
+        let WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } = event else {
+            panic!("Expected WorkflowExecutionStarted, got {:?}", event);
+        };
+        assert_eq!(execution_id.0.to_string(), "550e8400-e29b-41d4-a716-446655440000");
     }
 
     #[test]

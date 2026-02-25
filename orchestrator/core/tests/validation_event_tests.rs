@@ -139,27 +139,23 @@ async fn test_validation_event_streaming() {
         .expect("Timeout waiting for event 1")
         .expect("Event channel closed");
         
-    match event1 {
-        ExecutionEvent::Validation(ValidationEvent::GradientValidationPerformed { execution_id: eid, score, .. }) => {
-            assert_eq!(eid, execution_id);
-            assert_eq!(score, 0.95);
-        },
-        _ => panic!("Expected GradientValidationPerformed, got {:?}", event1),
-    }
+    let ExecutionEvent::Validation(ValidationEvent::GradientValidationPerformed { execution_id: eid, score, .. }) = event1 else {
+        panic!("Expected GradientValidationPerformed, got {:?}", event1);
+    };
+    assert_eq!(eid, execution_id);
+    assert_eq!(score, 0.95);
 
     // Expect MultiJudgeConsensus
     let event2 = timeout(Duration::from_secs(5), receiver.recv()).await
         .expect("Timeout waiting for event 2")
         .expect("Event channel closed");
         
-    match event2 {
-        ExecutionEvent::Validation(ValidationEvent::MultiJudgeConsensus { execution_id: eid, final_score, .. }) => {
-            assert_eq!(eid, execution_id);
-             // Consensus of one judge with 0.95 and high confidence should be close to 0.95
-            assert!(final_score > 0.9);
-        },
-        _ => panic!("Expected MultiJudgeConsensus, got {:?}", event2),
-    }
+    let ExecutionEvent::Validation(ValidationEvent::MultiJudgeConsensus { execution_id: eid, final_score, .. }) = event2 else {
+        panic!("Expected MultiJudgeConsensus, got {:?}", event2);
+    };
+    assert_eq!(eid, execution_id);
+    // Consensus of one judge with 0.95 and high confidence should be close to 0.95
+    assert!(final_score > 0.9);
     
     // Ensure validation completed successfully
     let result = handle.await.unwrap();

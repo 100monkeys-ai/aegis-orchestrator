@@ -307,3 +307,7 @@ patterns:
         exclude_if:
           file_patterns:
             - "**/examples/**"
+            - "**/cli/src/commands/**"      # CLI commands need println for user output
+            - "**/cli/src/daemon/**"        # Daemon CLI interaction
+            - "**/bin/**"                   # Binary entry points
+            - "**/main.rs"                  # Main entry points
