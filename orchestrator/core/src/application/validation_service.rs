@@ -30,15 +30,33 @@
 //! - Confidence score (0.0 - 1.0)
 //! - Detailed reasoning
 //!
-//! ```rust
+//! # Example
+//!
+//! ```rust,ignore
+//! # use aegis_orchestrator_core::application::validation::ValidationService;
+//! # use aegis_orchestrator_core::domain::validation::ValidationRequest;
+//! # use aegis_orchestrator_core::domain::agent::AgentId;
+//! # use aegis_orchestrator_core::domain::execution::ExecutionId;
+//! # use aegis_orchestrator_core::domain::workflow::ConsensusConfig;
+//! # async fn example(service: &ValidationService) -> anyhow::Result<()> {
+//! let execution_id = ExecutionId::new();
+//! let agent_id = AgentId::new();
+//! let judges = vec![(AgentId::new(), 1.0)];
+//! let request = ValidationRequest::new();
+//! let config = ConsensusConfig::default();
+//!
 //! let consensus = service.validate_with_judges(
 //!     execution_id,
+//!     agent_id,
+//!     1,
 //!     request,
 //!     judges,
 //!     Some(config),
-//!     timeout_secs,
-//!     poll_interval_ms
+//!     30,
+//!     100
 //! ).await?;
+//! # Ok(())
+//! # }
 //! ```
 
 use crate::domain::agent::AgentId;
