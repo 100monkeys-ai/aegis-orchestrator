@@ -46,7 +46,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Internal [dependencies]
 aegis-core = { path = "../orchestrator/core" }
-aegis-cortex = { path = "../cortex" }
 aegis-sdk = { path = "../sdks" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
