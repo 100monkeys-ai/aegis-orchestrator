@@ -686,14 +686,12 @@ impl ExecutionService for StandardExecutionService {
                             exec.ended_at = Some(Utc::now());
                             let _ = repository.save(&exec).await;
 
-                            event_bus.publish_execution_event(
-                                ExecutionEvent::ExecutionCancelled {
-                                    execution_id,
-                                    agent_id,
-                                    reason: Some("Cancelled via cancellation token".to_string()),
-                                    cancelled_at: Utc::now(),
-                                },
-                            );
+                            event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                                execution_id,
+                                agent_id,
+                                reason: Some("Cancelled via cancellation token".to_string()),
+                                cancelled_at: Utc::now(),
+                            });
                         }
                     }
                 }

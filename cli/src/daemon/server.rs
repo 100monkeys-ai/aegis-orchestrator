@@ -200,20 +200,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
         if let Some(pool) = pool.as_ref() {
-        (
+            (
             Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
             Arc::new(aegis_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
             Arc::new(aegis_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
             Arc::new(aegis_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool.clone())),
         )
-    } else {
-        (
-            Arc::new(InMemoryAgentRepository::new()),
-            Arc::new(aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new()),
-            Arc::new(InMemoryExecutionRepository::new()),
-            Arc::new(InMemoryWorkflowExecutionRepository::new()),
-        )
-    };
+        } else {
+            (
+                Arc::new(InMemoryAgentRepository::new()),
+                Arc::new(
+                    aegis_core::infrastructure::repositories::InMemoryWorkflowRepository::new(),
+                ),
+                Arc::new(InMemoryExecutionRepository::new()),
+                Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            )
+        };
 
     let event_bus = Arc::new(EventBus::new(100));
 

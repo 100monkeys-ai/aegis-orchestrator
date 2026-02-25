@@ -65,9 +65,7 @@ impl WebhookSecretProvider for EnvWebhookSecretProvider {
     async fn get_secret(&self, source_name: &str) -> Option<Vec<u8>> {
         let env_key = format!(
             "AEGIS_WEBHOOK_SECRET_{}",
-            source_name
-                .to_uppercase()
-                .replace(['-', '.'], "_")
+            source_name.to_uppercase().replace(['-', '.'], "_")
         );
         std::env::var(&env_key).ok().map(|s| s.into_bytes())
     }
