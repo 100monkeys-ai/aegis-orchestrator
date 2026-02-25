@@ -36,6 +36,7 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::agent::AgentId;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::volume::{VolumeMount, TenantId, AccessMode};
+use crate::domain::runtime::RuntimeError;
 use crate::application::agent::AgentLifecycleService;
 use crate::application::volume_manager::VolumeService;
 use crate::application::nfs_gateway::NfsGatewayService;
@@ -49,6 +50,7 @@ use std::sync::Arc;
 use std::path::PathBuf;
 use chrono::Utc;
 use crate::domain::policy::FilesystemPolicy;
+use tokio_util::sync::CancellationToken;
 
 /// Primary interface for running agents through the 100monkeys iteration loop (BC-2).
 ///
@@ -136,6 +138,10 @@ pub struct StandardExecutionService {
     config: Arc<crate::domain::node_config::NodeConfigManifest>,
     /// Optional NFS gateway for registering volume contexts before container spawn (ADR-036)
     nfs_gateway: Option<Arc<NfsGatewayService>>,
+    /// Active cancellation tokens keyed by ExecutionId.
+    /// Inserting a token on `start_execution` and calling `cancel()` on
+    /// `cancel_execution` lets the Supervisor cooperatively terminate.
+    cancellation_tokens: Arc<dashmap::DashMap<ExecutionId, CancellationToken>>,
 }
 
 impl StandardExecutionService {
@@ -155,6 +161,7 @@ impl StandardExecutionService {
             event_bus,
             config,
             nfs_gateway: None,
+            cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
 
@@ -423,12 +430,14 @@ impl ExecutionService for StandardExecutionService {
                 cpu_millis: Some(security.resources.cpu),
                 memory_bytes: security.resources.memory_bytes(),
                 disk_bytes: security.resources.disk_bytes(),
+                timeout_seconds: security.resources.parse_timeout_seconds(),
             }
         } else {
             crate::domain::runtime::ResourceLimits {
                 cpu_millis: None,
                 memory_bytes: None,
                 disk_bytes: None,
+                timeout_seconds: None,
             }
         };
         
@@ -535,8 +544,25 @@ impl ExecutionService for StandardExecutionService {
             event_bus: event_bus.clone(),
         });
 
+        // Create a cancellation token for this execution so cancel_execution() can
+        // signal the Supervisor loop to stop cooperatively.
+        let cancellation_token = CancellationToken::new();
+        self.cancellation_tokens.insert(execution_id, cancellation_token.clone());
+        let tokens_map = self.cancellation_tokens.clone();
+
         tokio::spawn(async move {
-            match supervisor.run_loop(runtime_config, exec_input, max_retries as u32, monitor).await {
+            let result = supervisor.run_loop(
+                runtime_config,
+                exec_input,
+                max_retries as u32,
+                monitor,
+                cancellation_token,
+            ).await;
+
+            // Clean up the token from the map now that the execution is done
+            tokens_map.remove(&execution_id);
+
+            match result {
                 Ok(final_output) => {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
@@ -554,10 +580,47 @@ impl ExecutionService for StandardExecutionService {
                              });
                         }
                     }
-                    // NOTE: No need to terminate instance here - Supervisor handles it
+                },
+                Err(RuntimeError::TimedOut(timeout_secs)) => {
+                    // Execution timed out — emit specific timeout event
+                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
+                        if let Some(mut exec) = exec_opt {
+                            exec.fail(format!("Execution timed out after {} seconds", timeout_secs));
+                            let total_iterations = exec.iterations().len() as u8;
+                            let _ = repository.save(&exec).await;
+
+                            event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
+                                execution_id,
+                                agent_id,
+                                timeout_seconds: timeout_secs,
+                                total_iterations,
+                                timed_out_at: Utc::now(),
+                            });
+                        }
+                    }
+                },
+                Err(RuntimeError::Cancelled) => {
+                    // Execution was cancelled — status already set by cancel_execution(),
+                    // but ensure we mark it if the token was triggered externally.
+                    if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
+                        if let Some(mut exec) = exec_opt {
+                            if exec.status != ExecutionStatus::Cancelled {
+                                exec.status = ExecutionStatus::Cancelled;
+                                exec.ended_at = Some(Utc::now());
+                                let _ = repository.save(&exec).await;
+
+                                event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                                    execution_id,
+                                    agent_id,
+                                    reason: Some("Cancelled via cancellation token".to_string()),
+                                    cancelled_at: Utc::now(),
+                                });
+                            }
+                        }
+                    }
                 },
                 Err(e) => {
-                    // Update to failed
+                    // Update to failed (generic failure)
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                          if let Some(mut exec) = exec_opt {
                               exec.fail(e.to_string());
@@ -573,7 +636,6 @@ impl ExecutionService for StandardExecutionService {
                              });
                          }
                      }
-                    // NOTE: No need to terminate instance here - Supervisor handles it
                 }
             }
         });
@@ -592,6 +654,13 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
+         // Signal the Supervisor loop to stop via the CancellationToken.
+         // The Supervisor will terminate the running container and return
+         // RuntimeError::Cancelled, which the spawned task handles above.
+         if let Some(token) = self.cancellation_tokens.get(&id) {
+             token.cancel();
+         }
+
          let mut execution = self.get_execution(id).await?;
          execution.status = ExecutionStatus::Cancelled;
          execution.ended_at = Some(Utc::now());
@@ -603,6 +672,11 @@ impl ExecutionService for StandardExecutionService {
              reason: None,
              cancelled_at: Utc::now(),
          });
+
+         // Remove the token from the map — the Supervisor will also try to remove
+         // it when it exits, but this is idempotent.
+         self.cancellation_tokens.remove(&id);
+
          Ok(())
     }
 

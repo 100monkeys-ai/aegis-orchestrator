@@ -81,7 +81,7 @@ fn default_container_gid() -> u32 {
 ///
 /// All fields are optional; `None` means the runtime applies no limit for that
 /// resource (useful for development). Production manifests should always set all
-/// three to bound agent blast radius.
+/// fields to bound agent blast radius.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceLimits {
     /// CPU quota expressed as millicores (1000 = 1 full CPU core).
@@ -91,6 +91,13 @@ pub struct ResourceLimits {
     pub memory_bytes: Option<u64>,
     /// Maximum ephemeral disk usage in bytes (enforced via volume quota).
     pub disk_bytes: Option<u64>,
+    /// Hard wall-clock timeout for the entire execution in **seconds**.
+    /// The [`crate::domain::supervisor::Supervisor`] wraps its loop in
+    /// `tokio::time::timeout` using this value. When elapsed, the running
+    /// container is terminated and the execution is marked `Failed`.
+    ///
+    /// `None` falls back to the global default (1800s / 30 min).
+    pub timeout_seconds: Option<u64>,
 }
 
 impl RuntimeConfig {
@@ -219,6 +226,14 @@ pub enum RuntimeError {
     /// on the runtime (e.g. Docker socket access denied).
     #[error("Permission denied: {0}")]
     PermissionDenied(String),
+    /// The execution exceeded its wall-clock timeout and was forcibly terminated.
+    /// Contains the timeout duration in seconds for diagnostics.
+    #[error("Execution timed out after {0} seconds")]
+    TimedOut(u64),
+    /// The execution was cancelled via [`crate::application::execution::ExecutionService::cancel_execution`].
+    /// The Supervisor observed the cancellation token and terminated the running instance.
+    #[error("Execution was cancelled")]
+    Cancelled,
 }
 
 /// Current resource-usage snapshot for a running [`InstanceId`].

@@ -359,6 +359,18 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     }
                 }
             }
+            aegis_core::domain::events::ExecutionEvent::ExecutionTimedOut {
+                timeout_seconds,
+                total_iterations,
+                ..
+            } => {
+                println!(
+                    "{} after {}s ({} iterations)",
+                    "Execution timed out".bold().red(),
+                    timeout_seconds,
+                    total_iterations
+                );
+            }
         },
         DomainEvent::Policy(policy_event) => match policy_event {
             aegis_core::domain::events::PolicyEvent::PolicyViolationAttempted {
