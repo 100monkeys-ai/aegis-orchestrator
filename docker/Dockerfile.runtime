@@ -18,15 +18,13 @@ COPY Cargo.toml Cargo.lock ./
 COPY orchestrator/core/Cargo.toml ./orchestrator/core/
 COPY orchestrator/swarm/Cargo.toml ./orchestrator/swarm/
 COPY cli/Cargo.toml ./cli/
-COPY cortex/Cargo.toml ./cortex/
 COPY sdks/Cargo.toml ./sdks/
 
 # Create dummy source files to build dependencies
-RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src cortex/src sdks/src && \
+RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src sdks/src && \
     echo "fn main() {}" > cli/src/main.rs && \
     echo "pub fn dummy() {}" > orchestrator/core/src/lib.rs && \
     echo "pub fn dummy() {}" > orchestrator/swarm/src/lib.rs && \
-    echo "pub fn dummy() {}" > cortex/src/lib.rs && \
     echo "pub fn dummy() {}" > sdks/src/lib.rs
 
 # Build dependencies only (skip building to avoid edition2024 issues with dummy files)
@@ -34,7 +32,7 @@ RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src cortex/src sdk
 RUN cargo fetch --locked
 
 # Remove dummy source files (keep cargo cache)
-RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src cortex/src sdks/src target
+RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src sdks/src target
 
 # Copy actual source code
 COPY orchestrator/core ./orchestrator/core
@@ -42,7 +40,6 @@ COPY orchestrator/swarm ./orchestrator/swarm
 COPY cli/src ./cli/src
 COPY cli/templates ./cli/templates
 COPY cli/migrations ./cli/migrations
-COPY cortex/src ./cortex/src
 COPY sdks/src ./sdks/src
 COPY proto ./proto
 
@@ -65,8 +62,8 @@ WORKDIR /app
 # Copy the built binary from builder
 COPY --from=builder /app/target/release/aegis /usr/local/bin/aegis-runtime
 
-# Copy configuration files
-COPY aegis-config.yaml ./
+# Configuration is injected at runtime via docker-compose volume mount
+# (see aegis-examples/deploy/docker-compose.yml)
 
 # Copy bootstrap script for mounting into agent containers
 COPY assets ./assets

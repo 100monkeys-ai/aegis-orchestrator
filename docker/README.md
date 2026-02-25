@@ -16,6 +16,22 @@ This directory contains the **build tooling** (Dockerfiles) for the AEGIS runtim
 
 These Dockerfiles are used by CI/CD to build and publish images to the GitHub Container Registry. End-users consume the published images via the compose stack in `aegis-examples`.
 
+## CI/CD
+
+Both platform images are automatically built and pushed to `ghcr.io` via GitHub Actions:
+
+| Image | Repo | Workflow | Triggers |
+|-------|------|----------|----------|
+| `ghcr.io/100monkeys-ai/aegis-runtime` | `aegis-orchestrator` | `.github/workflows/docker-publish.yml` | Push to `main` (`:latest`, `:sha-<short>`), semver tags `v*.*.*` |
+| `ghcr.io/100monkeys-ai/aegis-temporal-worker` | `aegis-temporal-worker` | `.github/workflows/docker-publish.yml` | Push to `main` (`:latest`, `:sha-<short>`), semver tags `v*.*.*` |
+
+### Tagging Strategy
+
+- **`:latest`** — updated on every push to `main`
+- **`:sha-abc1234`** — short commit SHA for traceability on `main` pushes
+- **`:0.1.0`**, **`:0.1`**, **`:0`** — semver tags when `v0.1.0` git tag is pushed
+- Rust builds use **BuildKit GHA layer caching** to avoid rebuilding unchanged dependencies
+
 ## Building images locally
 
 From the repo root:
