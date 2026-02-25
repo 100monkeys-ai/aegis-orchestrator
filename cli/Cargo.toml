@@ -1,11 +1,11 @@
 [package]
-name = "aegis-cli"
-version = "0.1.0"
+name = "aegis-orchestrator"
+version = "0.1.0-pre-alpha"
 edition = "2021"
 license = "AGPL-3.0"
 
 [lib]
-name = "aegis_cli"
+name = "aegis_orchestrator"
 path = "src/lib.rs"
 
 [[bin]]

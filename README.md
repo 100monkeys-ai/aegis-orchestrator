@@ -94,10 +94,10 @@ Lightweight binary for hybrid cloud/on-prem deployments.
 
 ```bash
 # Build the CLI and orchestrator
-cargo build -p aegis-cli
+cargo build -p aegis-orchestrator
 
 # Or build in release mode
-cargo build --release -p aegis-cli
+cargo build --release -p aegis-orchestrator
 ```
 
 ### Configuration
@@ -148,10 +148,10 @@ The orchestrator uses structured logging via the `tracing` crate. Log levels: `t
 ```bash
 # Via environment variable (recommended for development)
 export RUST_LOG=debug
-cargo run -p aegis-cli -- daemon start
+cargo run -p aegis-orchestrator -- daemon start
 
 # Via CLI flag
-cargo run -p aegis-cli -- daemon start --log-level debug
+cargo run -p aegis-orchestrator -- daemon start --log-level debug
 
 # Via config file (aegis-config.yaml)
 spec:
@@ -174,10 +174,10 @@ This is useful for tracing LLM connectivity issues, prompt delivery, or agent ex
 
 ```bash
 # Start with debug logging
-RUST_LOG=debug cargo run -p aegis-cli -- daemon start
+RUST_LOG=debug cargo run -p aegis-orchestrator -- daemon start
 
 # In another terminal, execute an agent
-cargo run -p aegis-cli -- task execute my-agent --input "test"
+cargo run -p aegis-orchestrator -- task execute my-agent --input "test"
 
 # You'll see in the orchestrator logs:
 # DEBUG aegis_core::infrastructure::runtime: Starting bootstrap.py execution container_id="abc123"

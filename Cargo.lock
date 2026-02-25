@@ -3,37 +3,6 @@
 version = 3
 
 [[package]]
-name = "aegis-cli"
-version = "0.1.0"
-dependencies = [
- "aegis-core",
- "aegis-sdk",
- "anyhow",
- "async-stream",
- "axum 0.7.9",
- "base64",
- "chrono",
- "clap",
- "colored",
- "daemonize",
- "futures",
- "indicatif",
- "jsonwebtoken 10.3.0",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
- "tokio-stream",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "aegis-core"
 version = "0.1.0"
 dependencies = [
@@ -82,6 +51,37 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "aegis-orchestrator"
+version = "0.1.0-pre-alpha"
+dependencies = [
+ "aegis-core",
+ "aegis-sdk",
+ "anyhow",
+ "async-stream",
+ "axum 0.7.9",
+ "base64",
+ "chrono",
+ "clap",
+ "colored",
+ "daemonize",
+ "futures",
+ "indicatif",
+ "jsonwebtoken 10.3.0",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
