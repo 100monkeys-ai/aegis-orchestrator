@@ -45,7 +45,9 @@ use bollard::models::{Mount, MountTypeEnum};
 use bollard::Docker;
 use chrono;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 pub struct DockerRuntime {
@@ -56,6 +58,7 @@ pub struct DockerRuntime {
     nfs_server_host: Option<String>, // NFS server hostname for volume mounts (ADR-036)
     nfs_port: u16,
     nfs_mountport: u16,
+    keep_container_on_failure: RwLock<HashMap<String, bool>>,
 }
 
 impl DockerRuntime {
@@ -135,6 +138,7 @@ impl DockerRuntime {
             nfs_server_host,
             nfs_port,
             nfs_mountport,
+            keep_container_on_failure: RwLock::new(HashMap::new()),
         })
     }
 
@@ -435,6 +439,11 @@ impl AgentRuntime for DockerRuntime {
 
         let id = res.id;
 
+        self.keep_container_on_failure
+            .write()
+            .await
+            .insert(id.clone(), config.keep_container_on_failure);
+
         self.docker
             .start_container(&id, None::<StartContainerOptions<String>>)
             .await
@@ -551,23 +560,37 @@ impl AgentRuntime for DockerRuntime {
         );
 
         // Check exit code and return error if bootstrap failed
-        if exit_code != 0 {
+        let keep_on_failure = self
+            .keep_container_on_failure
+            .read()
+            .await
+            .get(container_id)
+            .copied()
+            .unwrap_or(false);
+
+        let execution_result = if exit_code != 0 && keep_on_failure {
             let error_msg = if !stderr_logs.is_empty() {
                 stderr_logs.join("\n")
             } else {
                 format!("Bootstrap script exited with code {}", exit_code)
             };
-            return Err(RuntimeError::ExecutionFailed(error_msg));
-        }
+            Err(RuntimeError::ExecutionFailed(error_msg))
+        } else {
+            let result = serde_json::Value::String(stdout_logs.join(""));
+            Ok(TaskOutput {
+                result,
+                logs: stderr_logs,
+                tool_calls: vec![],
+                exit_code,
+            })
+        };
 
-        let result = serde_json::Value::String(stdout_logs.join(""));
+        self.keep_container_on_failure
+            .write()
+            .await
+            .remove(container_id);
 
-        Ok(TaskOutput {
-            result,
-            logs: stderr_logs,
-            tool_calls: vec![],
-            exit_code,
-        })
+        execution_result
     }
 
     async fn terminate(&self, id: &InstanceId) -> Result<(), RuntimeError> {
@@ -575,6 +598,11 @@ impl AgentRuntime for DockerRuntime {
             force: true,
             ..Default::default()
         };
+
+        self.keep_container_on_failure
+            .write()
+            .await
+            .remove(id.as_str());
 
         self.docker
             .remove_container(id.as_str(), Some(options))
