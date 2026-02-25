@@ -16,8 +16,10 @@ use chrono::Utc;
 
 use crate::application::execution::ExecutionService;
 use crate::application::validation_service::ValidationService;
+use crate::application::stimulus::StimulusService;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionInput;
+use crate::domain::stimulus::{Stimulus, StimulusSource};
 
 // Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
 // so that both the server and the CortexGrpcClient client share the same Rust types.
@@ -31,6 +33,8 @@ pub struct AegisRuntimeService {
     attestation_service: Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
     tool_invocation_service: Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
     cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
+    /// BC-8: Stimulus routing service (ADR-021). Optional until wired.
+    stimulus_service: Option<Arc<dyn StimulusService>>,
 }
 
 impl AegisRuntimeService {
@@ -44,6 +48,7 @@ impl AegisRuntimeService {
             attestation_service: None,
             tool_invocation_service: None,
             cortex_client: None,
+            stimulus_service: None,
         }
     }
 
@@ -66,6 +71,15 @@ impl AegisRuntimeService {
         cortex_client: Arc<crate::infrastructure::CortexGrpcClient>,
     ) -> Self {
         self.cortex_client = Some(cortex_client);
+        self
+    }
+
+    /// Set the Stimulus routing service (optional — omit if BC-8 is not deployed)
+    pub fn with_stimulus(
+        mut self,
+        stimulus_service: Arc<dyn StimulusService>,
+    ) -> Self {
+        self.stimulus_service = Some(stimulus_service);
         self
     }
 
@@ -419,6 +433,55 @@ impl AegisRuntime for AegisRuntimeService {
                 Ok(Response::new(InvokeToolResponse { result_json: bytes }))
             },
             Err(e) => Err(Status::permission_denied(format!("Tool invocation rejected: {}", e))),
+        }
+    }
+}
+
+// ── BC-8: IngestStimulus gRPC handler ─────────────────────────────────────────
+// This method implements the `IngestStimulus` RPC defined in aegis_runtime.proto.
+// It lives in a plain `impl` block until `cargo build` regenerates the proto
+// bindings and adds `ingest_stimulus` to the `AegisRuntime` trait, at which
+// point it should be moved back into the `impl AegisRuntime for AegisRuntimeService`
+// block above.  The HTTP equivalent is already live at `POST /v1/webhooks/{source}`.
+// TODO(proto-regen): move into `impl AegisRuntime for AegisRuntimeService` once
+// tonic-build has regenerated the trait with IngestStimulus.
+impl AegisRuntimeService {
+    /// Handle `IngestStimulus` RPC (BC-8 — ADR-021).
+    pub async fn ingest_stimulus_rpc(
+        &self,
+        source_name: String,
+        content: String,
+        idempotency_key: String,
+        headers: std::collections::HashMap<String, String>,
+    ) -> Result<(String, String), Status> {
+        let stimulus_service = self.stimulus_service.as_ref().ok_or_else(|| {
+            Status::unavailable("Stimulus service is not configured")
+        })?;
+
+        let stimulus = Stimulus::new(
+            StimulusSource::Webhook { source_name },
+            content,
+        )
+        .with_headers(headers)
+        .with_idempotency_key(idempotency_key);
+
+        match stimulus_service.ingest(stimulus).await {
+            Ok(resp) => Ok((resp.stimulus_id.to_string(), resp.workflow_execution_id)),
+            Err(e) => {
+                use crate::application::stimulus::StimulusError;
+                match e {
+                    StimulusError::IdempotentDuplicate { original_id } => Err(Status::already_exists(
+                        format!("Idempotent duplicate: original stimulus {original_id}")
+                    )),
+                    StimulusError::LowConfidence { confidence, threshold } => Err(Status::failed_precondition(
+                        format!("Classification confidence {confidence:.2} below threshold {threshold:.2}")
+                    )),
+                    StimulusError::NoRouterConfigured { source_name } => Err(Status::not_found(
+                        format!("No route or router agent configured for source '{source_name}'")
+                    )),
+                    other => Err(Status::internal(other.to_string())),
+                }
+            }
         }
     }
 }

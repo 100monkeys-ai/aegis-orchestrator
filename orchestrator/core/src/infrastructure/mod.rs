@@ -28,6 +28,7 @@
 
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server + cortex client | ADR-042 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
+//! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 
 pub mod repositories;
 pub mod runtime;
@@ -50,6 +51,7 @@ pub mod smcp;
 pub mod tool_router;
 pub mod aegis_runtime_proto;
 pub mod cortex_client;
+pub mod sensor;
 
 pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};
 pub use temporal_event_listener::{TemporalEventListener, TemporalEventPayload, TemporalEventMapper};

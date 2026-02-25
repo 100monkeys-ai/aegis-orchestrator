@@ -612,6 +612,51 @@ pub enum SmcpEvent {
     },
 }
 
+/// Stimulus ingestion and routing events (BC-8 Stimulus-Response Context, ADR-021).
+///
+/// Published by [`crate::application::stimulus::StandardStimulusService`].
+/// Consumed by:
+/// - Cortex for routing pattern learning (Stage 2 → Stage 1 promotion signals)
+/// - Control Plane for stimulus audit dashboard
+/// - ADR-030 event replay (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StimulusEvent {
+    /// A stimulus arrived and passed authentication — before routing begins.
+    StimulusReceived {
+        stimulus_id: crate::domain::stimulus::StimulusId,
+        /// Canonical source name (from `StimulusSource::name()`).
+        source: String,
+        received_at: DateTime<Utc>,
+    },
+
+    /// Routing succeeded and a workflow execution was started.
+    StimulusClassified {
+        stimulus_id: crate::domain::stimulus::StimulusId,
+        /// UUID string of the WorkflowId that was selected.
+        workflow_id: String,
+        /// Confidence score: 1.0 for deterministic routes, [0.7, 1.0] for LLM.
+        confidence: f64,
+        /// "Deterministic" | "LlmClassified"
+        routing_mode: String,
+        classified_at: DateTime<Utc>,
+    },
+
+    /// The stimulus was rejected before or after routing.
+    /// `reason` is a human-readable string (e.g. "low_confidence: 0.42", "hmac_invalid").
+    StimulusRejected {
+        stimulus_id: crate::domain::stimulus::StimulusId,
+        reason: String,
+        rejected_at: DateTime<Utc>,
+    },
+
+    /// The RouterAgent execution itself failed (distinct from a low-confidence classification).
+    ClassificationFailed {
+        stimulus_id: crate::domain::stimulus::StimulusId,
+        error: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

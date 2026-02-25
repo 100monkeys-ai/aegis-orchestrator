@@ -20,11 +20,16 @@ handlebars = "5.1"
 async-trait = "0.1"
 futures = { workspace = true }
 sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+subtle = "2.6"
+dashmap = "6"
 bollard.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
 tracing.workspace = true
 axum.workspace = true
 tokio-stream = "0.1.18"
+tokio-util = "0.7"
 tower-http.workspace = true
 hostname = "0.4"
 dirs = "5.0"

@@ -19,19 +19,24 @@
 //! | `POST` | `/smcp/attest` | SMCP attestation handshake (ADR-035) |
 //! | `POST` | `/smcp/tools/invoke` | SMCP tool invocation (ADR-033) |
 //! | `POST` | `/v1/llm/generate` | Inner loop gateway (ADR-038) |
+//! | `POST` | `/v1/stimuli` | Stimulus ingestion — Keycloak Bearer auth (ADR-021) |
+//! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
 
 use axum::{
     routing::{get, post},
-    Router, Json, extract::{State, Path},
+    Router, Json, extract::{State, Path, FromRef},
     response::{Sse, IntoResponse},
 };
 use std::sync::Arc;
 use tokio_stream::StreamExt;
 use crate::application::execution::ExecutionService;
 use crate::application::inner_loop_service::{InnerLoopService, InnerLoopRequest};
+use crate::application::stimulus::StimulusService;
 use crate::domain::execution::ExecutionInput;
 use crate::domain::agent::AgentId;
+use crate::presentation::webhook_guard::{WebhookHmacState, WebhookSecretProvider, EnvWebhookSecretProvider};
+use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
 use serde_json::json;
 use futures::stream::Stream;
 use std::pin::Pin;
@@ -41,6 +46,19 @@ pub struct AppState {
     pub human_input_service: Arc<crate::infrastructure::HumanInputService>,
     /// Inner loop gateway service (ADR-038). Optional until wired.
     pub inner_loop_service: Option<Arc<InnerLoopService>>,
+    /// BC-8: Stimulus routing and webhook ingestion service (ADR-021). Optional until wired.
+    pub stimulus_service: Option<Arc<dyn StimulusService>>,
+    /// BC-8: HMAC secret provider for webhook requests. Defaults to EnvWebhookSecretProvider.
+    pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
+}
+
+/// Enable [`WebhookHmacGuard`] Axum extractor to pull its state from [`AppState`].
+impl FromRef<Arc<AppState>> for WebhookHmacState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        WebhookHmacState {
+            secret_provider: state.webhook_secret_provider.clone(),
+        }
+    }
 }
 
 pub fn app(
@@ -51,6 +69,8 @@ pub fn app(
         execution_service,
         human_input_service,
         inner_loop_service: None,
+        stimulus_service: None,
+        webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
     });
     
     Router::new()
@@ -65,6 +85,9 @@ pub fn app(
         .route("/smcp/tools/invoke", post(smcp_tool_invoke))
         // Inner loop gateway (ADR-038)
         .route("/v1/llm/generate", post(inner_loop_generate))
+        // BC-8 Stimulus-Response (ADR-021)
+        .route("/v1/stimuli", post(ingest_stimulus_handler))
+        .route("/v1/webhooks/:source", post(webhook_handler))
         .with_state(state)
 }
 
@@ -80,6 +103,8 @@ pub fn app_with_inner_loop(
         execution_service,
         human_input_service,
         inner_loop_service: Some(inner_loop_service),
+        stimulus_service: None,
+        webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
     });
 
     Router::new()
@@ -92,6 +117,9 @@ pub fn app_with_inner_loop(
         .route("/smcp/attest", post(smcp_attestation))
         .route("/smcp/tools/invoke", post(smcp_tool_invoke))
         .route("/v1/llm/generate", post(inner_loop_generate))
+        // BC-8 Stimulus-Response (ADR-021)
+        .route("/v1/stimuli", post(ingest_stimulus_handler))
+        .route("/v1/webhooks/:source", post(webhook_handler))
         .with_state(state)
 }
 

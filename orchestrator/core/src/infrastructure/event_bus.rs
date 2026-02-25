@@ -33,6 +33,7 @@
 //! | `MCP` | BC-4/Tools | ADR-033 |
 //! | `Learning` / `Cortex` | BC-5 | ADR-018 |
 //! | `Policy` | BC-4 | — |
+//! | `Stimulus` | BC-8 | ADR-021 |
 //!
 //! ## Phase Notes
 //!
@@ -49,7 +50,7 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent, SmcpEvent};
+use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent, SmcpEvent, StimulusEvent};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -68,6 +69,8 @@ pub enum DomainEvent {
     Storage(StorageEvent),
     MCP(MCPToolEvent),
     Smcp(SmcpEvent),
+    /// BC-8 Stimulus-Response events (ADR-021)
+    Stimulus(StimulusEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -130,6 +133,11 @@ impl EventBus {
     /// Publish an SMCP session/security event (ADR-035)
     pub fn publish_smcp_event(&self, event: SmcpEvent) {
         self.publish(DomainEvent::Smcp(event));
+    }
+
+    /// Publish a stimulus ingestion/routing event (BC-8 ADR-021)
+    pub fn publish_stimulus_event(&self, event: StimulusEvent) {
+        self.publish(DomainEvent::Stimulus(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -341,6 +349,7 @@ impl AgentEventReceiver {
                 SmcpEvent::SessionRevoked { agent_id, .. } => agent_id == &self.agent_id,
                 SmcpEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
             },
+            DomainEvent::Stimulus(_) => false, // Stimulus events are system-wide, not per-agent
         }
     }
 }

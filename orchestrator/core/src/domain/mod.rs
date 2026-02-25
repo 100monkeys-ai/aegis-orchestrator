@@ -20,6 +20,8 @@
 //! | [`smcp_session`] | BC-12 SMCP | `SmcpSession` aggregate, `EnvelopeVerifier` trait |
 //! | [`smcp_session_repository`] | BC-12 SMCP | `SmcpSessionRepository` trait |
 //! | [`workflow`] | BC-3 Workflow | `Workflow` FSM aggregate, `WorkflowState`, `Blackboard` (ADR-015) |
+//! | [`workflow_registry`] | BC-8 Stimulus-Response | `WorkflowRegistry` aggregate root — routing table + RouterAgent ref (ADR-021) |
+//! | [`stimulus`] | BC-8 Stimulus-Response | `Stimulus`, `StimulusId`, `StimulusSource`, `RoutingDecision` value objects (ADR-021) |
 //! | [`volume`] | BC-7 Storage Gateway | `Volume` aggregate, `StorageClass`, `VolumeMount` (ADR-032) |
 //! | [`storage`] | BC-7 Storage Gateway | `StorageProvider` trait, `OpenMode`, ACL for SeaweedFS |
 //! | [`fsal`] | BC-7 Storage Gateway | `AegisFSAL` transport-agnostic security boundary (ADR-036) |
@@ -41,6 +43,8 @@ pub mod node_config;
 pub mod repository;
 pub mod llm;
 pub mod workflow;
+pub mod workflow_registry;
+pub mod stimulus;
 pub mod validation;
 pub mod volume;
 pub mod storage;
