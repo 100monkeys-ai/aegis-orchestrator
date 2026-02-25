@@ -256,6 +256,7 @@ spec:
                     version: "3.11".to_string(),
                     isolation: "inherit".to_string(),
                     autopull: true,
+                    model: "default".to_string(),
                 },
                 task: None,
                 context: vec![],

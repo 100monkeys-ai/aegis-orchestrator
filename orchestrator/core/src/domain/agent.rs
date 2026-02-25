@@ -25,7 +25,9 @@
 //!   name: code-reviewer
 //! spec:
 //!   runtime:
-//!     model: gpt-4o
+//!     language: python
+//!     version: "3.11"
+//!     model: default   # alias resolved to a real model in aegis-config.yaml
 //!   security:
 //!     network:
 //!       allowlist: ["github.com"]
@@ -166,6 +168,12 @@ pub struct RuntimeConfig {
     #[serde(default = "default_isolation")]
     pub isolation: String,
     
+    /// LLM model alias for this agent's primary LLM calls.
+    /// Maps to a concrete provider + model in `aegis-config.yaml`.
+    /// Standard aliases: `default`, `fast`, `smart`, `cheap`, `local`.
+    #[serde(default = "default_model_alias")]
+    pub model: String,
+
     /// Optional autopull
     #[serde(default = "default_true")]
     pub autopull: bool,
@@ -565,6 +573,7 @@ fn default_cpu() -> u32 { 1000 }
 fn default_memory() -> String { "512Mi".to_string() }
 fn default_disk() -> String { "1Gi".to_string() }
 fn default_isolation() -> String { "inherit".to_string() }
+fn default_model_alias() -> String { "default".to_string() }
 fn default_network_mode() -> String { "allow".to_string() }
 
 impl Default for ResourceLimits {
@@ -693,6 +702,7 @@ mod tests {
                     version: "3.11".to_string(),
                     isolation: "inherit".to_string(),
                     autopull: true,
+                    model: "default".to_string(),
                 },
                 task: None,
                 context: vec![],

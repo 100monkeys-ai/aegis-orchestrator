@@ -541,11 +541,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tool_router,
     ));
 
+    let inner_loop_service = Arc::new(
+        aegis_core::application::inner_loop_service::InnerLoopService::new(
+            tool_invocation_service.clone(),
+            llm_registry,
+        )
+    );
+
     let app_state = AppState {
         agent_service,
         execution_service: execution_service.clone(),
         event_bus: event_bus.clone(),
-        _llm_registry: llm_registry,
+        inner_loop_service: inner_loop_service.clone(),
         human_input_service: human_input_service.clone(),
         temporal_event_listener,
         register_workflow_use_case,
@@ -854,7 +861,7 @@ struct AppState {
     agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
     event_bus: Arc<EventBus>,
-    _llm_registry: Arc<ProviderRegistry>,
+    inner_loop_service: Arc<aegis_core::application::inner_loop_service::InnerLoopService>,
     human_input_service: Arc<aegis_core::infrastructure::HumanInputService>,
     temporal_event_listener: Arc<TemporalEventListener>,
     register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
@@ -1523,158 +1530,94 @@ struct LlmGenerateRequest {
     _provider: Option<String>,
     model: Option<String>,
     prompt: String,
-    temperature: Option<f32>,
-    max_tokens: Option<u32>,
+    _temperature: Option<f32>,
+    _max_tokens: Option<u32>,
 }
 
 async fn llm_generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LlmGenerateRequest>,
 ) -> impl IntoResponse {
-    use aegis_core::domain::llm::GenerationOptions;
-    
-    // Resolve alias or use default
-    let alias = req.model.as_deref().unwrap_or("default");
-    
-    let options = GenerationOptions {
-        temperature: req.temperature.or(Some(0.7)),
-        max_tokens: req.max_tokens,
-        ..Default::default()
-    };
-    
-    let registry = &state._llm_registry;
+    use aegis_core::application::inner_loop_service::{InnerLoopRequest, ConversationMessage};
 
-    // Resolve agent_id for event logging
-    let agent_id = if let Some(exec_id) = req.execution_id {
+    // Resolve agent_id for event logging and inner loop request
+    let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
         let execution_id = aegis_core::domain::execution::ExecutionId(exec_id);
         if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
-            exec.agent_id
+            let id = exec.agent_id;
+            let s = id.0.to_string();
+            (id, s)
         } else {
             tracing::warn!("Could not find execution {} for LLM event", exec_id);
-            aegis_core::domain::agent::AgentId(Uuid::nil())
+            (aegis_core::domain::agent::AgentId(Uuid::nil()), Uuid::nil().to_string())
         }
     } else {
-        aegis_core::domain::agent::AgentId(Uuid::nil())
+        (aegis_core::domain::agent::AgentId(Uuid::nil()), Uuid::nil().to_string())
     };
-    
-    let mut current_prompt = req.prompt.clone();
-    let mut final_response_text = String::new();
-    let mut final_usage = aegis_core::domain::llm::TokenUsage::default();
-    let mut final_provider = "unknown".to_string();
-    let mut final_model = alias.to_string();
 
-    // Inject Tool Schemas for Gateway Tool Routing
-    if let Ok(tools) = state.tool_invocation_service.get_available_tools().await {
-        if !tools.is_empty() {
-            let tools_json = serde_json::to_string_pretty(&tools).unwrap_or_default();
-            current_prompt.push_str(&format!(
-                "\n\n[SYSTEM: You have access to the following tools]\n{}\n[To use a tool, you MUST output EXACTLY the following format and nothing else in that block:]\n<tool_call>{{\"name\": \"tool_name\", \"args\": {{\"arg1\": \"value\"}}}}</tool_call>",
-                tools_json
-            ));
-        }
-    }
+    let execution_id_str = req.execution_id
+        .map(|id| id.to_string())
+        .unwrap_or_else(|| Uuid::nil().to_string());
 
-    for _loop_idx in 0..10 {
-        match registry.generate(alias, &current_prompt, &options).await {
-            Ok(response) => {
-                // Record usage and provider info
-                final_usage.prompt_tokens += response.usage.prompt_tokens;
-                final_usage.completion_tokens += response.usage.completion_tokens;
-                final_usage.total_tokens += response.usage.total_tokens;
-                final_provider = response.provider.clone();
-                final_model = response.model.clone();
+    let model_alias = req.model.clone().unwrap_or_else(|| "default".to_string());
 
-                let text = response.text.clone();
-                let mut tool_called = false;
+    // Build the inner loop request, seeding the conversation with the rendered prompt
+    let inner_req = InnerLoopRequest {
+        agent_id: agent_id_str,
+        execution_id: execution_id_str.clone(),
+        prompt: req.prompt.clone(),
+        model_alias: model_alias.clone(),
+        messages: vec![ConversationMessage {
+            role: "user".to_string(),
+            content: req.prompt.clone(),
+            tool_call_id: None,
+        }],
+    };
 
-                // Log the interaction
-                if agent_id.0 != Uuid::nil() {
-                    if let Some(exec_id) = req.execution_id {
-                        let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
-                            execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
-                            agent_id: agent_id.clone(),
-                            iteration_number: req.iteration_number.unwrap_or(0),
-                            provider: response.provider.clone(),
-                            model: response.model.clone(),
-                            input_tokens: Some(response.usage.prompt_tokens),
-                            output_tokens: Some(response.usage.completion_tokens),
-                            prompt: current_prompt.clone(),
-                            response: response.text.clone(),
-                            timestamp: chrono::Utc::now(),
-                        };
-                        state.event_bus.publish_execution_event(event);
-                        
-                        let interaction = aegis_core::domain::execution::LlmInteraction {
-                            provider: response.provider.clone(),
-                            model: response.model.clone(),
-                            prompt: current_prompt.clone(),
-                            response: response.text.clone(),
-                            timestamp: chrono::Utc::now(),
-                        };
-                        let _ = state.execution_service.record_llm_interaction(
-                            aegis_core::domain::execution::ExecutionId(exec_id), 
-                            req.iteration_number.unwrap_or(0), 
-                            interaction
-                        ).await;
-                    }
+    match state.inner_loop_service.generate(inner_req).await {
+        Ok(response) => {
+            // Publish LlmInteraction event for observability
+            if agent_id.0 != Uuid::nil() {
+                if let Some(exec_id) = req.execution_id {
+                    let event = aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                        execution_id: aegis_core::domain::execution::ExecutionId(exec_id),
+                        agent_id: agent_id.clone(),
+                        iteration_number: req.iteration_number.unwrap_or(0),
+                        provider: "orchestrator".to_string(),
+                        model: model_alias.clone(),
+                        input_tokens: None,
+                        output_tokens: None,
+                        prompt: req.prompt.clone(),
+                        response: response.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    state.event_bus.publish_execution_event(event);
+
+                    let interaction = aegis_core::domain::execution::LlmInteraction {
+                        provider: "orchestrator".to_string(),
+                        model: model_alias.clone(),
+                        prompt: req.prompt.clone(),
+                        response: response.content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    let _ = state.execution_service.record_llm_interaction(
+                        aegis_core::domain::execution::ExecutionId(exec_id),
+                        req.iteration_number.unwrap_or(0),
+                        interaction,
+                    ).await;
                 }
-
-                // Parse for tool output block: <tool_call>{"name": "...", "args": {...}}</tool_call>
-                if let Some(start) = text.find("<tool_call>") {
-                    if let Some(end) = text[start..].find("</tool_call>") {
-                        let json_str = &text[start + 11..start + end];
-                        if let Ok(tool_data) = serde_json::from_str::<serde_json::Value>(json_str) {
-                            if let (Some(name), Some(args)) = (tool_data.get("name").and_then(|n| n.as_str()), tool_data.get("args")) {
-                                if let Some(exec_id_uuid) = req.execution_id {
-                                    tracing::info!("Gateway intercepted tool call: {}", name);
-                                    let execution_id = aegis_core::domain::execution::ExecutionId(exec_id_uuid);
-                                    let result = state.tool_invocation_service.invoke_tool_internal(
-                                        &agent_id,
-                                        execution_id,
-                                        name.to_string(),
-                                        args.clone()
-                                    ).await;
-                                    
-                                    let tool_result_str = match result {
-                                        Ok(val) => serde_json::to_string(&val).unwrap_or_else(|_| "{}".to_string()),
-                                        Err(e) => format!("{{\"error\": \"{}\"}}", e),
-                                    };
-                                    
-                                    current_prompt.push_str(&format!("\n\nAssistant generated tool call:\n{}\n\nTool Execution Result:\n{}\n", text, tool_result_str));
-                                    tool_called = true;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if !tool_called {
-                    // This is the final answer!
-                    final_response_text = text;
-                    break;
-                }
-            },
-            Err(e) => {
-                tracing::error!("LLM generation failed: {}", e);
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})));
             }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "content": response.content,
+                "tool_calls_executed": response.tool_calls_executed,
+            })))
+        }
+        Err(e) => {
+            tracing::error!("Inner loop generation failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
         }
     }
-
-    if final_response_text.is_empty() {
-        final_response_text = "ERROR: Exceeded maximum tool call loop iterations".to_string();
-    }
-
-    (StatusCode::OK, Json(serde_json::json!({
-        "content": final_response_text,
-        "usage": {
-            "prompt_tokens": final_usage.prompt_tokens,
-            "completion_tokens": final_usage.completion_tokens,
-            "total_tokens": final_usage.total_tokens
-        },
-        "provider": final_provider,
-        "model": final_model
-    })))
 }
 
 // ========================================
