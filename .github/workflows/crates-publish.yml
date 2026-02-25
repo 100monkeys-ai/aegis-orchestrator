@@ -6,7 +6,7 @@ name: Publish crates.io
 on:
   push:
     tags:
-      - 'v*.*.*'   # Publishes semver tags (e.g. v0.1.0 → 0.1.0, 0.1, 0)
+      - '*.*.*'   # Publishes semver tags (e.g. 0.1.0 → 0.1.0, 0.1, 0)
     # Allow manual triggering for debugging
   workflow_dispatch:
     inputs:
