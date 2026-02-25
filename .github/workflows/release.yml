@@ -8,7 +8,7 @@ on:
     branches:
       - main
     tags:
-      - 'v*.*.*'
+      - '*.*.*'  # Matches 0.1.0, 0.1.0-pre-alpha, etc.
   workflow_dispatch:
     inputs:
       version:
