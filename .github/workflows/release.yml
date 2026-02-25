@@ -103,48 +103,11 @@ jobs:
           path: aegis-macos-aarch64.tar.gz
           retention-days: 1
 
-  build-macos-intel:
-    name: Build macOS (Intel)
-    runs-on: macos-12  # Intel runner
-    
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
 
-      - name: Install dependencies
-        run: |
-          brew install protobuf
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-apple-darwin
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: |
-          cargo build --release --bin aegis --locked --target x86_64-apple-darwin
-          
-      - name: Create tarball
-        run: |
-          cd target/x86_64-apple-darwin/release
-          tar -czf aegis-macos-x86_64.tar.gz aegis
-          cd ../../..
-          mv target/x86_64-apple-darwin/release/aegis-macos-x86_64.tar.gz .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: aegis-macos-x86_64
-          path: aegis-macos-x86_64.tar.gz
-          retention-days: 1
 
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-macos, build-macos-intel]
+    needs: [build-linux, build-macos]
     runs-on: ubuntu-latest
     
     steps:
@@ -200,7 +163,5 @@ jobs:
             artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz.sha256
             artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz
             artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz.sha256
-            artifacts/aegis-macos-x86_64/aegis-macos-x86_64.tar.gz
-            artifacts/aegis-macos-x86_64/aegis-macos-x86_64.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
