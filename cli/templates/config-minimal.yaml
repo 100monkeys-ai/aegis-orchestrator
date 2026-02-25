@@ -52,7 +52,7 @@ spec:
     # Agent container networking (Docker deployments)
     # docker_network_mode: "env:AEGIS_DOCKER_NETWORK"  # Optional, read from environment
     # Orchestrator URL for agent bootstrap callbacks
-    # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"    # Optional (default: http://localhost:8000)
+    # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"    # Optional (default: http://localhost:8088)
     # NFS server hostname/IP for volume mounts (ADR-036)
     # nfs_server_host: "env:AEGIS_NFS_HOST"             # Optional (default: 127.0.0.1)
     # nfs_port: 2049                                    # Optional (default: 2049)
@@ -60,7 +60,7 @@ spec:
 
   network:
     # bind_address: "0.0.0.0"  # Optional (default: 0.0.0.0)
-    # port: 8000               # Optional (default: 8000)
+    # port: 8088               # Optional (default: 8088)
     # orchestrator_endpoint: "https://orchestrator.aegis.ai"  # Optional
     # heartbeat_interval_seconds: 30  # Optional
 

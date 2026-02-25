@@ -162,10 +162,10 @@ spec:
     
     # Orchestrator URL for agent bootstrap callbacks
     # Used by agent containers to reach the LLM proxy endpoint
-    # Default: "http://localhost:8000" (local development)
+    # Default: "http://localhost:8088" (local development)
     # Supports env:VAR_NAME syntax for environment variable substitution
     # Examples:
-    #   - Local development: "http://localhost:8000"
+    #   - Local development: "http://localhost:8088"
     #   - Docker deployment: "http://aegis-runtime:8088"
     #   - Remote deployment: "https://orchestrator.example.com"
     #   - Environment var: "env:AEGIS_ORCHESTRATOR_URL"
@@ -199,7 +199,7 @@ spec:
   network:
     # Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
     # bind_address: "0.0.0.0"
-    # port: 8000
+    # port: 8088
 
     # Optional: Central orchestrator endpoint for multi-node coordination
     # Leave unset for standalone mode
@@ -212,8 +212,8 @@ spec:
     # heartbeat_interval_seconds: 30
     
     # Optional: Proxy configuration
-    # http_proxy: "http://proxy.example.com:8000"
-    # https_proxy: "http://proxy.example.com:8000"
+    # http_proxy: "http://proxy.example.com:8088"
+    # https_proxy: "http://proxy.example.com:8088"
     # no_proxy: "localhost,127.0.0.1,.local"
   
   # --------------------------------------------------------------------------

@@ -57,8 +57,8 @@ struct Cli {
     )]
     config: Option<PathBuf>,
 
-    /// HTTP API port (default: 8000)
-    #[arg(long, global = true, env = "AEGIS_PORT", default_value = "8000")]
+    /// HTTP API port (default: 8088)
+    #[arg(long, global = true, env = "AEGIS_PORT", default_value = "8088")]
     port: u16,
 
     /// HTTP API host (default: 127.0.0.1)

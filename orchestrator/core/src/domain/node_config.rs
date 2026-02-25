@@ -273,7 +273,7 @@ pub struct RuntimeConfig {
     /// Orchestrator URL for agent containers to call back to
     /// Used by agent bootstrap scripts to reach the LLM proxy endpoint
     /// Supports env:VAR_NAME syntax for environment variable substitution
-    /// Default: "http://localhost:8000" (local development)
+    /// Default: "http://localhost:8088" (local development)
     /// Docker deployments should override to "http://aegis-runtime:8088"
     #[serde(default = "default_orchestrator_url")]
     pub orchestrator_url: String,
@@ -828,7 +828,7 @@ fn default_log_level() -> String {
 }
 
 fn default_orchestrator_url() -> String {
-    "http://localhost:8000".to_string()
+    "http://localhost:8088".to_string()
 }
 
 fn default_log_format() -> String {
@@ -848,7 +848,7 @@ fn default_bind_address() -> String {
 }
 
 fn default_api_port() -> u16 {
-    8000
+    8088
 }
 
 fn default_grpc_port() -> u16 {

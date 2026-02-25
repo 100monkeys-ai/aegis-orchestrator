@@ -230,7 +230,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let orchestrator_url =
         resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
-            "http://localhost:8000".to_string()
+            "http://localhost:8088".to_string()
         });
 
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036

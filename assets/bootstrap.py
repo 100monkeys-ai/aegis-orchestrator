@@ -15,7 +15,7 @@ def debug_print(*args, **kwargs):
 
 def main():
     # 1. Configuration
-    orchestrator_url = os.environ.get("AEGIS_ORCHESTRATOR_URL", "http://host.docker.internal:8000")
+    orchestrator_url = os.environ.get("AEGIS_ORCHESTRATOR_URL", "http://host.docker.internal:8088")
     execution_id = os.environ.get("AEGIS_EXECUTION_ID")
     iteration_env = os.environ.get("AEGIS_ITERATION")
     iteration_number = int(iteration_env) if iteration_env else None
@@ -94,7 +94,7 @@ def main():
     urls = []
     if os.environ.get("AEGIS_ORCHESTRATOR_URL"):
         urls.append(os.environ["AEGIS_ORCHESTRATOR_URL"])
-    urls.append("http://host.docker.internal:8000")
+    urls.append("http://host.docker.internal:8088")
     
     # Deduplicate
     urls = list(dict.fromkeys(urls))

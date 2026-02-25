@@ -469,7 +469,7 @@ impl ExecutionService for StandardExecutionService {
             .network
             .as_ref()
             .map(|n| n.port)
-            .unwrap_or(8000);
+            .unwrap_or(8088);
         let url = format!("http://host.docker.internal:{}", port);
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
 
