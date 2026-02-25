@@ -100,8 +100,14 @@ impl NetworkPolicy {
     /// ```
     pub fn allows(&self, host: &str) -> bool {
         match self.mode {
-            PolicyMode::Allow => self.allowlist.iter().any(|pattern| matches_pattern(pattern, host)),
-            PolicyMode::Deny => !self.allowlist.iter().any(|pattern| matches_pattern(pattern, host)),
+            PolicyMode::Allow => self
+                .allowlist
+                .iter()
+                .any(|pattern| matches_pattern(pattern, host)),
+            PolicyMode::Deny => !self
+                .allowlist
+                .iter()
+                .any(|pattern| matches_pattern(pattern, host)),
         }
     }
 }
@@ -188,7 +194,10 @@ mod tests {
     fn test_network_policy_allow_mode_exact_match() {
         let policy = NetworkPolicy::new(
             PolicyMode::Allow,
-            vec!["api.example.com".to_string(), "data.example.com".to_string()],
+            vec![
+                "api.example.com".to_string(),
+                "data.example.com".to_string(),
+            ],
         );
         assert!(policy.allows("api.example.com"));
         assert!(policy.allows("data.example.com"));
@@ -197,10 +206,7 @@ mod tests {
 
     #[test]
     fn test_network_policy_allow_mode_wildcard() {
-        let policy = NetworkPolicy::new(
-            PolicyMode::Allow,
-            vec!["*.example.com".to_string()],
-        );
+        let policy = NetworkPolicy::new(PolicyMode::Allow, vec!["*.example.com".to_string()]);
         assert!(policy.allows("api.example.com"));
         assert!(policy.allows("db.example.com"));
         // The wildcard `ends_with` check also matches the bare domain

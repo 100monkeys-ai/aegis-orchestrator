@@ -16,8 +16,8 @@
 //! - **Purpose:** Implements internal responsibilities for storage
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
 
 /// Opaque file handle for POSIX operations
 ///
@@ -186,7 +186,12 @@ pub trait StorageProvider: Send + Sync {
     /// # Returns
     /// * `Ok(Vec<u8>)` - Data read (may be shorter than length at EOF)
     /// * `Err(StorageError)` if read failed
-    async fn read_at(&self, handle: &FileHandle, offset: u64, length: usize) -> Result<Vec<u8>, StorageError>;
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, StorageError>;
 
     /// Write data to file at specific offset
     ///
@@ -198,7 +203,12 @@ pub trait StorageProvider: Send + Sync {
     /// # Returns
     /// * `Ok(usize)` - Number of bytes written
     /// * `Err(StorageError)` if write failed
-    async fn write_at(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<usize, StorageError>;
+    async fn write_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, StorageError>;
 
     /// Close file handle
     ///
@@ -293,7 +303,7 @@ pub enum StorageError {
 
     #[error("Invalid path: {0}")]
     InvalidPath(String),
-    
+
     #[error("File not found: {0}")]
     FileNotFound(String),
 
@@ -344,8 +354,12 @@ mod tests {
     impl MockStorageProvider {
         pub fn new() -> Self {
             Self {
-                directories: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-                quotas: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                directories: std::sync::Arc::new(std::sync::Mutex::new(
+                    std::collections::HashMap::new(),
+                )),
+                quotas: std::sync::Arc::new(
+                    std::sync::Mutex::new(std::collections::HashMap::new()),
+                ),
             }
         }
     }
@@ -403,15 +417,29 @@ mod tests {
         }
 
         // POSIX file operations (ADR-036)
-        async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
+        async fn open_file(
+            &self,
+            _path: &str,
+            _mode: OpenMode,
+        ) -> Result<FileHandle, StorageError> {
             Ok(FileHandle(b"mock-handle".to_vec()))
         }
 
-        async fn read_at(&self, _handle: &FileHandle, _offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+        async fn read_at(
+            &self,
+            _handle: &FileHandle,
+            _offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, StorageError> {
             Ok(vec![0u8; length])
         }
 
-        async fn write_at(&self, _handle: &FileHandle, _offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+        async fn write_at(
+            &self,
+            _handle: &FileHandle,
+            _offset: u64,
+            data: &[u8],
+        ) -> Result<usize, StorageError> {
             Ok(data.len())
         }
 

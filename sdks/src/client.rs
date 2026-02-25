@@ -37,74 +37,73 @@ impl AegisClient {
     }
 
     /// Deploy an agent to the AEGIS cloud.
-    pub async fn deploy_agent(&self, manifest: &crate::AgentManifest) -> Result<DeploymentResponse> {
+    pub async fn deploy_agent(
+        &self,
+        manifest: &crate::AgentManifest,
+    ) -> Result<DeploymentResponse> {
         let url = format!("{}/v1/agents", self.base_url);
-        
+
         let mut req = self.client.post(&url).json(manifest);
-        
+
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        
+
         let response = req.send().await?;
         let deployment = response.json().await?;
-        
+
         Ok(deployment)
     }
 
     /// Execute a task on a deployed agent.
-    pub async fn execute_task(
-        &self,
-        agent_id: &str,
-        input: TaskInput,
-    ) -> Result<TaskOutput> {
+    pub async fn execute_task(&self, agent_id: &str, input: TaskInput) -> Result<TaskOutput> {
         let url = format!("{}/v1/agents/{}/execute", self.base_url, agent_id);
-        
+
         let mut req = self.client.post(&url).json(&input);
-        
+
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        
+
         let response = req.send().await?;
         let output = response.json().await?;
-        
+
         Ok(output)
     }
 
     /// Get the status of an agent.
     pub async fn get_agent_status(&self, agent_id: &str) -> Result<AgentStatus> {
         let url = format!("{}/v1/agents/{}/status", self.base_url, agent_id);
-        
+
         let mut req = self.client.get(&url);
-        
+
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        
+
         let response = req.send().await?;
         let status = response.json().await?;
-        
+
         Ok(status)
     }
 
     /// Terminate an agent instance.
     pub async fn terminate_agent(&self, agent_id: &str) -> Result<()> {
         let url = format!("{}/v1/agents/{}", self.base_url, agent_id);
-        
+
         let mut req = self.client.delete(&url);
-        
+
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        
+
         req.send().await?;
-        
+
         Ok(())
     }
 
     /// Generate text using the orchestrator's LLM proxy.
-    /// 
+    ///
     /// # Arguments
     /// * `prompt` - The prompt to generate text from.
     /// * `model` - Optional model alias to use.
@@ -116,23 +115,24 @@ impl AegisClient {
         execution_id: Option<&str>,
     ) -> Result<String> {
         let url = format!("{}/v1/dispatch-gateway", self.base_url);
-        
+
         let payload = serde_json::json!({
             "prompt": prompt,
             "model": model,
             "execution_id": execution_id
         });
-        
+
         let mut req = self.client.post(&url).json(&payload);
-        
+
         if let Some(key) = &self.api_key {
             req = req.header("Authorization", format!("Bearer {}", key));
         }
-        
+
         let response = req.send().await?;
         let json: serde_json::Value = response.json().await?;
-        
-        json["content"].as_str()
+
+        json["content"]
+            .as_str()
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow::anyhow!("Invalid response format"))
     }

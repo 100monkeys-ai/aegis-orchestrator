@@ -22,25 +22,26 @@
 //! - **Purpose:** Implements internal responsibilities for fsal
 
 use crate::domain::{
-    execution::ExecutionId,
-    volume::{VolumeId, Volume, VolumeStatus},
-    repository::VolumeRepository,
-    storage::{StorageProvider, FileAttributes, DirEntry, OpenMode, StorageError},
     events::StorageEvent,
-    policy::FilesystemPolicy,
+    execution::ExecutionId,
     path_sanitizer::{PathSanitizer, PathSanitizerError},
+    policy::FilesystemPolicy,
+    repository::VolumeRepository,
+    storage::{DirEntry, FileAttributes, OpenMode, StorageError, StorageProvider},
+    volume::{Volume, VolumeId, VolumeStatus},
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
-use serde::{Serialize, Deserialize};
-
 
 /// AegisFSAL errors
 #[derive(Debug, Error)]
 pub enum FsalError {
-    #[error("Unauthorized volume access: execution {execution_id} does not own volume {volume_id}")]
+    #[error(
+        "Unauthorized volume access: execution {execution_id} does not own volume {volume_id}"
+    )]
     UnauthorizedAccess {
         execution_id: ExecutionId,
         volume_id: VolumeId,
@@ -194,7 +195,9 @@ impl AegisFSAL {
 
         // Check execution owns volume
         let is_owner = match &volume.ownership {
-            crate::domain::volume::VolumeOwnership::Execution { execution_id: exec_id } => *exec_id == execution_id,
+            crate::domain::volume::VolumeOwnership::Execution {
+                execution_id: exec_id,
+            } => *exec_id == execution_id,
             _ => false, // WorkflowExecution or Persistent volumes require different auth
         };
 
@@ -217,23 +220,19 @@ impl AegisFSAL {
     }
 
     /// Enforce filesystem policy for read operation
-    fn enforce_read_policy(
-        &self,
-        policy: &FilesystemPolicy,
-        path: &str,
-    ) -> Result<(), FsalError> {
+    fn enforce_read_policy(&self, policy: &FilesystemPolicy, path: &str) -> Result<(), FsalError> {
         // Check if path matches any read allowlist pattern
         let allowed = policy.read.iter().any(|pattern| {
             // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
             if pattern.ends_with("/**") {
                 // Recursive glob pattern (/workspace/** matches /workspace and all nested)
                 let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
-                path.starts_with(prefix) && (path == prefix || path.starts_with(&format!("{}/", prefix)))
+                path.starts_with(prefix)
+                    && (path == prefix || path.starts_with(&format!("{}/", prefix)))
             } else if pattern.ends_with("/*") {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
-                path.starts_with(prefix)
-                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
+                path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 // Exact match
                 path == pattern
@@ -251,23 +250,19 @@ impl AegisFSAL {
     }
 
     /// Enforce filesystem policy for write operation
-    fn enforce_write_policy(
-        &self,
-        policy: &FilesystemPolicy,
-        path: &str,
-    ) -> Result<(), FsalError> {
+    fn enforce_write_policy(&self, policy: &FilesystemPolicy, path: &str) -> Result<(), FsalError> {
         // Check if path matches any write allowlist pattern
         let allowed = policy.write.iter().any(|pattern| {
             // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
             if pattern.ends_with("/**") {
                 // Recursive glob pattern (/workspace/** matches /workspace and all nested)
                 let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
-                path.starts_with(prefix) && (path == prefix || path.starts_with(&format!("{}/", prefix)))
+                path.starts_with(prefix)
+                    && (path == prefix || path.starts_with(&format!("{}/", prefix)))
             } else if pattern.ends_with("/*") {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
-                path.starts_with(prefix)
-                    && path.as_bytes().get(prefix.len()) == Some(&b'/')
+                path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/')
             } else {
                 // Exact match
                 path == pattern
@@ -311,11 +306,8 @@ impl AegisFSAL {
         let canonical_str = canonical.to_str().unwrap().replace("\\", "/");
 
         // 4. Create new handle
-        let new_handle = AegisFileHandle::new(
-            handle.execution_id,
-            handle.volume_id,
-            &canonical_str,
-        );
+        let new_handle =
+            AegisFileHandle::new(handle.execution_id, handle.volume_id, &canonical_str);
 
         Ok(new_handle)
     }
@@ -332,17 +324,26 @@ impl AegisFSAL {
         let start = std::time::Instant::now();
 
         // 1. Authorize
-        let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
+        let volume = self
+            .authorize(handle.execution_id, handle.volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_read_policy(policy, path_str)?;
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 3. Read via storage provider
-        let storage_handle = self.storage_provider.open_file(&full_path, OpenMode::ReadOnly).await?;
+        let storage_handle = self
+            .storage_provider
+            .open_file(&full_path, OpenMode::ReadOnly)
+            .await?;
         let data = self
             .storage_provider
             .read_at(&storage_handle, offset, length)
@@ -378,24 +379,30 @@ impl AegisFSAL {
         let start = std::time::Instant::now();
 
         // 1. Authorize and get volume for quota checking
-        let volume = self.authorize(handle.execution_id, handle.volume_id).await?;
+        let volume = self
+            .authorize(handle.execution_id, handle.volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_write_policy(policy, path_str)?;
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 3. Proactive quota enforcement (ADR-036)
         // Check if write would exceed volume quota before attempting write
         let current_usage = self.storage_provider.get_usage(&volume.remote_path).await?;
         let requested_bytes = data.len() as u64;
         let projected_usage = current_usage.saturating_add(requested_bytes);
-        
+
         if projected_usage > volume.size_limit_bytes {
             let available_bytes = volume.size_limit_bytes.saturating_sub(current_usage);
-            
+
             // Publish quota exceeded event
             self.event_publisher
                 .publish_storage_event(StorageEvent::QuotaExceeded {
@@ -406,7 +413,7 @@ impl AegisFSAL {
                     exceeded_at: Utc::now(),
                 })
                 .await;
-            
+
             return Err(FsalError::QuotaExceeded {
                 requested_bytes,
                 available_bytes,
@@ -414,7 +421,10 @@ impl AegisFSAL {
         }
 
         // 4. Write via storage provider
-        let storage_handle = self.storage_provider.open_file(&full_path, OpenMode::WriteOnly).await?;
+        let storage_handle = self
+            .storage_provider
+            .open_file(&full_path, OpenMode::WriteOnly)
+            .await?;
         let bytes_written = self
             .storage_provider
             .write_at(&storage_handle, offset, data)
@@ -458,7 +468,11 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. Create file via storage provider (using default mode 0o644)
         let handle = self.storage_provider.create_file(&full_path, 0o644).await?;
@@ -498,7 +512,11 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. Get attributes from storage provider
         let mut attrs = self.storage_provider.stat(&full_path).await?;
@@ -529,7 +547,11 @@ impl AegisFSAL {
         self.enforce_read_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. List directory via storage provider
         let entries = self.storage_provider.readdir(&full_path).await?;
@@ -567,7 +589,11 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. Create directory via storage provider
         self.storage_provider.create_directory(&full_path).await?;
@@ -604,7 +630,11 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. Delete file via storage provider
         self.storage_provider.delete_file(&full_path).await?;
@@ -641,7 +671,11 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = format!("{}/{}", volume.remote_path, path_str.trim_start_matches('/'));
+        let full_path = format!(
+            "{}/{}",
+            volume.remote_path,
+            path_str.trim_start_matches('/')
+        );
 
         // 5. Delete directory via storage provider
         self.storage_provider.delete_directory(&full_path).await?;
@@ -672,8 +706,12 @@ impl AegisFSAL {
         let volume = self.authorize(execution_id, volume_id).await?;
 
         // 2. Sanitize both paths
-        let from_canonical = self.path_sanitizer.canonicalize(from_path, Some("/workspace"))?;
-        let to_canonical = self.path_sanitizer.canonicalize(to_path, Some("/workspace"))?;
+        let from_canonical = self
+            .path_sanitizer
+            .canonicalize(from_path, Some("/workspace"))?;
+        let to_canonical = self
+            .path_sanitizer
+            .canonicalize(to_path, Some("/workspace"))?;
         let from_str = from_canonical.to_str().unwrap();
         let to_str = to_canonical.to_str().unwrap();
 
@@ -682,7 +720,11 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, to_str)?;
 
         // 4. Build full remote paths
-        let from_full = format!("{}/{}", volume.remote_path, from_str.trim_start_matches('/'));
+        let from_full = format!(
+            "{}/{}",
+            volume.remote_path,
+            from_str.trim_start_matches('/')
+        );
         let to_full = format!("{}/{}", volume.remote_path, to_str.trim_start_matches('/'));
 
         // 5. Rename via storage provider
@@ -725,11 +767,8 @@ mod tests {
 
     #[test]
     fn test_aegis_file_handle_roundtrip() {
-        let original = AegisFileHandle::new(
-            ExecutionId::new(),
-            VolumeId::new(),
-            "/workspace/test.txt",
-        );
+        let original =
+            AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/test.txt");
 
         let bytes = original.to_bytes().unwrap();
         let decoded = AegisFileHandle::from_bytes(&bytes).unwrap();

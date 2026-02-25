@@ -54,7 +54,9 @@ fn axum_headers_to_map(headers: &HeaderMap) -> HashMap<String, String> {
     headers
         .iter()
         .filter_map(|(k, v)| {
-            v.to_str().ok().map(|val| (k.as_str().to_string(), val.to_string()))
+            v.to_str()
+                .ok()
+                .map(|val| (k.as_str().to_string(), val.to_string()))
         })
         .collect()
 }
@@ -100,11 +102,8 @@ pub async fn ingest_stimulus_handler(
         }
     };
 
-    let stimulus = Stimulus::new(
-        StimulusSource::HttpApi,
-        body.content,
-    )
-    .with_headers(axum_headers_to_map(&headers));
+    let stimulus = Stimulus::new(StimulusSource::HttpApi, body.content)
+        .with_headers(axum_headers_to_map(&headers));
     let stimulus = if let Some(key) = body.idempotency_key {
         stimulus.with_idempotency_key(key)
     } else {
@@ -125,7 +124,8 @@ pub async fn ingest_stimulus_handler(
                     "stimulus_id": resp.stimulus_id.to_string(),
                     "workflow_execution_id": resp.workflow_execution_id,
                 })),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
             let (status, body) = stimulus_error_response(e);
@@ -167,7 +167,9 @@ pub async fn webhook_handler(
         .unwrap_or_else(|_| base64::engine::general_purpose::STANDARD.encode(&guard.body));
 
     let stimulus = Stimulus::new(
-        StimulusSource::Webhook { source_name: source.clone() },
+        StimulusSource::Webhook {
+            source_name: source.clone(),
+        },
         content,
     )
     .with_headers(axum_headers_to_map(&headers));
@@ -186,7 +188,8 @@ pub async fn webhook_handler(
                     "stimulus_id": resp.stimulus_id.to_string(),
                     "workflow_execution_id": resp.workflow_execution_id,
                 })),
-            ).into_response()
+            )
+                .into_response()
         }
         Err(e) => {
             let (status, body) = stimulus_error_response(e);

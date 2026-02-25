@@ -8,8 +8,8 @@
 //! Default base URL: `http://localhost:11434` (configurable via node config).
 
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions,
-    GenerationResponse, LLMError, LLMProvider, ToolSchema,
+    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
+    LLMError, LLMProvider, ToolSchema,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -233,7 +233,8 @@ mod tests {
 
     #[test]
     fn test_ollama_adapter_creation() {
-        let adapter = OllamaAdapter::new("http://localhost:11434".to_string(), "llama3.1".to_string());
+        let adapter =
+            OllamaAdapter::new("http://localhost:11434".to_string(), "llama3.1".to_string());
         assert_eq!(adapter.endpoint, "http://localhost:11434");
         assert_eq!(adapter.model, "llama3.1");
     }
@@ -242,10 +243,16 @@ mod tests {
     fn test_chat_request_serialization() {
         let request = OllamaChatRequest {
             model: "llama3.1".to_string(),
-            messages: vec![OllamaChatMessage { role: "user".to_string(), content: "Hi".to_string() }],
+            messages: vec![OllamaChatMessage {
+                role: "user".to_string(),
+                content: "Hi".to_string(),
+            }],
             stream: false,
             tools: None,
-            options: Some(OllamaOptions { temperature: Some(0.7), num_predict: Some(256) }),
+            options: Some(OllamaOptions {
+                temperature: Some(0.7),
+                num_predict: Some(256),
+            }),
         };
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json["model"], "llama3.1");
@@ -300,19 +307,40 @@ mod tests {
 
     #[test]
     fn test_endpoint_trailing_slash_handling() {
-        let url = format!("{}/api/chat", "http://localhost:11434/".trim_end_matches('/'));
+        let url = format!(
+            "{}/api/chat",
+            "http://localhost:11434/".trim_end_matches('/')
+        );
         assert_eq!(url, "http://localhost:11434/api/chat");
     }
 
     #[test]
     fn test_finish_reason_from_done_flag() {
-        assert_eq!(if true { FinishReason::Stop } else { FinishReason::Length }, FinishReason::Stop);
-        assert_eq!(if false { FinishReason::Stop } else { FinishReason::Length }, FinishReason::Length);
+        assert_eq!(
+            if true {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            },
+            FinishReason::Stop
+        );
+        assert_eq!(
+            if false {
+                FinishReason::Stop
+            } else {
+                FinishReason::Length
+            },
+            FinishReason::Length
+        );
     }
 
     #[test]
     fn test_default_max_tokens() {
-        let opts = GenerationOptions { max_tokens: None, temperature: None, stop_sequences: None };
+        let opts = GenerationOptions {
+            max_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+        };
         assert_eq!(opts.max_tokens.unwrap_or(4096), 4096);
     }
 

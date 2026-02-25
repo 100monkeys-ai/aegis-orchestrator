@@ -24,8 +24,8 @@
 //! - `extract_tool_name` / `extract_arguments` parse the `inner_mcp` JSON-RPC payload.
 //!
 //! See ADR-035 §3 (Protocol Wire Format).
-use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -95,44 +95,60 @@ pub struct ContextClaims {
 impl EnvelopeVerifier for SmcpEnvelope {
     fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
         let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
-            SmcpSessionError::SignatureVerificationFailed("Invalid public key length (must be 32 bytes)".to_string())
+            SmcpSessionError::SignatureVerificationFailed(
+                "Invalid public key length (must be 32 bytes)".to_string(),
+            )
         })?;
-        
+
         let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!("Invalid public key: {}", e))
         })?;
-        
+
         let decoded_sig = STANDARD.decode(&self.signature).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Invalid base64 signature: {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!(
+                "Invalid base64 signature: {}",
+                e
+            ))
         })?;
-        
+
         let sig_bytes: [u8; 64] = decoded_sig.try_into().map_err(|_| {
-            SmcpSessionError::SignatureVerificationFailed("Invalid signature length (must be 64 bytes)".to_string())
+            SmcpSessionError::SignatureVerificationFailed(
+                "Invalid signature length (must be 64 bytes)".to_string(),
+            )
         })?;
-        
+
         let signature = Signature::from_bytes(&sig_bytes);
-        
-        verifying_key.verify(&self.inner_mcp, &signature).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Signature verification failed: {}", e))
-        })
+
+        verifying_key
+            .verify(&self.inner_mcp, &signature)
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Signature verification failed: {}",
+                    e
+                ))
+            })
     }
-    
+
     fn extract_tool_name(&self) -> Option<String> {
         let payload: Value = serde_json::from_slice(&self.inner_mcp).ok()?;
-        
+
         // standard MCP tool call is `{ "method": "tools/call", "params": { "name": "..." } }`
         let method = payload.get("method")?.as_str()?;
         if method == "tools/call" {
-            payload.get("params")?.get("name")?.as_str().map(|s| s.to_string())
+            payload
+                .get("params")?
+                .get("name")?
+                .as_str()
+                .map(|s| s.to_string())
         } else {
             // For older specs or simpler variants
             Some(method.to_string())
         }
     }
-    
+
     fn extract_arguments(&self) -> Option<Value> {
         let payload: Value = serde_json::from_slice(&self.inner_mcp).ok()?;
-        
+
         let method = payload.get("method")?.as_str()?;
         if method == "tools/call" {
             payload.get("params")?.get("arguments").cloned()
@@ -155,7 +171,7 @@ mod tests {
         let mut csprng = OsRng;
         let signing_key: SigningKey = SigningKey::generate(&mut csprng);
         let verifying_key = signing_key.verifying_key();
-        
+
         let inner_mcp_json = json!({
             "method": "tools/call",
             "params": {
@@ -165,26 +181,29 @@ mod tests {
                 }
             }
         });
-        
+
         let inner_mcp_bytes = serde_json::to_vec(&inner_mcp_json).unwrap();
-        
+
         // Sign the MCP message
         let signature = signing_key.sign(&inner_mcp_bytes);
         let signature_b64 = STANDARD.encode(signature.to_bytes());
-        
+
         let envelope = SmcpEnvelope {
             security_token: "mock-jwt.token.here".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes.clone(),
         };
-        
+
         // Should verify successfully with the public key
         assert!(envelope.verify_signature(verifying_key.as_bytes()).is_ok());
-        
+
         // Property extraction tests
         assert_eq!(envelope.extract_tool_name(), Some("fs.read".to_string()));
         let args = envelope.extract_arguments().unwrap();
-        assert_eq!(args.get("path").unwrap().as_str().unwrap(), "/workspace/demo.txt");
+        assert_eq!(
+            args.get("path").unwrap().as_str().unwrap(),
+            "/workspace/demo.txt"
+        );
     }
 
     #[test]
@@ -192,22 +211,22 @@ mod tests {
         // Generate two different keypairs
         let mut csprng = OsRng;
         let signing_key1: SigningKey = SigningKey::generate(&mut csprng);
-        
+
         let signing_key2: SigningKey = SigningKey::generate(&mut csprng);
         let verifying_key2 = signing_key2.verifying_key();
-        
+
         let inner_mcp_bytes = b"{\"method\": \"something\"}".to_vec();
-        
+
         // Sign with key 1
         let signature = signing_key1.sign(&inner_mcp_bytes);
         let signature_b64 = STANDARD.encode(signature.to_bytes());
-        
+
         let envelope = SmcpEnvelope {
             security_token: "mock.jwt".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes,
         };
-        
+
         // Verification with key 2 should fail
         assert!(matches!(
             envelope.verify_signature(verifying_key2.as_bytes()),

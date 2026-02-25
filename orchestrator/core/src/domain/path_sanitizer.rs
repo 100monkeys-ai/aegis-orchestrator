@@ -11,7 +11,7 @@
 //! - **Layer:** Domain Layer
 //! - **Purpose:** Implements internal responsibilities for path sanitizer
 
-use std::path::{PathBuf, Component};
+use std::path::{Component, PathBuf};
 use thiserror::Error;
 
 /// Path sanitization errors
@@ -48,9 +48,7 @@ pub struct PathSanitizer {
 impl PathSanitizer {
     /// Create a new path sanitizer with default settings
     pub fn new() -> Self {
-        Self {
-            max_path_len: 4096,
-        }
+        Self { max_path_len: 4096 }
     }
 
     /// Create a path sanitizer with custom max length
@@ -130,7 +128,7 @@ impl PathSanitizer {
         // If volume root specified, ensure path is within boundary
         if let Some(root) = volume_root {
             let root_path = PathBuf::from(root);
-            
+
             // Make absolute if root is absolute
             let absolute_path = if root_path.is_absolute() && !normalized.is_absolute() {
                 root_path.join(&normalized)
@@ -232,7 +230,10 @@ mod tests {
         let sanitizer = PathSanitizer::new();
         let result = sanitizer.canonicalize("/workspace/../etc/passwd", Some("/workspace"));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PathSanitizerError::PathTraversal(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            PathSanitizerError::PathTraversal(_)
+        ));
     }
 
     #[test]
@@ -256,7 +257,10 @@ mod tests {
         let long_path = "/very/long/path/that/exceeds/limit";
         let result = sanitizer.canonicalize(long_path, None);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PathSanitizerError::PathTooLong(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            PathSanitizerError::PathTooLong(_)
+        ));
     }
 
     #[test]
@@ -264,13 +268,16 @@ mod tests {
         let sanitizer = PathSanitizer::new();
         let result = sanitizer.canonicalize("/etc/passwd", Some("/workspace"));
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), PathSanitizerError::OutsideBoundary(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            PathSanitizerError::OutsideBoundary(_)
+        ));
     }
 
     #[test]
     fn test_validate_quick_check() {
         let sanitizer = PathSanitizer::new();
-        
+
         assert!(sanitizer.validate("/workspace/file.txt").is_ok());
         assert!(sanitizer.validate("/workspace/../etc").is_err());
         assert!(sanitizer.validate("/path\0/with/null").is_err());

@@ -36,10 +36,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Gather all .proto files in temporal/api
     let proto_root = "../../proto/temporal/api";
     let mut protos = Vec::new();
-    
+
     // Add aegis_runtime from the aegis-proto submodule
     protos.push("../../aegis-proto/proto/aegis_runtime.proto".to_string());
-    
+
     // Walk directory to find all .proto files
     if let Ok(_) = std::fs::read_dir(proto_root) {
         fn visit_dirs(dir: &std::path::Path, protos: &mut Vec<String>) -> std::io::Result<()> {
@@ -50,18 +50,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if path.is_dir() {
                         visit_dirs(&path, protos)?;
                     } else if path.extension().map(|s| s == "proto").unwrap_or(false) {
-                         protos.push(path.to_string_lossy().replace("\\", "/"));
+                        protos.push(path.to_string_lossy().replace("\\", "/"));
                     }
                 }
             }
             Ok(())
         }
-        
+
         let root_path = std::path::Path::new(proto_root);
         let _ = visit_dirs(root_path, &mut protos);
     }
-    
-     let temporal_protos = &[
+
+    let temporal_protos = &[
         "../../proto/temporal/api/workflowservice/v1/service.proto",
         "../../proto/temporal/api/workflowservice/v1/request_response.proto",
         "../../proto/temporal/api/common/v1/message.proto",
@@ -106,15 +106,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
     protos.extend(temporal_protos.iter().map(|s| s.to_string()));
 
-
-
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .compile_protos(
-            &protos,
-            &["../../proto", "../../aegis-proto/proto"],
-        )?;
+        .compile_protos(&protos, &["../../proto", "../../aegis-proto/proto"])?;
 
     println!("cargo:rerun-if-changed=../../aegis-proto/proto/aegis_runtime.proto");
 

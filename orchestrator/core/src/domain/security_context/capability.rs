@@ -22,10 +22,10 @@
 //! 3. Command allowlist (for `cmd.run`)
 //! 4. Domain allowlist (for `web.*` / `web-search.*` tools)
 
+use crate::domain::mcp::PolicyViolation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-use crate::domain::mcp::PolicyViolation;
 
 /// Per-tool rate-limiting configuration within a [`Capability`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,7 +86,7 @@ impl Capability {
                 allowed_tools: vec![self.tool_pattern.clone()],
             });
         }
-        
+
         // Check path constraints for filesystem tools
         if tool_name.starts_with("fs.") || tool_name.starts_with("filesystem.") {
             if let Some(ref allowlist) = self.path_allowlist {
@@ -100,7 +100,7 @@ impl Capability {
                 }
             }
         }
-        
+
         // Check command constraints for cmd.run
         if tool_name == "cmd.run" {
             if let Some(ref allowlist) = self.command_allowlist {
@@ -115,7 +115,7 @@ impl Capability {
                 }
             }
         }
-        
+
         // Check domain constraints for web search
         if tool_name.starts_with("web.") || tool_name.starts_with("web-search.") {
             if let Some(ref allowlist) = self.domain_allowlist {
@@ -130,10 +130,10 @@ impl Capability {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     fn matches_tool(&self, tool_name: &str) -> bool {
         if self.tool_pattern == "*" {
             return true;
@@ -144,7 +144,7 @@ impl Capability {
         }
         tool_name == self.tool_pattern
     }
-    
+
     fn path_in_allowlist(&self, path: &str, allowlist: &[PathBuf]) -> bool {
         let path = PathBuf::from(path);
         for allowed_path in allowlist {
@@ -154,7 +154,7 @@ impl Capability {
         }
         false
     }
-    
+
     fn extract_domain(url: &str) -> String {
         if let Ok(parsed_url) = url::Url::parse(url) {
             parsed_url.host_str().unwrap_or("").to_string()

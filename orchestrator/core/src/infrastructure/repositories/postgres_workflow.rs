@@ -43,15 +43,15 @@
 //! let workflow = repo.find_by_id(workflow_id).await?;
 //! ```
 
+use crate::domain::repository::{RepositoryError, WorkflowRepository};
+use crate::domain::workflow::{Workflow, WorkflowId};
+use crate::infrastructure::workflow_parser::WorkflowParser;
+use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use anyhow::Result;
-use crate::domain::repository::{WorkflowRepository, RepositoryError};
-use crate::domain::workflow::{Workflow, WorkflowId};
-use crate::infrastructure::workflow_parser::WorkflowParser;
 
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
 pub struct PostgresWorkflowRepository {
@@ -62,7 +62,7 @@ impl PostgresWorkflowRepository {
     pub fn new_with_pool(pool: PgPool) -> Self {
         Self { pool }
     }
-    
+
     fn compute_hash(json: &serde_json::Value) -> String {
         let mut hasher = Sha256::new();
         hasher.update(json.to_string().as_bytes());
@@ -80,18 +80,31 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError> {
         let definition_json = serde_json::to_value(workflow)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let yaml_source = WorkflowParser::to_yaml(workflow)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         // Generate Temporal definition
-        let temporal_def = crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(workflow)
-            .map_err(|e| RepositoryError::Serialization(format!("Failed to map temporal definition: {}", e)))?;
-        let temporal_def_json = serde_json::to_value(temporal_def)
-            .map_err(|e| RepositoryError::Serialization(format!("Failed to serialize temporal definition: {}", e)))?;
-        
-        // Version 
-        let version = workflow.metadata.version.clone().unwrap_or_else(|| "0.0.1".to_string());
+        let temporal_def =
+            crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
+                workflow,
+            )
+            .map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to map temporal definition: {}", e))
+            })?;
+        let temporal_def_json = serde_json::to_value(temporal_def).map_err(|e| {
+            RepositoryError::Serialization(format!(
+                "Failed to serialize temporal definition: {}",
+                e
+            ))
+        })?;
+
+        // Version
+        let version = workflow
+            .metadata
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.1".to_string());
         let description = workflow.metadata.description.clone();
 
         sqlx::query(
@@ -120,7 +133,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         // Also save to shared workflow_definitions table for TypeScript worker
         let def_hash = Self::compute_hash(&temporal_def_json);
-        
+
         sqlx::query(
             r#"
             INSERT INTO workflow_definitions (workflow_id, name, definition, definition_hash, registered_at)
@@ -149,7 +162,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT domain_json
             FROM workflows
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -157,7 +170,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if let Some(row) = row {
-            let domain_json: serde_json::Value = row.try_get("domain_json")
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
@@ -173,7 +187,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT domain_json
             FROM workflows
             WHERE name = $1
-            "#
+            "#,
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -181,7 +195,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if let Some(row) = row {
-            let domain_json: serde_json::Value = row.try_get("domain_json")
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
@@ -197,7 +212,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT domain_json
             FROM workflows
             ORDER BY name ASC
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -205,7 +220,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         let mut workflows = Vec::new();
         for row in rows {
-            let domain_json: serde_json::Value = row.try_get("domain_json")
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
@@ -219,7 +235,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             DELETE FROM workflows
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .execute(&self.pool)
@@ -229,5 +245,3 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         Ok(())
     }
 }
-
-

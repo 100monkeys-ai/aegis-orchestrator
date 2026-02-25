@@ -44,8 +44,8 @@
 //! - **Layer:** Infrastructure Layer
 //! - **Purpose:** Implements internal responsibilities for mod
 
-pub mod server;
 pub mod file_handle;
+pub mod server;
 
+pub use file_handle::{decode_file_handle, encode_file_handle};
 pub use server::NfsServer;
-pub use file_handle::{encode_file_handle, decode_file_handle};

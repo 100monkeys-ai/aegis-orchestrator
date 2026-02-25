@@ -16,22 +16,22 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for repository factory
 
-use std::sync::Arc;
 use sqlx::PgPool;
+use std::sync::Arc;
 
 use crate::domain::repository::{
-    StorageBackend, AgentRepository, ExecutionRepository, WorkflowExecutionRepository,
-    VolumeRepository, StorageEventRepository,
-};
-use crate::infrastructure::repositories::{
-    InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryWorkflowExecutionRepository,
-    InMemoryVolumeRepository, InMemoryStorageEventRepository,
+    AgentRepository, ExecutionRepository, StorageBackend, StorageEventRepository, VolumeRepository,
+    WorkflowExecutionRepository,
 };
 use crate::infrastructure::repositories::postgres_agent::PostgresAgentRepository;
 use crate::infrastructure::repositories::postgres_execution::PostgresExecutionRepository;
-use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
-use crate::infrastructure::repositories::postgres_volume::PostgresVolumeRepository;
 use crate::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository;
+use crate::infrastructure::repositories::postgres_volume::PostgresVolumeRepository;
+use crate::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository;
+use crate::infrastructure::repositories::{
+    InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryStorageEventRepository,
+    InMemoryVolumeRepository, InMemoryWorkflowExecutionRepository,
+};
 
 /// Creates an AgentRepository implementation based on the configured backend
 pub fn create_agent_repository(backend: &StorageBackend, pool: PgPool) -> Arc<dyn AgentRepository> {
@@ -42,7 +42,10 @@ pub fn create_agent_repository(backend: &StorageBackend, pool: PgPool) -> Arc<dy
 }
 
 /// Creates an ExecutionRepository implementation based on the configured backend
-pub fn create_execution_repository(backend: &StorageBackend, pool: PgPool) -> Arc<dyn ExecutionRepository> {
+pub fn create_execution_repository(
+    backend: &StorageBackend,
+    pool: PgPool,
+) -> Arc<dyn ExecutionRepository> {
     match backend {
         StorageBackend::InMemory => Arc::new(InMemoryExecutionRepository::new()),
         StorageBackend::PostgreSQL(_) => Arc::new(PostgresExecutionRepository::new(pool)),
@@ -61,7 +64,10 @@ pub fn create_workflow_execution_repository(
 }
 
 /// Creates a VolumeRepository implementation based on the configured backend
-pub fn create_volume_repository(backend: &StorageBackend, pool: PgPool) -> Arc<dyn VolumeRepository> {
+pub fn create_volume_repository(
+    backend: &StorageBackend,
+    pool: PgPool,
+) -> Arc<dyn VolumeRepository> {
     match backend {
         StorageBackend::InMemory => Arc::new(InMemoryVolumeRepository::new()),
         StorageBackend::PostgreSQL(_) => Arc::new(PostgresVolumeRepository::new(pool)),

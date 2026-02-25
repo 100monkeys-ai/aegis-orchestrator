@@ -44,28 +44,28 @@ pub struct AgentManifestParser;
 impl AgentManifestParser {
     /// Parse agent manifest from YAML string
     pub fn parse_yaml(yaml: &str) -> Result<AgentManifest> {
-        let manifest: AgentManifest = serde_yaml::from_str(yaml)
-            .context("Failed to parse YAML manifest")?;
-        
+        let manifest: AgentManifest =
+            serde_yaml::from_str(yaml).context("Failed to parse YAML manifest")?;
+
         // Validate the parsed manifest
-        manifest.validate()
+        manifest
+            .validate()
             .map_err(|e| anyhow!("Manifest validation failed: {}", e))?;
-        
+
         Ok(manifest)
     }
-    
+
     /// Parse agent manifest from YAML file
     pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<AgentManifest> {
         let yaml = std::fs::read_to_string(path.as_ref())
             .with_context(|| format!("Failed to read manifest file: {:?}", path.as_ref()))?;
-        
+
         Self::parse_yaml(&yaml)
     }
-    
+
     /// Serialize agent manifest to YAML string
     pub fn to_yaml(manifest: &AgentManifest) -> Result<String> {
-        serde_yaml::to_string(manifest)
-            .context("Failed to serialize manifest to YAML")
+        serde_yaml::to_string(manifest).context("Failed to serialize manifest to YAML")
     }
 }
 
@@ -76,7 +76,7 @@ impl AgentManifestParser {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_minimal_manifest() {
         let yaml = r#"
@@ -90,7 +90,7 @@ spec:
     language: python
     version: "3.11"
 "#;
-        
+
         let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
         assert_eq!(manifest.api_version, "100monkeys.ai/v1");
         assert_eq!(manifest.kind, "Agent");
@@ -98,7 +98,7 @@ spec:
         assert_eq!(manifest.spec.runtime.language, "python");
         assert_eq!(manifest.spec.runtime.version, "3.11");
     }
-    
+
     #[test]
     fn test_parse_full_manifest() {
         let yaml = r#"
@@ -157,28 +157,28 @@ spec:
   env:
     DEBUG: "true"
 "#;
-        
+
         let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
         assert_eq!(manifest.metadata.name, "email-summarizer");
         assert_eq!(manifest.spec.runtime.language, "python");
-        
+
         // Check task
         let task = manifest.spec.task.as_ref().unwrap();
         assert_eq!(task.agentskills.len(), 1);
         assert!(task.instruction.is_some());
-        
+
         // Check execution
         let execution = manifest.spec.execution.as_ref().unwrap();
         assert_eq!(execution.mode, ExecutionMode::Iterative);
         assert_eq!(execution.max_retries, 10);
-        
+
         // Check security
         let security = manifest.spec.security.as_ref().unwrap();
         assert_eq!(security.network.mode, "allow");
         assert_eq!(security.network.allowlist.len(), 1);
         assert_eq!(security.resources.cpu, 1000);
     }
-    
+
     #[test]
     fn test_validate_api_version() {
         let yaml = r#"
@@ -192,12 +192,15 @@ spec:
     language: python
     version: "3.11"
 "#;
-        
+
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid apiVersion"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid apiVersion"));
     }
-    
+
     #[test]
     fn test_validate_kind() {
         let yaml = r#"
@@ -211,12 +214,12 @@ spec:
     language: python
     version: "3.11"
 "#;
-        
+
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid kind"));
     }
-    
+
     #[test]
     fn test_validate_name_format() {
         let yaml = r#"
@@ -230,16 +233,19 @@ spec:
     language: python
     version: "3.11"
 "#;
-        
+
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid metadata.name"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid metadata.name"));
     }
-    
+
     #[test]
     fn test_roundtrip_serialization() {
         use std::collections::HashMap;
-        
+
         let manifest = AgentManifest {
             api_version: "100monkeys.ai/v1".to_string(),
             kind: "Agent".to_string(),
@@ -269,13 +275,13 @@ spec:
                 advanced: None,
             },
         };
-        
+
         // Serialize to YAML
         let yaml = AgentManifestParser::to_yaml(&manifest).unwrap();
-        
+
         // Parse back
         let parsed = AgentManifestParser::parse_yaml(&yaml).unwrap();
-        
+
         // Compare
         assert_eq!(parsed.metadata.name, manifest.metadata.name);
         assert_eq!(parsed.spec.runtime.language, manifest.spec.runtime.language);

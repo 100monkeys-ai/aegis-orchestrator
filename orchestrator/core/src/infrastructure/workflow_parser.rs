@@ -200,20 +200,19 @@ pub struct WorkflowParser;
 impl WorkflowParser {
     /// Parse a workflow manifest from YAML file
     pub fn parse_file<P: AsRef<Path>>(path: P) -> Result<Workflow, WorkflowParseError> {
-        let content = fs::read_to_string(path.as_ref()).map_err(|e| {
-            WorkflowParseError::IoError {
+        let content =
+            fs::read_to_string(path.as_ref()).map_err(|e| WorkflowParseError::IoError {
                 path: path.as_ref().display().to_string(),
                 error: e.to_string(),
-            }
-        })?;
+            })?;
 
         Self::parse_yaml(&content)
     }
 
     /// Parse a workflow manifest from YAML string
     pub fn parse_yaml(yaml: &str) -> Result<Workflow, WorkflowParseError> {
-        let manifest: WorkflowManifest = serde_yaml::from_str(yaml)
-            .map_err(|e| WorkflowParseError::YamlError(e.to_string()))?;
+        let manifest: WorkflowManifest =
+            serde_yaml::from_str(yaml).map_err(|e| WorkflowParseError::YamlError(e.to_string()))?;
 
         Self::validate_and_convert(manifest)
     }
@@ -513,16 +512,12 @@ impl WorkflowParser {
             TransitionCondition::ExitCode { value } => {
                 TransitionConditionYaml::ExitCode { value: *value }
             }
-            TransitionCondition::ScoreAbove { threshold } => {
-                TransitionConditionYaml::ScoreAbove {
-                    threshold: *threshold,
-                }
-            }
-            TransitionCondition::ScoreBelow { threshold } => {
-                TransitionConditionYaml::ScoreBelow {
-                    threshold: *threshold,
-                }
-            }
+            TransitionCondition::ScoreAbove { threshold } => TransitionConditionYaml::ScoreAbove {
+                threshold: *threshold,
+            },
+            TransitionCondition::ScoreBelow { threshold } => TransitionConditionYaml::ScoreBelow {
+                threshold: *threshold,
+            },
             TransitionCondition::ScoreBetween { min, max } => {
                 TransitionConditionYaml::ScoreBetween {
                     min: *min,

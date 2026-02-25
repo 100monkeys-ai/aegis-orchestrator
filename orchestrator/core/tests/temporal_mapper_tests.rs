@@ -17,7 +17,7 @@ use std::collections::HashMap;
 fn test_map_100monkeys_workflow() {
     // Create a mock of the 100monkeys workflow
     let mut states = HashMap::new();
-    
+
     // GENERATE State
     states.insert(
         StateName::new("GENERATE").unwrap(),
@@ -89,17 +89,20 @@ fn test_map_100monkeys_workflow() {
     // Assertions
     assert_eq!(def.name, "100monkeys-test");
     assert_eq!(def.initial_state, "GENERATE");
-    
+
     // Verify GENERATE state
     let generate_state = def.states.get("GENERATE").expect("GENERATE state missing");
     assert_eq!(generate_state.kind, "Agent");
     assert_eq!(generate_state.agent, Some("coder".to_string()));
     assert_eq!(generate_state.isolation, Some("docker".to_string()));
-    
+
     // Verify transitions
     assert_eq!(generate_state.transitions.len(), 1);
     assert_eq!(generate_state.transitions[0].condition, "on_success");
-    assert_eq!(generate_state.transitions[0].target, Some("EXECUTE".to_string()));
+    assert_eq!(
+        generate_state.transitions[0].target,
+        Some("EXECUTE".to_string())
+    );
 
     // Verify EXECUTE state
     let execute_state = def.states.get("EXECUTE").expect("EXECUTE state missing");

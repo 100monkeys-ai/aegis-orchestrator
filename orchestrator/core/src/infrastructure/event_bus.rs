@@ -50,7 +50,10 @@
 // For MVP: In-memory only (events lost on restart)
 // Phase 2: Add persistent event store for replay capability
 
-use crate::domain::events::{AgentLifecycleEvent, ExecutionEvent, LearningEvent, ValidationEvent, VolumeEvent, StorageEvent, WorkflowEvent, MCPToolEvent, PolicyEvent, SmcpEvent, StimulusEvent};
+use crate::domain::events::{
+    AgentLifecycleEvent, ExecutionEvent, LearningEvent, MCPToolEvent, PolicyEvent, SmcpEvent,
+    StimulusEvent, StorageEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -156,7 +159,10 @@ impl EventBus {
 
     /// Subscribe and filter for specific execution ID
     /// Useful for streaming logs for a single execution
-    pub fn subscribe_execution(&self, execution_id: crate::domain::execution::ExecutionId) -> ExecutionEventReceiver {
+    pub fn subscribe_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> ExecutionEventReceiver {
         let receiver = self.sender.subscribe();
         ExecutionEventReceiver {
             receiver,
@@ -167,10 +173,7 @@ impl EventBus {
     /// Subscribe and filter for specific agent ID
     pub fn subscribe_agent(&self, agent_id: crate::domain::agent::AgentId) -> AgentEventReceiver {
         let receiver = self.sender.subscribe();
-        AgentEventReceiver {
-            receiver,
-            agent_id,
-        }
+        AgentEventReceiver { receiver, agent_id }
     }
 
     /// Get the number of active subscribers
@@ -178,8 +181,6 @@ impl EventBus {
         self.sender.receiver_count()
     }
 }
-
-
 
 /// Receiver for all domain events
 pub struct EventReceiver {
@@ -236,7 +237,7 @@ impl ExecutionEventReceiver {
                     if self.matches_execution(&exec_event) {
                         return Ok(exec_event);
                     }
-                },
+                }
                 _ => {}
             }
             // Continue loop if event doesn't match
@@ -245,27 +246,56 @@ impl ExecutionEventReceiver {
 
     fn matches_execution(&self, event: &ExecutionEvent) -> bool {
         match event {
-            ExecutionEvent::ExecutionStarted { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::IterationStarted { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::IterationCompleted { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::IterationFailed { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::RefinementApplied { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::ExecutionCompleted { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::ExecutionFailed { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::ExecutionCancelled { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::ConsoleOutput { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::LlmInteraction { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::InstanceSpawned { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::InstanceTerminated { execution_id, .. } => execution_id == &self.execution_id,
-            ExecutionEvent::ExecutionTimedOut { execution_id, .. } => execution_id == &self.execution_id,
+            ExecutionEvent::ExecutionStarted { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::IterationStarted { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::IterationCompleted { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::IterationFailed { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::RefinementApplied { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ExecutionCompleted { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ExecutionFailed { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ExecutionCancelled { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ConsoleOutput { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::LlmInteraction { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::InstanceSpawned { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::InstanceTerminated { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ExecutionTimedOut { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
             ExecutionEvent::Validation(e) => match e {
-                ValidationEvent::GradientValidationPerformed { execution_id, .. } => execution_id == &self.execution_id,
-                ValidationEvent::MultiJudgeConsensus { execution_id, .. } => execution_id == &self.execution_id,
+                ValidationEvent::GradientValidationPerformed { execution_id, .. } => {
+                    execution_id == &self.execution_id
+                }
+                ValidationEvent::MultiJudgeConsensus { execution_id, .. } => {
+                    execution_id == &self.execution_id
+                }
             },
         }
     }
-    }
-
+}
 
 /// Receiver for agent-specific events (filtered)
 pub struct AgentEventReceiver {
@@ -316,8 +346,12 @@ impl AgentEventReceiver {
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::ExecutionTimedOut { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::Validation(v) => match v {
-                    ValidationEvent::GradientValidationPerformed { agent_id, .. } => agent_id == &self.agent_id,
-                    ValidationEvent::MultiJudgeConsensus { agent_id, .. } => agent_id == &self.agent_id,
+                    ValidationEvent::GradientValidationPerformed { agent_id, .. } => {
+                        agent_id == &self.agent_id
+                    }
+                    ValidationEvent::MultiJudgeConsensus { agent_id, .. } => {
+                        agent_id == &self.agent_id
+                    }
                 },
             },
             DomainEvent::Learning(e) => match e {
@@ -327,7 +361,9 @@ impl AgentEventReceiver {
             },
             DomainEvent::Workflow(_) => false, // Workflow events are system-wide, not per-agent
             DomainEvent::Policy(e) => match e {
-                PolicyEvent::PolicyViolationAttempted { agent_id, .. } => agent_id == &self.agent_id,
+                PolicyEvent::PolicyViolationAttempted { agent_id, .. } => {
+                    agent_id == &self.agent_id
+                }
                 PolicyEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Volume(_) => false, // Not agent-filterable: carries execution_id, not agent_id
@@ -423,7 +459,10 @@ mod tests {
         event_bus.publish_agent_event(event.clone());
 
         let received = receiver.recv().await.unwrap();
-        let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { agent_id: id, .. }) = received else {
+        let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
+            agent_id: id, ..
+        }) = received
+        else {
             panic!("Expected AgentDeployed event, got {:?}", received);
         };
         assert_eq!(id, agent_id);
@@ -453,7 +492,10 @@ mod tests {
         });
 
         let received = receiver.recv().await.unwrap();
-        let ExecutionEvent::ExecutionStarted { execution_id: id, .. } = received else {
+        let ExecutionEvent::ExecutionStarted {
+            execution_id: id, ..
+        } = received
+        else {
             panic!("Expected ExecutionStarted event, got {:?}", received);
         };
         assert_eq!(id, execution_id);

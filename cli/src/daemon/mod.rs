@@ -47,7 +47,7 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
     // 1. Try HTTP health check first (works for local and remote/forwarded ports)
     // Use 127.0.0.1 to avoid ipv4/ipv6 ambiguity with localhost if host is explicitly localhost
     // otherwise use provided host.
-    
+
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(500)) // Fast timeout for local checks
         .build()?;
@@ -57,9 +57,9 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
     } else {
         format!("http://{}:{}", host, port)
     };
-    
+
     let health_url = format!("{}/health", base_url);
-    
+
     // We check the PID file primarily to return the PID in the Running status if available locally.
     // If not available (remote), we return 0 or another indicator.
     let pid_file = get_pid_file_path();
@@ -82,42 +82,42 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
             // Or we just don't return a PID in that case (DaemonStatus might need update or just use 0).
             // Existing `DaemonStatus::Running` requires `pid: u32`. Let's use 0 if unknown/remote.
             let pid = local_pid.unwrap_or(0);
-            
+
             return Ok(DaemonStatus::Running { pid, uptime });
         }
         Ok(resp) => {
             // HTTP reached but returned error
             if let Some(pid) = local_pid {
-                 return Ok(DaemonStatus::Unhealthy { 
-                    pid, 
-                    error: format!("HTTP {}", resp.status()) 
+                return Ok(DaemonStatus::Unhealthy {
+                    pid,
+                    error: format!("HTTP {}", resp.status()),
                 });
             }
             // If no PID file and unhealthy HTTP, it's ambiguous but likely "Running but broken" or incompatible version?
             // Let's treat as Unhealthy with PID 0
-            return Ok(DaemonStatus::Unhealthy { 
-                pid: 0, 
-                error: format!("HTTP {}", resp.status()) 
+            return Ok(DaemonStatus::Unhealthy {
+                pid: 0,
+                error: format!("HTTP {}", resp.status()),
             });
         }
         Err(e) => {
-             // HTTP failed. Check if local PID exists to determine if it SHOULD be running.
-             if let Some(pid) = local_pid {
-                 if process_exists(pid) {
-                      // PID exists, Process exists, but HTTP failed -> Unhealthy
-                      return Ok(DaemonStatus::Unhealthy { 
-                        pid, 
-                        error: e.to_string() 
+            // HTTP failed. Check if local PID exists to determine if it SHOULD be running.
+            if let Some(pid) = local_pid {
+                if process_exists(pid) {
+                    // PID exists, Process exists, but HTTP failed -> Unhealthy
+                    return Ok(DaemonStatus::Unhealthy {
+                        pid,
+                        error: e.to_string(),
                     });
-                 } else {
-                     // Stale PID file
-                     let _ = std::fs::remove_file(&pid_file);
-                     return Ok(DaemonStatus::Stopped);
-                 }
-             }
-             
-             // No PID file, HTTP failed -> Stopped
-             return Ok(DaemonStatus::Stopped);
+                } else {
+                    // Stale PID file
+                    let _ = std::fs::remove_file(&pid_file);
+                    return Ok(DaemonStatus::Stopped);
+                }
+            }
+
+            // No PID file, HTTP failed -> Stopped
+            return Ok(DaemonStatus::Stopped);
         }
     }
 }
@@ -166,10 +166,11 @@ pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
             .context("Failed to execute taskkill")?;
 
         if !output.status.success() {
-             let stderr = String::from_utf8_lossy(&output.stderr);
-             if !stderr.contains("not found") { // Ignore if already gone
-                 anyhow::bail!("Failed to stop daemon: {}", stderr);
-             }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            if !stderr.contains("not found") {
+                // Ignore if already gone
+                anyhow::bail!("Failed to stop daemon: {}", stderr);
+            }
         }
         info!("Daemon stopped (killed via taskkill)");
     }

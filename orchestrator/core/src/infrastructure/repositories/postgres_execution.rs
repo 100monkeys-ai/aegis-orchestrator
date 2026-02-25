@@ -42,13 +42,15 @@
 //! let execution = repo.find_by_id(execution_id).await?;
 //! ```
 
+use crate::domain::agent::AgentId;
+use crate::domain::execution::{
+    Execution, ExecutionHierarchy, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
+};
+use crate::domain::repository::{ExecutionRepository, RepositoryError};
+use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use anyhow::Result;
-use crate::domain::repository::{ExecutionRepository, RepositoryError};
-use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus, Iteration, ExecutionInput, ExecutionHierarchy};
-use crate::domain::agent::AgentId;
 
 pub struct PostgresExecutionRepository {
     pool: PgPool,
@@ -65,16 +67,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
     async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
         let iterations_json = serde_json::to_value(&execution.iterations())
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let input_json = serde_json::to_value(&execution.input)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
-
-
         // Extract final output and error from the execution state or last iteration
-        let final_output = execution.iterations().last()
-            .and_then(|i| i.output.clone());
-            
+        let final_output = execution.iterations().last().and_then(|i| i.output.clone());
+
         let error_message = execution.error.clone();
 
         let status_str = match execution.status {
@@ -92,10 +91,10 @@ impl ExecutionRepository for PostgresExecutionRepository {
         // For now, let's assume hierarchy is part of the context or we might lose it if not stored.
         // Wait, `iterations` is JSONB, so it stores full iteration history.
         // `input` is JSONB.
-        
+
         // We will store hierarchy in the input payload or similar if we can't change schema.
-        // Actually, let's just save what we can map. 
-        // If we need hierarchy persistence, we should probably update the schema, but I'll stick to the existing schema for now and maybe stash it in input if needed, 
+        // Actually, let's just save what we can map.
+        // If we need hierarchy persistence, we should probably update the schema, but I'll stick to the existing schema for now and maybe stash it in input if needed,
         // OR just ignore it if it's not critical for the "empty table" issue.
         // The user issue is "empty table", so primary goal is getting the main data in.
 
@@ -117,7 +116,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 container_uid = EXCLUDED.container_uid,
                 container_gid = EXCLUDED.container_gid,
                 completed_at = EXCLUDED.completed_at
-            "#
+            "#,
         )
         .bind(execution.id.0)
         .bind(execution.agent_id.0)
@@ -148,7 +147,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 started_at, completed_at, error_message
             FROM executions
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -177,25 +176,31 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 _ => ExecutionStatus::Pending, // Default fallback
             };
 
-            let input: ExecutionInput = serde_json::from_value(input_val)
-                .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize input: {}", e)))?;
+            let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize input: {}", e))
+            })?;
 
-            // There is a weird issue where iterations might be stored as property of Execution, 
+            // There is a weird issue where iterations might be stored as property of Execution,
             // but Execution struct has explicit `iterations: Vec<Iteration>`.
             // The `iterations` column is JSONB array.
-            let iterations: Vec<Iteration> = serde_json::from_value(iterations_val)
-                .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize iterations: {}", e)))?;
+            let iterations: Vec<Iteration> =
+                serde_json::from_value(iterations_val).map_err(|e| {
+                    RepositoryError::Serialization(format!(
+                        "Failed to deserialize iterations: {}",
+                        e
+                    ))
+                })?;
 
             Ok(Some(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
                 status,
-                iterations, // We need to access private field or use a constructor/struct update syntax? 
-                            // `iterations` field is private in `Execution` struct definition?
-                            // Checked `execution.rs`: `iterations: Vec<Iteration>` is private (not pub).
-                            // But `Execution` struct definition in `execution.rs` lines 128: `iterations: Vec<Iteration>,`
-                            // Ensure it is pub or we have a way to reconstruct it.
-                            // I need to check `execution.rs` again.
+                iterations, // We need to access private field or use a constructor/struct update syntax?
+                // `iterations` field is private in `Execution` struct definition?
+                // Checked `execution.rs`: `iterations: Vec<Iteration>` is private (not pub).
+                // But `Execution` struct definition in `execution.rs` lines 128: `iterations: Vec<Iteration>,`
+                // Ensure it is pub or we have a way to reconstruct it.
+                // I need to check `execution.rs` again.
                 max_iterations: max_iterations as u8,
                 container_uid: container_uid as u32,
                 container_gid: container_gid as u32,
@@ -220,7 +225,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             FROM executions
             WHERE agent_id = $1
             ORDER BY started_at DESC
-            "#
+            "#,
         )
         .bind(agent_id.0)
         .fetch_all(&self.pool)
@@ -252,8 +257,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 _ => ExecutionStatus::Pending,
             };
 
-            let input: ExecutionInput = serde_json::from_value(input_val).unwrap_or(ExecutionInput { intent: None, payload: serde_json::Value::Null });
-            let iterations: Vec<Iteration> = serde_json::from_value(iterations_val).unwrap_or_default();
+            let input: ExecutionInput =
+                serde_json::from_value(input_val).unwrap_or(ExecutionInput {
+                    intent: None,
+                    payload: serde_json::Value::Null,
+                });
+            let iterations: Vec<Iteration> =
+                serde_json::from_value(iterations_val).unwrap_or_default();
 
             executions.push(Execution {
                 id: ExecutionId(id),
@@ -284,7 +294,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             FROM executions
             ORDER BY started_at DESC
             LIMIT $1
-            "#
+            "#,
         )
         .bind(limit as i32)
         .fetch_all(&self.pool)
@@ -314,8 +324,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 _ => ExecutionStatus::Pending,
             };
 
-            let input: ExecutionInput = serde_json::from_value(input_val).unwrap_or(ExecutionInput { intent: None, payload: serde_json::Value::Null });
-            let iterations: Vec<Iteration> = serde_json::from_value(iterations_val).unwrap_or_default();
+            let input: ExecutionInput =
+                serde_json::from_value(input_val).unwrap_or(ExecutionInput {
+                    intent: None,
+                    payload: serde_json::Value::Null,
+                });
+            let iterations: Vec<Iteration> =
+                serde_json::from_value(iterations_val).unwrap_or_default();
 
             executions.push(Execution {
                 id: ExecutionId(id),

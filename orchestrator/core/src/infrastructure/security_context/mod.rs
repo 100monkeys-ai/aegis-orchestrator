@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::domain::security_context::SecurityContext;
 use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::security_context::SecurityContext;
 
 pub struct InMemorySecurityContextRepository {
     contexts: Arc<RwLock<HashMap<String, SecurityContext>>>,

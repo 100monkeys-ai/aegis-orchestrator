@@ -27,12 +27,12 @@
 //! See ADR-032 (Unified Storage via SeaweedFS), ADR-036 (NFS Server Gateway),
 //! AGENTS.md §Volume, AGENTS.md §StorageClass.
 
-use uuid::Uuid;
+use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
-use crate::domain::execution::ExecutionId;
+use uuid::Uuid;
 
 // ============================================================================
 // Value Objects
@@ -65,7 +65,7 @@ impl std::fmt::Display for VolumeId {
 }
 
 /// Unique identifier for a tenant
-/// 
+///
 /// Enables multi-tenant namespace isolation.
 /// Default tenant UUID for MVP: 00000000-0000-0000-0000-000000000001
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -84,8 +84,10 @@ impl TenantId {
 
     /// Get the default tenant ID for single-tenant MVP deployments
     pub fn default_tenant() -> Self {
-        Self(Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-            .expect("Default tenant UUID is valid"))
+        Self(
+            Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                .expect("Default tenant UUID is valid"),
+        )
     }
 }
 
@@ -201,18 +203,26 @@ mod duration_serialization {
 
         let parts: Vec<&str> = rest.split('H').collect();
         if parts.len() == 2 {
-            hours = parts[0].parse().map_err(|_| format!("Invalid hours: {}", parts[0]))?;
+            hours = parts[0]
+                .parse()
+                .map_err(|_| format!("Invalid hours: {}", parts[0]))?;
             if !parts[1].is_empty() {
                 let min_part = parts[1].trim_end_matches('M');
                 if !min_part.is_empty() {
-                    minutes = min_part.parse().map_err(|_| format!("Invalid minutes: {}", min_part))?;
+                    minutes = min_part
+                        .parse()
+                        .map_err(|_| format!("Invalid minutes: {}", min_part))?;
                 }
             }
         } else if rest.ends_with('H') {
-            hours = rest.trim_end_matches('H').parse()
+            hours = rest
+                .trim_end_matches('H')
+                .parse()
                 .map_err(|_| format!("Invalid hours: {}", rest))?;
         } else if rest.ends_with('M') {
-            minutes = rest.trim_end_matches('M').parse()
+            minutes = rest
+                .trim_end_matches('M')
+                .parse()
                 .map_err(|_| format!("Invalid minutes: {}", rest))?;
         } else {
             return Err(format!("Invalid duration format: {}", s));
@@ -255,11 +265,11 @@ impl FilerEndpoint {
     /// Create new filer endpoint with validation
     pub fn new(url: impl Into<String>) -> Result<Self, VolumeError> {
         let url = url.into();
-        
+
         // Basic URL validation
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(VolumeError::InvalidFilerEndpoint(
-                "Filer URL must start with http:// or https://".to_string()
+                "Filer URL must start with http:// or https://".to_string(),
             ));
         }
 
@@ -270,12 +280,13 @@ impl FilerEndpoint {
     pub fn host(&self) -> Result<String, VolumeError> {
         let parsed = reqwest::Url::parse(&self.url)
             .map_err(|e| VolumeError::InvalidFilerEndpoint(e.to_string()))?;
-        
-        let host = parsed.host_str()
+
+        let host = parsed
+            .host_str()
             .ok_or_else(|| VolumeError::InvalidFilerEndpoint("No host in URL".to_string()))?;
-        
+
         let port = parsed.port().unwrap_or(8888);
-        
+
         Ok(format!("{}:{}", host, port))
     }
 }
@@ -291,16 +302,16 @@ impl std::fmt::Display for FilerEndpoint {
 pub struct VolumeMount {
     /// Volume ID to mount
     pub volume_id: VolumeId,
-    
+
     /// Mount point path inside container/VM
     pub mount_point: PathBuf,
-    
+
     /// Access mode (read-only or read-write)
     pub access_mode: AccessMode,
-    
+
     /// Filer endpoint for NFS mounting
     pub filer_endpoint: FilerEndpoint,
-    
+
     /// Remote path on SeaweedFS filer
     pub remote_path: String,
 }
@@ -329,17 +340,11 @@ impl VolumeMount {
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum VolumeOwnership {
     /// Owned by a single agent execution (auto-cleanup on execution end)
-    Execution {
-        execution_id: ExecutionId,
-    },
+    Execution { execution_id: ExecutionId },
     /// Shared across workflow execution (auto-cleanup on workflow end)
-    WorkflowExecution {
-        workflow_execution_id: Uuid,
-    },
+    WorkflowExecution { workflow_execution_id: Uuid },
     /// User-owned persistent volume (manual cleanup only)
-    Persistent {
-        owner: String,
-    },
+    Persistent { owner: String },
 }
 
 impl VolumeOwnership {
@@ -350,12 +355,16 @@ impl VolumeOwnership {
 
     /// Create workflow-scoped ownership
     pub fn workflow(workflow_execution_id: Uuid) -> Self {
-        Self::WorkflowExecution { workflow_execution_id }
+        Self::WorkflowExecution {
+            workflow_execution_id,
+        }
     }
 
     /// Create persistent user-owned volume
     pub fn persistent(owner: impl Into<String>) -> Self {
-        Self::Persistent { owner: owner.into() }
+        Self::Persistent {
+            owner: owner.into(),
+        }
     }
 
     /// Get execution ID if execution-scoped
@@ -369,7 +378,9 @@ impl VolumeOwnership {
     /// Get workflow execution ID if workflow-scoped
     pub fn workflow_execution_id(&self) -> Option<Uuid> {
         match self {
-            Self::WorkflowExecution { workflow_execution_id } => Some(*workflow_execution_id),
+            Self::WorkflowExecution {
+                workflow_execution_id,
+            } => Some(*workflow_execution_id),
             _ => None,
         }
     }
@@ -414,47 +425,47 @@ impl VolumeStatus {
 // ============================================================================
 
 /// Volume aggregate root
-/// 
+///
 /// Represents an isolated storage context with lifecycle independent of agent execution.
 /// Follows DDD pattern from AGENTS.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Volume {
     /// Unique volume identifier
     pub id: VolumeId,
-    
+
     /// Human-readable volume name
     pub name: String,
-    
+
     /// Tenant identifier for multi-tenant isolation
     pub tenant_id: TenantId,
-    
+
     /// Storage classification (ephemeral or persistent)
     pub storage_class: StorageClass,
-    
+
     /// SeaweedFS filer endpoint
     pub filer_endpoint: FilerEndpoint,
-    
+
     /// Remote path on SeaweedFS (e.g., "/aegis/volumes/{tenant_id}/{volume_id}")
     pub remote_path: String,
-    
+
     /// Size limit in bytes (enforced by SeaweedFS quota)
     pub size_limit_bytes: u64,
-    
+
     /// Current volume status
     pub status: VolumeStatus,
-    
+
     /// Ownership model
     pub ownership: VolumeOwnership,
-    
+
     /// Creation timestamp
     pub created_at: DateTime<Utc>,
-    
+
     /// Last attached timestamp
     pub attached_at: Option<DateTime<Utc>>,
-    
+
     /// Last detached timestamp
     pub detached_at: Option<DateTime<Utc>>,
-    
+
     /// Expiration timestamp (for ephemeral volumes)
     pub expires_at: Option<DateTime<Utc>>,
 }
@@ -472,13 +483,15 @@ impl Volume {
         // Invariant: size_limit must be positive
         if size_limit_bytes == 0 {
             return Err(VolumeError::InvalidSizeLimit(
-                "Size limit must be greater than zero".to_string()
+                "Size limit must be greater than zero".to_string(),
             ));
         }
 
         // Invariant: name must not be empty
         if name.trim().is_empty() {
-            return Err(VolumeError::InvalidName("Volume name cannot be empty".to_string()));
+            return Err(VolumeError::InvalidName(
+                "Volume name cannot be empty".to_string(),
+            ));
         }
 
         let id = VolumeId::new();
@@ -730,12 +743,16 @@ mod tests {
             FilerEndpoint::new("http://localhost:8888").unwrap(),
             1_000_000_000, // 1GB
             VolumeOwnership::persistent("user-123"),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(volume.name, "test-volume");
         assert_eq!(volume.status, VolumeStatus::Creating);
         assert!(volume.expires_at.is_some());
-        assert_eq!(volume.remote_path, format!("/aegis/volumes/{}/{}", volume.tenant_id, volume.id));
+        assert_eq!(
+            volume.remote_path,
+            format!("/aegis/volumes/{}/{}", volume.tenant_id, volume.id)
+        );
     }
 
     #[test]
@@ -773,7 +790,8 @@ mod tests {
             FilerEndpoint::new("http://localhost:8888").unwrap(),
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Creating -> Available
         assert!(volume.mark_available().is_ok());
@@ -807,7 +825,8 @@ mod tests {
             FilerEndpoint::new("http://localhost:8888").unwrap(),
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Cannot attach while Creating
         assert!(volume.mark_attached().is_err());
@@ -829,7 +848,8 @@ mod tests {
             FilerEndpoint::new("http://localhost:8888").unwrap(),
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
-        ).unwrap();
+        )
+        .unwrap();
 
         // Should not be expired immediately
         assert!(!volume.is_expired());
@@ -848,7 +868,8 @@ mod tests {
             FilerEndpoint::new("http://localhost:8888").unwrap(),
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let mount = volume.to_mount(PathBuf::from("/workspace"), AccessMode::ReadWrite);
         assert_eq!(mount.volume_id, volume.id);
@@ -867,7 +888,10 @@ mod tests {
 
         let workflow_ownership = VolumeOwnership::workflow(workflow_id);
         assert!(workflow_ownership.execution_id().is_none());
-        assert_eq!(workflow_ownership.workflow_execution_id(), Some(workflow_id));
+        assert_eq!(
+            workflow_ownership.workflow_execution_id(),
+            Some(workflow_id)
+        );
 
         let persistent_ownership = VolumeOwnership::persistent("user-123");
         assert!(persistent_ownership.execution_id().is_none());

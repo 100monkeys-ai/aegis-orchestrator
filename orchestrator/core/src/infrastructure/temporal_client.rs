@@ -59,11 +59,11 @@
 
 use crate::domain::execution::ExecutionId;
 use anyhow::{Context, Result};
+use reqwest::Client as HttpClient;
 use std::collections::HashMap;
 use std::time::Duration;
 use tonic::transport::Channel;
 use uuid::Uuid;
-use reqwest::Client as HttpClient;
 
 // Import generated protos
 use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::workflow_service_client::WorkflowServiceClient;
@@ -125,7 +125,7 @@ impl TemporalClient {
         input: HashMap<String, serde_json::Value>,
     ) -> Result<String> {
         let workflow_id = execution_id.0.to_string();
-        
+
         // Generic workflow type that the worker registers
         let workflow_type_name = "aegis_workflow";
 
@@ -138,24 +138,21 @@ impl TemporalClient {
 
         // Serialize to JSON payload
         let json_bytes = serde_json::to_vec(&input_obj)?;
-        
+
         // Metadata for JSON encoding
         let mut metadata = HashMap::new();
-        metadata.insert(
-            "encoding".to_string(), 
-            "json/plain".as_bytes().to_vec()
-        );
+        metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
 
         let payload = Payload {
             metadata,
             data: json_bytes,
             // external_payloads was added in recent temporal api versions?
             // If prost generated it, we must provide it.
-            // Check if it exists in the downloaded proto. 
+            // Check if it exists in the downloaded proto.
             // Assuming strict error means it exists.
             // It is likely repeated?
             // Let's assume Vec::new().
-            ..Default::default() 
+            ..Default::default()
         };
 
         let payloads = Payloads {
@@ -167,24 +164,30 @@ impl TemporalClient {
         let request = StartWorkflowExecutionRequest {
             namespace: self.namespace.clone(),
             workflow_id: workflow_id.clone(),
-            workflow_type: Some(WorkflowType { name: workflow_type_name.to_string() }),
-            task_queue: Some(crate::infrastructure::temporal_proto::temporal::api::taskqueue::v1::TaskQueue {
-                name: self.task_queue.clone(),
-                kind: 0, // Normal
-                ..Default::default()
+            workflow_type: Some(WorkflowType {
+                name: workflow_type_name.to_string(),
             }),
+            task_queue: Some(
+                crate::infrastructure::temporal_proto::temporal::api::taskqueue::v1::TaskQueue {
+                    name: self.task_queue.clone(),
+                    kind: 0, // Normal
+                    ..Default::default()
+                },
+            ),
             input: Some(payloads),
             request_id,
             ..Default::default()
         };
 
         let mut client = self.client.clone();
-        let response = client.start_workflow_execution(request).await
+        let response = client
+            .start_workflow_execution(request)
+            .await
             .context(format!(
                 "Failed to start workflow execution via gRPC (Temporal: {})",
                 self.temporal_endpoint
             ))?;
-            
+
         Ok(response.into_inner().run_id)
     }
     /// Get workflow execution history
@@ -192,9 +195,10 @@ impl TemporalClient {
         &self,
         execution_id: String,
         run_id: Option<String>,
-    ) -> Result<Vec<crate::infrastructure::temporal_proto::temporal::api::history::v1::HistoryEvent>> {
-        use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryRequest;
+    ) -> Result<Vec<crate::infrastructure::temporal_proto::temporal::api::history::v1::HistoryEvent>>
+    {
         use crate::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution;
+        use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::GetWorkflowExecutionHistoryRequest;
 
         let request = GetWorkflowExecutionHistoryRequest {
             namespace: self.namespace.clone(),
@@ -210,10 +214,16 @@ impl TemporalClient {
         };
 
         let mut client = self.client.clone();
-        let response = client.get_workflow_execution_history(request).await
+        let response = client
+            .get_workflow_execution_history(request)
+            .await
             .context("Failed to get workflow history")?;
-            
-        Ok(response.into_inner().history.map(|h| h.events).unwrap_or_default())
+
+        Ok(response
+            .into_inner()
+            .history
+            .map(|h| h.events)
+            .unwrap_or_default())
     }
 
     /// Send a `humanInput` Temporal signal to a workflow paused at a Human state.
@@ -226,20 +236,13 @@ impl TemporalClient {
     ///
     /// `WorkflowService.SignalWorkflowExecution` — the signal is sent directly to
     /// Temporal Server without an extra HTTP hop through the TypeScript worker.
-    pub async fn send_human_signal(
-        &self,
-        execution_id: &str,
-        response: String,
-    ) -> Result<()> {
-        use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest;
+    pub async fn send_human_signal(&self, execution_id: &str, response: String) -> Result<()> {
         use crate::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution;
+        use crate::infrastructure::temporal_proto::temporal::api::workflowservice::v1::SignalWorkflowExecutionRequest;
 
         let json_bytes = serde_json::to_vec(&response)?;
         let mut metadata = HashMap::new();
-        metadata.insert(
-            "encoding".to_string(),
-            "json/plain".as_bytes().to_vec(),
-        );
+        metadata.insert("encoding".to_string(), "json/plain".as_bytes().to_vec());
 
         let payload = Payload {
             metadata,

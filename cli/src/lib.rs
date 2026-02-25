@@ -7,6 +7,6 @@
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** Implements internal responsibilities for lib
 
-pub mod daemon;
 pub mod commands;
+pub mod daemon;
 pub mod embedded;

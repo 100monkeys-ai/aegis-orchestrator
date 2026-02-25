@@ -52,13 +52,13 @@
 //! let execution = repo.find_by_id(execution_id).await?;
 //! ```
 
+use crate::domain::execution::{ExecutionId, ExecutionStatus};
+use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+use crate::domain::workflow::{Blackboard, StateName, WorkflowExecution, WorkflowId};
+use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use anyhow::Result;
-use crate::domain::repository::{WorkflowExecutionRepository, RepositoryError};
-use crate::domain::workflow::{WorkflowExecution, WorkflowId, StateName, Blackboard};
-use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use std::collections::HashMap;
 
 pub struct PostgresWorkflowExecutionRepository {
@@ -82,7 +82,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
 
         let state_outputs_json = serde_json::to_value(&execution.state_outputs)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let status_str = match execution.status {
             ExecutionStatus::Pending => "pending",
             ExecutionStatus::Running => "running",
@@ -117,27 +117,32 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 state_history = workflow_executions.state_history || EXCLUDED.state_history,
                 last_transition_at = EXCLUDED.last_transition_at,
                 completed_at = EXCLUDED.completed_at
-            "#
+            "#,
         )
         .bind(execution.id.0)
         .bind(execution.workflow_id.0)
-        .bind(execution.id.0.to_string())  // temporal_run_id is execution_id
+        .bind(execution.id.0.to_string()) // temporal_run_id is execution_id
         .bind(input_json)
         .bind(status_str)
         .bind(execution.current_state.as_str())
         .bind(blackboard_json)
         .bind(state_outputs_json)
-        .bind(serde_json::json!(vec![execution.current_state.as_str()]))  // state_history
+        .bind(serde_json::json!(vec![execution.current_state.as_str()])) // state_history
         .bind(execution.started_at)
         .bind(execution.last_transition_at)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save workflow execution: {}", e)))?;
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to save workflow execution: {}", e))
+        })?;
 
         Ok(())
     }
 
-    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<WorkflowExecution>, RepositoryError> {
+    async fn find_by_id(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT 
@@ -146,7 +151,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -163,7 +168,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
-            
+
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
                 "running" => ExecutionStatus::Running,
@@ -174,8 +179,8 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             };
 
             // Reconstructs blackboard and state_outputs from JSONB
-            let blackboard = Blackboard::from_json(&blackboard_val)
-                .unwrap_or_else(|_| Blackboard::new());
+            let blackboard =
+                Blackboard::from_json(&blackboard_val).unwrap_or_else(|_| Blackboard::new());
 
             let state_outputs: HashMap<StateName, serde_json::Value> = state_outputs_val
                 .as_object()
@@ -216,7 +221,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE status = 'running'
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -224,7 +229,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
 
         let mut executions = Vec::new();
         for row in rows {
-             let id: uuid::Uuid = row.get("id");
+            let id: uuid::Uuid = row.get("id");
             let workflow_id: uuid::Uuid = row.get("workflow_id");
             let input_val: serde_json::Value = row.get("input_params");
             let status_str: String = row.get("status");
@@ -233,14 +238,14 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
-            
+
             let status = match status_str.as_str() {
                 "running" => ExecutionStatus::Running,
                 _ => ExecutionStatus::Running,
             };
 
-            let blackboard = Blackboard::from_json(&blackboard_val)
-                .unwrap_or_else(|_| Blackboard::new());
+            let blackboard =
+                Blackboard::from_json(&blackboard_val).unwrap_or_else(|_| Blackboard::new());
 
             let state_outputs: HashMap<StateName, serde_json::Value> = state_outputs_val
                 .as_object()
@@ -272,15 +277,15 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     }
 
     async fn append_event(
-        &self, 
-        execution_id: ExecutionId, 
-        temporal_sequence_number: i64, 
-        event_type: String, 
-        payload: serde_json::Value, 
-        iteration_number: Option<u8>
+        &self,
+        execution_id: ExecutionId,
+        temporal_sequence_number: i64,
+        event_type: String,
+        payload: serde_json::Value,
+        iteration_number: Option<u8>,
     ) -> Result<(), RepositoryError> {
         let iteration_val = iteration_number.map(|n| n as i16);
-        
+
         sqlx::query(
             r#"
             INSERT INTO execution_events (
@@ -288,7 +293,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             )
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (execution_id, temporal_sequence_number) DO NOTHING
-            "#
+            "#,
         )
         .bind(execution_id.0)
         .bind(temporal_sequence_number)
@@ -297,7 +302,9 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(iteration_val)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to append execution event: {}", e)))?;
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to append execution event: {}", e))
+        })?;
 
         // Also update iteration_count if this is an iteration event
         if iteration_number.is_some() {
@@ -306,13 +313,15 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 UPDATE workflow_executions 
                 SET iteration_count = GREATEST(iteration_count, $2)
                 WHERE id = $1
-                "#
+                "#,
             )
             .bind(execution_id.0)
             .bind(iteration_val)
             .execute(&self.pool)
             .await
-            .map_err(|e| RepositoryError::Database(format!("Failed to update iteration_count: {}", e)))?;
+            .map_err(|e| {
+                RepositoryError::Database(format!("Failed to update iteration_count: {}", e))
+            })?;
         }
 
         Ok(())

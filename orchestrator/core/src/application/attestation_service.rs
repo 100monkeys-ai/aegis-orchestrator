@@ -41,7 +41,9 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::smcp_session::SmcpSession;
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
-use crate::infrastructure::smcp::attestation::{AttestationRequest, AttestationResponse, AttestationService};
+use crate::infrastructure::smcp::attestation::{
+    AttestationRequest, AttestationResponse, AttestationService,
+};
 use crate::infrastructure::smcp::envelope::ContextClaims;
 use crate::infrastructure::smcp::signature::SecurityTokenIssuer;
 
@@ -79,10 +81,17 @@ impl AttestationService for AttestationServiceImpl {
         // 1. Resolve agent identity and applicable security context.
         // For MVP, we'll try to load "default" context. If it doesn't exist, we error.
         let context_name = "default";
-        let security_context = self.security_context_repo
+        let security_context = self
+            .security_context_repo
             .find_by_name(context_name)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Security context '{}' not found for agent {}", context_name, request.agent_id))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Security context '{}' not found for agent {}",
+                    context_name,
+                    request.agent_id
+                )
+            })?;
 
         // 2. Generate Claims
         let mut claims = ContextClaims {
@@ -90,7 +99,11 @@ impl AttestationService for AttestationServiceImpl {
             execution_id: request.execution_id.clone(),
             security_context: security_context.name.clone(),
             iss: None, // Filled by issuer
-            aud: Some(crate::infrastructure::smcp::envelope::AudienceClaim::Single("aegis-orchestrator".to_string())),
+            aud: Some(
+                crate::infrastructure::smcp::envelope::AudienceClaim::Single(
+                    "aegis-orchestrator".to_string(),
+                ),
+            ),
             exp: Some(chrono::Utc::now().timestamp() + 3600), // 1 hour expiration
             iat: Some(chrono::Utc::now().timestamp()),
             nbf: None,

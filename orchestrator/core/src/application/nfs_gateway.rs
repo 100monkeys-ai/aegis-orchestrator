@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! NFS Gateway Application Service
 //!
-//! Manages the lifecycle of the NFS server that provides POSIX-transparent 
+//! Manages the lifecycle of the NFS server that provides POSIX-transparent
 //! volume access to agent containers per ADR-036.
 //!
 //! ## Architecture
@@ -17,20 +17,20 @@
 //! - **Purpose:** Implements internal responsibilities for nfs gateway
 
 use crate::domain::{
-    fsal::{AegisFSAL, EventPublisher},
-    repository::VolumeRepository,
-    storage::StorageProvider,
     events::StorageEvent,
     execution::ExecutionId,
-    volume::VolumeId,
+    fsal::{AegisFSAL, EventPublisher},
     policy::FilesystemPolicy,
+    repository::VolumeRepository,
+    storage::StorageProvider,
+    volume::VolumeId,
 };
 use crate::infrastructure::nfs::server::{NfsServer, NfsServerError, NfsVolumeContext};
-use std::sync::Arc;
-use std::collections::HashMap;
-use parking_lot::{RwLock, Mutex};
-use thiserror::Error;
 use async_trait::async_trait;
+use parking_lot::{Mutex, RwLock};
+use std::collections::HashMap;
+use std::sync::Arc;
+use thiserror::Error;
 use tracing::debug;
 
 /// NFS Gateway service errors
@@ -56,7 +56,7 @@ pub enum NfsGatewayError {
 }
 
 /// Volume context registry for NFS export path routing
-/// 
+///
 /// Maps VolumeId to execution context (execution_id, UID/GID, policy).
 /// Thread-safe with RwLock for concurrent access from NFS operations.
 #[derive(Clone)]
@@ -88,7 +88,10 @@ impl NfsVolumeRegistry {
             policy,
         };
         self.contexts.write().insert(volume_id, context);
-        debug!("Registered NFS volume context: volume_id={}, execution_id={}", volume_id, execution_id);
+        debug!(
+            "Registered NFS volume context: volume_id={}, execution_id={}",
+            volume_id, execution_id
+        );
     }
 
     /// Deregister a volume
@@ -121,10 +124,10 @@ impl NfsVolumeRegistry {
 pub struct NfsGatewayService {
     /// NFS server instance (infrastructure)
     nfs_server: NfsServer,
-    
+
     /// Volume registry for export path routing
     volume_registry: NfsVolumeRegistry,
-    
+
     /// Whether server is running (wrapped in Mutex for interior mutability)
     is_running: Arc<Mutex<bool>>,
 }
@@ -173,14 +176,17 @@ impl NfsGatewayService {
             return Err(NfsGatewayError::AlreadyRunning);
         }
 
-        tracing::info!("Starting NFS server gateway on port {}", self.nfs_server.bind_port());
+        tracing::info!(
+            "Starting NFS server gateway on port {}",
+            self.nfs_server.bind_port()
+        );
 
         // Start the NFS server
         self.nfs_server.start().await?;
         *self.is_running.lock() = true;
-        
+
         tracing::info!("NFS server gateway started successfully");
-        
+
         Ok(())
     }
 
@@ -202,7 +208,7 @@ impl NfsGatewayService {
 
         *self.is_running.lock() = false;
         debug!("NFS server gateway stopped");
-        
+
         Ok(())
     }
 
@@ -217,13 +223,13 @@ impl NfsGatewayService {
         // Check if server task is still running
         if !self.nfs_server.is_running() {
             return Err(NfsGatewayError::HealthCheckFailed(
-                "Server task has stopped".to_string()
+                "Server task has stopped".to_string(),
             ));
         }
 
         // TODO: Send NULL RPC to verify server responding
         // This would require NFS client implementation or raw RPC call
-        
+
         Ok(())
     }
 
@@ -251,7 +257,13 @@ impl NfsGatewayService {
         container_gid: u32,
         policy: FilesystemPolicy,
     ) {
-        self.volume_registry.register(volume_id, execution_id, container_uid, container_gid, policy);
+        self.volume_registry.register(
+            volume_id,
+            execution_id,
+            container_uid,
+            container_gid,
+            policy,
+        );
     }
 
     /// Deregister a volume from the NFS server

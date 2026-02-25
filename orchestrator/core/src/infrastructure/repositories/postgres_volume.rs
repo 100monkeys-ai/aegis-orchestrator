@@ -11,12 +11,14 @@
 //!
 //! See ADR-025 (PostgreSQL Schema), ADR-032 (Unified Storage via SeaweedFS).
 
+use crate::domain::repository::{RepositoryError, VolumeRepository};
+use crate::domain::volume::{
+    FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeOwnership, VolumeStatus,
+};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use crate::domain::repository::{VolumeRepository, RepositoryError};
-use crate::domain::volume::{Volume, VolumeId, TenantId, VolumeStatus, StorageClass, FilerEndpoint, VolumeOwnership};
-use chrono::{DateTime, Utc};
 
 pub struct PostgresVolumeRepository {
     pool: PgPool,
@@ -34,13 +36,13 @@ impl VolumeRepository for PostgresVolumeRepository {
         // Serialize complex types to JSONB
         let storage_class_json = serde_json::to_value(&volume.storage_class)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let filer_endpoint_json = serde_json::to_value(&volume.filer_endpoint)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let status_json = serde_json::to_value(&volume.status)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let ownership_json = serde_json::to_value(&volume.ownership)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -94,7 +96,7 @@ impl VolumeRepository for PostgresVolumeRepository {
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -119,7 +121,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             FROM volumes
             WHERE tenant_id = $1
             ORDER BY created_at DESC
-            "#
+            "#,
         )
         .bind(tenant_id.0)
         .fetch_all(&self.pool)
@@ -145,7 +147,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             WHERE expires_at IS NOT NULL AND expires_at < $1
               AND status NOT IN ('"deleted"', '"deleting"')
             ORDER BY expires_at ASC
-            "#
+            "#,
         )
         .bind(now)
         .fetch_all(&self.pool)
@@ -159,7 +161,10 @@ impl VolumeRepository for PostgresVolumeRepository {
         Ok(volumes)
     }
 
-    async fn find_by_ownership(&self, ownership: &VolumeOwnership) -> Result<Vec<Volume>, RepositoryError> {
+    async fn find_by_ownership(
+        &self,
+        ownership: &VolumeOwnership,
+    ) -> Result<Vec<Volume>, RepositoryError> {
         // Convert ownership to JSON for comparison
         let ownership_json = serde_json::to_value(ownership)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
@@ -173,7 +178,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             FROM volumes
             WHERE ownership @> $1
             ORDER BY created_at DESC
-            "#
+            "#,
         )
         .bind(ownership_json)
         .fetch_all(&self.pool)
@@ -192,7 +197,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             r#"
             DELETE FROM volumes
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .execute(&self.pool)
@@ -200,7 +205,10 @@ impl VolumeRepository for PostgresVolumeRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!("Volume {} not found", id)));
+            return Err(RepositoryError::NotFound(format!(
+                "Volume {} not found",
+                id
+            )));
         }
 
         Ok(())
@@ -223,17 +231,22 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
     let detached_at: Option<DateTime<Utc>> = row.get("detached_at");
     let expires_at: Option<DateTime<Utc>> = row.get("expires_at");
 
-    let storage_class: StorageClass = serde_json::from_value(storage_class_val)
-        .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize storage_class: {}", e)))?;
-    
-    let filer_endpoint: FilerEndpoint = serde_json::from_value(filer_endpoint_val)
-        .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize filer_endpoint: {}", e)))?;
-    
-    let status: VolumeStatus = serde_json::from_value(status_val)
-        .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize status: {}", e)))?;
-    
-    let ownership: VolumeOwnership = serde_json::from_value(ownership_val)
-        .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize ownership: {}", e)))?;
+    let storage_class: StorageClass = serde_json::from_value(storage_class_val).map_err(|e| {
+        RepositoryError::Serialization(format!("Failed to deserialize storage_class: {}", e))
+    })?;
+
+    let filer_endpoint: FilerEndpoint =
+        serde_json::from_value(filer_endpoint_val).map_err(|e| {
+            RepositoryError::Serialization(format!("Failed to deserialize filer_endpoint: {}", e))
+        })?;
+
+    let status: VolumeStatus = serde_json::from_value(status_val).map_err(|e| {
+        RepositoryError::Serialization(format!("Failed to deserialize status: {}", e))
+    })?;
+
+    let ownership: VolumeOwnership = serde_json::from_value(ownership_val).map_err(|e| {
+        RepositoryError::Serialization(format!("Failed to deserialize ownership: {}", e))
+    })?;
 
     Ok(Volume {
         id: VolumeId(id),

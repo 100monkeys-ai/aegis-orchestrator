@@ -175,27 +175,30 @@ impl InnerLoopService {
     /// - LLM proxy call fails
     /// - Tool execution fails
     /// - Maximum iteration count is exceeded
-    pub async fn generate(
-        &self,
-        request: InnerLoopRequest,
-    ) -> anyhow::Result<InnerLoopResponse> {
+    pub async fn generate(&self, request: InnerLoopRequest) -> anyhow::Result<InnerLoopResponse> {
         let agent_id = AgentId::from_string(&request.agent_id)?;
         let execution_id = ExecutionId(uuid::Uuid::parse_str(&request.execution_id)?);
 
         // 1. Get available tools to inject into LLM context
-        let available_tools = self.tool_invocation_service.get_available_tools().await
+        let available_tools = self
+            .tool_invocation_service
+            .get_available_tools()
+            .await
             .unwrap_or_default();
 
-        let tool_schemas: Vec<Value> = available_tools.iter().map(|t| {
-            serde_json::json!({
-                "type": "function",
-                "function": {
-                    "name": &t.name,
-                    "description": &t.description,
-                    "parameters": &t.input_schema,
-                }
+        let tool_schemas: Vec<Value> = available_tools
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": &t.name,
+                        "description": &t.description,
+                        "parameters": &t.input_schema,
+                    }
+                })
             })
-        }).collect();
+            .collect();
 
         // 2. Build initial conversation
         let mut conversation = request.messages.clone();
@@ -212,7 +215,9 @@ impl InnerLoopService {
         // 3. Inner loop: call LLM, execute tools, repeat
         for _iteration in 0..MAX_INNER_LOOP_ITERATIONS {
             // Call LLM with current conversation and tool schemas
-            let llm_output = self.call_llm(&request.model_alias, &conversation, &tool_schemas).await?;
+            let llm_output = self
+                .call_llm(&request.model_alias, &conversation, &tool_schemas)
+                .await?;
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
@@ -239,16 +244,19 @@ impl InnerLoopService {
                     );
 
                     // Record the assistant's tool-call message
-                    let tool_call_summary: Vec<Value> = tool_calls.iter().map(|tc| {
-                        serde_json::json!({
-                            "id": tc.id,
-                            "type": "function",
-                            "function": {
-                                "name": tc.name,
-                                "arguments": tc.arguments.to_string(),
-                            }
+                    let tool_call_summary: Vec<Value> = tool_calls
+                        .iter()
+                        .map(|tc| {
+                            serde_json::json!({
+                                "id": tc.id,
+                                "type": "function",
+                                "function": {
+                                    "name": tc.name,
+                                    "arguments": tc.arguments.to_string(),
+                                }
+                            })
                         })
-                    }).collect();
+                        .collect();
 
                     conversation.push(ConversationMessage {
                         role: "assistant".to_string(),
@@ -258,12 +266,15 @@ impl InnerLoopService {
 
                     // Execute each tool call and append results
                     for tool_call in &tool_calls {
-                        let result = self.tool_invocation_service.invoke_tool_internal(
-                            &agent_id,
-                            execution_id,
-                            tool_call.name.clone(),
-                            tool_call.arguments.clone(),
-                        ).await;
+                        let result = self
+                            .tool_invocation_service
+                            .invoke_tool_internal(
+                                &agent_id,
+                                execution_id,
+                                tool_call.name.clone(),
+                                tool_call.arguments.clone(),
+                            )
+                            .await;
 
                         let tool_result = match result {
                             Ok(value) => serde_json::to_string(&value).unwrap_or_default(),
@@ -285,7 +296,9 @@ impl InnerLoopService {
         // Safety: if we exhaust iterations, return the last conversation state
         anyhow::bail!(
             "Inner loop exceeded maximum iterations ({}) for agent {} execution {}",
-            MAX_INNER_LOOP_ITERATIONS, request.agent_id, request.execution_id
+            MAX_INNER_LOOP_ITERATIONS,
+            request.agent_id,
+            request.execution_id
         )
     }
 
@@ -316,7 +329,11 @@ impl InnerLoopService {
                 let f = v.get("function")?;
                 Some(ToolSchema {
                     name: f.get("name")?.as_str()?.to_string(),
-                    description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    description: f
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     parameters: f.get("parameters")?.clone(),
                 })
             })
@@ -329,9 +346,7 @@ impl InnerLoopService {
             .generate_chat(model_alias, &chat_messages, &schemas, &options)
             .await
         {
-            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => {
-                Ok(LlmOutput::FinalText(r.text))
-            }
+            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => Ok(LlmOutput::FinalText(r.text)),
             Ok(crate::domain::llm::ChatResponse::ToolCalls(calls)) => {
                 let tool_calls = calls
                     .into_iter()
@@ -419,7 +434,10 @@ mod tests {
         };
         // Expect an error because no providers are registered
         let result = service.generate(request).await;
-        assert!(result.is_err(), "Expected error without LLM provider configured");
+        assert!(
+            result.is_err(),
+            "Expected error without LLM provider configured"
+        );
     }
 
     #[tokio::test]
@@ -465,7 +483,11 @@ mod tests {
                 let f = v.get("function")?;
                 Some(ToolSchema {
                     name: f.get("name")?.as_str()?.to_string(),
-                    description: f.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    description: f
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
                     parameters: f.get("parameters")?.clone(),
                 })
             })

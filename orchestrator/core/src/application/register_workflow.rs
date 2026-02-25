@@ -8,7 +8,7 @@
 //!
 //! - **Layer:** Application
 //! - **Responsibility:** Orchestrate registration of workflow definitions
-//! - **Collaborators:** 
+//! - **Collaborators:**
 //!   - Domain: Workflow aggregate (validation)
 //!   - Infrastructure: WorkflowParser, WorkflowRepository, TemporalClient, EventBus
 //!
@@ -109,16 +109,24 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
 
         let workflow_id = workflow.id.to_string();
         let workflow_name = workflow.metadata.name.clone();
-        let workflow_version = workflow.metadata.version.clone().unwrap_or_else(|| "0.1.0".to_string());
+        let workflow_version = workflow
+            .metadata
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.1.0".to_string());
 
         // Step 2: Map to Temporal definition via anti-corruption layer
-        let temporal_definition = crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(&workflow)
+        let temporal_definition =
+            crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
+                &workflow,
+            )
             .context("Failed to map workflow to Temporal definition")?;
 
         // Step 3: Register with Temporal via HTTP to TypeScript worker
         let client = {
             let lock = self.temporal_client.read().await;
-            lock.clone().ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
+            lock.clone()
+                .ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
         };
 
         client

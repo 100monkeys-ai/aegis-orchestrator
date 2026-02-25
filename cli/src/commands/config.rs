@@ -132,7 +132,12 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("  Strategy: {:?}", config.spec.llm_selection.strategy);
     println!(
         "  Default provider: {}",
-        config.spec.llm_selection.default_provider.as_deref().unwrap_or("(none)")
+        config
+            .spec
+            .llm_selection
+            .default_provider
+            .as_deref()
+            .unwrap_or("(none)")
     );
     if let Some(fallback) = &config.spec.llm_selection.fallback_provider {
         println!("  Fallback provider: {}", fallback);
@@ -145,8 +150,8 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
 async fn validate(config_path: Option<PathBuf>) -> Result<()> {
     println!("Validating configuration...");
 
-    let config = NodeConfigManifest::load_or_default(config_path)
-        .context("Failed to load configuration")?;
+    let config =
+        NodeConfigManifest::load_or_default(config_path).context("Failed to load configuration")?;
 
     config
         .validate()

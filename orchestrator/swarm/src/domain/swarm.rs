@@ -10,11 +10,11 @@
 //!
 //! See AGENTS.md §Swarm Coordination Context.
 
-use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-use chrono::{DateTime, Utc};
-use std::collections::HashSet;
 use aegis_core::domain::agent::AgentId;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
+use uuid::Uuid;
 
 /// Unique identifier for a [`Swarm`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

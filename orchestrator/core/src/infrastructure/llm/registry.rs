@@ -10,7 +10,9 @@ use crate::domain::llm::{
     ChatMessage, ChatResponse, GenerationOptions, GenerationResponse, LLMError, LLMProvider,
     ToolSchema,
 };
-use crate::domain::node_config::{LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest, resolve_env_value};
+use crate::domain::node_config::{
+    resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest,
+};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,7 +66,10 @@ impl ProviderRegistry {
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to initialize provider '{}': {}", provider_config.name, e);
+                    warn!(
+                        "Failed to initialize provider '{}': {}",
+                        provider_config.name, e
+                    );
                     // Continue with other providers
                 }
             }
@@ -155,9 +160,10 @@ impl ProviderRegistry {
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
 
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
-            LLMError::Provider(format!("Provider '{}' not found", provider_name))
-        })?;
+        let provider = self
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
 
         let mut last_error = None;
 
@@ -211,9 +217,10 @@ impl ProviderRegistry {
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
 
         // Get provider
-        let provider = self.providers.get(provider_name).ok_or_else(|| {
-            LLMError::Provider(format!("Provider '{}' not found", provider_name))
-        })?;
+        let provider = self
+            .providers
+            .get(provider_name)
+            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
 
         // Generate with retries
         let mut last_error = None;
@@ -282,7 +289,7 @@ impl ProviderRegistry {
 mod tests {
     use super::*;
     use crate::domain::node_config::{
-        LLMSelection, ManifestMetadata, NodeConfigManifest, NodeConfigSpec, NodeIdentity, NodeType
+        LLMSelection, ManifestMetadata, NodeConfigManifest, NodeConfigSpec, NodeIdentity, NodeType,
     };
 
     #[test]
@@ -355,7 +362,8 @@ impl LLMProvider for ProviderRegistry {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        self.generate_chat("default", messages, tools, options).await
+        self.generate_chat("default", messages, tools, options)
+            .await
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {

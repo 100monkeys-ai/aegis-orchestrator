@@ -28,21 +28,21 @@
 //!
 //! See ADR-005 (Iterative Execution Strategy), AGENTS.md §Execution Context.
 
-use uuid::Uuid;
+use crate::domain::agent::AgentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use crate::domain::agent::AgentId;
+use uuid::Uuid;
 
 // ============================================================================
 // Execution Hierarchy (Recursive Execution Tracking)
 // ============================================================================
 
 /// Maximum recursive depth for nested agent executions
-/// 
+///
 /// This prevents infinite recursion when agents call other agents.
 /// Example execution tree:
-/// 
+///
 /// ```text
 /// Depth 0: User Agent (generates code)
 /// Depth 1: ├─ Validation Agent (validates code)
@@ -58,10 +58,10 @@ pub const MAX_RECURSIVE_DEPTH: u8 = 3;
 pub struct ExecutionHierarchy {
     /// Parent execution ID (None for root executions)
     pub parent_execution_id: Option<ExecutionId>,
-    
+
     /// Recursive depth (0 for root, 1 for child, 2 for grandchild, etc.)
     pub depth: u8,
-    
+
     /// Execution path from root (list of execution IDs)
     pub path: Vec<ExecutionId>,
 }
@@ -84,38 +84,41 @@ impl ExecutionHierarchy {
             path: vec![execution_id],
         }
     }
-    
+
     /// Create a child execution hierarchy
-    pub fn child(parent: &ExecutionHierarchy, child_execution_id: ExecutionId) -> Result<Self, String> {
+    pub fn child(
+        parent: &ExecutionHierarchy,
+        child_execution_id: ExecutionId,
+    ) -> Result<Self, String> {
         let new_depth = parent.depth + 1;
-        
+
         if new_depth > MAX_RECURSIVE_DEPTH {
             return Err(format!(
                 "Maximum recursive depth ({}) exceeded. Cannot create child execution.",
                 MAX_RECURSIVE_DEPTH
             ));
         }
-        
+
         let mut path = parent.path.clone();
         path.push(child_execution_id);
-        
+
         Ok(Self {
             parent_execution_id: Some(parent.path[parent.path.len() - 1]),
             depth: new_depth,
             path,
         })
     }
-    
+
     /// Check if this execution can spawn a child
     pub fn can_spawn_child(&self) -> bool {
         self.depth < MAX_RECURSIVE_DEPTH
     }
-    
+
     /// Get the root execution ID
     pub fn root_id(&self) -> ExecutionId {
         self.path[0]
     }
-    
+
     /// Get the immediate parent execution ID
     pub fn parent_id(&self) -> Option<ExecutionId> {
         self.parent_execution_id
@@ -158,17 +161,17 @@ pub struct Execution {
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
     pub error: Option<String>,
-    
+
     /// Hierarchical execution tracking for nested agent calls
     /// Enables judge-calling-judge and agent composition patterns
     #[serde(default)]
     pub hierarchy: ExecutionHierarchy,
-    
+
     /// Container user ID for permission squashing (ADR-036)
     /// Default: 1000 (standard non-root user)
     #[serde(default = "default_container_uid")]
     pub container_uid: u32,
-    
+
     /// Container group ID for permission squashing (ADR-036)
     /// Default: 1000 (standard non-root group)
     #[serde(default = "default_container_gid")]
@@ -310,7 +313,7 @@ impl Execution {
             hierarchy: ExecutionHierarchy::root(id),
         }
     }
-    
+
     /// Create a child execution (for nested agent calls like judges)
     pub fn new_child(
         agent_id: AgentId,
@@ -321,7 +324,7 @@ impl Execution {
         let child_id = ExecutionId::new();
         let hierarchy = ExecutionHierarchy::child(&parent.hierarchy, child_id)
             .map_err(|e| ExecutionError::MaxDepthExceeded(e))?;
-        
+
         Ok(Self {
             id: child_id,
             agent_id,
@@ -337,17 +340,17 @@ impl Execution {
             hierarchy,
         })
     }
-    
+
     /// Check if this execution can spawn a child agent (for recursive calls)
     pub fn can_spawn_child(&self) -> bool {
         self.hierarchy.can_spawn_child()
     }
-    
+
     /// Get execution depth (0 = root, 1 = child, 2 = grandchild, etc.)
     pub fn depth(&self) -> u8 {
         self.hierarchy.depth
     }
-    
+
     /// Get parent execution ID if this is a child execution
     pub fn parent_id(&self) -> Option<ExecutionId> {
         self.hierarchy.parent_id()
@@ -357,12 +360,20 @@ impl Execution {
         self.status = ExecutionStatus::Running;
     }
 
-    pub fn add_llm_interaction(&mut self, iteration_number: u8, interaction: LlmInteraction) -> Result<(), ExecutionError> {
-        if let Some(iter) = self.iterations.iter_mut().find(|i| i.number == iteration_number) {
+    pub fn add_llm_interaction(
+        &mut self,
+        iteration_number: u8,
+        interaction: LlmInteraction,
+    ) -> Result<(), ExecutionError> {
+        if let Some(iter) = self
+            .iterations
+            .iter_mut()
+            .find(|i| i.number == iteration_number)
+        {
             iter.llm_interactions.push(interaction);
             Ok(())
         } else {
-             Err(ExecutionError::IterationNotFound(iteration_number))
+            Err(ExecutionError::IterationNotFound(iteration_number))
         }
     }
 
@@ -399,9 +410,17 @@ impl Execution {
             iter.ended_at = Some(Utc::now());
         }
     }
-    
-    pub fn store_validation_results(&mut self, iteration_number: u8, results: ValidationResults) -> Result<(), ExecutionError> {
-        if let Some(iter) = self.iterations.iter_mut().find(|i| i.number == iteration_number) {
+
+    pub fn store_validation_results(
+        &mut self,
+        iteration_number: u8,
+        results: ValidationResults,
+    ) -> Result<(), ExecutionError> {
+        if let Some(iter) = self
+            .iterations
+            .iter_mut()
+            .find(|i| i.number == iteration_number)
+        {
             iter.validation_results = Some(results);
             Ok(())
         } else {

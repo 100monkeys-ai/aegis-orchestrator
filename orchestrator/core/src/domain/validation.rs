@@ -23,11 +23,11 @@
 //! See ADR-016 (Agent-as-Judge Pattern), ADR-017 (Gradient Validation System),
 //! AGENTS.md §Gradient Validation Domain.
 
-use serde::{Serialize, Deserialize};
-use thiserror::Error;
 use crate::domain::agent::AgentId;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use thiserror::Error;
 
 /// Score between 0.0 and 1.0 representing confidence/quality
 pub type ValidationScore = f64;
@@ -37,13 +37,13 @@ pub type ValidationScore = f64;
 pub struct GradientResult {
     /// The score assigned by the judge (0.0 - 1.0)
     pub score: ValidationScore,
-    
+
     /// How confident the judge is in their own assessment (0.0 - 1.0)
     pub confidence: f64,
-    
+
     /// Textual explanation of why this score was given
     pub reasoning: String,
-    
+
     /// Specific signals identified (e.g., "syntax_error", "security_risk")
     #[serde(default)]
     pub signals: Vec<ValidationSignal>,
@@ -65,14 +65,14 @@ pub struct ValidationSignal {
 pub struct MultiJudgeConsensus {
     /// The final aggregated score
     pub final_score: ValidationScore,
-    
+
     /// Agreement level among judges (0.0 - 1.0)
     /// High variance = low consensus confidence
     pub consensus_confidence: f64,
-    
+
     /// Individual assessments from each judge
     pub individual_results: Vec<(AgentId, GradientResult)>,
-    
+
     /// Strategy used to reach consensus (e.g., "average", "weighted", "strict")
     pub strategy: String,
 
@@ -147,7 +147,9 @@ mod tests {
     #[test]
     fn test_gradient_result_with_metadata() {
         let mut result = make_gradient_result(0.7, 0.8);
-        result.metadata.insert("judge_id".to_string(), serde_json::json!("judge-1"));
+        result
+            .metadata
+            .insert("judge_id".to_string(), serde_json::json!("judge-1"));
         assert_eq!(result.metadata.len(), 1);
     }
 

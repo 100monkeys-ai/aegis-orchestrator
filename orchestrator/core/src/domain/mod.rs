@@ -34,23 +34,23 @@
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
 
 pub mod agent;
-pub mod execution;
-pub mod policy;
 pub mod events;
-pub mod runtime;
-pub mod supervisor;
-pub mod node_config;
-pub mod repository;
-pub mod llm;
-pub mod workflow;
-pub mod workflow_registry;
-pub mod stimulus;
-pub mod validation;
-pub mod volume;
-pub mod storage;
-pub mod path_sanitizer;
+pub mod execution;
 pub mod fsal;
+pub mod llm;
 pub mod mcp;
+pub mod node_config;
+pub mod path_sanitizer;
+pub mod policy;
+pub mod repository;
+pub mod runtime;
 pub mod security_context;
 pub mod smcp_session;
 pub mod smcp_session_repository;
+pub mod stimulus;
+pub mod storage;
+pub mod supervisor;
+pub mod validation;
+pub mod volume;
+pub mod workflow;
+pub mod workflow_registry;

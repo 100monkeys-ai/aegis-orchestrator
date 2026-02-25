@@ -33,8 +33,8 @@ use axum::{
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use subtle::ConstantTimeEq;
 use std::sync::Arc;
+use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -65,11 +65,12 @@ impl WebhookSecretProvider for EnvWebhookSecretProvider {
     async fn get_secret(&self, source_name: &str) -> Option<Vec<u8>> {
         let env_key = format!(
             "AEGIS_WEBHOOK_SECRET_{}",
-            source_name.to_uppercase().replace('-', "_").replace('.', "_")
+            source_name
+                .to_uppercase()
+                .replace('-', "_")
+                .replace('.', "_")
         );
-        std::env::var(&env_key)
-            .ok()
-            .map(|s| s.into_bytes())
+        std::env::var(&env_key).ok().map(|s| s.into_bytes())
     }
 }
 
@@ -97,9 +98,13 @@ impl WebhookAuthError {
     fn status_and_code(&self) -> (StatusCode, &'static str) {
         match self {
             WebhookAuthError::MissingSignature => (StatusCode::UNAUTHORIZED, "missing_signature"),
-            WebhookAuthError::MalformedSignature => (StatusCode::BAD_REQUEST, "malformed_signature"),
+            WebhookAuthError::MalformedSignature => {
+                (StatusCode::BAD_REQUEST, "malformed_signature")
+            }
             WebhookAuthError::InvalidHex => (StatusCode::BAD_REQUEST, "invalid_hex"),
-            WebhookAuthError::SecretNotFound { .. } => (StatusCode::UNAUTHORIZED, "secret_not_found"),
+            WebhookAuthError::SecretNotFound { .. } => {
+                (StatusCode::UNAUTHORIZED, "secret_not_found")
+            }
             WebhookAuthError::InvalidSignature => (StatusCode::UNAUTHORIZED, "invalid_signature"),
             WebhookAuthError::BodyReadError(_) => (StatusCode::BAD_REQUEST, "body_read_error"),
         }
@@ -120,18 +125,20 @@ impl IntoResponse for WebhookAuthError {
 impl std::fmt::Display for WebhookAuthError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            WebhookAuthError::MissingSignature =>
-                write!(f, "X-Aegis-Signature header is required"),
-            WebhookAuthError::MalformedSignature =>
-                write!(f, "X-Aegis-Signature must be in the format 'sha256=<hex>'"),
-            WebhookAuthError::InvalidHex =>
-                write!(f, "X-Aegis-Signature contains invalid hex encoding"),
-            WebhookAuthError::SecretNotFound { source } =>
-                write!(f, "No HMAC secret configured for source '{source}'"),
-            WebhookAuthError::InvalidSignature =>
-                write!(f, "Webhook signature verification failed"),
-            WebhookAuthError::BodyReadError(e) =>
-                write!(f, "Failed to read request body: {e}"),
+            WebhookAuthError::MissingSignature => write!(f, "X-Aegis-Signature header is required"),
+            WebhookAuthError::MalformedSignature => {
+                write!(f, "X-Aegis-Signature must be in the format 'sha256=<hex>'")
+            }
+            WebhookAuthError::InvalidHex => {
+                write!(f, "X-Aegis-Signature contains invalid hex encoding")
+            }
+            WebhookAuthError::SecretNotFound { source } => {
+                write!(f, "No HMAC secret configured for source '{source}'")
+            }
+            WebhookAuthError::InvalidSignature => {
+                write!(f, "Webhook signature verification failed")
+            }
+            WebhookAuthError::BodyReadError(e) => write!(f, "Failed to read request body: {e}"),
         }
     }
 }
@@ -193,8 +200,7 @@ where
             .strip_prefix("sha256=")
             .ok_or(WebhookAuthError::MalformedSignature)?;
 
-        let expected_bytes = hex::decode(hex_sig)
-            .map_err(|_| WebhookAuthError::InvalidHex)?;
+        let expected_bytes = hex::decode(hex_sig).map_err(|_| WebhookAuthError::InvalidHex)?;
 
         // ── Fetch secret for this source ──────────────────────────────────────
         let secret = hmac_state
@@ -203,7 +209,9 @@ where
             .await
             .ok_or_else(|| {
                 warn!(source = %source, "No HMAC secret configured for webhook source");
-                WebhookAuthError::SecretNotFound { source: source.clone() }
+                WebhookAuthError::SecretNotFound {
+                    source: source.clone(),
+                }
             })?;
 
         // ── Read body bytes (must be done after header extraction) ────────────
@@ -212,8 +220,7 @@ where
             .map_err(|e| WebhookAuthError::BodyReadError(e.to_string()))?;
 
         // ── Compute HMAC-SHA256 ───────────────────────────────────────────────
-        let mut mac = HmacSha256::new_from_slice(&secret)
-            .expect("HMAC accepts any key length");
+        let mut mac = HmacSha256::new_from_slice(&secret).expect("HMAC accepts any key length");
         mac.update(&body_bytes);
         let computed = mac.finalize().into_bytes();
 
@@ -229,7 +236,10 @@ where
 
         debug!(source = %source, body_len = body_bytes.len(), "Webhook HMAC verified");
 
-        Ok(WebhookHmacGuard { source, body: body_bytes })
+        Ok(WebhookHmacGuard {
+            source,
+            body: body_bytes,
+        })
     }
 }
 
@@ -241,8 +251,7 @@ where
 ///
 /// Useful in tests and for generating `X-Aegis-Signature` in client code.
 pub fn compute_webhook_signature(body: &[u8], secret: &[u8]) -> String {
-    let mut mac = HmacSha256::new_from_slice(secret)
-        .expect("HMAC accepts any key length");
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts any key length");
     mac.update(body);
     let result = mac.finalize().into_bytes();
     format!("sha256={}", hex::encode(result))

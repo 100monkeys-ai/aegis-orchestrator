@@ -30,26 +30,28 @@
 //!
 //! See Also: ADR-005 (Iterative Execution Strategy), ADR-036 (NFS Server Gateway)
 
-use crate::domain::execution::{Execution, ExecutionId, Iteration, ExecutionStatus, ExecutionInput, ExecutionError};
-use crate::domain::repository::ExecutionRepository;
-use crate::domain::events::ExecutionEvent;
-use crate::domain::agent::AgentId;
-use crate::domain::supervisor::{Supervisor, SupervisorObserver};
-use crate::domain::volume::{VolumeMount, TenantId, AccessMode};
-use crate::domain::runtime::RuntimeError;
 use crate::application::agent::AgentLifecycleService;
-use crate::application::volume_manager::VolumeService;
 use crate::application::nfs_gateway::NfsGatewayService;
-use crate::infrastructure::event_bus::{EventBus, DomainEvent, EventBusError};
-use crate::infrastructure::prompt_template_engine::{PromptTemplateEngine, PromptContext};
-use anyhow::{Result, anyhow};
+use crate::application::volume_manager::VolumeService;
+use crate::domain::agent::AgentId;
+use crate::domain::events::ExecutionEvent;
+use crate::domain::execution::{
+    Execution, ExecutionError, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
+};
+use crate::domain::policy::FilesystemPolicy;
+use crate::domain::repository::ExecutionRepository;
+use crate::domain::runtime::RuntimeError;
+use crate::domain::supervisor::{Supervisor, SupervisorObserver};
+use crate::domain::volume::{AccessMode, TenantId, VolumeMount};
+use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
+use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use futures::Stream;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::path::PathBuf;
-use chrono::Utc;
-use crate::domain::policy::FilesystemPolicy;
 use tokio_util::sync::CancellationToken;
 
 /// Primary interface for running agents through the 100monkeys iteration loop (BC-2).
@@ -74,7 +76,11 @@ pub trait ExecutionService: Send + Sync {
     /// - Agent not found
     /// - Volume provisioning failure
     /// - Container spawn failure
-    async fn start_execution(&self, agent_id: AgentId, input: ExecutionInput) -> Result<ExecutionId>;
+    async fn start_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+    ) -> Result<ExecutionId>;
 
     /// Retrieve the current state of an execution by ID.
     ///
@@ -104,16 +110,26 @@ pub trait ExecutionService: Send + Sync {
     ///
     /// The stream ends when the execution reaches a terminal state
     /// (`ExecutionCompleted`, `ExecutionFailed`, or `ExecutionCancelled`).
-    async fn stream_execution(&self, id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>>;
+    async fn stream_execution(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>>;
 
     /// Open a live stream of all [`DomainEvent`]s associated with a given agent.
     ///
     /// This includes events from all executions of the agent, not just a single one.
     /// Used by the Control Plane to power per-agent monitoring views.
-    async fn stream_agent_events(&self, id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
+    async fn stream_agent_events(
+        &self,
+        id: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>>;
 
     /// List executions, optionally filtered by `agent_id`, newest first, capped at `limit`.
-    async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>>;
+    async fn list_executions(
+        &self,
+        agent_id: Option<AgentId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>>;
 
     /// Permanently delete an execution record and all its iterations.
     ///
@@ -126,7 +142,12 @@ pub trait ExecutionService: Send + Sync {
     ///
     /// Called by the Supervisor during execution to preserve the full prompt/response
     /// history for transparency and Cortex learning.
-    async fn record_llm_interaction(&self, execution_id: ExecutionId, iteration: u8, interaction: crate::domain::execution::LlmInteraction) -> Result<()>;
+    async fn record_llm_interaction(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        interaction: crate::domain::execution::LlmInteraction,
+    ) -> Result<()>;
 }
 
 pub struct StandardExecutionService {
@@ -191,26 +212,28 @@ impl SupervisorObserver for ExecutionMonitor {
             let _ = self.repository.save(&exec).await;
         }
         // Emit Event
-        self.event_bus.publish_execution_event(ExecutionEvent::IterationStarted {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            action: action.to_string(),
-            started_at: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::IterationStarted {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                action: action.to_string(),
+                started_at: now,
+            });
     }
 
     async fn on_console_output(&self, iteration: u8, stream: &str, content: &str) {
         let now = Utc::now();
         // Streams live to user but doesn't persist (stored in validation_results instead)
-        self.event_bus.publish_execution_event(ExecutionEvent::ConsoleOutput {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            stream: stream.to_string(),
-            content: content.to_string(),
-            timestamp: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ConsoleOutput {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                stream: stream.to_string(),
+                content: content.to_string(),
+                timestamp: now,
+            });
     }
 
     async fn on_iteration_complete(&self, iteration: u8, output: &str, _exit_code: i64) {
@@ -219,13 +242,14 @@ impl SupervisorObserver for ExecutionMonitor {
             exec.complete_iteration(output.to_string());
             let _ = self.repository.save(&exec).await;
         }
-        self.event_bus.publish_execution_event(ExecutionEvent::IterationCompleted {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            output: output.to_string(),
-            completed_at: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::IterationCompleted {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                output: output.to_string(),
+                completed_at: now,
+            });
     }
 
     async fn on_iteration_fail(&self, iteration: u8, error: &str) {
@@ -235,47 +259,58 @@ impl SupervisorObserver for ExecutionMonitor {
             message: error.to_string(),
             details: None,
         };
-        
+
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
             exec.fail_iteration(iter_error.clone());
             let _ = self.repository.save(&exec).await;
         }
 
-        self.event_bus.publish_execution_event(ExecutionEvent::IterationFailed {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            error: iter_error,
-            failed_at: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::IterationFailed {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                error: iter_error,
+                failed_at: now,
+            });
     }
 
-    async fn on_instance_spawned(&self, iteration: u8, instance_id: &crate::domain::runtime::InstanceId) {
+    async fn on_instance_spawned(
+        &self,
+        iteration: u8,
+        instance_id: &crate::domain::runtime::InstanceId,
+    ) {
         let now = Utc::now();
-        self.event_bus.publish_execution_event(ExecutionEvent::InstanceSpawned {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            instance_id: instance_id.clone(),
-            spawned_at: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::InstanceSpawned {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                instance_id: instance_id.clone(),
+                spawned_at: now,
+            });
     }
 
-    async fn on_instance_terminated(&self, iteration: u8, instance_id: &crate::domain::runtime::InstanceId) {
+    async fn on_instance_terminated(
+        &self,
+        iteration: u8,
+        instance_id: &crate::domain::runtime::InstanceId,
+    ) {
         let now = Utc::now();
-        self.event_bus.publish_execution_event(ExecutionEvent::InstanceTerminated {
-            execution_id: self.execution_id,
-            agent_id: self.agent_id,
-            iteration_number: iteration,
-            instance_id: instance_id.clone(),
-            terminated_at: now,
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::InstanceTerminated {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                instance_id: instance_id.clone(),
+                terminated_at: now,
+            });
     }
 }
 
 impl StandardExecutionService {
     /// Extract user input string from ExecutionInput payload
-    /// 
+    ///
     /// Handles various input formats with priority order:
     /// 1. Workflow data: `{"workflow_input": "..."}`  (from WorkflowEngine)
     /// 2. Direct input: `{"input": "..."}`  (from CLI/API)
@@ -285,7 +320,7 @@ impl StandardExecutionService {
         match payload {
             // Direct string value
             serde_json::Value::String(s) => Ok(s.clone()),
-            
+
             // Object - check for special keys in priority order
             serde_json::Value::Object(map) => {
                 // Priority 1: workflow_input (from WorkflowEngine)
@@ -294,36 +329,35 @@ impl StandardExecutionService {
                         return Ok(s.clone());
                     }
                 }
-                
+
                 // Priority 2: input (from CLI/direct calls)
                 if let Some(input_val) = map.get("input") {
                     if let serde_json::Value::String(s) = input_val {
                         return Ok(s.clone());
                     }
                 }
-                
+
                 // Fallback: serialize the whole object as JSON string
                 Ok(serde_json::to_string_pretty(payload)?)
-            },
-            
+            }
+
             // Null or empty
-            serde_json::Value::Null => {
-                Err(ExecutionError::InvalidExecutionInput(
-                    "Payload is null or empty".to_string()
-                ).into())
-            },
-            
+            serde_json::Value::Null => Err(ExecutionError::InvalidExecutionInput(
+                "Payload is null or empty".to_string(),
+            )
+            .into()),
+
             // Other types: serialize as string representation
             _ => Ok(payload.to_string()),
         }
     }
-    
+
     /// Prepare execution input by rendering prompt template
-    /// 
+    ///
     /// ARCHITECTURAL PRINCIPLE: Always renders the agent's prompt_template to ensure
     /// agents are deterministic black boxes. External callers provide data via payload,
     /// but the agent controls how that data is formatted into an LLM prompt.
-    /// 
+    ///
     /// Any pre-existing intent value is ignored to enforce this boundary.
     fn prepare_execution_input(
         &self,
@@ -331,81 +365,94 @@ impl StandardExecutionService {
         agent: &crate::domain::agent::Agent,
     ) -> Result<ExecutionInput> {
         // Get task spec with prompt template
-        let task_spec = agent.manifest.spec.task.as_ref()
+        let task_spec = agent
+            .manifest
+            .spec
+            .task
+            .as_ref()
             .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
-        
-        let prompt_template = task_spec.prompt_template.as_ref()
+
+        let prompt_template = task_spec
+            .prompt_template
+            .as_ref()
             .ok_or_else(|| ExecutionError::MissingPromptTemplate)?;
-        
+
         // Get agent instruction
-        let agent_instruction = task_spec.instruction.as_ref()
+        let agent_instruction = task_spec
+            .instruction
+            .as_ref()
             .or(agent.manifest.metadata.description.as_ref())
             .map(|s| s.as_str())
             .unwrap_or("");
-        
+
         // Extract user input from payload
         let user_input = Self::extract_user_input(&input.payload)?;
-        
+
         // Build prompt context
         let context = PromptContext::new()
             .instruction(agent_instruction)
             .input(user_input)
             .iteration_number(1);
-        
+
         // Render template
         let template_engine = PromptTemplateEngine::new();
         let rendered_prompt = template_engine
             .render(prompt_template, &context)
             .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
-        
+
         // Set the rendered prompt as intent (overwriting any pre-existing value)
         input.intent = Some(rendered_prompt);
-        
+
         Ok(input)
     }
 }
 
 #[async_trait]
 impl ExecutionService for StandardExecutionService {
-    async fn start_execution(&self, agent_id: AgentId, input: ExecutionInput) -> Result<ExecutionId> {
+    async fn start_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+    ) -> Result<ExecutionId> {
         // 1. Fetch Agent
         let agent = self.agent_service.get_agent(agent_id).await?;
-        
+
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
-        
+
         // 3. Create Execution Record
         let max_retries = if let Some(exec) = &agent.manifest.spec.execution {
-             exec.max_retries as u8
+            exec.max_retries as u8
         } else {
             3 // Default
         };
 
         let mut execution = Execution::new(agent_id, prepared_input.clone(), max_retries);
         let execution_id = execution.id;
-        
+
         // 3. Save initial state
         self.repository.save(&execution).await?;
 
         // Emit Started Event
-        self.event_bus.publish_execution_event(ExecutionEvent::ExecutionStarted {
-            execution_id,
-            agent_id,
-            started_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ExecutionStarted {
+                execution_id,
+                agent_id,
+                started_at: Utc::now(),
+            });
 
         // 4. Spawn Runtime
         let mut env = agent.manifest.spec.env.clone();
-        
+
         // Inject instruction from default task if available
         if let Some(task_spec) = &agent.manifest.spec.task {
-             if let Some(instr) = &task_spec.instruction {
-                 env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
-             }
-             // Inject prompt template if specified
-             if let Some(prompt_tpl) = &task_spec.prompt_template {
-                 env.insert("AEGIS_PROMPT_TEMPLATE".to_string(), prompt_tpl.clone());
-             }
+            if let Some(instr) = &task_spec.instruction {
+                env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
+            }
+            // Inject prompt template if specified
+            if let Some(prompt_tpl) = &task_spec.prompt_template {
+                env.insert("AEGIS_PROMPT_TEMPLATE".to_string(), prompt_tpl.clone());
+            }
         }
         // Fallback to description if not set above
         if !env.contains_key("AEGIS_AGENT_INSTRUCTION") {
@@ -413,17 +460,23 @@ impl ExecutionService for StandardExecutionService {
                 env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), desc.clone());
             }
         }
-        
+
         // Inject other metadata
         env.insert("AEGIS_AGENT_ID".to_string(), agent_id.0.to_string());
         env.insert("AEGIS_EXECUTION_ID".to_string(), execution_id.0.to_string());
-        
+
         // Inject Orchestrator URL
         // We use host.docker.internal as the generic host, but port comes from config.
-        let port = self.config.spec.network.as_ref().map(|n| n.port).unwrap_or(8000);
+        let port = self
+            .config
+            .spec
+            .network
+            .as_ref()
+            .map(|n| n.port)
+            .unwrap_or(8000);
         let url = format!("http://host.docker.internal:{}", port);
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), url);
-        
+
         // Convert resource limits from domain format to runtime format
         let resources = if let Some(security) = &agent.manifest.spec.security {
             crate::domain::runtime::ResourceLimits {
@@ -440,53 +493,76 @@ impl ExecutionService for StandardExecutionService {
                 timeout_seconds: None,
             }
         };
-        
+
         // Create volumes from manifest if specified
-        tracing::info!("Checking for volumes in agent manifest: {} volume(s) specified", agent.manifest.spec.volumes.len());
+        tracing::info!(
+            "Checking for volumes in agent manifest: {} volume(s) specified",
+            agent.manifest.spec.volumes.len()
+        );
         let volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
             tracing::info!("Creating volumes for execution {}", execution_id.0);
-            
+
             // Get storage config from node config
-            let storage_config = self.config.spec.storage.as_ref()
+            let storage_config = self
+                .config
+                .spec
+                .storage
+                .as_ref()
                 .ok_or_else(|| anyhow!("Storage configuration not found in node config"))?;
-            
-            tracing::debug!("Storage config: backend={}, fallback={}", storage_config.backend, storage_config.fallback_to_local);
-            
+
+            tracing::debug!(
+                "Storage config: backend={}, fallback={}",
+                storage_config.backend,
+                storage_config.fallback_to_local
+            );
+
             // Create volumes using volume service
             let tenant_id = TenantId::default_tenant(); // TODO: Multi-tenancy
-            let volumes = self.volume_service.create_volumes_for_execution(
-                execution_id,
-                tenant_id,
-                &agent.manifest.spec.volumes,
-                &storage_config.backend,
-                storage_config.fallback_to_local,
-                storage_config.local.as_ref()
-                    .map(|l| l.base_path.as_str())
-                    .unwrap_or("/var/lib/aegis/local-volumes"),
-            ).await?;
-            
-            tracing::info!("Successfully created {} volume(s)", volumes.len());
-            
-            // Build VolumeMount objects from created volumes
-            volumes.iter().map(|volume| {
-                // Find corresponding spec to get mount_path and access_mode
-                let spec = agent.manifest.spec.volumes.iter()
-                    .find(|s| s.name == volume.name)
-                    .expect("Volume spec not found for created volume");
-                
-                let access_mode = match spec.access_mode.as_str() {
-                    "read-only" => AccessMode::ReadOnly,
-                    "read-write" | _ => AccessMode::ReadWrite,
-                };
-                
-                VolumeMount::new(
-                    volume.id,
-                    PathBuf::from(&spec.mount_path),
-                    access_mode,
-                    volume.filer_endpoint.clone(),
-                    volume.remote_path.clone(),
+            let volumes = self
+                .volume_service
+                .create_volumes_for_execution(
+                    execution_id,
+                    tenant_id,
+                    &agent.manifest.spec.volumes,
+                    &storage_config.backend,
+                    storage_config.fallback_to_local,
+                    storage_config
+                        .local
+                        .as_ref()
+                        .map(|l| l.base_path.as_str())
+                        .unwrap_or("/var/lib/aegis/local-volumes"),
                 )
-            }).collect::<Vec<VolumeMount>>()
+                .await?;
+
+            tracing::info!("Successfully created {} volume(s)", volumes.len());
+
+            // Build VolumeMount objects from created volumes
+            volumes
+                .iter()
+                .map(|volume| {
+                    // Find corresponding spec to get mount_path and access_mode
+                    let spec = agent
+                        .manifest
+                        .spec
+                        .volumes
+                        .iter()
+                        .find(|s| s.name == volume.name)
+                        .expect("Volume spec not found for created volume");
+
+                    let access_mode = match spec.access_mode.as_str() {
+                        "read-only" => AccessMode::ReadOnly,
+                        "read-write" | _ => AccessMode::ReadWrite,
+                    };
+
+                    VolumeMount::new(
+                        volume.id,
+                        PathBuf::from(&spec.mount_path),
+                        access_mode,
+                        volume.filer_endpoint.clone(),
+                        volume.remote_path.clone(),
+                    )
+                })
+                .collect::<Vec<VolumeMount>>()
         } else {
             Vec::new()
         };
@@ -506,10 +582,14 @@ impl ExecutionService for StandardExecutionService {
                     1000, // container_gid
                     policy,
                 );
-                tracing::info!("Registered volume {} with NFS gateway for execution {}", mount.volume_id, execution_id);
+                tracing::info!(
+                    "Registered volume {} with NFS gateway for execution {}",
+                    mount.volume_id,
+                    execution_id
+                );
             }
         }
-        
+
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             language: agent.manifest.spec.runtime.language.clone(),
             version: agent.manifest.spec.runtime.version.clone(),
@@ -527,16 +607,16 @@ impl ExecutionService for StandardExecutionService {
 
         execution.start();
         self.repository.save(&execution).await?;
-            
+
         // 5. Run Supervisor Loop
         let supervisor = self.supervisor.clone();
         let repository = self.repository.clone();
         let event_bus = self.event_bus.clone();
         let exec_input = prepared_input.clone();
-        
+
         // NOTE: We no longer build judges here. Validation is the workflow's responsibility.
         // If workflows want validation, they should spawn judge agents.
-        
+
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
             agent_id,
@@ -547,17 +627,20 @@ impl ExecutionService for StandardExecutionService {
         // Create a cancellation token for this execution so cancel_execution() can
         // signal the Supervisor loop to stop cooperatively.
         let cancellation_token = CancellationToken::new();
-        self.cancellation_tokens.insert(execution_id, cancellation_token.clone());
+        self.cancellation_tokens
+            .insert(execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
 
         tokio::spawn(async move {
-            let result = supervisor.run_loop(
-                runtime_config,
-                exec_input,
-                max_retries as u32,
-                monitor,
-                cancellation_token,
-            ).await;
+            let result = supervisor
+                .run_loop(
+                    runtime_config,
+                    exec_input,
+                    max_retries as u32,
+                    monitor,
+                    cancellation_token,
+                )
+                .await;
 
             // Clean up the token from the map now that the execution is done
             tokens_map.remove(&execution_id);
@@ -567,25 +650,28 @@ impl ExecutionService for StandardExecutionService {
                     // Update to completed
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                         if let Some(mut exec) = exec_opt {
-                             exec.complete();
-                             let total_iterations = exec.iterations().len() as u8;
-                             let _ = repository.save(&exec).await;
+                            exec.complete();
+                            let total_iterations = exec.iterations().len() as u8;
+                            let _ = repository.save(&exec).await;
 
-                             event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
-                                 execution_id,
-                                 agent_id,
-                                 final_output: final_output.clone(),
-                                 total_iterations,
-                                 completed_at: Utc::now(),
-                             });
+                            event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
+                                execution_id,
+                                agent_id,
+                                final_output: final_output.clone(),
+                                total_iterations,
+                                completed_at: Utc::now(),
+                            });
                         }
                     }
-                },
+                }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
                     // Execution timed out — emit specific timeout event
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
                         if let Some(mut exec) = exec_opt {
-                            exec.fail(format!("Execution timed out after {} seconds", timeout_secs));
+                            exec.fail(format!(
+                                "Execution timed out after {} seconds",
+                                timeout_secs
+                            ));
                             let total_iterations = exec.iterations().len() as u8;
                             let _ = repository.save(&exec).await;
 
@@ -598,7 +684,7 @@ impl ExecutionService for StandardExecutionService {
                             });
                         }
                     }
-                },
+                }
                 Err(RuntimeError::Cancelled) => {
                     // Execution was cancelled — status already set by cancel_execution(),
                     // but ensure we mark it if the token was triggered externally.
@@ -609,33 +695,37 @@ impl ExecutionService for StandardExecutionService {
                                 exec.ended_at = Some(Utc::now());
                                 let _ = repository.save(&exec).await;
 
-                                event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
-                                    execution_id,
-                                    agent_id,
-                                    reason: Some("Cancelled via cancellation token".to_string()),
-                                    cancelled_at: Utc::now(),
-                                });
+                                event_bus.publish_execution_event(
+                                    ExecutionEvent::ExecutionCancelled {
+                                        execution_id,
+                                        agent_id,
+                                        reason: Some(
+                                            "Cancelled via cancellation token".to_string(),
+                                        ),
+                                        cancelled_at: Utc::now(),
+                                    },
+                                );
                             }
                         }
                     }
-                },
+                }
                 Err(e) => {
                     // Update to failed (generic failure)
                     if let Ok(exec_opt) = repository.find_by_id(execution_id).await {
-                         if let Some(mut exec) = exec_opt {
-                              exec.fail(e.to_string());
-                              let total_iterations = exec.iterations().len() as u8;
-                              let _ = repository.save(&exec).await;
+                        if let Some(mut exec) = exec_opt {
+                            exec.fail(e.to_string());
+                            let total_iterations = exec.iterations().len() as u8;
+                            let _ = repository.save(&exec).await;
 
-                              event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
-                                 execution_id,
-                                 agent_id,
-                                 reason: e.to_string(),
-                                 total_iterations,
-                                 failed_at: Utc::now(),
-                             });
-                         }
-                     }
+                            event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+                                execution_id,
+                                agent_id,
+                                reason: e.to_string(),
+                                total_iterations,
+                                failed_at: Utc::now(),
+                            });
+                        }
+                    }
                 }
             }
         });
@@ -644,7 +734,9 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
-        self.repository.find_by_id(id).await?
+        self.repository
+            .find_by_id(id)
+            .await?
             .ok_or_else(|| anyhow!("Execution not found"))
     }
 
@@ -654,53 +746,64 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-         // Signal the Supervisor loop to stop via the CancellationToken.
-         // The Supervisor will terminate the running container and return
-         // RuntimeError::Cancelled, which the spawned task handles above.
-         if let Some(token) = self.cancellation_tokens.get(&id) {
-             token.cancel();
-         }
+        // Signal the Supervisor loop to stop via the CancellationToken.
+        // The Supervisor will terminate the running container and return
+        // RuntimeError::Cancelled, which the spawned task handles above.
+        if let Some(token) = self.cancellation_tokens.get(&id) {
+            token.cancel();
+        }
 
-         let mut execution = self.get_execution(id).await?;
-         execution.status = ExecutionStatus::Cancelled;
-         execution.ended_at = Some(Utc::now());
-         self.repository.save(&execution).await?;
-         
-         self.event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
-             execution_id: id,
-             agent_id: execution.agent_id,
-             reason: None,
-             cancelled_at: Utc::now(),
-         });
+        let mut execution = self.get_execution(id).await?;
+        execution.status = ExecutionStatus::Cancelled;
+        execution.ended_at = Some(Utc::now());
+        self.repository.save(&execution).await?;
 
-         // Remove the token from the map — the Supervisor will also try to remove
-         // it when it exits, but this is idempotent.
-         self.cancellation_tokens.remove(&id);
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                execution_id: id,
+                agent_id: execution.agent_id,
+                reason: None,
+                cancelled_at: Utc::now(),
+            });
 
-         Ok(())
+        // Remove the token from the map — the Supervisor will also try to remove
+        // it when it exits, but this is idempotent.
+        self.cancellation_tokens.remove(&id);
+
+        Ok(())
     }
 
-    async fn stream_execution(&self, id: ExecutionId) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+    async fn stream_execution(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
         let receiver = self.event_bus.subscribe_execution(id);
-        
+
         let stream = futures::stream::unfold(receiver, |mut receiver| async move {
-             match receiver.recv().await {
-                 Ok(event) => Some((Ok(event), receiver)),
-                 Err(EventBusError::Closed) => None,
-                 Err(e) => Some((Err(anyhow!("Event bus error: {}", e)), receiver)),
-             }
+            match receiver.recv().await {
+                Ok(event) => Some((Ok(event), receiver)),
+                Err(EventBusError::Closed) => None,
+                Err(e) => Some((Err(anyhow!("Event bus error: {}", e)), receiver)),
+            }
         });
-        
+
         Ok(Box::pin(stream))
     }
 
-    async fn stream_agent_events(&self, _id: AgentId) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+    async fn stream_agent_events(
+        &self,
+        _id: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
         // Agent event streaming is implemented in daemon/server.rs::stream_agent_events_handler
         // which subscribes to EventBus directly. This trait method returns empty for interface compliance.
         Ok(Box::pin(futures::stream::empty()))
     }
 
-    async fn list_executions(&self, agent_id: Option<AgentId>, limit: usize) -> Result<Vec<Execution>> {
+    async fn list_executions(
+        &self,
+        agent_id: Option<AgentId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
         if let Some(aid) = agent_id {
             let executions = self.repository.find_by_agent(aid).await?;
             // Apply limit manually since repo doesn't support limit on find_by_agent yet
@@ -715,10 +818,20 @@ impl ExecutionService for StandardExecutionService {
         Ok(())
     }
 
-    async fn record_llm_interaction(&self, execution_id: ExecutionId, iteration: u8, interaction: crate::domain::execution::LlmInteraction) -> Result<()> {
+    async fn record_llm_interaction(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        interaction: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
         if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
             if let Err(e) = exec.add_llm_interaction(iteration, interaction) {
-                tracing::warn!("Failed to record LLM interaction for execution {} iteration {}: {}", execution_id.0, iteration, e);
+                tracing::warn!(
+                    "Failed to record LLM interaction for execution {} iteration {}: {}",
+                    execution_id.0,
+                    iteration,
+                    e
+                );
             } else {
                 self.repository.save(&exec).await?;
             }

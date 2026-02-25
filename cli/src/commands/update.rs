@@ -33,12 +33,12 @@
 //! Requires `spec.database.url` to be set in `aegis-config.yaml`.
 //! The URL supports `env:VAR_NAME` syntax for environment-based resolution.
 
+use aegis_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use anyhow::{Context, Result};
 use clap::Args;
-use anyhow::{Result, Context};
 use colored::Colorize;
 use sqlx::postgres::PgPoolOptions;
 use std::path::PathBuf;
-use aegis_core::domain::node_config::{NodeConfigManifest, resolve_env_value};
 
 #[derive(Args)]
 pub struct UpdateCommand {
@@ -49,11 +49,13 @@ pub struct UpdateCommand {
 
 pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result<()> {
     println!("{}", "AEGIS Update".bold().green());
-    
+
     // Load node configuration
     let config = NodeConfigManifest::load_or_default(config_path)?;
 
-    let db_config = config.spec.database
+    let db_config = config
+        .spec
+        .database
         .as_ref()
         .context("spec.database is not configured in aegis-config.yaml. Cannot run updates.")?;
 
@@ -80,13 +82,16 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
     };
 
     let total_migrations = MIGRATOR.iter().count();
-    
-    println!("Migration status: {} applied, {} total available.", applied_count, total_migrations);
+
+    println!(
+        "Migration status: {} applied, {} total available.",
+        applied_count, total_migrations
+    );
 
     if applied_count < total_migrations {
         if cmd.dry_run {
             println!("Pending migrations found (Dry Run):");
-             for migration in MIGRATOR.iter().skip(applied_count) {
+            for migration in MIGRATOR.iter().skip(applied_count) {
                 println!(" - {} {}", migration.version, migration.description);
             }
             println!("Skipping application due to --dry-run");
@@ -94,7 +99,10 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
         }
 
         println!("Applying pending migrations...");
-        MIGRATOR.run(&pool).await.context("Failed to apply migrations")?;
+        MIGRATOR
+            .run(&pool)
+            .await
+            .context("Failed to apply migrations")?;
         println!("{}", "✓ Database updated successfully.".green());
     } else {
         println!("{}", "✓ Database is up to date.".green());

@@ -15,18 +15,15 @@ use std::sync::Arc;
 
 use aegis_core::{
     application::{
-        execution::StandardExecutionService, execution::ExecutionService,
-        lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
+        agent::AgentLifecycleService, execution::ExecutionService,
+        execution::StandardExecutionService, lifecycle::StandardAgentLifecycleService,
     },
     domain::{
-        node_config::NodeConfigManifest,
         agent::AgentId,
-        execution::{ExecutionInput, ExecutionId},
+        execution::{ExecutionId, ExecutionInput},
+        node_config::NodeConfigManifest,
     },
-    infrastructure::{
-        event_bus::EventBus,
-        llm::registry::ProviderRegistry,
-    },
+    infrastructure::{event_bus::EventBus, llm::registry::ProviderRegistry},
 };
 use aegis_sdk::AgentManifest;
 
@@ -52,7 +49,8 @@ impl EmbeddedExecutor {
     }
 
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
-        let core_manifest: aegis_core::domain::agent::AgentManifest = serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
+        let core_manifest: aegis_core::domain::agent::AgentManifest =
+            serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
         self.agent_service.deploy_agent(core_manifest).await
     }
 
@@ -64,10 +62,12 @@ impl EmbeddedExecutor {
         // For now, keep intent as None and let ExecutionService handle prompt rendering
         // The input payload will be processed by ExecutionService.prepare_execution_input()
         let execution_input = ExecutionInput {
-             intent: None, // Will be rendered by ExecutionService from prompt template
-             payload: input,
+            intent: None, // Will be rendered by ExecutionService from prompt template
+            payload: input,
         };
-        self.execution_service.start_execution(agent_id, execution_input).await
+        self.execution_service
+            .start_execution(agent_id, execution_input)
+            .await
     }
 
     pub async fn get_execution(&self, execution_id: ExecutionId) -> Result<ExecutionInfo> {
@@ -92,7 +92,10 @@ impl EmbeddedExecutor {
         agent_id: Option<AgentId>,
         limit: usize,
     ) -> Result<Vec<ExecutionInfo>> {
-        let executions = self.execution_service.list_executions(agent_id, limit).await?;
+        let executions = self
+            .execution_service
+            .list_executions(agent_id, limit)
+            .await?;
         Ok(executions.into_iter().map(ExecutionInfo::from).collect())
     }
 
@@ -114,7 +117,7 @@ impl EmbeddedExecutor {
             match receiver.recv().await {
                 Ok(event) => {
                     let event = DomainEvent::Execution(event);
-                    
+
                     // Filter errors if requested
                     if errors_only && !is_error_event(&event) {
                         continue;
@@ -199,18 +202,9 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                 ..
             } => {
                 if verbose {
-                    println!(
-                        "{} {} - {}",
-                        "Iteration".yellow(),
-                        iteration_number,
-                        action
-                    );
+                    println!("{} {} - {}", "Iteration".yellow(), iteration_number, action);
                 } else {
-                    println!(
-                        "{} {}",
-                        "Iteration".yellow(),
-                        iteration_number,
-                    );
+                    println!("{} {}", "Iteration".yellow(), iteration_number,);
                 }
             }
             aegis_core::domain::events::ExecutionEvent::IterationCompleted {
@@ -285,7 +279,9 @@ fn print_event(event: &DomainEvent, verbose: bool) {
             aegis_core::domain::events::ExecutionEvent::ExecutionCancelled { .. } => {
                 println!("{}", "Execution cancelled".bold().yellow());
             }
-            aegis_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
+            aegis_core::domain::events::ExecutionEvent::ConsoleOutput {
+                stream, content, ..
+            } => {
                 if verbose {
                     let prefix = match stream.as_str() {
                         "stderr" => "[STDERR]".red(),
@@ -295,13 +291,14 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     println!("{} {}", prefix, content.trim_end());
                 }
             }
-            aegis_core::domain::events::ExecutionEvent::LlmInteraction { model, prompt, response, .. } => {
+            aegis_core::domain::events::ExecutionEvent::LlmInteraction {
+                model,
+                prompt,
+                response,
+                ..
+            } => {
                 if verbose {
-                    println!(
-                        "{} [{}]",
-                        "LLM Interaction".purple().bold(),
-                        model
-                    );
+                    println!("{} [{}]", "LLM Interaction".purple().bold(), model);
                     println!("{}", "PROMPT:".dimmed());
                     println!("{}", prompt);
                     println!("{}", "RESPONSE:".dimmed());
@@ -337,28 +334,34 @@ fn print_event(event: &DomainEvent, verbose: bool) {
                     instance_id.as_str().chars().take(12).collect::<String>()
                 );
             }
-            aegis_core::domain::events::ExecutionEvent::Validation(val_event) => {
-                match val_event {
-                    aegis_core::domain::events::ValidationEvent::GradientValidationPerformed { score, confidence, .. } => {
-                        println!(
-                            "{} {} (score: {:.2}, conf: {:.2})",
-                            "Validation".magenta().bold(),
-                            "performed".cyan(),
-                            score,
-                            confidence
-                        );
-                    }
-                    aegis_core::domain::events::ValidationEvent::MultiJudgeConsensus { final_score, confidence, .. } => {
-                        println!(
-                            "{} {} (score: {:.2}, conf: {:.2})",
-                            "Validation".magenta().bold(),
-                            "consensus reached".green(),
-                            final_score,
-                            confidence
-                        );
-                    }
+            aegis_core::domain::events::ExecutionEvent::Validation(val_event) => match val_event {
+                aegis_core::domain::events::ValidationEvent::GradientValidationPerformed {
+                    score,
+                    confidence,
+                    ..
+                } => {
+                    println!(
+                        "{} {} (score: {:.2}, conf: {:.2})",
+                        "Validation".magenta().bold(),
+                        "performed".cyan(),
+                        score,
+                        confidence
+                    );
                 }
-            }
+                aegis_core::domain::events::ValidationEvent::MultiJudgeConsensus {
+                    final_score,
+                    confidence,
+                    ..
+                } => {
+                    println!(
+                        "{} {} (score: {:.2}, conf: {:.2})",
+                        "Validation".magenta().bold(),
+                        "consensus reached".green(),
+                        final_score,
+                        confidence
+                    );
+                }
+            },
             aegis_core::domain::events::ExecutionEvent::ExecutionTimedOut {
                 timeout_seconds,
                 total_iterations,

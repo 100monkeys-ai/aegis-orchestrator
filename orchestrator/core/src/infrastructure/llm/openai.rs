@@ -11,8 +11,8 @@
 //! the custom `base_url` as `endpoint`.
 
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions,
-    GenerationResponse, LLMError, LLMProvider, ToolSchema,
+    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
+    LLMError, LLMProvider, ToolSchema,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -238,11 +238,7 @@ impl LLMProvider for OpenAIAdapter {
         }
 
         // Otherwise it's a final text response
-        let text = choice
-            .message
-            .content
-            .clone()
-            .unwrap_or_default();
+        let text = choice.message.content.clone().unwrap_or_default();
 
         Ok(ChatResponse::FinalText(GenerationResponse {
             text,
@@ -340,9 +336,18 @@ mod tests {
     #[test]
     fn test_finish_reason_mapping() {
         assert_eq!(OpenAIAdapter::map_finish_reason("stop"), FinishReason::Stop);
-        assert_eq!(OpenAIAdapter::map_finish_reason("length"), FinishReason::Length);
-        assert_eq!(OpenAIAdapter::map_finish_reason("content_filter"), FinishReason::ContentFilter);
-        assert_eq!(OpenAIAdapter::map_finish_reason("tool_calls"), FinishReason::Stop);
+        assert_eq!(
+            OpenAIAdapter::map_finish_reason("length"),
+            FinishReason::Length
+        );
+        assert_eq!(
+            OpenAIAdapter::map_finish_reason("content_filter"),
+            FinishReason::ContentFilter
+        );
+        assert_eq!(
+            OpenAIAdapter::map_finish_reason("tool_calls"),
+            FinishReason::Stop
+        );
     }
 
     #[test]

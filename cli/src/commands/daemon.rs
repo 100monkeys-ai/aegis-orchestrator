@@ -72,10 +72,15 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
     // logic in NodeConfigManifest::load_or_default handles explicit path check (errors if missing)
     let config = NodeConfigManifest::load_or_default(config_path.clone())
         .context("Failed to load configuration")?;
-    
+
     // 2. Warning: Check for empty providers
     if config.spec.llm_providers.is_empty() {
-        println!("{}", "WARNING: Started with NO LLM providers configured.".yellow().bold());
+        println!(
+            "{}",
+            "WARNING: Started with NO LLM providers configured."
+                .yellow()
+                .bold()
+        );
         println!("{}", "         Agents will fail to generate text.".yellow());
         println!("         Please check your config file or use --config <path>.");
     }
@@ -84,7 +89,10 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
 
     match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, .. }) => {
-            println!("{}", format!("✓ Daemon already running (PID: {})", pid).green());
+            println!(
+                "{}",
+                format!("✓ Daemon already running (PID: {})", pid).green()
+            );
             println!("Use 'aegis daemon stop' to stop it first.");
             return Ok(());
         }
@@ -92,7 +100,10 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
             info!("Daemon not running, starting...");
         }
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
-            warn!("Daemon PID {} exists but unhealthy (error: {}), stopping...", pid, error);
+            warn!(
+                "Daemon PID {} exists but unhealthy (error: {}), stopping...",
+                pid, error
+            );
             stop_daemon(false, 10).await?;
         }
         Err(e) => {
@@ -101,8 +112,7 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
     }
 
     // Re-exec self with --daemon flag
-    let current_exe =
-        std::env::current_exe().context("Failed to get current executable path")?;
+    let current_exe = std::env::current_exe().context("Failed to get current executable path")?;
 
     let mut cmd = std::process::Command::new(current_exe);
     cmd.arg("--daemon");
@@ -119,18 +129,20 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    
+
     let temp_dir = std::env::temp_dir();
     let stdout_path = temp_dir.join("aegis.out");
     let stderr_path = temp_dir.join("aegis.err");
 
-    let stdout_file = std::fs::File::create(&stdout_path).context("Failed to create stdout log file")?;
-    let stderr_file = std::fs::File::create(&stderr_path).context("Failed to create stderr log file")?;
+    let stdout_file =
+        std::fs::File::create(&stdout_path).context("Failed to create stdout log file")?;
+    let stderr_file =
+        std::fs::File::create(&stderr_path).context("Failed to create stderr log file")?;
 
     cmd.stdin(std::process::Stdio::null())
-       .stdout(stdout_file)
-       .stderr(stderr_file);
-    
+        .stdout(stdout_file)
+        .stderr(stderr_file);
+
     println!("Redirecting logs to: {}", stdout_path.display());
 
     let child = cmd.spawn().context("Failed to spawn daemon process")?;
@@ -179,10 +191,7 @@ async fn status(host: &str, port: u16) -> Result<()> {
             println!("{}", "✗ Daemon is not running".red());
         }
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
-            println!(
-                "{}",
-                format!("⚠ Daemon unhealthy (PID: {})", pid).yellow()
-            );
+            println!("{}", format!("⚠ Daemon unhealthy (PID: {})", pid).yellow());
             println!("  Process exists but HTTP API check failed: {}", error);
             println!("  Check logs at /tmp/aegis.out and /tmp/aegis.err");
         }

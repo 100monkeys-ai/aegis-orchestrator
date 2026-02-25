@@ -21,7 +21,7 @@
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::domain::smcp_session::{SmcpSession, EnvelopeVerifier, SmcpSessionError};
+use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSession, SmcpSessionError};
 
 /// Orchestrator middleware that verifies and unwraps incoming SMCP envelopes.
 ///
@@ -56,12 +56,12 @@ impl SmcpMiddleware {
     /// wrapper. The `security_token` and `signature` fields are never forwarded to
     /// the tool server, preserving credential isolation (ADR-033).
     pub fn verify_and_unwrap(
-        &self, 
-        session: &SmcpSession, 
-        envelope: &impl EnvelopeVerifier
+        &self,
+        session: &SmcpSession,
+        envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
         info!("Verifying SMCP envelope for session {}", session.id);
-        
+
         match session.evaluate_call(envelope) {
             Ok(()) => {
                 info!("SMCP envelope verified successfully");

@@ -9,12 +9,19 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements temporal integration test
 
-use aegis_core::application::register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase};
-use aegis_core::application::start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest};
-use aegis_core::infrastructure::event_bus::EventBus;
-use aegis_core::domain::repository::{WorkflowRepository, WorkflowExecutionRepository, RepositoryError};
-use aegis_core::domain::workflow::{Workflow, WorkflowId, WorkflowExecution};
+use aegis_core::application::register_workflow::{
+    RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase,
+};
+use aegis_core::application::start_workflow_execution::{
+    StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
+    StartWorkflowExecutionUseCase,
+};
 use aegis_core::domain::execution::ExecutionId;
+use aegis_core::domain::repository::{
+    RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
+};
+use aegis_core::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
+use aegis_core::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -23,20 +30,48 @@ use tokio::sync::RwLock;
 struct MockWorkflowRepo;
 #[async_trait]
 impl WorkflowRepository for MockWorkflowRepo {
-    async fn save(&self, _w: &Workflow) -> Result<(), RepositoryError> { Ok(()) }
-    async fn find_by_id(&self, _i: WorkflowId) -> Result<Option<Workflow>, RepositoryError> { Ok(None) }
-    async fn find_by_name(&self, _n: &str) -> Result<Option<Workflow>, RepositoryError> { Ok(None) }
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> { Ok(vec![]) }
-    async fn delete(&self, _i: WorkflowId) -> Result<(), RepositoryError> { Ok(()) }
+    async fn save(&self, _w: &Workflow) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+    async fn find_by_id(&self, _i: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
+    async fn find_by_name(&self, _n: &str) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
+    }
+    async fn delete(&self, _i: WorkflowId) -> Result<(), RepositoryError> {
+        Ok(())
+    }
 }
 
 struct MockWorkflowExecRepo;
 #[async_trait]
 impl WorkflowExecutionRepository for MockWorkflowExecRepo {
-    async fn save(&self, _e: &WorkflowExecution) -> Result<(), RepositoryError> { Ok(()) }
-    async fn find_by_id(&self, _i: ExecutionId) -> Result<Option<WorkflowExecution>, RepositoryError> { Ok(None) }
-    async fn append_event(&self, _id: ExecutionId, _iteration: i64, _event_type: String, _data: serde_json::Value, _agent_id: Option<u8>) -> Result<(), RepositoryError> { Ok(()) }
-    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> { Ok(vec![]) }
+    async fn save(&self, _e: &WorkflowExecution) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+    async fn find_by_id(
+        &self,
+        _i: ExecutionId,
+    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+        Ok(None)
+    }
+    async fn append_event(
+        &self,
+        _id: ExecutionId,
+        _iteration: i64,
+        _event_type: String,
+        _data: serde_json::Value,
+        _agent_id: Option<u8>,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
 }
 
 #[tokio::test]
@@ -50,7 +85,7 @@ async fn test_register_and_start_temporal_workflow() {
     let register_use_case = StandardRegisterWorkflowUseCase::new(
         workflow_repo.clone(),
         temporal_container.clone(),
-        event_bus.clone()
+        event_bus.clone(),
     );
 
     let start_use_case = StandardStartWorkflowExecutionUseCase::new(
@@ -72,14 +107,14 @@ states:
 "#;
 
     let register_result = register_use_case.register_workflow(workflow_yaml).await;
-    
+
     if let Ok(reg) = register_result {
         let req = StartWorkflowExecutionRequest {
             workflow_id: reg.workflow_id.clone(),
             input: serde_json::json!({"message": "hello testing"}),
             blackboard: None,
         };
-        
+
         let start_result = start_use_case.start_execution(req).await;
         if let Ok(exec) = start_result {
             assert_eq!(exec.workflow_id, reg.workflow_id);

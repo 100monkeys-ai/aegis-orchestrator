@@ -91,7 +91,9 @@ impl std::fmt::Display for SmcpSessionError {
             Self::SessionExpired => write!(f, "Session has expired"),
             Self::PolicyViolation(v) => write!(f, "Policy violation: {:?}", v),
             Self::MalformedPayload => write!(f, "Malformed MCP payload"),
-            Self::SignatureVerificationFailed(e) => write!(f, "Signature verification failed: {}", e),
+            Self::SignatureVerificationFailed(e) => {
+                write!(f, "Signature verification failed: {}", e)
+            }
         }
     }
 }
@@ -144,25 +146,25 @@ pub trait EnvelopeVerifier {
 pub struct SmcpSession {
     /// Session ID (UUID)
     pub id: SessionId,
-    
+
     /// Agent ID
     pub agent_id: AgentId,
-    
+
     /// Execution ID
     pub execution_id: ExecutionId,
-    
+
     /// Agent's public key bytes (for signature verification)
     pub agent_public_key: Vec<u8>,
-    
+
     /// Issued SecurityToken raw string (abstracted)
     pub security_token_raw: String,
-    
+
     /// Assigned SecurityContext
     pub security_context: SecurityContext,
-    
+
     /// Session status
     pub status: SessionStatus,
-    
+
     /// Timestamps
     pub created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
@@ -192,7 +194,7 @@ impl SmcpSession {
             expires_at: now + chrono::Duration::hours(1),
         }
     }
-    
+
     /// Authorise a single MCP tool call against this session's policy.
     ///
     /// Enforces the following checks **in order** (first failure returns immediately):
@@ -215,35 +217,35 @@ impl SmcpSession {
     /// This is the **single enforcement point** for all SMCP policy checks. Every
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
-    pub fn evaluate_call(
-        &self,
-        envelope: &impl EnvelopeVerifier,
-    ) -> Result<(), SmcpSessionError> {
+    pub fn evaluate_call(&self, envelope: &impl EnvelopeVerifier) -> Result<(), SmcpSessionError> {
         // 1. Check session is active
         if self.status != SessionStatus::Active {
             return Err(SmcpSessionError::SessionInactive(self.status.clone()));
         }
-        
+
         // 2. Check not expired
         if Utc::now() > self.expires_at {
             return Err(SmcpSessionError::SessionExpired);
         }
-        
+
         // 3. Verify signature
         envelope.verify_signature(&self.agent_public_key)?;
-        
+
         // 4. Extract tool name from MCP payload
-        let tool_name = envelope.extract_tool_name()
+        let tool_name = envelope
+            .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload)?;
-        
-        let args = envelope.extract_arguments()
+
+        let args = envelope
+            .extract_arguments()
             .ok_or(SmcpSessionError::MalformedPayload)?;
-        
+
         // 5. Evaluate against SecurityContext
-        self.security_context.evaluate(&tool_name, &args)
+        self.security_context
+            .evaluate(&tool_name, &args)
             .map_err(SmcpSessionError::PolicyViolation)
     }
-    
+
     /// Revoke this session, preventing any further tool calls.
     ///
     /// Should be called when the associated execution terminates (normally or abnormally)

@@ -25,23 +25,26 @@
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
 
-use axum::{
-    routing::{get, post},
-    Router, Json, extract::{State, Path, FromRef},
-    response::{Sse, IntoResponse},
+use crate::application::execution::ExecutionService;
+use crate::application::inner_loop_service::{InnerLoopRequest, InnerLoopService};
+use crate::application::stimulus::StimulusService;
+use crate::domain::agent::AgentId;
+use crate::domain::execution::ExecutionInput;
+use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
+use crate::presentation::webhook_guard::{
+    EnvWebhookSecretProvider, WebhookHmacState, WebhookSecretProvider,
 };
+use axum::{
+    extract::{FromRef, Path, State},
+    response::{IntoResponse, Sse},
+    routing::{get, post},
+    Json, Router,
+};
+use futures::stream::Stream;
+use serde_json::json;
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::StreamExt;
-use crate::application::execution::ExecutionService;
-use crate::application::inner_loop_service::{InnerLoopService, InnerLoopRequest};
-use crate::application::stimulus::StimulusService;
-use crate::domain::execution::ExecutionInput;
-use crate::domain::agent::AgentId;
-use crate::presentation::webhook_guard::{WebhookHmacState, WebhookSecretProvider, EnvWebhookSecretProvider};
-use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
-use serde_json::json;
-use futures::stream::Stream;
-use std::pin::Pin;
 
 pub struct AppState {
     pub execution_service: Arc<dyn ExecutionService>,
@@ -67,14 +70,14 @@ pub fn app(
     execution_service: Arc<dyn ExecutionService>,
     human_input_service: Arc<crate::infrastructure::HumanInputService>,
 ) -> Router {
-    let state = Arc::new(AppState { 
+    let state = Arc::new(AppState {
         execution_service,
         human_input_service,
         inner_loop_service: None,
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
     });
-    
+
     Router::new()
         .route("/v1/executions", post(start_execution))
         .route("/v1/executions/:id/stream", get(stream_execution))
@@ -144,13 +147,17 @@ async fn start_execution(
     // instead of bypassing it by setting intent directly. This ensures agents
     // behave consistently regardless of API type (gRPC, REST, CLI).
     let input = ExecutionInput {
-        intent: None,  // Let ExecutionService render agent's prompt_template
+        intent: None, // Let ExecutionService render agent's prompt_template
         payload: serde_json::json!({
             "input": payload.input  // User-provided input from REST API
         }),
     };
 
-    match state.execution_service.start_execution(agent_id, input).await {
+    match state
+        .execution_service
+        .start_execution(agent_id, input)
+        .await
+    {
         Ok(id) => Json(json!({ "execution_id": id.0.to_string() })),
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
@@ -163,29 +170,35 @@ async fn stream_execution(
     let execution_id = match uuid::Uuid::parse_str(&id) {
         Ok(uid) => crate::domain::execution::ExecutionId(uid),
         Err(_) => {
-            let stream: Pin<Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>> = Box::pin(tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1).map(Ok::<_, axum::Error>));
+            let stream: Pin<
+                Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>,
+            > = Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+                    .map(Ok::<_, axum::Error>),
+            );
             return Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default());
         }
     };
 
-    let stream: Pin<Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>> = match state.execution_service.stream_execution(execution_id).await {
-        Ok(s) => {
-            Box::pin(s.map(|event_res| {
-                match event_res {
-                    Ok(event) => {
-                        Ok(axum::response::sse::Event::default()
-                            .data(serde_json::to_string(&event).unwrap_or_default()))
-                    },
-                    Err(_) => Ok(axum::response::sse::Event::default().data("error")),
-                }
-            }))
-        }
+    let stream: Pin<
+        Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>,
+    > = match state.execution_service.stream_execution(execution_id).await {
+        Ok(s) => Box::pin(s.map(|event_res| {
+            match event_res {
+                Ok(event) => Ok(axum::response::sse::Event::default()
+                    .data(serde_json::to_string(&event).unwrap_or_default())),
+                Err(_) => Ok(axum::response::sse::Event::default().data("error")),
+            }
+        })),
         Err(_) => {
-             // Return empty stream on error
-            Box::pin(tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1).map(Ok::<_, axum::Error>))
+            // Return empty stream on error
+            Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+                    .map(Ok::<_, axum::Error>),
+            )
         }
     };
-    
+
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
@@ -194,9 +207,7 @@ async fn stream_execution(
 // ============================================================================
 
 /// List all pending approval requests
-async fn list_pending_approvals(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn list_pending_approvals(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let pending = state.human_input_service.list_pending_requests().await;
     Json(json!({ "pending_requests": pending }))
 }
@@ -211,7 +222,11 @@ async fn get_pending_approval(
         Err(_) => return Json(json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service.get_pending_request(request_id).await {
+    match state
+        .human_input_service
+        .get_pending_request(request_id)
+        .await
+    {
         Some(request) => Json(json!({ "request": request })),
         None => Json(json!({ "error": "Request not found or already completed" })),
     }
@@ -234,7 +249,8 @@ async fn approve_request(
         Err(_) => return Json(json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service
+    match state
+        .human_input_service
         .submit_approval(request_id, payload.feedback, payload.approved_by)
         .await
     {
@@ -260,7 +276,8 @@ async fn reject_request(
         Err(_) => return Json(json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service
+    match state
+        .human_input_service
         .submit_rejection(request_id, payload.reason, payload.rejected_by)
         .await
     {
@@ -368,7 +385,9 @@ async fn dispatch_gateway(
     };
 
     match inner_loop_service.generate(payload).await {
-        Ok(response) => Json(serde_json::to_value(response).unwrap_or(json!({"error": "serialization failed"}))),
+        Ok(response) => {
+            Json(serde_json::to_value(response).unwrap_or(json!({"error": "serialization failed"})))
+        }
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }

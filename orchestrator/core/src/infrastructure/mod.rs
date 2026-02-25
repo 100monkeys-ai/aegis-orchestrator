@@ -30,29 +30,31 @@
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 
-pub mod repositories;
-pub mod runtime;
-pub mod db;
-pub mod event_bus;
-pub mod llm;
-pub mod workflow_parser;
+pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
 pub mod agentskills_client;
-pub mod prompt_template_engine;
 pub mod context_loader;
-pub mod temporal_client;
-pub mod temporal_proto;
-pub mod temporal_event_listener;
-pub mod human_input_service;
-pub mod storage;
-pub mod nfs;
-pub mod security_context;
-pub mod smcp;
-pub mod tool_router;
-pub mod aegis_runtime_proto;
 pub mod cortex_client;
+pub mod db;
+pub mod event_bus;
+pub mod human_input_service;
+pub mod llm;
+pub mod nfs;
+pub mod prompt_template_engine;
+pub mod repositories;
+pub mod runtime;
+pub mod security_context;
 pub mod sensor;
+pub mod smcp;
+pub mod storage;
+pub mod temporal_client;
+pub mod temporal_event_listener;
+pub mod temporal_proto;
+pub mod tool_router;
+pub mod workflow_parser;
 
-pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};
-pub use temporal_event_listener::{TemporalEventListener, TemporalEventPayload, TemporalEventMapper};
 pub use cortex_client::CortexGrpcClient;
+pub use human_input_service::{HumanInputService, HumanInputStatus, PendingRequestInfo};
+pub use temporal_event_listener::{
+    TemporalEventListener, TemporalEventMapper, TemporalEventPayload,
+};

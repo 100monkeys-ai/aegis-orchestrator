@@ -11,12 +11,12 @@
 //!
 //! See ADR-025 (PostgreSQL Schema Design and Migration Strategy).
 
+use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
+use crate::domain::repository::{AgentRepository, RepositoryError};
+use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
 use sqlx::Row;
-use anyhow::Result;
-use crate::domain::repository::{AgentRepository, RepositoryError};
-use crate::domain::agent::{Agent, AgentId, AgentStatus, AgentManifest};
 
 pub struct PostgresAgentRepository {
     pool: PgPool,
@@ -33,7 +33,7 @@ impl AgentRepository for PostgresAgentRepository {
     async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
         let manifest_json = serde_json::to_value(&agent.manifest)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-        
+
         let manifest_yaml = serde_yaml::to_string(&agent.manifest)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -66,7 +66,7 @@ impl AgentRepository for PostgresAgentRepository {
                 security_policy = EXCLUDED.security_policy,
                 status = EXCLUDED.status,
                 updated_at = EXCLUDED.updated_at
-            "#
+            "#,
         )
         .bind(agent.id.0)
         .bind(&agent.name)
@@ -93,7 +93,7 @@ impl AgentRepository for PostgresAgentRepository {
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
             WHERE id = $1
-            "#
+            "#,
         )
         .bind(id.0)
         .fetch_optional(&self.pool)
@@ -115,8 +115,9 @@ impl AgentRepository for PostgresAgentRepository {
                 _ => AgentStatus::Active,
             };
 
-            let manifest: AgentManifest = serde_json::from_value(manifest_val)
-                .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e)))?;
+            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+            })?;
 
             Ok(Some(Agent {
                 id: AgentId(id),
@@ -138,7 +139,7 @@ impl AgentRepository for PostgresAgentRepository {
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
             WHERE name = $1
-            "#
+            "#,
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -160,8 +161,9 @@ impl AgentRepository for PostgresAgentRepository {
                 _ => AgentStatus::Active,
             };
 
-            let manifest: AgentManifest = serde_json::from_value(manifest_val)
-                .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e)))?;
+            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+            })?;
 
             Ok(Some(Agent {
                 id: AgentId(id),
@@ -183,7 +185,7 @@ impl AgentRepository for PostgresAgentRepository {
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
             ORDER BY name ASC
-            "#
+            "#,
         )
         .fetch_all(&self.pool)
         .await
@@ -205,8 +207,9 @@ impl AgentRepository for PostgresAgentRepository {
                 _ => AgentStatus::Active,
             };
 
-            let manifest: AgentManifest = serde_json::from_value(manifest_val)
-                .map_err(|e| RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e)))?;
+            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+            })?;
 
             agents.push(Agent {
                 id: AgentId(id),

@@ -15,8 +15,6 @@ use uuid::Uuid;
 
 use aegis_sdk::AgentManifest;
 
-
-
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     client: Client,
@@ -27,7 +25,6 @@ impl DaemonClient {
     pub fn new(host: &str, port: u16) -> Result<Self> {
         let client = Client::builder()
             // No global timeout for CLI client as we need long-lived streams
-
             .build()
             .context("Failed to create HTTP client")?;
 
@@ -37,10 +34,7 @@ impl DaemonClient {
             format!("http://{}:{}", host, port)
         };
 
-        Ok(Self {
-            client,
-            base_url,
-        })
+        Ok(Self { client, base_url })
     }
 
     pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
@@ -70,11 +64,7 @@ impl DaemonClient {
         Ok(deploy_response.agent_id)
     }
 
-    pub async fn execute_agent(
-        &self,
-        agent_id: Uuid,
-        input: serde_json::Value,
-    ) -> Result<Uuid> {
+    pub async fn execute_agent(&self, agent_id: Uuid, input: serde_json::Value) -> Result<Uuid> {
         #[derive(Serialize)]
         struct ExecuteRequest {
             input: serde_json::Value,
@@ -179,10 +169,7 @@ impl DaemonClient {
         errors_only: bool,
         verbose: bool,
     ) -> Result<()> {
-        let mut url = format!(
-            "{}/v1/executions/{}/events",
-            self.base_url, execution_id
-        );
+        let mut url = format!("{}/v1/executions/{}/events", self.base_url, execution_id);
         if follow {
             url.push_str("?follow=true");
         } else {
@@ -230,10 +217,7 @@ impl DaemonClient {
         errors_only: bool,
         verbose: bool,
     ) -> Result<()> {
-        let mut url = format!(
-            "{}/v1/agents/{}/events",
-            self.base_url, agent_id
-        );
+        let mut url = format!("{}/v1/agents/{}/events", self.base_url, agent_id);
         if follow {
             url.push_str("?follow=true");
         } else {
@@ -262,7 +246,7 @@ impl DaemonClient {
                 if line.starts_with("data: ") {
                     let json_str = &line[6..];
                     if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
-                         // Reuse the print logic? Yes.
+                        // Reuse the print logic? Yes.
                         if errors_only && !is_error_event(&event) {
                             continue;
                         }
@@ -278,10 +262,7 @@ impl DaemonClient {
     pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
             .client
-            .delete(&format!(
-                "{}/v1/executions/{}",
-                self.base_url, execution_id
-            ))
+            .delete(&format!("{}/v1/executions/{}", self.base_url, execution_id))
             .send()
             .await
             .context("Failed to delete execution")?;
@@ -419,7 +400,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
         "IterationStarted" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            
+
             if verbose {
                 let action = event["action"].as_str().unwrap_or("");
                 println!(
@@ -441,7 +422,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         "IterationCompleted" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
             let output = event["data"]["output"].as_str().unwrap_or("");
-            
+
             if verbose {
                 println!(
                     "{} {} {} {}\n{}",
@@ -464,9 +445,13 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         "IterationFailed" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
             let error = if let Some(err_obj) = event["data"]["error"].as_object() {
-                err_obj["message"].as_str().unwrap_or(event["data"]["error"].as_str().unwrap_or("Unknown error"))
+                err_obj["message"]
+                    .as_str()
+                    .unwrap_or(event["data"]["error"].as_str().unwrap_or("Unknown error"))
             } else {
-                 event["data"]["error"].as_str().unwrap_or(event["error"].as_str().unwrap_or(""))
+                event["data"]["error"]
+                    .as_str()
+                    .unwrap_or(event["error"].as_str().unwrap_or(""))
             };
             println!(
                 "{} {} {} {} - {}",
@@ -489,11 +474,11 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
         "LlmInteraction" => {
             let model = event["data"]["model"].as_str().unwrap_or("unknown");
-            
+
             if verbose {
                 let response = event["data"]["response"].as_str().unwrap_or("");
                 let prompt = event["data"]["prompt"].as_str().unwrap_or("");
-                
+
                 println!(
                     "{} {} [{}]",
                     format!("[{}]", timestamp).dimmed(),
@@ -536,12 +521,15 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
                 "{} {} {}",
                 format!("[{}]", timestamp).dimmed(),
                 "Execution failed".red().bold(),
-                event["data"]["error"].as_str().or(event["reason"].as_str()).unwrap_or("Unknown error")
+                event["data"]["error"]
+                    .as_str()
+                    .or(event["reason"].as_str())
+                    .unwrap_or("Unknown error")
             );
         }
         _ => {
             if event_type != "Unknown" {
-                 println!(
+                println!(
                     "{} {} {}",
                     format!("[{}]", timestamp).dimmed(),
                     event_type.cyan(),
@@ -559,8 +547,8 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
 impl DaemonClient {
     /// Deploy a workflow from a file
     pub async fn deploy_workflow(&self, file: &std::path::Path) -> Result<()> {
-        let workflow_yaml = std::fs::read_to_string(file)
-            .context("Failed to read workflow file")?;
+        let workflow_yaml =
+            std::fs::read_to_string(file).context("Failed to read workflow file")?;
 
         let response = self
             .client
@@ -580,11 +568,7 @@ impl DaemonClient {
     }
 
     /// Run a workflow
-    pub async fn run_workflow(
-        &self,
-        name: &str,
-        input: serde_json::Value,
-    ) -> Result<Uuid> {
+    pub async fn run_workflow(&self, name: &str, input: serde_json::Value) -> Result<Uuid> {
         #[derive(Serialize)]
         struct RunRequest {
             input: serde_json::Value,
@@ -727,10 +711,7 @@ impl DaemonClient {
             anyhow::bail!("Failed to get logs: {}", error_text);
         }
 
-        let logs = response
-            .text()
-            .await
-            .context("Failed to read logs")?;
+        let logs = response.text().await.context("Failed to read logs")?;
 
         Ok(logs)
     }

@@ -27,7 +27,7 @@ pub enum AgentCommand {
         /// Path to agent manifest YAML file
         #[arg(value_name = "MANIFEST")]
         manifest: PathBuf,
-        
+
         /// Validate manifest without deploying
         #[arg(long)]
         validate_only: bool,
@@ -74,19 +74,29 @@ pub async fn handle_command(
     port: u16,
 ) -> Result<()> {
     // Agents are currently only managed via Daemon.
-    // Embedded mode might support it through direct repository access, 
+    // Embedded mode might support it through direct repository access,
     // but for now we'll focus on Daemon interaction as per architecture.
-    
+
     let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
-        Ok(DaemonStatus::Running { .. }) => {},
+        Ok(DaemonStatus::Running { .. }) => {}
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
-             println!("{}", format!("⚠ Daemon is running (PID: {}) but unhealthy: {}", pid, error).yellow());
-             println!("Run 'aegis daemon status' for more info.");
-             return Ok(());
+            println!(
+                "{}",
+                format!(
+                    "⚠ Daemon is running (PID: {}) but unhealthy: {}",
+                    pid, error
+                )
+                .yellow()
+            );
+            println!("Run 'aegis daemon status' for more info.");
+            return Ok(());
         }
         _ => {
-            println!("{}", "Agent management requires the daemon to be running.".red());
+            println!(
+                "{}",
+                "Agent management requires the daemon to be running.".red()
+            );
             println!("Run 'aegis daemon start' to start the daemon.");
             return Ok(());
         }
@@ -96,21 +106,28 @@ pub async fn handle_command(
 
     match command {
         AgentCommand::List => list_agents(client).await,
-        AgentCommand::Deploy { manifest, validate_only } => deploy_agent(manifest, validate_only, client).await,
+        AgentCommand::Deploy {
+            manifest,
+            validate_only,
+        } => deploy_agent(manifest, validate_only, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
-        AgentCommand::Logs { agent_id, follow, errors, verbose } => logs_agent(agent_id, follow, errors, verbose, client).await,
+        AgentCommand::Logs {
+            agent_id,
+            follow,
+            errors,
+            verbose,
+        } => logs_agent(agent_id, follow, errors, verbose, client).await,
     }
 }
 
 async fn show_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     let manifest = client.get_agent(agent_id).await?;
-    
+
     // Export as YAML to stdout
-    let yaml = serde_yaml::to_string(&manifest)
-        .context("Failed to serialize manifest to YAML")?;
+    let yaml = serde_yaml::to_string(&manifest).context("Failed to serialize manifest to YAML")?;
     println!("{}", yaml);
-    
+
     Ok(())
 }
 
@@ -124,7 +141,7 @@ async fn list_agents(client: DaemonClient) -> Result<()> {
 
     println!("{} agents found:", agents.len());
     println!("{:<38} {:<20} {:<10} {}", "ID", "NAME", "VERSION", "STATUS");
-    
+
     for agent in agents {
         println!(
             "{:<38} {:<20} {:<10} {}",
@@ -140,10 +157,7 @@ async fn list_agents(client: DaemonClient) -> Result<()> {
 
 async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     client.delete_agent(agent_id).await?;
-    println!(
-        "{}",
-        format!("✓ Agent {} removed", agent_id).green()
-    );
+    println!("{}", format!("✓ Agent {} removed", agent_id).green());
     Ok(())
 }
 
@@ -152,20 +166,27 @@ async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClie
         .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
 
     // Parse with SDK types (now using core domain re-exports)
-    let agent_manifest: aegis_sdk::AgentManifest = serde_yaml::from_str(&manifest_content)
-        .context("Failed to parse manifest YAML")?;
-    
+    let agent_manifest: aegis_sdk::AgentManifest =
+        serde_yaml::from_str(&manifest_content).context("Failed to parse manifest YAML")?;
+
     // Use domain validation (comprehensive checks including DNS labels, timeouts, etc.)
-    agent_manifest.validate()
+    agent_manifest
+        .validate()
         .map_err(|e| anyhow::anyhow!("Manifest validation failed: {}", e))?;
-    
+
     if validate_only {
-        println!("{}", format!("✓ Manifest is valid: {}", agent_manifest.metadata.name).green());
+        println!(
+            "{}",
+            format!("✓ Manifest is valid: {}", agent_manifest.metadata.name).green()
+        );
         println!("  API Version: {}", agent_manifest.api_version);
         println!("  Kind: {}", agent_manifest.kind);
         println!("  Name: {}", agent_manifest.metadata.name);
         println!("  Version: {}", agent_manifest.metadata.version);
-        println!("  Runtime: {}:{}", agent_manifest.spec.runtime.language, agent_manifest.spec.runtime.version);
+        println!(
+            "  Runtime: {}:{}",
+            agent_manifest.spec.runtime.language, agent_manifest.spec.runtime.version
+        );
         return Ok(());
     }
 
@@ -190,7 +211,10 @@ async fn logs_agent(
         uuid
     } else {
         // Look up by name
-        println!("{}", format!("Looking up agent '{}'...", agent_id_str).dimmed());
+        println!(
+            "{}",
+            format!("Looking up agent '{}'...", agent_id_str).dimmed()
+        );
         match client.lookup_agent(&agent_id_str).await? {
             Some(id) => id,
             None => {
@@ -199,8 +223,13 @@ async fn logs_agent(
         }
     };
 
-    println!("{}", format!("Streaming logs for agent {}...", agent_id).dimmed());
-    client.stream_agent_logs(agent_id, follow, errors_only, verbose).await?;
+    println!(
+        "{}",
+        format!("Streaming logs for agent {}...", agent_id).dimmed()
+    );
+    client
+        .stream_agent_logs(agent_id, follow, errors_only, verbose)
+        .await?;
 
     Ok(())
 }

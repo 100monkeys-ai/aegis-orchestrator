@@ -117,18 +117,18 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         // Step 1: Parse execution ID
         let execution_id = ExecutionId(
             uuid::Uuid::parse_str(&request.execution_id)
-                .context("Invalid execution_id format (not a UUID)")?
+                .context("Invalid execution_id format (not a UUID)")?,
         );
 
         // Step 2: Load execution from repository
-        let mut execution = self.execution_repository
+        let mut execution = self
+            .execution_repository
             .find_by_id(execution_id)
             .await
             .context("Failed to query execution repository")?
-            .ok_or_else(|| anyhow::anyhow!(
-                "Workflow execution not found: {}",
-                request.execution_id
-            ))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("Workflow execution not found: {}", request.execution_id)
+            })?;
 
         // Step 3: Update execution status
         let final_status = match request.status {
@@ -142,8 +142,9 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
 
         // Step 4: Merge final blackboard state if provided
         if let Some(blackboard_json) = request.final_blackboard {
-            if let Ok(blackboard_map) =
-                serde_json::from_value::<std::collections::HashMap<String, serde_json::Value>>(blackboard_json)
+            if let Ok(blackboard_map) = serde_json::from_value::<
+                std::collections::HashMap<String, serde_json::Value>,
+            >(blackboard_json)
             {
                 for (key, value) in blackboard_map {
                     execution.blackboard.set(key, value);
@@ -161,7 +162,8 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         self.event_bus.publish_workflow_event(
             crate::domain::events::WorkflowEvent::WorkflowExecutionCompleted {
                 execution_id,
-                final_blackboard: serde_json::to_value(&execution.blackboard.data()).unwrap_or(serde_json::Value::Null),
+                final_blackboard: serde_json::to_value(&execution.blackboard.data())
+                    .unwrap_or(serde_json::Value::Null),
                 artifacts: request.artifacts,
                 completed_at: Utc::now(),
             },
@@ -178,4 +180,3 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         })
     }
 }
-

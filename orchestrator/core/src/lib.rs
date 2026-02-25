@@ -35,8 +35,8 @@
 //! See `orchestrator/core/tests/` for integration tests covering the NFS gateway,
 //! validation events, and Temporal workflow mapping.
 
-pub mod domain;
 pub mod application;
+pub mod domain;
 pub mod infrastructure;
 pub mod presentation;
 

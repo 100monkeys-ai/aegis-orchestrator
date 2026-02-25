@@ -30,8 +30,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::mcp::PolicyViolation;
 use super::capability::Capability;
+use crate::domain::mcp::PolicyViolation;
 
 /// Audit metadata for a [`SecurityContext`] record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -94,7 +94,7 @@ impl SecurityContext {
                 tool_name: tool_name.to_string(),
             });
         }
-        
+
         // 2. Check if any capability allows this call
         for capability in &self.capabilities {
             match capability.allows(tool_name, args) {
@@ -102,11 +102,15 @@ impl SecurityContext {
                 Err(_) => continue, // Try next capability
             }
         }
-        
+
         // 3. No capability matched — deny by default
         Err(PolicyViolation::ToolNotAllowed {
             tool_name: tool_name.to_string(),
-            allowed_tools: self.capabilities.iter().map(|c| c.tool_pattern.clone()).collect(),
+            allowed_tools: self
+                .capabilities
+                .iter()
+                .map(|c| c.tool_pattern.clone())
+                .collect(),
         })
     }
 }
@@ -129,28 +133,32 @@ mod tests {
         let ctx = SecurityContext {
             name: "test-ctx".to_string(),
             description: "Testing context".to_string(),
-            capabilities: vec![
-                Capability {
-                    tool_pattern: "fs.read".to_string(),
-                    path_allowlist: Some(vec!["/workspace".into()]),
-                    command_allowlist: None,
-                    domain_allowlist: None,
-                    rate_limit: None,
-                    max_response_size: None,
-                }
-            ],
+            capabilities: vec![Capability {
+                tool_pattern: "fs.read".to_string(),
+                path_allowlist: Some(vec!["/workspace".into()]),
+                command_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            }],
             deny_list: vec![],
             metadata: test_metadata(),
         };
 
         // Allowed
-        assert!(ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"})).is_ok());
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied by capability limits (path)
-        assert!(ctx.evaluate("fs.read", &json!({"path": "/etc/passwd"})).is_err());
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/etc/passwd"}))
+            .is_err());
 
         // Denied implicitly (not in capabilities)
-        assert!(ctx.evaluate("fs.write", &json!({"path": "/workspace/test.txt"})).is_err());
+        assert!(ctx
+            .evaluate("fs.write", &json!({"path": "/workspace/test.txt"}))
+            .is_err());
     }
 
     #[test]
@@ -158,23 +166,23 @@ mod tests {
         let ctx = SecurityContext {
             name: "test-ctx".to_string(),
             description: "Testing context".to_string(),
-            capabilities: vec![
-                Capability {
-                    tool_pattern: "fs.*".to_string(),
-                    path_allowlist: Some(vec!["/workspace".into()]),
-                    command_allowlist: None,
-                    domain_allowlist: None,
-                    rate_limit: None,
-                    max_response_size: None,
-                }
-            ],
+            capabilities: vec![Capability {
+                tool_pattern: "fs.*".to_string(),
+                path_allowlist: Some(vec!["/workspace".into()]),
+                command_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            }],
             // Although fs.* is allowed, fs.delete is explicitly denied
             deny_list: vec!["fs.delete".to_string()],
             metadata: test_metadata(),
         };
 
         // Allowed due to wildcard
-        assert!(ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"})).is_ok());
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied due to explicit deny list
         assert!(matches!(

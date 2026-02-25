@@ -17,9 +17,9 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for start workflow execution
 
-use crate::domain::workflow::{WorkflowExecution, WorkflowId};
-use crate::domain::repository::{WorkflowRepository, WorkflowExecutionRepository};
 use crate::domain::execution::ExecutionId;
+use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
+use crate::domain::workflow::{WorkflowExecution, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::temporal_client::TemporalClient;
 use anyhow::{Context, Result};
@@ -33,10 +33,10 @@ use std::sync::Arc;
 pub struct StartWorkflowExecutionRequest {
     /// Workflow ID to execute
     pub workflow_id: String,
-    
+
     /// Input context/parameters for workflow
     pub input: serde_json::Value,
-    
+
     /// Optional blackboard seed: key-value context forwarded to the TypeScript worker at startup.
     /// Values are included in the `StartWorkflowExecution` Temporal payload and accessible
     /// inside the worker via Handlebars templates (e.g. `{{blackboard.judges}}`).
@@ -72,7 +72,10 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
     /// - WorkflowNotFound: Specified workflow_id doesn't exist
     /// - TemporalError: Temporal server unavailable
     /// - PersistenceError: Database save failed
-    async fn start_execution(&self, request: StartWorkflowExecutionRequest) -> Result<StartedWorkflowExecution>;
+    async fn start_execution(
+        &self,
+        request: StartWorkflowExecutionRequest,
+    ) -> Result<StartedWorkflowExecution>;
 }
 
 /// Standard implementation of StartWorkflowExecutionUseCase
@@ -101,34 +104,37 @@ impl StandardStartWorkflowExecutionUseCase {
 
 #[async_trait]
 impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
-    async fn start_execution(&self, request: StartWorkflowExecutionRequest) -> Result<StartedWorkflowExecution> {
+    async fn start_execution(
+        &self,
+        request: StartWorkflowExecutionRequest,
+    ) -> Result<StartedWorkflowExecution> {
         // Step 1: Load workflow from repository
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
             let id = WorkflowId::from_uuid(uuid);
             self.workflow_repository.find_by_id(id).await
         } else {
-            self.workflow_repository.find_by_name(&request.workflow_id).await
+            self.workflow_repository
+                .find_by_name(&request.workflow_id)
+                .await
         }
         .context("Failed to query workflow repository")?
-        .ok_or_else(|| anyhow::anyhow!(
-            "Workflow not found: {}",
-            request.workflow_id
-        ))?;
+        .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
 
         // Step 2: Create workflow execution aggregate
         let execution_id = ExecutionId(uuid::Uuid::new_v4());
-        let mut workflow_execution = WorkflowExecution::new(&workflow, execution_id, request.input.clone());
+        let mut workflow_execution =
+            WorkflowExecution::new(&workflow, execution_id, request.input.clone());
 
         // Step 3: Merge initial blackboard if provided
         if let Some(blackboard_json) = request.blackboard {
-            if let Ok(blackboard_map) = serde_json::from_value::<HashMap<String, serde_json::Value>>(blackboard_json) {
+            if let Ok(blackboard_map) =
+                serde_json::from_value::<HashMap<String, serde_json::Value>>(blackboard_json)
+            {
                 for (key, value) in blackboard_map {
                     workflow_execution.blackboard.set(key, value);
                 }
             }
         }
-
-
 
         // Step 4: Persist execution to repository (establishes idempotency key)
         self.execution_repository
@@ -139,7 +145,8 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         // Step 5: Start execution in Temporal via gRPC
         let client = {
             let lock = self.temporal_client.read().await;
-            lock.clone().ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
+            lock.clone()
+                .ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
         };
 
         let temporal_run_id = client
@@ -148,10 +155,8 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 execution_id,
                 match &request.input {
                     serde_json::Value::Object(map) => {
-                        map.iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect()
-                    },
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
                     _ => {
                         // Wrap non-object inputs
                         let mut map = HashMap::new();
@@ -185,4 +190,3 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         })
     }
 }
-

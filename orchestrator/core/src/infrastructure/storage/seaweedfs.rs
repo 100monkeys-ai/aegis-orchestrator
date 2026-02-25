@@ -20,18 +20,20 @@
 //! - `POST /quota?path=/path&bytes=1000000` - Set quota
 //! - `GET /` - Health check
 
+use crate::domain::storage::{
+    DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
+};
 use async_trait::async_trait;
-use reqwest::{Client, StatusCode, multipart};
+use chrono;
+use reqwest::{multipart, Client, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
-use chrono;
-use crate::domain::storage::{StorageProvider, StorageError, FileHandle, OpenMode, FileAttributes, DirEntry, FileType};
 
 /// SeaweedFS Filer adapter
 pub struct SeaweedFSAdapter {
     /// HTTP client for communicating with filer
     client: Client,
-    
+
     /// Filer base URL (e.g., "http://localhost:8888")
     filer_url: String,
 }
@@ -49,7 +51,7 @@ impl SeaweedFSAdapter {
             .timeout(Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client");
-        
+
         Self {
             client,
             filer_url: filer_url.into(),
@@ -62,7 +64,7 @@ impl SeaweedFSAdapter {
             .timeout(timeout)
             .build()
             .expect("Failed to create HTTP client");
-        
+
         Self {
             client,
             filer_url: filer_url.into(),
@@ -81,22 +83,17 @@ impl StorageProvider for SeaweedFSAdapter {
         // Validate path
         if !path.starts_with('/') {
             return Err(StorageError::InvalidPath(
-                "Path must start with /".to_string()
+                "Path must start with /".to_string(),
             ));
         }
 
         // SeaweedFS filer creates directories automatically when files are uploaded
         // But we can explicitly create them via POST to /dir/
         let url = self.build_url("/dir/");
-        
-        let form = multipart::Form::new()
-            .text("path", path.to_string());
-        
-        let response = self.client
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await?;
+
+        let form = multipart::Form::new().text("path", path.to_string());
+
+        let response = self.client.post(&url).multipart(form).send().await?;
 
         match response.status() {
             StatusCode::CREATED | StatusCode::OK => Ok(()),
@@ -106,7 +103,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 Ok(())
             }
             status => {
-                let error_msg = response.text().await
+                let error_msg = response
+                    .text()
+                    .await
                     .unwrap_or_else(|_| format!("HTTP {}", status));
                 Err(StorageError::Unknown(format!(
                     "Failed to create directory {}: {}",
@@ -120,13 +119,14 @@ impl StorageProvider for SeaweedFSAdapter {
         // Validate path
         if !path.starts_with('/') {
             return Err(StorageError::InvalidPath(
-                "Path must start with /".to_string()
+                "Path must start with /".to_string(),
             ));
         }
 
         let url = self.build_url("/dir/");
-        
-        let response = self.client
+
+        let response = self
+            .client
             .delete(&url)
             .query(&[("path", path), ("recursive", "true")])
             .send()
@@ -134,11 +134,11 @@ impl StorageProvider for SeaweedFSAdapter {
 
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
             status => {
-                let error_msg = response.text().await
+                let error_msg = response
+                    .text()
+                    .await
                     .unwrap_or_else(|_| format!("HTTP {}", status));
                 Err(StorageError::Unknown(format!(
                     "Failed to delete directory {}: {}",
@@ -152,29 +152,25 @@ impl StorageProvider for SeaweedFSAdapter {
         // Validate path
         if !path.starts_with('/') {
             return Err(StorageError::InvalidPath(
-                "Path must start with /".to_string()
+                "Path must start with /".to_string(),
             ));
         }
 
         let url = self.build_url("/quota");
-        
+
         let form = multipart::Form::new()
             .text("path", path.to_string())
             .text("bytes", bytes.to_string());
-        
-        let response = self.client
-            .post(&url)
-            .multipart(form)
-            .send()
-            .await?;
+
+        let response = self.client.post(&url).multipart(form).send().await?;
 
         match response.status() {
             StatusCode::OK | StatusCode::CREATED => Ok(()),
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
             status => {
-                let error_msg = response.text().await
+                let error_msg = response
+                    .text()
+                    .await
                     .unwrap_or_else(|_| format!("HTTP {}", status));
                 Err(StorageError::Unknown(format!(
                     "Failed to set quota for {}: {}",
@@ -188,13 +184,14 @@ impl StorageProvider for SeaweedFSAdapter {
         // Validate path
         if !path.starts_with('/') {
             return Err(StorageError::InvalidPath(
-                "Path must start with /".to_string()
+                "Path must start with /".to_string(),
             ));
         }
 
         let url = self.build_url("/dir/status");
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .query(&[("path", path)])
             .send()
@@ -202,16 +199,18 @@ impl StorageProvider for SeaweedFSAdapter {
 
         match response.status() {
             StatusCode::OK => {
-                let status: DirectoryStatus = response.json().await
+                let status: DirectoryStatus = response
+                    .json()
+                    .await
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                
+
                 Ok(status.total_size)
             }
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
             status => {
-                let error_msg = response.text().await
+                let error_msg = response
+                    .text()
+                    .await
                     .unwrap_or_else(|_| format!("HTTP {}", status));
                 Err(StorageError::Unknown(format!(
                     "Failed to get usage for {}: {}",
@@ -223,8 +222,9 @@ impl StorageProvider for SeaweedFSAdapter {
 
     async fn health_check(&self) -> Result<(), StorageError> {
         let url = self.build_url("/");
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .timeout(Duration::from_secs(5))
             .send()
@@ -244,35 +244,35 @@ impl StorageProvider for SeaweedFSAdapter {
         // Validate path
         if !path.starts_with('/') {
             return Err(StorageError::InvalidPath(
-                "Path must start with /".to_string()
+                "Path must start with /".to_string(),
             ));
         }
 
         let url = self.build_url(path);
-        
-        let response = self.client
-            .get(&url)
-            .send()
-            .await?;
+
+        let response = self.client.get(&url).send().await?;
 
         match response.status() {
             StatusCode::OK => {
-                let listing: DirectoryListing = response.json().await
+                let listing: DirectoryListing = response
+                    .json()
+                    .await
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                
-                let dirs = listing.entries
+
+                let dirs = listing
+                    .entries
                     .into_iter()
                     .filter(|e| e.is_directory)
                     .map(|e| e.name)
                     .collect();
-                
+
                 Ok(dirs)
             }
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
             status => {
-                let error_msg = response.text().await
+                let error_msg = response
+                    .text()
+                    .await
                     .unwrap_or_else(|_| format!("HTTP {}", status));
                 Err(StorageError::Unknown(format!(
                     "Failed to list directories in {}: {}",
@@ -288,66 +288,73 @@ impl StorageProvider for SeaweedFSAdapter {
         // For SeaweedFS HTTP API, we don't need to actually "open" files
         // The FileHandle just stores the path for subsequent operations
         // Real implementations would validate file exists for ReadOnly mode
-        
+
         if matches!(mode, OpenMode::ReadOnly) {
             // Verify file exists via HEAD request
             let url = self.build_url(path);
             let response = self.client.head(&url).send().await?;
-            
+
             if !response.status().is_success() {
                 return Err(StorageError::FileNotFound(path.to_string()));
             }
         }
-        
+
         // Create file handle encoding path
         let handle_data = path.as_bytes().to_vec();
         Ok(FileHandle(handle_data))
     }
 
-    async fn read_at(&self, handle: &FileHandle, offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        length: usize,
+    ) -> Result<Vec<u8>, StorageError> {
         // Decode path from handle
         let path = String::from_utf8(handle.0.clone())
             .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
-        
+
         let url = self.build_url(&path);
-        
+
         // Use HTTP Range header for partial reads
         let range_header = format!("bytes={}-{}", offset, offset + length as u64 - 1);
-        
-        let response = self.client
+
+        let response = self
+            .client
             .get(&url)
             .header("Range", range_header)
             .send()
             .await?;
-        
+
         match response.status() {
             StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
                 let bytes = response.bytes().await?;
                 Ok(bytes.to_vec())
             }
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::FileNotFound(path))
-            }
-            status => {
-                Err(StorageError::Unknown(format!(
-                    "Failed to read file {}: HTTP {}",
-                    path, status
-                )))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path)),
+            status => Err(StorageError::Unknown(format!(
+                "Failed to read file {}: HTTP {}",
+                path, status
+            ))),
         }
     }
 
-    async fn write_at(&self, handle: &FileHandle, offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+    async fn write_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<usize, StorageError> {
         // Decode path from handle
         let path = String::from_utf8(handle.0.clone())
             .map_err(|_| StorageError::InvalidPath("Invalid file handle".to_string()))?;
-        
+
         let url = self.build_url(&path);
-        
+
         // For simplicity, we'll read existing content, modify, and write back
         // A production implementation would use proper partial write support
         // or append-only writes for efficiency
-        
+
         let mut content = if offset > 0 {
             // Read existing content if we're writing at an offset
             let response = self.client.get(&url).send().await;
@@ -363,31 +370,28 @@ impl StorageProvider for SeaweedFSAdapter {
         } else {
             Vec::new()
         };
-        
+
         // Extend content if needed
         if content.len() < offset as usize {
             content.resize(offset as usize, 0);
         }
-        
+
         // Write data at offset
         if offset as usize + data.len() > content.len() {
             content.resize(offset as usize + data.len(), 0);
         }
         content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
-        
+
         // Write back to SeaweedFS
-        let response = self.client
-            .post(&url)
-            .body(content)
-            .send()
-            .await?;
-        
+        let response = self.client.post(&url).body(content).send().await?;
+
         if response.status().is_success() {
             Ok(data.len())
         } else {
             Err(StorageError::Unknown(format!(
                 "Failed to write file {}: HTTP {}",
-                path, response.status()
+                path,
+                response.status()
             )))
         }
     }
@@ -399,25 +403,27 @@ impl StorageProvider for SeaweedFSAdapter {
 
     async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
         let url = self.build_url(path);
-        
+
         let response = self.client.head(&url).send().await?;
-        
+
         match response.status() {
             StatusCode::OK => {
                 // Extract metadata from headers
-                let size = response.headers()
+                let size = response
+                    .headers()
                     .get("content-length")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0);
-                
-                let mtime = response.headers()
+
+                let mtime = response
+                    .headers()
                     .get("last-modified")
                     .and_then(|v| v.to_str().ok())
                     .and_then(|s| chrono::DateTime::parse_from_rfc2822(s).ok())
                     .map(|dt| dt.timestamp())
                     .unwrap_or_else(|| chrono::Utc::now().timestamp());
-                
+
                 Ok(FileAttributes {
                     file_type: FileType::File,
                     size,
@@ -430,85 +436,79 @@ impl StorageProvider for SeaweedFSAdapter {
                     nlink: 1,
                 })
             }
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::FileNotFound(path.to_string()))
-            }
-            status => {
-                Err(StorageError::Unknown(format!(
-                    "Failed to stat {}: HTTP {}",
-                    path, status
-                )))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
+            status => Err(StorageError::Unknown(format!(
+                "Failed to stat {}: HTTP {}",
+                path, status
+            ))),
         }
     }
 
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError> {
         let url = self.build_url(path);
-        
+
         let response = self.client.get(&url).send().await?;
-        
+
         match response.status() {
             StatusCode::OK => {
-                let listing: DirectoryListing = response.json().await
+                let listing: DirectoryListing = response
+                    .json()
+                    .await
                     .map_err(|e| StorageError::Serialization(e.to_string()))?;
-                
-                let entries = listing.entries
+
+                let entries = listing
+                    .entries
                     .into_iter()
                     .map(|e| DirEntry {
                         name: e.name.rsplit('/').next().unwrap_or(&e.name).to_string(),
-                        file_type: if e.is_directory { FileType::Directory } else { FileType::File },
+                        file_type: if e.is_directory {
+                            FileType::Directory
+                        } else {
+                            FileType::File
+                        },
                     })
                     .collect();
-                
+
                 Ok(entries)
             }
-            StatusCode::NOT_FOUND => {
-                Err(StorageError::NotFound(path.to_string()))
-            }
-            status => {
-                Err(StorageError::Unknown(format!(
-                    "Failed to readdir {}: HTTP {}",
-                    path, status
-                )))
-            }
+            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
+            status => Err(StorageError::Unknown(format!(
+                "Failed to readdir {}: HTTP {}",
+                path, status
+            ))),
         }
     }
 
     async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
         let url = self.build_url(path);
-        
+
         // Create empty file
-        let response = self.client
-            .post(&url)
-            .body(Vec::<u8>::new())
-            .send()
-            .await?;
-        
+        let response = self.client.post(&url).body(Vec::<u8>::new()).send().await?;
+
         if response.status().is_success() {
             let handle_data = path.as_bytes().to_vec();
             Ok(FileHandle(handle_data))
         } else {
             Err(StorageError::Unknown(format!(
                 "Failed to create file {}: HTTP {}",
-                path, response.status()
+                path,
+                response.status()
             )))
         }
     }
 
     async fn delete_file(&self, path: &str) -> Result<(), StorageError> {
         let url = self.build_url(path);
-        
+
         let response = self.client.delete(&url).send().await?;
-        
+
         match response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
-            status => {
-                Err(StorageError::Unknown(format!(
-                    "Failed to delete file {}: HTTP {}",
-                    path, status
-                )))
-            }
+            status => Err(StorageError::Unknown(format!(
+                "Failed to delete file {}: HTTP {}",
+                path, status
+            ))),
         }
     }
 
@@ -516,46 +516,41 @@ impl StorageProvider for SeaweedFSAdapter {
         // SeaweedFS doesn't have a native rename operation via HTTP API
         // We implement it as copy + delete
         // Note: This is not atomic, but acceptable for Phase 1
-        
+
         // 1. Check source exists
         let from_url = self.build_url(from);
         let check_response = self.client.head(&from_url).send().await?;
-        
+
         if !check_response.status().is_success() {
             return Err(StorageError::FileNotFound(from.to_string()));
         }
-        
+
         // 2. Read source file
         let read_response = self.client.get(&from_url).send().await?;
-        
+
         if !read_response.status().is_success() {
             return Err(StorageError::Unknown(format!(
                 "Failed to read source file {}",
                 from
             )));
         }
-        
-        let data = read_response.bytes().await?
-            .to_vec();
-        
+
+        let data = read_response.bytes().await?.to_vec();
+
         // 3. Write to destination
         let to_url = self.build_url(to);
-        let write_response = self.client
-            .post(&to_url)
-            .body(data)
-            .send()
-            .await?;
-        
+        let write_response = self.client.post(&to_url).body(data).send().await?;
+
         if !write_response.status().is_success() {
             return Err(StorageError::Unknown(format!(
                 "Failed to write destination file {}",
                 to
             )));
         }
-        
+
         // 4. Delete source
         let delete_response = self.client.delete(&from_url).send().await?;
-        
+
         if !delete_response.status().is_success() {
             // Rename semantics: if delete fails, both files exist - this is an error
             // Don't leave orphaned files; fail the rename operation
@@ -564,7 +559,7 @@ impl StorageProvider for SeaweedFSAdapter {
                 from, to
             )));
         }
-        
+
         Ok(())
     }
 }
@@ -577,7 +572,7 @@ impl StorageProvider for SeaweedFSAdapter {
 struct DirectoryStatus {
     #[serde(rename = "TotalSize")]
     total_size: u64,
-    
+
     #[serde(rename = "FileCount")]
     file_count: u64,
 }
@@ -586,7 +581,7 @@ struct DirectoryStatus {
 struct DirectoryListing {
     #[serde(rename = "Path")]
     path: String,
-    
+
     #[serde(rename = "Entries")]
     entries: Vec<DirectoryEntry>,
 }
@@ -595,13 +590,13 @@ struct DirectoryListing {
 struct DirectoryEntry {
     #[serde(rename = "FullPath")]
     name: String,
-    
+
     #[serde(rename = "Mtime")]
     mtime: String,
-    
+
     #[serde(rename = "Mode")]
     mode: u32,
-    
+
     #[serde(default)]
     #[serde(rename = "IsDirectory")]
     is_directory: bool,
@@ -627,7 +622,7 @@ mod tests {
     #[tokio::test]
     async fn test_invalid_path_rejection() {
         let adapter = SeaweedFSAdapter::new("http://localhost:8888");
-        
+
         // Path must start with /
         let result = adapter.create_directory("invalid/path").await;
         assert!(matches!(result, Err(StorageError::InvalidPath(_))));
@@ -635,32 +630,32 @@ mod tests {
 
     // Integration tests require running SeaweedFS instance
     // Run these manually with: cargo test --package orchestrator --lib -- --ignored
-    
+
     #[tokio::test]
     #[ignore]
     async fn integration_test_directory_lifecycle() {
         let adapter = SeaweedFSAdapter::new("http://localhost:8888");
-        
+
         // Health check
         adapter.health_check().await.unwrap();
-        
+
         // Create directory
         let path = "/test/integration/dir";
         adapter.create_directory(path).await.unwrap();
-        
+
         // Test idempotency - creating same directory again should succeed
         adapter.create_directory(path).await.unwrap();
-        
+
         // Set quota
         adapter.set_quota(path, 10_000_000).await.unwrap();
-        
+
         // Get usage (should be 0 initially)
         let usage = adapter.get_usage(path).await.unwrap();
         assert_eq!(usage, 0);
-        
+
         // Delete directory
         adapter.delete_directory(path).await.unwrap();
-        
+
         // Verify deletion
         let result = adapter.get_usage(path).await;
         assert!(matches!(result, Err(StorageError::NotFound(_))));

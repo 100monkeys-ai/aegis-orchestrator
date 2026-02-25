@@ -9,7 +9,7 @@
 //!
 //! - **Layer:** Infrastructure
 //! - **Responsibility:** Translate external Temporal events to domain events
-//! - **Collaborators:** 
+//! - **Collaborators:**
 //!   - EventBus: Publishes domain events to subscribers
 //!   - Domain: WorkflowEvent types
 //!
@@ -194,9 +194,9 @@ impl TemporalEventMapper {
             }
 
             "WorkflowIterationStarted" => {
-                let iteration_number = payload
-                    .iteration_number
-                    .ok_or_else(|| anyhow!("iteration_number required for WorkflowIterationStarted event"))?;
+                let iteration_number = payload.iteration_number.ok_or_else(|| {
+                    anyhow!("iteration_number required for WorkflowIterationStarted event")
+                })?;
 
                 Ok(WorkflowEvent::WorkflowIterationStarted {
                     execution_id,
@@ -206,14 +206,13 @@ impl TemporalEventMapper {
             }
 
             "WorkflowIterationCompleted" => {
-                let iteration_number = payload
-                    .iteration_number
-                    .ok_or_else(|| anyhow!("iteration_number required for WorkflowIterationCompleted event"))?;
+                let iteration_number = payload.iteration_number.ok_or_else(|| {
+                    anyhow!("iteration_number required for WorkflowIterationCompleted event")
+                })?;
 
-                let output = payload
-                    .output
-                    .clone()
-                    .ok_or_else(|| anyhow!("output required for WorkflowIterationCompleted event"))?;
+                let output = payload.output.clone().ok_or_else(|| {
+                    anyhow!("output required for WorkflowIterationCompleted event")
+                })?;
 
                 Ok(WorkflowEvent::WorkflowIterationCompleted {
                     execution_id,
@@ -224,9 +223,9 @@ impl TemporalEventMapper {
             }
 
             "WorkflowIterationFailed" => {
-                let iteration_number = payload
-                    .iteration_number
-                    .ok_or_else(|| anyhow!("iteration_number required for WorkflowIterationFailed event"))?;
+                let iteration_number = payload.iteration_number.ok_or_else(|| {
+                    anyhow!("iteration_number required for WorkflowIterationFailed event")
+                })?;
 
                 let error = payload
                     .error
@@ -243,11 +242,11 @@ impl TemporalEventMapper {
 
             "WorkflowExecutionCompleted" => Ok(WorkflowEvent::WorkflowExecutionCompleted {
                 execution_id,
-                final_blackboard: payload.final_blackboard.clone().unwrap_or(serde_json::json!({})),
-                artifacts: payload
-                    .artifacts
-                    .as_ref()
-                    .map(|v| serde_json::json!(v)),
+                final_blackboard: payload
+                    .final_blackboard
+                    .clone()
+                    .unwrap_or(serde_json::json!({})),
+                artifacts: payload.artifacts.as_ref().map(|v| serde_json::json!(v)),
                 completed_at: timestamp,
             }),
 
@@ -287,7 +286,10 @@ impl TemporalEventListener {
         event_bus: Arc<EventBus>,
         execution_repository: Arc<dyn WorkflowExecutionRepository>,
     ) -> Self {
-        Self { event_bus, execution_repository }
+        Self {
+            event_bus,
+            execution_repository,
+        }
     }
 
     /// Process incoming event from Temporal worker
@@ -309,22 +311,25 @@ impl TemporalEventListener {
         // Special case for RefinementApplied execution event
         if payload.event_type == "RefinementApplied" {
             let execution_id = ExecutionId(uuid::Uuid::parse_str(&payload.execution_id)?);
-            let agent_id = crate::domain::agent::AgentId(
-                uuid::Uuid::parse_str(&payload.agent_id.clone().unwrap_or_else(|| uuid::Uuid::nil().to_string()))?
-            );
+            let agent_id = crate::domain::agent::AgentId(uuid::Uuid::parse_str(
+                &payload
+                    .agent_id
+                    .clone()
+                    .unwrap_or_else(|| uuid::Uuid::nil().to_string()),
+            )?);
             let iteration_number = payload.iteration_number.unwrap_or(0);
-            
+
             let diff_val = payload.code_diff.clone().unwrap_or_default();
             let diff_str = match diff_val {
                 serde_json::Value::String(s) => s,
                 _ => diff_val.to_string(),
             };
-            
+
             let code_diff = crate::domain::execution::CodeDiff {
                 file_path: "validation_feedback".to_string(),
                 diff: diff_str,
             };
-            
+
             let domain_event = crate::domain::events::ExecutionEvent::RefinementApplied {
                 execution_id,
                 agent_id,
@@ -332,15 +337,18 @@ impl TemporalEventListener {
                 code_diff,
                 applied_at: chrono::Utc::now(),
             };
-            
-            self.execution_repository.append_event(
-                execution_id,
-                payload.temporal_sequence_number,
-                payload.event_type.clone(),
-                serde_json::to_value(&payload)?,
-                Some(iteration_number),
-            ).await.context("Failed to persist execution event")?;
-            
+
+            self.execution_repository
+                .append_event(
+                    execution_id,
+                    payload.temporal_sequence_number,
+                    payload.event_type.clone(),
+                    serde_json::to_value(&payload)?,
+                    Some(iteration_number),
+                )
+                .await
+                .context("Failed to persist execution event")?;
+
             self.event_bus.publish_execution_event(domain_event);
             return Ok(payload.execution_id.clone());
         }
@@ -350,28 +358,45 @@ impl TemporalEventListener {
             .context("Failed to map Temporal event to domain event")?;
 
         let execution_id_str = match &domain_event {
-            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => execution_id.0.to_string(),
+            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
             WorkflowEvent::WorkflowStateEntered { execution_id, .. } => execution_id.0.to_string(),
             WorkflowEvent::WorkflowStateExited { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => execution_id.0.to_string(),
+            WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
+            WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
+            WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
+            WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
+            WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
+            WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
+                execution_id.0.to_string()
+            }
             _ => return Err(anyhow!("Unexpected event type in response")),
         };
 
         let execution_id_obj = ExecutionId(uuid::Uuid::parse_str(&execution_id_str)?);
 
         // Step 2: Persist event to the repository for event sourcing
-        self.execution_repository.append_event(
-            execution_id_obj,
-            payload.temporal_sequence_number,
-            payload.event_type.clone(),
-            serde_json::to_value(&payload)?,
-            payload.iteration_number,
-        ).await.context("Failed to persist execution event")?;
+        self.execution_repository
+            .append_event(
+                execution_id_obj,
+                payload.temporal_sequence_number,
+                payload.event_type.clone(),
+                serde_json::to_value(&payload)?,
+                payload.iteration_number,
+            )
+            .await
+            .context("Failed to persist execution event")?;
 
         // Step 3: Publish to event bus
         self.event_bus.publish_workflow_event(domain_event.clone());
@@ -407,7 +432,10 @@ mod tests {
         let WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } = event else {
             panic!("Expected WorkflowExecutionStarted, got {:?}", event);
         };
-        assert_eq!(execution_id.0.to_string(), "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(
+            execution_id.0.to_string(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
     }
 
     #[test]

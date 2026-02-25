@@ -23,17 +23,15 @@
 /// AEGIS Rust SDK
 ///
 /// Build secure, autonomous agents with the AEGIS runtime.
-
 pub mod client;
 pub mod types;
 
 // Re-export core domain types for manifest (single source of truth)
 pub use aegis_core::domain::agent::{
-    AgentManifest, ManifestMetadata, AgentSpec, RuntimeConfig, TaskConfig,
-    SecurityConfig, NetworkPolicy, FilesystemPolicy, ResourceLimits,
-    ExecutionStrategy, ValidationConfig, ContextItem, AdvancedConfig,
-    SemanticValidation, SystemValidation, OutputValidation, ScriptValidation,
-    DeliveryConfig, DeliveryDestination, FallbackBehavior,
+    AdvancedConfig, AgentManifest, AgentSpec, ContextItem, DeliveryConfig, DeliveryDestination,
+    ExecutionStrategy, FallbackBehavior, FilesystemPolicy, ManifestMetadata, NetworkPolicy,
+    OutputValidation, ResourceLimits, RuntimeConfig, ScriptValidation, SecurityConfig,
+    SemanticValidation, SystemValidation, TaskConfig, ValidationConfig,
 };
 
 pub use client::AegisClient;

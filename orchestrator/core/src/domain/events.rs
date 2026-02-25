@@ -26,12 +26,12 @@
 //! The EventBus is currently **in-memory only** (tokio broadcast channel). Persistent
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
-use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
 use crate::domain::agent::{AgentId, AgentManifest};
-use crate::domain::execution::{ExecutionId, IterationError, CodeDiff};
+use crate::domain::execution::{CodeDiff, ExecutionId, IterationError};
 use crate::domain::runtime::InstanceId;
-use crate::domain::volume::{VolumeId, StorageClass};
+use crate::domain::volume::{StorageClass, VolumeId};
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// File-level audit events published by the NFS Server Gateway FSAL (ADR-036).
 ///
@@ -122,7 +122,6 @@ pub enum StorageEvent {
         attempted_at: DateTime<Utc>,
     },
 }
-
 
 /// Agent manifest lifecycle events (BC-1 Agent Lifecycle Context).
 ///
@@ -221,7 +220,7 @@ pub enum ExecutionEvent {
         total_iterations: u8,
         completed_at: DateTime<Utc>,
     },
-     ExecutionFailed {
+    ExecutionFailed {
         execution_id: ExecutionId,
         agent_id: AgentId,
         reason: String,
@@ -498,41 +497,39 @@ pub enum ViolationType {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MCPToolEvent {
     // ========== Server Lifecycle Events ==========
-    
     ServerRegistered {
         server_id: crate::domain::mcp::ToolServerId,
         name: String,
         capabilities: Vec<String>,
         registered_at: DateTime<Utc>,
     },
-    
+
     ServerStarted {
         server_id: crate::domain::mcp::ToolServerId,
         name: String,
         process_id: u32,
         started_at: DateTime<Utc>,
     },
-    
+
     ServerStopped {
         server_id: crate::domain::mcp::ToolServerId,
         name: String,
         stopped_at: DateTime<Utc>,
     },
-    
+
     ServerFailed {
         server_id: crate::domain::mcp::ToolServerId,
         name: String,
         error: String,
         failed_at: DateTime<Utc>,
     },
-    
+
     ServerUnhealthy {
         server_id: crate::domain::mcp::ToolServerId,
         last_healthy: Option<DateTime<Utc>>,
     },
-    
+
     // ========== Tool Invocation Events ==========
-    
     InvocationRequested {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
@@ -541,14 +538,14 @@ pub enum MCPToolEvent {
         arguments: serde_json::Value,
         requested_at: DateTime<Utc>,
     },
-    
+
     InvocationStarted {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         server_id: crate::domain::mcp::ToolServerId,
         tool_name: String,
         started_at: DateTime<Utc>,
     },
-    
+
     InvocationCompleted {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
@@ -557,7 +554,7 @@ pub enum MCPToolEvent {
         duration_ms: u64,
         completed_at: DateTime<Utc>,
     },
-    
+
     InvocationFailed {
         invocation_id: crate::domain::mcp::ToolInvocationId,
         execution_id: ExecutionId,
@@ -565,9 +562,8 @@ pub enum MCPToolEvent {
         error: crate::domain::mcp::MCPError,
         failed_at: DateTime<Utc>,
     },
-    
+
     // ========== Policy Violation Events ==========
-    
     PolicyViolation {
         execution_id: ExecutionId,
         agent_id: AgentId,
@@ -672,7 +668,7 @@ mod tests {
     use super::*;
     use crate::domain::agent::AgentId;
     use crate::domain::execution::{ExecutionId, IterationError};
-    use crate::domain::volume::{VolumeId, StorageClass};
+    use crate::domain::volume::{StorageClass, VolumeId};
     use chrono::Utc;
 
     // ── StorageEvent serialization ────────────────────────────────────────────
@@ -690,7 +686,10 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
-        let StorageEvent::FileOpened { path, open_mode, .. } = deserialized else {
+        let StorageEvent::FileOpened {
+            path, open_mode, ..
+        } = deserialized
+        else {
             panic!("Expected FileOpened variant, got: {:?}", deserialized);
         };
         assert_eq!(path, "/workspace/file.txt");
@@ -773,8 +772,14 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ValidationEvent = serde_json::from_str(&json).unwrap();
-        let ValidationEvent::GradientValidationPerformed { score, confidence, .. } = deserialized else {
-            panic!("Expected GradientValidationPerformed variant, got: {:?}", deserialized);
+        let ValidationEvent::GradientValidationPerformed {
+            score, confidence, ..
+        } = deserialized
+        else {
+            panic!(
+                "Expected GradientValidationPerformed variant, got: {:?}",
+                deserialized
+            );
         };
         assert_eq!(score, 0.9);
         assert_eq!(confidence, 0.85);
@@ -835,7 +840,10 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
         let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized else {
-            panic!("Expected PolicyViolationBlocked variant, got: {:?}", deserialized);
+            panic!(
+                "Expected PolicyViolationBlocked variant, got: {:?}",
+                deserialized
+            );
         };
         assert_eq!(violation_type, "network");
     }

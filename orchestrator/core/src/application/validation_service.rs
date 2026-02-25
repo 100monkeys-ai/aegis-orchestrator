@@ -41,12 +41,12 @@
 //! ).await?;
 //! ```
 
-use std::sync::Arc;
-use std::time::Duration;
-use anyhow::{Result, anyhow, Context};
 use crate::domain::agent::AgentId;
 use crate::domain::validation::{GradientResult, MultiJudgeConsensus, ValidationRequest};
-use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy, ConfidenceWeighting};
+use crate::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
+use anyhow::{anyhow, Context, Result};
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::application::execution::ExecutionService;
 use crate::domain::execution::{ExecutionInput, ExecutionStatus};
@@ -61,7 +61,10 @@ impl ValidationService {
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
         execution_service: Arc<dyn ExecutionService>,
     ) -> Self {
-        Self { event_bus, execution_service }
+        Self {
+            event_bus,
+            execution_service,
+        }
     }
 
     pub async fn validate_with_judges(
@@ -90,7 +93,8 @@ impl ValidationService {
 
         // Validate confidence weighting if provided
         if let Some(ref weighting) = config.confidence_weighting {
-            weighting.validate()
+            weighting
+                .validate()
                 .map_err(|e| anyhow!("Invalid confidence weighting: {}", e))?;
         }
 
@@ -102,7 +106,7 @@ impl ValidationService {
             let w = *weight;
             let timeout = timeout_seconds;
             let poll_interval = poll_interval_ms;
-            
+
             futures.push(tokio::spawn(async move {
                 match Self::run_judge(service, judge, req, timeout, poll_interval).await {
                     Ok((_agent_id, gradient_result)) => Ok((judge, gradient_result, w)),
@@ -125,11 +129,11 @@ impl ValidationService {
                                 score: result.score,
                                 confidence: result.confidence,
                                 validated_at: chrono::Utc::now(),
-                            }
-                        )
+                            },
+                        ),
                     );
                     results.push((agent_id, result, weight));
-                },
+                }
                 Ok(Err(e)) => tracing::warn!("Judge execution failed: {}", e),
                 Err(e) => tracing::error!("Join error: {}", e),
             }
@@ -148,18 +152,21 @@ impl ValidationService {
         let consensus = self.compute_consensus(results, &config)?;
 
         // Publish consensus event
-        self.event_bus.publish_execution_event(
-            crate::domain::events::ExecutionEvent::Validation(
+        self.event_bus
+            .publish_execution_event(crate::domain::events::ExecutionEvent::Validation(
                 crate::domain::events::ValidationEvent::MultiJudgeConsensus {
                     execution_id,
                     agent_id,
-                    judge_scores: consensus.individual_results.iter().map(|(id, r)| (*id, r.score)).collect(),
+                    judge_scores: consensus
+                        .individual_results
+                        .iter()
+                        .map(|(id, r)| (*id, r.score))
+                        .collect(),
                     final_score: consensus.final_score,
                     confidence: consensus.consensus_confidence,
                     reached_at: chrono::Utc::now(),
-                }
-            )
-        );
+                },
+            ));
 
         Ok(consensus)
     }
@@ -178,7 +185,7 @@ impl ValidationService {
         // the judge's template (e.g., "You are a validation judge...{user_input}").
         let payload_data = serde_json::to_value(&request)?;
         let input = ExecutionInput {
-            intent: None,  // Let ExecutionService render judge agent's prompt_template
+            intent: None, // Let ExecutionService render judge agent's prompt_template
             payload: serde_json::json!({
                 "workflow_input": payload_data,  // ValidationRequest data
                 "validation_context": "judge_execution"
@@ -191,34 +198,41 @@ impl ValidationService {
         // 3. Poll for completion with configurable timeout and interval
         let max_attempts = (timeout_seconds * 1000) / poll_interval_ms;
         let mut attempts = 0;
-        
+
         loop {
             if attempts >= max_attempts {
-                return Err(anyhow!("Judge execution timed out after {} seconds", timeout_seconds));
+                return Err(anyhow!(
+                    "Judge execution timed out after {} seconds",
+                    timeout_seconds
+                ));
             }
-            
+
             let exec = service.get_execution(exec_id).await?;
             match exec.status {
                 ExecutionStatus::Completed => {
                     // 4. Parse output
-                    let last_iter = exec.iterations().last()
+                    let last_iter = exec
+                        .iterations()
+                        .last()
                         .ok_or_else(|| anyhow!("Judge completed but has no iterations"))?;
-                        
-                    let output_str = last_iter.output.as_ref()
+
+                    let output_str = last_iter
+                        .output
+                        .as_ref()
                         .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
-                    
+
                     // Attempt to parse JSON
                     // The judge might wrap it in markdown block ```json ... ```
                     let json_str = Self::extract_json(output_str).unwrap_or(output_str.clone());
-                    
+
                     let result: GradientResult = serde_json::from_str(&json_str)
                         .context(format!("Failed to parse judge output: {}", json_str))?;
-                        
+
                     return Ok((judge_id, result));
-                },
+                }
                 ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
                     return Err(anyhow!("Judge execution failed or cancelled"));
-                },
+                }
                 _ => {
                     tokio::time::sleep(Duration::from_millis(poll_interval_ms)).await;
                     attempts += 1;
@@ -226,7 +240,7 @@ impl ValidationService {
             }
         }
     }
-    
+
     fn extract_json(text: &str) -> Option<String> {
         // Find start of markdown code block
         let start_marker = "```json";
@@ -238,28 +252,34 @@ impl ValidationService {
                 return Some(text[content_start..content_end].trim().to_string());
             }
         }
-        
+
         // Try generic code block if json specific one not found
         let generic_marker = "```";
         if let Some(start) = text.find(generic_marker) {
-             let content_start = start + generic_marker.len();
-             if let Some(end_offset) = text[content_start..].find("```") {
-                 let content_end = content_start + end_offset;
-                 return Some(text[content_start..content_end].trim().to_string());
-             }
+            let content_start = start + generic_marker.len();
+            if let Some(end_offset) = text[content_start..].find("```") {
+                let content_end = content_start + end_offset;
+                return Some(text[content_start..content_end].trim().to_string());
+            }
         }
-        
+
         None
     }
 
-    fn compute_consensus(&self, results: Vec<(AgentId, GradientResult, f64)>, config: &ConsensusConfig) -> Result<MultiJudgeConsensus> {
+    fn compute_consensus(
+        &self,
+        results: Vec<(AgentId, GradientResult, f64)>,
+        config: &ConsensusConfig,
+    ) -> Result<MultiJudgeConsensus> {
         if results.is_empty() {
             return Err(anyhow!("Cannot compute consensus with zero results"));
         }
 
         // Dispatch to appropriate strategy
         match config.strategy {
-            ConsensusStrategy::WeightedAverage => self.compute_weighted_average_consensus(results, config),
+            ConsensusStrategy::WeightedAverage => {
+                self.compute_weighted_average_consensus(results, config)
+            }
             ConsensusStrategy::Majority => self.compute_majority_consensus(results, config),
             ConsensusStrategy::Unanimous => self.compute_unanimous_consensus(results, config),
             ConsensusStrategy::BestOfN => self.compute_best_of_n_consensus(results, config),
@@ -272,40 +292,45 @@ impl ValidationService {
         config: &ConsensusConfig,
     ) -> Result<MultiJudgeConsensus> {
         let total_weight: f64 = results.iter().map(|(_, _, w)| w).sum();
-        
+
         if total_weight == 0.0 {
             return Err(anyhow!("Total weight is zero"));
         }
 
         // Weighted average of scores
-        let weighted_score: f64 = results.iter()
-            .map(|(_, r, w)| r.score * w)
-            .sum::<f64>() / total_weight;
+        let weighted_score: f64 =
+            results.iter().map(|(_, r, w)| r.score * w).sum::<f64>() / total_weight;
 
         // Confidence calculation with configurable weighting
         let count = results.len() as f64;
         let unweighted_mean: f64 = results.iter().map(|(_, r, _)| r.score).sum::<f64>() / count;
-        
+
         // Variance = sum((x - mean)^2) / n
-        let variance: f64 = results.iter()
+        let variance: f64 = results
+            .iter()
             .map(|(_, r, _)| (r.score - unweighted_mean).powi(2))
-            .sum::<f64>() / count;
-            
+            .sum::<f64>()
+            / count;
+
         // Max variance for [0,1] is 0.25 (e.g. half 0s, half 1s)
         let disagreement_penalty = (variance / 0.25).min(1.0);
         let agreement_factor = 1.0 - disagreement_penalty;
-        
+
         // Average of judges' self-confidence (weighted)
-        let avg_judge_confidence: f64 = results.iter()
+        let avg_judge_confidence: f64 = results
+            .iter()
             .map(|(_, r, w)| r.confidence * w)
-            .sum::<f64>() / total_weight;
-        
+            .sum::<f64>()
+            / total_weight;
+
         // Use configurable confidence weighting or defaults
         let default_weighting = ConfidenceWeighting::default();
-        let weighting = config.confidence_weighting.as_ref().unwrap_or(&default_weighting);
-        let consensus_confidence = 
-            agreement_factor * weighting.agreement_factor + 
-            avg_judge_confidence * weighting.self_confidence_factor;
+        let weighting = config
+            .confidence_weighting
+            .as_ref()
+            .unwrap_or(&default_weighting);
+        let consensus_confidence = agreement_factor * weighting.agreement_factor
+            + avg_judge_confidence * weighting.self_confidence_factor;
 
         Ok(MultiJudgeConsensus {
             final_score: weighted_score,
@@ -322,14 +347,15 @@ impl ValidationService {
         config: &ConsensusConfig,
     ) -> Result<MultiJudgeConsensus> {
         let threshold = config.threshold.unwrap_or(0.7);
-        
+
         // Count votes: pass (score >= threshold) vs fail (score < threshold)
-        let pass_votes: usize = results.iter()
+        let pass_votes: usize = results
+            .iter()
             .filter(|(_, r, _)| r.score >= threshold)
             .count();
-        
+
         let fail_votes = results.len() - pass_votes;
-        
+
         // Majority decision
         let final_score = if pass_votes > fail_votes {
             1.0 // Pass
@@ -338,16 +364,15 @@ impl ValidationService {
         } else {
             0.5 // Tie - neutral
         };
-        
+
         // Confidence based on margin of victory
         let total = results.len() as f64;
         let margin = ((pass_votes as f64 - fail_votes as f64).abs() / total).min(1.0);
-        
+
         // Also factor in individual judge confidence
-        let avg_judge_confidence: f64 = results.iter()
-            .map(|(_, r, _)| r.confidence)
-            .sum::<f64>() / total;
-        
+        let avg_judge_confidence: f64 =
+            results.iter().map(|(_, r, _)| r.confidence).sum::<f64>() / total;
+
         let consensus_confidence = margin * 0.7 + avg_judge_confidence * 0.3;
 
         Ok(MultiJudgeConsensus {
@@ -371,10 +396,10 @@ impl ValidationService {
         config: &ConsensusConfig,
     ) -> Result<MultiJudgeConsensus> {
         let threshold = config.threshold.unwrap_or(0.7);
-        
+
         // All judges must score >= threshold
         let all_pass = results.iter().all(|(_, r, _)| r.score >= threshold);
-        
+
         let final_score = if all_pass {
             // Average of actual scores
             let count = results.len() as f64;
@@ -382,12 +407,13 @@ impl ValidationService {
         } else {
             0.0 // Any dissenter fails consensus
         };
-        
+
         // Confidence is minimum of all judge confidences (weakest link)
-        let min_confidence = results.iter()
+        let min_confidence = results
+            .iter()
             .map(|(_, r, _)| r.confidence)
             .fold(f64::INFINITY, f64::min);
-        
+
         Ok(MultiJudgeConsensus {
             final_score,
             consensus_confidence: min_confidence,
@@ -408,37 +434,35 @@ impl ValidationService {
         config: &ConsensusConfig,
     ) -> Result<MultiJudgeConsensus> {
         let n = config.n.unwrap_or(results.len());
-        
+
         if n == 0 {
             return Err(anyhow!("BestOfN requires n > 0"));
         }
-        
+
         // Sort by score * confidence (descending)
         let mut sorted_results = results.clone();
         sorted_results.sort_by(|(_, a, _), (_, b, _)| {
             let score_a = a.score * a.confidence;
             let score_b = b.score * b.confidence;
-            score_b.partial_cmp(&score_a).unwrap_or(std::cmp::Ordering::Equal)
+            score_b
+                .partial_cmp(&score_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
-        
+
         // Take top N (or all if N > total)
         let top_n: Vec<_> = sorted_results.iter().take(n).collect();
         let count = top_n.len() as f64;
-        
+
         // Average of top N scores (weighted)
         let total_weight: f64 = top_n.iter().map(|(_, _, w)| w).sum();
         let final_score = if total_weight > 0.0 {
-            top_n.iter()
-                .map(|(_, r, w)| r.score * w)
-                .sum::<f64>() / total_weight
+            top_n.iter().map(|(_, r, w)| r.score * w).sum::<f64>() / total_weight
         } else {
             top_n.iter().map(|(_, r, _)| r.score).sum::<f64>() / count
         };
-        
+
         // Average confidence of top N
-        let consensus_confidence = top_n.iter()
-            .map(|(_, r, _)| r.confidence)
-            .sum::<f64>() / count;
+        let consensus_confidence = top_n.iter().map(|(_, r, _)| r.confidence).sum::<f64>() / count;
 
         Ok(MultiJudgeConsensus {
             final_score,

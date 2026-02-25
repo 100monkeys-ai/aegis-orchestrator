@@ -37,26 +37,39 @@ impl ToolInvocationService {
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
         // 1. Get active session for agent
-        let session = self.smcp_session_repo
+        let session = self
+            .smcp_session_repo
             .find_active_by_agent(agent_id)
             .await
             .map_err(|_| SmcpSessionError::MalformedPayload)? // generic fallback error
-            .ok_or(SmcpSessionError::SessionInactive(crate::domain::smcp_session::SessionStatus::Expired))?;
+            .ok_or(SmcpSessionError::SessionInactive(
+                crate::domain::smcp_session::SessionStatus::Expired,
+            ))?;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self.smcp_middleware.verify_and_unwrap(&session, envelope)?;
-        let tool_name = envelope.extract_tool_name().ok_or(SmcpSessionError::MalformedPayload)?;
+        let tool_name = envelope
+            .extract_tool_name()
+            .ok_or(SmcpSessionError::MalformedPayload)?;
 
         // 3. Route tool call to the appropriate TCP server
         // The ToolRouter returns a ToolServerId, but we might actually want to call the tool.
         // For MVP, if it routes successfully, we return a mock payload or delegate to actual calling logic.
         // Wait, the ToolRouter doesn't actually *invoke* the tool yet. It returns `ToolServerId`.
         // Let's get the server ID first.
-        let server_id = self.tool_router.route_tool(session.execution_id, &tool_name).await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e)))?;
+        let server_id = self
+            .tool_router
+            .route_tool(session.execution_id, &tool_name)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e))
+            })?;
 
-        let server = self.tool_router.get_server(server_id).await
-            .ok_or(SmcpSessionError::SignatureVerificationFailed("Server vanished after routing".to_string()))?;
+        let server = self.tool_router.get_server(server_id).await.ok_or(
+            SmcpSessionError::SignatureVerificationFailed(
+                "Server vanished after routing".to_string(),
+            ),
+        )?;
 
         // 4. Execute based on ExecutionMode (Gateway Retrofit)
         match server.execution_mode {
@@ -64,11 +77,15 @@ impl ToolInvocationService {
                 // FSAL Execution
                 // In a production implementation, we'd look up the agent's volume path via the Storage manager
                 // and directly manipulate files using the runtime-agnostic FSAL.
-                tracing::info!("Executing local tool via FSAL: {} for agent {:?}", tool_name, agent_id);
-                
+                tracing::info!(
+                    "Executing local tool via FSAL: {} for agent {:?}",
+                    tool_name,
+                    agent_id
+                );
+
                 // [MVP Placeholder for FSAL operations]
                 // Examples: modifying /shared/<agent_id>/workspace natively on the host filesystem
-                
+
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "local_fsal",
@@ -86,9 +103,13 @@ impl ToolInvocationService {
                     "params": args,
                     "id": session.execution_id.to_string()
                 });
-                
-                tracing::info!("Proxying remote tool via JSON-RPC: {} to server {:?}", tool_name, server_id);
-                
+
+                tracing::info!(
+                    "Proxying remote tool via JSON-RPC: {} to server {:?}",
+                    tool_name,
+                    server_id
+                );
+
                 // [MVP Placeholder for stdio/http IPC to actual MCP server process]
                 Ok(serde_json::json!({
                     "status": "success",
@@ -110,18 +131,30 @@ impl ToolInvocationService {
         tool_name: String,
         args: Value,
     ) -> Result<Value, SmcpSessionError> {
-        let server_id = self.tool_router.route_tool(execution_id, &tool_name).await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e)))?;
+        let server_id = self
+            .tool_router
+            .route_tool(execution_id, &tool_name)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e))
+            })?;
 
-        let server = self.tool_router.get_server(server_id).await
-            .ok_or(SmcpSessionError::SignatureVerificationFailed("Server vanished after routing".to_string()))?;
+        let server = self.tool_router.get_server(server_id).await.ok_or(
+            SmcpSessionError::SignatureVerificationFailed(
+                "Server vanished after routing".to_string(),
+            ),
+        )?;
 
         // Note: For MVP we skip SecurityContext validation here because it was checked earlier
         // or assumes the orchestrator only routes to authorized tools.
-        
+
         match server.execution_mode {
             crate::domain::mcp::ExecutionMode::Local => {
-                tracing::info!("Executing local tool via FSAL: {} for agent {:?}", tool_name, agent_id);
+                tracing::info!(
+                    "Executing local tool via FSAL: {} for agent {:?}",
+                    tool_name,
+                    agent_id
+                );
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "local_fsal",
@@ -136,8 +169,12 @@ impl ToolInvocationService {
                     "params": args,
                     "id": execution_id.to_string()
                 });
-                
-                tracing::info!("Proxying remote tool via JSON-RPC: {} to server {:?}", tool_name, server_id);
+
+                tracing::info!(
+                    "Proxying remote tool via JSON-RPC: {} to server {:?}",
+                    tool_name,
+                    server_id
+                );
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",
@@ -149,9 +186,12 @@ impl ToolInvocationService {
     }
 
     /// Retrieve available tool schemas to inject into LLM prompts
-    pub async fn get_available_tools(&self) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
-        self.tool_router.list_tools().await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e)))
+    pub async fn get_available_tools(
+        &self,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+        self.tool_router.list_tools().await.map_err(|e| {
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e))
+        })
     }
 }
 
@@ -160,9 +200,9 @@ mod tests {
     use super::*;
     use crate::domain::execution::ExecutionId;
     use crate::domain::security_context::SecurityContext;
-    use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
     use crate::domain::smcp_session::SmcpSession;
-    use crate::infrastructure::tool_router::{ToolRouter, InMemoryToolRegistry};
+    use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
+    use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
 
     struct DummyEnvelope {
         valid: bool,
@@ -173,7 +213,9 @@ mod tests {
             if self.valid {
                 Ok(())
             } else {
-                Err(SmcpSessionError::SignatureVerificationFailed("invalid sig".to_string()))
+                Err(SmcpSessionError::SignatureVerificationFailed(
+                    "invalid sig".to_string(),
+                ))
             }
         }
         fn extract_tool_name(&self) -> Option<String> {
@@ -187,7 +229,8 @@ mod tests {
     #[tokio::test]
     async fn test_invoke_tool_no_session() {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
-        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let router = Arc::new(ToolRouter::new(registry, servers));
         let middleware = Arc::new(SmcpMiddleware::new());
@@ -205,7 +248,7 @@ mod tests {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
         let agent_id = AgentId::new();
         let exec_id = ExecutionId::new();
-        
+
         let context = SecurityContext {
             name: "test".to_string(),
             description: "".to_string(),
@@ -219,9 +262,10 @@ mod tests {
         };
 
         let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
-        let _ =  repo.save(session).await;
+        let _ = repo.save(session).await;
 
-        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let router = Arc::new(ToolRouter::new(registry, servers));
         let middleware = Arc::new(SmcpMiddleware::new());
@@ -230,18 +274,23 @@ mod tests {
         let envelope = DummyEnvelope { valid: false };
 
         let result = service.invoke_tool(&agent_id, &envelope).await;
-        assert!(matches!(result, Err(SmcpSessionError::SignatureVerificationFailed(_))));
+        assert!(matches!(
+            result,
+            Err(SmcpSessionError::SignatureVerificationFailed(_))
+        ));
     }
 
     #[tokio::test]
     async fn test_invoke_tool_execution_modes() {
-        use crate::domain::mcp::{ToolServer, ToolServerId, ToolServerStatus, ExecutionMode, ResourceLimits};
+        use crate::domain::mcp::{
+            ExecutionMode, ResourceLimits, ToolServer, ToolServerId, ToolServerStatus,
+        };
         use std::path::PathBuf;
 
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
         let agent_id = AgentId::new();
         let exec_id = ExecutionId::new();
-        
+
         use crate::domain::security_context::Capability;
         let context = SecurityContext {
             name: "test".to_string(),
@@ -275,7 +324,8 @@ mod tests {
         let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
         let _ = repo.save(session).await;
 
-        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
         let router = Arc::new(ToolRouter::new(registry, servers.clone()));
         let middleware = Arc::new(SmcpMiddleware::new());
@@ -294,17 +344,23 @@ mod tests {
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
             credentials: None,
-            resource_limits: ResourceLimits { max_memory_mb: None, max_cpu_shares: None },
+            resource_limits: ResourceLimits {
+                max_memory_mb: None,
+                max_cpu_shares: None,
+            },
             started_at: None,
             stopped_at: None,
         };
-        
+
         router.add_server(local_server).await.unwrap();
-        
+
         let envelope = DummyEnvelope { valid: true }; // extracts "test_tool"
         let result = service.invoke_tool(&agent_id, &envelope).await.unwrap();
-        
-        let exec_mode = result.get("execution_mode").and_then(|v| v.as_str()).unwrap();
+
+        let exec_mode = result
+            .get("execution_mode")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert_eq!(exec_mode, "local_fsal");
 
         // 2. Remote Tool
@@ -320,23 +376,44 @@ mod tests {
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
             credentials: None,
-            resource_limits: ResourceLimits { max_memory_mb: None, max_cpu_shares: None },
+            resource_limits: ResourceLimits {
+                max_memory_mb: None,
+                max_cpu_shares: None,
+            },
             started_at: None,
             stopped_at: None,
         };
         router.add_server(remote_server).await.unwrap();
-        
-        struct DummyRemoteEnvelope { valid: bool }
-        impl EnvelopeVerifier for DummyRemoteEnvelope {
-            fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> { if self.valid { Ok(()) } else { Err(SmcpSessionError::SignatureVerificationFailed("".into())) } }
-            fn extract_tool_name(&self) -> Option<String> { Some("test_tool_remote".to_string()) }
-            fn extract_arguments(&self) -> Option<Value> { Some(serde_json::json!({})) }
+
+        struct DummyRemoteEnvelope {
+            valid: bool,
         }
-        
+        impl EnvelopeVerifier for DummyRemoteEnvelope {
+            fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
+                if self.valid {
+                    Ok(())
+                } else {
+                    Err(SmcpSessionError::SignatureVerificationFailed("".into()))
+                }
+            }
+            fn extract_tool_name(&self) -> Option<String> {
+                Some("test_tool_remote".to_string())
+            }
+            fn extract_arguments(&self) -> Option<Value> {
+                Some(serde_json::json!({}))
+            }
+        }
+
         let remote_envelope = DummyRemoteEnvelope { valid: true };
-        let result = service.invoke_tool(&agent_id, &remote_envelope).await.unwrap();
-        
-        let exec_mode = result.get("execution_mode").and_then(|v| v.as_str()).unwrap();
+        let result = service
+            .invoke_tool(&agent_id, &remote_envelope)
+            .await
+            .unwrap();
+
+        let exec_mode = result
+            .get("execution_mode")
+            .and_then(|v| v.as_str())
+            .unwrap();
         assert_eq!(exec_mode, "remote_jsonrpc");
     }
 }

@@ -23,37 +23,37 @@
 // ============================================================================
 // Current Implementation: Docker runtime only (Bollard client)
 // This module provides agent execution isolation via Docker containers.
-// 
+//
 // Firecracker VM-based isolation deferred to Phase 2 for production hardening.
 // Phase 1 uses Docker for development/testing convenience.
-// 
+//
 // TODO: Implement Firecracker runtime variant when Phase 2 begins.
 // See: adrs/003-firecracker-isolation.md
 // ============================================================================
 
 use crate::domain::runtime::{
-    AgentRuntime, InstanceId, TaskInput, TaskOutput, RuntimeError, InstanceStatus, RuntimeConfig
+    AgentRuntime, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError, TaskInput, TaskOutput,
 };
 use async_trait::async_trait;
-use bollard::Docker;
 use bollard::container::{
-    Config, CreateContainerOptions, StartContainerOptions, RemoveContainerOptions,
-    LogOutput, UploadToContainerOptions
+    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
+    UploadToContainerOptions,
 };
+use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
-use bollard::exec::{CreateExecOptions, StartExecResults, StartExecOptions};
 use bollard::models::{Mount, MountTypeEnum};
-use futures::StreamExt;
-use tracing::{info, debug, warn};
-use std::path::PathBuf;
+use bollard::Docker;
 use chrono;
+use futures::StreamExt;
+use std::path::PathBuf;
+use tracing::{debug, info, warn};
 
 pub struct DockerRuntime {
     docker: Docker,
-    bootstrap_script_path: PathBuf,  // Store as PathBuf for better path handling
+    bootstrap_script_path: PathBuf, // Store as PathBuf for better path handling
     network_mode: Option<String>,
     orchestrator_url: String,
-    nfs_server_host: Option<String>,  // NFS server hostname for volume mounts (ADR-036)
+    nfs_server_host: Option<String>, // NFS server hostname for volume mounts (ADR-036)
     nfs_port: u16,
     nfs_mountport: u16,
 }
@@ -74,10 +74,12 @@ impl DockerRuntime {
         } else {
             // Relative path - resolve from current directory
             std::env::current_dir()
-                .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to get current directory: {}", e)))?
+                .map_err(|e| {
+                    RuntimeError::SpawnFailed(format!("Failed to get current directory: {}", e))
+                })?
                 .join(&bootstrap_script)
         };
-        
+
         // Validate the bootstrap script exists
         if !bootstrap_path.exists() {
             return Err(RuntimeError::SpawnFailed(format!(
@@ -90,22 +92,24 @@ impl DockerRuntime {
                 std::env::current_dir()
             )));
         }
-        
+
         info!("Using bootstrap script: {}", bootstrap_path.display());
         // Connect to Docker daemon (custom socket or auto-detect)
         let docker = if let Some(path) = socket_path {
             // Try custom socket path
             #[cfg(unix)]
             let result = Docker::connect_with_unix(&path, 120, bollard::API_DEFAULT_VERSION);
-            
+
             #[cfg(windows)]
             let result = Docker::connect_with_named_pipe(&path, 120, bollard::API_DEFAULT_VERSION);
-            
-            result.map_err(|e| RuntimeError::SpawnFailed(format!(
-                "Failed to connect to Docker at {}: {}\n\n\
+
+            result.map_err(|e| {
+                RuntimeError::SpawnFailed(format!(
+                    "Failed to connect to Docker at {}: {}\n\n\
                  Ensure Docker is running and the socket path is correct.",
-                path, e
-            )))?
+                    path, e
+                ))
+            })?
         } else {
             // Auto-detect Docker connection
             Docker::connect_with_local_defaults()
@@ -123,21 +127,21 @@ impl DockerRuntime {
                     e
                 )))?
         };
-        Ok(Self { 
-            docker, 
+        Ok(Self {
+            docker,
             bootstrap_script_path: bootstrap_path,
-            network_mode, 
+            network_mode,
             orchestrator_url,
             nfs_server_host,
             nfs_port,
             nfs_mountport,
         })
     }
-    
+
     /// Verify Docker daemon is accessible
     pub async fn healthcheck(&self) -> Result<(), RuntimeError> {
-        self.docker.ping().await
-            .map_err(|e| RuntimeError::SpawnFailed(format!(
+        self.docker.ping().await.map_err(|e| {
+            RuntimeError::SpawnFailed(format!(
                 "Cannot connect to Docker daemon: {}\n\n\
                  Docker healthcheck failed. Ensure Docker is running:\n\
                  - On Windows: Start Docker Desktop\n\
@@ -145,7 +149,8 @@ impl DockerRuntime {
                  - On macOS: Start Docker Desktop\n\n\
                  Verify with: docker ps",
                 e
-            )))?;
+            ))
+        })?;
         Ok(())
     }
 
@@ -154,7 +159,7 @@ impl DockerRuntime {
         match self.docker.inspect_container(id, None).await {
             Ok(inspect) => {
                 let state = inspect.state.as_ref()?;
-                
+
                 // Calculate uptime from StartedAt timestamp
                 let uptime = if let Some(started_at) = &state.started_at {
                     match chrono::DateTime::parse_from_rfc3339(started_at) {
@@ -170,31 +175,49 @@ impl DockerRuntime {
                 };
 
                 // Get CPU and memory stats (requires stats API call)
-                match self.docker.stats(id, Some(bollard::container::StatsOptions { stream: false, one_shot: true })).next().await {
+                match self
+                    .docker
+                    .stats(
+                        id,
+                        Some(bollard::container::StatsOptions {
+                            stream: false,
+                            one_shot: true,
+                        }),
+                    )
+                    .next()
+                    .await
+                {
                     Some(Ok(stats)) => {
                         // Calculate CPU percentage
-                        let cpu_percent = if let (Some(system_cpu_usage), Some(presystem_cpu_usage)) =
-                            (stats.cpu_stats.system_cpu_usage, stats.precpu_stats.system_cpu_usage) {
-                            let cpu_usage = &stats.cpu_stats.cpu_usage;
-                            let precpu_usage = &stats.precpu_stats.cpu_usage;
-                            let cpu_delta = cpu_usage.total_usage.saturating_sub(precpu_usage.total_usage) as f64;
-                            let system_delta = system_cpu_usage.saturating_sub(presystem_cpu_usage) as f64;
-                            let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
-                            if system_delta > 0.0 {
-                                (cpu_delta / system_delta) * num_cpus * 100.0
+                        let cpu_percent =
+                            if let (Some(system_cpu_usage), Some(presystem_cpu_usage)) = (
+                                stats.cpu_stats.system_cpu_usage,
+                                stats.precpu_stats.system_cpu_usage,
+                            ) {
+                                let cpu_usage = &stats.cpu_stats.cpu_usage;
+                                let precpu_usage = &stats.precpu_stats.cpu_usage;
+                                let cpu_delta = cpu_usage
+                                    .total_usage
+                                    .saturating_sub(precpu_usage.total_usage)
+                                    as f64;
+                                let system_delta =
+                                    system_cpu_usage.saturating_sub(presystem_cpu_usage) as f64;
+                                let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+                                if system_delta > 0.0 {
+                                    (cpu_delta / system_delta) * num_cpus * 100.0
+                                } else {
+                                    0.0
+                                }
                             } else {
                                 0.0
-                            }
-                        } else {
-                            0.0
-                        };
+                            };
 
                         // Get memory usage
                         let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
 
                         Some((cpu_percent, memory_bytes, uptime))
                     }
-                    _ => Some((0.0, 0, uptime)),  // Return at least uptime if stats fail
+                    _ => Some((0.0, 0, uptime)), // Return at least uptime if stats fail
                 }
             }
             Err(e) => {
@@ -210,12 +233,12 @@ impl AgentRuntime for DockerRuntime {
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
         // Validate isolation mode first
         config.validate_isolation()?;
-        
+
         let image = config.to_image();
-        
+
         // Check if image exists locally first
         let image_exists = self.docker.inspect_image(&image).await.is_ok();
-        
+
         // Decide whether to pull
         let should_pull = if image_exists {
             false
@@ -252,9 +275,12 @@ impl AgentRuntime for DockerRuntime {
             }
             info!("Successfully pulled image: {}", image);
         } else if !image_exists && !config.autopull {
-             return Err(RuntimeError::SpawnFailed(format!("Image {} not found locally and autopull is disabled", image)));
+            return Err(RuntimeError::SpawnFailed(format!(
+                "Image {} not found locally and autopull is disabled",
+                image
+            )));
         }
-        
+
         // Validate isolation mode first
         config.validate_isolation()?;
 
@@ -262,13 +288,13 @@ impl AgentRuntime for DockerRuntime {
 
         // Build host config with resource limits
         debug!("Preparing to copy bootstrap script into container");
-        
+
         let mut host_config = bollard::service::HostConfig {
-            mounts: None,  // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
-            network_mode: self.network_mode.clone(),  // Optional Docker network (None = default)
+            mounts: None, // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
+            network_mode: self.network_mode.clone(), // Optional Docker network (None = default)
             ..Default::default()
         };
-        
+
         // Apply resource limits if specified
         if let Some(memory_bytes) = config.resources.memory_bytes {
             host_config.memory = Some(memory_bytes as i64);
@@ -277,77 +303,85 @@ impl AgentRuntime for DockerRuntime {
             // Docker nano_cpus: 1 CPU = 1e9 nano CPUs, 1 milli CPU = 1e6 nano CPUs
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
         }
-        
+
         // Apply NFS volume mounts if specified (ADR-036: Orchestrator Proxy Pattern)
         if !config.volumes.is_empty() {
             // Use explicit NFS server host if provided, otherwise extract from orchestrator_url
             // This separation is needed because:
             // - orchestrator_url is used by containers (Docker service name works: "aegis-runtime")
             // - NFS mounts happen at Docker daemon level on host (needs resolvable hostname: "127.0.0.1")
-            let orchestrator_host = self.nfs_server_host
-                .as_deref()
-                .unwrap_or_else(|| {
-                    // Fallback: Default to "127.0.0.1" which covers Native Linux and WSL2 deployments.
-                    // Prior behavior extracted the hostname from orchestrator_url (e.g., "aegis-runtime"),
-                    // but this fails for Docker deployments since the Docker Daemon on the host 
-                    // cannot resolve internal container network names.
-                    "127.0.0.1"
-                });
-            
-            let mounts: Vec<Mount> = config.volumes.iter().map(|volume_mount| {
-                let container_path = volume_mount.mount_point.display().to_string();
-                
-                // ADR-036: NFS Server Gateway configuration via local driver
-                // Mount options: addr={host},nfsvers=3,proto=tcp,soft,timeo=10,nolock
-                // - NFSv3 protocol (not v4, for simplicity)
-                // - nolock: No NLM support in Phase 1 (safe for single-agent-per-volume)
-                // - soft mount with 10-second timeout (fail gracefully on network issues)
-                // - TCP protocol for reliability
-                
-                debug!(
-                    "Configuring NFS mount: volume_id={}, path={}, mode={:?}, host={}",
-                    volume_mount.volume_id,
-                    container_path,
-                    volume_mount.access_mode,
-                    orchestrator_host
-                );
-                
-                // Build NFS mount using local driver (standard Docker approach)
-                use bollard::models::{MountVolumeOptions, MountVolumeOptionsDriverConfig};
-                use std::collections::HashMap;
-                
-                let mut driver_opts = HashMap::new();
-                driver_opts.insert("type".to_string(), "nfs".to_string());
-                driver_opts.insert(
-                    "o".to_string(),
-                    format!("addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock", orchestrator_host, self.nfs_port, self.nfs_mountport)
-                );
-                driver_opts.insert(
-                    "device".to_string(),
-                    format!(":{}", volume_mount.remote_path) // remote_path contains /{tenant_id}/{volume_id}
-                );
-                
-                Mount {
-                    target: Some(container_path),
-                    source: None,
-                    typ: Some(MountTypeEnum::VOLUME),
-                    read_only: Some(matches!(
+            let orchestrator_host = self.nfs_server_host.as_deref().unwrap_or_else(|| {
+                // Fallback: Default to "127.0.0.1" which covers Native Linux and WSL2 deployments.
+                // Prior behavior extracted the hostname from orchestrator_url (e.g., "aegis-runtime"),
+                // but this fails for Docker deployments since the Docker Daemon on the host
+                // cannot resolve internal container network names.
+                "127.0.0.1"
+            });
+
+            let mounts: Vec<Mount> = config
+                .volumes
+                .iter()
+                .map(|volume_mount| {
+                    let container_path = volume_mount.mount_point.display().to_string();
+
+                    // ADR-036: NFS Server Gateway configuration via local driver
+                    // Mount options: addr={host},nfsvers=3,proto=tcp,soft,timeo=10,nolock
+                    // - NFSv3 protocol (not v4, for simplicity)
+                    // - nolock: No NLM support in Phase 1 (safe for single-agent-per-volume)
+                    // - soft mount with 10-second timeout (fail gracefully on network issues)
+                    // - TCP protocol for reliability
+
+                    debug!(
+                        "Configuring NFS mount: volume_id={}, path={}, mode={:?}, host={}",
+                        volume_mount.volume_id,
+                        container_path,
                         volume_mount.access_mode,
-                        crate::domain::volume::AccessMode::ReadOnly
-                    )),
-                    volume_options: Some(MountVolumeOptions {
-                        driver_config: Some(MountVolumeOptionsDriverConfig {
-                            name: Some("local".to_string()),
-                            options: Some(driver_opts),
+                        orchestrator_host
+                    );
+
+                    // Build NFS mount using local driver (standard Docker approach)
+                    use bollard::models::{MountVolumeOptions, MountVolumeOptionsDriverConfig};
+                    use std::collections::HashMap;
+
+                    let mut driver_opts = HashMap::new();
+                    driver_opts.insert("type".to_string(), "nfs".to_string());
+                    driver_opts.insert(
+                        "o".to_string(),
+                        format!(
+                            "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
+                            orchestrator_host, self.nfs_port, self.nfs_mountport
+                        ),
+                    );
+                    driver_opts.insert(
+                        "device".to_string(),
+                        format!(":{}", volume_mount.remote_path), // remote_path contains /{tenant_id}/{volume_id}
+                    );
+
+                    Mount {
+                        target: Some(container_path),
+                        source: None,
+                        typ: Some(MountTypeEnum::VOLUME),
+                        read_only: Some(matches!(
+                            volume_mount.access_mode,
+                            crate::domain::volume::AccessMode::ReadOnly
+                        )),
+                        volume_options: Some(MountVolumeOptions {
+                            driver_config: Some(MountVolumeOptionsDriverConfig {
+                                name: Some("local".to_string()),
+                                options: Some(driver_opts),
+                            }),
+                            ..Default::default()
                         }),
                         ..Default::default()
-                    }),
-                    ..Default::default()
-                }
-            }).collect();
-            
+                    }
+                })
+                .collect();
+
             host_config.mounts = Some(mounts);
-            info!("Configured {} NFS volume mount(s) for container (ADR-036)", config.volumes.len());
+            info!(
+                "Configured {} NFS volume mount(s) for container (ADR-036)",
+                config.volumes.len()
+            );
         }
 
         // Removed container_config that was causing move issues and unused var warning
@@ -358,13 +392,15 @@ impl AgentRuntime for DockerRuntime {
         };
 
         // Convert map to "KEY=VALUE" strings
-        let mut env_vars: Vec<String> = config.env.iter()
+        let mut env_vars: Vec<String> = config
+            .env
+            .iter()
             .map(|(k, v)| format!("{}={}", k, v))
             .collect();
-        
+
         // Add orchestrator URL for agent bootstrap script to call LLM proxy
         env_vars.push(format!("AEGIS_ORCHESTRATOR_URL={}", self.orchestrator_url));
-        
+
         // Enable bootstrap.py verbose mode if log level is debug or trace
         if tracing::level_enabled!(tracing::Level::DEBUG) {
             env_vars.push("AEGIS_BOOTSTRAP_DEBUG=true".to_string());
@@ -372,7 +408,11 @@ impl AgentRuntime for DockerRuntime {
         }
 
         // Keep container alive - actual agent execution happens via bootstrap script in execute()
-        let cmd = vec!["tail".to_string(), "-f".to_string(), "/dev/null".to_string()];
+        let cmd = vec![
+            "tail".to_string(),
+            "-f".to_string(),
+            "/dev/null".to_string(),
+        ];
 
         // Create container configuration
         let container_config = Config {
@@ -385,22 +425,30 @@ impl AgentRuntime for DockerRuntime {
             host_config: Some(host_config),
             ..Default::default()
         };
-        
+
         // Create the container
-        let res = self.docker.create_container(Some(options), container_config).await
+        let res = self
+            .docker
+            .create_container(Some(options), container_config)
+            .await
             .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
 
         let id = res.id;
 
-        self.docker.start_container(&id, None::<StartContainerOptions<String>>).await
+        self.docker
+            .start_container(&id, None::<StartContainerOptions<String>>)
+            .await
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to start container: {}", e)))?;
 
         info!("Spawned agent container: {}", id);
-        
+
         // Copy bootstrap script into the container
-        debug!(container_id = &id, "Copying bootstrap script into container");
+        debug!(
+            container_id = &id,
+            "Copying bootstrap script into container"
+        );
         self.copy_bootstrap_to_container(&id).await?;
-        
+
         Ok(InstanceId::new(id))
     }
 
@@ -420,17 +468,23 @@ impl AgentRuntime for DockerRuntime {
             // Pass input as argument. Note: Shell escaping might be needed if input has special chars.
             // Using list form avoids shell: ["python", ...")
             cmd: Some(vec![
-                "python".to_string(), 
+                "python".to_string(),
                 "/usr/local/bin/aegis-bootstrap".to_string(),
-                input.prompt.clone()
+                input.prompt.clone(),
             ]),
             // env: Some(vec!["PYTHONUNBUFFERED=1".to_string()]), // Commented out to ensure inheritance from container
             ..Default::default()
         };
-        
-        debug!(container_id = container_id, "Exec command: python /usr/local/bin/aegis-bootstrap <prompt>");
 
-        let exec = self.docker.create_exec(container_id, exec_config).await
+        debug!(
+            container_id = container_id,
+            "Exec command: python /usr/local/bin/aegis-bootstrap <prompt>"
+        );
+
+        let exec = self
+            .docker
+            .create_exec(container_id, exec_config)
+            .await
             .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
         let start_opts = StartExecOptions {
@@ -438,41 +492,59 @@ impl AgentRuntime for DockerRuntime {
             ..Default::default()
         };
 
-        let res = self.docker.start_exec(&exec.id, Some(start_opts)).await
+        let res = self
+            .docker
+            .start_exec(&exec.id, Some(start_opts))
+            .await
             .map_err(|e| RuntimeError::ExecutionFailed(e.to_string()))?;
 
         let mut stdout_logs = Vec::new();
         let mut stderr_logs = Vec::new();
-        
-        debug!(container_id = container_id, "Starting bootstrap.py execution");
-        
+
+        debug!(
+            container_id = container_id,
+            "Starting bootstrap.py execution"
+        );
+
         match res {
             StartExecResults::Attached { mut output, .. } => {
                 while let Some(msg) = output.next().await {
                     match msg {
                         Ok(LogOutput::StdOut { message }) => {
                             let content = String::from_utf8_lossy(&message).to_string();
-                            debug!(container_id = container_id, stream = "stdout", "Bootstrap output: {}", content);
+                            debug!(
+                                container_id = container_id,
+                                stream = "stdout",
+                                "Bootstrap output: {}",
+                                content
+                            );
                             stdout_logs.push(content);
-                        },
+                        }
                         Ok(LogOutput::StdErr { message }) => {
                             let content = String::from_utf8_lossy(&message).to_string();
-                            warn!(container_id = container_id, stream = "stderr", "Bootstrap stderr: {}", content);
+                            warn!(
+                                container_id = container_id,
+                                stream = "stderr",
+                                "Bootstrap stderr: {}",
+                                content
+                            );
                             stderr_logs.push(content);
-                        },
+                        }
                         _ => {}
                     }
                 }
-            },
+            }
             _ => {}
         }
 
         // Get exit code from exec
-        let exec_inspect = self.docker.inspect_exec(&exec.id).await
-            .map_err(|e| RuntimeError::ExecutionFailed(format!("Failed to inspect exec: {}", e)))?;
-        
+        let exec_inspect =
+            self.docker.inspect_exec(&exec.id).await.map_err(|e| {
+                RuntimeError::ExecutionFailed(format!("Failed to inspect exec: {}", e))
+            })?;
+
         let exit_code = exec_inspect.exit_code.unwrap_or(0);
-        
+
         debug!(
             container_id = container_id,
             exit_code = exit_code,
@@ -482,7 +554,7 @@ impl AgentRuntime for DockerRuntime {
         );
 
         let result = serde_json::Value::String(stdout_logs.join(""));
-        
+
         Ok(TaskOutput {
             result,
             logs: stderr_logs,
@@ -497,20 +569,31 @@ impl AgentRuntime for DockerRuntime {
             ..Default::default()
         };
 
-        self.docker.remove_container(id.as_str(), Some(options)).await
+        self.docker
+            .remove_container(id.as_str(), Some(options))
+            .await
             .map_err(|e| RuntimeError::TerminationFailed(e.to_string()))?;
-            
+
         info!("Terminated agent container: {}", id.as_str());
         Ok(())
     }
 
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
-        let inspect = self.docker.inspect_container(id.as_str(), None).await
+        let inspect = self
+            .docker
+            .inspect_container(id.as_str(), None)
+            .await
             .map_err(|e| RuntimeError::InstanceNotFound(e.to_string()))?;
-            
-        let state = inspect.state.and_then(|s| s.status).unwrap_or(bollard::models::ContainerStateStatusEnum::DEAD);
-        
-        let (cpu, mem, uptime) = self.get_container_stats(id.as_str()).await.unwrap_or((0.0, 0, 0));
+
+        let state = inspect
+            .state
+            .and_then(|s| s.status)
+            .unwrap_or(bollard::models::ContainerStateStatusEnum::DEAD);
+
+        let (cpu, mem, uptime) = self
+            .get_container_stats(id.as_str())
+            .await
+            .unwrap_or((0.0, 0, 0));
 
         Ok(InstanceStatus {
             id: id.clone(),
@@ -537,68 +620,97 @@ impl DockerRuntime {
             ]),
             ..Default::default()
         };
-        
-        let check_exec = self.docker.create_exec(container_id, check_exists).await
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to check for bootstrap script: {}", e)))?;
-        
+
+        let check_exec = self
+            .docker
+            .create_exec(container_id, check_exists)
+            .await
+            .map_err(|e| {
+                RuntimeError::SpawnFailed(format!("Failed to check for bootstrap script: {}", e))
+            })?;
+
         let start_opts = StartExecOptions {
             detach: false,
             ..Default::default()
         };
-        
+
         // Execute the test command
-        let _ = self.docker.start_exec(&check_exec.id, Some(start_opts)).await;
-        
+        let _ = self
+            .docker
+            .start_exec(&check_exec.id, Some(start_opts))
+            .await;
+
         // Check exit code - 0 means file exists, non-zero means it doesn't
-        let check_inspect = self.docker.inspect_exec(&check_exec.id).await
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to inspect bootstrap check: {}", e)))?;
-        
+        let check_inspect = self
+            .docker
+            .inspect_exec(&check_exec.id)
+            .await
+            .map_err(|e| {
+                RuntimeError::SpawnFailed(format!("Failed to inspect bootstrap check: {}", e))
+            })?;
+
         let exit_code = check_inspect.exit_code.unwrap_or(1);
-        
+
         if exit_code == 0 {
-            debug!(container_id = container_id, "Bootstrap script already exists in container, skipping copy");
+            debug!(
+                container_id = container_id,
+                "Bootstrap script already exists in container, skipping copy"
+            );
             return Ok(());
         }
-        
-        debug!(container_id = container_id, "Bootstrap script not found in container, copying from host");
-        
+
+        debug!(
+            container_id = container_id,
+            "Bootstrap script not found in container, copying from host"
+        );
+
         // Read bootstrap script content
-        let bootstrap_content = std::fs::read(&self.bootstrap_script_path)
-            .map_err(|e| RuntimeError::SpawnFailed(format!(
+        let bootstrap_content = std::fs::read(&self.bootstrap_script_path).map_err(|e| {
+            RuntimeError::SpawnFailed(format!(
                 "Failed to read bootstrap script at {}: {}",
                 self.bootstrap_script_path.display(),
                 e
-            )))?;
-        
+            ))
+        })?;
+
         // Create a tar archive with the bootstrap script
         let mut tar_builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
-        header.set_path("aegis-bootstrap").map_err(|e| 
-            RuntimeError::SpawnFailed(format!("Failed to set tar path: {}", e))
-        )?;
+        header
+            .set_path("aegis-bootstrap")
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to set tar path: {}", e)))?;
         header.set_size(bootstrap_content.len() as u64);
         header.set_mode(0o755); // Make executable
         header.set_cksum();
-        
-        tar_builder.append(&header, bootstrap_content.as_slice())
+
+        tar_builder
+            .append(&header, bootstrap_content.as_slice())
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to create tar: {}", e)))?;
-        
-        let tar_data = tar_builder.into_inner()
+
+        let tar_data = tar_builder
+            .into_inner()
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to finalize tar: {}", e)))?;
-        
+
         // Upload to container at /usr/local/bin/
         let options = UploadToContainerOptions {
             path: "/usr/local/bin/",
             ..Default::default()
         };
-        
-        self.docker.upload_to_container(container_id, Some(options), tar_data.into())
+
+        self.docker
+            .upload_to_container(container_id, Some(options), tar_data.into())
             .await
-            .map_err(|e| RuntimeError::SpawnFailed(format!(
-                "Failed to copy bootstrap script to container: {}", e
-            )))?;
-        
-        debug!(container_id = container_id, "Bootstrap script copied successfully");
+            .map_err(|e| {
+                RuntimeError::SpawnFailed(format!(
+                    "Failed to copy bootstrap script to container: {}",
+                    e
+                ))
+            })?;
+
+        debug!(
+            container_id = container_id,
+            "Bootstrap script copied successfully"
+        );
         Ok(())
     }
 }

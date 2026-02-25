@@ -24,12 +24,12 @@
 //! - **Layer:** Domain Layer
 //! - **Purpose:** Implements internal responsibilities for workflow
 
+use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 use uuid::Uuid;
-use crate::domain::execution::{ExecutionId, ExecutionStatus};
 
 // ============================================================================
 // Value Objects: Identifiers
@@ -78,7 +78,9 @@ impl StateName {
     pub fn new(name: impl Into<String>) -> Result<Self, WorkflowError> {
         let name = name.into();
         if name.is_empty() {
-            return Err(WorkflowError::InvalidStateName("State name cannot be empty".to_string()));
+            return Err(WorkflowError::InvalidStateName(
+                "State name cannot be empty".to_string(),
+            ));
         }
         Ok(Self(name))
     }
@@ -439,10 +441,16 @@ impl ConfidenceWeighting {
             ));
         }
         if self.agreement_factor < 0.0 || self.agreement_factor > 1.0 {
-            return Err(format!("Agreement factor must be between 0.0 and 1.0, got {}", self.agreement_factor));
+            return Err(format!(
+                "Agreement factor must be between 0.0 and 1.0, got {}",
+                self.agreement_factor
+            ));
         }
         if self.self_confidence_factor < 0.0 || self.self_confidence_factor > 1.0 {
-            return Err(format!("Self-confidence factor must be between 0.0 and 1.0, got {}", self.self_confidence_factor));
+            return Err(format!(
+                "Self-confidence factor must be between 0.0 and 1.0, got {}",
+                self.self_confidence_factor
+            ));
         }
         Ok(())
     }
@@ -523,10 +531,7 @@ pub enum TransitionCondition {
     ConfidenceAbove { threshold: f64 },
 
     /// Consensus reached (for ParallelAgents)
-    Consensus {
-        threshold: f64,
-        agreement: f64,
-    },
+    Consensus { threshold: f64, agreement: f64 },
 
     /// All parallel agents approved
     AllApproved,
@@ -834,13 +839,13 @@ mod tests {
     #[test]
     fn test_blackboard_operations() {
         let mut blackboard = Blackboard::new();
-        
+
         blackboard.set("iteration", serde_json::json!(1));
         assert_eq!(blackboard.get("iteration"), Some(&serde_json::json!(1)));
-        
+
         blackboard.set("iteration", serde_json::json!(2));
         assert_eq!(blackboard.get("iteration"), Some(&serde_json::json!(2)));
-        
+
         blackboard.remove("iteration");
         assert_eq!(blackboard.get("iteration"), None);
     }

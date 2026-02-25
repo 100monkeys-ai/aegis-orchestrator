@@ -35,28 +35,38 @@
 //! replaced the in-process FSM executor. The TypeScript `aegis_workflow` worker function
 //! drives all FSM execution; Rust interacts with it exclusively via gRPC (`TemporalClient`).
 
-pub mod lifecycle;
 pub mod agent;
 pub mod attestation_service;
-pub mod tool_invocation_service;
 pub mod execution;
+pub mod lifecycle;
+pub mod tool_invocation_service;
 pub mod validation_service;
 
 pub mod policy;
 // pub mod workflow_engine; Removed during Temporal integration
-pub mod temporal_mapper;
-pub mod register_workflow;
-pub mod start_workflow_execution;
 pub mod complete_workflow_execution;
-pub mod volume_manager;
-pub mod nfs_gateway;
-pub mod storage_event_persister;
-pub mod repository_factory;
 pub mod inner_loop_service;
+pub mod nfs_gateway;
+pub mod register_workflow;
+pub mod repository_factory;
+pub mod start_workflow_execution;
 pub mod stimulus;
+pub mod storage_event_persister;
+pub mod temporal_mapper;
+pub mod volume_manager;
 
 // Re-export use cases for convenience
-pub use register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase, RegisteredWorkflow};
-pub use start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest, StartedWorkflowExecution};
-pub use complete_workflow_execution::{CompleteWorkflowExecutionUseCase, StandardCompleteWorkflowExecutionUseCase, CompleteWorkflowExecutionRequest, CompletedWorkflowExecution};
-pub use stimulus::{StimulusService, StandardStimulusService, StimulusIngestResponse, StimulusError};
+pub use complete_workflow_execution::{
+    CompleteWorkflowExecutionRequest, CompleteWorkflowExecutionUseCase, CompletedWorkflowExecution,
+    StandardCompleteWorkflowExecutionUseCase,
+};
+pub use register_workflow::{
+    RegisterWorkflowUseCase, RegisteredWorkflow, StandardRegisterWorkflowUseCase,
+};
+pub use start_workflow_execution::{
+    StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
+    StartWorkflowExecutionUseCase, StartedWorkflowExecution,
+};
+pub use stimulus::{
+    StandardStimulusService, StimulusError, StimulusIngestResponse, StimulusService,
+};

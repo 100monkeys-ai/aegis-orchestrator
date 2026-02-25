@@ -35,14 +35,14 @@
 //!
 //! See ADR-035 for the full threat model and protocol specification.
 pub mod attestation;
+pub mod audit;
 pub mod envelope;
 pub mod middleware;
 pub mod policy_engine;
-pub mod signature;
-pub mod audit;
 pub mod session_repository;
+pub mod signature;
 
 pub use attestation::{AttestationRequest, AttestationResponse, AttestationService};
-pub use envelope::{SmcpEnvelope, ContextClaims, AudienceClaim};
+pub use envelope::{AudienceClaim, ContextClaims, SmcpEnvelope};
 pub use middleware::SmcpMiddleware;
 pub use policy_engine::PolicyEngine;

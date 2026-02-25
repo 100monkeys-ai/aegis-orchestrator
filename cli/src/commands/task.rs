@@ -25,7 +25,6 @@ use crate::embedded::EmbeddedExecutor;
 pub enum TaskCommand {
     /// Deploy an agent from manifest file
 
-
     /// Execute an agent task
     Execute {
         /// Agent ID or manifest path
@@ -80,7 +79,6 @@ pub enum TaskCommand {
         /// Force kill without graceful shutdown
         #[arg(short, long)]
         force: bool,
-
     },
 
     /// Remove an execution
@@ -110,9 +108,12 @@ pub async fn handle_command(
 ) -> Result<()> {
     // Detect if daemon is running
     let daemon_status = check_daemon_running(host, port).await;
-    
+
     if let Ok(DaemonStatus::Unhealthy { pid, error }) = &daemon_status {
-        println!("{}", format!("⚠ Daemon found (PID: {}) but unhealthy: {}", pid, error).yellow());
+        println!(
+            "{}",
+            format!("⚠ Daemon found (PID: {}) but unhealthy: {}", pid, error).yellow()
+        );
         println!("Falling back to embedded mode.");
     }
 
@@ -134,12 +135,11 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
     // DaemonClient likely accepts Uuid and converts internally or expects string.
     // For now, assuming DaemonClient still uses Uuid in method signatures, which might fail compilation.
     // I should check client.rs but for now I'll fix the embedded path first.
-    
+
     // Actually, to make this file compile, I must ensure calls match definitions.
     // Assuming DaemonClient methods define Uuid, I'll pass Uuid.
-    
-    match command {
 
+    match command {
         TaskCommand::Execute {
             agent,
             input,
@@ -164,7 +164,6 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
 
 async fn handle_command_embedded(command: TaskCommand, executor: EmbeddedExecutor) -> Result<()> {
     match command {
-
         TaskCommand::Execute {
             agent,
             input,
@@ -209,16 +208,16 @@ async fn execute_daemon(
             if manifest_path.exists() {
                 let manifest_content = std::fs::read_to_string(&manifest_path)
                     .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
-                
+
                 let agent_manifest: aegis_sdk::AgentManifest =
                     serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
-                
+
                 // Deploy (will fail if name exists, so user sees error, which is good)
                 match client.deploy_agent(agent_manifest).await {
                     Ok(id) => id,
                     Err(e) => {
-                         // Simplify error for user
-                         anyhow::bail!("Failed to deploy manifest: {}", e);
+                        // Simplify error for user
+                        anyhow::bail!("Failed to deploy manifest: {}", e);
                     }
                 }
             } else {
@@ -321,7 +320,7 @@ async fn execute_embedded(
     let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent) {
         AgentId(uuid)
     } else {
-         // Try lookup by name
+        // Try lookup by name
         if let Ok(Some(id)) = executor.lookup_agent(&agent).await {
             id
         } else {
@@ -380,7 +379,11 @@ async fn logs_embedded(
     Ok(())
 }
 
-async fn cancel_embedded(execution_id: Uuid, _force: bool, executor: EmbeddedExecutor) -> Result<()> {
+async fn cancel_embedded(
+    execution_id: Uuid,
+    _force: bool,
+    executor: EmbeddedExecutor,
+) -> Result<()> {
     executor.cancel_execution(ExecutionId(execution_id)).await?;
     println!(
         "{}",
@@ -394,7 +397,9 @@ async fn list_embedded(
     limit: usize,
     executor: EmbeddedExecutor,
 ) -> Result<()> {
-    let executions = executor.list_executions(agent_id.map(AgentId), limit).await?;
+    let executions = executor
+        .list_executions(agent_id.map(AgentId), limit)
+        .await?;
 
     if executions.is_empty() {
         println!("{}", "No executions found".yellow());

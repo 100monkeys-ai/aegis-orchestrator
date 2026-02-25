@@ -29,7 +29,7 @@
 //!
 //! See AGENTS.md §Swarm, AGENTS.md §BC-6.
 
-pub mod domain;
 pub mod application;
+pub mod domain;
 
 pub use domain::*;

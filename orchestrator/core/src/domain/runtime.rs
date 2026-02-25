@@ -24,12 +24,12 @@
 //!
 //! See Also: ADR-027 (Docker Runtime), ADR-036 (NFS Server Gateway)
 
+use crate::domain::volume::VolumeMount;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use thiserror::Error;
-use chrono::{DateTime, Utc};
-use crate::domain::volume::VolumeMount;
 
 /// Configuration for spawning an isolated agent runtime instance.
 ///
@@ -119,7 +119,7 @@ impl RuntimeConfig {
             _ => format!("{}:{}", self.language, self.version),
         }
     }
-    
+
     /// Validate that the requested isolation mode is supported in the current phase.
     ///
     /// # Errors
@@ -130,14 +130,16 @@ impl RuntimeConfig {
         match self.isolation.as_str() {
             "docker" | "inherit" => Ok(()),
             "firecracker" => Err(RuntimeError::SpawnFailed(
-                "Firecracker isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string()
+                "Firecracker isolation is not yet implemented. Use 'docker' or 'inherit'."
+                    .to_string(),
             )),
             "process" => Err(RuntimeError::SpawnFailed(
-                "Process isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string()
+                "Process isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string(),
             )),
-            other => Err(RuntimeError::SpawnFailed(
-                format!("Unknown isolation mode '{}'. Supported: docker, inherit", other)
-            )),
+            other => Err(RuntimeError::SpawnFailed(format!(
+                "Unknown isolation mode '{}'. Supported: docker, inherit",
+                other
+            ))),
         }
     }
 }

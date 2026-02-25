@@ -20,10 +20,10 @@
 //! - **Purpose:** Implements internal responsibilities for storage event persister
 
 use crate::domain::repository::StorageEventRepository;
-use crate::infrastructure::event_bus::{EventBus, DomainEvent};
+use crate::infrastructure::event_bus::{DomainEvent, EventBus};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tracing::{info, error, warn, debug};
+use tracing::{debug, error, info, warn};
 
 // ============================================================================
 // Service
@@ -40,10 +40,7 @@ pub struct StorageEventPersister {
 
 impl StorageEventPersister {
     /// Create new persister with repository and event bus
-    pub fn new(
-        repository: Arc<dyn StorageEventRepository>,
-        event_bus: Arc<EventBus>,
-    ) -> Self {
+    pub fn new(repository: Arc<dyn StorageEventRepository>, event_bus: Arc<EventBus>) -> Self {
         Self {
             repository,
             event_bus,
@@ -68,13 +65,12 @@ impl StorageEventPersister {
                 match receiver.recv().await {
                     Ok(DomainEvent::Storage(storage_event)) => {
                         events_processed += 1;
-                        
+
                         // Log every 100 events for observability
                         if events_processed % 100 == 0 {
                             debug!(
                                 "Storage event persister processed {} events ({} errors)",
-                                events_processed,
-                                errors_encountered
+                                events_processed, errors_encountered
                             );
                         }
 
@@ -86,7 +82,7 @@ impl StorageEventPersister {
                                 error = ?e,
                                 "Failed to persist storage event to database"
                             );
-                            
+
                             // Log warning every 10 errors to avoid spam
                             if errors_encountered % 10 == 0 {
                                 warn!(
@@ -106,8 +102,7 @@ impl StorageEventPersister {
                                 info!(
                                     "Event bus closed, shutting down storage event persister \
                                      (processed {} events, {} errors)",
-                                    events_processed,
-                                    errors_encountered
+                                    events_processed, errors_encountered
                                 );
                                 break;
                             }
@@ -134,8 +129,7 @@ impl StorageEventPersister {
             info!(
                 "Storage event persister shut down gracefully \
                  (processed {} events, {} errors)",
-                events_processed,
-                errors_encountered
+                events_processed, errors_encountered
             );
         })
     }
@@ -189,13 +183,18 @@ mod tests {
 
         // Assert: Event was persisted
         let StorageEvent::FileOpened { volume_id, .. } = &event else {
-            panic!("Test setup error: expected FileOpened event, got {:?}", event);
+            panic!(
+                "Test setup error: expected FileOpened event, got {:?}",
+                event
+            );
         };
         let volume_id = *volume_id;
-        let persisted_events = repository.find_by_volume(
-            volume_id,
-            None, // No limit
-        ).await.unwrap();
+        let persisted_events = repository
+            .find_by_volume(
+                volume_id, None, // No limit
+            )
+            .await
+            .unwrap();
 
         assert_eq!(persisted_events.len(), 1);
     }

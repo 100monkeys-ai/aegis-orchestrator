@@ -9,11 +9,14 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{State, Path},
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::{
+        sse::{Event, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
-    http::{StatusCode, HeaderMap},
-    response::{IntoResponse, sse::{Event, Sse}},
 };
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
@@ -25,25 +28,31 @@ use uuid::Uuid;
 
 use aegis_core::{
     application::{
-        execution::StandardExecutionService, execution::ExecutionService,
-        lifecycle::StandardAgentLifecycleService, agent::AgentLifecycleService,
-        validation_service::ValidationService,
+        agent::AgentLifecycleService,
+        execution::ExecutionService,
+        execution::StandardExecutionService,
+        lifecycle::StandardAgentLifecycleService,
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
-        start_workflow_execution::{StartWorkflowExecutionUseCase, StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest},
+        start_workflow_execution::{
+            StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
+            StartWorkflowExecutionUseCase,
+        },
+        validation_service::ValidationService,
     },
     domain::{
-        node_config::{NodeConfigManifest, resolve_env_value},
         agent::AgentId,
         execution::ExecutionId,
         execution::ExecutionInput,
-        supervisor::Supervisor,
+        node_config::{resolve_env_value, NodeConfigManifest},
         repository::AgentRepository,
+        supervisor::Supervisor,
     },
     infrastructure::{
         event_bus::EventBus,
         llm::registry::ProviderRegistry,
         repositories::{
-            InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryWorkflowExecutionRepository
+            InMemoryAgentRepository, InMemoryExecutionRepository,
+            InMemoryWorkflowExecutionRepository,
         },
         runtime::DockerRuntime,
         temporal_client::TemporalClient,
@@ -76,8 +85,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Load configuration
     println!("Loading configuration...");
-    let config = NodeConfigManifest::load_or_default(config_path)
-        .context("Failed to load configuration")?;
+    let config =
+        NodeConfigManifest::load_or_default(config_path).context("Failed to load configuration")?;
 
     config
         .validate()
@@ -92,36 +101,47 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Configuration loaded. Initializing services...");
 
     // Initialize repositories — resolve database URL from config (spec.database)
-    let database_url: Option<String> = config.spec.database.as_ref().and_then(|db| {
-        match resolve_env_value(&db.url) {
-            Ok(url) => Some(url),
-            Err(e) => {
-                tracing::warn!("Failed to resolve database URL: {}. Falling back to InMemory.", e);
-                None
-            }
-        }
-    });
-    let db_max_connections: u32 = config.spec.database.as_ref()
+    let database_url: Option<String> =
+        config
+            .spec
+            .database
+            .as_ref()
+            .and_then(|db| match resolve_env_value(&db.url) {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to resolve database URL: {}. Falling back to InMemory.",
+                        e
+                    );
+                    None
+                }
+            });
+    let db_max_connections: u32 = config
+        .spec
+        .database
+        .as_ref()
         .map(|db| db.max_connections)
         .unwrap_or(5);
-    
+
     // Store pool separately for later volume repo initialization
     let pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
         println!("Initializing repositories with PostgreSQL: {}", url);
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(db_max_connections)
             .connect(url)
-            .await 
+            .await
         {
             Ok(pool) => {
                 println!("Connected to PostgreSQL.");
-                
+
                 // Check migration status
                 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-                
+
                 let total_known = MIGRATOR.iter().count();
                 if total_known == 0 {
-                    return Err(anyhow::anyhow!("CRITICAL: No migrations found in binary! Check build process."));
+                    return Err(anyhow::anyhow!(
+                        "CRITICAL: No migrations found in binary! Check build process."
+                    ));
                 }
 
                 // Check applied migrations
@@ -134,7 +154,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     Err(_) => 0,
                 };
 
-                println!("INFO: Database has {}/{} applied migrations.", applied_count, total_known);
+                println!(
+                    "INFO: Database has {}/{} applied migrations.",
+                    applied_count, total_known
+                );
 
                 if applied_count < total_known {
                     println!("Applying pending migrations...");
@@ -147,12 +170,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 } else {
                     println!("INFO: Database is up to date.");
                 }
-                
+
                 Some(pool)
-            },
+            }
             Err(e) => {
-                tracing::error!("Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
-                println!("ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.", e);
+                tracing::error!(
+                    "Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
+                    e
+                );
+                println!(
+                    "ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
+                    e
+                );
                 None
             }
         }
@@ -160,12 +189,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         println!("No database configured (spec.database omitted). Using InMemory repositories.");
         None
     };
-    
+
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): (
         Arc<dyn AgentRepository>,
         Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
         Arc<dyn aegis_core::domain::repository::ExecutionRepository>,
-        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>
+        Arc<dyn aegis_core::domain::repository::WorkflowExecutionRepository>,
     ) = if let Some(pool) = pool.as_ref() {
         (
             Arc::new(aegis_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
@@ -181,24 +210,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(InMemoryWorkflowExecutionRepository::new()),
         )
     };
-    
+
     let event_bus = Arc::new(EventBus::new(100));
-    
+
     println!("Initializing LLM registry...");
     let llm_registry = Arc::new(
-        ProviderRegistry::from_config(&config)
-            .context("Failed to initialize LLM providers")?,
+        ProviderRegistry::from_config(&config).context("Failed to initialize LLM providers")?,
     );
 
     println!("Initializing Docker runtime...");
-    
+
     // Resolve orchestrator URL (supports env:VAR_NAME syntax via resolve_env_value)
-    let orchestrator_url = resolve_env_value(&config.spec.runtime.orchestrator_url)
-        .unwrap_or_else(|e| {
+    let orchestrator_url =
+        resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
             "http://localhost:8000".to_string()
         });
-    
+
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
     // Note: The Docker daemon relies on this to mount volumes from the host environment.
     let nfs_server_host = config.spec.runtime.nfs_server_host.as_ref().and_then(|host| {
@@ -211,19 +239,25 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     });
-    
+
     // Resolve Docker network mode (supports env:VAR_NAME syntax)
-    let network_mode = config.spec.runtime.docker_network_mode.as_ref().and_then(|nm| {
-        match resolve_env_value(nm) {
+    let network_mode = config
+        .spec
+        .runtime
+        .docker_network_mode
+        .as_ref()
+        .and_then(|nm| match resolve_env_value(nm) {
             Ok(resolved) if !resolved.is_empty() => Some(resolved),
             Ok(_) => None,
             Err(e) => {
-                tracing::debug!("Failed to resolve Docker network mode: {}. Using no explicit Docker network.", e);
+                tracing::debug!(
+                    "Failed to resolve Docker network mode: {}. Using no explicit Docker network.",
+                    e
+                );
                 None
             }
-        }
-    });
-    
+        });
+
     let runtime = Arc::new(
         DockerRuntime::new(
             config.spec.runtime.bootstrap_script.clone(),
@@ -234,56 +268,71 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             config.spec.runtime.nfs_port,
             config.spec.runtime.nfs_mountport,
         )
-        .context("Failed to initialize Docker runtime")?
+        .context("Failed to initialize Docker runtime")?,
     );
-    
+
     // Only healthcheck Docker if it's the configured isolation mode
     if config.spec.runtime.default_isolation == "docker" {
         runtime.healthcheck().await
             .context("Docker healthcheck failed. Docker isolation is configured but Docker daemon is not accessible.")?;
         println!("✓ Docker runtime connected and healthy.");
     } else {
-        println!("Docker runtime initialized (healthcheck skipped - isolation mode: {}).", 
-                 config.spec.runtime.default_isolation);
+        println!(
+            "Docker runtime initialized (healthcheck skipped - isolation mode: {}).",
+            config.spec.runtime.default_isolation
+        );
     }
 
     let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
     // Initialize volume service (with SeaweedFS or fallback to local)
     println!("Initializing volume service...");
-    let storage_config = config.spec.storage.as_ref()
+    let storage_config = config
+        .spec
+        .storage
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("Storage configuration not found in node config"))?;
-    
+
     let filer_url = if storage_config.backend == "seaweedfs" {
-        storage_config.seaweedfs.as_ref()
+        storage_config
+            .seaweedfs
+            .as_ref()
             .map(|s| s.filer_url.clone())
             .unwrap_or_else(|| "http://localhost:8888".to_string())
     } else {
         "http://localhost:8888".to_string() // Fallback even for local mode
     };
-    
+
     // Reuse existing pool for volume repository (avoid redundant connection)
-    let volume_repo: Arc<dyn aegis_core::domain::repository::VolumeRepository> = if let Some(pool) = pool.as_ref() {
+    let volume_repo: Arc<dyn aegis_core::domain::repository::VolumeRepository> = if let Some(pool) =
+        pool.as_ref()
+    {
         Arc::new(aegis_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
     } else {
         println!("WARNING: Volume persistence disabled (no database pool available)");
-        return Err(anyhow::anyhow!("Database connection required for volume management"));
+        return Err(anyhow::anyhow!(
+            "Database connection required for volume management"
+        ));
     };
-    
-    let storage_provider: Arc<dyn aegis_core::domain::storage::StorageProvider> = 
-        Arc::new(aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()));
-    
-    let volume_service = Arc::new(aegis_core::application::volume_manager::StandardVolumeService::new(
-        volume_repo.clone(),
-        storage_provider.clone(),
-        event_bus.clone(),
-        filer_url,
-    )?);
-    
-    println!("✓ Volume service initialized (mode: {}, fallback: {})", 
-             storage_config.backend, 
-             storage_config.fallback_to_local);
-    
+
+    let storage_provider: Arc<dyn aegis_core::domain::storage::StorageProvider> = Arc::new(
+        aegis_core::infrastructure::storage::SeaweedFSAdapter::new(filer_url.clone()),
+    );
+
+    let volume_service = Arc::new(
+        aegis_core::application::volume_manager::StandardVolumeService::new(
+            volume_repo.clone(),
+            storage_provider.clone(),
+            event_bus.clone(),
+            filer_url,
+        )?,
+    );
+
+    println!(
+        "✓ Volume service initialized (mode: {}, fallback: {})",
+        storage_config.backend, storage_config.fallback_to_local
+    );
+
     // Spawn TTL cleanup background task for ephemeral volumes
     let volume_service_cleanup = volume_service.clone();
     tokio::spawn(async move {
@@ -307,59 +356,77 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
     println!("Initializing Storage Event Persister...");
-    let storage_event_repo: Arc<dyn aegis_core::domain::repository::StorageEventRepository> = if let Some(pool) = pool.as_ref() {
-        Arc::new(aegis_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
-    } else {
-        println!("WARNING: Storage event persistence disabled (no database pool available)");
-        Arc::new(aegis_core::infrastructure::repositories::InMemoryStorageEventRepository::new())
-    };
-    
-    let storage_event_persister = Arc::new(aegis_core::application::storage_event_persister::StorageEventPersister::new(
-        storage_event_repo,
-        event_bus.clone(),
-    ));
-    
+    let storage_event_repo: Arc<dyn aegis_core::domain::repository::StorageEventRepository> =
+        if let Some(pool) = pool.as_ref() {
+            Arc::new(aegis_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+        } else {
+            println!("WARNING: Storage event persistence disabled (no database pool available)");
+            Arc::new(
+                aegis_core::infrastructure::repositories::InMemoryStorageEventRepository::new(),
+            )
+        };
+
+    let storage_event_persister = Arc::new(
+        aegis_core::application::storage_event_persister::StorageEventPersister::new(
+            storage_event_repo,
+            event_bus.clone(),
+        ),
+    );
+
     // Start background task for event persistence
     let _persister_handle = storage_event_persister.start();
     println!("✓ Storage Event Persister started (audit trail enabled)");
 
     // Initialize NFS Server Gateway (ADR-036)
     println!("Initializing NFS Server Gateway...");
-    let nfs_bind_port = config.spec.storage.as_ref()
+    let nfs_bind_port = config
+        .spec
+        .storage
+        .as_ref()
         .and_then(|s| s.nfs_port)
         .unwrap_or(2049);
-    
+
     // Wrap EventBus in EventBusPublisher adapter for FSAL
-    let event_publisher = Arc::new(aegis_core::application::nfs_gateway::EventBusPublisher::new(
-        event_bus.clone()
-    ));
-    
-    let nfs_gateway = Arc::new(aegis_core::application::nfs_gateway::NfsGatewayService::new(
-        storage_provider,
-        volume_repo,
-        event_publisher,
-        Some(nfs_bind_port),
-    ));
-    
+    let event_publisher =
+        Arc::new(aegis_core::application::nfs_gateway::EventBusPublisher::new(event_bus.clone()));
+
+    let nfs_gateway = Arc::new(
+        aegis_core::application::nfs_gateway::NfsGatewayService::new(
+            storage_provider,
+            volume_repo,
+            event_publisher,
+            Some(nfs_bind_port),
+        ),
+    );
+
     // Start NFS server and await successful startup before continuing
     if let Err(e) = nfs_gateway.start_server().await {
-        tracing::error!("CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.", e);
+        tracing::error!(
+            "CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.",
+            e
+        );
         // Log to stderr to ensure visibility
         eprintln!("FATAL: NFS Server Gateway failed: {}", e);
         // Allow shutdown of daemon via signal
         std::process::exit(1);
     }
-    println!("✓ NFS Server Gateway started on port {} (ADR-036)", nfs_bind_port);
+    println!(
+        "✓ NFS Server Gateway started on port {} (ADR-036)",
+        nfs_bind_port
+    );
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
-    let execution_service = Arc::new(StandardExecutionService::new(
-        agent_service.clone(),
-        volume_service.clone(),
-        supervisor,
-        execution_repo.clone(),
-        event_bus.clone(),
-        Arc::new(config.clone()),
-    ).with_nfs_gateway(nfs_gateway.clone()));
+    let execution_service = Arc::new(
+        StandardExecutionService::new(
+            agent_service.clone(),
+            volume_service.clone(),
+            supervisor,
+            execution_repo.clone(),
+            event_bus.clone(),
+            Arc::new(config.clone()),
+        )
+        .with_nfs_gateway(nfs_gateway.clone()),
+    );
 
     // ADR-036: Event-driven NFS volume deregistration (security requirement)
     // Listen for VolumeExpired and VolumeDeleted events and immediately remove
@@ -374,13 +441,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 match nfs_deregister_sub.recv().await {
                     Ok(aegis_core::infrastructure::event_bus::DomainEvent::Volume(vol_event)) => {
                         let volume_id = match &vol_event {
-                            aegis_core::domain::events::VolumeEvent::VolumeExpired { volume_id, .. } => Some(*volume_id),
-                            aegis_core::domain::events::VolumeEvent::VolumeDeleted { volume_id, .. } => Some(*volume_id),
+                            aegis_core::domain::events::VolumeEvent::VolumeExpired {
+                                volume_id,
+                                ..
+                            } => Some(*volume_id),
+                            aegis_core::domain::events::VolumeEvent::VolumeDeleted {
+                                volume_id,
+                                ..
+                            } => Some(*volume_id),
                             _ => None,
                         };
                         if let Some(vid) = volume_id {
                             nfs_deregister_gateway.deregister_volume(vid);
-                            tracing::info!("NFS: Deregistered volume {} from gateway (volume expired/deleted)", vid);
+                            tracing::info!(
+                                "NFS: Deregistered volume {} from gateway (volume expired/deleted)",
+                                vid
+                            );
                         }
                     }
                     Ok(_) => {} // Ignore non-volume events
@@ -388,7 +464,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         tracing::warn!("NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed", n);
                     }
                     Err(aegis_core::infrastructure::event_bus::EventBusError::Closed) => {
-                        tracing::info!("NFS deregistration listener: event bus closed, shutting down");
+                        tracing::info!(
+                            "NFS deregistration listener: event bus closed, shutting down"
+                        );
                         break;
                     }
                     Err(_) => {}
@@ -399,38 +477,48 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     println!("Initializing workflow engine...");
-    
+
     // Initialize Temporal Client — read from config (spec.temporal)
     let temporal_config = config.spec.temporal.clone().unwrap_or_default();
-    let temporal_address = resolve_env_value(&temporal_config.address)
-        .unwrap_or_else(|_| "temporal:7233".to_string());
+    let temporal_address =
+        resolve_env_value(&temporal_config.address).unwrap_or_else(|_| "temporal:7233".to_string());
     let worker_http_endpoint = resolve_env_value(&temporal_config.worker_http_endpoint)
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
-    println!("Initializing Temporal Client (Address: {})...", temporal_address);
-    
+    println!(
+        "Initializing Temporal Client (Address: {})...",
+        temporal_address
+    );
+
     // Create a shared container for the client that relies on interior mutability
     let temporal_client_container = Arc::new(tokio::sync::RwLock::new(None));
     let temporal_client_container_clone = temporal_client_container.clone();
-    
+
     // Clone for async task
     let temporal_address_clone = temporal_address.clone();
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
-    
+
     // Spawn background task to connect
     tokio::spawn(async move {
         let mut retries = 0;
         let max_retries = 30; // Try for 1 minute (2s * 30) or indefinitely? User said "eventually timeout/quit trying"
-        
+
         loop {
-            match TemporalClient::new(&temporal_address_clone, &temporal_namespace, &temporal_task_queue, &worker_http_endpoint_clone).await {
+            match TemporalClient::new(
+                &temporal_address_clone,
+                &temporal_namespace,
+                &temporal_task_queue,
+                &worker_http_endpoint_clone,
+            )
+            .await
+            {
                 Ok(client) => {
                     println!("Async: Temporal Client connected successfully.");
                     let mut lock = temporal_client_container_clone.write().await;
                     *lock = Some(Arc::new(client));
                     break;
-                },
+                }
                 Err(e) => {
                     retries += 1;
                     if retries >= max_retries {
@@ -438,33 +526,38 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         tracing::error!("Async: Failed to connect to Temporal: {}. Giving up.", e);
                         break;
                     }
-                    
+
                     if retries % 5 == 0 {
-                        println!("Async INFO: Still verifying Temporal connection... ({}/{})", retries, max_retries);
+                        println!(
+                            "Async INFO: Still verifying Temporal connection... ({}/{})",
+                            retries, max_retries
+                        );
                     }
-                    tracing::debug!("Async: Failed to connect to Temporal: {}. Retrying in 2s...", e);
+                    tracing::debug!(
+                        "Async: Failed to connect to Temporal: {}. Retrying in 2s...",
+                        e
+                    );
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
         }
     });
-    
+
     let validation_service = Arc::new(ValidationService::new(
-        event_bus.clone(), 
+        event_bus.clone(),
         execution_service.clone(),
     ));
-    
+
     // Create human input service
     let human_input_service = Arc::new(aegis_core::infrastructure::HumanInputService::new());
-    
-    // Legacy WorkflowEngine removed as part of Temporal migration
 
+    // Legacy WorkflowEngine removed as part of Temporal migration
 
     let temporal_event_listener = Arc::new(TemporalEventListener::new(
         event_bus.clone(),
         workflow_execution_repo.clone(),
     ));
-    
+
     println!("Temporal event listener initialized.");
 
     let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
@@ -482,14 +575,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // --- Initialize SMCP / Tool Routing Services ---
     println!("Initializing SMCP & Tool Routing services...");
-    
+
     // Repositories
-    let security_context_repo: Arc<dyn aegis_core::domain::security_context::repository::SecurityContextRepository> = 
-        Arc::new(aegis_core::infrastructure::security_context::InMemorySecurityContextRepository::new());
-        
-    let smcp_session_repo: Arc<dyn aegis_core::domain::smcp_session_repository::SmcpSessionRepository> = 
-        Arc::new(aegis_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new());
-        
+    let security_context_repo: Arc<
+        dyn aegis_core::domain::security_context::repository::SecurityContextRepository,
+    > = Arc::new(
+        aegis_core::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+    );
+
+    let smcp_session_repo: Arc<
+        dyn aegis_core::domain::smcp_session_repository::SmcpSessionRepository,
+    > = Arc::new(
+        aegis_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new(),
+    );
+
     // Token Issuer (using env var for security; falls back to dev key for local dev)
     // WARNING: The fallback key is for local development only - never use in production!
     // Set AEGIS_SMCP_PRIVATE_KEY environment variable in production deployments
@@ -498,22 +597,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         // Dev-only fallback key (ADR-035/ADR-034 delay for OpenBao integration)
         "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----".to_string()
     });
-    let token_issuer = Arc::new(aegis_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(&private_key, "aegis-orchestrator").unwrap());
-    
+    let token_issuer = Arc::new(
+        aegis_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
+            &private_key,
+            "aegis-orchestrator",
+        )
+        .unwrap(),
+    );
+
     // Application Services
-    let attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService> = 
-        Arc::new(aegis_core::application::attestation_service::AttestationServiceImpl::new(
+    let attestation_service: Arc<
+        dyn aegis_core::infrastructure::smcp::attestation::AttestationService,
+    > = Arc::new(
+        aegis_core::application::attestation_service::AttestationServiceImpl::new(
             security_context_repo.clone(),
             smcp_session_repo.clone(),
             token_issuer,
-        ));
-        
-    let smcp_middleware = Arc::new(aegis_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
-    let tool_registry = Arc::new(aegis_core::infrastructure::tool_router::InMemoryToolRegistry::new());
-    
+        ),
+    );
+
+    let smcp_middleware =
+        Arc::new(aegis_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
+    let tool_registry =
+        Arc::new(aegis_core::infrastructure::tool_router::InMemoryToolRegistry::new());
+
     // Shared tool servers state
     let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-    
+
     // Load configured servers from NodeConfig
     if let Some(mcp_configs) = &config.spec.mcp_servers {
         let mut servers_lock = tool_servers.write().await;
@@ -524,21 +634,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     }
-    
+
     let tool_router = Arc::new(aegis_core::infrastructure::tool_router::ToolRouter::new(
         tool_registry.clone(),
-        tool_servers.clone()
+        tool_servers.clone(),
     ));
-    
+
     // Build initial capabilities index
     tool_router.rebuild_index().await;
-    
-    let tool_manager = Arc::new(aegis_core::infrastructure::tool_router::ToolServerManager::new(
-        tool_registry,
-        tool_servers.clone(),
-        event_bus.clone()
-    ));
-    
+
+    let tool_manager = Arc::new(
+        aegis_core::infrastructure::tool_router::ToolServerManager::new(
+            tool_registry,
+            tool_servers.clone(),
+            event_bus.clone(),
+        ),
+    );
+
     // Start MCP servers and spawn health check loop
     let tool_manager_clone = tool_manager.clone();
     tokio::spawn(async move {
@@ -547,18 +659,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
         tool_manager_clone.health_check_loop().await;
     });
-    
-    let tool_invocation_service = Arc::new(aegis_core::application::tool_invocation_service::ToolInvocationService::new(
-        smcp_session_repo.clone(),
-        smcp_middleware,
-        tool_router,
-    ));
+
+    let tool_invocation_service = Arc::new(
+        aegis_core::application::tool_invocation_service::ToolInvocationService::new(
+            smcp_session_repo.clone(),
+            smcp_middleware,
+            tool_router,
+        ),
+    );
 
     let inner_loop_service = Arc::new(
         aegis_core::application::inner_loop_service::InnerLoopService::new(
             tool_invocation_service.clone(),
             llm_registry,
-        )
+        ),
     );
 
     let app_state = AppState {
@@ -588,9 +702,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     } else {
         "0.0.0.0".to_string()
     };
-    
+
     // Config port takes precedence over CLI default if we consider config the source of truth for the node.
-    // However, start_daemon receives `port`. 
+    // However, start_daemon receives `port`.
     // Let's use the config port if network config is present, otherwise use the passed port.
     let final_port = if let Some(network) = &config.spec.network {
         network.port
@@ -606,7 +720,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     let grpc_addr_str = format!("{}:{}", bind_addr, grpc_port);
-    let grpc_addr: std::net::SocketAddr = grpc_addr_str.parse()
+    let grpc_addr: std::net::SocketAddr = grpc_addr_str
+        .parse()
         .with_context(|| format!("Failed to parse gRPC address: {}", grpc_addr_str))?;
 
     // Tool routing services moved above AppState!
@@ -626,7 +741,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         domain_allowlist: None,
                         rate_limit: None,
                         max_response_size: None,
-                    }
+                    },
                 ],
                 deny_list: vec![],
                 metadata: aegis_core::domain::security_context::SecurityContextMetadata {
@@ -641,7 +756,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Connect to the standalone Cortex service if configured (ADR-042).
     // Absence of spec.cortex.grpc_url means memoryless mode — no error, no retry.
-    let cortex_grpc_url: Option<String> = config.spec.cortex.as_ref()
+    let cortex_grpc_url: Option<String> = config
+        .spec
+        .cortex
+        .as_ref()
         .and_then(|c| c.grpc_url.as_ref())
         .and_then(|url| resolve_env_value(url).ok());
     let cortex_client: Option<std::sync::Arc<aegis_core::infrastructure::CortexGrpcClient>> =
@@ -682,9 +800,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Some(attestation_service),
             Some(tool_invocation_service),
             cortex_client,
-        ).await {
-             tracing::error!("gRPC server failed: {}", e);
-             eprintln!("gRPC server failed: {}", e);
+        )
+        .await
+        {
+            tracing::error!("gRPC server failed: {}", e);
+            eprintln!("gRPC server failed: {}", e);
         }
     });
 
@@ -751,11 +871,19 @@ async fn register_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
     body: String,
 ) -> impl IntoResponse {
-    match state.register_workflow_use_case.register_workflow(&body).await {
+    match state
+        .register_workflow_use_case
+        .register_workflow(&body)
+        .await
+    {
         Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Failed to register workflow: {}", e)
-        }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Failed to register workflow: {}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -765,11 +893,19 @@ async fn execute_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<StartWorkflowExecutionRequest>,
 ) -> impl IntoResponse {
-    match state.start_workflow_execution_use_case.start_execution(request).await {
+    match state
+        .start_workflow_execution_use_case
+        .start_execution(request)
+        .await
+    {
         Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
-        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-            "error": format!("Failed to start workflow execution: {}", e)
-        }))).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Failed to start workflow execution: {}", e)
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -811,9 +947,13 @@ async fn temporal_events_handler(
         match provided {
             Some(value) if value == secret => {}
             _ => {
-                return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-                    "error": "Unauthorized: invalid or missing X-Temporal-Worker-Secret header"
-                }))).into_response();
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Unauthorized: invalid or missing X-Temporal-Worker-Secret header"
+                    })),
+                )
+                    .into_response();
             }
         }
     } else {
@@ -824,17 +964,21 @@ async fn temporal_events_handler(
     }
 
     match state.temporal_event_listener.handle_event(payload).await {
-        Ok(execution_id) => {
-            (StatusCode::OK, Json(serde_json::json!({
+        Ok(execution_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
                 "execution_id": execution_id,
                 "status": "received"
-            }))).into_response()
-        },
-        Err(e) => {
-            (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
                 "error": format!("Failed to process event: {}", e)
-            }))).into_response()
-        }
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -848,29 +992,71 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             "/v1/executions/:execution_id/cancel",
             post(cancel_execution_handler),
         )
-        .route("/v1/executions/:execution_id/events", get(stream_events_handler))
-        .route("/v1/agents/:agent_id/events", get(stream_agent_events_handler))
+        .route(
+            "/v1/executions/:execution_id/events",
+            get(stream_events_handler),
+        )
+        .route(
+            "/v1/agents/:agent_id/events",
+            get(stream_agent_events_handler),
+        )
         .route("/v1/executions", get(list_executions_handler))
-        .route("/v1/executions/:execution_id", axum::routing::delete(delete_execution_handler))
-        .route("/v1/agents", post(deploy_agent_handler).get(list_agents_handler))
-        .route("/v1/agents/:id", get(get_agent_handler).delete(delete_agent_handler))
+        .route(
+            "/v1/executions/:execution_id",
+            axum::routing::delete(delete_execution_handler),
+        )
+        .route(
+            "/v1/agents",
+            post(deploy_agent_handler).get(list_agents_handler),
+        )
+        .route(
+            "/v1/agents/:id",
+            get(get_agent_handler).delete(delete_agent_handler),
+        )
         .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
         .route("/v1/dispatch-gateway", post(llm_generate_handler))
-        .route("/v1/workflows", post(register_temporal_workflow_handler).get(list_workflows_handler))
-        .route("/v1/workflows/:name", get(get_workflow_handler).delete(delete_workflow_handler))
+        .route(
+            "/v1/workflows",
+            post(register_temporal_workflow_handler).get(list_workflows_handler),
+        )
+        .route(
+            "/v1/workflows/:name",
+            get(get_workflow_handler).delete(delete_workflow_handler),
+        )
         .route("/v1/workflows/:name/run", post(run_workflow_legacy_handler))
         // Note: `/v1/workflows/temporal/register` is an explicit alias of POST `/v1/workflows`
         // for Temporal workflow registration and is kept for compatibility/clarity.
-        .route("/v1/workflows/temporal/register", post(register_temporal_workflow_handler))
-        .route("/v1/workflows/temporal/execute", post(execute_temporal_workflow_handler))
-        .route("/v1/workflows/executions/:execution_id", get(get_workflow_execution_handler))
-        .route("/v1/workflows/executions/:execution_id/logs", get(stream_workflow_logs_handler))
-        .route("/v1/workflows/executions/:execution_id/signal", post(signal_workflow_execution_handler))
+        .route(
+            "/v1/workflows/temporal/register",
+            post(register_temporal_workflow_handler),
+        )
+        .route(
+            "/v1/workflows/temporal/execute",
+            post(execute_temporal_workflow_handler),
+        )
+        .route(
+            "/v1/workflows/executions/:execution_id",
+            get(get_workflow_execution_handler),
+        )
+        .route(
+            "/v1/workflows/executions/:execution_id/logs",
+            get(stream_workflow_logs_handler),
+        )
+        .route(
+            "/v1/workflows/executions/:execution_id/signal",
+            post(signal_workflow_execution_handler),
+        )
         .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
         .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
-        .route("/v1/human-approvals/:id/approve", post(approve_request_handler))
-        .route("/v1/human-approvals/:id/reject", post(reject_request_handler))
+        .route(
+            "/v1/human-approvals/:id/approve",
+            post(approve_request_handler),
+        )
+        .route(
+            "/v1/human-approvals/:id/reject",
+            post(reject_request_handler),
+        )
         .route("/v1/smcp/attest", post(attest_smcp_handler))
         .route("/v1/smcp/invoke", post(invoke_smcp_handler))
         .with_state(app_state)
@@ -888,8 +1074,13 @@ struct AppState {
     register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
     start_workflow_execution_use_case: Arc<StandardStartWorkflowExecutionUseCase>,
     workflow_repo: Arc<dyn aegis_core::domain::repository::WorkflowRepository>,
-    temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>>>,
-    tool_invocation_service: Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
+    temporal_client_container: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<aegis_core::infrastructure::temporal_client::TemporalClient>>,
+        >,
+    >,
+    tool_invocation_service:
+        Arc<aegis_core::application::tool_invocation_service::ToolInvocationService>,
     attestation_service: Arc<dyn aegis_core::infrastructure::smcp::attestation::AttestationService>,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
@@ -910,7 +1101,10 @@ async fn deploy_agent_handler(
     // SDK now re-exports core types, so no conversion needed
     match state.agent_service.deploy_agent(manifest).await {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -928,10 +1122,20 @@ async fn execute_agent_handler(
         intent: Some(request.input.to_string()), // Simplified assumption
         payload: request.input,
     };
-    
-    match state.execution_service.start_execution(AgentId(agent_id), input).await {
-        Ok(id) => (StatusCode::OK, Json(serde_json::json!({"execution_id": id.0}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+
+    match state
+        .execution_service
+        .start_execution(AgentId(agent_id), input)
+        .await
+    {
+        Ok(id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"execution_id": id.0})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -939,7 +1143,11 @@ async fn get_execution_handler(
     State(state): State<Arc<AppState>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    match state.execution_service.get_execution(ExecutionId(execution_id)).await {
+    match state
+        .execution_service
+        .get_execution(ExecutionId(execution_id))
+        .await
+    {
         Ok(exec) => Json(serde_json::json!({
             "id": exec.id.0,
             "agent_id": exec.agent_id.0,
@@ -955,7 +1163,11 @@ async fn cancel_execution_handler(
     State(state): State<Arc<AppState>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    match state.execution_service.cancel_execution(ExecutionId(execution_id)).await {
+    match state
+        .execution_service
+        .cancel_execution(ExecutionId(execution_id))
+        .await
+    {
         Ok(_) => Json(serde_json::json!({"success": true})),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
@@ -968,13 +1180,13 @@ async fn stream_events_handler(
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
     let exec_id = aegis_core::domain::execution::ExecutionId(execution_id);
-    
+
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_execution(exec_id);
-    
+
     // 2. Fetch history
     let execution_result = state.execution_service.get_execution(exec_id).await;
-    
+
     let stream = async_stream::stream! {
         // 3. Replay history if execution exists
         if let Ok(execution) = execution_result {
@@ -992,7 +1204,7 @@ async fn stream_events_handler(
                 let iter_start = serde_json::json!({
                     "event_type": "IterationStarted",
                     "iteration_number": iter.number,
-                    "action": iter.action, 
+                    "action": iter.action,
                     "timestamp": iter.started_at.to_rfc3339(),
                     "data": { "action": iter.action }
                 });
@@ -1043,10 +1255,10 @@ async fn stream_events_handler(
                          // The Execution struct doesn't seem to have `final_output` field in the previous view, just iterations.
                          // We'll infer it from the last iteration for now or empty.
                         let result = execution.iterations().last().and_then(|i| i.output.clone()).unwrap_or_default();
-                        
+
                         let exec_end = serde_json::json!({
                             "event_type": "ExecutionCompleted",
-                            "total_iterations": execution.iterations().len(), 
+                            "total_iterations": execution.iterations().len(),
                             "timestamp": ended_at.to_rfc3339(),
                             "data": { "result": result }
                         });
@@ -1080,8 +1292,8 @@ async fn stream_events_handler(
                          // Convert domain event to JSON (Same logic as before)
                          let json = match event {
                             aegis_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
-                                // Skip if we already replayed it? 
-                                // Simple filter: check timestamp? 
+                                // Skip if we already replayed it?
+                                // Simple filter: check timestamp?
                                 // For now, just stream it.
                                 serde_json::json!({
                                     "event_type": "ExecutionStarted",
@@ -1093,7 +1305,7 @@ async fn stream_events_handler(
                                 serde_json::json!({
                                     "event_type": "IterationStarted",
                                     "iteration_number": iteration_number,
-                                    "action": action, 
+                                    "action": action,
                                     "timestamp": chrono::Utc::now().to_rfc3339(),
                                     "data": { "action": action }
                                 })
@@ -1109,7 +1321,7 @@ async fn stream_events_handler(
                             aegis_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
                                 serde_json::json!({
                                     "event_type": "ExecutionCompleted",
-                                    "total_iterations": 0, 
+                                    "total_iterations": 0,
                                     "timestamp": chrono::Utc::now().to_rfc3339(),
                                     "data": { "result": final_output }
                                 })
@@ -1150,7 +1362,7 @@ async fn stream_events_handler(
                                 })
                             }
                         };
-                        
+
                         yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
                     }
                     Err(_) => {
@@ -1171,19 +1383,22 @@ async fn stream_agent_events_handler(
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
     let aid = aegis_core::domain::agent::AgentId(agent_id);
-    
+
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_agent(aid);
-    
+
     // 2. Fetch all executions for this agent
-    let executions_result = state.execution_service.list_executions(Some(aid), 100).await;
-    
+    let executions_result = state
+        .execution_service
+        .list_executions(Some(aid), 100)
+        .await;
+
     let stream = async_stream::stream! {
         // 3. Replay history for all executions
         if let Ok(mut executions) = executions_result {
             // Sort by started_at to replay in chronological order
             executions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
-            
+
             for execution in executions {
                 // ExecutionStarted
                 let start_event = serde_json::json!({
@@ -1225,7 +1440,7 @@ async fn stream_agent_events_handler(
                          });
                          yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
                     }
-                    
+
                     // Replay validation results as console output
                     if let Some(validation_results) = &iter.validation_results {
                         if let Some(system) = &validation_results.system {
@@ -1252,7 +1467,7 @@ async fn stream_agent_events_handler(
                                 yield Ok::<_, anyhow::Error>(Event::default().data(stderr_event.to_string()));
                             }
                         }
-                        
+
                         // Replay judge evaluation
                         if let Some(semantic) = &validation_results.semantic {
                             let judge_start = serde_json::json!({
@@ -1263,7 +1478,7 @@ async fn stream_agent_events_handler(
                                 "data": { "output": "🧑‍⚖️ Evaluating output..." }
                             });
                             yield Ok::<_, anyhow::Error>(Event::default().data(judge_start.to_string()));
-                            
+
                             let judge_result = if semantic.success {
                                 format!("✅ Judge: PASS (confidence: {:.2})", semantic.score)
                             } else {
@@ -1277,7 +1492,7 @@ async fn stream_agent_events_handler(
                                 "data": { "output": judge_result }
                             });
                             yield Ok::<_, anyhow::Error>(Event::default().data(judge_event.to_string()));
-                            
+
                             if !semantic.reasoning.is_empty() {
                                 let feedback_event = serde_json::json!({
                                     "event_type": "ConsoleOutput",
@@ -1438,7 +1653,7 @@ async fn stream_agent_events_handler(
                                 })
                             }
                         };
-                        
+
                         yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
                     }
                     Err(_) => {
@@ -1456,7 +1671,11 @@ async fn delete_execution_handler(
     State(state): State<Arc<AppState>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    match state.execution_service.delete_execution(ExecutionId(execution_id)).await {
+    match state
+        .execution_service
+        .delete_execution(ExecutionId(execution_id))
+        .await
+    {
         Ok(_) => Json(serde_json::json!({"success": true})),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
@@ -1475,29 +1694,34 @@ async fn list_executions_handler(
     let agent_id = query.agent_id.map(AgentId);
     let limit = query.limit.unwrap_or(20);
 
-    match state.execution_service.list_executions(agent_id, limit).await {
+    match state
+        .execution_service
+        .list_executions(agent_id, limit)
+        .await
+    {
         Ok(executions) => {
-            let json_executions: Vec<serde_json::Value> = executions.into_iter().map(|exec| {
-                serde_json::json!({
-                    "id": exec.id.0,
-                    "agent_id": exec.agent_id.0,
-                    "status": format!("{:?}", exec.status),
-                    "started_at": exec.started_at,
-                    "ended_at": exec.ended_at
+            let json_executions: Vec<serde_json::Value> = executions
+                .into_iter()
+                .map(|exec| {
+                    serde_json::json!({
+                        "id": exec.id.0,
+                        "agent_id": exec.agent_id.0,
+                        "status": format!("{:?}", exec.status),
+                        "started_at": exec.started_at,
+                        "ended_at": exec.ended_at
+                    })
                 })
-            }).collect();
+                .collect();
             Json(serde_json::json!(json_executions))
-        },
+        }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
 }
 
-async fn list_agents_handler(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
+async fn list_agents_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
     match state.agent_service.list_agents().await {
         Ok(agents) => {
-             let json_agents: Vec<serde_json::Value> = agents.into_iter().map(|agent| {
+            let json_agents: Vec<serde_json::Value> = agents.into_iter().map(|agent| {
                 serde_json::json!({
                     "id": agent.id.0,
                     "name": agent.manifest.metadata.name,
@@ -1507,7 +1731,7 @@ async fn list_agents_handler(
                 })
             }).collect();
             Json(serde_json::json!(json_agents))
-        },
+        }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
 }
@@ -1527,9 +1751,10 @@ async fn get_agent_handler(
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
     match state.agent_service.get_agent(AgentId(id)).await {
-        Ok(agent) => {
-             Json(serde_json::to_value(agent.manifest).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})))
-        },
+        Ok(agent) => Json(
+            serde_json::to_value(agent.manifest)
+                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
+        ),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
 }
@@ -1540,8 +1765,14 @@ async fn lookup_agent_handler(
 ) -> impl IntoResponse {
     match state.agent_service.lookup_agent(&name).await {
         Ok(Some(id)) => (StatusCode::OK, Json(serde_json::json!({"id": id.0}))),
-        Ok(None) => (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Agent not found"}))),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
     }
 }
 
@@ -1560,7 +1791,7 @@ async fn llm_generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LlmGenerateRequest>,
 ) -> impl IntoResponse {
-    use aegis_core::application::inner_loop_service::{InnerLoopRequest, ConversationMessage};
+    use aegis_core::application::inner_loop_service::{ConversationMessage, InnerLoopRequest};
 
     // Resolve agent_id for event logging and inner loop request
     let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
@@ -1571,13 +1802,20 @@ async fn llm_generate_handler(
             (id, s)
         } else {
             tracing::warn!("Could not find execution {} for LLM event", exec_id);
-            (aegis_core::domain::agent::AgentId(Uuid::nil()), Uuid::nil().to_string())
+            (
+                aegis_core::domain::agent::AgentId(Uuid::nil()),
+                Uuid::nil().to_string(),
+            )
         }
     } else {
-        (aegis_core::domain::agent::AgentId(Uuid::nil()), Uuid::nil().to_string())
+        (
+            aegis_core::domain::agent::AgentId(Uuid::nil()),
+            Uuid::nil().to_string(),
+        )
     };
 
-    let execution_id_str = req.execution_id
+    let execution_id_str = req
+        .execution_id
         .map(|id| id.to_string())
         .unwrap_or_else(|| Uuid::nil().to_string());
 
@@ -1622,22 +1860,31 @@ async fn llm_generate_handler(
                         response: response.content.clone(),
                         timestamp: chrono::Utc::now(),
                     };
-                    let _ = state.execution_service.record_llm_interaction(
-                        aegis_core::domain::execution::ExecutionId(exec_id),
-                        req.iteration_number.unwrap_or(0),
-                        interaction,
-                    ).await;
+                    let _ = state
+                        .execution_service
+                        .record_llm_interaction(
+                            aegis_core::domain::execution::ExecutionId(exec_id),
+                            req.iteration_number.unwrap_or(0),
+                            interaction,
+                        )
+                        .await;
                 }
             }
 
-            (StatusCode::OK, Json(serde_json::json!({
-                "content": response.content,
-                "tool_calls_executed": response.tool_calls_executed,
-            })))
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "content": response.content,
+                    "tool_calls_executed": response.tool_calls_executed,
+                })),
+            )
         }
         Err(e) => {
             tracing::error!("Inner loop generation failed: {}", e);
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})))
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
         }
     }
 }
@@ -1647,11 +1894,9 @@ async fn llm_generate_handler(
 // ========================================
 
 /// GET /v1/workflows - List all workflows
-async fn list_workflows_handler(
-    State(state): State<Arc<AppState>>,
-) -> impl IntoResponse {
+async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let workflows = state.workflow_repo.list_all().await.unwrap_or_default();
-    
+
     let workflow_list: Vec<serde_json::Value> = workflows
         .iter()
         .map(|w| {
@@ -1675,19 +1920,17 @@ async fn get_workflow_handler(
     use aegis_core::infrastructure::workflow_parser::WorkflowParser;
 
     match state.workflow_repo.find_by_name(&name).await {
-        Ok(Some(workflow)) => {
-            match WorkflowParser::to_yaml(&workflow) {
-                Ok(yaml) => {
-                    (StatusCode::OK, yaml)
-                }
-                Err(e) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to serialize workflow: {}", e))
-                }
-            }
-        }
-        _ => {
-            (StatusCode::NOT_FOUND, format!("Workflow '{}' not found", name))
-        }
+        Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {
+            Ok(yaml) => (StatusCode::OK, yaml),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to serialize workflow: {}", e),
+            ),
+        },
+        _ => (
+            StatusCode::NOT_FOUND,
+            format!("Workflow '{}' not found", name),
+        ),
     }
 }
 
@@ -1699,28 +1942,34 @@ async fn delete_workflow_handler(
     match state.workflow_repo.find_by_name(&name).await {
         Ok(Some(workflow)) => {
             if let Err(e) = state.workflow_repo.delete(workflow.id).await {
-                return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()})));
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                );
             }
             (StatusCode::OK, Json(serde_json::json!({"success": true})))
         }
-        _ => {
-            (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "not found"})))
-        }
+        _ => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        ),
     }
 }
 
-
 /// GET /v1/workflows/executions/:execution_id - Get execution details
-/// 
+///
 /// TODO: Implement execution state retrieval once WorkflowEngine exposes active executions
 /// Tracked in #WORKFLOW-EXECUTION-STATE
 async fn get_workflow_execution_handler(
     State(_state): State<Arc<AppState>>,
     Path(_execution_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    (StatusCode::NOT_IMPLEMENTED, Json(serde_json::json!({
-        "error": "Workflow execution retrieval not yet implemented"
-    })))
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(serde_json::json!({
+            "error": "Workflow execution retrieval not yet implemented"
+        })),
+    )
 }
 
 #[derive(serde::Deserialize)]
@@ -1757,12 +2006,15 @@ async fn signal_workflow_execution_handler(
                     "error": "Temporal client not yet connected"
                 })),
             )
-            .into_response();
+                .into_response();
         }
     };
     drop(guard);
 
-    match client.send_human_signal(&execution_id, request.response).await {
+    match client
+        .send_human_signal(&execution_id, request.response)
+        .await
+    {
         Ok(()) => (
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
@@ -1770,12 +2022,12 @@ async fn signal_workflow_execution_handler(
                 "execution_id": execution_id
             })),
         )
-        .into_response(),
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
-        .into_response(),
+            .into_response(),
     }
 }
 
@@ -1791,39 +2043,51 @@ async fn stream_workflow_logs_handler(
     let client_opt = state.temporal_client_container.read().await;
     let client = match &*client_opt {
         Some(c) => c,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Temporal client not available".to_string()),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Temporal client not available".to_string(),
+            )
+        }
     };
 
     // Fetch history
     // Note: This fetches existing history. Streaming live events would require
     // using 'wait_new_event' loop or similar, but for now we just return current history.
-    match client.get_workflow_history(execution_id.to_string(), None).await {
+    match client
+        .get_workflow_history(execution_id.to_string(), None)
+        .await
+    {
         Ok(history) => {
             let mut output = String::new();
             for event in history {
                 // Approximate timestamp formatting
-                let timestamp = event.event_time.map(|t| {
-                    let secs = t.seconds;
-                    let nanos = t.nanos;
-                    if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos as u32) {
-                        dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-                    } else {
-                        "Unknown Time".to_string()
-                    }
-                }).unwrap_or_else(|| "Unknown Time".to_string());
+                let timestamp = event
+                    .event_time
+                    .map(|t| {
+                        let secs = t.seconds;
+                        let nanos = t.nanos;
+                        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos as u32) {
+                            dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
+                        } else {
+                            "Unknown Time".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "Unknown Time".to_string());
 
                 let event_type = event.event_type(); // Enum
-                
+
                 let _ = writeln!(output, "[{}] {:?}", timestamp, event_type);
-                
+
                 // Add details for key events if possible?
                 // For now just the type is useful enough to verify it works.
             }
             (StatusCode::OK, output)
         }
-        Err(e) => {
-            (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get workflow logs: {}", e))
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to get workflow logs: {}", e),
+        ),
     }
 }
 
@@ -1852,7 +2116,11 @@ async fn get_pending_approval_handler(
         Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service.get_pending_request(request_id).await {
+    match state
+        .human_input_service
+        .get_pending_request(request_id)
+        .await
+    {
         Some(request) => Json(serde_json::json!({ "request": request })),
         None => Json(serde_json::json!({ "error": "Request not found or already completed" })),
     }
@@ -1875,7 +2143,8 @@ async fn approve_request_handler(
         Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service
+    match state
+        .human_input_service
         .submit_approval(request_id, payload.feedback, payload.approved_by)
         .await
     {
@@ -1904,7 +2173,8 @@ async fn reject_request_handler(
         Err(_) => return Json(serde_json::json!({"error": "Invalid request ID"})),
     };
 
-    match state.human_input_service
+    match state
+        .human_input_service
         .submit_rejection(request_id, payload.reason, payload.rejected_by)
         .await
     {
@@ -1930,18 +2200,28 @@ async fn attest_smcp_handler(
 ) -> impl IntoResponse {
     let internal_req = aegis_core::infrastructure::smcp::attestation::AttestationRequest {
         agent_id: request.agent_id.clone(),
-        execution_id: request.execution_id.unwrap_or_else(|| request.agent_id.clone()),
+        execution_id: request
+            .execution_id
+            .unwrap_or_else(|| request.agent_id.clone()),
         container_id: request.container_id.clone(),
         public_key_pem: request.public_key.clone(),
     };
-    
+
     match state.attestation_service.attest(internal_req).await {
-        Ok(res) => (StatusCode::OK, Json(serde_json::json!({
-            "security_token": res.security_token
-        }))).into_response(),
-        Err(e) => (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": e.to_string()
-        }))).into_response(),
+        Ok(res) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "security_token": res.security_token
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1957,36 +2237,68 @@ async fn invoke_smcp_handler(
     Json(request): Json<HttpSmcpEnvelope>,
 ) -> impl IntoResponse {
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
-    
+
     let envelope = aegis_core::infrastructure::smcp::envelope::SmcpEnvelope {
         security_token: request.security_token,
         signature: request.signature,
         inner_mcp: payload_bytes,
     };
-    
+
     let payload_b64 = envelope.security_token.split('.').nth(1).unwrap_or("");
-    let payload_bytes = match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload_b64) {
+    let payload_bytes = match base64::Engine::decode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        payload_b64,
+    ) {
         Ok(b) => b,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Malformed security token base64" }))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Malformed security token base64" })),
+            )
+                .into_response()
+        }
     };
-    
+
     let token_data: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
         Ok(d) => d,
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "Malformed security token JSON" }))).into_response(),
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "Malformed security token JSON" })),
+            )
+                .into_response()
+        }
     };
-    
-    let agent_id_str = token_data.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
-    
+
+    let agent_id_str = token_data
+        .get("agent_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
     let agent_id = match uuid::Uuid::parse_str(agent_id_str) {
         Ok(uid) => AgentId(uid),
-        Err(_) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": "agent_id in token is missing or not a valid UUID" }))).into_response(),
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::json!({ "error": "agent_id in token is missing or not a valid UUID" }),
+            ),
+        )
+            .into_response(),
     };
-    
-    match state.tool_invocation_service.invoke_tool(&agent_id, &envelope).await {
-         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-         Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
-             "error": e.to_string()
-         }))).into_response(),
+
+    match state
+        .tool_invocation_service
+        .invoke_tool(&agent_id, &envelope)
+        .await
+    {
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -1997,7 +2309,7 @@ mod tests {
         // This is a smoke test to ensure create_router compiles and can be called
         // We can't easily test the full router without a complex setup
         // but we can at least verify the function signature works
-        
+
         // For now, just verify the module compiles
         assert!(true);
     }

@@ -22,12 +22,12 @@
 //! This is **separate** from `WorkflowRepository` (which owns persistence of
 //! `Workflow` manifests). `WorkflowRegistry` is a pure in-memory routing index.
 
-use std::collections::HashMap;
-use anyhow::{anyhow, Result};
-use serde::{Serialize, Deserialize};
-use uuid::Uuid;
 use crate::domain::agent::AgentId;
 use crate::domain::workflow::WorkflowId;
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use uuid::Uuid;
 
 // ──────────────────────────────────────────────────────────────────────────────
 // WorkflowRegistryId
@@ -37,11 +37,15 @@ use crate::domain::workflow::WorkflowId;
 pub struct WorkflowRegistryId(pub Uuid);
 
 impl WorkflowRegistryId {
-    pub fn new() -> Self { Self(Uuid::new_v4()) }
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
 }
 
 impl Default for WorkflowRegistryId {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -107,7 +111,10 @@ impl WorkflowRegistry {
     /// Returns `Err` if `threshold` is outside `[0.0, 1.0]`.
     pub fn set_confidence_threshold(&mut self, threshold: f64) -> Result<()> {
         if !(0.0..=1.0).contains(&threshold) {
-            return Err(anyhow!("confidence_threshold must be in [0.0, 1.0], got {}", threshold));
+            return Err(anyhow!(
+                "confidence_threshold must be in [0.0, 1.0], got {}",
+                threshold
+            ));
         }
         self.confidence_threshold = threshold;
         Ok(())
@@ -201,7 +208,9 @@ mod tests {
     #[test]
     fn invalid_key_slash() {
         let mut reg = WorkflowRegistry::new(None);
-        let err = reg.register_route("foo/bar", make_workflow_id()).unwrap_err();
+        let err = reg
+            .register_route("foo/bar", make_workflow_id())
+            .unwrap_err();
         assert!(err.to_string().contains("'/'"));
     }
 
@@ -231,6 +240,9 @@ mod tests {
         reg.register_route("stripe", make_workflow_id()).unwrap();
         reg.register_route("github", make_workflow_id()).unwrap();
         reg.register_route("aws-sns", make_workflow_id()).unwrap();
-        assert_eq!(reg.registered_sources(), vec!["aws-sns", "github", "stripe"]);
+        assert_eq!(
+            reg.registered_sources(),
+            vec!["aws-sns", "github", "stripe"]
+        );
     }
 }

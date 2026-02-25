@@ -29,16 +29,16 @@
 //! See ADR-033 (Orchestrator-Mediated MCP Tool Routing), ADR-035 (SMCP),
 //! AGENTS.md §Tools & Integration Domain.
 
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::time::Duration;
+use crate::domain::agent::AgentId;
+use crate::domain::events::MCPToolEvent;
+use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
-use crate::domain::agent::AgentId;
-use crate::domain::execution::ExecutionId;
-use crate::domain::events::{MCPToolEvent};
 
 /// Unique identifier for a long-running MCP server process.
 ///
@@ -100,7 +100,7 @@ impl CredentialRef {
             key: key.to_string(),
         }
     }
-    
+
     pub fn from_vault(path: &str) -> Self {
         Self {
             store_type: CredentialStoreType::OpenBao,
@@ -133,20 +133,20 @@ pub enum ExecutionMode {
 /// Tool server status (enum value object)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolServerStatus {
-    Stopped,      // Not running
-    Starting,     // Spawning process
-    Running,      // Healthy and available
-    Unhealthy,    // Process alive but failing health checks
-    Failed,       // Process crashed or killed
+    Stopped,   // Not running
+    Starting,  // Spawning process
+    Running,   // Healthy and available
+    Unhealthy, // Process alive but failing health checks
+    Failed,    // Process crashed or killed
 }
 
 /// Invocation status (enum value object)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InvocationStatus {
-    Requested,    // Queued, not yet started
-    Running,      // Currently executing
-    Completed,    // Successful completion
-    Failed,       // Error occurred
+    Requested, // Queued, not yet started
+    Running,   // Currently executing
+    Completed, // Successful completion
+    Failed,    // Error occurred
 }
 
 /// Policy violation types
@@ -183,10 +183,7 @@ pub enum PolicyViolation {
 
 #[derive(Debug, Clone)]
 pub enum DomainError {
-    InvalidStateTransition {
-        from: String,
-        to: String,
-    },
+    InvalidStateTransition { from: String, to: String },
 }
 
 impl std::fmt::Display for DomainError {
@@ -213,23 +210,23 @@ pub struct ToolServer {
     // Identity
     pub id: ToolServerId,
     pub name: String,
-    
+
     // Configuration
     pub execution_mode: ExecutionMode,
     pub executable_path: PathBuf,
     pub args: Vec<String>,
     pub capabilities: Vec<String>,
-    
+
     // Lifecycle
     pub status: ToolServerStatus,
     pub process_id: Option<u32>,
     pub health_check_interval: Duration,
     pub last_health_check: Option<DateTime<Utc>>,
-    
+
     // Security
     pub credentials: Option<CredentialRef>,
     pub resource_limits: ResourceLimits,
-    
+
     // Metadata
     pub started_at: Option<DateTime<Utc>>,
     pub stopped_at: Option<DateTime<Utc>>,
@@ -245,7 +242,7 @@ impl ToolServer {
             } else if let Some(vault_val) = v.strip_prefix("vault:") {
                 CredentialRef::from_vault(vault_val)
             } else {
-                CredentialRef::from_env(v) 
+                CredentialRef::from_env(v)
             }
         });
 
@@ -277,10 +274,10 @@ impl ToolServer {
                 to: format!("{:?}", ToolServerStatus::Starting),
             });
         }
-        
+
         self.status = ToolServerStatus::Starting;
         self.started_at = Some(Utc::now());
-        
+
         Ok(MCPToolEvent::ServerStarted {
             server_id: self.id,
             name: self.name.clone(),
@@ -288,9 +285,9 @@ impl ToolServer {
             started_at: self.started_at.unwrap(),
         })
     }
-    
+
     pub fn can_invoke(&self, tool_name: &str) -> bool {
-        self.status == ToolServerStatus::Running 
+        self.status == ToolServerStatus::Running
             && self.capabilities.iter().any(|cap| {
                 if cap.ends_with(".*") {
                     let prefix = cap.trim_end_matches(".*");
@@ -300,10 +297,10 @@ impl ToolServer {
                 }
             })
     }
-    
+
     pub fn record_health_check(&mut self, healthy: bool) -> Option<MCPToolEvent> {
         self.last_health_check = Some(Utc::now());
-        
+
         if !healthy && self.status == ToolServerStatus::Running {
             self.status = ToolServerStatus::Unhealthy;
             return Some(MCPToolEvent::ServerUnhealthy {
@@ -311,7 +308,7 @@ impl ToolServer {
                 last_healthy: self.started_at,
             });
         }
-        
+
         None
     }
 }
@@ -323,22 +320,22 @@ pub struct ToolInvocation {
     pub id: ToolInvocationId,
     pub execution_id: ExecutionId,
     pub agent_id: AgentId,
-    
+
     // Tool details
     pub tool_name: String,
     pub server_id: ToolServerId,
     pub arguments: Value,
-    
+
     // Lifecycle
     pub status: InvocationStatus,
     pub requested_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
-    
+
     // Results
     pub result: Option<Value>,
     pub error: Option<MCPError>,
-    
+
     // Observability
     pub duration_ms: Option<u64>,
     pub bytes_transferred: Option<u64>,
@@ -346,7 +343,13 @@ pub struct ToolInvocation {
 }
 
 impl ToolInvocation {
-    pub fn new(execution_id: ExecutionId, agent_id: AgentId, server_id: ToolServerId, tool_name: String, arguments: Value) -> Self {
+    pub fn new(
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        server_id: ToolServerId,
+        tool_name: String,
+        arguments: Value,
+    ) -> Self {
         Self {
             id: ToolInvocationId::new(),
             execution_id,
@@ -373,10 +376,10 @@ impl ToolInvocation {
                 to: format!("{:?}", InvocationStatus::Running),
             });
         }
-        
+
         self.status = InvocationStatus::Running;
         self.started_at = Some(Utc::now());
-        
+
         Ok(MCPToolEvent::InvocationStarted {
             invocation_id: self.id,
             server_id: self.server_id,
@@ -384,7 +387,7 @@ impl ToolInvocation {
             started_at: self.started_at.unwrap(),
         })
     }
-    
+
     pub fn complete(&mut self, result: Value) -> Result<MCPToolEvent, DomainError> {
         if self.status != InvocationStatus::Running {
             return Err(DomainError::InvalidStateTransition {
@@ -392,13 +395,14 @@ impl ToolInvocation {
                 to: format!("{:?}", InvocationStatus::Completed),
             });
         }
-        
+
         self.completed_at = Some(Utc::now());
-        self.duration_ms = self.started_at
+        self.duration_ms = self
+            .started_at
             .map(|start| (self.completed_at.unwrap() - start).num_milliseconds() as u64);
         self.status = InvocationStatus::Completed;
         self.result = Some(result.clone());
-        
+
         Ok(MCPToolEvent::InvocationCompleted {
             invocation_id: self.id,
             execution_id: self.execution_id,
@@ -408,7 +412,7 @@ impl ToolInvocation {
             completed_at: self.completed_at.unwrap(),
         })
     }
-    
+
     pub fn fail(&mut self, error: MCPError) -> Result<MCPToolEvent, DomainError> {
         if self.status != InvocationStatus::Running {
             return Err(DomainError::InvalidStateTransition {
@@ -416,13 +420,14 @@ impl ToolInvocation {
                 to: format!("{:?}", InvocationStatus::Failed),
             });
         }
-        
+
         self.completed_at = Some(Utc::now());
-        self.duration_ms = self.started_at
+        self.duration_ms = self
+            .started_at
             .map(|start| (self.completed_at.unwrap() - start).num_milliseconds() as u64);
         self.status = InvocationStatus::Failed;
         self.error = Some(error.clone());
-        
+
         Ok(MCPToolEvent::InvocationFailed {
             invocation_id: self.id,
             execution_id: self.execution_id,
@@ -436,8 +441,11 @@ impl ToolInvocation {
 #[async_trait::async_trait]
 pub trait ToolRegistry: Send + Sync {
     /// Retrieve all registered tool servers for a specific agent execution
-    async fn get_tools_for_agent(&self, execution_id: ExecutionId) -> Result<Vec<ToolServer>, DomainError>;
-    
+    async fn get_tools_for_agent(
+        &self,
+        execution_id: ExecutionId,
+    ) -> Result<Vec<ToolServer>, DomainError>;
+
     /// Register a new tool server
     async fn register_tool(&self, server: ToolServer) -> Result<(), DomainError>;
 }
@@ -456,14 +464,14 @@ pub struct ToolPolicy {
     // Allowlists
     pub allowed_tools: Vec<String>,
     pub denied_tools: Vec<String>,
-    
+
     // Path constraints (for filesystem tools)
     pub allowed_paths: Vec<PathBuf>,
     pub deny_path_traversal: bool,
-    
+
     // Network constraints (for external tools)
     pub allowed_domains: Vec<String>,
-    
+
     // Rate limiting
     pub max_calls_per_execution: u32,
     pub max_calls_per_tool: HashMap<String, u32>,
@@ -506,14 +514,14 @@ impl ToolPolicy {
                 allowed_tools: self.allowed_tools.clone(),
             });
         }
-        
+
         // 2. Check denylist (explicit denials override allowlist)
         if self.is_tool_denied(tool_name) {
             return Err(PolicyViolation::ToolExplicitlyDenied {
                 tool_name: tool_name.to_string(),
             });
         }
-        
+
         // 3. Rate limit check
         if current_call_count >= self.max_calls_per_execution {
             return Err(PolicyViolation::RateLimitExceeded {
@@ -521,43 +529,47 @@ impl ToolPolicy {
                 current_calls: current_call_count,
             });
         }
-        
+
         // 4. Tool-specific validation
         if tool_name.starts_with("filesystem.") {
             self.validate_filesystem_access(arguments)?;
         }
-        
+
         if tool_name.starts_with("web-search.") {
             self.validate_network_access(arguments)?;
         }
-        
+
         Ok(())
     }
-    
+
     fn validate_filesystem_access(&self, arguments: &Value) -> Result<(), PolicyViolation> {
         let path = arguments
             .get("path")
             .and_then(Value::as_str)
             .ok_or(PolicyViolation::MissingRequiredArgument("path".to_string()))?;
-        
+
         let path = PathBuf::from(path);
-        
+
         // Check path traversal attempts
         if self.deny_path_traversal && path.to_str().unwrap_or("").contains("..") {
             return Err(PolicyViolation::PathTraversalAttempt { path });
         }
-        
+
         // Check against allowed volume boundaries
-        if !self.allowed_paths.iter().any(|allowed| path.starts_with(allowed)) {
+        if !self
+            .allowed_paths
+            .iter()
+            .any(|allowed| path.starts_with(allowed))
+        {
             return Err(PolicyViolation::PathOutsideBoundary {
                 path,
                 allowed_paths: self.allowed_paths.clone(),
             });
         }
-        
+
         Ok(())
     }
-    
+
     fn validate_network_access(&self, arguments: &Value) -> Result<(), PolicyViolation> {
         // Extract domain from arguments (tool-specific logic)
         if let Some(url) = arguments.get("url").and_then(Value::as_str) {
@@ -569,7 +581,7 @@ impl ToolPolicy {
                 });
             }
         }
-        
+
         Ok(())
     }
 }
@@ -593,15 +605,23 @@ mod tests {
         };
 
         let args_read = json!({"path": "/workspace/test.txt"});
-        assert!(policy.validate_invocation("filesystem.read", &args_read, 0).is_ok());
+        assert!(policy
+            .validate_invocation("filesystem.read", &args_read, 0)
+            .is_ok());
 
         let args_delete = json!({"path": "/workspace/test.txt"});
         let result = policy.validate_invocation("filesystem.delete", &args_delete, 0);
-        assert!(matches!(result, Err(PolicyViolation::ToolExplicitlyDenied { .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyViolation::ToolExplicitlyDenied { .. })
+        ));
 
         let args_unknown = json!({});
         let result = policy.validate_invocation("unknown.tool", &args_unknown, 0);
-        assert!(matches!(result, Err(PolicyViolation::ToolNotAllowed { .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyViolation::ToolNotAllowed { .. })
+        ));
     }
 
     #[test]
@@ -619,11 +639,17 @@ mod tests {
 
         let args_outside = json!({"path": "/etc/passwd"});
         let result = policy.validate_invocation("filesystem.read", &args_outside, 0);
-        assert!(matches!(result, Err(PolicyViolation::PathOutsideBoundary { .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyViolation::PathOutsideBoundary { .. })
+        ));
 
         let args_traversal = json!({"path": "/workspace/../etc/passwd"});
         let result = policy.validate_invocation("filesystem.read", &args_traversal, 0);
-        assert!(matches!(result, Err(PolicyViolation::PathTraversalAttempt { .. })));
+        assert!(matches!(
+            result,
+            Err(PolicyViolation::PathTraversalAttempt { .. })
+        ));
     }
 
     #[test]
@@ -654,9 +680,9 @@ mod tests {
 
         // Start again should fail
         assert!(server.start().is_err());
-        
+
         server.status = ToolServerStatus::Running;
-        
+
         // Health check failing should move it to Unhealthy
         server.record_health_check(false);
         assert_eq!(server.status, ToolServerStatus::Unhealthy);
@@ -669,9 +695,9 @@ mod tests {
         let mut invocation = ToolInvocation::new(
             execution_id,
             AgentId::new(),
-            server_id, 
-            "test.tool".to_string(), 
-            json!({})
+            server_id,
+            "test.tool".to_string(),
+            json!({}),
         );
 
         // Starts out Requested
@@ -690,8 +716,14 @@ mod tests {
         assert_eq!(invocation.status, InvocationStatus::Completed);
         assert!(invocation.completed_at.is_some());
         assert!(invocation.duration_ms.is_some());
-        
+
         // Cannot fail if already completed
-        assert!(invocation.fail(MCPError { code: 1, message: "err".to_string(), data: None }).is_err());
+        assert!(invocation
+            .fail(MCPError {
+                code: 1,
+                message: "err".to_string(),
+                data: None
+            })
+            .is_err());
     }
 }

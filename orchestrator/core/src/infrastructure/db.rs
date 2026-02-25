@@ -11,8 +11,8 @@
 //!
 //! See ADR-025 (PostgreSQL Schema Design).
 
-use sqlx::postgres::{PgPool, PgPoolOptions};
 use anyhow::Result;
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 #[derive(Clone)]
 pub struct Database {
@@ -25,7 +25,7 @@ impl Database {
             .max_connections(5)
             .connect(connection_string)
             .await?;
-            
+
         Ok(Self { pool })
     }
 

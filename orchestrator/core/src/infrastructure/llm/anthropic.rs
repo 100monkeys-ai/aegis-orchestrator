@@ -8,8 +8,8 @@
 //! content blocks for function-calling.
 
 use crate::domain::llm::{
-    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions,
-    GenerationResponse, LLMError, LLMProvider, ToolSchema,
+    ChatMessage, ChatResponse, ChatToolCall, FinishReason, GenerationOptions, GenerationResponse,
+    LLMError, LLMProvider, ToolSchema,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -250,16 +250,26 @@ mod tests {
 
     #[test]
     fn test_anthropic_adapter_creation() {
-        let adapter = AnthropicAdapter::new("k".to_string(), "claude-3-5-sonnet-20241022".to_string());
+        let adapter =
+            AnthropicAdapter::new("k".to_string(), "claude-3-5-sonnet-20241022".to_string());
         assert_eq!(adapter.api_key, "k");
         assert_eq!(adapter.model, "claude-3-5-sonnet-20241022");
     }
 
     #[test]
     fn test_stop_reason_mapping() {
-        assert_eq!(AnthropicAdapter::map_stop_reason(Some("end_turn")), FinishReason::Stop);
-        assert_eq!(AnthropicAdapter::map_stop_reason(Some("max_tokens")), FinishReason::Length);
-        assert_eq!(AnthropicAdapter::map_stop_reason(Some("stop_sequence")), FinishReason::Stop);
+        assert_eq!(
+            AnthropicAdapter::map_stop_reason(Some("end_turn")),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            AnthropicAdapter::map_stop_reason(Some("max_tokens")),
+            FinishReason::Length
+        );
+        assert_eq!(
+            AnthropicAdapter::map_stop_reason(Some("stop_sequence")),
+            FinishReason::Stop
+        );
         assert_eq!(AnthropicAdapter::map_stop_reason(None), FinishReason::Stop);
     }
 
@@ -305,7 +315,10 @@ mod tests {
             "tool_use_id": "call_1",
             "content": "Search results here",
         }]);
-        let msg = AnthropicMessage { role: "user".to_string(), content };
+        let msg = AnthropicMessage {
+            role: "user".to_string(),
+            content,
+        };
         let json = serde_json::to_value(&msg).unwrap();
         assert_eq!(json["role"], "user");
         assert_eq!(json["content"][0]["type"], "tool_result");
@@ -329,13 +342,20 @@ mod tests {
 
     #[test]
     fn test_default_max_tokens() {
-        let opts = GenerationOptions { max_tokens: None, temperature: None, stop_sequences: None };
+        let opts = GenerationOptions {
+            max_tokens: None,
+            temperature: None,
+            stop_sequences: None,
+        };
         assert_eq!(opts.max_tokens.unwrap_or(4096), 4096);
     }
 
     #[test]
     fn test_usage_calculation() {
-        let usage = AnthropicUsage { input_tokens: 100, output_tokens: 200 };
+        let usage = AnthropicUsage {
+            input_tokens: 100,
+            output_tokens: 200,
+        };
         assert_eq!(usage.input_tokens + usage.output_tokens, 300);
     }
 }

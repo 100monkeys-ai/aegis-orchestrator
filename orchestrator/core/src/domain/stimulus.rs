@@ -13,7 +13,7 @@
 //! pipeline and workflow dispatch.
 
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -43,7 +43,9 @@ impl std::fmt::Display for StimulusId {
 }
 
 impl Default for StimulusId {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -188,7 +190,9 @@ mod tests {
 
     #[test]
     fn stimulus_source_name_webhook() {
-        let src = StimulusSource::Webhook { source_name: "GitHub".to_string() };
+        let src = StimulusSource::Webhook {
+            source_name: "GitHub".to_string(),
+        };
         assert_eq!(src.name(), "GitHub");
     }
 

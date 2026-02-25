@@ -153,7 +153,11 @@ impl TemporalWorkflowMapper {
         Ok(TemporalWorkflowDefinition {
             workflow_id: workflow.id.to_string(),
             name: workflow.metadata.name.clone(),
-            version: workflow.metadata.version.clone().unwrap_or_else(|| "1.0.0".to_string()),
+            version: workflow
+                .metadata
+                .version
+                .clone()
+                .unwrap_or_else(|| "1.0.0".to_string()),
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states: temporal_states,
@@ -162,93 +166,104 @@ impl TemporalWorkflowMapper {
 
     /// Map WorkflowState to TemporalWorkflowState
     fn map_workflow_state(state: &WorkflowState) -> Result<TemporalWorkflowState> {
-        let (kind, agent, input, isolation, command, env, workdir, prompt, default_response, agents, consensus) =
-            match &state.kind {
-                StateKind::Agent {
-                    agent,
-                    input,
-                    isolation,
-                } => (
-                    "Agent".to_string(),
-                    Some(agent.clone()),
-                    Some(input.clone()),
-                    isolation.map(|i| Self::map_isolation_mode(i)),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
+        let (
+            kind,
+            agent,
+            input,
+            isolation,
+            command,
+            env,
+            workdir,
+            prompt,
+            default_response,
+            agents,
+            consensus,
+        ) = match &state.kind {
+            StateKind::Agent {
+                agent,
+                input,
+                isolation,
+            } => (
+                "Agent".to_string(),
+                Some(agent.clone()),
+                Some(input.clone()),
+                isolation.map(|i| Self::map_isolation_mode(i)),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
 
-                StateKind::System {
-                    command,
-                    env,
-                    workdir,
-                } => (
-                    "System".to_string(),
-                    None,
-                    None,
-                    None,
-                    Some(command.clone()),
-                    Some(env.clone()),
-                    workdir.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                ),
+            StateKind::System {
+                command,
+                env,
+                workdir,
+            } => (
+                "System".to_string(),
+                None,
+                None,
+                None,
+                Some(command.clone()),
+                Some(env.clone()),
+                workdir.clone(),
+                None,
+                None,
+                None,
+                None,
+            ),
 
-                StateKind::Human {
-                    prompt,
-                    default_response,
-                } => (
-                    "Human".to_string(),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(prompt.clone()),
-                    default_response.clone(),
-                    None,
-                    None,
-                ),
+            StateKind::Human {
+                prompt,
+                default_response,
+            } => (
+                "Human".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(prompt.clone()),
+                default_response.clone(),
+                None,
+                None,
+            ),
 
-                StateKind::ParallelAgents { agents, consensus } => {
-                    let temporal_agents = agents
-                        .iter()
-                        .map(|a| TemporalParallelAgentConfig {
-                            agent: a.agent.clone(),
-                            input: a.input.clone(),
-                            weight: a.weight,
-                        })
-                        .collect();
+            StateKind::ParallelAgents { agents, consensus } => {
+                let temporal_agents = agents
+                    .iter()
+                    .map(|a| TemporalParallelAgentConfig {
+                        agent: a.agent.clone(),
+                        input: a.input.clone(),
+                        weight: a.weight,
+                    })
+                    .collect();
 
-                    let temporal_consensus = TemporalConsensusConfig {
-                        strategy: Self::map_consensus_strategy(consensus.strategy),
-                        threshold: consensus.threshold,
-                        agreement: consensus.min_agreement_confidence,
-                        n: consensus.n,
-                    };
+                let temporal_consensus = TemporalConsensusConfig {
+                    strategy: Self::map_consensus_strategy(consensus.strategy),
+                    threshold: consensus.threshold,
+                    agreement: consensus.min_agreement_confidence,
+                    n: consensus.n,
+                };
 
-                    (
-                        "ParallelAgents".to_string(),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        Some(temporal_agents),
-                        Some(temporal_consensus),
-                    )
-                }
-            };
+                (
+                    "ParallelAgents".to_string(),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(temporal_agents),
+                    Some(temporal_consensus),
+                )
+            }
+        };
 
         // Map transitions
         let transitions = state
@@ -277,45 +292,144 @@ impl TemporalWorkflowMapper {
     /// Map TransitionRule to TemporalTransitionRule
     fn map_transition_rule(rule: &TransitionRule) -> Result<TemporalTransitionRule> {
         let (condition, threshold, min, max, exit_code, value, expression) = match &rule.condition {
-            TransitionCondition::Always => ("always".to_string(), None, None, None, None, None, None),
-            TransitionCondition::OnSuccess => ("on_success".to_string(), None, None, None, None, None, None),
-            TransitionCondition::OnFailure => ("on_failure".to_string(), None, None, None, None, None, None),
-            TransitionCondition::ExitCodeZero => ("exit_code_zero".to_string(), None, None, None, None, None, None),
-            TransitionCondition::ExitCodeNonZero => {
-                ("exit_code_non_zero".to_string(), None, None, None, None, None, None)
+            TransitionCondition::Always => {
+                ("always".to_string(), None, None, None, None, None, None)
             }
-            TransitionCondition::ExitCode { value: v } => {
-                ("exit_code".to_string(), None, None, None, Some(*v), None, None)
+            TransitionCondition::OnSuccess => {
+                ("on_success".to_string(), None, None, None, None, None, None)
             }
-            TransitionCondition::ScoreAbove { threshold: t } => {
-                ("score_above".to_string(), Some(*t), None, None, None, None, None)
+            TransitionCondition::OnFailure => {
+                ("on_failure".to_string(), None, None, None, None, None, None)
             }
-            TransitionCondition::ScoreBelow { threshold: t } => {
-                ("score_below".to_string(), Some(*t), None, None, None, None, None)
-            }
-            TransitionCondition::ScoreBetween { min: mi, max: ma } => {
-                ("score_between".to_string(), None, Some(*mi), Some(*ma), None, None, None)
-            }
-            TransitionCondition::ConfidenceAbove { threshold: t } => {
-                ("confidence_above".to_string(), Some(*t), None, None, None, None, None)
-            }
-            TransitionCondition::Consensus { threshold: t, agreement: a } => {
-                ("consensus".to_string(), Some(*t), Some(*a), None, None, None, None)
-            }
-            TransitionCondition::AllApproved => ("all_approved".to_string(), None, None, None, None, None, None),
-            TransitionCondition::AnyRejected => ("any_rejected".to_string(), None, None, None, None, None, None),
-            TransitionCondition::InputEquals { value: v } => {
-                ("input_equals".to_string(), None, None, None, None, Some(v.clone()), None)
-            }
-            TransitionCondition::InputEqualsYes => {
-                ("input_equals_yes".to_string(), None, None, None, None, None, None)
-            }
-            TransitionCondition::InputEqualsNo => {
-                ("input_equals_no".to_string(), None, None, None, None, None, None)
-            }
-            TransitionCondition::Custom { expression: expr } => {
-                ("custom".to_string(), None, None, None, None, None, Some(expr.clone()))
-            }
+            TransitionCondition::ExitCodeZero => (
+                "exit_code_zero".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::ExitCodeNonZero => (
+                "exit_code_non_zero".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::ExitCode { value: v } => (
+                "exit_code".to_string(),
+                None,
+                None,
+                None,
+                Some(*v),
+                None,
+                None,
+            ),
+            TransitionCondition::ScoreAbove { threshold: t } => (
+                "score_above".to_string(),
+                Some(*t),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::ScoreBelow { threshold: t } => (
+                "score_below".to_string(),
+                Some(*t),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::ScoreBetween { min: mi, max: ma } => (
+                "score_between".to_string(),
+                None,
+                Some(*mi),
+                Some(*ma),
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::ConfidenceAbove { threshold: t } => (
+                "confidence_above".to_string(),
+                Some(*t),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::Consensus {
+                threshold: t,
+                agreement: a,
+            } => (
+                "consensus".to_string(),
+                Some(*t),
+                Some(*a),
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::AllApproved => (
+                "all_approved".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::AnyRejected => (
+                "any_rejected".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::InputEquals { value: v } => (
+                "input_equals".to_string(),
+                None,
+                None,
+                None,
+                None,
+                Some(v.clone()),
+                None,
+            ),
+            TransitionCondition::InputEqualsYes => (
+                "input_equals_yes".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::InputEqualsNo => (
+                "input_equals_no".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            TransitionCondition::Custom { expression: expr } => (
+                "custom".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(expr.clone()),
+            ),
         };
 
         Ok(TemporalTransitionRule {
@@ -362,14 +476,19 @@ impl TemporalWorkflowMapper {
                 StateKind::Agent { input, .. } => {
                     handlebars
                         .render_template(input, &serde_json::json!({}))
-                        .with_context(|| format!("Invalid template in state {}: {}", state_name, input))?;
+                        .with_context(|| {
+                            format!("Invalid template in state {}: {}", state_name, input)
+                        })?;
                 }
                 StateKind::System { env, .. } => {
                     for (key, value) in env {
                         handlebars
                             .render_template(value, &serde_json::json!({}))
                             .with_context(|| {
-                                format!("Invalid template in state {} env {}: {}", state_name, key, value)
+                                format!(
+                                    "Invalid template in state {} env {}: {}",
+                                    state_name, key, value
+                                )
                             })?;
                     }
                 }
@@ -378,7 +497,10 @@ impl TemporalWorkflowMapper {
                         handlebars
                             .render_template(&agent.input, &serde_json::json!({}))
                             .with_context(|| {
-                                format!("Invalid template in parallel agent {}: {}", agent.agent, agent.input)
+                                format!(
+                                    "Invalid template in parallel agent {}: {}",
+                                    agent.agent, agent.input
+                                )
                             })?;
                     }
                 }

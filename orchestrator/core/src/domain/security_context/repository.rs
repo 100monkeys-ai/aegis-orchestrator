@@ -8,8 +8,8 @@
 //! The repository is loaded once during orchestrator startup and consulted at
 //! every agent attestation via [`crate::application::attestation_service::AttestationServiceImpl`].
 
-use async_trait::async_trait;
 use anyhow::Result;
+use async_trait::async_trait;
 
 use super::security_context::SecurityContext;
 

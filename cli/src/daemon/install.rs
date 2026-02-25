@@ -18,10 +18,7 @@ const SERVICE_TEMPLATE: &str = include_str!("../../templates/aegis.service");
 #[cfg(target_os = "macos")]
 const PLIST_TEMPLATE: &str = include_str!("../../templates/io.aegis.daemon.plist");
 
-pub async fn install_service(
-    binary_path: Option<PathBuf>,
-    user: Option<String>,
-) -> Result<()> {
+pub async fn install_service(binary_path: Option<PathBuf>, user: Option<String>) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
         install_systemd(binary_path, user).await
@@ -62,8 +59,8 @@ async fn install_systemd(binary_path: Option<PathBuf>, user: Option<String>) -> 
     info!("Installing systemd service");
 
     // Determine binary path
-    let binary = binary_path
-        .unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
+    let binary =
+        binary_path.unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
 
     // Verify binary exists
     if !binary.exists() {
@@ -161,16 +158,15 @@ async fn install_launchd(binary_path: Option<PathBuf>, _user: Option<String>) ->
     info!("Installing LaunchDaemon");
 
     // Determine binary path
-    let binary = binary_path
-        .unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
+    let binary =
+        binary_path.unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
 
     if !binary.exists() {
         anyhow::bail!("Binary not found: {:?}", binary);
     }
 
     // Generate plist file
-    let plist_content = PLIST_TEMPLATE
-        .replace("{{BINARY_PATH}}", &binary.display().to_string());
+    let plist_content = PLIST_TEMPLATE.replace("{{BINARY_PATH}}", &binary.display().to_string());
 
     // Write to /Library/LaunchDaemons/io.aegis.daemon.plist
     let plist_path = "/Library/LaunchDaemons/io.aegis.daemon.plist";

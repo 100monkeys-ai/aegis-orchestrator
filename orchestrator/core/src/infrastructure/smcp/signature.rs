@@ -24,9 +24,11 @@
 //!
 //! See ADR-035 §3.3, AGENTS.md §SecurityToken.
 
-use anyhow::Result;
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation, Algorithm, TokenData};
 use crate::infrastructure::smcp::envelope::ContextClaims;
+use anyhow::Result;
+use jsonwebtoken::{
+    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
+};
 
 /// Validates RSA-256 signed SMCP SecurityTokens (JWTs).
 ///
@@ -66,13 +68,15 @@ impl SecurityTokenVerifier {
         let mut validation = Validation::new(Algorithm::RS256);
         validation.set_required_spec_claims(&["exp", "iss", "aud"]);
         validation.set_issuer(&[&self.expected_issuer]);
-        validation.set_audience(&self.expected_audiences.iter().map(String::as_str).collect::<Vec<_>>());
+        validation.set_audience(
+            &self
+                .expected_audiences
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+        );
 
-        let token_data = decode::<ContextClaims>(
-            token_str,
-            &self.decoding_key,
-            &validation
-        )?;
+        let token_data = decode::<ContextClaims>(token_str, &self.decoding_key, &validation)?;
         Ok(token_data)
     }
 }
@@ -127,7 +131,10 @@ mod tests {
 
     fn make_claims(iss: Option<&str>, aud: Option<Vec<String>>, exp_offset: i64) -> ContextClaims {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         ContextClaims {
             agent_id: "agent-1".to_string(),
             execution_id: "exec-1".to_string(),
@@ -140,9 +147,16 @@ mod tests {
         }
     }
 
-    fn make_claims_single_aud(iss: Option<&str>, aud: Option<&str>, exp_offset: i64) -> ContextClaims {
+    fn make_claims_single_aud(
+        iss: Option<&str>,
+        aud: Option<&str>,
+        exp_offset: i64,
+    ) -> ContextClaims {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         ContextClaims {
             agent_id: "agent-1".to_string(),
             execution_id: "exec-1".to_string(),
@@ -162,25 +176,52 @@ mod tests {
 
     #[test]
     fn test_verify_valid_token_with_iss_and_aud() {
-        let claims = make_claims(Some("aegis-orchestrator"), Some(vec!["aegis-agents".to_string()]), 3600);
+        let claims = make_claims(
+            Some("aegis-orchestrator"),
+            Some(vec!["aegis-agents".to_string()]),
+            3600,
+        );
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_ok());
     }
 
     #[test]
     fn test_verify_rejects_wrong_issuer() {
-        let claims = make_claims(Some("untrusted-issuer"), Some(vec!["aegis-agents".to_string()]), 3600);
+        let claims = make_claims(
+            Some("untrusted-issuer"),
+            Some(vec!["aegis-agents".to_string()]),
+            3600,
+        );
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
     #[test]
     fn test_verify_rejects_wrong_audience() {
-        let claims = make_claims(Some("aegis-orchestrator"), Some(vec!["wrong-audience".to_string()]), 3600);
+        let claims = make_claims(
+            Some("aegis-orchestrator"),
+            Some(vec!["wrong-audience".to_string()]),
+            3600,
+        );
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
@@ -188,7 +229,12 @@ mod tests {
     fn test_verify_rejects_missing_iss() {
         let claims = make_claims(None, Some(vec!["aegis-agents".to_string()]), 3600);
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
@@ -196,23 +242,46 @@ mod tests {
     fn test_verify_rejects_missing_aud() {
         let claims = make_claims(Some("aegis-orchestrator"), None, 3600);
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
     #[test]
     fn test_verify_accepts_token_with_one_of_multiple_audiences() {
-        let claims = make_claims(Some("aegis-orchestrator"), Some(vec!["aegis-agents".to_string()]), 3600);
+        let claims = make_claims(
+            Some("aegis-orchestrator"),
+            Some(vec!["aegis-agents".to_string()]),
+            3600,
+        );
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["other-service", "aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["other-service", "aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_ok());
     }
 
     #[test]
     fn test_verify_rejects_expired_token() {
-        let claims = make_claims(Some("aegis-orchestrator"), Some(vec!["aegis-agents".to_string()]), -3600);
+        let claims = make_claims(
+            Some("aegis-orchestrator"),
+            Some(vec!["aegis-agents".to_string()]),
+            -3600,
+        );
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
@@ -221,15 +290,26 @@ mod tests {
         // Token where aud is a single string (not an array) — both forms are valid per the JWT spec.
         let claims = make_claims_single_aud(Some("aegis-orchestrator"), Some("aegis-agents"), 3600);
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_ok());
     }
 
     #[test]
     fn test_verify_rejects_wrong_string_aud() {
-        let claims = make_claims_single_aud(Some("aegis-orchestrator"), Some("untrusted-audience"), 3600);
+        let claims =
+            make_claims_single_aud(Some("aegis-orchestrator"), Some("untrusted-audience"), 3600);
         let token = sign_claims(&claims);
-        let verifier = SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &["aegis-agents"]).unwrap();
+        let verifier = SecurityTokenVerifier::new(
+            TEST_RSA_PUBLIC_PEM,
+            "aegis-orchestrator",
+            &["aegis-agents"],
+        )
+        .unwrap();
         assert!(verifier.verify(&token).is_err());
     }
 
@@ -240,7 +320,8 @@ mod tests {
 
     #[test]
     fn test_new_rejects_empty_audiences() {
-        assert!(SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &[]).is_err());
+        assert!(
+            SecurityTokenVerifier::new(TEST_RSA_PUBLIC_PEM, "aegis-orchestrator", &[]).is_err()
+        );
     }
 }
-

@@ -16,18 +16,22 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements internal responsibilities for nfs gateway integration tests
 
-use aegis_core::application::nfs_gateway::{NfsGatewayService, EventBusPublisher};
-use aegis_core::domain::fsal::{AegisFSAL, FsalError, EventPublisher};
-use aegis_core::domain::storage::{StorageProvider, StorageError, FileHandle, FileAttributes, DirEntry, OpenMode, FileType};
-use aegis_core::domain::repository::{VolumeRepository, RepositoryError};
-use aegis_core::domain::volume::{Volume, VolumeId, VolumeOwnership, StorageClass, TenantId, FilerEndpoint};
-use aegis_core::domain::execution::ExecutionId;
+use aegis_core::application::nfs_gateway::{EventBusPublisher, NfsGatewayService};
 use aegis_core::domain::events::StorageEvent;
+use aegis_core::domain::execution::ExecutionId;
+use aegis_core::domain::fsal::{AegisFSAL, EventPublisher, FsalError};
 use aegis_core::domain::policy::FilesystemPolicy;
-use aegis_core::infrastructure::event_bus::{EventBus, DomainEvent};
-use std::sync::Arc;
+use aegis_core::domain::repository::{RepositoryError, VolumeRepository};
+use aegis_core::domain::storage::{
+    DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
+};
+use aegis_core::domain::volume::{
+    FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeOwnership,
+};
+use aegis_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
-use chrono::{Utc, Duration};
+use chrono::{Duration, Utc};
+use std::sync::Arc;
 
 // ── Test helper ─────────────────────────────────────────────────────────────
 
@@ -41,11 +45,14 @@ async fn create_attached_test_volume(
     let mut volume = Volume::new(
         "test-volume".to_string(),
         TenantId::default(),
-        StorageClass::Ephemeral { ttl: Duration::hours(24) },
+        StorageClass::Ephemeral {
+            ttl: Duration::hours(24),
+        },
         FilerEndpoint::new("http://filer:8888").unwrap(),
         quota_bytes,
         VolumeOwnership::Execution { execution_id },
-    ).unwrap();
+    )
+    .unwrap();
     volume.mark_available().unwrap();
     volume.mark_attached().unwrap();
     let volume_id = volume.id;
@@ -62,11 +69,21 @@ impl StorageProvider for MockStorageProvider {
         Ok(FileHandle(uuid::Uuid::new_v4().as_bytes().to_vec()))
     }
 
-    async fn read_at(&self, _handle: &FileHandle, _offset: u64, count: usize) -> Result<Vec<u8>, StorageError> {
+    async fn read_at(
+        &self,
+        _handle: &FileHandle,
+        _offset: u64,
+        count: usize,
+    ) -> Result<Vec<u8>, StorageError> {
         Ok(vec![0u8; count])
     }
 
-    async fn write_at(&self, _handle: &FileHandle, _offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+    async fn write_at(
+        &self,
+        _handle: &FileHandle,
+        _offset: u64,
+        data: &[u8],
+    ) -> Result<usize, StorageError> {
         Ok(data.len())
     }
 
@@ -171,7 +188,10 @@ impl VolumeRepository for MockVolumeRepository {
         Ok(Vec::new())
     }
 
-    async fn find_by_ownership(&self, _ownership: &VolumeOwnership) -> Result<Vec<Volume>, RepositoryError> {
+    async fn find_by_ownership(
+        &self,
+        _ownership: &VolumeOwnership,
+    ) -> Result<Vec<Volume>, RepositoryError> {
         Ok(Vec::new())
     }
 
@@ -188,7 +208,8 @@ async fn test_nfs_gateway_lifecycle() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     // Create NFS gateway service (use non-standard port for testing)
     let gateway = NfsGatewayService::new(
@@ -226,12 +247,14 @@ async fn test_fsal_mode_validation() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
     let execution_id = ExecutionId::new();
-    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
+    let volume_id =
+        create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
@@ -259,13 +282,15 @@ async fn test_fsal_path_traversal_prevention() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
     // Create test volume (path traversal check occurs after authorization, so volume must be attached)
     let execution_id = ExecutionId::new();
-    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
+    let volume_id =
+        create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
@@ -273,14 +298,20 @@ async fn test_fsal_path_traversal_prevention() {
     };
 
     // Test: Attempt path traversal attack
-    let handle = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/../etc/passwd");
-    let traversal_result = fsal.read(
-        &handle,
-        "/workspace/../etc/passwd", // Path traversal attempt
-        &policy,
-        0,
-        100,
-    ).await;
+    let handle = aegis_core::domain::fsal::AegisFileHandle::new(
+        execution_id,
+        volume_id,
+        "/workspace/../etc/passwd",
+    );
+    let traversal_result = fsal
+        .read(
+            &handle,
+            "/workspace/../etc/passwd", // Path traversal attempt
+            &policy,
+            0,
+            100,
+        )
+        .await;
 
     // Should be rejected by path sanitizer
     assert!(traversal_result.is_err());
@@ -295,12 +326,14 @@ async fn test_fsal_policy_enforcement() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
     let execution_id = ExecutionId::new();
-    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
+    let volume_id =
+        create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     // Policy: Only allow /workspace/data/* files
     let policy = FilesystemPolicy {
@@ -309,14 +342,20 @@ async fn test_fsal_policy_enforcement() {
     };
 
     // Test: Attempt to write outside allowlist
-    let handle1 = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/config.yaml");
-    let denied_result = fsal.read(
-        &handle1,
-        "/workspace/config.yaml", // Not in /workspace/data/*
-        &policy,
-        0,
-        100,
-    ).await;
+    let handle1 = aegis_core::domain::fsal::AegisFileHandle::new(
+        execution_id,
+        volume_id,
+        "/workspace/config.yaml",
+    );
+    let denied_result = fsal
+        .read(
+            &handle1,
+            "/workspace/config.yaml", // Not in /workspace/data/*
+            &policy,
+            0,
+            100,
+        )
+        .await;
 
     // Should be rejected by policy enforcement
     assert!(denied_result.is_err());
@@ -325,14 +364,14 @@ async fn test_fsal_policy_enforcement() {
     }
 
     // Test: Open file within allowlist
-    let handle2 = aegis_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, "/workspace/data/file.txt");
-    let allowed_result = fsal.read(
-        &handle2,
+    let handle2 = aegis_core::domain::fsal::AegisFileHandle::new(
+        execution_id,
+        volume_id,
         "/workspace/data/file.txt",
-        &policy,
-        0,
-        100,
-    ).await;
+    );
+    let allowed_result = fsal
+        .read(&handle2, "/workspace/data/file.txt", &policy, 0, 100)
+        .await;
 
     assert!(allowed_result.is_ok());
 }
@@ -343,12 +382,14 @@ async fn test_fsal_audit_events() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
     let execution_id = ExecutionId::new();
-    let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
+    let volume_id =
+        create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     let policy = FilesystemPolicy {
         read: vec!["/workspace/*".to_string()],
@@ -360,12 +401,10 @@ async fn test_fsal_audit_events() {
 
     // Create, write file
     let path = "/workspace/test.txt";
-    let handle = fsal.create_file(
-        execution_id,
-        volume_id,
-        path,
-        &policy,
-    ).await.unwrap();
+    let handle = fsal
+        .create_file(execution_id, volume_id, path, &policy)
+        .await
+        .unwrap();
 
     // Give event bus time to process
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
@@ -376,7 +415,10 @@ async fn test_fsal_audit_events() {
     }
 
     // Write file
-    let _ = fsal.write(&handle, path, &policy, 0, b"data").await.unwrap();
+    let _ = fsal
+        .write(&handle, path, &policy, 0, b"data")
+        .await
+        .unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     // Check for FileWritten event
@@ -391,7 +433,8 @@ async fn test_fsal_quota_enforcement() {
     let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
     let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
-    let event_publisher = Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
 
@@ -422,7 +465,10 @@ async fn test_fsal_quota_enforcement() {
     // Verify write was rejected with QuotaExceeded error
     assert!(write_result.is_err());
     match write_result {
-        Err(FsalError::QuotaExceeded { requested_bytes, available_bytes }) => {
+        Err(FsalError::QuotaExceeded {
+            requested_bytes,
+            available_bytes,
+        }) => {
             // Current usage: 5120 bytes
             // Quota: 1024 bytes
             // Available should be 0 (quota already exceeded by existing usage)
@@ -436,14 +482,19 @@ async fn test_fsal_quota_enforcement() {
 
     // Verify QuotaExceeded event was published
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-    
+
     let mut found_quota_event = false;
     while let Ok(event) = event_rx.try_recv() {
-        if matches!(event, DomainEvent::Storage(StorageEvent::QuotaExceeded { .. })) {
+        if matches!(
+            event,
+            DomainEvent::Storage(StorageEvent::QuotaExceeded { .. })
+        ) {
             found_quota_event = true;
             break;
         }
     }
-    assert!(found_quota_event, "QuotaExceeded event should have been published");
+    assert!(
+        found_quota_event,
+        "QuotaExceeded event should have been published"
+    );
 }
-

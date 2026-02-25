@@ -127,7 +127,9 @@ pub async fn handle_command(
             follow,
         } => run_workflow(name, input, params, follow, host, port).await,
         WorkflowCommand::List { long, labels } => list_workflows(long, labels, host, port).await,
-        WorkflowCommand::Describe { name, output } => describe_workflow(name, output, host, port).await,
+        WorkflowCommand::Describe { name, output } => {
+            describe_workflow(name, output, host, port).await
+        }
         WorkflowCommand::Logs {
             execution_id,
             follow,
@@ -150,13 +152,12 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
     println!();
 
     // Parse manifest
-    let workflow = WorkflowParser::parse_file(&file)
-        .context("Failed to parse workflow manifest")?;
+    let workflow =
+        WorkflowParser::parse_file(&file).context("Failed to parse workflow manifest")?;
 
     // Validate for cycles
     use aegis_core::domain::workflow::WorkflowValidator;
-    WorkflowValidator::check_for_cycles(&workflow)
-        .context("Workflow validation failed")?;
+    WorkflowValidator::check_for_cycles(&workflow).context("Workflow validation failed")?;
 
     // Success
     println!("{}", "✓ Workflow is valid!".green().bold());
@@ -170,10 +171,7 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
         println!("  Description: {}", description);
     }
     println!("  States:      {}", workflow.spec.states.len());
-    println!(
-        "  Initial:     {}",
-        workflow.spec.initial_state.as_str()
-    );
+    println!("  Initial:     {}", workflow.spec.initial_state.as_str());
 
     // Count terminal states
     let terminal_count = workflow
@@ -221,8 +219,8 @@ async fn deploy_workflow(file: PathBuf, host: &str, port: u16) -> Result<()> {
 
     // First validate locally
     use aegis_core::infrastructure::workflow_parser::WorkflowParser;
-    let workflow = WorkflowParser::parse_file(&file)
-        .context("Failed to parse workflow manifest")?;
+    let workflow =
+        WorkflowParser::parse_file(&file).context("Failed to parse workflow manifest")?;
 
     let workflow_name = workflow.metadata.name.clone();
 
@@ -269,8 +267,8 @@ async fn run_workflow(
 
     // Parse JSON input if provided
     if let Some(json) = input_json {
-        let parsed: serde_json::Value = serde_json::from_str(&json)
-            .context("Invalid JSON input")?;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).context("Invalid JSON input")?;
         if let Some(obj) = parsed.as_object() {
             input_params.extend(obj.clone());
         }
@@ -280,15 +278,18 @@ async fn run_workflow(
     for param in params {
         let parts: Vec<&str> = param.splitn(2, '=').collect();
         if parts.len() != 2 {
-            anyhow::bail!("Invalid parameter format: '{}'. Expected 'key=value'", param);
+            anyhow::bail!(
+                "Invalid parameter format: '{}'. Expected 'key=value'",
+                param
+            );
         }
         let key = parts[0].to_string();
         let value = parts[1].to_string();
-        
+
         // Try to parse as JSON, fall back to string
-        let json_value = serde_json::from_str(&value)
-            .unwrap_or_else(|_| serde_json::Value::String(value));
-        
+        let json_value =
+            serde_json::from_str(&value).unwrap_or_else(|_| serde_json::Value::String(value));
+
         input_params.insert(key, json_value);
     }
 
@@ -415,7 +416,12 @@ async fn list_workflows(long: bool, labels: Vec<String>, host: &str, port: u16) 
 }
 
 /// Describe a workflow (show YAML definition)
-async fn describe_workflow(name: String, output_format: String, host: &str, port: u16) -> Result<()> {
+async fn describe_workflow(
+    name: String,
+    output_format: String,
+    host: &str,
+    port: u16,
+) -> Result<()> {
     // Check daemon is running
     let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
@@ -441,14 +447,17 @@ async fn describe_workflow(name: String, output_format: String, host: &str, port
             println!("{}", workflow_yaml);
         }
         "json" => {
-            let parsed: serde_yaml::Value = serde_yaml::from_str(&workflow_yaml)
-                .context("Failed to parse workflow YAML")?;
-            let json = serde_json::to_string_pretty(&parsed)
-                .context("Failed to convert to JSON")?;
+            let parsed: serde_yaml::Value =
+                serde_yaml::from_str(&workflow_yaml).context("Failed to parse workflow YAML")?;
+            let json =
+                serde_json::to_string_pretty(&parsed).context("Failed to convert to JSON")?;
             println!("{}", json);
         }
         _ => {
-            anyhow::bail!("Invalid output format: '{}'. Use 'yaml' or 'json'", output_format);
+            anyhow::bail!(
+                "Invalid output format: '{}'. Use 'yaml' or 'json'",
+                output_format
+            );
         }
     }
 
@@ -485,7 +494,7 @@ async fn stream_workflow_logs(
     println!();
 
     let client = DaemonClient::new(host, port)?;
-    
+
     if follow {
         client
             .stream_workflow_logs(execution_id)
@@ -504,7 +513,12 @@ async fn stream_workflow_logs(
 }
 
 /// Delete a workflow from registry
-async fn delete_workflow(name: String, skip_confirmation: bool, host: &str, port: u16) -> Result<()> {
+async fn delete_workflow(
+    name: String,
+    skip_confirmation: bool,
+    host: &str,
+    port: u16,
+) -> Result<()> {
     // Check daemon is running
     let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
@@ -522,10 +536,7 @@ async fn delete_workflow(name: String, skip_confirmation: bool, host: &str, port
     // Confirmation prompt
     if !skip_confirmation {
         use std::io::{self, Write};
-        print!(
-            "{}",
-            format!("Delete workflow '{}' (y/N)? ", name).yellow()
-        );
+        print!("{}", format!("Delete workflow '{}' (y/N)? ", name).yellow());
         io::stdout().flush()?;
 
         let mut response = String::new();

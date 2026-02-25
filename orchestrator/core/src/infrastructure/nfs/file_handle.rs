@@ -70,13 +70,13 @@ pub enum FileHandleError {
 /// - [`FileHandleError::Serialization`] — bincode encountered an unexpected type.
 /// - [`FileHandleError::TooLarge`] — encoded size exceeds 64 bytes.
 pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandleError> {
-    let bytes = bincode::serialize(handle)
-        .map_err(|e| FileHandleError::Serialization(e.to_string()))?;
-    
+    let bytes =
+        bincode::serialize(handle).map_err(|e| FileHandleError::Serialization(e.to_string()))?;
+
     if bytes.len() > 64 {
         return Err(FileHandleError::TooLarge { size: bytes.len() });
     }
-    
+
     Ok(bytes)
 }
 
@@ -91,8 +91,7 @@ pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandl
 /// [`FileHandleError::Deserialization`] if the bytes are corrupt or the type
 /// layout has changed since the handle was created.
 pub fn decode_file_handle(bytes: &[u8]) -> Result<AegisFileHandle, FileHandleError> {
-    bincode::deserialize(bytes)
-        .map_err(|e| FileHandleError::Deserialization(e.to_string()))
+    bincode::deserialize(bytes).map_err(|e| FileHandleError::Deserialization(e.to_string()))
 }
 
 #[cfg(test)]
@@ -116,29 +115,24 @@ mod tests {
 
     #[test]
     fn test_size_limit() {
-        let handle = AegisFileHandle::new(
-            ExecutionId::new(),
-            VolumeId::new(),
-            "/workspace/test.txt",
-        );
+        let handle =
+            AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/test.txt");
 
         let bytes = encode_file_handle(&handle).unwrap();
-        assert!(bytes.len() <= 64, "FileHandle exceeds 64-byte NFSv3 limit: {} bytes", bytes.len());
+        assert!(
+            bytes.len() <= 64,
+            "FileHandle exceeds 64-byte NFSv3 limit: {} bytes",
+            bytes.len()
+        );
     }
 
     #[test]
     fn test_multiple_handles_different_bytes() {
-        let handle1 = AegisFileHandle::new(
-            ExecutionId::new(),
-            VolumeId::new(),
-            "/workspace/file1.txt",
-        );
+        let handle1 =
+            AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/file1.txt");
 
-        let handle2 = AegisFileHandle::new(
-            ExecutionId::new(),
-            VolumeId::new(),
-            "/workspace/file2.txt",
-        );
+        let handle2 =
+            AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/file2.txt");
 
         let bytes1 = encode_file_handle(&handle1).unwrap();
         let bytes2 = encode_file_handle(&handle2).unwrap();

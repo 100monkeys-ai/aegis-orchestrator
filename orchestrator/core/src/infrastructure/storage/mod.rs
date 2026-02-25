@@ -10,13 +10,15 @@
 //! - **Layer:** Infrastructure Layer
 //! - **Purpose:** Implements internal responsibilities for mod
 
-pub mod seaweedfs;
 pub mod local;
+pub mod seaweedfs;
 
-use crate::domain::storage::{StorageProvider, FileHandle, OpenMode, FileAttributes, DirEntry, FileType};
+use crate::domain::storage::{
+    DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageProvider,
+};
 
-pub use seaweedfs::SeaweedFSAdapter;
 pub use local::LocalStorageProvider;
+pub use seaweedfs::SeaweedFSAdapter;
 
 use std::sync::Arc;
 
@@ -25,10 +27,10 @@ use std::sync::Arc;
 pub enum StorageBackend {
     /// SeaweedFS distributed storage (production)
     SeaweedFS { filer_url: String },
-    
+
     /// Local filesystem storage (development/testing)
     Local { base_path: String },
-    
+
     /// Mock storage for unit testing
     Mock,
 }
@@ -36,13 +38,10 @@ pub enum StorageBackend {
 /// Factory function to create storage provider from configuration
 pub fn create_storage_provider(backend: StorageBackend) -> Arc<dyn StorageProvider> {
     match backend {
-        StorageBackend::SeaweedFS { filer_url } => {
-            Arc::new(SeaweedFSAdapter::new(filer_url))
-        }
-        StorageBackend::Local { base_path } => {
-            Arc::new(LocalStorageProvider::new(base_path)
-                .expect("Failed to create LocalStorageProvider"))
-        }
+        StorageBackend::SeaweedFS { filer_url } => Arc::new(SeaweedFSAdapter::new(filer_url)),
+        StorageBackend::Local { base_path } => Arc::new(
+            LocalStorageProvider::new(base_path).expect("Failed to create LocalStorageProvider"),
+        ),
         StorageBackend::Mock => {
             // Return mock implementation
             Arc::new(mock::MockStorageProvider::new())
@@ -55,10 +54,10 @@ pub use mock::MockStorageProvider;
 
 mod mock {
     use super::*;
-    use async_trait::async_trait;
     use crate::domain::storage::StorageError;
-    use std::sync::{Arc, Mutex};
+    use async_trait::async_trait;
     use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
 
     pub struct MockStorageProvider {
         pub directories: Arc<Mutex<HashMap<String, u64>>>,
@@ -118,15 +117,29 @@ mod mock {
         }
 
         // POSIX file operations (ADR-036)
-        async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
+        async fn open_file(
+            &self,
+            _path: &str,
+            _mode: OpenMode,
+        ) -> Result<FileHandle, StorageError> {
             Ok(FileHandle(b"mock-handle".to_vec()))
         }
 
-        async fn read_at(&self, _handle: &FileHandle, _offset: u64, length: usize) -> Result<Vec<u8>, StorageError> {
+        async fn read_at(
+            &self,
+            _handle: &FileHandle,
+            _offset: u64,
+            length: usize,
+        ) -> Result<Vec<u8>, StorageError> {
             Ok(vec![0u8; length])
         }
 
-        async fn write_at(&self, _handle: &FileHandle, _offset: u64, data: &[u8]) -> Result<usize, StorageError> {
+        async fn write_at(
+            &self,
+            _handle: &FileHandle,
+            _offset: u64,
+            data: &[u8],
+        ) -> Result<usize, StorageError> {
             Ok(data.len())
         }
 
@@ -166,7 +179,6 @@ mod mock {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,20 +188,20 @@ mod tests {
         let provider = create_storage_provider(StorageBackend::SeaweedFS {
             filer_url: "http://localhost:8888".to_string(),
         });
-        
+
         // Should not panic
         assert!(Arc::strong_count(&provider) == 1);
     }
-    
+
     #[test]
     fn test_factory_local() {
         use tempfile::TempDir;
-        
+
         let temp_dir = TempDir::new().unwrap();
         let provider = create_storage_provider(StorageBackend::Local {
             base_path: temp_dir.path().to_string_lossy().to_string(),
         });
-        
+
         // Should not panic
         assert!(Arc::strong_count(&provider) == 1);
     }
@@ -197,7 +209,7 @@ mod tests {
     #[test]
     fn test_factory_mock() {
         let provider = create_storage_provider(StorageBackend::Mock);
-        
+
         // Should not panic
         assert!(Arc::strong_count(&provider) == 1);
     }

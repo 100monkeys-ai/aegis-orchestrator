@@ -16,7 +16,7 @@
 //!
 //! See AGENTS.md §BC-4 Security Policy Context, ADR-035 (SMCP).
 
-use crate::domain::policy::{SecurityPolicy, NetworkPolicy, FilesystemPolicy, ResourceLimits};
+use crate::domain::policy::{FilesystemPolicy, NetworkPolicy, ResourceLimits, SecurityPolicy};
 use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
@@ -43,7 +43,13 @@ pub struct ResourceUsage {
 #[async_trait]
 pub trait PolicyService: Send + Sync {
     async fn validate_policy(&self, policy: &SecurityPolicy) -> Result<()>;
-    async fn enforce_network(&self, policy: &NetworkPolicy, request: &NetworkRequest) -> Result<()>;
-    async fn enforce_filesystem(&self, policy: &FilesystemPolicy, path: &Path, mode: AccessMode) -> Result<()>;
+    async fn enforce_network(&self, policy: &NetworkPolicy, request: &NetworkRequest)
+        -> Result<()>;
+    async fn enforce_filesystem(
+        &self,
+        policy: &FilesystemPolicy,
+        path: &Path,
+        mode: AccessMode,
+    ) -> Result<()>;
     async fn check_resources(&self, limits: &ResourceLimits, usage: &ResourceUsage) -> Result<()>;
 }

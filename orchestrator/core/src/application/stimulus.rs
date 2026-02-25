@@ -23,8 +23,8 @@ use tracing::{debug, info, warn};
 
 use crate::application::execution::ExecutionService;
 use crate::application::{StartWorkflowExecutionRequest, StartWorkflowExecutionUseCase};
-use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 use crate::domain::events::StimulusEvent;
+use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 use crate::domain::stimulus::{RoutingDecision, RoutingMode, Stimulus, StimulusId};
 use crate::domain::workflow_registry::WorkflowRegistry;
 use crate::infrastructure::event_bus::EventBus;
@@ -117,7 +117,11 @@ pub trait StimulusService: Send + Sync {
     /// Register a direct route: `source_name → workflow_id`.
     ///
     /// Bypasses LLM classification entirely when matched.
-    async fn register_route(&self, source_name: &str, workflow_id: crate::domain::workflow::WorkflowId) -> anyhow::Result<()>;
+    async fn register_route(
+        &self,
+        source_name: &str,
+        workflow_id: crate::domain::workflow::WorkflowId,
+    ) -> anyhow::Result<()>;
 
     /// Remove a direct route by source name.
     async fn remove_route(&self, source_name: &str) -> bool;
@@ -187,7 +191,10 @@ impl StandardStimulusService {
             if let Some(entry) = self.idempotency_cache.get(&cache_key) {
                 let (original_id, recorded_at) = entry.value();
                 // Check TTL — if entry is still fresh, treat as duplicate
-                if Utc::now().signed_duration_since(*recorded_at).to_std().ok()
+                if Utc::now()
+                    .signed_duration_since(*recorded_at)
+                    .to_std()
+                    .ok()
                     .map(|age| age < self.idempotency_ttl)
                     .unwrap_or(false)
                 {
@@ -204,7 +211,8 @@ impl StandardStimulusService {
     fn record_idempotency(&self, stimulus: &Stimulus) {
         if let Some(key) = &stimulus.idempotency_key {
             let cache_key = (stimulus.source.name(), key.clone());
-            self.idempotency_cache.insert(cache_key, (stimulus.id, Utc::now()));
+            self.idempotency_cache
+                .insert(cache_key, (stimulus.id, Utc::now()));
         }
     }
 
@@ -228,9 +236,12 @@ impl StandardStimulusService {
         }
 
         // Stage 2: LLM RouterAgent classification
-        let agent_id = registry.router_agent().ok_or_else(|| {
-            StimulusError::NoRouterConfigured { source_name: source_key.clone() }
-        })?;
+        let agent_id =
+            registry
+                .router_agent()
+                .ok_or_else(|| StimulusError::NoRouterConfigured {
+                    source_name: source_key.clone(),
+                })?;
         let threshold = registry.confidence_threshold();
         drop(registry); // release read lock before async I/O
 
@@ -247,13 +258,16 @@ impl StandardStimulusService {
         };
 
         // Run the RouterAgent
-        let exec_id = self.execution_service
+        let exec_id = self
+            .execution_service
             .start_execution(agent_id, input)
             .await
             .map_err(|e| StimulusError::RouterAgentFailed(e.to_string()))?;
 
         // Poll for completion (RouterAgent is a single-iteration agent)
-        let result = self.await_execution_output(exec_id).await
+        let result = self
+            .await_execution_output(exec_id)
+            .await
             .map_err(|e| StimulusError::RouterAgentFailed(e.to_string()))?;
 
         // Parse classification JSON
@@ -268,7 +282,10 @@ impl StandardStimulusService {
                 threshold,
                 "RouterAgent classification below confidence threshold"
             );
-            return Err(StimulusError::LowConfidence { confidence, threshold });
+            return Err(StimulusError::LowConfidence {
+                confidence,
+                threshold,
+            });
         }
 
         let workflow_name = classification["workflow"]
@@ -278,7 +295,9 @@ impl StandardStimulusService {
 
         let registry = self.registry.read().await;
         let workflow_id = registry.lookup_direct(&workflow_name).ok_or_else(|| {
-            StimulusError::UnknownWorkflow { workflow: workflow_name.clone() }
+            StimulusError::UnknownWorkflow {
+                workflow: workflow_name.clone(),
+            }
         })?;
 
         Ok(RoutingDecision {
@@ -299,7 +318,10 @@ impl StandardStimulusService {
 
         loop {
             if tokio::time::Instant::now() > deadline {
-                anyhow::bail!("RouterAgent classification timed out after {:?}", self.classification_timeout);
+                anyhow::bail!(
+                    "RouterAgent classification timed out after {:?}",
+                    self.classification_timeout
+                );
             }
 
             let execution = self.execution_service.get_execution(exec_id).await?;
@@ -343,29 +365,41 @@ impl StimulusService for StandardStimulusService {
         }
 
         // ── 2. Publish StimulusReceived event ────────────────────────────────
-        self.event_bus.publish_stimulus_event(StimulusEvent::StimulusReceived {
-            stimulus_id: stimulus.id,
-            source: stimulus.source.name(),
-            received_at: stimulus.received_at,
-        });
+        self.event_bus
+            .publish_stimulus_event(StimulusEvent::StimulusReceived {
+                stimulus_id: stimulus.id,
+                source: stimulus.source.name(),
+                received_at: stimulus.received_at,
+            });
 
         // ── 3. Route the stimulus ─────────────────────────────────────────────
         let decision = match self.route(&stimulus).await {
             Ok(d) => d,
-            Err(StimulusError::LowConfidence { confidence, threshold }) => {
-                self.event_bus.publish_stimulus_event(StimulusEvent::StimulusRejected {
-                    stimulus_id: stimulus.id,
-                    reason: format!("low_confidence: {:.2} (threshold: {:.2})", confidence, threshold),
-                    rejected_at: Utc::now(),
+            Err(StimulusError::LowConfidence {
+                confidence,
+                threshold,
+            }) => {
+                self.event_bus
+                    .publish_stimulus_event(StimulusEvent::StimulusRejected {
+                        stimulus_id: stimulus.id,
+                        reason: format!(
+                            "low_confidence: {:.2} (threshold: {:.2})",
+                            confidence, threshold
+                        ),
+                        rejected_at: Utc::now(),
+                    });
+                return Err(StimulusError::LowConfidence {
+                    confidence,
+                    threshold,
                 });
-                return Err(StimulusError::LowConfidence { confidence, threshold });
             }
             Err(e) => {
-                self.event_bus.publish_stimulus_event(StimulusEvent::ClassificationFailed {
-                    stimulus_id: stimulus.id,
-                    error: e.to_string(),
-                    failed_at: Utc::now(),
-                });
+                self.event_bus
+                    .publish_stimulus_event(StimulusEvent::ClassificationFailed {
+                        stimulus_id: stimulus.id,
+                        error: e.to_string(),
+                        failed_at: Utc::now(),
+                    });
                 return Err(e);
             }
         };
@@ -382,7 +416,8 @@ impl StimulusService for StandardStimulusService {
             blackboard: None,
         };
 
-        let started = self.start_workflow_use_case
+        let started = self
+            .start_workflow_use_case
             .start_execution(workflow_request)
             .await
             .map_err(StimulusError::WorkflowError)?;
@@ -391,13 +426,14 @@ impl StimulusService for StandardStimulusService {
         self.record_idempotency(&stimulus);
 
         // ── 6. Publish StimulusClassified event ───────────────────────────────
-        self.event_bus.publish_stimulus_event(StimulusEvent::StimulusClassified {
-            stimulus_id: stimulus.id,
-            workflow_id: decision.workflow_id.0.to_string(),
-            confidence: decision.confidence,
-            routing_mode: format!("{:?}", decision.mode),
-            classified_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_stimulus_event(StimulusEvent::StimulusClassified {
+                stimulus_id: stimulus.id,
+                workflow_id: decision.workflow_id.0.to_string(),
+                confidence: decision.confidence,
+                routing_mode: format!("{:?}", decision.mode),
+                classified_at: Utc::now(),
+            });
 
         info!(
             stimulus_id = %stimulus.id,

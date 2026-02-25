@@ -28,23 +28,23 @@
 //! See ADR-032 (Unified Storage via SeaweedFS), ADR-036 (NFS Gateway),
 //! AGENTS.md §BC-7 Storage Gateway.
 
-use crate::domain::volume::{
-    Volume, VolumeId, TenantId, StorageClass, FilerEndpoint, 
-    VolumeOwnership, VolumeMount, AccessMode,
-};
-use crate::domain::repository::VolumeRepository;
-use crate::domain::storage::StorageProvider;
-use crate::domain::runtime::InstanceId;
+use crate::domain::agent::VolumeSpec;
 use crate::domain::events::VolumeEvent;
 use crate::domain::execution::ExecutionId;
-use crate::domain::agent::VolumeSpec;
+use crate::domain::repository::VolumeRepository;
+use crate::domain::runtime::InstanceId;
+use crate::domain::storage::StorageProvider;
+use crate::domain::volume::{
+    AccessMode, FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeMount,
+    VolumeOwnership,
+};
 use crate::infrastructure::event_bus::EventBus;
-use anyhow::{Result, Context};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
-use std::sync::Arc;
-use std::path::PathBuf;
 use chrono::Utc;
-use tracing::{info, warn, error, debug};
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{debug, error, info, warn};
 
 // ============================================================================
 // Service Trait
@@ -114,11 +114,7 @@ pub trait VolumeService: Send + Sync {
     /// Detach a volume from an instance.
     ///
     /// Publishes [`crate::domain::events::VolumeEvent::VolumeDetached`].
-    async fn detach_volume(
-        &self,
-        volume_id: VolumeId,
-        instance_id: InstanceId,
-    ) -> Result<()>;
+    async fn detach_volume(&self, volume_id: VolumeId, instance_id: InstanceId) -> Result<()>;
 
     /// Mark a volume for deletion.
     ///
@@ -186,9 +182,8 @@ impl StandardVolumeService {
         event_bus: Arc<EventBus>,
         filer_url: String,
     ) -> Result<Self> {
-        let filer_endpoint = FilerEndpoint::new(filer_url)
-            .context("Invalid filer URL")?;
-        
+        let filer_endpoint = FilerEndpoint::new(filer_url).context("Invalid filer URL")?;
+
         Ok(Self {
             repository,
             storage_provider,
@@ -241,7 +236,9 @@ impl VolumeService for StandardVolumeService {
 
         // Transition volume from Creating → Available now that storage is provisioned
         let mut volume = volume;
-        volume.mark_available().context("Failed to mark volume as available")?;
+        volume
+            .mark_available()
+            .context("Failed to mark volume as available")?;
 
         // Persist to database
         self.repository
@@ -250,18 +247,21 @@ impl VolumeService for StandardVolumeService {
             .context("Failed to save volume to repository")?;
 
         // Publish domain event
-        self.event_bus.publish_volume_event(VolumeEvent::VolumeCreated {
-            volume_id,
-            execution_id: match &ownership {
-                VolumeOwnership::Execution { execution_id } => Some(*execution_id),
-                VolumeOwnership::WorkflowExecution { workflow_execution_id: _ } => None,
-                VolumeOwnership::Persistent { owner: _ } => None,
-            },
-            storage_class: storage_class.clone(),
-            remote_path: remote_path.clone(),
-            size_limit_bytes,
-            created_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_volume_event(VolumeEvent::VolumeCreated {
+                volume_id,
+                execution_id: match &ownership {
+                    VolumeOwnership::Execution { execution_id } => Some(*execution_id),
+                    VolumeOwnership::WorkflowExecution {
+                        workflow_execution_id: _,
+                    } => None,
+                    VolumeOwnership::Persistent { owner: _ } => None,
+                },
+                storage_class: storage_class.clone(),
+                remote_path: remote_path.clone(),
+                size_limit_bytes,
+                created_at: Utc::now(),
+            });
 
         info!(
             "Volume '{}' created successfully (id: {}, remote_path: {})",
@@ -332,13 +332,14 @@ impl VolumeService for StandardVolumeService {
         let volume_mount = volume.to_mount(mount_point.clone(), access_mode);
 
         // Publish domain event
-        self.event_bus.publish_volume_event(VolumeEvent::VolumeAttached {
-            volume_id,
-            instance_id: instance_id.clone(),
-            mount_point: mount_point.to_string_lossy().to_string(),
-            access_mode: format!("{:?}", access_mode),
-            attached_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_volume_event(VolumeEvent::VolumeAttached {
+                volume_id,
+                instance_id: instance_id.clone(),
+                mount_point: mount_point.to_string_lossy().to_string(),
+                access_mode: format!("{:?}", access_mode),
+                attached_at: Utc::now(),
+            });
 
         info!(
             "Volume {} attached to instance {:?} successfully",
@@ -348,11 +349,7 @@ impl VolumeService for StandardVolumeService {
         Ok(volume_mount)
     }
 
-    async fn detach_volume(
-        &self,
-        volume_id: VolumeId,
-        instance_id: InstanceId,
-    ) -> Result<()> {
+    async fn detach_volume(&self, volume_id: VolumeId, instance_id: InstanceId) -> Result<()> {
         info!(
             "Detaching volume {} from instance {:?}",
             volume_id, instance_id
@@ -380,11 +377,12 @@ impl VolumeService for StandardVolumeService {
             .context("Failed to save volume after detach")?;
 
         // Publish domain event
-        self.event_bus.publish_volume_event(VolumeEvent::VolumeDetached {
-            volume_id,
-            instance_id: instance_id.clone(),
-            detached_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_volume_event(VolumeEvent::VolumeDetached {
+                volume_id,
+                instance_id: instance_id.clone(),
+                detached_at: Utc::now(),
+            });
 
         info!(
             "Volume {} detached from instance {:?} successfully",
@@ -413,7 +411,10 @@ impl VolumeService for StandardVolumeService {
         let remote_path = volume.remote_path.clone();
         match self.storage_provider.delete_directory(&remote_path).await {
             Ok(_) => {
-                debug!("Volume directory {} deleted from storage backend", remote_path);
+                debug!(
+                    "Volume directory {} deleted from storage backend",
+                    remote_path
+                );
             }
             Err(e) => {
                 warn!(
@@ -434,10 +435,11 @@ impl VolumeService for StandardVolumeService {
             .context("Failed to mark volume as deleted")?;
 
         // Publish domain event
-        self.event_bus.publish_volume_event(VolumeEvent::VolumeDeleted {
-            volume_id,
-            deleted_at: Utc::now(),
-        });
+        self.event_bus
+            .publish_volume_event(VolumeEvent::VolumeDeleted {
+                volume_id,
+                deleted_at: Utc::now(),
+            });
 
         info!("Volume {} deleted successfully", volume_id);
 
@@ -462,18 +464,17 @@ impl VolumeService for StandardVolumeService {
         if usage_bytes > volume.size_limit_bytes {
             warn!(
                 "Volume {} quota exceeded: {} bytes used, {} bytes limit",
-                volume_id,
-                usage_bytes,
-                volume.size_limit_bytes
+                volume_id, usage_bytes, volume.size_limit_bytes
             );
 
             // Publish quota exceeded event
-            self.event_bus.publish_volume_event(VolumeEvent::VolumeQuotaExceeded {
-                volume_id,
-                size_limit_bytes: volume.size_limit_bytes,
-                actual_bytes: usage_bytes,
-                exceeded_at: Utc::now(),
-            });
+            self.event_bus
+                .publish_volume_event(VolumeEvent::VolumeQuotaExceeded {
+                    volume_id,
+                    size_limit_bytes: volume.size_limit_bytes,
+                    actual_bytes: usage_bytes,
+                    exceeded_at: Utc::now(),
+                });
         }
 
         Ok(usage_bytes)
@@ -496,12 +497,13 @@ impl VolumeService for StandardVolumeService {
         let mut deleted_count = 0usize;
         for volume in expired_volumes {
             let volume_id = volume.id;
-            
+
             // Publish expiration event
-            self.event_bus.publish_volume_event(VolumeEvent::VolumeExpired {
-                volume_id,
-                expired_at: Utc::now(),
-            });
+            self.event_bus
+                .publish_volume_event(VolumeEvent::VolumeExpired {
+                    volume_id,
+                    expired_at: Utc::now(),
+                });
 
             // Delete volume (includes storage cleanup)
             match self.delete_volume(volume_id).await {
@@ -516,10 +518,13 @@ impl VolumeService for StandardVolumeService {
             }
         }
 
-        info!("Cleanup completed: {}/{} expired volumes deleted", deleted_count, count);
+        info!(
+            "Cleanup completed: {}/{} expired volumes deleted",
+            deleted_count, count
+        );
         Ok(deleted_count)
     }
-    
+
     async fn create_volumes_for_execution(
         &self,
         execution_id: ExecutionId,
@@ -532,7 +537,7 @@ impl VolumeService for StandardVolumeService {
         if volume_specs.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         info!(
             "Creating {} volumes for execution {} (storage_mode: {}, fallback: {})",
             volume_specs.len(),
@@ -540,14 +545,16 @@ impl VolumeService for StandardVolumeService {
             storage_mode,
             fallback_to_local
         );
-        
+
         let mut volumes = Vec::new();
-        
+
         for spec in volume_specs {
             // Parse size limit from string (e.g., "1Gi", "500Mi")
-            let size_limit_bytes = parse_size_string(&spec.size_limit)
-                .context(format!("Invalid size_limit '{}' in volume spec '{}'", spec.size_limit, spec.name))?;
-            
+            let size_limit_bytes = parse_size_string(&spec.size_limit).context(format!(
+                "Invalid size_limit '{}' in volume spec '{}'",
+                spec.size_limit, spec.name
+            ))?;
+
             // Parse storage class
             let storage_class = match spec.storage_class.as_str() {
                 "ephemeral" => {
@@ -563,10 +570,10 @@ impl VolumeService for StandardVolumeService {
                     ));
                 }
             };
-            
+
             // Create volume ownership tied to execution
             let ownership = VolumeOwnership::execution(execution_id);
-            
+
             // Attempt to create volume
             let volume_id = match storage_mode {
                 "seaweedfs" => {
@@ -621,23 +628,23 @@ impl VolumeService for StandardVolumeService {
                     ));
                 }
             };
-            
+
             // Fetch created volume
             let volume = self.get_volume(volume_id).await?;
             volumes.push(volume);
-            
+
             info!(
                 "Volume '{}' created successfully (id: {}, size: {} bytes)",
                 spec.name, volume_id, size_limit_bytes
             );
         }
-        
+
         info!(
             "Successfully created {} volumes for execution {}",
             volumes.len(),
             execution_id
         );
-        
+
         Ok(volumes)
     }
 }
@@ -645,20 +652,16 @@ impl VolumeService for StandardVolumeService {
 /// Parse size string like "1Gi", "500Mi", "100Ki" to bytes
 fn parse_size_string(size: &str) -> Result<u64> {
     let size = size.trim();
-    
+
     // Find where digits end and unit begins
-    let (number_part, unit_part) = size
-        .split_at(
-            size
-                .find(|c: char| c.is_alphabetic())
-                .unwrap_or(size.len())
-        );
-    
+    let (number_part, unit_part) =
+        size.split_at(size.find(|c: char| c.is_alphabetic()).unwrap_or(size.len()));
+
     let number: u64 = number_part
         .trim()
         .parse()
         .context(format!("Invalid number in size '{}'", size))?;
-    
+
     let multiplier: u64 = match unit_part.trim().to_lowercase().as_str() {
         "ki" => 1024,
         "mi" => 1024 * 1024,
@@ -676,19 +679,19 @@ fn parse_size_string(size: &str) -> Result<u64> {
             ));
         }
     };
-    
+
     Ok(number * multiplier)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::execution::ExecutionId;
     use crate::domain::repository::RepositoryError;
     use crate::infrastructure::storage::MockStorageProvider;
-    use crate::domain::execution::ExecutionId;
+    use chrono::Duration;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
-    use chrono::Duration;
 
     // Mock VolumeRepository for testing
     struct MockVolumeRepository {
@@ -716,7 +719,10 @@ mod tests {
             Ok(volumes.get(&id).cloned())
         }
 
-        async fn find_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>, RepositoryError> {
+        async fn find_by_tenant(
+            &self,
+            tenant_id: TenantId,
+        ) -> Result<Vec<Volume>, RepositoryError> {
             let volumes = self.volumes.lock().await;
             Ok(volumes
                 .values()
@@ -734,7 +740,10 @@ mod tests {
                 .collect())
         }
 
-        async fn find_by_ownership(&self, ownership: &VolumeOwnership) -> Result<Vec<Volume>, RepositoryError> {
+        async fn find_by_ownership(
+            &self,
+            ownership: &VolumeOwnership,
+        ) -> Result<Vec<Volume>, RepositoryError> {
             let volumes = self.volumes.lock().await;
             Ok(volumes
                 .values()
@@ -750,17 +759,22 @@ mod tests {
         }
     }
 
-    fn create_test_service() -> (StandardVolumeService, Arc<MockVolumeRepository>, Arc<MockStorageProvider>) {
+    fn create_test_service() -> (
+        StandardVolumeService,
+        Arc<MockVolumeRepository>,
+        Arc<MockStorageProvider>,
+    ) {
         let repository = Arc::new(MockVolumeRepository::new());
         let storage_provider = Arc::new(MockStorageProvider::new());
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        
+
         let service = StandardVolumeService::new(
             repository.clone(),
             storage_provider.clone(),
             event_bus,
             "http://localhost:8888".to_string(),
-        ).expect("Failed to create test service");
+        )
+        .expect("Failed to create test service");
 
         (service, repository, storage_provider)
     }
@@ -822,7 +836,12 @@ mod tests {
         let instance_id = InstanceId::new("test-instance-001".to_string());
         let mount_point = PathBuf::from("/workspace");
         let volume_mount = service
-            .attach_volume(volume_id, instance_id.clone(), mount_point.clone(), AccessMode::ReadWrite)
+            .attach_volume(
+                volume_id,
+                instance_id.clone(),
+                mount_point.clone(),
+                AccessMode::ReadWrite,
+            )
             .await
             .expect("Failed to attach volume");
 
@@ -837,8 +856,14 @@ mod tests {
             .expect("Failed to detach volume");
 
         // Verify volume state
-        let volume = service.get_volume(volume_id).await.expect("Volume not found");
-        assert!(volume.can_attach(), "Volume should be attachable after detach");
+        let volume = service
+            .get_volume(volume_id)
+            .await
+            .expect("Volume not found");
+        assert!(
+            volume.can_attach(),
+            "Volume should be attachable after detach"
+        );
     }
 
     #[tokio::test]
@@ -873,13 +898,19 @@ mod tests {
             .await
             .expect("Repository error")
             .expect("Volume not found");
-        
+
         // Volume should be in Deleted state
-        assert!(!volume.can_attach(), "Deleted volume should not be attachable");
+        assert!(
+            !volume.can_attach(),
+            "Deleted volume should not be attachable"
+        );
 
         // Verify storage provider deleted directory
         let directories = storage_provider.directories.lock().unwrap();
-        assert!(!directories.contains_key(&remote_path), "Directory should be deleted");
+        assert!(
+            !directories.contains_key(&remote_path),
+            "Directory should be deleted"
+        );
     }
 
     #[tokio::test]
@@ -914,7 +945,10 @@ mod tests {
         assert_eq!(count, 1, "Should have cleaned up 1 expired volume");
 
         // Verify volume deleted
-        let volume = service.get_volume(volume_id).await.expect("Volume not found");
+        let volume = service
+            .get_volume(volume_id)
+            .await
+            .expect("Volume not found");
         assert!(!volume.can_attach(), "Expired volume should be deleted");
     }
 }
