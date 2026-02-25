@@ -89,5 +89,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --workspace --locked
-        env:
-          DATABASE_URL: postgresql://aegis:aegis@localhost:5432/aegis

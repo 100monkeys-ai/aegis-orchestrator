@@ -336,8 +336,10 @@ impl<'de> Deserialize<'de> for SemanticValidation {
         struct SemanticValidationHelper {
             #[serde(default = "default_true")]
             enabled: bool,
-            model: String,
-            prompt: String,
+            #[serde(default)]
+            model: Option<String>,
+            #[serde(default)]
+            prompt: Option<String>,
             #[serde(default = "default_semantic_threshold")]
             threshold: f64,
             #[serde(default = "default_validation_timeout")]
@@ -356,14 +358,46 @@ impl<'de> Deserialize<'de> for SemanticValidation {
             )));
         }
 
+        let mut model = helper.model.unwrap_or_else(default_semantic_model);
+        if model.trim().is_empty() {
+            model = default_semantic_model();
+        }
+
+        let mut prompt = helper.prompt.unwrap_or_else(default_semantic_prompt);
+        if prompt.trim().is_empty() {
+            prompt = default_semantic_prompt();
+        }
+
         Ok(SemanticValidation {
             enabled: helper.enabled,
-            model: helper.model,
-            prompt: helper.prompt,
+            model,
+            prompt,
             threshold: helper.threshold,
             timeout_seconds: helper.timeout_seconds,
             fallback_on_unavailable: helper.fallback_on_unavailable,
         })
+    }
+}
+
+impl SemanticValidation {
+    pub fn default_for_task() -> Self {
+        Self {
+            enabled: true,
+            model: default_semantic_model(),
+            prompt: default_semantic_prompt(),
+            threshold: default_semantic_threshold(),
+            timeout_seconds: default_validation_timeout(),
+            fallback_on_unavailable: FallbackBehavior::default(),
+        }
+    }
+
+    pub fn apply_defaults(&mut self) {
+        if self.model.trim().is_empty() {
+            self.model = default_semantic_model();
+        }
+        if self.prompt.trim().is_empty() {
+            self.prompt = default_semantic_prompt();
+        }
     }
 }
 
@@ -625,6 +659,13 @@ fn default_validation_timeout() -> u64 {
 fn default_semantic_threshold() -> f64 {
     0.8
 }
+pub(crate) const DEFAULT_SEMANTIC_PROMPT_TEMPLATE: &str = "Evaluate whether this output meets the task requirements.\n\nTask:\n{criteria}\n\nOutput:\n{output}\n\nRespond: {\"success\": true/false, \"confidence\": 0.0-1.0, \"feedback\": \"...\"}\n";
+fn default_semantic_prompt() -> String {
+    DEFAULT_SEMANTIC_PROMPT_TEMPLATE.to_string()
+}
+fn default_semantic_model() -> String {
+    "default".to_string()
+}
 fn default_post() -> String {
     "POST".to_string()
 }
@@ -694,6 +735,47 @@ impl Agent {
 }
 
 impl AgentManifest {
+    pub fn apply_defaults(&mut self) {
+        self.apply_semantic_defaults();
+    }
+
+    fn apply_semantic_defaults(&mut self) {
+        let has_instruction = self
+            .spec
+            .task
+            .as_ref()
+            .and_then(|task| task.instruction.as_ref())
+            .map(|instruction| !instruction.trim().is_empty())
+            .unwrap_or(false);
+
+        if !has_instruction {
+            return;
+        }
+
+        let execution = self
+            .spec
+            .execution
+            .get_or_insert_with(|| ExecutionStrategy {
+                mode: ExecutionMode::default(),
+                max_retries: default_max_retries(),
+                timeout_per_iteration: None,
+                validation: None,
+                delivery: None,
+            });
+
+        let validation = execution.validation.get_or_insert(ValidationConfig {
+            system: None,
+            output: None,
+            script: None,
+            semantic: None,
+        });
+
+        match validation.semantic.as_mut() {
+            Some(semantic) => semantic.apply_defaults(),
+            None => validation.semantic = Some(SemanticValidation::default_for_task()),
+        }
+    }
+
     /// Validate the manifest structure and constraints
     pub fn validate(&self) -> Result<(), String> {
         // Validate API version
