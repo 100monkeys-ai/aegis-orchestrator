@@ -35,6 +35,7 @@
 
 use crate::domain::execution::ExecutionInput;
 use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput};
+use crate::domain::validation::{ValidationContext, ValidationPipeline, ValidationResults};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -71,9 +72,17 @@ pub trait SupervisorObserver: Send + Sync {
     async fn on_iteration_complete(&self, iteration: u8, result: &str, exit_code: i64);
     async fn on_iteration_fail(&self, iteration: u8, error: &str);
 
-    // New methods for instance lifecycle
+    // Instance lifecycle events
     async fn on_instance_spawned(&self, iteration: u8, instance_id: &InstanceId);
     async fn on_instance_terminated(&self, iteration: u8, instance_id: &InstanceId);
+
+    /// Called after gradient validation completes for a successful iteration (ADR-017).
+    async fn on_validation_complete(
+        &self,
+        iteration: u8,
+        results: &ValidationResults,
+        passed: bool,
+    );
 }
 
 pub struct Supervisor {
@@ -91,9 +100,13 @@ impl Supervisor {
     /// ensuring complete isolation between iterations. Each instance is
     /// terminated after the iteration completes (success or failure).
     ///
-    /// NOTE: This supervisor is role-agnostic. It does NOT validate outputs.
-    /// Validation is the responsibility of workflows that compose agents.
-    /// This supervisor simply executes iterations and reports results.
+    /// ## Gradient Validation (ADR-005, ADR-017)
+    ///
+    /// When a `validation_pipeline` is provided, iteration output is evaluated
+    /// by the pipeline after each runtime-success.  If the output is rejected
+    /// (score below threshold), the iteration is added to history and the loop
+    /// continues to the next attempt.  Without a pipeline the first runtime-success
+    /// is returned immediately — the original behaviour.
     ///
     /// ## Timeout Enforcement
     ///
@@ -114,6 +127,7 @@ impl Supervisor {
     /// * `max_retries` - Maximum number of iteration attempts (from manifest)
     /// * `observer` - Observer for iteration lifecycle events
     /// * `cancellation_token` - Token to cooperatively cancel the execution
+    /// * `validation_pipeline` - Optional gradient validation pipeline (ADR-017)
     pub async fn run_loop(
         &self,
         runtime_config: RuntimeConfig,
@@ -121,6 +135,7 @@ impl Supervisor {
         max_retries: u32,
         observer: Arc<dyn SupervisorObserver>,
         cancellation_token: CancellationToken,
+        validation_pipeline: Option<Arc<ValidationPipeline>>,
     ) -> Result<String, RuntimeError> {
         let overall_timeout_secs = runtime_config
             .resources
@@ -154,6 +169,7 @@ impl Supervisor {
                 observer,
                 cancellation_token,
                 per_iteration_timeout,
+                validation_pipeline,
             ),
         )
         .await
@@ -171,6 +187,7 @@ impl Supervisor {
 
     /// Inner implementation of the 100monkeys loop, run under a `tokio::time::timeout`
     /// wrapper by [`Supervisor::run_loop`].
+    #[allow(clippy::too_many_arguments)]
     async fn run_loop_inner(
         &self,
         runtime_config: RuntimeConfig,
@@ -179,6 +196,7 @@ impl Supervisor {
         observer: Arc<dyn SupervisorObserver>,
         cancellation_token: CancellationToken,
         per_iteration_timeout: Duration,
+        validation_pipeline: Option<Arc<ValidationPipeline>>,
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
@@ -327,25 +345,80 @@ impl Supervisor {
                     .await;
             }
 
-            // SUCCESS: iteration completed without runtime errors
-            // NOTE: We do NOT validate output here. Validation is the workflow's job.
-            // If the workflow wants validation, it should spawn a judge agent.
+            // Iteration completed without runtime errors — run gradient validation (ADR-017).
             info!("Iteration {} completed", attempts);
             observer
                 .on_iteration_complete(attempts as u8, &stdout, output.exit_code)
                 .await;
 
-            // Record this iteration in history for context in future attempts
-            iteration_history.push(serde_json::json!({
-                "iteration": attempts,
-                "output": stdout,
-                "exit_code": output.exit_code
-            }));
-
-            // For now, we return the first successful execution.
-            // Workflow-driven iteration is handled by WorkflowEngine.tick() which
-            // controls when to invoke Supervisor.run_loop(). See ADR-015.
-            return Ok(stdout);
+            if let Some(ref pipeline) = validation_pipeline {
+                let ctx = ValidationContext {
+                    task: original_intent.clone(),
+                    output: stdout.clone(),
+                    exit_code: output.exit_code,
+                    stderr: stderr.clone(),
+                };
+                match pipeline.validate(&ctx).await {
+                    Ok(pipeline_result) => {
+                        observer
+                            .on_validation_complete(
+                                attempts as u8,
+                                &pipeline_result.results,
+                                pipeline_result.passed,
+                            )
+                            .await;
+                        if pipeline_result.passed {
+                            iteration_history.push(serde_json::json!({
+                                "iteration": attempts,
+                                "output": stdout,
+                                "exit_code": output.exit_code
+                            }));
+                            return Ok(stdout);
+                        }
+                        let blocking_reason = pipeline_result
+                            .blocking_reason
+                            .unwrap_or_else(|| "validation failed".to_string());
+                        warn!(
+                            iteration = attempts,
+                            reason = %blocking_reason,
+                            "Validation pipeline rejected iteration — retrying"
+                        );
+                        iteration_history.push(serde_json::json!({
+                            "iteration": attempts,
+                            "output": stdout,
+                            "exit_code": output.exit_code,
+                            "validation_failed": true,
+                            "validation_reason": blocking_reason
+                        }));
+                        continue;
+                    }
+                    Err(e) => {
+                        let reason = format!("validation error: {e}");
+                        warn!(
+                            iteration = attempts,
+                            error = %e,
+                            "Validation pipeline error — treating iteration as failed"
+                        );
+                        iteration_history.push(serde_json::json!({
+                            "iteration": attempts,
+                            "output": stdout,
+                            "exit_code": output.exit_code,
+                            "validation_failed": true,
+                            "validation_reason": reason
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                // No validation pipeline: return the first runtime-success.
+                // Workflow-driven iteration is handled by WorkflowEngine.tick() — see ADR-015.
+                iteration_history.push(serde_json::json!({
+                    "iteration": attempts,
+                    "output": stdout,
+                    "exit_code": output.exit_code
+                }));
+                return Ok(stdout);
+            }
         }
 
         Err(RuntimeError::ExecutionFailed(
@@ -482,6 +555,14 @@ mod tests {
         async fn on_instance_spawned(&self, _iteration: u8, _instance_id: &InstanceId) {}
 
         async fn on_instance_terminated(&self, _iteration: u8, _instance_id: &InstanceId) {}
+
+        async fn on_validation_complete(
+            &self,
+            _iteration: u8,
+            _results: &ValidationResults,
+            _passed: bool,
+        ) {
+        }
     }
 
     fn create_test_config() -> RuntimeConfig {
@@ -540,6 +621,7 @@ mod tests {
                 3,
                 observer.clone(),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -585,6 +667,7 @@ mod tests {
                 3,
                 observer.clone(),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -620,6 +703,7 @@ mod tests {
                 3,
                 observer.clone(),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -653,6 +737,7 @@ mod tests {
                 3,
                 observer,
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -690,6 +775,7 @@ mod tests {
                 3,
                 observer.clone(),
                 CancellationToken::new(),
+                None,
             )
             .await;
 
@@ -723,7 +809,14 @@ mod tests {
         config.resources.timeout_seconds = Some(60); // long timeout — cancellation should fire first
 
         let result = supervisor
-            .run_loop(config, create_test_input(), 3, observer.clone(), token)
+            .run_loop(
+                config,
+                create_test_input(),
+                3,
+                observer.clone(),
+                token,
+                None,
+            )
             .await;
 
         assert!(result.is_err());
@@ -755,6 +848,7 @@ mod tests {
                 3,
                 observer,
                 CancellationToken::new(),
+                None,
             )
             .await;
 

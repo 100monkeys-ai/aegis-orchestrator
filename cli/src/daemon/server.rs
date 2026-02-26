@@ -443,7 +443,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
             Arc::new(config.clone()),
         )
-        .with_nfs_gateway(nfs_gateway.clone()),
+        .with_nfs_gateway(nfs_gateway.clone())
+        .with_provider_registry(llm_registry.clone()),
     );
 
     // ADR-036: Event-driven NFS volume deregistration (security requirement)

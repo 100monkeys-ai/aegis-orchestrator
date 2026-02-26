@@ -23,7 +23,7 @@
 //! See ADR-016 (Agent-as-Judge Pattern), ADR-017 (Gradient Validation System),
 //! AGENTS.md §Gradient Validation Domain.
 
-use crate::domain::agent::AgentId;
+use crate::domain::agent::{AgentId, OutputValidation, SystemValidation};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -97,6 +97,421 @@ pub struct ValidationRequest {
     pub content: String,
     pub criteria: String,
     pub context: Option<serde_json::Value>,
+}
+
+// ── Validation Results (moved here from execution.rs — belong to validation domain) ──
+
+/// All validation results collected for a single iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidationResults {
+    pub system: Option<SystemValidationResult>,
+    pub output: Option<OutputValidationResult>,
+    pub semantic: Option<SemanticValidationResult>,
+    pub gradient: Option<GradientResult>,
+    pub consensus: Option<MultiJudgeConsensus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SystemValidationResult {
+    pub success: bool,
+    pub exit_code: i32,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputValidationResult {
+    pub success: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SemanticValidationResult {
+    pub success: bool,
+    pub score: f64,
+    pub reasoning: String,
+}
+
+// ── GradientValidator Trait & Concrete Validators (ADR-017) ──────────────────
+
+/// Context passed to each gradient validator for a single iteration.
+#[derive(Debug, Clone)]
+pub struct ValidationContext {
+    /// Original agent intent (for semantic evaluation context).
+    pub task: String,
+    /// Iteration stdout.
+    pub output: String,
+    /// Process exit code from the iteration.
+    pub exit_code: i64,
+    /// Iteration stderr (joined log lines).
+    pub stderr: String,
+}
+
+/// Domain trait for gradient validators (ADR-017).
+///
+/// Each validator receives a [`ValidationContext`] and produces a [`GradientResult`].
+/// Deterministic validators (`System`, `Output`) always have `confidence = 1.0`.
+/// Semantic validators may return lower confidence when the LLM is uncertain.
+#[async_trait::async_trait]
+pub trait GradientValidator: Send + Sync {
+    async fn validate(&self, ctx: &ValidationContext) -> anyhow::Result<GradientResult>;
+}
+
+/// Validates iteration output based on process exit code and stderr (ADR-017).
+///
+/// Score calculation:
+/// - `exit_code == 0` → exit_score = 1.0; non-zero → 0.0
+/// - `stderr` empty or `allow_stderr` → stderr_score = 1.0; else 0.5
+/// - final = `exit_score * 0.7 + stderr_score * 0.3`
+/// - If `must_succeed && exit_code != 0` → score forced to 0.0 regardless of weights
+pub struct SystemGradientValidator {
+    pub must_succeed: bool,
+    pub allow_stderr: bool,
+}
+
+impl SystemGradientValidator {
+    pub fn from_config(config: &SystemValidation) -> Self {
+        Self {
+            must_succeed: config.must_succeed,
+            allow_stderr: config.allow_stderr,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GradientValidator for SystemGradientValidator {
+    async fn validate(&self, ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+        const EXIT_CODE_WEIGHT: f64 = 0.7;
+        const STDERR_WEIGHT: f64 = 0.3;
+
+        let exit_score = if ctx.exit_code == 0 { 1.0 } else { 0.0 };
+        let stderr_score = if ctx.stderr.is_empty() || self.allow_stderr {
+            1.0
+        } else {
+            0.5
+        };
+
+        let weighted_score = exit_score * EXIT_CODE_WEIGHT + stderr_score * STDERR_WEIGHT;
+        let must_succeed_violated = self.must_succeed && ctx.exit_code != 0;
+        let score = if must_succeed_violated {
+            0.0
+        } else {
+            weighted_score
+        };
+
+        let mut signals = Vec::new();
+        if ctx.exit_code != 0 {
+            signals.push(ValidationSignal {
+                category: "exit_code".to_string(),
+                score: 0.0,
+                message: format!("Process exited with code {}", ctx.exit_code),
+            });
+        }
+        if !ctx.stderr.is_empty() && !self.allow_stderr {
+            signals.push(ValidationSignal {
+                category: "stderr".to_string(),
+                score: 0.5,
+                message: format!("Stderr output present ({} bytes)", ctx.stderr.len()),
+            });
+        }
+
+        let reasoning = format!(
+            "Exit code: {} ({}), stderr: {} bytes{}",
+            ctx.exit_code,
+            if ctx.exit_code == 0 {
+                "success"
+            } else {
+                "failure"
+            },
+            ctx.stderr.len(),
+            if must_succeed_violated {
+                " — must_succeed constraint violated"
+            } else {
+                ""
+            },
+        );
+
+        Ok(GradientResult {
+            score,
+            confidence: 1.0,
+            reasoning,
+            signals,
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+/// Validates iteration output against a declared format, JSON schema, and/or regex (ADR-017).
+///
+/// All checks are deterministic (`confidence = 1.0`). Checks run in order:
+/// format → schema → regex. The first failing check short-circuits and returns score 0.0.
+pub struct OutputGradientValidator {
+    pub format: String,
+    pub schema: Option<serde_json::Value>,
+    pub regex_pattern: Option<String>,
+}
+
+impl OutputGradientValidator {
+    pub fn from_config(config: &OutputValidation) -> Self {
+        Self {
+            format: config.format.clone(),
+            schema: config.schema.clone(),
+            regex_pattern: config.regex.clone(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GradientValidator for OutputGradientValidator {
+    async fn validate(&self, ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+        // Step 1: Format check
+        let parsed_value: Option<serde_json::Value> = match self.format.to_lowercase().as_str() {
+            "json" => match serde_json::from_str::<serde_json::Value>(&ctx.output) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    return Ok(GradientResult {
+                        score: 0.0,
+                        confidence: 1.0,
+                        reasoning: format!("Output is not valid JSON: {}", e),
+                        signals: vec![ValidationSignal {
+                            category: "format".to_string(),
+                            score: 0.0,
+                            message: format!("JSON parse error: {}", e),
+                        }],
+                        metadata: HashMap::new(),
+                    });
+                }
+            },
+            "yaml" => match serde_yaml::from_str::<serde_json::Value>(&ctx.output) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    return Ok(GradientResult {
+                        score: 0.0,
+                        confidence: 1.0,
+                        reasoning: format!("Output is not valid YAML: {}", e),
+                        signals: vec![ValidationSignal {
+                            category: "format".to_string(),
+                            score: 0.0,
+                            message: format!("YAML parse error: {}", e),
+                        }],
+                        metadata: HashMap::new(),
+                    });
+                }
+            },
+            _ => None, // Unknown format — skip format check
+        };
+
+        // Step 2: JSON Schema validation
+        if let (Some(ref schema), Some(ref value)) = (&self.schema, &parsed_value) {
+            let compiled = jsonschema::validator_for(schema)
+                .map_err(|e| anyhow::anyhow!("Invalid JSON schema in manifest: {}", e))?;
+            if !compiled.is_valid(value) {
+                let errors: Vec<String> =
+                    compiled.iter_errors(value).map(|e| e.to_string()).collect();
+                return Ok(GradientResult {
+                    score: 0.0,
+                    confidence: 1.0,
+                    reasoning: format!(
+                        "Output does not conform to declared schema: {}",
+                        errors.join("; ")
+                    ),
+                    signals: vec![ValidationSignal {
+                        category: "schema".to_string(),
+                        score: 0.0,
+                        message: errors.join("; "),
+                    }],
+                    metadata: HashMap::new(),
+                });
+            }
+        }
+
+        // Step 3: Regex match
+        if let Some(ref pattern) = self.regex_pattern {
+            let re = regex::Regex::new(pattern)
+                .map_err(|e| anyhow::anyhow!("Invalid regex in manifest: {}", e))?;
+            if !re.is_match(&ctx.output) {
+                return Ok(GradientResult {
+                    score: 0.0,
+                    confidence: 1.0,
+                    reasoning: format!("Output does not match required pattern: {}", pattern),
+                    signals: vec![ValidationSignal {
+                        category: "regex".to_string(),
+                        score: 0.0,
+                        message: format!("Pattern '{}' not matched in output", pattern),
+                    }],
+                    metadata: HashMap::new(),
+                });
+            }
+        }
+
+        Ok(GradientResult {
+            score: 1.0,
+            confidence: 1.0,
+            reasoning: "Output passed all format/schema/regex checks".to_string(),
+            signals: vec![],
+            metadata: HashMap::new(),
+        })
+    }
+}
+
+// ── ValidationPipeline (ADR-017) ──────────────────────────────────────────────
+
+/// Tag for each entry in the pipeline, used to map `GradientResult`s to the
+/// correct `ValidationResults` field.
+pub enum ValidatorKind {
+    System,
+    Output,
+    Semantic,
+}
+
+/// Result from running the full validation pipeline for one iteration.
+#[derive(Debug)]
+pub struct ValidationPipelineResult {
+    /// Populated `ValidationResults` for persistence.
+    pub results: ValidationResults,
+    /// True when all enabled validators passed their thresholds.
+    pub passed: bool,
+    /// Human-readable reason for the first failure (if `!passed`).
+    pub blocking_reason: Option<String>,
+}
+
+/// Ordered pipeline of gradient validators applied to each iteration output (ADR-017).
+///
+/// Constructed by the application layer from an agent's `ValidationConfig` and
+/// passed to `Supervisor::run_loop`. Validators run sequentially:
+/// System → Output → Semantic.
+///
+/// If no `ValidationPipeline` is provided to the Supervisor, it returns on the
+/// first runtime-success — the original behaviour.
+pub struct ValidationPipeline {
+    pub(crate) validators: Vec<(ValidatorKind, Box<dyn GradientValidator>)>,
+    /// Acceptance threshold for the semantic validator (`SemanticValidation.threshold`).
+    /// System and output validators are binary-deterministic; this field is ignored for them.
+    pub(crate) semantic_threshold: f64,
+}
+
+impl ValidationPipeline {
+    /// Construct from already-built validators. Called by the application layer factory.
+    pub fn new(
+        validators: Vec<(ValidatorKind, Box<dyn GradientValidator>)>,
+        semantic_threshold: f64,
+    ) -> Self {
+        Self {
+            validators,
+            semantic_threshold,
+        }
+    }
+
+    /// Run all validators in order. Short-circuits on the first blocking failure.
+    pub async fn validate(
+        &self,
+        ctx: &ValidationContext,
+    ) -> anyhow::Result<ValidationPipelineResult> {
+        let mut system: Option<SystemValidationResult> = None;
+        let mut output: Option<OutputValidationResult> = None;
+        let mut semantic: Option<SemanticValidationResult> = None;
+        let mut gradient: Option<GradientResult> = None;
+
+        for (kind, validator) in &self.validators {
+            let result = validator.validate(ctx).await?;
+
+            match kind {
+                ValidatorKind::System => {
+                    let passed = result.score >= 1.0;
+                    system = Some(SystemValidationResult {
+                        success: passed,
+                        exit_code: ctx.exit_code as i32,
+                        stdout: ctx.output.clone(),
+                        stderr: ctx.stderr.clone(),
+                    });
+                    if !passed {
+                        let blocking = result.reasoning.clone();
+                        gradient = Some(result);
+                        return Ok(ValidationPipelineResult {
+                            results: ValidationResults {
+                                system,
+                                output,
+                                semantic,
+                                gradient,
+                                consensus: None,
+                            },
+                            passed: false,
+                            blocking_reason: Some(blocking),
+                        });
+                    }
+                    gradient = Some(result);
+                }
+                ValidatorKind::Output => {
+                    let passed = result.score >= 1.0;
+                    output = Some(OutputValidationResult {
+                        success: passed,
+                        error: if passed {
+                            None
+                        } else {
+                            Some(result.reasoning.clone())
+                        },
+                    });
+                    if !passed {
+                        let blocking = result.reasoning.clone();
+                        gradient = Some(result);
+                        return Ok(ValidationPipelineResult {
+                            results: ValidationResults {
+                                system,
+                                output,
+                                semantic,
+                                gradient,
+                                consensus: None,
+                            },
+                            passed: false,
+                            blocking_reason: Some(blocking),
+                        });
+                    }
+                    gradient = Some(result);
+                }
+                ValidatorKind::Semantic => {
+                    let passed = result.score >= self.semantic_threshold;
+                    let sem = SemanticValidationResult {
+                        success: passed,
+                        score: result.score,
+                        reasoning: result.reasoning.clone(),
+                    };
+                    if !passed {
+                        let blocking = format!(
+                            "Semantic score {:.2} below threshold {:.2}: {}",
+                            result.score, self.semantic_threshold, result.reasoning
+                        );
+                        semantic = Some(sem);
+                        gradient = Some(result);
+                        return Ok(ValidationPipelineResult {
+                            results: ValidationResults {
+                                system,
+                                output,
+                                semantic,
+                                gradient,
+                                consensus: None,
+                            },
+                            passed: false,
+                            blocking_reason: Some(blocking),
+                        });
+                    }
+                    semantic = Some(sem);
+                    gradient = Some(result);
+                }
+            }
+        }
+
+        Ok(ValidationPipelineResult {
+            results: ValidationResults {
+                system,
+                output,
+                semantic,
+                gradient,
+                consensus: None,
+            },
+            passed: true,
+            blocking_reason: None,
+        })
+    }
 }
 
 #[cfg(test)]

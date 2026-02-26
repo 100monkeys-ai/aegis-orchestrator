@@ -225,37 +225,7 @@ pub struct LlmInteraction {
     pub timestamp: DateTime<Utc>,
 }
 
-use crate::domain::validation::{GradientResult, MultiJudgeConsensus};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ValidationResults {
-    pub system: Option<SystemValidationResult>,
-    pub output: Option<OutputValidationResult>,
-    pub semantic: Option<SemanticValidationResult>,
-    pub gradient: Option<GradientResult>,
-    pub consensus: Option<MultiJudgeConsensus>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SystemValidationResult {
-    pub success: bool,
-    pub exit_code: i32,
-    pub stdout: String,
-    pub stderr: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputValidationResult {
-    pub success: bool,
-    pub error: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SemanticValidationResult {
-    pub success: bool,
-    pub score: f64,
-    pub reasoning: String,
-}
+use crate::domain::validation::ValidationResults;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IterationStatus {

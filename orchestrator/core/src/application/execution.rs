@@ -32,6 +32,7 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::nfs_gateway::NfsGatewayService;
+use crate::application::validation_service::build_validation_pipeline;
 use crate::application::volume_manager::VolumeService;
 use crate::domain::agent::AgentId;
 use crate::domain::events::ExecutionEvent;
@@ -45,6 +46,7 @@ use crate::domain::runtime::RuntimeError;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::volume::{AccessMode, TenantId, VolumeMount};
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
+use crate::infrastructure::llm::registry::ProviderRegistry;
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -167,6 +169,8 @@ pub struct StandardExecutionService {
     /// Inserting a token on `start_execution` and calling `cancel()` on
     /// `cancel_execution` lets the Supervisor cooperatively terminate.
     cancellation_tokens: Arc<dashmap::DashMap<ExecutionId, CancellationToken>>,
+    /// Optional LLM provider registry for building gradient validation pipelines (ADR-017).
+    provider_registry: Option<Arc<ProviderRegistry>>,
 }
 
 impl StandardExecutionService {
@@ -188,6 +192,7 @@ impl StandardExecutionService {
             nfs_gateway: None,
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
+            provider_registry: None,
         }
     }
 
@@ -205,6 +210,17 @@ impl StandardExecutionService {
         registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
     ) -> Self {
         self.runtime_registry = Some(registry);
+        self
+    }
+
+    /// Attach an LLM provider registry for building gradient validation pipelines (ADR-017).
+    ///
+    /// Required when agents declare `spec.execution.validation.semantic` blocks.
+    /// Without a registry the semantic validator is silently skipped regardless of
+    /// the `fallback_on_unavailable` setting — ensure this is called whenever the
+    /// orchestrator has a configured LLM back-end.
+    pub fn with_provider_registry(mut self, registry: Arc<ProviderRegistry>) -> Self {
+        self.provider_registry = Some(registry);
         self
     }
 }
@@ -321,6 +337,33 @@ impl SupervisorObserver for ExecutionMonitor {
                 instance_id: instance_id.clone(),
                 terminated_at: now,
             });
+    }
+
+    async fn on_validation_complete(
+        &self,
+        iteration: u8,
+        results: &crate::domain::validation::ValidationResults,
+        passed: bool,
+    ) {
+        // Derive score + confidence from the pipeline result for the event payload.
+        // Prefer the gradient field (last validator's raw score) for richness;
+        // fall back to a binary 1.0/0.0 based on `passed`.
+        let (score, confidence) = match &results.gradient {
+            Some(g) => (g.score, g.confidence),
+            None => (if passed { 1.0 } else { 0.0 }, 1.0),
+        };
+
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::Validation(
+                crate::domain::events::ValidationEvent::GradientValidationPerformed {
+                    execution_id: self.execution_id,
+                    agent_id: self.agent_id,
+                    iteration_number: iteration,
+                    score,
+                    confidence,
+                    validated_at: Utc::now(),
+                },
+            ));
     }
 }
 
@@ -719,6 +762,15 @@ impl ExecutionService for StandardExecutionService {
             event_bus: event_bus.clone(),
         });
 
+        // Build gradient validation pipeline from manifest config (ADR-017).
+        let validation_pipeline = agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .and_then(|e| e.validation.as_ref())
+            .map(|v| Arc::new(build_validation_pipeline(v, self.provider_registry.clone())));
+
         // Create a cancellation token for this execution so cancel_execution() can
         // signal the Supervisor loop to stop cooperatively.
         let cancellation_token = CancellationToken::new();
@@ -734,6 +786,7 @@ impl ExecutionService for StandardExecutionService {
                     max_retries as u32,
                     monitor,
                     cancellation_token,
+                    validation_pipeline,
                 )
                 .await;
 

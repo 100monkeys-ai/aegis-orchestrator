@@ -59,9 +59,15 @@
 //! # }
 //! ```
 
-use crate::domain::agent::AgentId;
-use crate::domain::validation::{GradientResult, MultiJudgeConsensus, ValidationRequest};
+use crate::domain::agent::{AgentId, FallbackBehavior, SemanticValidation, ValidationConfig};
+use crate::domain::llm::{ChatMessage, ChatResponse, GenerationOptions};
+use crate::domain::validation::{
+    GradientResult, GradientValidator, MultiJudgeConsensus, OutputGradientValidator,
+    SystemGradientValidator, ValidationContext, ValidationPipeline, ValidationRequest,
+    ValidatorKind,
+};
 use crate::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
+use crate::infrastructure::llm::registry::ProviderRegistry;
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -261,28 +267,7 @@ impl ValidationService {
     }
 
     fn extract_json(text: &str) -> Option<String> {
-        // Find start of markdown code block
-        let start_marker = "```json";
-        if let Some(start) = text.find(start_marker) {
-            let content_start = start + start_marker.len();
-            // Find end marker AFTER the content start
-            if let Some(end_offset) = text[content_start..].find("```") {
-                let content_end = content_start + end_offset;
-                return Some(text[content_start..content_end].trim().to_string());
-            }
-        }
-
-        // Try generic code block if json specific one not found
-        let generic_marker = "```";
-        if let Some(start) = text.find(generic_marker) {
-            let content_start = start + generic_marker.len();
-            if let Some(end_offset) = text[content_start..].find("```") {
-                let content_end = content_start + end_offset;
-                return Some(text[content_start..content_end].trim().to_string());
-            }
-        }
-
-        None
+        extract_json_from_text(text)
     }
 
     fn compute_consensus(
@@ -496,4 +481,214 @@ impl ValidationService {
             },
         })
     }
+}
+
+// ── Module-level helpers ─────────────────────────────────────────────────────
+
+/// Extract the first JSON value from `text`, stripping markdown code fences.
+///
+/// Looks first for a ` ```json ... ``` ` block, then a generic ` ``` ... ``` ` block.
+/// Returns the trimmed interior, or `None` if neither fence is found.
+pub(crate) fn extract_json_from_text(text: &str) -> Option<String> {
+    let json_marker = "```json";
+    if let Some(start) = text.find(json_marker) {
+        let content_start = start + json_marker.len();
+        if let Some(end_offset) = text[content_start..].find("```") {
+            return Some(
+                text[content_start..content_start + end_offset]
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+
+    let generic_marker = "```";
+    if let Some(start) = text.find(generic_marker) {
+        let content_start = start + generic_marker.len();
+        if let Some(end_offset) = text[content_start..].find("```") {
+            return Some(
+                text[content_start..content_start + end_offset]
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+
+    None
+}
+
+// ── SemanticGradientValidator ────────────────────────────────────────────────
+
+/// Gradient validator that uses an LLM to semantically evaluate iteration output (ADR-017).
+///
+/// The validator sends the iteration output to an LLM using the prompt template from
+/// the agent manifest's `spec.execution.validation.semantic` section.  The LLM must
+/// respond with a JSON object matching [`SemanticScoreOutput`].
+///
+/// If the LLM is unavailable and `config.fallback_on_unavailable == FallbackBehavior::Skip`,
+/// the validator returns a passing score of `1.0` with `confidence = 0.0` so the agent
+/// can still make progress.  With `FallbackBehavior::Fail` the error propagates to the
+/// pipeline, which records the iteration as failed.
+pub struct SemanticGradientValidator {
+    config: SemanticValidation,
+    provider_registry: Arc<ProviderRegistry>,
+}
+
+impl SemanticGradientValidator {
+    pub fn new(config: SemanticValidation, provider_registry: Arc<ProviderRegistry>) -> Self {
+        Self {
+            config,
+            provider_registry,
+        }
+    }
+
+    fn handle_unavailable(&self, reason: String) -> anyhow::Result<GradientResult> {
+        match self.config.fallback_on_unavailable {
+            FallbackBehavior::Skip => Ok(GradientResult {
+                score: 1.0,
+                confidence: 0.0,
+                reasoning: format!("Semantic validation skipped (fallback): {}", reason),
+                signals: vec![],
+                metadata: std::collections::HashMap::new(),
+            }),
+            FallbackBehavior::Fail => Err(anyhow::anyhow!("{}", reason)),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl GradientValidator for SemanticGradientValidator {
+    async fn validate(&self, ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
+        let system_prompt = self.config.prompt.clone();
+        let user_content = format!(
+            "Task: {}\n\nAgent output:\n{}\n\nRespond with JSON only: \
+            {{\"valid\": <bool>, \"score\": <0.0-1.0>, \"confidence\": <0.0-1.0>, \"reasoning\": \"<explanation>\"}}",
+            ctx.task, ctx.output
+        );
+
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: system_prompt,
+                tool_call_id: None,
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: user_content,
+                tool_call_id: None,
+            },
+        ];
+
+        let options = GenerationOptions {
+            max_tokens: Some(512),
+            temperature: Some(0.0),
+            stop_sequences: None,
+        };
+
+        let timeout = std::time::Duration::from_secs(self.config.timeout_seconds);
+        let generate_fut =
+            self.provider_registry
+                .generate_chat(&self.config.model, &messages, &[], &options);
+
+        let chat_response = match tokio::time::timeout(timeout, generate_fut).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                return self
+                    .handle_unavailable(format!("LLM error during semantic validation: {e}"));
+            }
+            Err(_elapsed) => {
+                return self.handle_unavailable(format!(
+                    "Semantic validation timed out after {}s",
+                    self.config.timeout_seconds
+                ));
+            }
+        };
+
+        let raw_text = match chat_response {
+            ChatResponse::FinalText(resp) => resp.text,
+            ChatResponse::ToolCalls(_) => {
+                return self.handle_unavailable(
+                    "Semantic validator received unexpected tool calls from LLM".to_string(),
+                );
+            }
+        };
+
+        let json_str = extract_json_from_text(&raw_text).unwrap_or(raw_text);
+        let scored: SemanticScoreOutput = serde_json::from_str(&json_str).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse semantic validator JSON response ({}): {}",
+                e,
+                json_str
+            )
+        })?;
+
+        let score = scored.score.clamp(0.0, 1.0);
+        let confidence = scored.confidence.unwrap_or(0.8).clamp(0.0, 1.0);
+
+        Ok(GradientResult {
+            score,
+            confidence,
+            reasoning: scored.reasoning,
+            signals: vec![],
+            metadata: {
+                let mut map = std::collections::HashMap::new();
+                map.insert("valid".to_string(), serde_json::json!(scored.valid));
+                map.insert("model".to_string(), serde_json::json!(self.config.model));
+                map
+            },
+        })
+    }
+}
+
+/// Serde target for the JSON the LLM returns during semantic validation.
+#[derive(serde::Deserialize)]
+struct SemanticScoreOutput {
+    valid: bool,
+    score: f64,
+    confidence: Option<f64>,
+    reasoning: String,
+}
+
+// ── Pipeline factory ─────────────────────────────────────────────────────────
+
+/// Build a [`ValidationPipeline`] from an agent manifest's [`ValidationConfig`].
+///
+/// Validators are added in order: `System` → `Output` → `Semantic`.
+/// The `Semantic` validator is only added when both a `SemanticValidation` config
+/// **and** a `provider_registry` are provided, and `semantic.enabled == true`.
+pub fn build_validation_pipeline(
+    config: &ValidationConfig,
+    provider_registry: Option<Arc<ProviderRegistry>>,
+) -> ValidationPipeline {
+    let semantic_threshold = config.semantic.as_ref().map(|s| s.threshold).unwrap_or(0.7);
+
+    let mut validators: Vec<(ValidatorKind, Box<dyn GradientValidator>)> = Vec::new();
+
+    if let Some(ref system_cfg) = config.system {
+        validators.push((
+            ValidatorKind::System,
+            Box::new(SystemGradientValidator::from_config(system_cfg)),
+        ));
+    }
+
+    if let Some(ref output_cfg) = config.output {
+        validators.push((
+            ValidatorKind::Output,
+            Box::new(OutputGradientValidator::from_config(output_cfg)),
+        ));
+    }
+
+    if let (Some(ref semantic_cfg), Some(registry)) = (&config.semantic, provider_registry) {
+        if semantic_cfg.enabled {
+            validators.push((
+                ValidatorKind::Semantic,
+                Box::new(SemanticGradientValidator::new(
+                    semantic_cfg.clone(),
+                    registry,
+                )),
+            ));
+        }
+    }
+
+    ValidationPipeline::new(validators, semantic_threshold)
 }

@@ -50,6 +50,8 @@ prost = { workspace = true }
 bytes = { workspace = true }
 prost-types = "0.13"
 tar = "0.4"
+regex = "1"
+jsonschema = "0.28"
 
 # NFS Server Gateway (ADR-036)
 nfsserve = { workspace = true }
