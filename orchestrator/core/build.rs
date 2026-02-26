@@ -33,85 +33,97 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set PROTOC environment variable to point to the vendored protoc binary
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
 
-    // Gather all .proto files in temporal/api
-    let proto_root = "../../proto/temporal/api";
+    // Get the manifest directory and construct paths
+    // CARGO_MANIFEST_DIR = aegis-orchestrator/orchestrator/core
+    // We need to go up 2 levels to aegis-orchestrator root, then access proto/
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
+    let crate_root = std::path::Path::new(&manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or("Failed to find crate root")?;
+
+    // Construct paths relative to aegis-orchestrator crate root
+    let aegis_proto_dir = crate_root
+        .join("aegis-proto/proto")
+        .to_string_lossy()
+        .to_string();
+    let proto_dir = crate_root.join("proto").to_string_lossy().to_string();
+
     let mut protos = Vec::new();
 
     // Add aegis_runtime from the aegis-proto submodule
-    protos.push("../../aegis-proto/proto/aegis_runtime.proto".to_string());
-
-    // Walk directory to find all .proto files
-    if std::fs::read_dir(proto_root).is_ok() {
-        fn visit_dirs(dir: &std::path::Path, protos: &mut Vec<String>) -> std::io::Result<()> {
-            if dir.is_dir() {
-                for entry in std::fs::read_dir(dir)? {
-                    let entry = entry?;
-                    let path = entry.path();
-                    if path.is_dir() {
-                        visit_dirs(&path, protos)?;
-                    } else if path.extension().map(|s| s == "proto").unwrap_or(false) {
-                        protos.push(path.to_string_lossy().replace("\\", "/"));
-                    }
-                }
-            }
-            Ok(())
-        }
-
-        let root_path = std::path::Path::new(proto_root);
-        let _ = visit_dirs(root_path, &mut protos);
-    }
+    protos.push(
+        crate_root
+            .join("aegis-proto/proto/aegis_runtime.proto")
+            .to_string_lossy()
+            .to_string(),
+    );
 
     let temporal_protos = &[
-        "../../proto/temporal/api/workflowservice/v1/service.proto",
-        "../../proto/temporal/api/workflowservice/v1/request_response.proto",
-        "../../proto/temporal/api/common/v1/message.proto",
-        "../../proto/temporal/api/taskqueue/v1/message.proto",
-        "../../proto/temporal/api/enums/v1/workflow.proto",
-        "../../proto/temporal/api/enums/v1/namespace.proto",
-        "../../proto/temporal/api/enums/v1/task_queue.proto",
-        "../../proto/temporal/api/enums/v1/common.proto",
-        "../../proto/temporal/api/enums/v1/query.proto",
-        "../../proto/temporal/api/enums/v1/event_type.proto",
-        "../../proto/temporal/api/enums/v1/failed_cause.proto",
-        "../../proto/temporal/api/enums/v1/reset.proto",
-        "../../proto/temporal/api/enums/v1/schedule.proto",
-        "../../proto/temporal/api/enums/v1/update.proto",
-        "../../proto/temporal/api/enums/v1/batch_operation.proto",
-        "../../proto/temporal/api/enums/v1/deployment.proto",
-        "../../proto/temporal/api/enums/v1/activity.proto",
-        "../../proto/temporal/api/enums/v1/nexus.proto",
-        "../../proto/temporal/api/activity/v1/message.proto",
-        "../../proto/temporal/api/history/v1/message.proto",
-        "../../proto/temporal/api/command/v1/message.proto",
-        "../../proto/temporal/api/protocol/v1/message.proto",
-        "../../proto/temporal/api/rules/v1/message.proto",
-        "../../proto/temporal/api/batch/v1/message.proto",
-        "../../proto/temporal/api/worker/v1/message.proto",
-        "../../proto/temporal/api/sdk/v1/worker_config.proto",
-        "../../proto/temporal/api/sdk/v1/user_metadata.proto",
-        "../../proto/temporal/api/sdk/v1/task_complete_metadata.proto",
-        "../../proto/temporal/api/sdk/v1/workflow_metadata.proto",
-        "../../proto/temporal/api/sdk/v1/enhanced_stack_trace.proto",
-        "../../proto/temporal/api/failure/v1/message.proto",
-        "../../proto/temporal/api/filter/v1/message.proto",
-        "../../proto/temporal/api/namespace/v1/message.proto",
-        "../../proto/temporal/api/query/v1/message.proto",
-        "../../proto/temporal/api/replication/v1/message.proto",
-        "../../proto/temporal/api/schedule/v1/message.proto",
-        "../../proto/temporal/api/update/v1/message.proto",
-        "../../proto/temporal/api/version/v1/message.proto",
-        "../../proto/temporal/api/workflow/v1/message.proto",
-        "../../proto/temporal/api/nexus/v1/message.proto",
-        "../../proto/temporal/api/deployment/v1/message.proto",
+        "workflowservice/v1/service.proto",
+        "workflowservice/v1/request_response.proto",
+        "common/v1/message.proto",
+        "taskqueue/v1/message.proto",
+        "enums/v1/workflow.proto",
+        "enums/v1/namespace.proto",
+        "enums/v1/task_queue.proto",
+        "enums/v1/common.proto",
+        "enums/v1/query.proto",
+        "enums/v1/event_type.proto",
+        "enums/v1/failed_cause.proto",
+        "enums/v1/reset.proto",
+        "enums/v1/schedule.proto",
+        "enums/v1/update.proto",
+        "enums/v1/batch_operation.proto",
+        "enums/v1/deployment.proto",
+        "enums/v1/activity.proto",
+        "enums/v1/nexus.proto",
+        "activity/v1/message.proto",
+        "history/v1/message.proto",
+        "command/v1/message.proto",
+        "protocol/v1/message.proto",
+        "rules/v1/message.proto",
+        "batch/v1/message.proto",
+        "worker/v1/message.proto",
+        "sdk/v1/worker_config.proto",
+        "sdk/v1/user_metadata.proto",
+        "sdk/v1/task_complete_metadata.proto",
+        "sdk/v1/workflow_metadata.proto",
+        "sdk/v1/enhanced_stack_trace.proto",
+        "failure/v1/message.proto",
+        "filter/v1/message.proto",
+        "namespace/v1/message.proto",
+        "query/v1/message.proto",
+        "replication/v1/message.proto",
+        "schedule/v1/message.proto",
+        "update/v1/message.proto",
+        "version/v1/message.proto",
+        "workflow/v1/message.proto",
+        "nexus/v1/message.proto",
+        "deployment/v1/message.proto",
     ];
-    protos.extend(temporal_protos.iter().map(|s| s.to_string()));
+    for proto_file in temporal_protos {
+        let full_path = crate_root.join("proto/temporal/api").join(proto_file);
+        if full_path.exists() {
+            protos.push(full_path.to_string_lossy().to_string());
+        }
+    }
 
-    tonic_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .compile_protos(&protos, &["../../proto", "../../aegis-proto/proto"])?;
+    // Only compile if we have proto files to compile
+    if !protos.is_empty() {
+        tonic_build::configure()
+            .build_server(true)
+            .build_client(true)
+            .compile_protos(&protos, &[&proto_dir, &aegis_proto_dir])?;
+    }
 
-    println!("cargo:rerun-if-changed=../../aegis-proto/proto/aegis_runtime.proto");
+    let aegis_proto_file = crate_root.join("aegis-proto/proto/aegis_runtime.proto");
+    if aegis_proto_file.exists() {
+        println!(
+            "cargo:rerun-if-changed={}",
+            aegis_proto_file.to_string_lossy()
+        );
+    }
 
     Ok(())
 }
