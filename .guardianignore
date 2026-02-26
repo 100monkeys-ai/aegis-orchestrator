@@ -40,8 +40,6 @@ Thumbs.db
 
 # === Documentation and Assets ===
 assets/
-docs/PIVOT/*
-!docs/PIVOT/IMPLEMENTATION_PLAN.md
 docs/_build/
 site/
 *.png

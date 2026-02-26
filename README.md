@@ -36,7 +36,6 @@ Pure domain logic implementing:
 - Runtime trait abstraction
 - Security policy engine
 - Swarm coordination
-- Memory system (Cortex)
 
 ### API (`api/`)
 
@@ -232,7 +231,6 @@ aegis-orchestrator/
 ├── api/               # HTTP/gRPC server
 ├── runtime-docker/    # Docker adapter
 ├── runtime-firecracker/ # Firecracker adapter
-├── memory/            # Cortex vector store
 ├── security/          # Policy enforcement
 ├── cli/               # CLI tool
 ├── edge-node/         # Edge node binary
