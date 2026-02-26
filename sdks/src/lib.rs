@@ -29,9 +29,8 @@ pub mod types;
 // Re-export core domain types for manifest (single source of truth)
 pub use aegis_orchestrator_core::domain::agent::{
     AdvancedConfig, AgentManifest, AgentSpec, ContextItem, DeliveryConfig, DeliveryDestination,
-    ExecutionStrategy, FallbackBehavior, FilesystemPolicy, ManifestMetadata, NetworkPolicy,
-    OutputValidation, ResourceLimits, RuntimeConfig, ScriptValidation, SecurityConfig,
-    SemanticValidation, SystemValidation, TaskConfig, ValidationConfig,
+    ExecutionStrategy, FilesystemPolicy, ManifestMetadata, NetworkPolicy, ResourceLimits,
+    RuntimeConfig, SecurityConfig, TaskConfig, ValidationConfig, ValidatorSpec,
 };
 
 pub use client::AegisClient;

@@ -443,9 +443,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
             Arc::new(config.clone()),
         )
-        .with_nfs_gateway(nfs_gateway.clone())
-        .with_provider_registry(llm_registry.clone()),
+        .with_nfs_gateway(nfs_gateway.clone()),
     );
+    // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
+    execution_service.set_child_execution_service(execution_service.clone());
 
     // ADR-036: Event-driven NFS volume deregistration (security requirement)
     // Listen for VolumeExpired and VolumeDeleted events and immediately remove

@@ -44,10 +44,8 @@ pub struct AgentManifestParser;
 impl AgentManifestParser {
     /// Parse agent manifest from YAML string
     pub fn parse_yaml(yaml: &str) -> Result<AgentManifest> {
-        let mut manifest: AgentManifest =
+        let manifest: AgentManifest =
             serde_yaml::from_str(yaml).context("Failed to parse YAML manifest")?;
-
-        manifest.apply_defaults();
 
         // Validate the parsed manifest
         manifest
@@ -132,14 +130,9 @@ spec:
     mode: iterative
     max_iterations: 10
     validation:
-      system:
-        must_succeed: true
-        timeout_seconds: 90
-      semantic:
-        enabled: true
-        model: "default"
-        prompt: "Evaluate the output"
-        threshold: 0.8
+      - type: exit_code
+        expected: 0
+        min_score: 1.0
   security:
     network:
       mode: allow
@@ -179,69 +172,6 @@ spec:
         assert_eq!(security.network.mode, "allow");
         assert_eq!(security.network.allowlist.len(), 1);
         assert_eq!(security.resources.cpu, 1000);
-    }
-
-    #[test]
-    fn test_parse_semantic_defaults_when_missing_model() {
-        let yaml = r#"
-apiVersion: 100monkeys.ai/v1
-kind: Agent
-metadata:
-  name: semantic-defaults
-  version: "1.0.0"
-spec:
-  runtime:
-    language: python
-    version: "3.11"
-  task:
-    instruction: "Summarize the input"
-  execution:
-    validation:
-      semantic:
-        prompt: "Judge this output"
-"#;
-
-        let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
-        let semantic = manifest
-            .spec
-            .execution
-            .as_ref()
-            .and_then(|exec| exec.validation.as_ref())
-            .and_then(|validation| validation.semantic.as_ref())
-            .expect("semantic validation should be defaulted");
-
-        assert_eq!(semantic.model, "default");
-        assert!(!semantic.prompt.trim().is_empty());
-    }
-
-    #[test]
-    fn test_auto_enable_semantic_when_task_instruction_present() {
-        let yaml = r#"
-apiVersion: 100monkeys.ai/v1
-kind: Agent
-metadata:
-  name: semantic-auto
-  version: "1.0.0"
-spec:
-  runtime:
-    language: python
-    version: "3.11"
-  task:
-    instruction: "Review this code"
-"#;
-
-        let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
-        let semantic = manifest
-            .spec
-            .execution
-            .as_ref()
-            .and_then(|exec| exec.validation.as_ref())
-            .and_then(|validation| validation.semantic.as_ref())
-            .expect("semantic validation should be auto-created");
-
-        assert_eq!(semantic.model, "default");
-        assert_eq!(semantic.prompt, DEFAULT_SEMANTIC_PROMPT_TEMPLATE);
-        assert!(semantic.enabled);
     }
 
     #[test]

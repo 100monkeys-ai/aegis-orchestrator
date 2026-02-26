@@ -23,7 +23,7 @@
 //! See ADR-016 (Agent-as-Judge Pattern), ADR-017 (Gradient Validation System),
 //! AGENTS.md §Gradient Validation Domain.
 
-use crate::domain::agent::{AgentId, OutputValidation, SystemValidation};
+use crate::domain::agent::AgentId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -170,10 +170,10 @@ pub struct SystemGradientValidator {
 }
 
 impl SystemGradientValidator {
-    pub fn from_config(config: &SystemValidation) -> Self {
+    pub fn new(must_succeed: bool, allow_stderr: bool) -> Self {
         Self {
-            must_succeed: config.must_succeed,
-            allow_stderr: config.allow_stderr,
+            must_succeed,
+            allow_stderr,
         }
     }
 }
@@ -252,11 +252,15 @@ pub struct OutputGradientValidator {
 }
 
 impl OutputGradientValidator {
-    pub fn from_config(config: &OutputValidation) -> Self {
+    pub fn new(
+        format: String,
+        schema: Option<serde_json::Value>,
+        regex_pattern: Option<String>,
+    ) -> Self {
         Self {
-            format: config.format.clone(),
-            schema: config.schema.clone(),
-            regex_pattern: config.regex.clone(),
+            format,
+            schema,
+            regex_pattern,
         }
     }
 }
@@ -362,6 +366,17 @@ pub enum ValidatorKind {
     System,
     Output,
     Semantic,
+    MultiJudge,
+}
+
+/// One entry in the validation pipeline with its acceptance thresholds.
+pub struct ValidatorEntry {
+    pub kind: ValidatorKind,
+    pub validator: Box<dyn GradientValidator>,
+    /// Minimum score required for this entry to pass (0.0–1.0).
+    pub min_score: f64,
+    /// Minimum confidence required; scores with lower confidence are treated as fails.
+    pub min_confidence: f64,
 }
 
 /// Result from running the full validation pipeline for one iteration.
@@ -377,32 +392,27 @@ pub struct ValidationPipelineResult {
 
 /// Ordered pipeline of gradient validators applied to each iteration output (ADR-017).
 ///
-/// Constructed by the application layer from an agent's `ValidationConfig` and
-/// passed to `Supervisor::run_loop`. Validators run sequentially:
-/// System → Output → Semantic.
+/// Constructed by the application layer factory from an agent's `ValidationConfig` and
+/// passed to `Supervisor::run_loop`. Validators run sequentially in declaration order;
+/// a failing entry short-circuits the rest.
 ///
 /// If no `ValidationPipeline` is provided to the Supervisor, it returns on the
 /// first runtime-success — the original behaviour.
 pub struct ValidationPipeline {
-    pub(crate) validators: Vec<(ValidatorKind, Box<dyn GradientValidator>)>,
-    /// Acceptance threshold for the semantic validator (`SemanticValidation.threshold`).
-    /// System and output validators are binary-deterministic; this field is ignored for them.
-    pub(crate) semantic_threshold: f64,
+    pub(crate) entries: Vec<ValidatorEntry>,
 }
 
 impl ValidationPipeline {
-    /// Construct from already-built validators. Called by the application layer factory.
-    pub fn new(
-        validators: Vec<(ValidatorKind, Box<dyn GradientValidator>)>,
-        semantic_threshold: f64,
-    ) -> Self {
-        Self {
-            validators,
-            semantic_threshold,
-        }
+    /// Construct from already-built entries. Called by the application layer factory.
+    pub fn new(entries: Vec<ValidatorEntry>) -> Self {
+        Self { entries }
     }
 
     /// Run all validators in order. Short-circuits on the first blocking failure.
+    ///
+    /// Each entry's `min_score` and `min_confidence` are evaluated independently.
+    /// A `MultiJudge` entry's individual results are stored in `GradientResult.metadata`
+    /// and reconstructed into `ValidationResults.consensus`.
     pub async fn validate(
         &self,
         ctx: &ValidationContext,
@@ -411,13 +421,32 @@ impl ValidationPipeline {
         let mut output: Option<OutputValidationResult> = None;
         let mut semantic: Option<SemanticValidationResult> = None;
         let mut gradient: Option<GradientResult> = None;
+        let mut consensus: Option<MultiJudgeConsensus> = None;
 
-        for (kind, validator) in &self.validators {
-            let result = validator.validate(ctx).await?;
+        for entry in &self.entries {
+            let result = entry.validator.validate(ctx).await?;
 
-            match kind {
+            // Confidence gate: insufficient confidence is treated as a fail.
+            let confidence_ok = result.confidence >= entry.min_confidence;
+            let score_ok = result.score >= entry.min_score;
+            let passed = score_ok && confidence_ok;
+
+            let blocking_reason = if !confidence_ok {
+                Some(format!(
+                    "Validation confidence {:.2} below minimum {:.2}: {}",
+                    result.confidence, entry.min_confidence, result.reasoning
+                ))
+            } else if !score_ok {
+                Some(format!(
+                    "Validation score {:.2} below minimum {:.2}: {}",
+                    result.score, entry.min_score, result.reasoning
+                ))
+            } else {
+                None
+            };
+
+            match entry.kind {
                 ValidatorKind::System => {
-                    let passed = result.score >= 1.0;
                     system = Some(SystemValidationResult {
                         success: passed,
                         exit_code: ctx.exit_code as i32,
@@ -425,7 +454,6 @@ impl ValidationPipeline {
                         stderr: ctx.stderr.clone(),
                     });
                     if !passed {
-                        let blocking = result.reasoning.clone();
                         gradient = Some(result);
                         return Ok(ValidationPipelineResult {
                             results: ValidationResults {
@@ -433,16 +461,15 @@ impl ValidationPipeline {
                                 output,
                                 semantic,
                                 gradient,
-                                consensus: None,
+                                consensus,
                             },
                             passed: false,
-                            blocking_reason: Some(blocking),
+                            blocking_reason,
                         });
                     }
                     gradient = Some(result);
                 }
                 ValidatorKind::Output => {
-                    let passed = result.score >= 1.0;
                     output = Some(OutputValidationResult {
                         success: passed,
                         error: if passed {
@@ -452,7 +479,6 @@ impl ValidationPipeline {
                         },
                     });
                     if !passed {
-                        let blocking = result.reasoning.clone();
                         gradient = Some(result);
                         return Ok(ValidationPipelineResult {
                             results: ValidationResults {
@@ -460,26 +486,31 @@ impl ValidationPipeline {
                                 output,
                                 semantic,
                                 gradient,
-                                consensus: None,
+                                consensus,
                             },
                             passed: false,
-                            blocking_reason: Some(blocking),
+                            blocking_reason,
                         });
                     }
                     gradient = Some(result);
                 }
-                ValidatorKind::Semantic => {
-                    let passed = result.score >= self.semantic_threshold;
+                ValidatorKind::Semantic | ValidatorKind::MultiJudge => {
+                    // For MultiJudge, try to reconstruct the consensus struct from metadata.
+                    if matches!(entry.kind, ValidatorKind::MultiJudge) {
+                        if let Some(raw) = result.metadata.get("consensus") {
+                            if let Ok(c) =
+                                serde_json::from_value::<MultiJudgeConsensus>(raw.clone())
+                            {
+                                consensus = Some(c);
+                            }
+                        }
+                    }
                     let sem = SemanticValidationResult {
                         success: passed,
                         score: result.score,
                         reasoning: result.reasoning.clone(),
                     };
                     if !passed {
-                        let blocking = format!(
-                            "Semantic score {:.2} below threshold {:.2}: {}",
-                            result.score, self.semantic_threshold, result.reasoning
-                        );
                         semantic = Some(sem);
                         gradient = Some(result);
                         return Ok(ValidationPipelineResult {
@@ -488,10 +519,10 @@ impl ValidationPipeline {
                                 output,
                                 semantic,
                                 gradient,
-                                consensus: None,
+                                consensus,
                             },
                             passed: false,
-                            blocking_reason: Some(blocking),
+                            blocking_reason,
                         });
                     }
                     semantic = Some(sem);
@@ -506,7 +537,7 @@ impl ValidationPipeline {
                 output,
                 semantic,
                 gradient,
-                consensus: None,
+                consensus,
             },
             passed: true,
             blocking_reason: None,

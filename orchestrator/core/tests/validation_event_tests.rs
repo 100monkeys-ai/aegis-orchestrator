@@ -26,6 +26,14 @@ struct MockExecutionService;
 
 #[async_trait]
 impl ExecutionService for MockExecutionService {
+    async fn start_child_execution(
+        &self,
+        _agent_id: AgentId,
+        _input: ExecutionInput,
+        _parent_execution_id: ExecutionId,
+    ) -> anyhow::Result<ExecutionId> {
+        Ok(ExecutionId::new())
+    }
     async fn start_execution(
         &self,
         _agent_id: AgentId,

@@ -46,7 +46,6 @@ use crate::domain::runtime::RuntimeError;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
 use crate::domain::volume::{AccessMode, TenantId, VolumeMount};
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
-use crate::infrastructure::llm::registry::ProviderRegistry;
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
@@ -83,6 +82,24 @@ pub trait ExecutionService: Send + Sync {
         &self,
         agent_id: AgentId,
         input: ExecutionInput,
+    ) -> Result<ExecutionId>;
+
+    /// Start a new child execution spawned by a parent (e.g., a judge agent).
+    ///
+    /// Enforces `MAX_RECURSIVE_DEPTH` from the parent's [`ExecutionHierarchy`].
+    /// The child's execution ID is returned immediately; the supervisor loop runs
+    /// asynchronously, same as [`ExecutionService::start_execution`].
+    ///
+    /// # Errors
+    ///
+    /// - Agent not found
+    /// - Parent execution not found
+    /// - Maximum recursive depth exceeded (ADR-039)
+    async fn start_child_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        parent_execution_id: ExecutionId,
     ) -> Result<ExecutionId>;
 
     /// Retrieve the current state of an execution by ID.
@@ -169,8 +186,9 @@ pub struct StandardExecutionService {
     /// Inserting a token on `start_execution` and calling `cancel()` on
     /// `cancel_execution` lets the Supervisor cooperatively terminate.
     cancellation_tokens: Arc<dashmap::DashMap<ExecutionId, CancellationToken>>,
-    /// Optional LLM provider registry for building gradient validation pipelines (ADR-017).
-    provider_registry: Option<Arc<ProviderRegistry>>,
+    /// Self-reference used by judge validators to spawn child executions (ADR-016, ADR-039).
+    /// Set once at composition root via `set_child_execution_service()`.
+    child_executor: std::sync::OnceLock<Arc<dyn ExecutionService>>,
 }
 
 impl StandardExecutionService {
@@ -192,7 +210,7 @@ impl StandardExecutionService {
             nfs_gateway: None,
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
-            provider_registry: None,
+            child_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -200,6 +218,20 @@ impl StandardExecutionService {
     pub fn with_nfs_gateway(mut self, gateway: Arc<NfsGatewayService>) -> Self {
         self.nfs_gateway = Some(gateway);
         self
+    }
+
+    /// Set the self-referential child execution service used by judge validators (ADR-016).
+    ///
+    /// Must be called from the composition root immediately after constructing the
+    /// `Arc<StandardExecutionService>`, before any executions are started:
+    ///
+    /// ```rust,ignore
+    /// let svc = Arc::new(StandardExecutionService::new(...));
+    /// svc.set_child_execution_service(svc.clone());
+    /// ```
+    pub fn set_child_execution_service(&self, svc: Arc<dyn ExecutionService>) {
+        // OnceLock silently ignores a second set; the service is wired once at startup.
+        let _ = self.child_executor.set(svc);
     }
 
     /// Attach a StandardRuntime registry for validated language+version → image resolution (ADR-043).
@@ -210,17 +242,6 @@ impl StandardExecutionService {
         registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
     ) -> Self {
         self.runtime_registry = Some(registry);
-        self
-    }
-
-    /// Attach an LLM provider registry for building gradient validation pipelines (ADR-017).
-    ///
-    /// Required when agents declare `spec.execution.validation.semantic` blocks.
-    /// Without a registry the semantic validator is silently skipped regardless of
-    /// the `fallback_on_unavailable` setting — ensure this is called whenever the
-    /// orchestrator has a configured LLM back-end.
-    pub fn with_provider_registry(mut self, registry: Arc<ProviderRegistry>) -> Self {
-        self.provider_registry = Some(registry);
         self
     }
 }
@@ -364,6 +385,20 @@ impl SupervisorObserver for ExecutionMonitor {
                     validated_at: Utc::now(),
                 },
             ));
+
+        // Persist validation results so Iteration.validation_results is populated.
+        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+            if let Err(e) = exec.store_validation_results(iteration, results.clone()) {
+                tracing::warn!(
+                    "Failed to store validation results for execution {} iteration {}: {}",
+                    self.execution_id,
+                    iteration,
+                    e
+                );
+            } else {
+                let _ = self.repository.save(&exec).await;
+            }
+        }
     }
 }
 
@@ -769,7 +804,19 @@ impl ExecutionService for StandardExecutionService {
             .execution
             .as_ref()
             .and_then(|e| e.validation.as_ref())
-            .map(|v| Arc::new(build_validation_pipeline(v, self.provider_registry.clone())));
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let child_svc = self.child_executor.get().cloned().expect(
+                    "child_executor not set; call set_child_execution_service() at startup",
+                );
+                Arc::new(build_validation_pipeline(
+                    v,
+                    self.agent_service.clone(),
+                    child_svc,
+                    self.event_bus.clone(),
+                    execution_id,
+                ))
+            });
 
         // Create a cancellation token for this execution so cancel_execution() can
         // signal the Supervisor loop to stop cooperatively.
@@ -947,6 +994,305 @@ impl ExecutionService for StandardExecutionService {
         } else {
             Ok(self.repository.find_recent(limit).await?)
         }
+    }
+
+    async fn start_child_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        parent_execution_id: ExecutionId,
+    ) -> Result<ExecutionId> {
+        // 1. Fetch parent to validate hierarchy depth and build child hierarchy.
+        let parent = self
+            .repository
+            .find_by_id(parent_execution_id)
+            .await?
+            .ok_or_else(|| anyhow!("Parent execution {} not found", parent_execution_id))?;
+
+        if !parent.can_spawn_child() {
+            return Err(anyhow!(
+                "Maximum recursive depth reached at depth {}; cannot spawn child from execution {}",
+                parent.depth(),
+                parent_execution_id
+            ));
+        }
+
+        // 2. Fetch judge agent.
+        let agent = self.agent_service.get_agent(agent_id).await?;
+
+        // 3. Prepare input (render judge's prompt template).
+        let prepared_input = self.prepare_execution_input(input, &agent)?;
+
+        // 4. Create child execution record with hierarchy.
+        let max_retries = agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .map(|e| e.max_retries as u8)
+            .unwrap_or(3);
+
+        let mut child_execution = crate::domain::execution::Execution::new_child(
+            agent_id,
+            prepared_input.clone(),
+            max_retries,
+            &parent,
+        )
+        .map_err(|e| anyhow!("Failed to create child execution: {}", e))?;
+        let child_execution_id = child_execution.id;
+        child_execution.start();
+        self.repository.save(&child_execution).await?;
+
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ExecutionStarted {
+                execution_id: child_execution_id,
+                agent_id,
+                started_at: Utc::now(),
+            });
+
+        // 5. Build runtime config.
+        let mut env = agent.manifest.spec.env.clone();
+        if let Some(task_spec) = &agent.manifest.spec.task {
+            if let Some(instr) = &task_spec.instruction {
+                env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), instr.clone());
+            }
+            if let Some(prompt_tpl) = &task_spec.prompt_template {
+                env.insert("AEGIS_PROMPT_TEMPLATE".to_string(), prompt_tpl.clone());
+            }
+        }
+        if !env.contains_key("AEGIS_AGENT_INSTRUCTION") {
+            if let Some(desc) = &agent.manifest.metadata.description {
+                env.insert("AEGIS_AGENT_INSTRUCTION".to_string(), desc.clone());
+            }
+        }
+        env.insert("AEGIS_AGENT_ID".to_string(), agent_id.0.to_string());
+        env.insert(
+            "AEGIS_EXECUTION_ID".to_string(),
+            child_execution_id.0.to_string(),
+        );
+        let orchestrator_url = resolve_env_value(&self.config.spec.runtime.orchestrator_url)
+            .ok()
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| {
+                let port = self
+                    .config
+                    .spec
+                    .network
+                    .as_ref()
+                    .map(|n| n.port)
+                    .unwrap_or(8088);
+                format!("http://host.docker.internal:{}", port)
+            });
+        env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
+        let llm_timeout_seconds = agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .map(|e| e.llm_timeout_seconds)
+            .unwrap_or(300);
+        env.insert(
+            "AEGIS_LLM_TIMEOUT_SECONDS".to_string(),
+            llm_timeout_seconds.to_string(),
+        );
+
+        let resources = if let Some(security) = &agent.manifest.spec.security {
+            crate::domain::runtime::ResourceLimits {
+                cpu_millis: Some(security.resources.cpu),
+                memory_bytes: security.resources.memory_bytes(),
+                disk_bytes: security.resources.disk_bytes(),
+                timeout_seconds: security.resources.parse_timeout_seconds(),
+            }
+        } else {
+            crate::domain::runtime::ResourceLimits {
+                cpu_millis: None,
+                memory_bytes: None,
+                disk_bytes: None,
+                timeout_seconds: None,
+            }
+        };
+
+        let image = if let Some(custom_image) = agent.manifest.spec.runtime.image.as_deref() {
+            custom_image.to_string()
+        } else {
+            let language = agent
+                .manifest
+                .spec
+                .runtime
+                .language
+                .as_deref()
+                .unwrap_or("");
+            let version = agent.manifest.spec.runtime.version.as_deref().unwrap_or("");
+            if let Some(ref reg) = self.runtime_registry {
+                reg.resolve(language, version).map_err(|e| {
+                    anyhow!(
+                        "Unsupported Standard Runtime for judge: {} {}. {}",
+                        language,
+                        version,
+                        e
+                    )
+                })?
+            } else {
+                return Err(anyhow!(
+                    "StandardRuntime registry not configured; cannot resolve judge agent image"
+                ));
+            }
+        };
+
+        let runtime_config = crate::domain::runtime::RuntimeConfig {
+            language: agent
+                .manifest
+                .spec
+                .runtime
+                .language
+                .clone()
+                .unwrap_or_default(),
+            version: agent
+                .manifest
+                .spec
+                .runtime
+                .version
+                .clone()
+                .unwrap_or_default(),
+            isolation: agent.manifest.spec.runtime.isolation.clone(),
+            env,
+            image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
+            resources,
+            execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
+            volumes: Vec::new(), // Judge agents do not mount volumes
+            container_uid: 1000,
+            container_gid: 1000,
+            keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false),
+            image,
+            bootstrap_path: agent
+                .manifest
+                .spec
+                .advanced
+                .as_ref()
+                .and_then(|a| a.bootstrap_path.clone()),
+            execution_id: child_execution_id,
+        };
+
+        // 6. Run Supervisor loop in background task.
+        let supervisor = self.supervisor.clone();
+        let repository = self.repository.clone();
+        let event_bus = self.event_bus.clone();
+        let monitor = Arc::new(ExecutionMonitor {
+            execution_id: child_execution_id,
+            agent_id,
+            repository: repository.clone(),
+            event_bus: event_bus.clone(),
+        });
+
+        // Judge agents may declare their own (nested) validation steps.
+        let validation_pipeline = agent
+            .manifest
+            .spec
+            .execution
+            .as_ref()
+            .and_then(|e| e.validation.as_ref())
+            .filter(|v| !v.is_empty())
+            .map(|v| {
+                let child_svc = self
+                    .child_executor
+                    .get()
+                    .cloned()
+                    .expect("child_executor not set");
+                Arc::new(build_validation_pipeline(
+                    v,
+                    self.agent_service.clone(),
+                    child_svc,
+                    self.event_bus.clone(),
+                    child_execution_id,
+                ))
+            });
+
+        let cancellation_token = CancellationToken::new();
+        self.cancellation_tokens
+            .insert(child_execution_id, cancellation_token.clone());
+        let tokens_map = self.cancellation_tokens.clone();
+
+        tokio::spawn(async move {
+            let result = supervisor
+                .run_loop(
+                    runtime_config,
+                    prepared_input,
+                    max_retries as u32,
+                    monitor,
+                    cancellation_token,
+                    validation_pipeline,
+                )
+                .await;
+
+            tokens_map.remove(&child_execution_id);
+
+            match result {
+                Ok(final_output) => {
+                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                        exec.complete();
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
+                            execution_id: child_execution_id,
+                            agent_id,
+                            final_output,
+                            total_iterations,
+                            completed_at: Utc::now(),
+                        });
+                    }
+                }
+                Err(RuntimeError::TimedOut(timeout_secs)) => {
+                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                        exec.fail(format!(
+                            "Execution timed out after {} seconds",
+                            timeout_secs
+                        ));
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
+                            execution_id: child_execution_id,
+                            agent_id,
+                            timeout_seconds: timeout_secs,
+                            total_iterations,
+                            timed_out_at: Utc::now(),
+                        });
+                    }
+                }
+                Err(RuntimeError::Cancelled) => {
+                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                        if exec.status != ExecutionStatus::Cancelled {
+                            exec.status = ExecutionStatus::Cancelled;
+                            exec.ended_at = Some(Utc::now());
+                            let _ = repository.save(&exec).await;
+                            event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                                execution_id: child_execution_id,
+                                agent_id,
+                                reason: Some("Cancelled".to_string()),
+                                cancelled_at: Utc::now(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                        exec.fail(e.to_string());
+                        let total_iterations = exec.iterations().len() as u8;
+                        let _ = repository.save(&exec).await;
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
+                            execution_id: child_execution_id,
+                            agent_id,
+                            reason: e.to_string(),
+                            total_iterations,
+                            failed_at: Utc::now(),
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok(child_execution_id)
     }
 
     async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
