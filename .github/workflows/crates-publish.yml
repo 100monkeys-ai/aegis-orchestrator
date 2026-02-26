@@ -70,14 +70,33 @@ jobs:
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
 
+      - name: Prepare proto files for publishing
+        run: |
+          # Create proto-vendor directory structure
+          mkdir -p orchestrator/core/proto-vendor/aegis
+          mkdir -p orchestrator/core/proto-vendor/temporal/api
+          mkdir -p orchestrator/core/proto-vendor/google
+          
+          # Copy AEGIS proto files from submodule
+          cp aegis-proto/proto/*.proto orchestrator/core/proto-vendor/aegis/
+          
+          # Copy Temporal API proto files
+          cp -r proto/temporal/api/* orchestrator/core/proto-vendor/temporal/api/
+          
+          # Copy Google proto dependencies
+          cp -r proto/google/* orchestrator/core/proto-vendor/google/
+          
+          echo "✅ Proto files prepared for packaging"
+          find orchestrator/core/proto-vendor -name '*.proto' | wc -l
+
       - name: Publish aegis-orchestrator-core
         run: |
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             echo "🔍 DRY RUN: Would publish aegis-orchestrator-core"
-            cargo publish -p aegis-orchestrator-core --locked --dry-run --token ${{ secrets.CRATES_TOKEN }}
+            cargo publish -p aegis-orchestrator-core --locked --allow-dirty --dry-run --token ${{ secrets.CRATES_TOKEN }}
           else
             echo "📦 Publishing aegis-orchestrator-core to crates.io..."
-            cargo publish -p aegis-orchestrator-core --locked --token ${{ secrets.CRATES_TOKEN }}
+            cargo publish -p aegis-orchestrator-core --locked --allow-dirty --token ${{ secrets.CRATES_TOKEN }}
           fi
 
       - name: Wait for crates.io index to update

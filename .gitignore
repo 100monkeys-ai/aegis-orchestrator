@@ -31,3 +31,6 @@ guardian_report.*
 
 # Protocol Buffers
 cli/tools/*
+
+# Proto vendor directory (created by CI for crates.io publishing)
+orchestrator/core/proto-vendor/

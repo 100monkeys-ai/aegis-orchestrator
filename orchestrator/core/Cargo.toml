@@ -8,6 +8,14 @@ license.workspace = true
 repository.workspace = true
 description = "Core domain and runtime primitives for the 100monkeys.ai AEGIS orchestrator"
 
+# Include proto-vendor in published packages (created by CI)
+include = [
+    "src/**/*.rs",
+    "Cargo.toml",
+    "build.rs",
+    "proto-vendor/**/*.proto",
+]
+
 [dependencies]
 tokio = { workspace = true }
 serde.workspace = true

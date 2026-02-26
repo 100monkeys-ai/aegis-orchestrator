@@ -12,52 +12,75 @@
 //!
 //! # Code Generation
 //!
-//! Uses `tonic-build` to generate Rust code from `.proto` files located in:
-//! - `../../aegis-proto/proto/aegis_runtime.proto` - AEGIS-specific protocols (git submodule: aegis-proto)
-//! - `../../proto/temporal/api/**/*.proto` - Temporal API definitions
+//! Uses `tonic-build` to generate Rust code from `.proto` files.
 //!
-//! Generated code is placed in `OUT_DIR` and included via `tonic::include_proto!`
-//! in `src/infrastructure/temporal_proto.rs`.
+//! # Proto File Sources
+//!
+//! - **Development**: Proto files are read from git submodules (aegis-proto/, proto/)
+//! - **CI Publishing**: GitHub Actions copies submodule files to proto-vendor/ before cargo publish
+//! - **crates.io**: Published packages include proto-vendor/ directory in the tarball
+//!
+//! This hybrid approach ensures:
+//! - Single source of truth (git submodules)
+//! - No drift (proto files not committed to consumer repos)
+//! - Publishing works (proto-vendor/ included in cargo package)
+//!
+//! # Proto Files
+//!
+//! - `proto-vendor/aegis/aegis_runtime.proto` - AEGIS runtime protocol
+//! - `proto-vendor/temporal/api/**/*.proto` - Temporal API definitions
+//! - `proto-vendor/google/api/**/*.proto` - Google API annotations
 //!
 //! # Dependencies
 //!
 //! - **protoc**: Protocol buffer compiler (vendored via `protoc-bin-vendored`)
 //! - **tonic-build**: Code generator for Rust gRPC stubs
-//!
-//! # Architecture
-//!
-//! - **Layer:** Core System
-//! - **Purpose:** Implements internal responsibilities for build
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set PROTOC environment variable to point to the vendored protoc binary
     std::env::set_var("PROTOC", protoc_bin_vendored::protoc_bin_path().unwrap());
 
-    // Get the manifest directory and construct paths
-    // CARGO_MANIFEST_DIR = aegis-orchestrator/orchestrator/core
-    // We need to go up 2 levels to aegis-orchestrator root, then access proto/
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")?;
-    let crate_root = std::path::Path::new(&manifest_dir)
+    let crate_dir = std::path::Path::new(&manifest_dir);
+    let crate_root = crate_dir
         .parent()
         .and_then(|p| p.parent())
         .ok_or("Failed to find crate root")?;
 
-    // Construct paths relative to aegis-orchestrator crate root
-    let aegis_proto_dir = crate_root
-        .join("aegis-proto/proto")
-        .to_string_lossy()
-        .to_string();
-    let proto_dir = crate_root.join("proto").to_string_lossy().to_string();
+    // Try proto-vendor first (CI/crates.io), fall back to submodule (development)
+    let proto_vendor_dir = crate_dir.join("proto-vendor");
+    let use_vendor = proto_vendor_dir.exists();
+
+    let (aegis_proto_path, temporal_api_base, include_dirs) = if use_vendor {
+        // CI/crates.io mode: use proto-vendor/
+        (
+            proto_vendor_dir.join("aegis/aegis_runtime.proto"),
+            proto_vendor_dir.join("temporal/api"),
+            vec![proto_vendor_dir.to_string_lossy().to_string()],
+        )
+    } else {
+        // Development mode: use git submodule
+        (
+            crate_root.join("aegis-proto/proto/aegis_runtime.proto"),
+            crate_root.join("proto/temporal/api"),
+            vec![
+                crate_root.join("proto").to_string_lossy().to_string(),
+                crate_root
+                    .join("aegis-proto/proto")
+                    .to_string_lossy()
+                    .to_string(),
+            ],
+        )
+    };
 
     let mut protos = Vec::new();
 
-    // Add aegis_runtime from the aegis-proto submodule
-    protos.push(
-        crate_root
-            .join("aegis-proto/proto/aegis_runtime.proto")
-            .to_string_lossy()
-            .to_string(),
-    );
+    // Add aegis_runtime proto
+    if aegis_proto_path.exists() {
+        protos.push(aegis_proto_path.to_string_lossy().to_string());
+    } else {
+        return Err(format!("aegis_runtime.proto not found at {:?}", aegis_proto_path).into());
+    }
 
     let temporal_protos = &[
         "workflowservice/v1/service.proto",
@@ -103,7 +126,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "deployment/v1/message.proto",
     ];
     for proto_file in temporal_protos {
-        let full_path = crate_root.join("proto/temporal/api").join(proto_file);
+        let full_path = temporal_api_base.join(proto_file);
         if full_path.exists() {
             protos.push(full_path.to_string_lossy().to_string());
         }
@@ -111,17 +134,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Only compile if we have proto files to compile
     if !protos.is_empty() {
+        let include_refs: Vec<&str> = include_dirs.iter().map(|dir| dir.as_str()).collect();
         tonic_build::configure()
             .build_server(true)
             .build_client(true)
-            .compile_protos(&protos, &[&proto_dir, &aegis_proto_dir])?;
+            .compile_protos(&protos, &include_refs)?;
     }
 
-    let aegis_proto_file = crate_root.join("aegis-proto/proto/aegis_runtime.proto");
-    if aegis_proto_file.exists() {
+    // Trigger rebuild if proto files change (development mode)
+    if !use_vendor {
         println!(
             "cargo:rerun-if-changed={}",
-            aegis_proto_file.to_string_lossy()
+            crate_root.join("aegis-proto/proto").display()
+        );
+        println!(
+            "cargo:rerun-if-changed={}",
+            crate_root.join("proto/temporal/api").display()
         );
     }
 
