@@ -41,7 +41,7 @@ use thiserror::Error;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeConfig {
     /// Target programming language (e.g. `"python"`, `"typescript"`, `"rust"`).
-    /// Combined with `version` to derive a Docker image tag via [`RuntimeConfig::to_image`].
+    /// Combined with `version` to derive a Docker image tag via [`RuntimeConfig::resolve_image_with_registry`].
     pub language: String,
     /// Language runtime version (e.g. `"3.12"`, `"20"`, `"1.76"`). Used in image tag.
     pub version: String,
@@ -143,7 +143,7 @@ impl RuntimeConfig {
     ///
     /// Returns an error if the language or version is not recognised by the registry.
     /// [`crate::application::execution::StandardExecutionService`] propagates this as
-    /// an [`ExecutionError`](crate::application::execution::ExecutionError) and the
+    /// an [`ExecutionError`](crate::domain::execution::ExecutionError) and the
     /// execution is immediately failed — no container is started.
     pub fn resolve_image_with_registry(
         &self,

@@ -86,7 +86,7 @@ pub trait ExecutionService: Send + Sync {
 
     /// Start a new child execution spawned by a parent (e.g., a judge agent).
     ///
-    /// Enforces `MAX_RECURSIVE_DEPTH` from the parent's [`ExecutionHierarchy`].
+    /// Enforces `MAX_RECURSIVE_DEPTH` from the parent's [`crate::domain::execution::ExecutionHierarchy`].
     /// The child's execution ID is returned immediately; the supervisor loop runs
     /// asynchronously, same as [`ExecutionService::start_execution`].
     ///
