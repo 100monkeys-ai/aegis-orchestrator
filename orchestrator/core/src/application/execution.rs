@@ -160,6 +160,9 @@ pub struct StandardExecutionService {
     config: Arc<crate::domain::node_config::NodeConfigManifest>,
     /// Optional NFS gateway for registering volume contexts before container spawn (ADR-036)
     nfs_gateway: Option<Arc<NfsGatewayService>>,
+    /// StandardRuntime registry for validating language+version and resolving images (ADR-043).
+    /// Required for StandardRuntime agents; executions will fail without it.
+    runtime_registry: Option<Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>>,
     /// Active cancellation tokens keyed by ExecutionId.
     /// Inserting a token on `start_execution` and calling `cancel()` on
     /// `cancel_execution` lets the Supervisor cooperatively terminate.
@@ -183,6 +186,7 @@ impl StandardExecutionService {
             event_bus,
             config,
             nfs_gateway: None,
+            runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
         }
     }
@@ -190,6 +194,17 @@ impl StandardExecutionService {
     /// Attach an NFS gateway so volume contexts are registered before agent containers spawn
     pub fn with_nfs_gateway(mut self, gateway: Arc<NfsGatewayService>) -> Self {
         self.nfs_gateway = Some(gateway);
+        self
+    }
+
+    /// Attach a StandardRuntime registry for validated language+version → image resolution (ADR-043).
+    /// Required when running StandardRuntime agents. Executions that use `language`+`version`
+    /// without a configured registry will immediately fail with a clear error.
+    pub fn with_runtime_registry(
+        mut self,
+        registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
+    ) -> Self {
+        self.runtime_registry = Some(registry);
         self
     }
 }
@@ -604,11 +619,11 @@ impl ExecutionService for StandardExecutionService {
         }
 
         let runtime_config = crate::domain::runtime::RuntimeConfig {
-            language: agent.manifest.spec.runtime.language.clone(),
-            version: agent.manifest.spec.runtime.version.clone(),
+            language: agent.manifest.spec.runtime.language.clone().unwrap_or_else(|| String::new()),
+            version: agent.manifest.spec.runtime.version.clone().unwrap_or_else(|| String::new()),
             isolation: agent.manifest.spec.runtime.isolation.clone(),
             env,
-            autopull: agent.manifest.spec.runtime.autopull,
+            image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
             volumes: volume_mounts,
@@ -617,10 +632,50 @@ impl ExecutionService for StandardExecutionService {
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
                 .map(|v| v.to_lowercase() == "true")
                 .unwrap_or(false),
+            // Resolve container image (ADR-043: StandardRuntime, ADR-044: CustomRuntime).
+            // CustomRuntime: use spec.runtime.image verbatim.
+            // StandardRuntime: registry maps language+version → slim tag (e.g. python:3.11-slim).
+            image: if let Some(custom_image) = agent.manifest.spec.runtime.image.as_deref() {
+                tracing::info!("CustomRuntime image: {}", custom_image);
+                custom_image.to_string()
+            } else {
+                let language = agent.manifest.spec.runtime.language.as_deref().unwrap_or("");
+                let version = agent.manifest.spec.runtime.version.as_deref().unwrap_or("");
+                if let Some(ref registry) = self.runtime_registry {
+                    match registry.resolve(language, version) {
+                        Ok(img) => {
+                            tracing::info!(
+                                "Resolved StandardRuntime image for {}/{}: {}",
+                                language, version, img
+                            );
+                            img
+                        }
+                        Err(e) => {
+                            tracing::error!("StandardRuntime validation failed: {}", e);
+                            return Err(anyhow!(
+                                "Unsupported Standard Runtime: {} {}. {}",
+                                language, version, e
+                            ));
+                        }
+                    }
+                } else {
+                    return Err(anyhow!(
+                        "StandardRuntime registry not configured; cannot resolve image for \
+                         language='{}' version='{}'. Call `.with_runtime_registry()` when \
+                         building StandardExecutionService (ADR-043).",
+                        language, version
+                    ));
+                }
+            },
+            // Forward custom bootstrap path from spec.advanced (ADR-044).
+            // None → orchestrator copies its own bootstrap into the container (StandardRuntime).
+            // Some(path) → bootstrap already present in image; skip injection, exec at path.
+            bootstrap_path: agent.manifest.spec.advanced
+                .as_ref()
+                .and_then(|a| a.bootstrap_path.clone()),
+            // Attach execution_id so DockerRuntime can correlate image events (ADR-045).
+            execution_id,
         };
-
-        // NOTE: We no longer spawn the instance here.
-        // The Supervisor will spawn fresh instances per iteration.
 
         execution.start();
         self.repository.save(&execution).await?;
@@ -630,9 +685,6 @@ impl ExecutionService for StandardExecutionService {
         let repository = self.repository.clone();
         let event_bus = self.event_bus.clone();
         let exec_input = prepared_input.clone();
-
-        // NOTE: We no longer build judges here. Validation is the workflow's responsibility.
-        // If workflows want validation, they should spawn judge agents.
 
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,

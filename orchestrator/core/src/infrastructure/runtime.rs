@@ -31,22 +31,25 @@
 // See: adrs/003-firecracker-isolation.md
 // ============================================================================
 
+use crate::domain::events::ImageManagementEvent;
 use crate::domain::runtime::{
     AgentRuntime, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError, TaskInput, TaskOutput,
 };
+use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::image_manager::{CredentialResolver, DockerImageManager, StandardDockerImageManager};
 use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
     UploadToContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::image::CreateImageOptions;
 use bollard::models::{Mount, MountTypeEnum};
 use bollard::Docker;
-use chrono;
+use chrono::Utc;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
@@ -59,6 +62,14 @@ pub struct DockerRuntime {
     nfs_port: u16,
     nfs_mountport: u16,
     keep_container_on_failure: RwLock<HashMap<String, bool>>,
+    /// Per-container custom bootstrap paths (ADR-044).
+    /// Key: container ID. `Some(path)` → CustomRuntime bootstrap already in image at `path`.
+    /// Absent → StandardRuntime; default `/usr/local/bin/aegis-bootstrap` is used.
+    bootstrap_paths: RwLock<HashMap<String, String>>,
+    /// Image lifecycle manager: pull-policy enforcement and cache checks (ADR-045).
+    image_manager: Arc<dyn DockerImageManager>,
+    /// Event bus for publishing image management lifecycle events (ADR-045, ADR-030).
+    event_bus: Arc<EventBus>,
 }
 
 impl DockerRuntime {
@@ -70,6 +81,8 @@ impl DockerRuntime {
         nfs_server_host: Option<String>,
         nfs_port: u16,
         nfs_mountport: u16,
+        event_bus: Arc<EventBus>,
+        credential_resolver: Arc<dyn CredentialResolver>,
     ) -> Result<Self, RuntimeError> {
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
@@ -130,6 +143,9 @@ impl DockerRuntime {
                     e
                 )))?
         };
+        // Clone docker before moving it into Self (image_manager needs its own handle).
+        let image_manager: Arc<dyn DockerImageManager> =
+            Arc::new(StandardDockerImageManager::new(docker.clone(), credential_resolver));
         Ok(Self {
             docker,
             bootstrap_script_path: bootstrap_path,
@@ -139,7 +155,26 @@ impl DockerRuntime {
             nfs_port,
             nfs_mountport,
             keep_container_on_failure: RwLock::new(HashMap::new()),
+            bootstrap_paths: RwLock::new(HashMap::new()),
+            image_manager,
+            event_bus,
         })
+    }
+
+    /// Remove dangling (unused) Docker images to reclaim disk space (ADR-045).
+    ///
+    /// Calls `docker image prune --filter dangling=true`. Safe to call at any time;
+    /// running containers are never affected because Docker only prunes images with
+    /// no active consumer.
+    pub async fn cleanup_images(&self) -> Result<(), RuntimeError> {
+        use bollard::image::PruneImagesOptions;
+        let mut filters = std::collections::HashMap::new();
+        filters.insert("dangling", vec!["true"]);
+        self.docker
+            .prune_images(Some(PruneImagesOptions { filters }))
+            .await
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Image prune failed: {}", e)))?;
+        Ok(())
     }
 
     /// Verify Docker daemon is accessible
@@ -238,60 +273,48 @@ impl AgentRuntime for DockerRuntime {
         // Validate isolation mode first
         config.validate_isolation()?;
 
-        let image = config.to_image();
+        let image = config.image.clone();
 
-        // Check if image exists locally first
-        let image_exists = self.docker.inspect_image(&image).await.is_ok();
-
-        // Decide whether to pull
-        let should_pull = if image_exists {
-            false
-        } else if config.autopull {
-            info!("Image {} not found locally, will attempt to pull", image);
-            true
-        } else {
-            false
-        };
-
-        if should_pull {
-            info!("Pulling image: {}", image);
-            let options = Some(CreateImageOptions {
-                from_image: image.clone(),
-                ..Default::default()
+        // Ensure the image is available locally (ADR-045); publish lifecycle events.
+        let pull_start = std::time::Instant::now();
+        self.event_bus
+            .publish_image_event(ImageManagementEvent::ImagePullStarted {
+                execution_id: config.execution_id,
+                image: image.clone(),
+                pull_policy: config.image_pull_policy,
+                started_at: Utc::now(),
             });
-
-            let mut stream = self.docker.create_image(options, None, None);
-            while let Some(result) = stream.next().await {
-                if let Err(e) = result {
-                    let error_msg = format!(
-                        "Failed to pull image {}: {}\n\n\
-                         Common causes:\n\
-                         - Docker daemon not responding (connection issue)\n\
-                         - No internet connectivity to Docker Hub\n\
-                         - Image name is incorrect or doesn't exist\n\
-                         - Corporate proxy/firewall blocking Docker Hub\n\
-                         - Registry authentication required\n\n\
-                         Try manually: docker pull {}",
-                        image, e, image
-                    );
-                    return Err(RuntimeError::SpawnFailed(error_msg));
-                }
+        let pull_source = match self
+            .image_manager
+            .ensure_image(&image, config.image_pull_policy)
+            .await
+        {
+            Ok(source) => {
+                self.event_bus
+                    .publish_image_event(ImageManagementEvent::ImagePullCompleted {
+                        execution_id: config.execution_id,
+                        image: image.clone(),
+                        source,
+                        duration_ms: pull_start.elapsed().as_millis() as u64,
+                        completed_at: Utc::now(),
+                    });
+                source
             }
-            info!("Successfully pulled image: {}", image);
-        } else if !image_exists && !config.autopull {
-            return Err(RuntimeError::SpawnFailed(format!(
-                "Image {} not found locally and autopull is disabled",
-                image
-            )));
-        }
-
-        // Validate isolation mode first
-        config.validate_isolation()?;
-
-        let image = config.to_image();
+            Err(e) => {
+                self.event_bus
+                    .publish_image_event(ImageManagementEvent::ImagePullFailed {
+                        execution_id: config.execution_id,
+                        image: image.clone(),
+                        reason: e.to_string(),
+                        failed_at: Utc::now(),
+                    });
+                return Err(e);
+            }
+        };
+        // pull_source carried for audit; not needed for container creation logic.
+        let _ = pull_source;
 
         // Build host config with resource limits
-        debug!("Preparing to copy bootstrap script into container");
 
         let mut host_config = bollard::service::HostConfig {
             mounts: None, // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
@@ -451,18 +474,43 @@ impl AgentRuntime for DockerRuntime {
 
         info!("Spawned agent container: {}", id);
 
-        // Copy bootstrap script into the container
-        debug!(
-            container_id = &id,
-            "Copying bootstrap script into container"
-        );
-        self.copy_bootstrap_to_container(&id).await?;
+        // Handle bootstrap script for this container (ADR-044).
+        // StandardRuntime: copy host-side bootstrap.py into the container at /usr/local/bin/aegis-bootstrap.
+        // CustomRuntime (bootstrap_path set): script is already present in the image; store the
+        // path for execute() and skip host-side injection.
+        if let Some(ref custom_path) = config.bootstrap_path {
+            self.bootstrap_paths
+                .write()
+                .await
+                .insert(id.clone(), custom_path.clone());
+            debug!(
+                container_id = &id,
+                bootstrap_path = custom_path.as_str(),
+                "Custom bootstrap path stored; skipping host-side injection"
+            );
+        } else {
+            debug!(
+                container_id = &id,
+                "Copying bootstrap script into container"
+            );
+            self.copy_bootstrap_to_container(&id).await?;
+        }
 
         Ok(InstanceId::new(id))
     }
 
     async fn execute(&self, id: &InstanceId, input: TaskInput) -> Result<TaskOutput, RuntimeError> {
         let container_id = id.as_str();
+
+        // Resolve bootstrap script path: stored custom path (CustomRuntime) or the default
+        // injected by spawn() (StandardRuntime: /usr/local/bin/aegis-bootstrap).
+        let bootstrap_path = self
+            .bootstrap_paths
+            .read()
+            .await
+            .get(container_id)
+            .cloned()
+            .unwrap_or_else(|| "/usr/local/bin/aegis-bootstrap".to_string());
 
         debug!(
             container_id = container_id,
@@ -478,7 +526,7 @@ impl AgentRuntime for DockerRuntime {
             // Using list form avoids shell: ["python", ...")
             cmd: Some(vec![
                 "python".to_string(),
-                "/usr/local/bin/aegis-bootstrap".to_string(),
+                bootstrap_path.clone(),
                 input.prompt.clone(),
             ]),
             // env: Some(vec!["PYTHONUNBUFFERED=1".to_string()]), // Commented out to ensure inheritance from container
@@ -487,7 +535,8 @@ impl AgentRuntime for DockerRuntime {
 
         debug!(
             container_id = container_id,
-            "Exec command: python /usr/local/bin/aegis-bootstrap <prompt>"
+            bootstrap_path = %bootstrap_path,
+            "Exec command: python <bootstrap_path> <prompt>"
         );
 
         let exec = self
@@ -600,6 +649,11 @@ impl AgentRuntime for DockerRuntime {
         };
 
         self.keep_container_on_failure
+            .write()
+            .await
+            .remove(id.as_str());
+
+        self.bootstrap_paths
             .write()
             .await
             .remove(id.as_str());

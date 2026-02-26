@@ -15,6 +15,7 @@
 //! | [`execution`] | BC-2 Execution | `Execution` aggregate, `Iteration`, 100monkeys loop types |
 //! | [`supervisor`] | BC-2 Execution | `Supervisor` domain service driving the iteration loop (ADR-005) |
 //! | [`runtime`] | BC-2 Execution | `AgentRuntime` trait, `RuntimeConfig`, `InstanceId` |
+//! | [`runtime_registry`] | BC-2 Execution | `StandardRuntimeRegistry` — certified language+version → image mapping (ADR-043) |
 //! | [`policy`] | BC-4 Security Policy | `SecurityPolicy`, `NetworkPolicy`, `FilesystemPolicy`, `ResourceLimits` |
 //! | [`security_context`] | BC-4/BC-12 SMCP | `SecurityContext` aggregate, `Capability` value object |
 //! | [`smcp_session`] | BC-12 SMCP | `SmcpSession` aggregate, `EnvelopeVerifier` trait |
@@ -44,6 +45,7 @@ pub mod path_sanitizer;
 pub mod policy;
 pub mod repository;
 pub mod runtime;
+pub mod runtime_registry;
 pub mod security_context;
 pub mod smcp_session;
 pub mod smcp_session_repository;

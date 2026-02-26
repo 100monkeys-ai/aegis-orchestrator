@@ -405,6 +405,7 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
+                registry_credentials: vec![],
             },
         };
         Arc::new(ProviderRegistry::from_config(&config).unwrap())

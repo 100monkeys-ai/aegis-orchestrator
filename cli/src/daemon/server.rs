@@ -273,6 +273,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             nfs_server_host,
             config.spec.runtime.nfs_port,
             config.spec.runtime.nfs_mountport,
+            event_bus.clone(),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::image_manager::NodeConfigCredentialResolver::new(
+                    config.spec.registry_credentials.clone(),
+                ),
+            ),
         )
         .context("Failed to initialize Docker runtime")?,
     );

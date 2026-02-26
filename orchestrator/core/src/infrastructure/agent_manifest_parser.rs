@@ -97,8 +97,8 @@ spec:
         assert_eq!(manifest.api_version, "100monkeys.ai/v1");
         assert_eq!(manifest.kind, "Agent");
         assert_eq!(manifest.metadata.name, "test-agent");
-        assert_eq!(manifest.spec.runtime.language, "python");
-        assert_eq!(manifest.spec.runtime.version, "3.11");
+        assert_eq!(manifest.spec.runtime.language, Some("python".to_string()));
+        assert_eq!(manifest.spec.runtime.version, Some("3.11".to_string()));
     }
 
     #[test]
@@ -162,7 +162,7 @@ spec:
 
         let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
         assert_eq!(manifest.metadata.name, "email-summarizer");
-        assert_eq!(manifest.spec.runtime.language, "python");
+        assert_eq!(manifest.spec.runtime.language, Some("python".to_string()));
 
         // Check task
         let task = manifest.spec.task.as_ref().unwrap();
@@ -323,10 +323,11 @@ spec:
             },
             spec: AgentSpec {
                 runtime: RuntimeConfig {
-                    language: "python".to_string(),
-                    version: "3.11".to_string(),
-                    isolation: "inherit".to_string(),
-                    autopull: true,
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "docker".to_string(),
                     model: "default".to_string(),
                 },
                 task: None,

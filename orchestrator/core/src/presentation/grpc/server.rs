@@ -466,16 +466,26 @@ impl AegisRuntime for AegisRuntimeService {
             ))),
         }
     }
+
+    /// Ingest an external stimulus and route it to a workflow (BC-8 — ADR-021).
+    async fn ingest_stimulus(
+        &self,
+        request: Request<IngestStimulusRequest>,
+    ) -> Result<Response<IngestStimulusResponse>, Status> {
+        let req = request.into_inner();
+        let (stimulus_id, workflow_execution_id) = self
+            .ingest_stimulus_rpc(req.source_name, req.content, req.idempotency_key, req.headers)
+            .await?;
+        Ok(Response::new(IngestStimulusResponse {
+            stimulus_id,
+            workflow_execution_id,
+        }))
+    }
 }
 
-// ── BC-8: IngestStimulus gRPC handler ─────────────────────────────────────────
-// This method implements the `IngestStimulus` RPC defined in aegis_runtime.proto.
-// It lives in a plain `impl` block until `cargo build` regenerates the proto
-// bindings and adds `ingest_stimulus` to the `AegisRuntime` trait, at which
-// point it should be moved back into the `impl AegisRuntime for AegisRuntimeService`
-// block above.  The HTTP equivalent is already live at `POST /v1/webhooks/{source}`.
-// TODO(proto-regen): move into `impl AegisRuntime for AegisRuntimeService` once
-// tonic-build has regenerated the trait with IngestStimulus.
+// ── BC-8: IngestStimulus gRPC helper ──────────────────────────────────────────
+// Shared implementation logic used by the `ingest_stimulus` trait method above.
+// The HTTP equivalent is live at `POST /v1/webhooks/{source}` and `POST /v1/stimuli`.
 impl AegisRuntimeService {
     /// Handle `IngestStimulus` RPC (BC-8 — ADR-021).
     pub async fn ingest_stimulus_rpc(

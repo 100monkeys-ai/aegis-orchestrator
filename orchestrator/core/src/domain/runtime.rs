@@ -24,6 +24,8 @@
 //!
 //! See Also: ADR-027 (Docker Runtime), ADR-036 (NFS Server Gateway)
 
+use crate::domain::agent::ImagePullPolicy;
+use crate::domain::execution::ExecutionId;
 use crate::domain::volume::VolumeMount;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -49,9 +51,8 @@ pub struct RuntimeConfig {
     pub isolation: String,
     /// Additional environment variables injected into the container at spawn time.
     pub env: HashMap<String, String>,
-    /// If `true`, the runtime will `docker pull` the image before spawning if it is
-    /// not already present locally. Useful in CI; disable for air-gapped deployments.
-    pub autopull: bool,
+    /// Image pull policy for runtime images.
+    pub image_pull_policy: ImagePullPolicy,
     /// CPU, memory, and disk resource limits applied to the container.
     pub resources: ResourceLimits,
     /// Execution strategy from the agent manifest (iteration settings, validation, etc.)
@@ -74,6 +75,30 @@ pub struct RuntimeConfig {
     /// `docker rm -f <container_id>`
     #[serde(default)]
     pub keep_container_on_failure: bool,
+    /// Fully-resolved container image reference used at spawn time.
+    ///
+    /// For **StandardRuntime** this is the registry-resolved tag (e.g. `"python:3.11-slim"`),
+    /// obtained via [`RuntimeConfig::resolve_image_with_registry`] in
+    /// `application/execution.rs` before constructing this config.
+    /// For **CustomRuntime** this is the verbatim `spec.runtime.image` value from the manifest.
+    ///
+    /// Always non-empty by the time `DockerRuntime::spawn()` is called (ADR-043, ADR-044).
+    pub image: String,
+    /// In-container path to the bootstrap script (ADR-044).
+    ///
+    /// `None` (default) means the orchestrator copies its own `bootstrap.py` into
+    /// the container at `/usr/local/bin/aegis-bootstrap` (StandardRuntime behaviour).
+    ///
+    /// `Some(path)` signals CustomRuntime: the script is already present inside the
+    /// image at `path`; the orchestrator skips injection and execs directly at that path.
+    /// Sourced from `spec.advanced.bootstrap_path` in the agent manifest.
+    pub bootstrap_path: Option<String>,
+    /// The `ExecutionId` of the execution that spawned this runtime instance.
+    ///
+    /// Propagated into [`crate::domain::events::ImageManagementEvent`] variants so
+    /// that image pull telemetry can be correlated back to the specific execution
+    /// (ADR-045).
+    pub execution_id: ExecutionId,
 }
 
 fn default_container_uid() -> u32 {
@@ -108,42 +133,23 @@ pub struct ResourceLimits {
 }
 
 impl RuntimeConfig {
-    /// Derive the Docker image tag from `language` and `version`.
+    /// Derive the Docker image tag from `language` and `version` using the StandardRuntime registry.
     ///
-    /// # Examples
+    /// This is the sole mechanism for resolving StandardRuntime images (ADR-043). The
+    /// `application/execution.rs` layer calls this before constructing [`RuntimeConfig`];
+    /// by the time `DockerRuntime::spawn()` is invoked, `config.image` is always pre-set.
     ///
-    /// ```
-    /// # use aegis_orchestrator_core::domain::runtime::{RuntimeConfig, ResourceLimits};
-    /// # use aegis_orchestrator_core::domain::agent::ExecutionStrategy;
-    /// # use std::collections::HashMap;
-    /// let cfg = RuntimeConfig {
-    ///     language: "python".to_string(),
-    ///     version: "3.12".to_string(),
-    ///     isolation: "docker".to_string(),
-    ///     env: HashMap::new(),
-    ///     autopull: false,
-    ///     resources: ResourceLimits {
-    ///         cpu_millis: None,
-    ///         memory_bytes: None,
-    ///         disk_bytes: None,
-    ///         timeout_seconds: None,
-    ///     },
-    ///     execution: ExecutionStrategy::default(),
-    ///     volumes: vec![],
-    ///     container_uid: 1000,
-    ///     container_gid: 1000,
-    ///     keep_container_on_failure: false,
-    /// };
-    /// assert_eq!(cfg.to_image(), "python:3.12");
-    /// ```
-    pub fn to_image(&self) -> String {
-        match self.language.as_str() {
-            "python" => format!("python:{}", self.version),
-            "javascript" | "typescript" => format!("node:{}", self.version),
-            "rust" => format!("rust:{}", self.version),
-            "go" => format!("golang:{}", self.version),
-            _ => format!("{}:{}", self.language, self.version),
-        }
+    /// # Errors
+    ///
+    /// Returns an error if the language or version is not recognised by the registry.
+    /// [`crate::application::execution::StandardExecutionService`] propagates this as
+    /// an [`ExecutionError`](crate::application::execution::ExecutionError) and the
+    /// execution is immediately failed — no container is started.
+    pub fn resolve_image_with_registry(
+        &self,
+        registry: &crate::domain::runtime_registry::StandardRuntimeRegistry,
+    ) -> Result<String, crate::domain::runtime_registry::RegistryError> {
+        registry.resolve(&self.language, &self.version)
     }
 
     /// Validate that the requested isolation mode is supported in the current phase.

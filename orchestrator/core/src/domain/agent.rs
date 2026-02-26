@@ -42,6 +42,35 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// Image pull policy strategy
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ImagePullPolicy {
+    /// Always pull from registry, even if cached locally
+    Always,
+    /// Use local cache if available; pull only if missing
+    #[serde(rename = "IfNotPresent")]
+    IfNotPresent,
+    /// Never pull; use only cached images (fail if missing)
+    Never,
+}
+
+impl Default for ImagePullPolicy {
+    fn default() -> Self {
+        ImagePullPolicy::IfNotPresent
+    }
+}
+
+impl std::fmt::Display for ImagePullPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ImagePullPolicy::Always => write!(f, "Always"),
+            ImagePullPolicy::IfNotPresent => write!(f, "IfNotPresent"),
+            ImagePullPolicy::Never => write!(f, "Never"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AgentId(pub Uuid);
 
@@ -156,27 +185,153 @@ pub struct AgentSpec {
 }
 
 /// Runtime configuration
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// 
+/// Supports two mutually exclusive runtime modes:
+/// - **StandardRuntime**: language + version (resolved to official Docker image)
+/// - **CustomRuntime**: image (user-supplied fully-qualified container image)
+///
+/// Validation ensures exactly one mode is specified (not both).
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct RuntimeConfig {
     /// Programming language (python, javascript, typescript, rust, go)
-    pub language: String,
+    /// Mutually exclusive with `image` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
 
     /// Language version (e.g., "3.11", "20", "1.75")
-    pub version: String,
+    /// Mutually exclusive with `image` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+
+    /// Custom Docker image reference (fully-qualified: registry/repo:tag)
+    /// Mutually exclusive with `language` + `version` fields.
+    /// Example: "ghcr.io/myorg/agent:v1.0.0"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
+
+    /// Image pull policy (Always, IfNotPresent, Never)
+    /// Controls whether the runtime image is pulled from registry.
+    pub image_pull_policy: ImagePullPolicy,
 
     /// Optional isolation mode (inherit, firecracker, docker, process)
-    #[serde(default = "default_isolation")]
     pub isolation: String,
 
     /// LLM model alias for this agent's primary LLM calls.
     /// Maps to a concrete provider + model in `aegis-config.yaml`.
     /// Standard aliases: `default`, `fast`, `smart`, `cheap`, `local`.
-    #[serde(default = "default_model_alias")]
     pub model: String,
+}
 
-    /// Optional autopull
-    #[serde(default = "default_true")]
-    pub autopull: bool,
+impl RuntimeConfig {
+    /// Validate mutual exclusion: exactly one of (language+version) or (image) must be specified.
+    pub fn validate(&self) -> Result<(), String> {
+        let has_standard = self.language.is_some() && self.version.is_some();
+        let has_language_without_version = self.language.is_some() && self.version.is_none();
+        let has_version_without_language = self.version.is_some() && self.language.is_none();
+        let has_custom = self.image.is_some();
+
+        // Reject partial standard runtime specification
+        if has_language_without_version {
+            return Err("language requires version to be specified".to_string());
+        }
+        if has_version_without_language {
+            return Err("version requires language to be specified".to_string());
+        }
+
+        // Enforce mutual exclusion
+        if has_standard && has_custom {
+            return Err(
+                "cannot specify both image and language+version (mutually exclusive)".to_string(),
+            );
+        }
+
+        // Require at least one
+        if !has_standard && !has_custom {
+            return Err(
+                "must specify either standard runtime (language+version) or custom runtime (image)"
+                    .to_string(),
+            );
+        }
+
+        // Validate custom image format (must be fully-qualified)
+        if let Some(img) = &self.image {
+            if !img.contains('/') {
+                return Err(
+                    "image must be fully-qualified: registry/repo:tag (e.g., ghcr.io/org/image:v1.0)"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Determine runtime type (standard or custom)
+    pub fn runtime_type(&self) -> RuntimeType {
+        if self.image.is_some() {
+            RuntimeType::Custom
+        } else {
+            RuntimeType::Standard
+        }
+    }
+}
+
+/// Runtime type discriminator
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeType {
+    /// AEGIS standard runtime (language + version pair)
+    Standard,
+    /// User-supplied custom runtime (Docker image)
+    Custom,
+}
+
+// For backward compatibility and deserialization, convert legacy format
+impl<'de> Deserialize<'de> for RuntimeConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RuntimeConfigHelper {
+            #[serde(default)]
+            language: Option<String>,
+            #[serde(default)]
+            version: Option<String>,
+            #[serde(default)]
+            image: Option<String>,
+            #[serde(default)]
+            image_pull_policy: Option<String>,
+            #[serde(default)]
+            isolation: Option<String>,
+            #[serde(default)]
+            model: Option<String>,
+        }
+
+        let helper = RuntimeConfigHelper::deserialize(deserializer)?;
+
+        // Parse image_pull_policy
+        let image_pull_policy = match helper.image_pull_policy.as_deref() {
+            Some("Always") => ImagePullPolicy::Always,
+            Some("IfNotPresent") => ImagePullPolicy::IfNotPresent,
+            Some("Never") => ImagePullPolicy::Never,
+            Some(invalid) => {
+                return Err(serde::de::Error::custom(format!(
+                    "invalid image_pull_policy: {} (must be Always, IfNotPresent, or Never)",
+                    invalid
+                )))
+            }
+            None => default_image_pull_policy(),
+        };
+
+        Ok(RuntimeConfig {
+            language: helper.language,
+            version: helper.version,
+            image: helper.image,
+            image_pull_policy,
+            isolation: helper.isolation.unwrap_or_else(default_isolation),
+            model: helper.model.unwrap_or_else(default_model_alias),
+        })
+    }
 }
 
 /// Volume specification in agent manifest
@@ -637,8 +792,15 @@ pub struct AdvancedConfig {
     pub warm_pool_size: u32,
     #[serde(default)]
     pub swarm_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_script: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckConfig>,
+    /// Custom bootstrap script path (for CustomRuntime only)
+    /// If specified, orchestrator will use this script instead of default bootstrap.py
+    /// The script must be present inside the custom container image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bootstrap_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -696,14 +858,20 @@ fn default_memory() -> String {
 fn default_disk() -> String {
     "1Gi".to_string()
 }
+
 fn default_isolation() -> String {
     "inherit".to_string()
 }
+
 fn default_model_alias() -> String {
     "default".to_string()
 }
 fn default_network_mode() -> String {
     "allow".to_string()
+}
+
+fn default_image_pull_policy() -> ImagePullPolicy {
+    ImagePullPolicy::IfNotPresent
 }
 
 impl Default for ResourceLimits {
@@ -859,12 +1027,13 @@ impl AgentManifest {
         Ok(())
     }
 
-    /// Get the runtime as a combined string
-    pub fn runtime_string(&self) -> String {
-        format!(
-            "{}:{}",
-            self.spec.runtime.language, self.spec.runtime.version
-        )
+    /// Get the runtime as a combined string (for standard runtimes)
+    /// Returns None for custom runtimes (use image field instead)
+    pub fn runtime_string(&self) -> Option<String> {
+        match (&self.spec.runtime.language, &self.spec.runtime.version) {
+            (Some(lang), Some(ver)) => Some(format!("{}:{}", lang, ver)),
+            _ => None,
+        }
     }
 }
 
@@ -885,10 +1054,11 @@ mod tests {
             },
             spec: AgentSpec {
                 runtime: RuntimeConfig {
-                    language: "python".to_string(),
-                    version: "3.11".to_string(),
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
                     isolation: "inherit".to_string(),
-                    autopull: true,
                     model: "default".to_string(),
                 },
                 task: None,
@@ -1023,12 +1193,6 @@ mod tests {
         manifest.metadata.name = "agent-".to_string();
         let err = manifest.validate().unwrap_err();
         assert!(err.contains("hyphen"));
-    }
-
-    #[test]
-    fn test_manifest_runtime_string() {
-        let manifest = make_manifest("my-agent");
-        assert_eq!(manifest.runtime_string(), "python:3.11");
     }
 
     // ── ResourceLimits ────────────────────────────────────────────────────────

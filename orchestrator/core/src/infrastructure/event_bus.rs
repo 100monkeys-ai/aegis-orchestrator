@@ -34,6 +34,7 @@
 //! | `Learning` / `Cortex` | BC-5 | ADR-018 |
 //! | `Policy` | BC-4 | — |
 //! | `Stimulus` | BC-8 | ADR-021 |
+//! | `ImageManagement` | BC-2 | ADR-045 |
 //!
 //! ## Phase Notes
 //!
@@ -51,8 +52,9 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{
-    AgentLifecycleEvent, ExecutionEvent, LearningEvent, MCPToolEvent, PolicyEvent, SmcpEvent,
-    StimulusEvent, StorageEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+    AgentLifecycleEvent, ExecutionEvent, ImageManagementEvent, LearningEvent, MCPToolEvent,
+    PolicyEvent, SmcpEvent, StimulusEvent, StorageEvent, ValidationEvent, VolumeEvent,
+    WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -75,6 +77,8 @@ pub enum DomainEvent {
     Smcp(SmcpEvent),
     /// BC-8 Stimulus-Response events (ADR-021)
     Stimulus(StimulusEvent),
+    /// BC-2 container image pull lifecycle events (ADR-045)
+    ImageManagement(ImageManagementEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -142,6 +146,11 @@ impl EventBus {
     /// Publish a stimulus ingestion/routing event (BC-8 ADR-021)
     pub fn publish_stimulus_event(&self, event: StimulusEvent) {
         self.publish(DomainEvent::Stimulus(event));
+    }
+
+    /// Publish a container image management event (BC-2 ADR-045)
+    pub fn publish_image_event(&self, event: ImageManagementEvent) {
+        self.publish(DomainEvent::ImageManagement(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -386,6 +395,7 @@ impl AgentEventReceiver {
                 SmcpEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Stimulus(_) => false, // Stimulus events are system-wide, not per-agent
+            DomainEvent::ImageManagement(_) => false, // Image management events are system-wide, not per-agent
         }
     }
 }
@@ -434,10 +444,11 @@ mod tests {
                 },
                 spec: crate::domain::agent::AgentSpec {
                     runtime: crate::domain::agent::RuntimeConfig {
-                        language: "python".to_string(),
-                        version: "3.11".to_string(),
-                        isolation: "inherit".to_string(),
-                        autopull: true,
+                        language: Some("python".to_string()),
+                        version: Some("3.11".to_string()),
+                        image: None,
+                        image_pull_policy: crate::domain::agent::ImagePullPolicy::IfNotPresent,
+                        isolation: "docker".to_string(),
                         model: "default".to_string(),
                     },
                     task: None,

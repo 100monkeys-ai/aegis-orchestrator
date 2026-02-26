@@ -20,18 +20,69 @@
 //! | [`PolicyEvent`] | BC-4 Security Policy | Runtime policy violation records |
 //! | [`ViolationType`] | BC-4 / BC-12 | Structured violation classification |
 //! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
+//! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //!
 //! ## Phase 2 Note
 //!
 //! The EventBus is currently **in-memory only** (tokio broadcast channel). Persistent
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
-use crate::domain::agent::{AgentId, AgentManifest};
+use crate::domain::agent::{AgentId, AgentManifest, ImagePullPolicy};
 use crate::domain::execution::{CodeDiff, ExecutionId, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::volume::{StorageClass, VolumeId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+/// Whether a container image was retrieved from the local Docker cache or pulled
+/// fresh from a remote registry (ADR-045).
+///
+/// Returned by [`crate::infrastructure::image_manager::DockerImageManager::ensure_image`]
+/// and embedded in [`ImageManagementEvent::ImagePullCompleted`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PullSource {
+    /// Image was already present in the local Docker daemon cache; no network I/O.
+    Cached,
+    /// Image was freshly pulled from the remote registry.
+    Downloaded,
+}
+
+/// Container image lifecycle events emitted by [`crate::infrastructure::runtime::DockerRuntime`]
+/// during the `spawn()` path (ADR-045).
+///
+/// Published to the [`crate::infrastructure::event_bus::EventBus`] before/after every
+/// Docker image pull so that the Control Plane, Cortex, and audit log can:
+/// - Track which images were pulled vs cache-hit across executions
+/// - Alert on systematic pull failures (misconfigured registry credentials, rate limits)
+/// - Feed Cortex with image-reuse patterns for cost optimisation signals
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ImageManagementEvent {
+    /// Raised immediately before the `DockerImageManager::ensure_image` call so
+    /// that slow pulls are visible in the execution timeline.
+    ImagePullStarted {
+        execution_id: ExecutionId,
+        image: String,
+        pull_policy: ImagePullPolicy,
+        started_at: DateTime<Utc>,
+    },
+    /// Raised after a successful `ensure_image` call; `source` distinguishes a
+    /// cache-hit from an actual network pull.
+    ImagePullCompleted {
+        execution_id: ExecutionId,
+        image: String,
+        source: PullSource,
+        duration_ms: u64,
+        completed_at: DateTime<Utc>,
+    },
+    /// Raised when `ensure_image` returns an error so the execution can be failed
+    /// immediately and the reason preserved for audit.
+    ImagePullFailed {
+        execution_id: ExecutionId,
+        image: String,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
 
 /// File-level audit events published by the NFS Server Gateway FSAL (ADR-036).
 ///

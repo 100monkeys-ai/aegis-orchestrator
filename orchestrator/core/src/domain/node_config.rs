@@ -64,6 +64,25 @@ pub struct ManifestMetadata {
     pub labels: Option<HashMap<String, String>>,
 }
 
+/// Credentials for pulling container images from a private container registry (ADR-045).
+///
+/// Phase 1: sourced from `aegis-config.yaml` via `spec.registry_credentials`.
+/// Phase 2: sourced from OpenBao KV at execution time (ADR-034).
+///
+/// The `registry` field is matched as a **prefix** of the resolved image reference
+/// (e.g. `"ghcr.io"` matches `"ghcr.io/myorg/agent:v1.0"`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegistryCredentials {
+    /// Registry hostname prefix to match against image references
+    /// (e.g. `"ghcr.io"`, `"registry.example.com:5000"`).
+    pub registry: String,
+    /// Username for HTTP Basic authentication with the Docker registry API.
+    pub username: String,
+    /// Password or personal access token.
+    /// Supports `env:VAR_NAME` syntax for environment variable substitution.
+    pub password: String,
+}
+
 /// Node configuration specification (content under spec:)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfigSpec {
@@ -97,6 +116,12 @@ pub struct NodeConfigSpec {
     /// MCP tool servers configurations
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
+
+    /// Private container registry credentials for pulling images (ADR-045).
+    /// Each entry covers one registry host prefix. Phase 1: static node-config;
+    /// Phase 2: resolved from OpenBao at execution time.
+    #[serde(default)]
+    pub registry_credentials: Vec<RegistryCredentials>,
 
     /// Database configuration (PostgreSQL)
     /// If omitted, the orchestrator uses InMemory repositories (development mode).
@@ -972,6 +997,7 @@ impl Default for NodeConfigSpec {
             mcp_servers: None,
             smcp: None,
             security_contexts: None,
+            registry_credentials: vec![],
         }
     }
 }
@@ -1340,6 +1366,7 @@ mod tests {
                 mcp_servers: None,
                 smcp: None,
                 security_contexts: None,
+                registry_credentials: vec![],
             },
         };
 

@@ -490,7 +490,7 @@ mod tests {
             version: "3.12".to_string(),
             isolation: "process".to_string(),
             env: HashMap::new(),
-            autopull: false,
+            image_pull_policy: crate::domain::agent::ImagePullPolicy::IfNotPresent,
             container_uid: 1000,
             container_gid: 1000,
             resources: ResourceLimits {
@@ -509,6 +509,9 @@ mod tests {
             },
             volumes: Vec::new(),
             keep_container_on_failure: false,
+            image: "python:3.12".to_string(),
+            bootstrap_path: None,
+            execution_id: crate::domain::execution::ExecutionId::new(),
         }
     }
 
