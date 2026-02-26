@@ -36,7 +36,9 @@ use crate::domain::runtime::{
     AgentRuntime, InstanceId, InstanceStatus, RuntimeConfig, RuntimeError, TaskInput, TaskOutput,
 };
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::image_manager::{CredentialResolver, DockerImageManager, StandardDockerImageManager};
+use crate::infrastructure::image_manager::{
+    CredentialResolver, DockerImageManager, StandardDockerImageManager,
+};
 use async_trait::async_trait;
 use bollard::container::{
     Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
@@ -72,18 +74,35 @@ pub struct DockerRuntime {
     event_bus: Arc<EventBus>,
 }
 
+/// Configuration bundle for constructing a [`DockerRuntime`].
+///
+/// Groups the nine constructor parameters into a single struct to keep the
+/// `new` call-site readable and satisfy the `clippy::too_many_arguments` lint.
+pub struct DockerRuntimeConfig {
+    pub bootstrap_script: String,
+    pub socket_path: Option<String>,
+    pub network_mode: Option<String>,
+    pub orchestrator_url: String,
+    pub nfs_server_host: Option<String>,
+    pub nfs_port: u16,
+    pub nfs_mountport: u16,
+    pub event_bus: Arc<EventBus>,
+    pub credential_resolver: Arc<dyn CredentialResolver>,
+}
+
 impl DockerRuntime {
-    pub fn new(
-        bootstrap_script: String,
-        socket_path: Option<String>,
-        network_mode: Option<String>,
-        orchestrator_url: String,
-        nfs_server_host: Option<String>,
-        nfs_port: u16,
-        nfs_mountport: u16,
-        event_bus: Arc<EventBus>,
-        credential_resolver: Arc<dyn CredentialResolver>,
-    ) -> Result<Self, RuntimeError> {
+    pub fn new(config: DockerRuntimeConfig) -> Result<Self, RuntimeError> {
+        let DockerRuntimeConfig {
+            bootstrap_script,
+            socket_path,
+            network_mode,
+            orchestrator_url,
+            nfs_server_host,
+            nfs_port,
+            nfs_mountport,
+            event_bus,
+            credential_resolver,
+        } = config;
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
             PathBuf::from(&bootstrap_script)
@@ -144,8 +163,10 @@ impl DockerRuntime {
                 )))?
         };
         // Clone docker before moving it into Self (image_manager needs its own handle).
-        let image_manager: Arc<dyn DockerImageManager> =
-            Arc::new(StandardDockerImageManager::new(docker.clone(), credential_resolver));
+        let image_manager: Arc<dyn DockerImageManager> = Arc::new(StandardDockerImageManager::new(
+            docker.clone(),
+            credential_resolver,
+        ));
         Ok(Self {
             docker,
             bootstrap_script_path: bootstrap_path,
@@ -653,10 +674,7 @@ impl AgentRuntime for DockerRuntime {
             .await
             .remove(id.as_str());
 
-        self.bootstrap_paths
-            .write()
-            .await
-            .remove(id.as_str());
+        self.bootstrap_paths.write().await.remove(id.as_str());
 
         self.docker
             .remove_container(id.as_str(), Some(options))

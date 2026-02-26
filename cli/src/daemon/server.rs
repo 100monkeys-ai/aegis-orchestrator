@@ -265,21 +265,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
 
     let runtime = Arc::new(
-        DockerRuntime::new(
-            config.spec.runtime.bootstrap_script.clone(),
-            config.spec.runtime.docker_socket_path.clone(),
+        DockerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::DockerRuntimeConfig {
+            bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
+            socket_path: config.spec.runtime.docker_socket_path.clone(),
             network_mode,
             orchestrator_url,
             nfs_server_host,
-            config.spec.runtime.nfs_port,
-            config.spec.runtime.nfs_mountport,
-            event_bus.clone(),
-            Arc::new(
+            nfs_port: config.spec.runtime.nfs_port,
+            nfs_mountport: config.spec.runtime.nfs_mountport,
+            event_bus: event_bus.clone(),
+            credential_resolver: Arc::new(
                 aegis_orchestrator_core::infrastructure::image_manager::NodeConfigCredentialResolver::new(
                     config.spec.registry_credentials.clone(),
                 ),
             ),
-        )
+        })
         .context("Failed to initialize Docker runtime")?,
     );
 

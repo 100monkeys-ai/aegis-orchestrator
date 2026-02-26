@@ -619,8 +619,20 @@ impl ExecutionService for StandardExecutionService {
         }
 
         let runtime_config = crate::domain::runtime::RuntimeConfig {
-            language: agent.manifest.spec.runtime.language.clone().unwrap_or_else(|| String::new()),
-            version: agent.manifest.spec.runtime.version.clone().unwrap_or_else(|| String::new()),
+            language: agent
+                .manifest
+                .spec
+                .runtime
+                .language
+                .clone()
+                .unwrap_or_default(),
+            version: agent
+                .manifest
+                .spec
+                .runtime
+                .version
+                .clone()
+                .unwrap_or_default(),
             isolation: agent.manifest.spec.runtime.isolation.clone(),
             env,
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
@@ -639,14 +651,22 @@ impl ExecutionService for StandardExecutionService {
                 tracing::info!("CustomRuntime image: {}", custom_image);
                 custom_image.to_string()
             } else {
-                let language = agent.manifest.spec.runtime.language.as_deref().unwrap_or("");
+                let language = agent
+                    .manifest
+                    .spec
+                    .runtime
+                    .language
+                    .as_deref()
+                    .unwrap_or("");
                 let version = agent.manifest.spec.runtime.version.as_deref().unwrap_or("");
                 if let Some(ref registry) = self.runtime_registry {
                     match registry.resolve(language, version) {
                         Ok(img) => {
                             tracing::info!(
                                 "Resolved StandardRuntime image for {}/{}: {}",
-                                language, version, img
+                                language,
+                                version,
+                                img
                             );
                             img
                         }
@@ -654,7 +674,9 @@ impl ExecutionService for StandardExecutionService {
                             tracing::error!("StandardRuntime validation failed: {}", e);
                             return Err(anyhow!(
                                 "Unsupported Standard Runtime: {} {}. {}",
-                                language, version, e
+                                language,
+                                version,
+                                e
                             ));
                         }
                     }
@@ -663,14 +685,18 @@ impl ExecutionService for StandardExecutionService {
                         "StandardRuntime registry not configured; cannot resolve image for \
                          language='{}' version='{}'. Call `.with_runtime_registry()` when \
                          building StandardExecutionService (ADR-043).",
-                        language, version
+                        language,
+                        version
                     ));
                 }
             },
             // Forward custom bootstrap path from spec.advanced (ADR-044).
             // None → orchestrator copies its own bootstrap into the container (StandardRuntime).
             // Some(path) → bootstrap already present in image; skip injection, exec at path.
-            bootstrap_path: agent.manifest.spec.advanced
+            bootstrap_path: agent
+                .manifest
+                .spec
+                .advanced
                 .as_ref()
                 .and_then(|a| a.bootstrap_path.clone()),
             // Attach execution_id so DockerRuntime can correlate image events (ADR-045).

@@ -185,8 +185,18 @@ async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClie
         println!("  Version: {}", agent_manifest.metadata.version);
         println!(
             "  Runtime: {}:{}",
-            agent_manifest.spec.runtime.language.as_deref().unwrap_or("unknown"),
-            agent_manifest.spec.runtime.version.as_deref().unwrap_or("unknown")
+            agent_manifest
+                .spec
+                .runtime
+                .language
+                .as_deref()
+                .unwrap_or("unknown"),
+            agent_manifest
+                .spec
+                .runtime
+                .version
+                .as_deref()
+                .unwrap_or("unknown")
         );
         return Ok(());
     }

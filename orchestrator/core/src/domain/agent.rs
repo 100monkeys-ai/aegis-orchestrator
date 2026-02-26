@@ -43,22 +43,17 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Image pull policy strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub enum ImagePullPolicy {
     /// Always pull from registry, even if cached locally
     Always,
     /// Use local cache if available; pull only if missing
     #[serde(rename = "IfNotPresent")]
+    #[default]
     IfNotPresent,
     /// Never pull; use only cached images (fail if missing)
     Never,
-}
-
-impl Default for ImagePullPolicy {
-    fn default() -> Self {
-        ImagePullPolicy::IfNotPresent
-    }
 }
 
 impl std::fmt::Display for ImagePullPolicy {
@@ -185,7 +180,7 @@ pub struct AgentSpec {
 }
 
 /// Runtime configuration
-/// 
+///
 /// Supports two mutually exclusive runtime modes:
 /// - **StandardRuntime**: language + version (resolved to official Docker image)
 /// - **CustomRuntime**: image (user-supplied fully-qualified container image)

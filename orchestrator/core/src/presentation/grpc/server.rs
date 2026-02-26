@@ -474,7 +474,12 @@ impl AegisRuntime for AegisRuntimeService {
     ) -> Result<Response<IngestStimulusResponse>, Status> {
         let req = request.into_inner();
         let (stimulus_id, workflow_execution_id) = self
-            .ingest_stimulus_rpc(req.source_name, req.content, req.idempotency_key, req.headers)
+            .ingest_stimulus_rpc(
+                req.source_name,
+                req.content,
+                req.idempotency_key,
+                req.headers,
+            )
             .await?;
         Ok(Response::new(IngestStimulusResponse {
             stimulus_id,

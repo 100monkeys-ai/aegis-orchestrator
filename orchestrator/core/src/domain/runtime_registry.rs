@@ -33,7 +33,10 @@ pub enum RegistryError {
     ParseError(String),
     /// The requested language is not supported by the registry.
     #[error("Unsupported language '{language}': {available}", available = .available.join(", "))]
-    UnsupportedLanguage { language: String, available: Vec<String> },
+    UnsupportedLanguage {
+        language: String,
+        available: Vec<String>,
+    },
     /// The requested language+version combination is not supported.
     #[error("Unsupported {language} version '{version}': {available}", available = .available.join(", "))]
     UnsupportedVersion {
@@ -113,9 +116,8 @@ impl StandardRuntimeRegistry {
     /// or [`RegistryError::ParseError`] if the YAML is malformed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let path = path.as_ref();
-        let content = std::fs::read_to_string(path).map_err(|e| {
-            RegistryError::FileNotFound(format!("{}:{}", path.display(), e))
-        })?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| RegistryError::FileNotFound(format!("{}:{}", path.display(), e)))?;
 
         let manifest: RegistryManifest = serde_yaml::from_str(&content)
             .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {}", e)))?;
@@ -130,7 +132,7 @@ impl StandardRuntimeRegistry {
     /// # Errors
     ///
     /// Returns [`RegistryError::ParseError`] if the YAML is malformed.
-    pub fn from_str(content: &str) -> Result<Self, RegistryError> {
+    pub fn from_yaml_str(content: &str) -> Result<Self, RegistryError> {
         let manifest: RegistryManifest = serde_yaml::from_str(content)
             .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {}", e)))?;
 
@@ -146,14 +148,14 @@ impl StandardRuntimeRegistry {
     /// Returns [`RegistryError::UnsupportedLanguage`] if the language is not in the registry,
     /// or [`RegistryError::UnsupportedVersion`] if the version is not supported for that language.
     pub fn resolve(&self, language: &str, version: &str) -> Result<String, RegistryError> {
-        let lang_map = self
-            .spec
-            .runtimes
-            .get(language)
-            .ok_or_else(|| RegistryError::UnsupportedLanguage {
-                language: language.to_string(),
-                available: self.spec.runtimes.keys().cloned().collect(),
-            })?;
+        let lang_map =
+            self.spec
+                .runtimes
+                .get(language)
+                .ok_or_else(|| RegistryError::UnsupportedLanguage {
+                    language: language.to_string(),
+                    available: self.spec.runtimes.keys().cloned().collect(),
+                })?;
 
         let entry = lang_map
             .get(version)
@@ -171,15 +173,19 @@ impl StandardRuntimeRegistry {
     /// # Errors
     ///
     /// Same as [`Self::resolve`].
-    pub fn resolve_entry(&self, language: &str, version: &str) -> Result<RuntimeEntry, RegistryError> {
-        let lang_map = self
-            .spec
-            .runtimes
-            .get(language)
-            .ok_or_else(|| RegistryError::UnsupportedLanguage {
-                language: language.to_string(),
-                available: self.spec.runtimes.keys().cloned().collect(),
-            })?;
+    pub fn resolve_entry(
+        &self,
+        language: &str,
+        version: &str,
+    ) -> Result<RuntimeEntry, RegistryError> {
+        let lang_map =
+            self.spec
+                .runtimes
+                .get(language)
+                .ok_or_else(|| RegistryError::UnsupportedLanguage {
+                    language: language.to_string(),
+                    available: self.spec.runtimes.keys().cloned().collect(),
+                })?;
 
         lang_map
             .get(version)
@@ -213,7 +219,12 @@ impl StandardRuntimeRegistry {
             .get(language)
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
-        versions.sort();
+        // Sort by each numeric segment so "3.9" < "3.10" rather than lexicographically.
+        versions.sort_by(|a, b| {
+            let a_parts: Vec<u64> = a.split('.').filter_map(|s| s.parse().ok()).collect();
+            let b_parts: Vec<u64> = b.split('.').filter_map(|s| s.parse().ok()).collect();
+            a_parts.cmp(&b_parts)
+        });
         versions
     }
 }
@@ -238,7 +249,7 @@ spec:
         description: "Python 3.11 with slim Debian base"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         assert_eq!(
             registry.resolve("python", "3.11").unwrap(),
             "python:3.11-slim"
@@ -261,7 +272,7 @@ spec:
         description: "Python 3.11 with slim Debian base"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         let result = registry.resolve("ruby", "3.0");
         match result {
             Err(RegistryError::UnsupportedLanguage { language, .. }) => {
@@ -287,13 +298,11 @@ spec:
         description: "Python 3.11"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         let result = registry.resolve("python", "3.9");
         match result {
             Err(RegistryError::UnsupportedVersion {
-                language,
-                version,
-                ..
+                language, version, ..
             }) => {
                 assert_eq!(language, "python");
                 assert_eq!(version, "3.9");
@@ -320,7 +329,7 @@ spec:
         image: "node:20-alpine"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         let langs = registry.supported_languages();
         assert_eq!(langs.len(), 2);
         assert!(langs.contains(&"python".to_string()));
@@ -346,7 +355,7 @@ spec:
         image: "python:3.11-slim"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         let versions = registry.supported_versions("python");
         assert_eq!(versions, vec!["3.9", "3.10", "3.11"]);
     }
@@ -369,10 +378,13 @@ spec:
           TYPESCRIPT_VERSION: "5.1"
 "#;
 
-        let registry = StandardRuntimeRegistry::from_str(registry_yaml).unwrap();
+        let registry = StandardRuntimeRegistry::from_yaml_str(registry_yaml).unwrap();
         let entry = registry.resolve_entry("typescript", "5.1").unwrap();
         assert_eq!(entry.image, "node:20-alpine");
         assert_eq!(entry.metadata.description, "TypeScript 5.1 via Node.js 20");
-        assert_eq!(entry.metadata.bootstrap_env.get("TYPESCRIPT_VERSION"), Some(&"5.1".to_string()));
+        assert_eq!(
+            entry.metadata.bootstrap_env.get("TYPESCRIPT_VERSION"),
+            Some(&"5.1".to_string())
+        );
     }
 }
