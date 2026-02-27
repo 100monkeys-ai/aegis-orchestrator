@@ -651,8 +651,8 @@ mod tests {
             .await;
 
         assert!(result.is_ok());
-        // The result is serialized as JSON string, so it includes quotes
-        assert_eq!(result.unwrap(), "\"Success output\"");
+        // Value::String is unwrapped directly — no surrounding quotes
+        assert_eq!(result.unwrap(), "Success output");
 
         // Verify observer was called correctly
         assert_eq!(observer.iteration_starts.lock().await.len(), 1);
