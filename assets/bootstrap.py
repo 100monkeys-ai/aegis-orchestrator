@@ -82,11 +82,6 @@ def main():
     if history_context:
         final_prompt = f"{history_context}{rendered_prompt}"
 
-    # Prepend history context to the rendered prompt if we're in a retry
-    final_prompt = rendered_prompt
-    if history_context:
-        final_prompt = f"{history_context}{rendered_prompt}"
-
     # 4. Call LLM Proxy
     payload = {
         "prompt": final_prompt,
