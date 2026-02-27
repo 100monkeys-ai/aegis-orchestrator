@@ -807,7 +807,11 @@ fn default_llm_timeout() -> u64 {
     300
 }
 fn default_validation_timeout() -> u64 {
-    30
+    // 300 s matches default_llm_timeout so a judge's LLM call (typically 30–120 s)
+    // completes well within the polling window. The previous 30 s default caused
+    // SemanticAgentValidator to time out before the judge finished, resulting in
+    // Err(e) in the supervisor and missing Feedback: sections in subsequent prompts.
+    300
 }
 fn default_post() -> String {
     "POST".to_string()

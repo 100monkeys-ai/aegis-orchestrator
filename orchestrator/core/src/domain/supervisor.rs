@@ -333,7 +333,16 @@ impl Supervisor {
                 }
             };
 
-            let stdout = output.result.to_string();
+            // Unwrap Value::String to avoid double-encoding: when the agent's bootstrap
+            // returns a plain string, `serde_json::Value::String(s).to_string()` produces
+            // `"\"...escaped...\""` — the outer quotes plus JSON-escaped newlines/quotes.
+            // Validators (OutputGradientValidator, strip_code_fence) and bootstrap.py's
+            // clean_str all then receive a mangled string that starts with `"` rather than
+            // the raw content, causing JSON parse errors at column 1.
+            let stdout = match output.result {
+                serde_json::Value::String(s) => s,
+                other => other.to_string(),
+            };
             let stderr = output.logs.join("\n");
 
             observer
@@ -416,7 +425,11 @@ impl Supervisor {
                             "output": stdout,
                             "exit_code": output.exit_code,
                             "validation_failed": true,
-                            "validation_reason": reason
+                            "validation_reason": reason,
+                            // Surface the error as feedback so bootstrap.py injects it
+                            // into the next iteration's prompt. Without this key the agent
+                            // sees no feedback at all when validation times out or errors.
+                            "feedback": reason
                         }));
                         continue;
                     }

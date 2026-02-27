@@ -263,6 +263,35 @@ impl OutputGradientValidator {
             regex_pattern,
         }
     }
+
+    /// Strip the first markdown code fence (` ```json … ``` ` or ` ``` … ``` `) from `text`.
+    /// Returns `None` when no fence is found; callers should fall back to the original text.
+    ///
+    /// LLMs commonly wrap structured output in fences even when instructed to emit raw JSON.
+    /// Stripping here keeps `OutputGradientValidator` compatible with both raw and fenced output.
+    fn strip_code_fence(text: &str) -> Option<String> {
+        if let Some(start) = text.find("```json") {
+            let content_start = start + "```json".len();
+            if let Some(end_offset) = text[content_start..].find("```") {
+                return Some(
+                    text[content_start..content_start + end_offset]
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(start) = text.find("```") {
+            let content_start = start + "```".len();
+            if let Some(end_offset) = text[content_start..].find("```") {
+                return Some(
+                    text[content_start..content_start + end_offset]
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+        None
+    }
 }
 
 #[async_trait::async_trait]
@@ -270,20 +299,25 @@ impl GradientValidator for OutputGradientValidator {
     async fn validate(&self, ctx: &ValidationContext) -> anyhow::Result<GradientResult> {
         // Step 1: Format check
         let parsed_value: Option<serde_json::Value> = match self.format.to_lowercase().as_str() {
-            "json" => match serde_json::from_str::<serde_json::Value>(&ctx.output) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    return Ok(GradientResult {
-                        score: 0.0,
-                        confidence: 1.0,
-                        reasoning: format!("Output is not valid JSON: {}", e),
-                        signals: vec![ValidationSignal {
-                            category: "format".to_string(),
+            "json" => {
+                // Strip markdown fences before parsing — LLMs often emit ```json…``` wrappers.
+                let stripped = Self::strip_code_fence(&ctx.output);
+                let to_parse = stripped.as_deref().unwrap_or(&ctx.output);
+                match serde_json::from_str::<serde_json::Value>(to_parse) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        return Ok(GradientResult {
                             score: 0.0,
-                            message: format!("JSON parse error: {}", e),
-                        }],
-                        metadata: HashMap::new(),
-                    });
+                            confidence: 1.0,
+                            reasoning: format!("Output is not valid JSON: {}", e),
+                            signals: vec![ValidationSignal {
+                                category: "format".to_string(),
+                                score: 0.0,
+                                message: format!("JSON parse error: {}", e),
+                            }],
+                            metadata: HashMap::new(),
+                        });
+                    }
                 }
             },
             "yaml" => match serde_yaml::from_str::<serde_json::Value>(&ctx.output) {
