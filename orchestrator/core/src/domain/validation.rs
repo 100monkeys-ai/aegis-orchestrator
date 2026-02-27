@@ -319,7 +319,7 @@ impl GradientValidator for OutputGradientValidator {
                         });
                     }
                 }
-            },
+            }
             "yaml" => match serde_yaml::from_str::<serde_json::Value>(&ctx.output) {
                 Ok(v) => Some(v),
                 Err(e) => {
