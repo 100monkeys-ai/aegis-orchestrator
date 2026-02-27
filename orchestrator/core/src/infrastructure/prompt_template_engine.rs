@@ -152,6 +152,11 @@ impl PromptTemplateEngine {
         // Configure Handlebars
         handlebars.set_strict_mode(false); // Don't fail on missing variables
 
+        // LLM prompts are plain text — disable HTML escaping so that backticks,
+        // quotes, and angle brackets in `{{input}}` / `{{instruction}}` reach the
+        // model verbatim rather than as &quot;, &#x60;, &lt;, etc.
+        handlebars.register_escape_fn(handlebars::no_escape);
+
         // Register custom helpers (if needed in future)
         // handlebars.register_helper("uppercase", Box::new(uppercase_helper));
 
