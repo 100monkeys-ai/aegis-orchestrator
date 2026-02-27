@@ -383,12 +383,24 @@ impl Supervisor {
                             reason = %blocking_reason,
                             "Validation pipeline rejected iteration — retrying"
                         );
+                        // Serialize the full GradientResult so bootstrap.py injects the
+                        // complete judge response (score, confidence, reasoning, signals)
+                        // into the next iteration's prompt. Re-serialisation is fine here —
+                        // the LLM doesn't care about field ordering, and GradientResult has
+                        // a metadata HashMap catchall so no judge-emitted data is lost.
+                        let feedback = pipeline_result
+                            .results
+                            .gradient
+                            .as_ref()
+                            .and_then(|g| serde_json::to_string_pretty(g).ok())
+                            .unwrap_or_else(|| blocking_reason.clone());
                         iteration_history.push(serde_json::json!({
                             "iteration": attempts,
                             "output": stdout,
                             "exit_code": output.exit_code,
                             "validation_failed": true,
-                            "validation_reason": blocking_reason
+                            "validation_reason": blocking_reason,
+                            "feedback": feedback
                         }));
                         continue;
                     }
