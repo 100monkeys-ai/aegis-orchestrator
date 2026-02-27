@@ -9,7 +9,7 @@ repository.workspace = true
 description = "Rust SDK for building 100monkeys.ai AEGIS agents"
 
 [dependencies]
-aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.1.0-pre-alpha" }
+aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.2.0-pre-alpha" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
