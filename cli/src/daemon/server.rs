@@ -53,6 +53,7 @@ use aegis_orchestrator_core::{
         execution::ExecutionInput,
         node_config::{resolve_env_value, NodeConfigManifest},
         repository::AgentRepository,
+        runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
@@ -434,6 +435,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
+
+    // Load StandardRuntime registry (ADR-043)
+    let registry_path = &config.spec.runtime.runtime_registry_path;
+    let runtime_registry = match StandardRuntimeRegistry::from_file(registry_path) {
+        Ok(registry) => {
+            println!(
+                "✓ StandardRuntime registry loaded from '{}' (ADR-043)",
+                registry_path
+            );
+            Arc::new(registry)
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "Failed to load StandardRuntime registry from '{}': {}. \
+                 Ensure runtime-registry.yaml exists at the configured path \
+                 (spec.runtime.runtime_registry_path in aegis-config.yaml).",
+                registry_path,
+                e
+            ));
+        }
+    };
+
     let execution_service = Arc::new(
         StandardExecutionService::new(
             agent_service.clone(),
@@ -443,7 +466,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
             Arc::new(config.clone()),
         )
-        .with_nfs_gateway(nfs_gateway.clone()),
+        .with_nfs_gateway(nfs_gateway.clone())
+        .with_runtime_registry(runtime_registry),
     );
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
     execution_service.set_child_execution_service(execution_service.clone());

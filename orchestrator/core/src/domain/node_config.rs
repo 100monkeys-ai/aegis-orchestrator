@@ -326,6 +326,16 @@ pub struct RuntimeConfig {
     /// Default: 2049
     #[serde(default = "default_nfs_port")]
     pub nfs_mountport: u16,
+
+    /// Path to the StandardRuntime registry YAML file (ADR-043).
+    /// Resolves language+version pairs to deterministic Docker images.
+    /// Default: "runtime-registry.yaml" (relative to daemon working directory)
+    #[serde(default = "default_runtime_registry_path")]
+    pub runtime_registry_path: String,
+}
+
+fn default_runtime_registry_path() -> String {
+    "runtime-registry.yaml".to_string()
 }
 
 fn default_nfs_port() -> u16 {
@@ -343,6 +353,7 @@ impl Default for RuntimeConfig {
             nfs_server_host: None,
             nfs_port: default_nfs_port(),
             nfs_mountport: default_nfs_port(),
+            runtime_registry_path: default_runtime_registry_path(),
         }
     }
 }
