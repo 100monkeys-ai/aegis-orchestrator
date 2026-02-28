@@ -97,11 +97,14 @@ def main():
         final_prompt = f"{history_context}{rendered_prompt}"
 
     # 4. Call LLM Proxy
+    # AEGIS_MODEL_ALIAS is injected by the orchestrator from spec.runtime.model.
+    # It routes this execution to the correct provider alias (e.g. "judge",
+    # "smart", "default"). The key must match InnerLoopRequest.model_alias.
     payload = {
         "prompt": final_prompt,
         "execution_id": execution_id,
         "iteration_number": iteration_number,
-        "model": "default"
+        "model_alias": os.environ.get("AEGIS_MODEL_ALIAS", "default")
     }
     
     debug_print(f"Preparing LLM request - prompt length: {len(final_prompt)} chars")

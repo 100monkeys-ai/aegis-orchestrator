@@ -22,11 +22,89 @@ use super::anthropic::AnthropicAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
+/// Builds the alias → (provider_name, ModelConfig) map respecting the configured
+/// `LLMSelectionStrategy`.
+///
+/// When multiple enabled providers define the same alias, the strategy decides which
+/// entry wins rather than the last-write-wins behaviour of a plain sequential insert:
+///
+/// | Strategy           | Wins when …                                                        |
+/// |--------------------|---------------------------------------------------------------------|
+/// | `PreferLocal`      | New provider `is_local()` and existing entry is not local          |
+/// | `PreferCloud`      | New provider is not local and existing entry is local              |
+/// | `CostOptimized`    | New model's `cost_per_1k_tokens` < existing model's cost           |
+/// | `LatencyOptimized` | Same as `PreferLocal` — local inference always has lower latency    |
+///
+/// Providers that have been disabled via `enabled: false` are skipped entirely.
+fn build_alias_map(
+    provider_configs: &[LLMProviderConfig],
+    strategy: &LLMSelectionStrategy,
+) -> HashMap<String, (String, ModelConfig)> {
+    // Intermediate map also tracks is_local for the current winner so we can
+    // apply the strategy without re-looking up the provider config later.
+    // (alias -> (provider_name, is_local, model_config))
+    let mut working: HashMap<String, (String, bool, ModelConfig)> = HashMap::new();
+
+    for provider_config in provider_configs {
+        if !provider_config.enabled {
+            continue;
+        }
+
+        let new_is_local = provider_config.is_local();
+
+        for model_config in &provider_config.models {
+            let alias = &model_config.alias;
+
+            let should_insert = match working.get(alias) {
+                None => true,
+                Some((_, existing_is_local, existing_model)) => match strategy {
+                    LLMSelectionStrategy::PreferLocal | LLMSelectionStrategy::LatencyOptimized => {
+                        // Overwrite only if the new provider is local and the existing is not.
+                        new_is_local && !existing_is_local
+                    }
+                    LLMSelectionStrategy::PreferCloud => {
+                        // Overwrite only if the new provider is cloud and the existing is local.
+                        !new_is_local && *existing_is_local
+                    }
+                    LLMSelectionStrategy::CostOptimized => {
+                        model_config.cost_per_1k_tokens < existing_model.cost_per_1k_tokens
+                    }
+                },
+            };
+
+            if should_insert {
+                info!(
+                    "Mapping alias '{}' -> {} ({}) [strategy={:?}]",
+                    alias, model_config.model, provider_config.name, strategy
+                );
+                working.insert(
+                    alias.clone(),
+                    (
+                        provider_config.name.clone(),
+                        new_is_local,
+                        model_config.clone(),
+                    ),
+                );
+            } else {
+                info!(
+                    "Alias '{}' already mapped to a preferred provider, skipping {} ({}) [strategy={:?}]",
+                    alias, model_config.model, provider_config.name, strategy
+                );
+            }
+        }
+    }
+
+    // Strip the is_local bookkeeping field — callers only need (provider_name, ModelConfig).
+    working
+        .into_iter()
+        .map(|(alias, (provider_name, _, model_config))| (alias, (provider_name, model_config)))
+        .collect()
+}
+
 /// Registry for managing LLM providers and resolving model aliases
 pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     alias_map: HashMap<String, (String, ModelConfig)>, // alias -> (provider_name, model_config)
-    _selection_strategy: LLMSelectionStrategy,
     fallback_provider: Option<String>,
     max_retries: u32,
     retry_delay_ms: u64,
@@ -36,7 +114,6 @@ impl ProviderRegistry {
     /// Create provider registry from node configuration
     pub fn from_config(config: &NodeConfigManifest) -> anyhow::Result<Self> {
         let mut providers = HashMap::new();
-        let mut alias_map = HashMap::new();
 
         info!("Initializing LLM provider registry");
 
@@ -52,18 +129,6 @@ impl ProviderRegistry {
             match Self::create_provider(provider_config) {
                 Ok(provider) => {
                     providers.insert(provider_config.name.clone(), provider);
-
-                    // Build alias mapping
-                    for model_config in &provider_config.models {
-                        info!(
-                            "Mapping alias '{}' -> {} ({})",
-                            model_config.alias, model_config.model, provider_config.name
-                        );
-                        alias_map.insert(
-                            model_config.alias.clone(),
-                            (provider_config.name.clone(), model_config.clone()),
-                        );
-                    }
                 }
                 Err(e) => {
                     warn!(
@@ -79,10 +144,14 @@ impl ProviderRegistry {
             warn!("No LLM providers configured - semantic validation will not be available");
         }
 
+        let alias_map = build_alias_map(
+            &config.spec.llm_providers,
+            &config.spec.llm_selection.strategy,
+        );
+
         Ok(Self {
             providers,
             alias_map,
-            _selection_strategy: config.spec.llm_selection.strategy.clone(),
             fallback_provider: config.spec.llm_selection.fallback_provider.clone(),
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,

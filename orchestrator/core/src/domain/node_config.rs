@@ -218,6 +218,17 @@ pub struct LLMProviderConfig {
     pub models: Vec<ModelConfig>,
 }
 
+impl LLMProviderConfig {
+    /// Returns `true` when this provider runs inference locally (no external API call).
+    ///
+    /// Local provider types: `"ollama"`, `"openai-compatible"` (e.g. LM Studio, vLLM).
+    /// Cloud provider types: `"openai"`, `"anthropic"`.
+    /// Used by `ProviderRegistry::build_alias_map` to implement `LLMSelectionStrategy`.
+    pub fn is_local(&self) -> bool {
+        matches!(self.provider_type.as_str(), "ollama" | "openai-compatible")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
     /// Model alias used in agent manifests (e.g., "default", "fast", "smart")
