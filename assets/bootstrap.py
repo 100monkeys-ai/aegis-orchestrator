@@ -100,11 +100,22 @@ def main():
     # AEGIS_MODEL_ALIAS is injected by the orchestrator from spec.runtime.model.
     # It routes this execution to the correct provider alias (e.g. "judge",
     # "smart", "default"). The key must match InnerLoopRequest.model_alias.
+    # The orchestrator MUST always inject this variable; a missing value indicates
+    # a misconfiguration that must be fixed at the source, not silently masked.
+    model_alias = os.environ.get("AEGIS_MODEL_ALIAS")
+    if model_alias is None:
+        print(
+            "Error: AEGIS_MODEL_ALIAS environment variable is not set. "
+            "The orchestrator must inject this for every execution via spec.runtime.model.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    debug_print(f"Model alias: {model_alias}")
     payload = {
         "prompt": final_prompt,
         "execution_id": execution_id,
         "iteration_number": iteration_number,
-        "model_alias": os.environ.get("AEGIS_MODEL_ALIAS", "default")
+        "model_alias": model_alias,
     }
     
     debug_print(f"Preparing LLM request - prompt length: {len(final_prompt)} chars")

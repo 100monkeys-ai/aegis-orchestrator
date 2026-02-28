@@ -1828,11 +1828,8 @@ async fn lookup_agent_handler(
 struct LlmGenerateRequest {
     execution_id: Option<Uuid>,
     iteration_number: Option<u8>,
-    _provider: Option<String>,
-    model: Option<String>,
+    model_alias: Option<String>,
     prompt: String,
-    _temperature: Option<f32>,
-    _max_tokens: Option<u32>,
 }
 
 async fn llm_generate_handler(
@@ -1869,7 +1866,10 @@ async fn llm_generate_handler(
         .map(|id| id.to_string())
         .unwrap_or_else(|| Uuid::nil().to_string());
 
-    let model_alias = req.model.clone().unwrap_or_else(|| "default".to_string());
+    let model_alias = req
+        .model_alias
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
 
     // Build the inner loop request, seeding the conversation with the rendered prompt
     let inner_req = InnerLoopRequest {

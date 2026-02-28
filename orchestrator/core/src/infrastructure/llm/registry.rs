@@ -31,11 +31,11 @@ use super::openai::OpenAIAdapter;
 /// `providers` holds one health-check adapter per provider name (using `models.first()`).
 pub struct ProviderRegistry {
     /// alias → pre-configured adapter for that exact model.
-    alias_map: HashMap<String, Arc<dyn LLMProvider>>,
+    alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)>,
     /// provider_name → adapter used for health checks (built from models.first()).
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     /// Fallback adapter resolved at construction time; used when primary exhausts retries.
-    fallback_provider: Option<Arc<dyn LLMProvider>>,
+    fallback_provider: Option<(String, Arc<dyn LLMProvider>)>,
     max_retries: u32,
     retry_delay_ms: u64,
 }
@@ -135,7 +135,7 @@ impl ProviderRegistry {
         }
 
         // ── Phase 2: build one per-model adapter per winning alias ─────────────────────
-        let mut alias_map: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
+        let mut alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -149,7 +149,7 @@ impl ProviderRegistry {
                     {
                         match Self::create_adapter(provider_config, winner_model) {
                             Ok(adapter) => {
-                                alias_map.insert(alias.clone(), adapter);
+                                alias_map.insert(alias.clone(), (winner_model.clone(), adapter));
                             }
                             Err(e) => {
                                 warn!(
@@ -164,12 +164,18 @@ impl ProviderRegistry {
         }
 
         // Resolve fallback to a concrete adapter at construction time.
+        // We look up the provider name and assume the first model was used for health checks.
         let fallback_provider = config
             .spec
             .llm_selection
             .fallback_provider
             .as_deref()
-            .and_then(|name| providers.get(name).cloned());
+            .and_then(|name| {
+                let adapter = providers.get(name)?.clone();
+                let provider_config = config.spec.llm_providers.iter().find(|p| p.name == name)?;
+                let first_model = provider_config.models.first()?.model.clone();
+                Some((first_model, adapter))
+            });
 
         Ok(Self {
             alias_map,
@@ -235,22 +241,25 @@ impl ProviderRegistry {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        let provider = self
+        let (model_name, provider) = self
             .alias_map
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
+
+        info!("LLM inference: alias='{}', model='{}'", alias, model_name);
 
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
             match provider.generate_chat(messages, tools, options).await {
                 Ok(response) => {
-                    info!("generate_chat successful on attempt {}", attempt + 1);
+                    info!("generate_chat successful: alias='{}', model='{}', attempt={}", alias, model_name, attempt + 1);
                     return Ok(response);
                 }
                 Err(e) => {
                     warn!(
-                        "generate_chat failed (attempt {}/{}): {:?}",
+                        "generate_chat failed: alias='{}', attempt={}/{}: {:?}",
+                        alias,
                         attempt + 1,
                         self.max_retries,
                         e
@@ -258,8 +267,8 @@ impl ProviderRegistry {
                     last_error = Some(e);
 
                     if attempt == self.max_retries - 1 {
-                        if let Some(fallback) = &self.fallback_provider {
-                            info!("Trying fallback provider");
+                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                            info!("Trying fallback provider (model='{}')", fallback_model);
                             return fallback.generate_chat(messages, tools, options).await;
                         }
                     }
@@ -286,17 +295,19 @@ impl ProviderRegistry {
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
-        let provider = self
+        let (model_name, provider) = self
             .alias_map
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
+
+        info!("LLM text generation: alias='{}', model='{}'", alias, model_name);
 
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
             match provider.generate(prompt, options).await {
                 Ok(response) => {
-                    info!("Generation successful on attempt {}", attempt + 1);
+                    info!("Generation successful on attempt {} (model='{}')", attempt + 1, model_name);
                     return Ok(response);
                 }
                 Err(e) => {
@@ -309,8 +320,8 @@ impl ProviderRegistry {
                     last_error = Some(e);
 
                     if attempt == self.max_retries - 1 {
-                        if let Some(fallback) = &self.fallback_provider {
-                            info!("Trying fallback provider");
+                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                            info!("Trying fallback provider (model='{}')", fallback_model);
                             return fallback.generate(prompt, options).await;
                         }
                     }
@@ -434,7 +445,7 @@ impl LLMProvider for ProviderRegistry {
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
-        let provider = self
+        let (_, provider) = self
             .alias_map
             .get("default")
             .ok_or_else(|| LLMError::Provider("Default model alias not configured".into()))?;
