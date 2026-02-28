@@ -11,7 +11,7 @@ use crate::domain::llm::{
     ToolSchema,
 };
 use crate::domain::node_config::{
-    resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, ModelConfig, NodeConfigManifest,
+    resolve_env_value, LLMProviderConfig, LLMSelectionStrategy, NodeConfigManifest,
 };
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -22,120 +22,110 @@ use super::anthropic::AnthropicAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
-/// Builds the alias → (provider_name, ModelConfig) map respecting the configured
-/// `LLMSelectionStrategy`.
+/// Registry for managing LLM providers and resolving model aliases.
 ///
-/// When multiple enabled providers define the same alias, the strategy decides which
-/// entry wins rather than the last-write-wins behaviour of a plain sequential insert:
+/// Each entry in `alias_map` is an `Arc<dyn LLMProvider>` that was constructed at
+/// startup with the **exact model name** that won the selection-strategy evaluation.
+/// There is no runtime model-override: the adapter *is* the model.
 ///
-/// | Strategy           | Wins when …                                                        |
-/// |--------------------|---------------------------------------------------------------------|
-/// | `PreferLocal`      | New provider `is_local()` and existing entry is not local          |
-/// | `PreferCloud`      | New provider is not local and existing entry is local              |
-/// | `CostOptimized`    | New model's `cost_per_1k_tokens` < existing model's cost           |
-/// | `LatencyOptimized` | Same as `PreferLocal` — local inference always has lower latency    |
-///
-/// Providers that have been disabled via `enabled: false` are skipped entirely.
-fn build_alias_map(
-    provider_configs: &[LLMProviderConfig],
-    strategy: &LLMSelectionStrategy,
-) -> HashMap<String, (String, ModelConfig)> {
-    // Intermediate map also tracks is_local for the current winner so we can
-    // apply the strategy without re-looking up the provider config later.
-    // (alias -> (provider_name, is_local, model_config))
-    let mut working: HashMap<String, (String, bool, ModelConfig)> = HashMap::new();
-
-    for provider_config in provider_configs {
-        if !provider_config.enabled {
-            continue;
-        }
-
-        let new_is_local = provider_config.is_local();
-
-        for model_config in &provider_config.models {
-            let alias = &model_config.alias;
-
-            let should_insert = match working.get(alias) {
-                None => true,
-                Some((_, existing_is_local, existing_model)) => match strategy {
-                    LLMSelectionStrategy::PreferLocal | LLMSelectionStrategy::LatencyOptimized => {
-                        // Overwrite only if the new provider is local and the existing is not.
-                        new_is_local && !existing_is_local
-                    }
-                    LLMSelectionStrategy::PreferCloud => {
-                        // Overwrite only if the new provider is cloud and the existing is local.
-                        !new_is_local && *existing_is_local
-                    }
-                    LLMSelectionStrategy::CostOptimized => {
-                        model_config.cost_per_1k_tokens < existing_model.cost_per_1k_tokens
-                    }
-                },
-            };
-
-            if should_insert {
-                info!(
-                    "Mapping alias '{}' -> {} ({}) [strategy={:?}]",
-                    alias, model_config.model, provider_config.name, strategy
-                );
-                working.insert(
-                    alias.clone(),
-                    (
-                        provider_config.name.clone(),
-                        new_is_local,
-                        model_config.clone(),
-                    ),
-                );
-            } else {
-                info!(
-                    "Alias '{}' already mapped to a preferred provider, skipping {} ({}) [strategy={:?}]",
-                    alias, model_config.model, provider_config.name, strategy
-                );
-            }
-        }
-    }
-
-    // Strip the is_local bookkeeping field — callers only need (provider_name, ModelConfig).
-    working
-        .into_iter()
-        .map(|(alias, (provider_name, _, model_config))| (alias, (provider_name, model_config)))
-        .collect()
-}
-
-/// Registry for managing LLM providers and resolving model aliases
+/// `providers` holds one health-check adapter per provider name (using `models.first()`).
 pub struct ProviderRegistry {
+    /// alias → pre-configured adapter for that exact model.
+    alias_map: HashMap<String, Arc<dyn LLMProvider>>,
+    /// provider_name → adapter used for health checks (built from models.first()).
     providers: HashMap<String, Arc<dyn LLMProvider>>,
-    alias_map: HashMap<String, (String, ModelConfig)>, // alias -> (provider_name, model_config)
-    fallback_provider: Option<String>,
+    /// Fallback adapter resolved at construction time; used when primary exhausts retries.
+    fallback_provider: Option<Arc<dyn LLMProvider>>,
     max_retries: u32,
     retry_delay_ms: u64,
 }
 
 impl ProviderRegistry {
-    /// Create provider registry from node configuration
+    /// Create provider registry from node configuration.
+    ///
+    /// Applies the configured `LLMSelectionStrategy` to resolve each alias to its winner,
+    /// then instantiates one `Arc<dyn LLMProvider>` per winning (provider, model) pair.
+    /// Each adapter is pre-configured with the exact model name — no runtime override needed.
+    ///
+    /// | Strategy           | Wins when …                                                     |
+    /// |--------------------|-----------------------------------------------------------------|
+    /// | `PreferLocal`      | New provider `is_local()` and existing entry is not local       |
+    /// | `PreferCloud`      | New provider is not local and existing entry is local           |
+    /// | `CostOptimized`    | New model's `cost_per_1k_tokens` < existing model's cost        |
+    /// | `LatencyOptimized` | Same as `PreferLocal` — local inference has lower latency       |
     pub fn from_config(config: &NodeConfigManifest) -> anyhow::Result<Self> {
-        let mut providers = HashMap::new();
-
         info!("Initializing LLM provider registry");
 
-        // Initialize providers from config
+        let strategy = &config.spec.llm_selection.strategy;
+
+        // ── Phase 1: health-check adapters (one per provider, models.first()) ────────────
+        let mut providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
+
+        // ── Phase 1 + strategy selection pass ─────────────────────────────────────────
+        // alias -> (provider_name, model_name, is_local, cost_per_1k_tokens)
+        let mut alias_candidates: HashMap<String, (String, String, bool, f64)> = HashMap::new();
+
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
                 info!("Provider '{}' disabled, skipping", provider_config.name);
                 continue;
             }
 
-            info!("Initializing provider: {}", provider_config.name);
+            let new_is_local = provider_config.is_local();
 
-            match Self::create_provider(provider_config) {
-                Ok(provider) => {
-                    providers.insert(provider_config.name.clone(), provider);
+            // Health-check adapter uses the first model in the provider list.
+            if let Some(first_model) = provider_config.models.first() {
+                match Self::create_adapter(provider_config, &first_model.model) {
+                    Ok(adapter) => {
+                        providers.insert(provider_config.name.clone(), adapter);
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to initialize provider '{}': {}",
+                            provider_config.name, e
+                        );
+                        continue;
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        "Failed to initialize provider '{}': {}",
-                        provider_config.name, e
+            }
+
+            // Evaluate each alias under the selection strategy.
+            for model_config in &provider_config.models {
+                let alias = &model_config.alias;
+
+                let should_insert = match alias_candidates.get(alias) {
+                    None => true,
+                    Some((_, _, existing_is_local, existing_cost)) => match strategy {
+                        LLMSelectionStrategy::PreferLocal
+                        | LLMSelectionStrategy::LatencyOptimized => {
+                            new_is_local && !existing_is_local
+                        }
+                        LLMSelectionStrategy::PreferCloud => !new_is_local && *existing_is_local,
+                        LLMSelectionStrategy::CostOptimized => {
+                            model_config.cost_per_1k_tokens < *existing_cost
+                        }
+                    },
+                };
+
+                if should_insert {
+                    info!(
+                        "Mapping alias '{}' -> {} ({}) [strategy={:?}]",
+                        alias, model_config.model, provider_config.name, strategy
                     );
-                    // Continue with other providers
+                    alias_candidates.insert(
+                        alias.clone(),
+                        (
+                            provider_config.name.clone(),
+                            model_config.model.clone(),
+                            new_is_local,
+                            model_config.cost_per_1k_tokens,
+                        ),
+                    );
+                } else {
+                    info!(
+                        "Alias '{}' already mapped to a preferred provider, skipping {} ({}) [strategy={:?}]",
+                        alias, model_config.model, provider_config.name, strategy
+                    );
                 }
             }
         }
@@ -144,62 +134,80 @@ impl ProviderRegistry {
             warn!("No LLM providers configured - semantic validation will not be available");
         }
 
-        let alias_map = build_alias_map(
-            &config.spec.llm_providers,
-            &config.spec.llm_selection.strategy,
-        );
+        // ── Phase 2: build one per-model adapter per winning alias ─────────────────────
+        let mut alias_map: HashMap<String, Arc<dyn LLMProvider>> = HashMap::new();
+
+        for provider_config in &config.spec.llm_providers {
+            if !provider_config.enabled {
+                continue;
+            }
+            for model_config in &provider_config.models {
+                let alias = &model_config.alias;
+                if let Some((winner_provider, winner_model, _, _)) = alias_candidates.get(alias) {
+                    if winner_provider == &provider_config.name
+                        && winner_model == &model_config.model
+                    {
+                        match Self::create_adapter(provider_config, winner_model) {
+                            Ok(adapter) => {
+                                alias_map.insert(alias.clone(), adapter);
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "Failed to create adapter for alias '{}' ({}): {}",
+                                    alias, winner_model, e
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve fallback to a concrete adapter at construction time.
+        let fallback_provider = config
+            .spec
+            .llm_selection
+            .fallback_provider
+            .as_deref()
+            .and_then(|name| providers.get(name).cloned());
 
         Ok(Self {
-            providers,
             alias_map,
-            fallback_provider: config.spec.llm_selection.fallback_provider.clone(),
+            providers,
+            fallback_provider,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
         })
     }
 
-    /// Create a provider instance from configuration
-    fn create_provider(config: &LLMProviderConfig) -> anyhow::Result<Arc<dyn LLMProvider>> {
+    /// Create an adapter for the given provider config initialized with a specific model name.
+    ///
+    /// Called twice per (provider, model) pair:
+    /// 1. With `models.first()` to build the health-check adapter stored in `providers`.
+    /// 2. With the strategy-selected model to build the per-alias adapter stored in `alias_map`.
+    fn create_adapter(
+        config: &LLMProviderConfig,
+        model: &str,
+    ) -> anyhow::Result<Arc<dyn LLMProvider>> {
         let api_key = Self::resolve_api_key(&config.api_key)?;
 
         let provider: Arc<dyn LLMProvider> = match config.provider_type.as_str() {
-            "openai" => {
-                let model = config
-                    .models
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No models configured"))?
-                    .model
-                    .clone();
-                Arc::new(OpenAIAdapter::new(config.endpoint.clone(), api_key, model))
-            }
-            "ollama" => {
-                let model = config
-                    .models
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No models configured"))?
-                    .model
-                    .clone();
-                Arc::new(OllamaAdapter::new(config.endpoint.clone(), model))
-            }
-            "anthropic" => {
-                let model = config
-                    .models
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No models configured"))?
-                    .model
-                    .clone();
-                Arc::new(AnthropicAdapter::new(api_key, model))
-            }
-            "openai-compatible" => {
-                // OpenAI-compatible APIs (LM Studio, vLLM, etc.)
-                let model = config
-                    .models
-                    .first()
-                    .ok_or_else(|| anyhow::anyhow!("No models configured"))?
-                    .model
-                    .clone();
-                Arc::new(OpenAIAdapter::new(config.endpoint.clone(), api_key, model))
-            }
+            "openai" => Arc::new(OpenAIAdapter::new(
+                config.endpoint.clone(),
+                api_key,
+                model.to_string(),
+            )),
+            "ollama" => Arc::new(OllamaAdapter::new(
+                config.endpoint.clone(),
+                model.to_string(),
+            )),
+            "anthropic" => Arc::new(AnthropicAdapter::new(api_key, model.to_string())),
+            // OpenAI-compatible APIs (LM Studio, vLLM, etc.)
+            "openai-compatible" => Arc::new(OpenAIAdapter::new(
+                config.endpoint.clone(),
+                api_key,
+                model.to_string(),
+            )),
             _ => anyhow::bail!("Unsupported provider type: {}", config.provider_type),
         };
 
@@ -215,8 +223,11 @@ impl ProviderRegistry {
         }
     }
 
-    /// Generate using a model alias, multi-turn messages, and optional tools.
-    /// Includes retry logic and fallback to secondary provider.
+    /// Generate a chat response for the given model alias.
+    ///
+    /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
+    /// no model name override is needed at call time.
+    /// Includes retry-with-exponential-backoff and one-level fallback.
     pub async fn generate_chat(
         &self,
         alias: &str,
@@ -224,15 +235,10 @@ impl ProviderRegistry {
         tools: &[ToolSchema],
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
-        let (provider_name, _model_config) = self
+        let provider = self
             .alias_map
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
-
-        let provider = self
-            .providers
-            .get(provider_name)
-            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
 
         let mut last_error = None;
 
@@ -253,10 +259,8 @@ impl ProviderRegistry {
 
                     if attempt == self.max_retries - 1 {
                         if let Some(fallback) = &self.fallback_provider {
-                            if let Some(fb) = self.providers.get(fallback) {
-                                info!("Trying fallback provider: {}", fallback);
-                                return fb.generate_chat(messages, tools, options).await;
-                            }
+                            info!("Trying fallback provider");
+                            return fallback.generate_chat(messages, tools, options).await;
                         }
                     }
 
@@ -271,27 +275,22 @@ impl ProviderRegistry {
         Err(last_error.unwrap_or_else(|| LLMError::Provider("Unknown error".into())))
     }
 
-    /// Generate text using a model alias
-    /// Includes retry logic and fallback to secondary provider
+    /// Generate text for the given model alias.
+    ///
+    /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
+    /// no model name override is needed at call time.
+    /// Includes retry-with-exponential-backoff and one-level fallback.
     pub async fn generate(
         &self,
         alias: &str,
         prompt: &str,
         options: &GenerationOptions,
     ) -> Result<GenerationResponse, LLMError> {
-        // Look up alias
-        let (provider_name, _model_config) = self
+        let provider = self
             .alias_map
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
 
-        // Get provider
-        let provider = self
-            .providers
-            .get(provider_name)
-            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
-
-        // Generate with retries
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
@@ -309,13 +308,10 @@ impl ProviderRegistry {
                     );
                     last_error = Some(e);
 
-                    // Try fallback provider on last attempt
                     if attempt == self.max_retries - 1 {
                         if let Some(fallback) = &self.fallback_provider {
-                            if let Some(fallback_provider) = self.providers.get(fallback) {
-                                info!("Trying fallback provider: {}", fallback);
-                                return fallback_provider.generate(prompt, options).await;
-                            }
+                            info!("Trying fallback provider");
+                            return fallback.generate(prompt, options).await;
                         }
                     }
 
@@ -358,7 +354,8 @@ impl ProviderRegistry {
 mod tests {
     use super::*;
     use crate::domain::node_config::{
-        LLMSelection, ManifestMetadata, NodeConfigManifest, NodeConfigSpec, NodeIdentity, NodeType,
+        LLMSelection, ManifestMetadata, ModelConfig, NodeConfigManifest, NodeConfigSpec,
+        NodeIdentity, NodeType,
     };
 
     #[test]
@@ -437,15 +434,10 @@ impl LLMProvider for ProviderRegistry {
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
-        let (provider_name, _) = self
+        let provider = self
             .alias_map
             .get("default")
             .ok_or_else(|| LLMError::Provider("Default model alias not configured".into()))?;
-
-        let provider = self
-            .providers
-            .get(provider_name)
-            .ok_or_else(|| LLMError::Provider(format!("Provider '{}' not found", provider_name)))?;
 
         provider.health_check().await
     }

@@ -1104,6 +1104,14 @@ impl ExecutionService for StandardExecutionService {
             llm_timeout_seconds.to_string(),
         );
 
+        // Inject model alias so bootstrap.py routes this child agent's LLM calls to the
+        // correct provider (e.g. "judge" → anthropic/claude-haiku, "smart" → local).
+        // Falls back to "default" when spec.runtime.model is not set in the manifest.
+        env.insert(
+            "AEGIS_MODEL_ALIAS".to_string(),
+            agent.manifest.spec.runtime.model.clone(),
+        );
+
         let resources = if let Some(security) = &agent.manifest.spec.security {
             crate::domain::runtime::ResourceLimits {
                 cpu_millis: Some(security.resources.cpu),
