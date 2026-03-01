@@ -115,7 +115,10 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
     dispatch_id = msg["dispatch_id"]
 
     if action == "exec":
-        command = [msg["command"]] + msg.get("args", [])
+        # Build a shell command string. The orchestrator sends "command" as a
+        # single string (e.g. "touch /workspace/hello.txt") and optional "args".
+        parts = [msg["command"]] + msg.get("args", [])
+        command = " ".join(parts)
         cwd = msg.get("cwd", "/workspace")
         timeout_secs = msg.get("timeout_secs", 60)
         max_bytes = msg.get("max_output_bytes", 524288)  # 512 KB default
@@ -130,6 +133,7 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
         try:
             result = subprocess.run(
                 command,
+                shell=True,
                 cwd=cwd,
                 env=env,
                 capture_output=True,

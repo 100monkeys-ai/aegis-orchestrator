@@ -55,6 +55,8 @@ pub struct Capability {
     /// If set, `cmd.run` tool calls must use a command whose base executable name
     /// is in this list.
     pub command_allowlist: Option<Vec<String>>,
+    /// If set, `cmd.run` tool calls must have command arguments matching these subcommands.
+    pub subcommand_allowlist: Option<Vec<String>>,
     /// If set, `web.*` tool calls must target a URL whose domain suffix matches
     /// one of these entries.
     pub domain_allowlist: Option<Vec<String>>,
@@ -103,13 +105,32 @@ impl Capability {
 
         // Check command constraints for cmd.run
         if tool_name == "cmd.run" {
-            if let Some(ref allowlist) = self.command_allowlist {
-                if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
-                    let cmd_base = cmd.split_whitespace().next().unwrap_or("");
+            if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
+                let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
+                let cmd_base = cmd_parts.first().unwrap_or(&"");
+
+                if let Some(ref allowlist) = self.command_allowlist {
                     if !allowlist.contains(&cmd_base.to_string()) {
                         return Err(PolicyViolation::ToolNotAllowed {
                             tool_name: format!("cmd.run (command: {})", cmd),
                             allowed_tools: allowlist.clone(),
+                        });
+                    }
+                }
+
+                if let Some(ref sub_allowlist) = self.subcommand_allowlist {
+                    if cmd_parts.len() > 1 {
+                        let subcommand = cmd_parts[1];
+                        if !sub_allowlist.contains(&subcommand.to_string()) {
+                            return Err(PolicyViolation::ToolNotAllowed {
+                                tool_name: format!("cmd.run (subcommand: {})", subcommand),
+                                allowed_tools: sub_allowlist.clone(),
+                            });
+                        }
+                    } else if !sub_allowlist.is_empty() {
+                        return Err(PolicyViolation::ToolNotAllowed {
+                            tool_name: format!("cmd.run (missing subcommand: {})", cmd),
+                            allowed_tools: sub_allowlist.clone(),
                         });
                     }
                 }
@@ -161,5 +182,47 @@ impl Capability {
         } else {
             "".to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_cmd_run_subcommand_allowlist() {
+        let cap = Capability {
+            tool_pattern: "cmd.run".to_string(),
+            path_allowlist: None,
+            command_allowlist: Some(vec!["cargo".to_string()]),
+            subcommand_allowlist: Some(vec!["build".to_string(), "check".to_string()]),
+            domain_allowlist: None,
+            rate_limit: None,
+            max_response_size: None,
+        };
+
+        // Allowed: cargo build
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo build"}))
+            .is_ok());
+
+        // Allowed: cargo check
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo check"}))
+            .is_ok());
+
+        // Denied: incorrect command base
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "npm install"}))
+            .is_err());
+
+        // Denied: incorrect subcommand
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo publish"}))
+            .is_err());
+
+        // Denied: missing subcommand
+        assert!(cap.allows("cmd.run", &json!({"command": "cargo"})).is_err());
     }
 }

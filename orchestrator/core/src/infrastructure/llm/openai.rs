@@ -155,7 +155,8 @@ impl LLMProvider for OpenAIAdapter {
             })
             .collect();
 
-        // Map ToolSchema → OpenAI function-calling schema
+        // OpenAI strictly forbids `.` in tool names (`^[a-zA-Z0-9_-]{1,64}$`).
+        // We map `.` to `_` outbound, and back to `.` when receiving.
         let oai_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -166,7 +167,7 @@ impl LLMProvider for OpenAIAdapter {
                         serde_json::json!({
                             "type": "function",
                             "function": {
-                                "name": t.name,
+                                "name": t.name.replace('.', "_"),
                                 "description": t.description,
                                 "parameters": t.parameters,
                             }
@@ -221,14 +222,15 @@ impl LLMProvider for OpenAIAdapter {
             .first()
             .ok_or_else(|| LLMError::Provider("No response choices from model".into()))?;
 
-        // If the model requested tool calls, return them
+        // If the model requested tool calls natively, return them
         if let Some(tool_calls) = &choice.message.tool_calls {
             if !tool_calls.is_empty() {
                 let calls: Vec<ChatToolCall> = tool_calls
                     .iter()
                     .map(|tc| ChatToolCall {
                         id: tc.id.clone(),
-                        name: tc.function.name.clone(),
+                        // Map internal `_` back to the standard Aegis `.`
+                        name: tc.function.name.replace('_', "."),
                         arguments: serde_json::from_str(&tc.function.arguments)
                             .unwrap_or(serde_json::Value::Object(Default::default())),
                     })
@@ -237,8 +239,31 @@ impl LLMProvider for OpenAIAdapter {
             }
         }
 
-        // Otherwise it's a final text response
         let text = choice.message.content.clone().unwrap_or_default();
+
+        // Fallback: If smaller models hallucinated the OpenAI JSON array inside raw text
+        if let Some(start_idx) = text.find("[{\"function\":") {
+            if let Some(end_offset) = text[start_idx..].find("}]") {
+                let json_slice = &text[start_idx..start_idx + end_offset + 2];
+                if let Ok(parsed_calls) = serde_json::from_str::<Vec<serde_json::Value>>(json_slice) {
+                    let mut calls = Vec::new();
+                    for c in parsed_calls {
+                        if let (Some(func), Some(id)) = (c.get("function"), c.get("id").and_then(|v| v.as_str())) {
+                            if let (Some(name), Some(args_str)) = (func.get("name").and_then(|v| v.as_str()), func.get("arguments").and_then(|v| v.as_str())) {
+                                calls.push(ChatToolCall {
+                                    id: id.to_string(),
+                                    name: name.replace('_', "."),
+                                    arguments: serde_json::from_str(args_str).unwrap_or(serde_json::Value::Object(Default::default())),
+                                });
+                            }
+                        }
+                    }
+                    if !calls.is_empty() {
+                        return Ok(ChatResponse::ToolCalls(calls));
+                    }
+                }
+            }
+        }
 
         Ok(ChatResponse::FinalText(GenerationResponse {
             text,

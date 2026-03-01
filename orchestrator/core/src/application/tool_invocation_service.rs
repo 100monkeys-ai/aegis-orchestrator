@@ -5,28 +5,50 @@ use anyhow::Result;
 use serde_json::Value;
 use std::sync::Arc;
 
+use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::domain::agent::AgentId;
+use crate::domain::dispatch::DispatchAction;
+use crate::domain::fsal::{AegisFileHandle, AegisFSAL};
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::infrastructure::smcp::middleware::SmcpMiddleware;
 use crate::infrastructure::tool_router::ToolRouter;
 
+use crate::domain::security_context::repository::SecurityContextRepository;
+
+pub enum ToolInvocationResult {
+    Direct(Value),
+    DispatchRequired(DispatchAction),
+}
+
 pub struct ToolInvocationService {
     smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+    security_context_repo: Arc<dyn SecurityContextRepository>,
     smcp_middleware: Arc<SmcpMiddleware>,
     tool_router: Arc<ToolRouter>,
+    /// AegisFSAL security boundary for all storage operations (ADR-033 Path 1, ADR-047)
+    /// Delegates to the appropriate StorageProvider (SeaweedFS, OpenDAL, SMCP, LocalHost)
+    fsal: Arc<AegisFSAL>,
+    /// Volume registry for resolving execution_id → volume context
+    volume_registry: NfsVolumeRegistry,
 }
 
 impl ToolInvocationService {
     pub fn new(
         smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+        security_context_repo: Arc<dyn SecurityContextRepository>,
         smcp_middleware: Arc<SmcpMiddleware>,
         tool_router: Arc<ToolRouter>,
+        fsal: Arc<AegisFSAL>,
+        volume_registry: NfsVolumeRegistry,
     ) -> Self {
         Self {
             smcp_session_repo,
+            security_context_repo,
             smcp_middleware,
             tool_router,
+            fsal,
+            volume_registry,
         }
     }
 
@@ -122,15 +144,189 @@ impl ToolInvocationService {
     }
 
     /// Internal orchestrator-driven tool invocation (Gateway pattern)
-    /// This bypasses SMCP signature checks because the orchestrator itself is initiating it
-    /// on behalf of the agent's LLM output.
+    /// Performs SecurityContext validation against the agent's active session,
+    /// so that orchestrator-mediated calls (e.g. from generated LLM text)
+    /// enforce the same policies as direct agent SMCP calls.
     pub async fn invoke_tool_internal(
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: String,
         args: Value,
-    ) -> Result<Value, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        // 1. Determine the applicable SecurityContext.
+        // If the agent is connected via SMCP (Path 1), it has an active session.
+        // If the agent is running via Container Dispatch Protocol (Path 3), it does NOT
+        // establish an SMCP session natively but still needs policy enforcement.
+        let security_context = match self.smcp_session_repo.find_active_by_agent(agent_id).await {
+            Ok(Some(session)) => session.security_context,
+            _ => {
+                // Fallback for inner-loop executions. Try to load the "default" context.
+                self.security_context_repo
+                    .find_by_name("default")
+                    .await
+                    .map_err(|_| SmcpSessionError::MalformedPayload)?
+                    .ok_or(SmcpSessionError::SessionInactive(
+                        crate::domain::smcp_session::SessionStatus::Expired,
+                    ))?
+            }
+        };
+
+        // Enforce SecurityContext constraints (e.g. subcommand_allowlist for cmd.run)
+        if let Err(violation) = security_context.evaluate(&tool_name, &args) {
+            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                "Policy violation: {:?}",
+                violation
+            )));
+        }
+
+        // Handle Dispatch Protocol tools (ADR-040)
+        if tool_name == "cmd.run" {
+            let command = args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            return Ok(ToolInvocationResult::DispatchRequired(
+                DispatchAction::Exec {
+                    command,
+                    args: vec![],
+                    cwd: "/workspace".to_string(),
+                    env_additions: std::collections::HashMap::new(),
+                    timeout_secs: 300,
+                    max_output_bytes: 1048576,
+                },
+            ));
+        }
+
+        // Handle built-in FSAL tools (ADR-033 Path 1, ADR-047)
+        // These execute on the orchestrator host via AegisFSAL, which handles:
+        // - Authorization (execution owns volume)
+        // - Path sanitization (traversal prevention)
+        // - Policy enforcement (read/write allowlists)
+        // - Quota checking
+        // - Audit events (StorageEvent publishing)
+        if tool_name == "fs.write" || tool_name == "fs.read" || tool_name == "fs.list" {
+            // Resolve the agent's volume context from execution_id
+            let vol_ctx = self
+                .volume_registry
+                .find_by_execution(execution_id)
+                .ok_or_else(|| {
+                    SmcpSessionError::SignatureVerificationFailed(format!(
+                        "No volume registered for execution {}",
+                        execution_id
+                    ))
+                })?;
+
+            let handle = AegisFileHandle::new(
+                vol_ctx.execution_id,
+                vol_ctx.volume_id,
+                "/",
+            );
+
+            match tool_name.as_str() {
+                "fs.write" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                    tracing::info!(
+                        "FSAL fs.write: path={:?} content_len={} execution={}",
+                        path, content.len(), execution_id
+                    );
+
+                    // Create file first, then write content
+                    let _file_handle = self
+                        .fsal
+                        .create_file(vol_ctx.execution_id, vol_ctx.volume_id, path, &vol_ctx.policy)
+                        .await
+                        .map_err(|e| {
+                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                "FSAL create_file error: {}",
+                                e
+                            ))
+                        })?;
+
+                    let bytes_written = self
+                        .fsal
+                        .write(&handle, path, &vol_ctx.policy, 0, content.as_bytes())
+                        .await
+                        .map_err(|e| {
+                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                "FSAL write error: {}",
+                                e
+                            ))
+                        })?;
+
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "status": "success",
+                        "path": path,
+                        "bytes_written": bytes_written
+                    })));
+                }
+                "fs.read" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                    tracing::info!(
+                        "FSAL fs.read: path={:?} execution={}",
+                        path, execution_id
+                    );
+
+                    let data = self
+                        .fsal
+                        .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024) // 10MB max
+                        .await
+                        .map_err(|e| {
+                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                "FSAL read error: {}",
+                                e
+                            ))
+                        })?;
+
+                    let content = String::from_utf8_lossy(&data).to_string();
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "status": "success",
+                        "path": path,
+                        "content": content,
+                        "size_bytes": data.len()
+                    })));
+                }
+                "fs.list" => {
+                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+                    tracing::info!(
+                        "FSAL fs.list: path={:?} execution={}",
+                        path, execution_id
+                    );
+
+                    let entries = self
+                        .fsal
+                        .readdir(vol_ctx.execution_id, vol_ctx.volume_id, path, &vol_ctx.policy)
+                        .await
+                        .map_err(|e| {
+                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                "FSAL readdir error: {}",
+                                e
+                            ))
+                        })?;
+
+                    let entries_json: Vec<serde_json::Value> = entries
+                        .iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "name": e.name,
+                                "file_type": format!("{:?}", e.file_type),
+                            })
+                        })
+                        .collect();
+
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "status": "success",
+                        "path": path,
+                        "entries": entries_json
+                    })));
+                }
+                _ => unreachable!(),
+            }
+        }
+
         let server_id = self
             .tool_router
             .route_tool(execution_id, &tool_name)
@@ -145,9 +341,6 @@ impl ToolInvocationService {
             ),
         )?;
 
-        // Note: For MVP we skip SecurityContext validation here because it was checked earlier
-        // or assumes the orchestrator only routes to authorized tools.
-
         match server.execution_mode {
             crate::domain::mcp::ExecutionMode::Local => {
                 tracing::info!(
@@ -155,12 +348,12 @@ impl ToolInvocationService {
                     tool_name,
                     agent_id
                 );
-                Ok(serde_json::json!({
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "status": "success",
                     "execution_mode": "local_fsal",
                     "message": format!("Locally executed {} affecting agent volume", tool_name),
                     "args_executed": args
-                }))
+                })))
             }
             crate::domain::mcp::ExecutionMode::Remote => {
                 let _json_rpc_payload = serde_json::json!({
@@ -175,12 +368,12 @@ impl ToolInvocationService {
                     tool_name,
                     server_id
                 );
-                Ok(serde_json::json!({
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",
                     "message": format!("Proxied {} to external MCP server {:?}", tool_name, server_id),
                     "args_proxied": args
-                }))
+                })))
             }
         }
     }
@@ -198,11 +391,34 @@ impl ToolInvocationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use crate::application::nfs_gateway::NfsVolumeRegistry;
+    use crate::domain::events::StorageEvent;
     use crate::domain::execution::ExecutionId;
+    use crate::domain::fsal::{AegisFSAL, EventPublisher};
     use crate::domain::security_context::SecurityContext;
     use crate::domain::smcp_session::SmcpSession;
+    use crate::infrastructure::repositories::InMemoryVolumeRepository;
     use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
+    use crate::infrastructure::storage::MockStorageProvider;
     use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+
+    struct NoOpEventPublisher;
+
+    #[async_trait]
+    impl EventPublisher for NoOpEventPublisher {
+        async fn publish_storage_event(&self, _event: StorageEvent) {}
+    }
+
+    /// Create mock AegisFSAL + empty NfsVolumeRegistry for tests
+    fn mock_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
+        let storage = Arc::new(MockStorageProvider::new());
+        let vol_repo = Arc::new(InMemoryVolumeRepository::new());
+        let publisher = Arc::new(NoOpEventPublisher);
+        let fsal = Arc::new(AegisFSAL::new(storage, vol_repo, publisher));
+        let registry = NfsVolumeRegistry::new();
+        (fsal, registry)
+    }
 
     struct DummyEnvelope {
         valid: bool,
@@ -232,10 +448,12 @@ mod tests {
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
             Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let router = Arc::new(ToolRouter::new(registry, servers));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
         let middleware = Arc::new(SmcpMiddleware::new());
 
-        let service = ToolInvocationService::new(repo, middleware, router);
+        let security_context_repo = Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+        let (fsal, volume_registry) = mock_fsal_deps();
+        let service = ToolInvocationService::new(repo, security_context_repo, middleware, router, fsal, volume_registry);
         let agent_id = AgentId::new();
         let envelope = DummyEnvelope { valid: true };
 
@@ -267,10 +485,12 @@ mod tests {
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
             Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let router = Arc::new(ToolRouter::new(registry, servers));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
         let middleware = Arc::new(SmcpMiddleware::new());
 
-        let service = ToolInvocationService::new(repo, middleware, router);
+        let security_context_repo = Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+        let (fsal, volume_registry) = mock_fsal_deps();
+        let service = ToolInvocationService::new(repo, security_context_repo, middleware, router, fsal, volume_registry);
         let envelope = DummyEnvelope { valid: false };
 
         let result = service.invoke_tool(&agent_id, &envelope).await;
@@ -300,6 +520,7 @@ mod tests {
                     tool_pattern: "test_tool".to_string(),
                     path_allowlist: None,
                     command_allowlist: None,
+                    subcommand_allowlist: None,
                     domain_allowlist: None,
                     rate_limit: None,
                     max_response_size: None,
@@ -308,6 +529,7 @@ mod tests {
                     tool_pattern: "test_tool_remote".to_string(),
                     path_allowlist: None,
                     command_allowlist: None,
+                    subcommand_allowlist: None,
                     domain_allowlist: None,
                     rate_limit: None,
                     max_response_size: None,
@@ -327,9 +549,11 @@ mod tests {
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
             Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-        let router = Arc::new(ToolRouter::new(registry, servers.clone()));
+        let router = Arc::new(ToolRouter::new(registry, servers.clone(), vec![]));
         let middleware = Arc::new(SmcpMiddleware::new());
-        let service = ToolInvocationService::new(repo, middleware, router.clone());
+        let security_context_repo = Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+        let (fsal, volume_registry) = mock_fsal_deps();
+        let service = ToolInvocationService::new(repo, security_context_repo, middleware, router.clone(), fsal, volume_registry);
 
         // 1. Local Tool
         let local_server = ToolServer {

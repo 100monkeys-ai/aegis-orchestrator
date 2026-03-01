@@ -21,6 +21,7 @@
 //! | [`ViolationType`] | BC-4 / BC-12 | Structured violation classification |
 //! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
+//! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
 //!
 //! ## Phase 2 Note
 //!
@@ -28,6 +29,7 @@
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
 use crate::domain::agent::{AgentId, AgentManifest, ImagePullPolicy};
+use crate::domain::dispatch::DispatchId;
 use crate::domain::execution::{CodeDiff, ExecutionId, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::volume::{StorageClass, VolumeId};
@@ -624,6 +626,41 @@ pub enum MCPToolEvent {
         details: String,
         blocked_at: DateTime<Utc>,
     },
+}
+
+/// Commands executed inside the container via Dispatch Protocol (ADR-040).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CommandExecutionEvent {
+    CommandDispatched {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        dispatch_id: DispatchId,
+        command: String,
+        dispatched_at: DateTime<Utc>,
+    },
+    CommandCompleted {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        dispatch_id: DispatchId,
+        exit_code: i32,
+        duration_ms: u64,
+        completed_at: DateTime<Utc>,
+    },
+    CommandFailed {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        dispatch_id: DispatchId,
+        reason: CommandFailureReason,
+        failed_at: DateTime<Utc>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CommandFailureReason {
+    TimeoutExceeded,
+    OutputTruncated,
+    NonZeroExit(i32),
+    AgentConnectionLost,
 }
 
 /// SMCP session lifecycle and security events (BC-12 SMCP Protocol, ADR-035 §5).

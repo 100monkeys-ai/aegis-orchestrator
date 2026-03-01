@@ -26,9 +26,10 @@
 //! | `GET` | `/health` | liveness probe |
 
 use crate::application::execution::ExecutionService;
-use crate::application::inner_loop_service::{InnerLoopRequest, InnerLoopService};
+use crate::application::inner_loop_service::InnerLoopService;
 use crate::application::stimulus::StimulusService;
 use crate::domain::agent::AgentId;
+use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
 use crate::presentation::webhook_guard::{
@@ -373,7 +374,7 @@ async fn smcp_tool_invoke(
 /// LLM → tool call → LLM cycle internally via the Dispatch Protocol.
 async fn dispatch_gateway(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<InnerLoopRequest>,
+    Json(payload): Json<AgentMessage>,
 ) -> impl IntoResponse {
     let inner_loop_service = match &state.inner_loop_service {
         Some(svc) => svc.clone(),
@@ -384,7 +385,7 @@ async fn dispatch_gateway(
         }
     };
 
-    match inner_loop_service.generate(payload).await {
+    match inner_loop_service.handle_agent_message(payload).await {
         Ok(response) => {
             Json(serde_json::to_value(response).unwrap_or(json!({"error": "serialization failed"})))
         }

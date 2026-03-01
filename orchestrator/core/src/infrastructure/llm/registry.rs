@@ -424,6 +424,7 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
+                builtin_dispatchers: None,
                 registry_credentials: vec![],
             },
         };

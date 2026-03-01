@@ -488,20 +488,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     };
 
-    let execution_service = Arc::new(
-        StandardExecutionService::new(
-            agent_service.clone(),
-            volume_service.clone(),
-            supervisor,
-            execution_repo.clone(),
-            event_bus.clone(),
-            Arc::new(config.clone()),
-        )
-        .with_nfs_gateway(nfs_gateway.clone())
-        .with_runtime_registry(runtime_registry),
-    );
-    // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
-    execution_service.set_child_execution_service(execution_service.clone());
+    // Execution service initialization deferred until after ToolRouter is created
 
     // ADR-036: Event-driven NFS volume deregistration (security requirement)
     // Listen for VolumeExpired and VolumeDeleted events and immediately remove
@@ -628,6 +615,98 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
 
+    // Initialize SMCP / Tool Routing Services (now hoisted for ExecutionService dependency)
+    println!("Initializing SMCP & Tool Routing services...");
+
+    let smcp_middleware =
+        Arc::new(aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
+    let tool_registry =
+        Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
+
+    // Shared tool servers state
+    let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // Load configured servers from NodeConfig
+    if let Some(mcp_configs) = &config.spec.mcp_servers {
+        let mut servers_lock = tool_servers.write().await;
+        for srv_cfg in mcp_configs {
+            if srv_cfg.enabled {
+                let tool_server =
+                    aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
+                servers_lock.insert(tool_server.id, tool_server);
+            }
+        }
+    }
+
+    let mut builtin_dispatchers = config.spec.builtin_dispatchers.clone().unwrap_or_default();
+    if !builtin_dispatchers.iter().any(|d| d.name == "cmd.run") {
+        builtin_dispatchers.push(aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+            name: "cmd.run".to_string(),
+            description: "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally.".to_string(),
+            enabled: true,
+            capabilities: vec!["cmd.run".to_string()],
+        });
+    }
+
+    // FSAL Native Tools (ADR-040)
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.read") {
+        builtin_dispatchers.push(aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+            name: "fs.read".to_string(),
+            description: "Read the contents of a file at the given POSIX path from the mounted Workspace volume.".to_string(),
+            enabled: true,
+            capabilities: vec!["fs.read".to_string()],
+        });
+    }
+
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.write") {
+        builtin_dispatchers.push(aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+            name: "fs.write".to_string(),
+            description: "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories.".to_string(),
+            enabled: true,
+            capabilities: vec!["fs.write".to_string()],
+        });
+    }
+
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.list") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.list".to_string(),
+                description: "List the contents of a directory in the Workspace volume."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec!["fs.list".to_string()],
+            },
+        );
+    }
+
+    let tool_router = Arc::new(
+        aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
+            tool_registry.clone(),
+            tool_servers.clone(),
+            builtin_dispatchers,
+        ),
+    );
+
+    // Build initial capabilities index
+    tool_router.rebuild_index().await;
+
+    // Finally initialize ExecutionService now that ToolRouter is ready
+    let execution_service = Arc::new(
+        StandardExecutionService::new(
+            agent_service.clone(),
+            volume_service.clone(),
+            supervisor,
+            execution_repo.clone(),
+            event_bus.clone(),
+            Arc::new(config.clone()),
+        )
+        .with_nfs_gateway(nfs_gateway.clone())
+        .with_runtime_registry(runtime_registry) // No Arc::new needed per signature
+        .with_tool_router(tool_router.clone()),
+    );
+    // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
+    execution_service.set_child_execution_service(execution_service.clone());
+
     let validation_service = Arc::new(ValidationService::new(
         event_bus.clone(),
         execution_service.clone(),
@@ -681,7 +760,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let private_key = std::env::var("AEGIS_SMCP_PRIVATE_KEY").unwrap_or_else(|_| {
         warn!("AEGIS_SMCP_PRIVATE_KEY not set, using insecure default key (dev only!)");
         // Dev-only fallback key (ADR-035/ADR-034 delay for OpenBao integration)
-        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----".to_string()
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N0BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoIIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1Vky2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPXTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----".to_string()
     });
     let token_issuer = Arc::new(
         aegis_orchestrator_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
@@ -701,36 +780,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             token_issuer,
         ),
     );
-
-    let smcp_middleware =
-        Arc::new(aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
-    let tool_registry =
-        Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
-
-    // Shared tool servers state
-    let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
-
-    // Load configured servers from NodeConfig
-    if let Some(mcp_configs) = &config.spec.mcp_servers {
-        let mut servers_lock = tool_servers.write().await;
-        for srv_cfg in mcp_configs {
-            if srv_cfg.enabled {
-                let tool_server =
-                    aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
-                servers_lock.insert(tool_server.id, tool_server);
-            }
-        }
-    }
-
-    let tool_router = Arc::new(
-        aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
-            tool_registry.clone(),
-            tool_servers.clone(),
-        ),
-    );
-
-    // Build initial capabilities index
-    tool_router.rebuild_index().await;
 
     let tool_manager = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
@@ -752,8 +801,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let tool_invocation_service = Arc::new(
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             smcp_session_repo.clone(),
+            security_context_repo.clone(),
             smcp_middleware,
-            tool_router,
+            tool_router.clone(),
+            nfs_gateway.fsal().clone(),
+            nfs_gateway.volume_registry().clone(),
         ),
     );
 
@@ -828,6 +880,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                             tool_pattern: "*".to_string(),
                             path_allowlist: None,
                             command_allowlist: None,
+                            subcommand_allowlist: None,
                             domain_allowlist: None,
                             rate_limit: None,
                             max_response_size: None,
@@ -1867,9 +1920,8 @@ async fn llm_generate_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<LlmGenerateRequest>,
 ) -> impl IntoResponse {
-    use aegis_orchestrator_core::application::inner_loop_service::{
-        ConversationMessage, InnerLoopRequest,
-    };
+    use aegis_orchestrator_core::application::inner_loop_service::ConversationMessage;
+    use aegis_orchestrator_core::domain::dispatch::{AgentMessage, OrchestratorMessage};
 
     // Resolve agent_id for event logging and inner loop request
     let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
@@ -1903,9 +1955,10 @@ async fn llm_generate_handler(
         .unwrap_or_else(|| "default".to_string());
 
     // Build the inner loop request, seeding the conversation with the rendered prompt
-    let inner_req = InnerLoopRequest {
+    let agent_msg = AgentMessage::Generate {
         agent_id: agent_id_str,
         execution_id: execution_id_str.clone(),
+        iteration_number: req.iteration_number.unwrap_or(0),
         prompt: req.prompt.clone(),
         model_alias: model_alias.clone(),
         messages: vec![ConversationMessage {
@@ -1915,8 +1968,16 @@ async fn llm_generate_handler(
         }],
     };
 
-    match state.inner_loop_service.generate(inner_req).await {
-        Ok(response) => {
+    match state
+        .inner_loop_service
+        .handle_agent_message(agent_msg)
+        .await
+    {
+        Ok(OrchestratorMessage::Final {
+            content,
+            tool_calls_executed,
+            ..
+        }) => {
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
                 if let Some(exec_id) = req.execution_id {
@@ -1932,7 +1993,7 @@ async fn llm_generate_handler(
                             input_tokens: None,
                             output_tokens: None,
                             prompt: req.prompt.clone(),
-                            response: response.content.clone(),
+                            response: content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
                     state.event_bus.publish_execution_event(event);
@@ -1941,7 +2002,7 @@ async fn llm_generate_handler(
                         provider: "orchestrator".to_string(),
                         model: model_alias.clone(),
                         prompt: req.prompt.clone(),
-                        response: response.content.clone(),
+                        response: content.clone(),
                         timestamp: chrono::Utc::now(),
                     };
                     let _ = state
@@ -1958,9 +2019,22 @@ async fn llm_generate_handler(
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
-                    "content": response.content,
-                    "tool_calls_executed": response.tool_calls_executed,
+                    "content": content,
+                    "tool_calls_executed": tool_calls_executed,
                 })),
+            )
+        }
+        Ok(OrchestratorMessage::Dispatch {
+            dispatch_id,
+            action,
+        }) => {
+            // Respond with the dispatch action so bootstrap.py can execute it
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(OrchestratorMessage::Dispatch {
+                    dispatch_id,
+                    action,
+                }).unwrap_or_else(|_| serde_json::json!({"error": "dispatch serialization failed"}))),
             )
         }
         Err(e) => {

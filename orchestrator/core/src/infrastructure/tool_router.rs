@@ -19,6 +19,7 @@
 
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
+use crate::domain::node_config::BuiltinDispatcherConfig;
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -125,17 +126,20 @@ pub struct ToolRouter {
     registry: Arc<dyn ToolRegistry>,
     servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
     capabilities_index: Arc<RwLock<HashMap<String, ToolServerId>>>,
+    builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
 }
 
 impl ToolRouter {
     pub fn new(
         registry: Arc<dyn ToolRegistry>,
         servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
+        builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
     ) -> Self {
         Self {
             registry,
             servers,
             capabilities_index: Arc::new(RwLock::new(HashMap::new())),
+            builtin_dispatchers,
         }
     }
 
@@ -278,6 +282,64 @@ impl ToolRouter {
                         input_schema: json!({ "type": "object" }),
                     });
                 }
+            }
+        }
+
+        for dispatcher in &self.builtin_dispatchers {
+            for cap in &dispatcher.capabilities {
+                let schema = match cap.as_str() {
+                    "cmd.run" => json!({
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "Command to execute (must be on the agent's allowlist)"
+                            }
+                        },
+                        "required": ["command"]
+                    }),
+                    "fs.read" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to read."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    "fs.write" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to write."
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "String content to write to the file."
+                            }
+                        },
+                        "required": ["path", "content"]
+                    }),
+                    "fs.list" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the directory to list."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    _ => json!({ "type": "object" }),
+                };
+
+                all_tools.push(ToolMetadata {
+                    name: cap.clone(),
+                    description: dispatcher.description.clone(),
+                    input_schema: schema,
+                });
             }
         }
 
@@ -592,7 +654,7 @@ mod tests {
         let server_id = server.id;
         servers.write().await.insert(server_id, server);
 
-        let router = ToolRouter::new(registry, servers);
+        let router = ToolRouter::new(registry, servers, vec![]);
         router.rebuild_index().await;
 
         let exec_id = ExecutionId::new();
@@ -605,7 +667,7 @@ mod tests {
     async fn test_route_tool_not_found() {
         let registry = Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(RwLock::new(HashMap::new()));
-        let router = ToolRouter::new(registry, servers);
+        let router = ToolRouter::new(registry, servers, vec![]);
         router.rebuild_index().await;
 
         let exec_id = ExecutionId::new();
@@ -622,7 +684,7 @@ mod tests {
         let server_id = server.id;
         servers.write().await.insert(server_id, server);
 
-        let router = ToolRouter::new(registry, servers);
+        let router = ToolRouter::new(registry, servers, vec![]);
         router.rebuild_index().await;
 
         let exec_id = ExecutionId::new();
@@ -644,7 +706,7 @@ mod tests {
         let gmail_id = router_server.id;
         servers.write().await.insert(gmail_id, router_server);
 
-        let router = ToolRouter::new(registry, servers);
+        let router = ToolRouter::new(registry, servers, vec![]);
         router.rebuild_index().await;
 
         // Agent is only authorized for filesystem.read, not gmail.send
@@ -673,7 +735,7 @@ mod tests {
         servers.write().await.insert(running.id, running);
         servers.write().await.insert(stopped.id, stopped);
 
-        let router = ToolRouter::new(registry, servers);
+        let router = ToolRouter::new(registry, servers, vec![]);
         let tools = router.list_tools().await.unwrap();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "filesystem.read");

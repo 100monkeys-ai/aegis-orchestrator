@@ -112,6 +112,22 @@ impl NfsVolumeRegistry {
         self.contexts.read().keys().copied().collect()
     }
 
+    /// Reverse lookup: find volume context by execution_id
+    ///
+    /// Used by ToolInvocationService to resolve the agent's volume for FSAL
+    /// tool execution (ADR-033 Path 1). Returns the first matching context
+    /// since each execution typically owns a single workspace volume.
+    pub fn find_by_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Option<NfsVolumeContext> {
+        self.contexts
+            .read()
+            .values()
+            .find(|ctx| ctx.execution_id == execution_id)
+            .cloned()
+    }
+
     /// Get count of registered volumes
     pub fn count(&self) -> usize {
         self.contexts.read().len()

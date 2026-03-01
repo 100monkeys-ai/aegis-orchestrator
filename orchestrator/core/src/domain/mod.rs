@@ -35,6 +35,7 @@
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
 
 pub mod agent;
+pub mod dispatch;
 pub mod events;
 pub mod execution;
 pub mod fsal;

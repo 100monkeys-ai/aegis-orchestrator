@@ -117,6 +117,10 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_servers: Option<Vec<McpServerConfig>>,
 
+    /// Built-in dispatchers configurations (e.g. cmd.run) (ADR-040)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub builtin_dispatchers: Option<Vec<BuiltinDispatcherConfig>>,
+
     /// Private container registry credentials for pulling images (ADR-045).
     /// Each entry covers one registry host prefix. Phase 1: static node-config;
     /// Phase 2: resolved from OpenBao at execution time.
@@ -597,6 +601,24 @@ impl Default for OpenDalConfig {
     }
 }
 
+/// Built-in tools configured directly inside the Orchestrator via Dispatch Protocol (ADR-040)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BuiltinDispatcherConfig {
+    /// Dispatcher name (e.g. "cmd.run")
+    pub name: String,
+
+    /// Description for the LLM
+    pub description: String,
+
+    /// Is this dispatcher active?
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Capabilities provided by this dispatcher
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
 /// MCP Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpServerConfig {
@@ -1009,13 +1031,14 @@ impl Default for NodeConfigSpec {
             network: None,
             observability: None,
             storage: None,
+            mcp_servers: None,
+            builtin_dispatchers: None,
+            registry_credentials: vec![],
             database: None,
             temporal: None,
             cortex: None,
-            mcp_servers: None,
             smcp: None,
             security_contexts: None,
-            registry_credentials: vec![],
         }
     }
 }
@@ -1382,6 +1405,7 @@ mod tests {
                 temporal: None,
                 cortex: None,
                 mcp_servers: None,
+                builtin_dispatchers: None,
                 smcp: None,
                 security_contexts: None,
                 registry_credentials: vec![],

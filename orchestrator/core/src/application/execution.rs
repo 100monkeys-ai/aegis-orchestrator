@@ -189,6 +189,9 @@ pub struct StandardExecutionService {
     /// Self-reference used by judge validators to spawn child executions (ADR-016, ADR-039).
     /// Set once at composition root via `set_child_execution_service()`.
     child_executor: std::sync::OnceLock<Arc<dyn ExecutionService>>,
+    /// Optional ToolRouter used to validate that an agent's requested tools actually exist
+    /// before spawning the container (Safety & Polish).
+    tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
 }
 
 impl StandardExecutionService {
@@ -211,6 +214,7 @@ impl StandardExecutionService {
             runtime_registry: None,
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
+            tool_router: None,
         }
     }
 
@@ -242,6 +246,16 @@ impl StandardExecutionService {
         registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
     ) -> Self {
         self.runtime_registry = Some(registry);
+        self
+    }
+
+    /// Attach a ToolRouter to validate that an agent's requested tools actually exist
+    /// before spawning the container.
+    pub fn with_tool_router(
+        mut self,
+        tool_router: Arc<crate::infrastructure::tool_router::ToolRouter>,
+    ) -> Self {
+        self.tool_router = Some(tool_router);
         self
     }
 }
@@ -506,6 +520,23 @@ impl ExecutionService for StandardExecutionService {
     ) -> Result<ExecutionId> {
         // 1. Fetch Agent
         let agent = self.agent_service.get_agent(agent_id).await?;
+
+        // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
+        if let Some(router) = &self.tool_router {
+            let available_tools = router.list_tools().await.map_err(|e| {
+                ExecutionError::InvalidExecutionInput(format!("Failed to query tool router: {}", e))
+            })?;
+
+            let requested_tools = agent.manifest.spec.tools.clone();
+            for req_tool in requested_tools {
+                if !available_tools.iter().any(|t| t.name == req_tool) {
+                    return Err(ExecutionError::InvalidExecutionInput(format!(
+                        "Agent requested tool '{}' but it is not available in the current node configuration.",
+                        req_tool
+                    )).into());
+                }
+            }
+        }
 
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
