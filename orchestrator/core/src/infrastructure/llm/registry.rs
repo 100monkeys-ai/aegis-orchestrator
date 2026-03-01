@@ -253,7 +253,12 @@ impl ProviderRegistry {
         for attempt in 0..self.max_retries {
             match provider.generate_chat(messages, tools, options).await {
                 Ok(response) => {
-                    info!("generate_chat successful: alias='{}', model='{}', attempt={}", alias, model_name, attempt + 1);
+                    info!(
+                        "generate_chat successful: alias='{}', model='{}', attempt={}",
+                        alias,
+                        model_name,
+                        attempt + 1
+                    );
                     return Ok(response);
                 }
                 Err(e) => {
@@ -300,14 +305,21 @@ impl ProviderRegistry {
             .get(alias)
             .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
 
-        info!("LLM text generation: alias='{}', model='{}'", alias, model_name);
+        info!(
+            "LLM text generation: alias='{}', model='{}'",
+            alias, model_name
+        );
 
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
             match provider.generate(prompt, options).await {
                 Ok(response) => {
-                    info!("Generation successful on attempt {} (model='{}')", attempt + 1, model_name);
+                    info!(
+                        "Generation successful on attempt {} (model='{}')",
+                        attempt + 1,
+                        model_name
+                    );
                     return Ok(response);
                 }
                 Err(e) => {
