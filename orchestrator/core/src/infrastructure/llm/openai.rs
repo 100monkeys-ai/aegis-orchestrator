@@ -245,15 +245,22 @@ impl LLMProvider for OpenAIAdapter {
         if let Some(start_idx) = text.find("[{\"function\":") {
             if let Some(end_offset) = text[start_idx..].find("}]") {
                 let json_slice = &text[start_idx..start_idx + end_offset + 2];
-                if let Ok(parsed_calls) = serde_json::from_str::<Vec<serde_json::Value>>(json_slice) {
+                if let Ok(parsed_calls) = serde_json::from_str::<Vec<serde_json::Value>>(json_slice)
+                {
                     let mut calls = Vec::new();
                     for c in parsed_calls {
-                        if let (Some(func), Some(id)) = (c.get("function"), c.get("id").and_then(|v| v.as_str())) {
-                            if let (Some(name), Some(args_str)) = (func.get("name").and_then(|v| v.as_str()), func.get("arguments").and_then(|v| v.as_str())) {
+                        if let (Some(func), Some(id)) =
+                            (c.get("function"), c.get("id").and_then(|v| v.as_str()))
+                        {
+                            if let (Some(name), Some(args_str)) = (
+                                func.get("name").and_then(|v| v.as_str()),
+                                func.get("arguments").and_then(|v| v.as_str()),
+                            ) {
                                 calls.push(ChatToolCall {
                                     id: id.to_string(),
                                     name: name.replace('_', "."),
-                                    arguments: serde_json::from_str(args_str).unwrap_or(serde_json::Value::Object(Default::default())),
+                                    arguments: serde_json::from_str(args_str)
+                                        .unwrap_or(serde_json::Value::Object(Default::default())),
                                 });
                             }
                         }

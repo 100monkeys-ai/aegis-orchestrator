@@ -2031,10 +2031,15 @@ async fn llm_generate_handler(
             // Respond with the dispatch action so bootstrap.py can execute it
             (
                 StatusCode::OK,
-                Json(serde_json::to_value(OrchestratorMessage::Dispatch {
-                    dispatch_id,
-                    action,
-                }).unwrap_or_else(|_| serde_json::json!({"error": "dispatch serialization failed"}))),
+                Json(
+                    serde_json::to_value(OrchestratorMessage::Dispatch {
+                        dispatch_id,
+                        action,
+                    })
+                    .unwrap_or_else(
+                        |_| serde_json::json!({"error": "dispatch serialization failed"}),
+                    ),
+                ),
             )
         }
         Err(e) => {
