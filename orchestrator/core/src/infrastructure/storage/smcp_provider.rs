@@ -15,13 +15,14 @@ use crate::domain::storage::{
 };
 use async_trait::async_trait;
 
+#[derive(Default)]
 pub struct SmcpStorageProvider {
     // node_id: String, // Kept for eventual gRPC routing
 }
 
 impl SmcpStorageProvider {
     pub fn new() -> Self {
-        Self {}
+        Self::default()
     }
 
     /// Helper to convert our internal path mapping back into metadata
