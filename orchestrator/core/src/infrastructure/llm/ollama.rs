@@ -120,6 +120,8 @@ impl LLMProvider for OllamaAdapter {
             })
             .collect();
 
+        // Sanitize tool names: `.` → `_` outbound, reversed on inbound.
+        // Consistent with OpenAI/Anthropic adapters.
         let ollama_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -130,7 +132,7 @@ impl LLMProvider for OllamaAdapter {
                         serde_json::json!({
                             "type": "function",
                             "function": {
-                                "name": t.name,
+                                "name": t.name.replace('.', "_"),
                                 "description": t.description,
                                 "parameters": t.parameters,
                             }
@@ -184,7 +186,7 @@ impl LLMProvider for OllamaAdapter {
                 .enumerate()
                 .map(|(i, tc)| ChatToolCall {
                     id: format!("ollama-call-{}", i),
-                    name: tc.function.name,
+                    name: tc.function.name.replace('_', "."),  // Reverse outbound sanitization
                     arguments: tc.function.arguments,
                 })
                 .collect();

@@ -134,6 +134,8 @@ impl LLMProvider for AnthropicAdapter {
             })
             .collect();
 
+        // Anthropic strictly forbids `.` in tool names (`^[a-zA-Z0-9_-]{1,128}$`).
+        // We map `.` to `_` outbound, and reverse (`_` → `.`) when receiving tool_use blocks.
         let anthropic_tools: Option<Vec<serde_json::Value>> = if tools.is_empty() {
             None
         } else {
@@ -142,7 +144,7 @@ impl LLMProvider for AnthropicAdapter {
                     .iter()
                     .map(|t| {
                         serde_json::json!({
-                            "name": t.name,
+                            "name": t.name.replace('.', "_"),
                             "description": t.description,
                             "input_schema": t.parameters,
                         })
@@ -195,7 +197,7 @@ impl LLMProvider for AnthropicAdapter {
             .filter(|b| b.block_type == "tool_use")
             .map(|b| ChatToolCall {
                 id: b.id.clone(),
-                name: b.name.clone(),
+                name: b.name.replace('_', "."),  // Reverse outbound sanitization
                 arguments: b.input.clone(),
             })
             .collect();
