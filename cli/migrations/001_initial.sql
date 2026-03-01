@@ -321,8 +321,7 @@ CREATE TABLE volumes (
     
     -- Storage configuration
     storage_class JSONB NOT NULL,      -- {"type": "ephemeral", "ttl": "PT24H"} or {"type": "persistent"}
-    filer_endpoint JSONB NOT NULL,     -- {"url": "http://localhost:8888"}
-    remote_path TEXT NOT NULL UNIQUE,  -- /aegis/volumes/{tenant_id}/{volume_id}
+    backend JSONB NOT NULL,            -- ADR-047 Dynamic Storage backend definition
     size_limit_bytes BIGINT NOT NULL,
     
     -- Lifecycle state
@@ -339,7 +338,7 @@ CREATE TABLE volumes (
     CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0)
     -- Note: Volume names are logical labels, NOT globally unique.
     -- Multiple executions can have volumes with the same name but different volume_ids.
-    -- Uniqueness is enforced by: id (PRIMARY KEY) and remote_path (UNIQUE).
+    -- Uniqueness is enforced by: id (PRIMARY KEY).
 );
 
 -- Indexes for common queries
@@ -347,19 +346,18 @@ CREATE INDEX idx_volumes_tenant_id ON volumes(tenant_id);
 CREATE INDEX idx_volumes_expires_at ON volumes(expires_at) WHERE expires_at IS NOT NULL;
 CREATE INDEX idx_volumes_ownership ON volumes USING GIN (ownership);
 CREATE INDEX idx_volumes_status ON volumes USING GIN (status);
-CREATE INDEX idx_volumes_remote_path ON volumes(remote_path);
 CREATE INDEX idx_volumes_created_at ON volumes(created_at DESC);
 
 -- Composite indexes for ownership queries
 CREATE INDEX idx_volumes_tenant_status ON volumes(tenant_id, (status->>'type'));
 
 -- Add comment for documentation
-COMMENT ON TABLE volumes IS 'Volume metadata for SeaweedFS-backed distributed storage (ADR-032)';
+COMMENT ON TABLE volumes IS 'Volume metadata mapping to diverse StorageBackends (ADR-047)';
 COMMENT ON COLUMN volumes.tenant_id IS 'Multi-tenant namespace isolation (default: 00000000-0000-0000-0000-000000000001)';
 COMMENT ON COLUMN volumes.storage_class IS 'Ephemeral (TTL-based) or Persistent storage classification';
 COMMENT ON COLUMN volumes.ownership IS 'Execution-scoped, Workflow-scoped, or User-owned persistent';
 COMMENT ON COLUMN volumes.expires_at IS 'Auto-cleanup timestamp for ephemeral volumes (NULL for persistent)';
-COMMENT ON COLUMN volumes.remote_path IS 'Unique SeaweedFS filer path for this volume';
+COMMENT ON COLUMN volumes.backend IS 'Storage backend metadata mapping the volume (SeaweedFS, OpenDAL, SMCP, LocalHost)';
 
 -- =============================================================================
 -- Migration Rollback

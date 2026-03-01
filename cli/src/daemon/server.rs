@@ -328,11 +328,42 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
 
     let storage_provider: Arc<dyn aegis_orchestrator_core::domain::storage::StorageProvider> =
-        Arc::new(
-            aegis_orchestrator_core::infrastructure::storage::SeaweedFSAdapter::new(
-                filer_url.clone(),
-            ),
-        );
+        match storage_config.backend.as_str() {
+            "seaweedfs" => {
+                aegis_orchestrator_core::infrastructure::storage::create_storage_provider(
+                    aegis_orchestrator_core::infrastructure::storage::StorageBackend::SeaweedFS {
+                        filer_url: filer_url.clone(),
+                    },
+                )
+            }
+            "local_host" => {
+                let mount_point = storage_config
+                    .local_host
+                    .as_ref()
+                    .map(|l| l.mount_point.clone())
+                    .unwrap_or_else(|| "/var/lib/aegis/local-host-volumes".to_string());
+                aegis_orchestrator_core::infrastructure::storage::create_storage_provider(
+                    aegis_orchestrator_core::infrastructure::storage::StorageBackend::LocalHost {
+                        mount_point,
+                    },
+                )
+            }
+            "opendal" => {
+                let opendal_config = storage_config.opendal.as_ref().cloned().unwrap_or_default();
+                // Resolve env variables in config map
+                let mut resolved_options = std::collections::HashMap::new();
+                for (k, v) in opendal_config.options {
+                    resolved_options.insert(k, resolve_env_value(&v).unwrap_or(v));
+                }
+                aegis_orchestrator_core::infrastructure::storage::create_storage_provider(
+                    aegis_orchestrator_core::infrastructure::storage::StorageBackend::OpenDal {
+                        provider: opendal_config.provider,
+                        options: resolved_options,
+                    },
+                )
+            }
+            other => return Err(anyhow::anyhow!("Unsupported storage backend: {}", other)),
+        };
 
     let volume_service = Arc::new(
         aegis_orchestrator_core::application::volume_manager::StandardVolumeService::new(
@@ -344,8 +375,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     println!(
-        "✓ Volume service initialized (mode: {}, fallback: {})",
-        storage_config.backend, storage_config.fallback_to_local
+        "✓ Volume service initialized (mode: {})",
+        storage_config.backend
     );
 
     // Spawn TTL cleanup background task for ephemeral volumes

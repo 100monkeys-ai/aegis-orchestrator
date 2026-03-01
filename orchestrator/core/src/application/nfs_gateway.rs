@@ -16,6 +16,7 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for nfs gateway
 
+use crate::application::storage_router::StorageRouter;
 use crate::domain::{
     events::StorageEvent,
     execution::ExecutionId,
@@ -26,6 +27,7 @@ use crate::domain::{
     volume::VolumeId,
 };
 use crate::infrastructure::nfs::server::{NfsServer, NfsServerError, NfsVolumeContext};
+use crate::infrastructure::storage::{LocalHostStorageProvider, SmcpStorageProvider};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -152,8 +154,20 @@ impl NfsGatewayService {
         event_publisher: Arc<dyn EventPublisher>,
         bind_port: Option<u16>,
     ) -> Self {
-        let fsal = Arc::new(AegisFSAL::new(
+        // Build StorageRouter to support diverse backends
+        let local_provider = Arc::new(
+            LocalHostStorageProvider::new("/tmp/aegis")
+                .unwrap_or_else(|_| LocalHostStorageProvider::new("/tmp").unwrap()),
+        );
+        let smcp_provider = Arc::new(SmcpStorageProvider::new());
+        let storage_router = Arc::new(StorageRouter::new(
             storage_provider,
+            local_provider,
+            smcp_provider,
+        ));
+
+        let fsal = Arc::new(AegisFSAL::new(
+            storage_router,
             volume_repository,
             event_publisher,
         ));

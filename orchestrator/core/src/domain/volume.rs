@@ -381,6 +381,40 @@ impl VolumeOwnership {
     }
 }
 
+/// The storage backend hosting the volume
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+pub enum VolumeBackend {
+    /// Standard SeaweedFS volume (ADR-032)
+    SeaweedFS {
+        filer_endpoint: FilerEndpoint,
+        remote_path: String,
+    },
+    /// Local Host path (ADR-047)
+    HostPath { path: PathBuf },
+    /// Cloud APIs via OpenDAL (ADR-047)
+    OpenDal {
+        provider: String,
+        config: Option<serde_json::Value>,
+        /// Optional internal caching path
+        cache_path: Option<String>,
+    },
+    /// Remote Orchestrator Node via SMCP (ADR-047)
+    Smcp {
+        node_id: String,
+        remote_volume_id: VolumeId,
+    },
+}
+
+impl VolumeBackend {
+    pub fn seaweedfs(filer_endpoint: FilerEndpoint, remote_path: String) -> Self {
+        Self::SeaweedFS {
+            filer_endpoint,
+            remote_path,
+        }
+    }
+}
+
 /// Volume status lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -437,13 +471,10 @@ pub struct Volume {
     /// Storage classification (ephemeral or persistent)
     pub storage_class: StorageClass,
 
-    /// SeaweedFS filer endpoint
-    pub filer_endpoint: FilerEndpoint,
+    /// Concrete backend handling this volume
+    pub backend: VolumeBackend,
 
-    /// Remote path on SeaweedFS (e.g., "/aegis/volumes/{tenant_id}/{volume_id}")
-    pub remote_path: String,
-
-    /// Size limit in bytes (enforced by SeaweedFS quota)
+    /// Size limit in bytes (enforced by backend quota or FSAL)
     pub size_limit_bytes: u64,
 
     /// Current volume status
@@ -471,7 +502,7 @@ impl Volume {
         name: String,
         tenant_id: TenantId,
         storage_class: StorageClass,
-        filer_endpoint: FilerEndpoint,
+        backend: VolumeBackend,
         size_limit_bytes: u64,
         ownership: VolumeOwnership,
     ) -> Result<Self, VolumeError> {
@@ -493,16 +524,12 @@ impl Volume {
         let created_at = Utc::now();
         let expires_at = storage_class.calculate_expiry(created_at);
 
-        // Construct remote path: /aegis/volumes/{tenant_id}/{volume_id}
-        let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, id);
-
         Ok(Self {
             id,
             name,
             tenant_id,
             storage_class,
-            filer_endpoint,
-            remote_path,
+            backend,
             size_limit_bytes,
             status: VolumeStatus::Creating,
             ownership,
@@ -619,12 +646,27 @@ impl Volume {
 
     /// Create volume mount specification
     pub fn to_mount(&self, mount_point: PathBuf, access_mode: AccessMode) -> VolumeMount {
+        // Fallback for Phase 1 code expecting SeaweedFS
+        let (filer_endpoint, remote_path) = match &self.backend {
+            VolumeBackend::SeaweedFS {
+                filer_endpoint,
+                remote_path,
+            } => (filer_endpoint.clone(), remote_path.clone()),
+            _ => {
+                // Return dummy values for non-NFS backends (they route directly via StorageRouter)
+                (
+                    FilerEndpoint::new("http://localhost:8888").unwrap(),
+                    format!("/aegis/volumes/{}/{}", self.tenant_id, self.id),
+                )
+            }
+        };
+
         VolumeMount::new(
             self.id,
             mount_point,
             access_mode,
-            self.filer_endpoint.clone(),
-            self.remote_path.clone(),
+            filer_endpoint,
+            remote_path,
         )
     }
 }
@@ -735,7 +777,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             StorageClass::ephemeral_hours(24),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000, // 1GB
             VolumeOwnership::persistent("user-123"),
         )
@@ -744,10 +789,7 @@ mod tests {
         assert_eq!(volume.name, "test-volume");
         assert_eq!(volume.status, VolumeStatus::Creating);
         assert!(volume.expires_at.is_some());
-        assert_eq!(
-            volume.remote_path,
-            format!("/aegis/volumes/{}/{}", volume.tenant_id, volume.id)
-        );
+        // We bypass the direct remote_path check for standard properties since we are mocking
     }
 
     #[test]
@@ -756,7 +798,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             StorageClass::persistent(),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             0, // Invalid: zero size
             VolumeOwnership::persistent("user-123"),
         );
@@ -769,7 +814,10 @@ mod tests {
             "".to_string(), // Invalid: empty name
             TenantId::default(),
             StorageClass::persistent(),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
         );
@@ -782,7 +830,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             StorageClass::persistent(),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
         )
@@ -817,7 +868,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             StorageClass::persistent(),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
         )
@@ -840,7 +894,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             storage,
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
         )
@@ -860,7 +917,10 @@ mod tests {
             "test-volume".to_string(),
             TenantId::default(),
             StorageClass::persistent(),
-            FilerEndpoint::new("http://localhost:8888").unwrap(),
+            VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/dummy".to_string(),
+            },
             1_000_000_000,
             VolumeOwnership::persistent("user-123"),
         )

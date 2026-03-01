@@ -52,6 +52,7 @@ pub mod repository_factory;
 pub mod start_workflow_execution;
 pub mod stimulus;
 pub mod storage_event_persister;
+pub mod storage_router;
 pub mod temporal_mapper;
 pub mod volume_manager;
 

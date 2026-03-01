@@ -35,8 +35,8 @@ use crate::domain::repository::VolumeRepository;
 use crate::domain::runtime::InstanceId;
 use crate::domain::storage::StorageProvider;
 use crate::domain::volume::{
-    AccessMode, FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeMount,
-    VolumeOwnership,
+    AccessMode, FilerEndpoint, StorageClass, TenantId, Volume, VolumeBackend, VolumeId,
+    VolumeMount, VolumeOwnership,
 };
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Context, Result};
@@ -147,20 +147,12 @@ pub trait VolumeService: Send + Sync {
     /// # Arguments
     ///
     /// * `execution_id` — The execution that will own the volumes.
-    /// * `tenant_id` — Tenant namespace for quota and NFS export isolation.
-    /// * `volume_specs` — Parsed from `agent.yaml` `spec.volumes[]`.
-    /// * `storage_mode` — `"seaweedfs"` or `"local"` (test/dev only).
-    /// * `fallback_to_local` — If `true`, fall back to local fs when SeaweedFS
-    ///   is unreachable (safe for dev, never for prod).
-    /// * `local_path` — Base path for local fallback volumes.
     async fn create_volumes_for_execution(
         &self,
         execution_id: ExecutionId,
         tenant_id: TenantId,
         volume_specs: &[VolumeSpec],
         storage_mode: &str,
-        fallback_to_local: bool,
-        local_path: &str,
     ) -> Result<Vec<Volume>>;
 }
 
@@ -208,19 +200,32 @@ impl VolumeService for StandardVolumeService {
             name, tenant_id, storage_class, size_limit_mb
         );
 
+        // Determine backend based on inputs
+        // For standard volume service creating standard volumes, we use SeaweedFS
+        // Construct remote path: /aegis/volumes/{tenant_id}/{volume_id}
+        let volume_id = VolumeId::new();
+        let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
+        let backend = VolumeBackend::SeaweedFS {
+            filer_endpoint: self.filer_endpoint.clone(),
+            remote_path: remote_path.clone(),
+        };
+
         // Create volume aggregate
         let size_limit_bytes = size_limit_mb * 1024 * 1024;
-        let volume = Volume::new(
-            name.clone(),
+        let mut volume = Volume {
+            id: volume_id,
+            name: name.clone(),
             tenant_id,
-            storage_class.clone(),
-            self.filer_endpoint.clone(),
+            storage_class: storage_class.clone(),
+            backend,
             size_limit_bytes,
-            ownership.clone(),
-        )?;
-
-        let volume_id = volume.id;
-        let remote_path = volume.remote_path.clone();
+            status: crate::domain::volume::VolumeStatus::Creating,
+            ownership: ownership.clone(),
+            created_at: Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: storage_class.calculate_expiry(Utc::now()),
+        };
 
         // Create directory on SeaweedFS
         self.storage_provider
@@ -235,7 +240,6 @@ impl VolumeService for StandardVolumeService {
             .context("Failed to set volume quota on storage backend")?;
 
         // Transition volume from Creating → Available now that storage is provisioned
-        let mut volume = volume;
         volume
             .mark_available()
             .context("Failed to mark volume as available")?;
@@ -407,21 +411,28 @@ impl VolumeService for StandardVolumeService {
             .await
             .context("Failed to mark volume as deleting")?;
 
-        // Delete directory from SeaweedFS
-        let remote_path = volume.remote_path.clone();
-        match self.storage_provider.delete_directory(&remote_path).await {
-            Ok(_) => {
-                debug!(
-                    "Volume directory {} deleted from storage backend",
-                    remote_path
-                );
-            }
-            Err(e) => {
-                warn!(
-                    "Failed to delete volume directory {} from storage backend: {}. Marking as deleted anyway.",
-                    remote_path, e
-                );
-                // Continue even if storage deletion fails - volume is orphaned but marked deleted
+        // Delete directory from backend if applicable
+        let path_to_delete = match &volume.backend {
+            VolumeBackend::SeaweedFS { remote_path, .. } => Some(remote_path.clone()),
+            VolumeBackend::HostPath { path } => Some(path.to_string_lossy().to_string()),
+            VolumeBackend::OpenDal { .. } | VolumeBackend::Smcp { .. } => None, // Handled implicitly or unmanaged natively here
+        };
+
+        if let Some(remote_path) = path_to_delete {
+            match self.storage_provider.delete_directory(&remote_path).await {
+                Ok(_) => {
+                    debug!(
+                        "Volume direction {} deleted from storage backend",
+                        remote_path
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to delete volume directory {} from storage backend: {}. Marking as deleted anyway.",
+                        remote_path, e
+                    );
+                    // Continue even if storage deletion fails - volume is orphaned but marked deleted
+                }
             }
         }
 
@@ -452,13 +463,21 @@ impl VolumeService for StandardVolumeService {
         // Load volume aggregate
         let volume = self.get_volume(volume_id).await?;
 
-        // Query SeaweedFS for actual usage
-        let remote_path = volume.remote_path.clone();
-        let usage_bytes = self
-            .storage_provider
-            .get_usage(&remote_path)
-            .await
-            .context("Failed to get volume usage from storage backend")?;
+        // Query backend for actual usage
+        let remote_path = match &volume.backend {
+            VolumeBackend::SeaweedFS { remote_path, .. } => remote_path.clone(),
+            VolumeBackend::HostPath { path } => path.to_string_lossy().to_string(),
+            VolumeBackend::OpenDal { .. } | VolumeBackend::Smcp { .. } => String::new(), // Not accurately supported purely via `get_usage` directly
+        };
+
+        let usage_bytes = if remote_path.is_empty() {
+            0
+        } else {
+            self.storage_provider
+                .get_usage(&remote_path)
+                .await
+                .context("Failed to get volume usage from storage backend")?
+        };
 
         // Check if quota exceeded
         if usage_bytes > volume.size_limit_bytes {
@@ -531,19 +550,16 @@ impl VolumeService for StandardVolumeService {
         tenant_id: TenantId,
         volume_specs: &[VolumeSpec],
         storage_mode: &str,
-        fallback_to_local: bool,
-        _local_path: &str, // Prefixed with _ to suppress unused warning
     ) -> Result<Vec<Volume>> {
         if volume_specs.is_empty() {
             return Ok(Vec::new());
         }
 
         info!(
-            "Creating {} volumes for execution {} (storage_mode: {}, fallback: {})",
+            "Creating {} volumes for execution {} (storage_mode: {})",
             volume_specs.len(),
             execution_id,
-            storage_mode,
-            fallback_to_local
+            storage_mode
         );
 
         let mut volumes = Vec::new();
@@ -575,9 +591,9 @@ impl VolumeService for StandardVolumeService {
             let ownership = VolumeOwnership::execution(execution_id);
 
             // Attempt to create volume
-            let volume_id = match storage_mode {
-                "seaweedfs" => {
-                    // Try SeaweedFS first
+            let volume_id = match spec.volume_type.as_str() {
+                "seaweedfs" | "local_host" | "opendal_memory" => {
+                    // Try SeaweedFS / Local / Default standard workflow for now
                     match self
                         .create_volume(
                             spec.name.clone(),
@@ -589,41 +605,78 @@ impl VolumeService for StandardVolumeService {
                         .await
                     {
                         Ok(id) => id,
-                        Err(e) if fallback_to_local => {
-                            warn!(
-                                "SeaweedFS volume creation failed for '{}', falling back to local storage: {}",
-                                spec.name, e
-                            );
-                            // Create local volume instead (not using SeaweedFS adapter)
-                            return Err(anyhow::anyhow!(
-                                "Local storage fallback not yet implemented. SeaweedFS error: {}",
-                                e
-                            ));
-                        }
                         Err(e) => {
                             return Err(anyhow::anyhow!(
-                                "SeaweedFS volume creation failed for '{}' and fallback is disabled: {}",
+                                "SeaweedFS volume creation failed for '{}': {}",
                                 spec.name,
                                 e
                             ));
                         }
                     }
                 }
-                "local" => {
-                    // Local storage mode (not using SeaweedFS)
-                    warn!("Local storage mode not yet fully implemented, using SeaweedFS adapter anyway");
-                    self.create_volume(
-                        spec.name.clone(),
+                "opendal" | "hostPath" | "smcp" => {
+                    // Custom non-standard volume types.
+                    // For now, we will construct the backend appropriately and store directly to bypass standard seaweedsfs creation routine.
+                    let backend = match spec.volume_type.as_str() {
+                        "opendal" => VolumeBackend::OpenDal {
+                            provider: spec.provider.clone().unwrap_or_else(|| "s3".to_string()),
+                            config: spec.config.clone(),
+                            cache_path: None,
+                        },
+                        "hostPath" => VolumeBackend::HostPath {
+                            path: PathBuf::from(
+                                spec.config
+                                    .as_ref()
+                                    .and_then(|c| c.get("path"))
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("/tmp/aegis"),
+                            ),
+                        },
+                        "smcp" => VolumeBackend::Smcp {
+                            node_id: spec
+                                .config
+                                .as_ref()
+                                .and_then(|c| c.get("node_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string(),
+                            remote_volume_id: spec
+                                .config
+                                .as_ref()
+                                .and_then(|c| c.get("volume_id"))
+                                .and_then(|v| v.as_str())
+                                .and_then(|v| VolumeId::from_string(v).ok())
+                                .unwrap_or_else(VolumeId::new),
+                        },
+                        _ => unreachable!(),
+                    };
+
+                    let volume_id = VolumeId::new();
+                    let volume = Volume {
+                        id: volume_id,
+                        name: spec.name.clone(),
                         tenant_id,
-                        storage_class.clone(),
-                        size_limit_bytes / (1024 * 1024),
-                        ownership.clone(),
-                    )
-                    .await?
+                        storage_class: storage_class.clone(),
+                        backend,
+                        size_limit_bytes,
+                        status: crate::domain::volume::VolumeStatus::Available,
+                        ownership: ownership.clone(),
+                        created_at: Utc::now(),
+                        attached_at: None,
+                        detached_at: None,
+                        expires_at: storage_class.calculate_expiry(Utc::now()),
+                    };
+
+                    self.repository
+                        .save(&volume)
+                        .await
+                        .context("Failed to save custom volume to repository")?;
+
+                    volume_id
                 }
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Invalid storage mode '{}'. Expected 'seaweedfs' or 'local'",
+                        "Invalid volume_type '{}'. Expected 'seaweedfs', 'opendal', 'hostPath', 'smcp'",
                         other
                     ));
                 }

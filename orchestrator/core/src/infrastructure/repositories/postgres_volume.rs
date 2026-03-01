@@ -13,7 +13,7 @@
 
 use crate::domain::repository::{RepositoryError, VolumeRepository};
 use crate::domain::volume::{
-    FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeOwnership, VolumeStatus,
+    StorageClass, TenantId, Volume, VolumeBackend, VolumeId, VolumeOwnership, VolumeStatus,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -37,7 +37,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         let storage_class_json = serde_json::to_value(&volume.storage_class)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
-        let filer_endpoint_json = serde_json::to_value(&volume.filer_endpoint)
+        let backend_json = serde_json::to_value(&volume.backend)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         let status_json = serde_json::to_value(volume.status)
@@ -49,14 +49,14 @@ impl VolumeRepository for PostgresVolumeRepository {
         sqlx::query(
             r#"
             INSERT INTO volumes (
-                id, name, tenant_id, storage_class, filer_endpoint,
-                remote_path, size_limit_bytes, status, ownership,
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
                 storage_class = EXCLUDED.storage_class,
-                filer_endpoint = EXCLUDED.filer_endpoint,
+                backend = EXCLUDED.backend,
                 size_limit_bytes = EXCLUDED.size_limit_bytes,
                 status = EXCLUDED.status,
                 ownership = EXCLUDED.ownership,
@@ -71,8 +71,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         .bind(&volume.name)
         .bind(volume.tenant_id.0)
         .bind(storage_class_json)
-        .bind(filer_endpoint_json)
-        .bind(&volume.remote_path)
+        .bind(backend_json)
         .bind(volume.size_limit_bytes as i64)
         .bind(status_json)
         .bind(ownership_json)
@@ -91,8 +90,8 @@ impl VolumeRepository for PostgresVolumeRepository {
         let row = sqlx::query(
             r#"
             SELECT 
-                id, name, tenant_id, storage_class, filer_endpoint,
-                remote_path, size_limit_bytes, status, ownership,
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE id = $1
@@ -115,8 +114,8 @@ impl VolumeRepository for PostgresVolumeRepository {
         let rows = sqlx::query(
             r#"
             SELECT 
-                id, name, tenant_id, storage_class, filer_endpoint,
-                remote_path, size_limit_bytes, status, ownership,
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE tenant_id = $1
@@ -140,8 +139,8 @@ impl VolumeRepository for PostgresVolumeRepository {
         let rows = sqlx::query(
             r#"
             SELECT 
-                id, name, tenant_id, storage_class, filer_endpoint,
-                remote_path, size_limit_bytes, status, ownership,
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE expires_at IS NOT NULL AND expires_at < $1
@@ -172,8 +171,8 @@ impl VolumeRepository for PostgresVolumeRepository {
         let rows = sqlx::query(
             r#"
             SELECT 
-                id, name, tenant_id, storage_class, filer_endpoint,
-                remote_path, size_limit_bytes, status, ownership,
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE ownership @> $1
@@ -220,31 +219,29 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
     let id: uuid::Uuid = row.get("id");
     let name: String = row.get("name");
     let tenant_id: uuid::Uuid = row.get("tenant_id");
-    let storage_class_val: serde_json::Value = row.get("storage_class");
-    let filer_endpoint_val: serde_json::Value = row.get("filer_endpoint");
-    let remote_path: String = row.get("remote_path");
+    let storage_class: serde_json::Value = row.get("storage_class");
+    let backend: serde_json::Value = row.get("backend");
     let size_limit_bytes: i64 = row.get("size_limit_bytes");
-    let status_val: serde_json::Value = row.get("status");
-    let ownership_val: serde_json::Value = row.get("ownership");
+    let status: serde_json::Value = row.get("status");
+    let ownership: serde_json::Value = row.get("ownership");
     let created_at: DateTime<Utc> = row.get("created_at");
     let attached_at: Option<DateTime<Utc>> = row.get("attached_at");
     let detached_at: Option<DateTime<Utc>> = row.get("detached_at");
     let expires_at: Option<DateTime<Utc>> = row.get("expires_at");
 
-    let storage_class: StorageClass = serde_json::from_value(storage_class_val).map_err(|e| {
+    let storage_class: StorageClass = serde_json::from_value(storage_class).map_err(|e| {
         RepositoryError::Serialization(format!("Failed to deserialize storage_class: {}", e))
     })?;
 
-    let filer_endpoint: FilerEndpoint =
-        serde_json::from_value(filer_endpoint_val).map_err(|e| {
-            RepositoryError::Serialization(format!("Failed to deserialize filer_endpoint: {}", e))
-        })?;
+    let backend: VolumeBackend = serde_json::from_value(backend).map_err(|e| {
+        RepositoryError::Serialization(format!("Failed to deserialize backend: {}", e))
+    })?;
 
-    let status: VolumeStatus = serde_json::from_value(status_val).map_err(|e| {
+    let status: VolumeStatus = serde_json::from_value(status).map_err(|e| {
         RepositoryError::Serialization(format!("Failed to deserialize status: {}", e))
     })?;
 
-    let ownership: VolumeOwnership = serde_json::from_value(ownership_val).map_err(|e| {
+    let ownership: VolumeOwnership = serde_json::from_value(ownership).map_err(|e| {
         RepositoryError::Serialization(format!("Failed to deserialize ownership: {}", e))
     })?;
 
@@ -253,8 +250,7 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
         name,
         tenant_id: TenantId(tenant_id),
         storage_class,
-        filer_endpoint,
-        remote_path,
+        backend,
         size_limit_bytes: size_limit_bytes as u64,
         status,
         ownership,

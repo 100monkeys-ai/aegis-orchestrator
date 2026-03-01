@@ -338,6 +338,19 @@ pub struct VolumeSpec {
     /// Storage class: "ephemeral" or "persistent"
     pub storage_class: String,
 
+    /// New volume backend type (e.g., "seaweedfs", "opendal", "hostPath", "smcp")
+    /// Defaults to "seaweedfs" if omitted for backward compatibility.
+    #[serde(default = "default_volume_type", rename = "type")]
+    pub volume_type: String,
+
+    /// External provider name (e.g., "s3", "gcs" for OpenDAL)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+
+    /// Provider-specific configuration (bucket name, paths, etc)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<serde_json::Value>,
+
     /// Mount path inside container
     pub mount_path: String,
 
@@ -799,6 +812,10 @@ pub enum AgentStatus {
 // Defaults
 fn default_true() -> bool {
     true
+}
+
+fn default_volume_type() -> String {
+    "seaweedfs".to_string()
 }
 fn default_max_retries() -> u32 {
     5

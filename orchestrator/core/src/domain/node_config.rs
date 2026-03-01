@@ -469,16 +469,10 @@ pub struct TracingConfig {
 /// Related: ADR-032 Unified Storage via SeaweedFS, ADR-036 NFS Server Gateway
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StorageConfig {
-    /// Storage backend: "seaweedfs" or "local"
-    /// Default: "local"
+    /// Storage backend: "seaweedfs", "local_host", or "opendal_memory"
+    /// Default: "seaweedfs"
     #[serde(default = "default_storage_backend")]
     pub backend: String,
-
-    /// Fallback to local storage if SeaweedFS is unreachable
-    /// Only applies when backend is "seaweedfs"
-    /// Default: true (graceful degradation for development/edge scenarios)
-    #[serde(default = "default_fallback_to_local")]
-    pub fallback_to_local: bool,
 
     /// NFS Server Gateway port (ADR-036)
     /// Default: 2049 (standard NFS port)
@@ -489,19 +483,23 @@ pub struct StorageConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seaweedfs: Option<SeaweedFSConfig>,
 
-    /// Local filesystem configuration (used if backend: "local")
+    /// Local host filesystem configuration (used if backend: "local_host")
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub local: Option<LocalStorageConfig>,
+    pub local_host: Option<LocalHostStorageConfig>,
+
+    /// OpenDAL configuration (used if backend: "opendal")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opendal: Option<OpenDalConfig>,
 }
 
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             backend: default_storage_backend(),
-            fallback_to_local: default_fallback_to_local(),
             nfs_port: default_storage_nfs_port(),
             seaweedfs: None,
-            local: Some(LocalStorageConfig::default()),
+            local_host: Some(LocalHostStorageConfig::default()),
+            opendal: None,
         }
     }
 }
@@ -562,37 +560,39 @@ impl Default for SeaweedFSConfig {
     }
 }
 
-/// Local filesystem storage configuration
+/// Local host filesystem storage configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LocalStorageConfig {
-    /// Base directory for volume storage
-    /// Default: "/var/lib/aegis/local-volumes"
-    #[serde(default = "default_local_base_path")]
-    pub base_path: String,
-
-    /// Default TTL for ephemeral volumes (hours)
-    /// Default: 24
-    #[serde(default = "default_ttl_hours")]
-    pub default_ttl_hours: u32,
-
-    /// Default size limit for volumes (MB)
-    /// Default: 1000
-    #[serde(default = "default_size_limit_mb")]
-    pub default_size_limit_mb: u64,
-
-    /// Maximum allowed size limit (MB)
-    /// Default: 10000
-    #[serde(default = "default_max_size_limit_mb")]
-    pub max_size_limit_mb: u64,
+pub struct LocalHostStorageConfig {
+    /// Host filesystem mount point
+    /// Default: "/var/lib/aegis/local-host-volumes"
+    #[serde(default = "default_local_host_mount_point")]
+    pub mount_point: String,
 }
 
-impl Default for LocalStorageConfig {
+impl Default for LocalHostStorageConfig {
     fn default() -> Self {
         Self {
-            base_path: default_local_base_path(),
-            default_ttl_hours: default_ttl_hours(),
-            default_size_limit_mb: default_size_limit_mb(),
-            max_size_limit_mb: default_max_size_limit_mb(),
+            mount_point: default_local_host_mount_point(),
+        }
+    }
+}
+
+/// OpenDAL unified storage configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenDalConfig {
+    /// Scheme provider (e.g. "s3", "gcs", "memory", "fs")
+    pub provider: String,
+
+    /// Configuration options for the provider. Values can use "env:VAR_NAME"
+    #[serde(default)]
+    pub options: std::collections::HashMap<String, String>,
+}
+
+impl Default for OpenDalConfig {
+    fn default() -> Self {
+        Self {
+            provider: "memory".to_string(),
+            options: std::collections::HashMap::new(),
         }
     }
 }
@@ -903,11 +903,7 @@ fn default_grpc_port() -> u16 {
 }
 
 fn default_storage_backend() -> String {
-    "local".to_string()
-}
-
-fn default_fallback_to_local() -> bool {
-    true // Default: graceful degradation for dev/edge scenarios
+    "local_host".to_string()
 }
 
 fn default_storage_nfs_port() -> Option<u16> {
@@ -918,8 +914,8 @@ fn default_seaweedfs_mount_point() -> String {
     "/var/lib/aegis/storage".to_string()
 }
 
-fn default_local_base_path() -> String {
-    "/var/lib/aegis/local-volumes".to_string()
+fn default_local_host_mount_point() -> String {
+    "/var/lib/aegis/local-host-volumes".to_string()
 }
 
 fn default_ttl_hours() -> u32 {

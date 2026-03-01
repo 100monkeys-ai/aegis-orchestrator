@@ -624,11 +624,7 @@ impl ExecutionService for StandardExecutionService {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Storage configuration not found in node config"))?;
 
-            tracing::debug!(
-                "Storage config: backend={}, fallback={}",
-                storage_config.backend,
-                storage_config.fallback_to_local
-            );
+            tracing::debug!("Storage config: backend={}", storage_config.backend);
 
             // Create volumes using volume service
             let tenant_id = TenantId::default_tenant(); // TODO: Multi-tenancy
@@ -639,12 +635,6 @@ impl ExecutionService for StandardExecutionService {
                     tenant_id,
                     &agent.manifest.spec.volumes,
                     &storage_config.backend,
-                    storage_config.fallback_to_local,
-                    storage_config
-                        .local
-                        .as_ref()
-                        .map(|l| l.base_path.as_str())
-                        .unwrap_or("/var/lib/aegis/local-volumes"),
                 )
                 .await?;
 
@@ -668,13 +658,7 @@ impl ExecutionService for StandardExecutionService {
                         _ => AccessMode::ReadWrite,
                     };
 
-                    VolumeMount::new(
-                        volume.id,
-                        PathBuf::from(&spec.mount_path),
-                        access_mode,
-                        volume.filer_endpoint.clone(),
-                        volume.remote_path.clone(),
-                    )
+                    volume.to_mount(PathBuf::from(&spec.mount_path), access_mode)
                 })
                 .collect::<Vec<VolumeMount>>()
         } else {

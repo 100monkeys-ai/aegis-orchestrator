@@ -26,11 +26,11 @@ use aegis_orchestrator_core::domain::storage::{
     DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
 };
 use aegis_orchestrator_core::domain::volume::{
-    FilerEndpoint, StorageClass, TenantId, Volume, VolumeId, VolumeOwnership,
+    FilerEndpoint, StorageClass, TenantId, Volume, VolumeBackend, VolumeId, VolumeOwnership,
 };
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use chrono::Utc;
 use std::sync::Arc;
 
 // ── Test helper ─────────────────────────────────────────────────────────────
@@ -45,10 +45,11 @@ async fn create_attached_test_volume(
     let mut volume = Volume::new(
         "test-volume".to_string(),
         TenantId::default(),
-        StorageClass::Ephemeral {
-            ttl: Duration::hours(24),
+        StorageClass::persistent(),
+        VolumeBackend::SeaweedFS {
+            filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
+            remote_path: "/dummy".to_string(),
         },
-        FilerEndpoint::new("http://filer:8888").unwrap(),
         quota_bytes,
         VolumeOwnership::Execution { execution_id },
     )

@@ -10,15 +10,20 @@
 //! - **Layer:** Infrastructure Layer
 //! - **Purpose:** Implements internal responsibilities for mod
 
-pub mod local;
+pub mod local_host_provider;
+pub mod opendal_provider;
 pub mod seaweedfs;
 
 use crate::domain::storage::{
     DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageProvider,
 };
 
-pub use local::LocalStorageProvider;
+pub use local_host_provider::LocalHostStorageProvider;
+pub use opendal_provider::OpenDalStorageProvider;
 pub use seaweedfs::SeaweedFSAdapter;
+pub mod smcp_provider;
+use opendal::Operator;
+pub use smcp_provider::SmcpStorageProvider;
 
 use std::sync::Arc;
 
@@ -28,8 +33,14 @@ pub enum StorageBackend {
     /// SeaweedFS distributed storage (production)
     SeaweedFS { filer_url: String },
 
-    /// Local filesystem storage (development/testing)
-    Local { base_path: String },
+    /// Local host mount point for direct host IO (ADR-047)
+    LocalHost { mount_point: String },
+
+    /// OpenDAL unified storage backend (ADR-047)
+    OpenDal {
+        provider: String,
+        options: std::collections::HashMap<String, String>,
+    },
 
     /// Mock storage for unit testing
     Mock,
@@ -39,9 +50,18 @@ pub enum StorageBackend {
 pub fn create_storage_provider(backend: StorageBackend) -> Arc<dyn StorageProvider> {
     match backend {
         StorageBackend::SeaweedFS { filer_url } => Arc::new(SeaweedFSAdapter::new(filer_url)),
-        StorageBackend::Local { base_path } => Arc::new(
-            LocalStorageProvider::new(base_path).expect("Failed to create LocalStorageProvider"),
+        StorageBackend::LocalHost { mount_point } => Arc::new(
+            LocalHostStorageProvider::new(mount_point)
+                .expect("Failed to create LocalHostStorageProvider"),
         ),
+        StorageBackend::OpenDal { provider, options } => {
+            let scheme: opendal::Scheme = provider
+                .parse()
+                .unwrap_or_else(|_| panic!("Invalid OpenDAL scheme: {}", provider));
+            let op =
+                Operator::via_iter(scheme, options).expect("Failed to create OpenDAL operator");
+            Arc::new(OpenDalStorageProvider::new(op))
+        }
         StorageBackend::Mock => {
             // Return mock implementation
             Arc::new(mock::MockStorageProvider::new())
@@ -193,19 +213,6 @@ mod tests {
     fn test_factory_seaweedfs() {
         let provider = create_storage_provider(StorageBackend::SeaweedFS {
             filer_url: "http://localhost:8888".to_string(),
-        });
-
-        // Should not panic
-        assert!(Arc::strong_count(&provider) == 1);
-    }
-
-    #[test]
-    fn test_factory_local() {
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().unwrap();
-        let provider = create_storage_provider(StorageBackend::Local {
-            base_path: temp_dir.path().to_string_lossy().to_string(),
         });
 
         // Should not panic
