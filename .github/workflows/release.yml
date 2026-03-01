@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -58,7 +58,7 @@ jobs:
           mv target/release/aegis-linux-x86_64.tar.gz .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aegis-linux-x86_64
           path: aegis-linux-x86_64.tar.gz
@@ -69,7 +69,7 @@ jobs:
     runs-on: macos-latest
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           submodules: recursive
 
@@ -97,7 +97,7 @@ jobs:
           mv target/aarch64-apple-darwin/release/aegis-macos-aarch64.tar.gz .
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: aegis-macos-aarch64
           path: aegis-macos-aarch64.tar.gz
@@ -111,10 +111,10 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -151,7 +151,7 @@ jobs:
           cd ..
 
       - name: Create Release
-        uses: softprops/action-gh-release@v1
+        uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.VERSION }}
           name: AEGIS ${{ steps.version.outputs.VERSION }}
