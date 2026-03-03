@@ -7,11 +7,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core domain and runtime primitives for the 100monkeys.ai AEGIS orchestrator"
+readme = "README.md"
 
 # Include proto-vendor in published packages (created by CI)
 include = [
     "src/**/*.rs",
     "Cargo.toml",
+    "README.md",
     "build.rs",
     "proto-vendor/**/*.proto",
 ]

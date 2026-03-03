@@ -74,7 +74,7 @@ aegis task logs <execution-id>        # View execution logs
 aegis task cancel <execution-id>      # Cancel execution
 ```
 
-See [CLI Reference](docs/CLI_REFERENCE.md) for complete documentation.
+See [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) for complete documentation.
 
 ### Edge Node (`edge-node/`)
 
@@ -136,7 +136,7 @@ spec:
       level: "info"
 ```
 
-See [aegis-config.yaml](aegis-config.yaml) for a complete example.
+See [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-config) and [`aegis-config.yaml`](aegis-config.yaml) for a complete example.
 
 ### Debugging and Logging
 
@@ -219,7 +219,7 @@ target/debug/aegis agent logs echo
 target/debug/aegis daemon stop
 ```
 
-For detailed instructions, see [Getting Started Guide](docs/GETTING_STARTED.md).
+For detailed instructions, see [Getting Started Guide](https://docs.100monkeys.ai/docs/getting-started).
 
 ## Development
 
@@ -270,7 +270,7 @@ The orchestrator enforces:
 - **Resource Limits**: CPU, memory, execution time
 - **Audit Trail**: Immutable logging
 
-For details, see [SECURITY.md](SECURITY.md).
+For details, see [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model).
 
 ## Performance
 
@@ -286,9 +286,22 @@ Full documentation is available at **[docs.100monkeys.ai](https://docs.100monkey
 | --- | --- |
 | [Getting Started](https://docs.100monkeys.ai/docs/getting-started) | Install, configure, and run your first agent |
 | [Core Concepts](https://docs.100monkeys.ai/docs/concepts) | Agents, executions, workflows, swarms, security model |
-| [Guides](https://docs.100monkeys.ai/docs/guides) | Writing agents, building workflows, configuring storage |
+| [Writing Agents](https://docs.100monkeys.ai/docs/guides/writing-agents) | Author and structure agent code |
+| [Deploying Agents](https://docs.100monkeys.ai/docs/guides/deploying-agents) | Deploy agents with the CLI or API |
+| [LLM Providers](https://docs.100monkeys.ai/docs/guides/llm-providers) | Configure Ollama, OpenAI, and other LLM backends |
+| [Building Workflows](https://docs.100monkeys.ai/docs/guides/building-workflows) | Chain agents into multi-step workflows |
+| [Building Swarms](https://docs.100monkeys.ai/docs/guides/building-swarms) | Coordinate parallel agent swarms |
+| [Configuring Storage](https://docs.100monkeys.ai/docs/guides/configuring-storage) | Persistent storage backends for agents |
+| [Local Testing](https://docs.100monkeys.ai/docs/guides/local-testing) | Test agents locally before deploying |
 | [Architecture](https://docs.100monkeys.ai/docs/architecture) | Execution engine, SMCP, storage gateway, event bus |
-| [Deployment](https://docs.100monkeys.ai/docs/deployment) | Docker, Firecracker, IAM, secrets, configuration reference |
+| [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model) | Isolation, network control, secrets, audit trail |
+| [Deployment — Docker](https://docs.100monkeys.ai/docs/deployment/docker) | Run the orchestrator with Docker |
+| [Deployment — Firecracker](https://docs.100monkeys.ai/docs/deployment/firecracker) | Production micro-VM setup |
+| [Secrets Management](https://docs.100monkeys.ai/docs/deployment/secrets) | OpenBao / Vault integration (Keymaster Pattern) |
+| [IAM](https://docs.100monkeys.ai/docs/deployment/iam) | Keycloak identity and access management |
+| [Configuration Reference](https://docs.100monkeys.ai/docs/reference/node-config) | `NodeConfig` YAML reference (`aegis-config.yaml`) |
+| [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) | `AgentManifest` YAML field reference |
+| [Workflow Manifest Reference](https://docs.100monkeys.ai/docs/reference/workflow-manifest) | `WorkflowManifest` YAML field reference |
 | [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) | Complete `aegis` CLI command reference |
 | [gRPC API](https://docs.100monkeys.ai/docs/reference/grpc-api) | `aegis.runtime.v1` service methods and message types |
 
