@@ -277,6 +277,45 @@ impl InnerLoopService {
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
                             Err(e) => {
+                                // Differentiate fatal policy/validation errors from
+                                // recoverable tool execution errors.
+                                //
+                                // SignatureVerificationFailed is used for:
+                                //   - Missing judge agent ("Judge agent '...' not found")
+                                //   - Validation rejection (score below threshold)
+                                //   - Policy violations from SecurityContext
+                                //
+                                // These are configuration or security errors that will
+                                // never self-resolve by retrying. Fail the execution
+                                // immediately instead of looping forever (ADR-049).
+                                use crate::domain::smcp_session::SmcpSessionError;
+                                let is_fatal = matches!(
+                                    &e,
+                                    SmcpSessionError::SignatureVerificationFailed(_)
+                                        | SmcpSessionError::PolicyViolation(_)
+                                        | SmcpSessionError::SessionInactive(_)
+                                );
+
+                                if is_fatal {
+                                    tracing::error!(
+                                        tool = %tool_call.name,
+                                        error = %e,
+                                        "Fatal tool validation/policy error — terminating inner loop"
+                                    );
+                                    self.active_executions
+                                        .write()
+                                        .await
+                                        .remove(execution_id_str);
+                                    anyhow::bail!(
+                                        "Tool '{}' blocked by policy: {}",
+                                        tool_call.name,
+                                        e
+                                    );
+                                }
+
+                                // Recoverable errors (e.g. MalformedPayload, SessionExpired)
+                                // are fed back to the LLM as tool error messages so it can
+                                // adjust its approach.
                                 let tool_result = format!("Tool execution error: {}", e);
                                 let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
                                 next_ctx.conversation.push(ConversationMessage {

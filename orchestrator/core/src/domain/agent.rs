@@ -1178,4 +1178,48 @@ mod tests {
         assert_eq!(limits.disk, "1Gi");
         assert!(limits.timeout.is_none());
     }
+
+    #[test]
+    fn test_tool_validation_parsing() {
+        let yaml = r#"
+apiVersion: aegis.ai/v1
+kind: Agent
+metadata:
+  name: test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    model: smart
+  volumes: []
+  execution:
+    mode: iterative
+    max_iterations: 5
+    tool_validation:
+      - type: semantic
+        judge_agent: "code-quality-judge"
+        criteria: "Test criteria"
+        min_score: 0.85
+        timeout_seconds: 60
+  security:
+    network:
+      mode: block
+      allowlist: []
+    filesystem:
+      read: []
+      write: []
+    resources: {}
+  tools: []
+"#;
+        let manifest: AgentManifest = serde_yaml::from_str(yaml).unwrap();
+        let exec = manifest.spec.execution.unwrap();
+        let tool_val = exec.tool_validation.unwrap();
+        assert_eq!(tool_val.len(), 1);
+        if let ValidatorSpec::Semantic { judge_agent, .. } = &tool_val[0] {
+            assert_eq!(judge_agent, "code-quality-judge");
+        } else {
+            panic!("Expected semantic validator");
+        }
+    }
 }
