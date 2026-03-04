@@ -407,7 +407,11 @@ impl AgentRuntime for DockerRuntime {
 
                     Mount {
                         target: Some(container_path),
-                        source: None,
+                        // Named volumes (source is set) support ReadOnly mode;
+                        // anonymous volumes (source=None) do NOT — Docker returns
+                        // HTTP 400 "must not set ReadOnly mode when using anonymous
+                        // volumes".  Use a deterministic name derived from volume_id.
+                        source: Some(format!("aegis-vol-{}", volume_mount.volume_id)),
                         typ: Some(MountTypeEnum::VOLUME),
                         read_only: Some(matches!(
                             volume_mount.access_mode,
