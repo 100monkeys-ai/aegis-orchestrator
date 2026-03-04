@@ -620,6 +620,7 @@ mod tests {
                 iteration_timeout: None, // Use default 300s
                 llm_timeout_seconds: 300,
                 validation: None,
+                tool_validation: None,
                 delivery: None,
             },
             volumes: Vec::new(),
