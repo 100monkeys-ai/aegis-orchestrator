@@ -644,7 +644,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             name: "cmd.run".to_string(),
             description: "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally.".to_string(),
             enabled: true,
-            capabilities: vec!["cmd.run".to_string()],
+            capabilities: vec![aegis_orchestrator_core::domain::node_config::CapabilityConfig { name: "cmd.run".to_string(), skip_judge: false }],
         });
     }
 
@@ -654,7 +654,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             name: "fs.read".to_string(),
             description: "Read the contents of a file at the given POSIX path from the mounted Workspace volume.".to_string(),
             enabled: true,
-            capabilities: vec!["fs.read".to_string()],
+            capabilities: vec![aegis_orchestrator_core::domain::node_config::CapabilityConfig { name: "fs.read".to_string(), skip_judge: true }],
         });
     }
 
@@ -663,7 +663,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             name: "fs.write".to_string(),
             description: "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories.".to_string(),
             enabled: true,
-            capabilities: vec!["fs.write".to_string()],
+            capabilities: vec![aegis_orchestrator_core::domain::node_config::CapabilityConfig { name: "fs.write".to_string(), skip_judge: false }],
         });
     }
 
@@ -674,7 +674,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 description: "List the contents of a directory in the Workspace volume."
                     .to_string(),
                 enabled: true,
-                capabilities: vec!["fs.list".to_string()],
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
             },
         );
     }

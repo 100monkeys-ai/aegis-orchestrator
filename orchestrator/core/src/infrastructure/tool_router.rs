@@ -287,7 +287,7 @@ impl ToolRouter {
 
         for dispatcher in &self.builtin_dispatchers {
             for cap in &dispatcher.capabilities {
-                let schema = match cap.as_str() {
+                let schema = match cap.name.as_str() {
                     "cmd.run" => json!({
                         "type": "object",
                         "properties": {
@@ -448,7 +448,7 @@ impl ToolRouter {
                 };
 
                 all_tools.push(ToolMetadata {
-                    name: cap.clone(),
+                    name: cap.name.clone(),
                     description: dispatcher.description.clone(),
                     input_schema: schema,
                 });
@@ -456,6 +456,32 @@ impl ToolRouter {
         }
 
         Ok(all_tools)
+    }
+
+    /// Returns `true` if the operator has flagged `tool_name` to bypass the inner-loop
+    /// semantic judge.  Checks builtin dispatchers first, then MCP server entries.
+    ///
+    /// Called by `ToolInvocationService::invoke_tool_internal` before running the
+    /// `spec.execution.tool_validation` pipeline (see ADR-049 and NODE_CONFIGURATION_SPEC_V1.md).
+    pub async fn is_skip_judge(&self, tool_name: &str) -> bool {
+        // 1. Builtin dispatchers — iterate CapabilityConfig entries directly.
+        for dispatcher in &self.builtin_dispatchers {
+            for cap in &dispatcher.capabilities {
+                if cap.name == tool_name && cap.skip_judge {
+                    return true;
+                }
+            }
+        }
+
+        // 2. MCP server ToolServer entries — ask each server whether this tool is flagged.
+        let servers = self.servers.read().await;
+        for server in servers.values() {
+            if server.is_skip_judge(tool_name) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -744,6 +770,7 @@ mod tests {
             executable_path: PathBuf::from("/usr/local/bin/mcp-test"),
             args: vec![],
             capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: Duration::from_secs(60),

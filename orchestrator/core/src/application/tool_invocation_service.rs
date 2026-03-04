@@ -209,7 +209,17 @@ impl ToolInvocationService {
             })?;
 
         if let Some(exec_spec) = &agent.manifest.spec.execution {
-            if let Some(validation_pipeline) = &exec_spec.tool_validation {
+            // Check operator-level skip_judge flag before running the inner-loop semantic
+            // judge pipeline. When the node config marks a tool with `skip_judge: true`
+            // (e.g. read-only tools such as fs.read, fs.list), we bypass the judge entirely
+            // to reduce latency on low-risk operations (NODE_CONFIGURATION_SPEC_V1.md).
+            let skip_tool_judge = self.tool_router.is_skip_judge(&tool_name).await;
+            if skip_tool_judge {
+                tracing::debug!(
+                    tool_name = %tool_name,
+                    "Inner-loop semantic judge skipped (skip_judge=true in node config for this tool)"
+                );
+            } else if let Some(validation_pipeline) = &exec_spec.tool_validation {
                 for validator in validation_pipeline {
                     // Check if this is an Inner-Loop Semantic Validator configuration
                     if let crate::domain::agent::ValidatorSpec::Semantic {
@@ -706,6 +716,7 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test_tool".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),
@@ -738,6 +749,7 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test_tool_remote".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),

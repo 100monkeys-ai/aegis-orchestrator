@@ -229,6 +229,12 @@ pub struct ToolServer {
     pub args: Vec<String>,
     pub capabilities: Vec<String>,
 
+    /// Set of tool names for which the inner-loop semantic judge should be skipped.
+    /// Derived from `CapabilityConfig.skip_judge` entries in the node configuration.
+    /// See `NODE_CONFIGURATION_SPEC_V1.md § spec.mcp_servers[].capabilities[].skip_judge`.
+    #[serde(default)]
+    pub skip_judge_tools: std::collections::HashSet<String>,
+
     // Lifecycle
     pub status: ToolServerStatus,
     pub process_id: Option<u32>,
@@ -258,13 +264,24 @@ impl ToolServer {
             }
         });
 
+        let capabilities: Vec<String> =
+            config.capabilities.iter().map(|c| c.name.clone()).collect();
+
+        let skip_judge_tools: std::collections::HashSet<String> = config
+            .capabilities
+            .iter()
+            .filter(|c| c.skip_judge)
+            .map(|c| c.name.clone())
+            .collect();
+
         Self {
             id: ToolServerId::new(),
             name: config.name.clone(),
             execution_mode,
             executable_path: PathBuf::from(&config.executable),
             args: config.args.clone(),
-            capabilities: config.capabilities.clone(),
+            capabilities,
+            skip_judge_tools,
             status: ToolServerStatus::Stopped,
             process_id: None,
             health_check_interval: Duration::from_secs(config.health_check.interval_seconds),
@@ -277,6 +294,12 @@ impl ToolServer {
             started_at: None,
             stopped_at: None,
         }
+    }
+
+    /// Returns `true` if the operator has flagged this specific tool to skip the
+    /// inner-loop semantic judge (see `CapabilityConfig.skip_judge` in node config).
+    pub fn is_skip_judge(&self, tool_name: &str) -> bool {
+        self.skip_judge_tools.contains(tool_name)
     }
 
     pub fn start(&mut self) -> Result<MCPToolEvent, DomainError> {
@@ -673,6 +696,7 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test.*".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Stopped,
             process_id: None,
             health_check_interval: Duration::from_secs(30),

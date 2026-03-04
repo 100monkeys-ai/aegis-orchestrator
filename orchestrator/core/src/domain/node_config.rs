@@ -601,6 +601,28 @@ impl Default for OpenDalConfig {
     }
 }
 
+/// Per-tool capability configuration, including operator-level judge optimization flags.
+///
+/// Replaces the previous flat `Vec<String>` capabilities list on both
+/// `BuiltinDispatcherConfig` and `McpServerConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityConfig {
+    /// Tool name exposed to agents (e.g. `"fs.read"`, `"cmd.run"`, `"gmail.send"`)
+    pub name: String,
+
+    /// When `true`, the inner-loop semantic judge (if enabled on the agent manifest via
+    /// `spec.execution.tool_validation`) is skipped for this specific tool call.
+    ///
+    /// Intended for read-only or low-risk tools (e.g. `fs.read`, `fs.list`) where the
+    /// latency cost of spawning a judge child execution is undesirable and the operation
+    /// carries no write-side risk. Defaults to `false` (judge always runs when configured).
+    ///
+    /// **Security note**: This is an operator-level infrastructure opt-out set in the
+    /// node configuration, not an agent-level privilege. Agents cannot influence this flag.
+    #[serde(default)]
+    pub skip_judge: bool,
+}
+
 /// Built-in tools configured directly inside the Orchestrator via Dispatch Protocol (ADR-040)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinDispatcherConfig {
@@ -616,7 +638,7 @@ pub struct BuiltinDispatcherConfig {
 
     /// Capabilities provided by this dispatcher
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<CapabilityConfig>,
 }
 
 /// MCP Server configuration
@@ -636,9 +658,10 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
 
-    /// Tool names this server provides
+    /// Tool capabilities provided by this server.
+    /// Use object form to control per-tool `skip_judge` behaviour.
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<CapabilityConfig>,
 
     /// API keys/tokens for external services
     #[serde(default)]
