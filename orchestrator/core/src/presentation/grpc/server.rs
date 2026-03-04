@@ -376,6 +376,26 @@ impl AegisRuntime for AegisRuntimeService {
         }
     }
 
+    /// Store a learned trajectory pattern in Cortex (ADR-049).
+    async fn store_trajectory_pattern(
+        &self,
+        request: Request<StoreTrajectoryPatternRequest>,
+    ) -> Result<Response<StoreTrajectoryPatternResponse>, Status> {
+        let req = request.into_inner();
+
+        match &self.cortex_client {
+            Some(client) => client
+                .store_trajectory_pattern(req)
+                .await
+                .map(Response::new),
+            None => Ok(Response::new(StoreTrajectoryPatternResponse {
+                trajectory_id: String::new(),
+                new_weight: 0.0,
+                deduplicated: false,
+            })),
+        }
+    }
+
     /// Attest an agent to receive an SMCP Security Token
     async fn attest_agent(
         &self,

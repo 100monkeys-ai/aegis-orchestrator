@@ -428,6 +428,8 @@ pub struct ExecutionStrategy {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<ValidationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_validation: Option<ValidationConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery: Option<DeliveryConfig>,
 }
 
@@ -439,6 +441,7 @@ impl Default for ExecutionStrategy {
             iteration_timeout: None,
             llm_timeout_seconds: default_llm_timeout(),
             validation: None,
+            tool_validation: None,
             delivery: None,
         }
     }

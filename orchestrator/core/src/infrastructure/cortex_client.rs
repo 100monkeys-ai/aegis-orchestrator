@@ -30,7 +30,8 @@ use tonic::Status;
 
 use crate::infrastructure::aegis_runtime_proto::{
     aegis_runtime_client::AegisRuntimeClient, QueryCortexRequest, QueryCortexResponse,
-    StoreCortexPatternRequest, StoreCortexPatternResponse,
+    StoreCortexPatternRequest, StoreCortexPatternResponse, StoreTrajectoryPatternRequest,
+    StoreTrajectoryPatternResponse,
 };
 
 /// Thin wrapper around `AegisRuntimeClient` that exposes only the Cortex RPCs.
@@ -69,6 +70,16 @@ impl CortexGrpcClient {
     ) -> Result<StoreCortexPatternResponse, Status> {
         let mut client = self.client.clone();
         let response = client.store_cortex_pattern(request).await?;
+        Ok(response.into_inner())
+    }
+
+    /// Forward a `StoreTrajectoryPattern` RPC to the Cortex service (ADR-049).
+    pub async fn store_trajectory_pattern(
+        &self,
+        request: StoreTrajectoryPatternRequest,
+    ) -> Result<StoreTrajectoryPatternResponse, Status> {
+        let mut client = self.client.clone();
+        let response = client.store_trajectory_pattern(request).await?;
         Ok(response.into_inner())
     }
 }

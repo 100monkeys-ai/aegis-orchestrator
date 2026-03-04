@@ -1190,7 +1190,56 @@ impl ExecutionService for StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            volumes: Vec::new(), // Judge agents do not mount volumes
+            volumes: {
+                let mut vols = Vec::new();
+                // ADR-049: Dynamically inject parent "workspace" volume for judges
+                let is_judge = agent
+                    .manifest
+                    .metadata
+                    .labels
+                    .get("role")
+                    .map(|s| s.as_str())
+                    == Some("judge");
+                if is_judge {
+                    let parent_exec_id = parent_execution_id;
+
+                    let proxy_backend = crate::domain::volume::VolumeBackend::Smcp {
+                        node_id: "local".to_string(),
+                        remote_volume_id: crate::domain::volume::VolumeId::new(), // In a real cluster we'd look up the real parent VolumeId
+                    };
+
+                    let proxy_volume = crate::domain::volume::Volume {
+                        id: crate::domain::volume::VolumeId::new(),
+                        name: "worker-state".to_string(),
+                        tenant_id: crate::domain::volume::TenantId::default_tenant(),
+                        storage_class: crate::domain::volume::StorageClass::persistent(),
+                        status: crate::domain::volume::VolumeStatus::Available,
+                        ownership: crate::domain::volume::VolumeOwnership::Execution {
+                            execution_id: parent_exec_id,
+                        },
+                        size_limit_bytes: 1024 * 1024 * 100, // 100MB
+                        created_at: chrono::Utc::now(),
+                        attached_at: None,
+                        detached_at: None,
+                        expires_at: None,
+                        backend: proxy_backend,
+                    };
+
+                    // Mount as read-only at /workspace/worker-state
+                    let mount = proxy_volume.to_mount(
+                        std::path::PathBuf::from("/workspace/worker-state"),
+                        crate::domain::volume::AccessMode::ReadOnly,
+                    );
+                    vols.push(mount);
+
+                    tracing::info!(
+                        "Injected read-only worker-state volume from parent {} for judge child execution {}",
+                        parent_execution_id,
+                        child_execution_id
+                    );
+                }
+                vols
+            },
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")

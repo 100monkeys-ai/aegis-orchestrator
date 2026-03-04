@@ -14,7 +14,11 @@ use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::infrastructure::smcp::middleware::SmcpMiddleware;
 use crate::infrastructure::tool_router::ToolRouter;
 
+use crate::application::agent::AgentLifecycleService;
+use crate::application::execution::ExecutionService;
+use crate::domain::execution::ExecutionInput;
 use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::validation::extract_json_from_text;
 
 pub enum ToolInvocationResult {
     Direct(Value),
@@ -31,8 +35,13 @@ pub struct ToolInvocationService {
     fsal: Arc<AegisFSAL>,
     /// Volume registry for resolving execution_id → volume context
     volume_registry: NfsVolumeRegistry,
+    /// Agent lifecycle service for semantic validation
+    agent_lifecycle: Arc<dyn AgentLifecycleService>,
+    /// Execution service for spawning inner-loop judges
+    execution_service: Arc<dyn ExecutionService>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
     pub fn new(
         smcp_session_repo: Arc<dyn SmcpSessionRepository>,
@@ -41,6 +50,8 @@ impl ToolInvocationService {
         tool_router: Arc<ToolRouter>,
         fsal: Arc<AegisFSAL>,
         volume_registry: NfsVolumeRegistry,
+        agent_lifecycle: Arc<dyn AgentLifecycleService>,
+        execution_service: Arc<dyn ExecutionService>,
     ) -> Self {
         Self {
             smcp_session_repo,
@@ -49,6 +60,8 @@ impl ToolInvocationService {
             tool_router,
             fsal,
             volume_registry,
+            agent_lifecycle,
+            execution_service,
         }
     }
 
@@ -180,6 +193,154 @@ impl ToolInvocationService {
             )));
         }
 
+        // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
+        // If the agent manifest specifies an inner-loop semantic validation step,
+        // execute it BEFORE the tool call is dispatched to external systems.
+        // This is a synchronous block that fails the tool call if the judge rejects it.
+        let agent = self
+            .agent_lifecycle
+            .get_agent(*agent_id)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to retrieve agent: {}",
+                    e
+                ))
+            })?;
+
+        if let Some(exec_spec) = &agent.manifest.spec.execution {
+            if let Some(validation_pipeline) = &exec_spec.tool_validation {
+                for validator in validation_pipeline {
+                    // Check if this is an Inner-Loop Semantic Validator configuration
+                    if let crate::domain::agent::ValidatorSpec::Semantic {
+                        judge_agent,
+                        criteria,
+                        min_score,
+                        min_confidence,
+                        timeout_seconds,
+                    } = validator
+                    {
+                        tracing::info!(
+                            "Running inner-loop semantic validation for tool '{}' via judge '{}'",
+                            tool_name,
+                            judge_agent
+                        );
+
+                        let judge_id = self
+                            .agent_lifecycle
+                            .lookup_agent(judge_agent)
+                            .await
+                            .map_err(|e| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Failed to lookup judge: {}",
+                                    e
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Judge agent '{}' not found",
+                                    judge_agent
+                                ))
+                            })?;
+
+                        let semantic_input = format!(
+                            "Tool Call Request:\nTool: {}\nArguments: {}",
+                            tool_name,
+                            serde_json::to_string_pretty(&args).unwrap_or_default()
+                        );
+
+                        let input = ExecutionInput {
+                            intent: None,
+                            payload: serde_json::json!({
+                                "task": "Evaluate whether the agent's requested tool call adheres to constitutional policies and makes logical sense for the trajectory.",
+                                "output": semantic_input,
+                                "criteria": criteria,
+                                "validation_context": "semantic_judge_pre_execution_inner_loop"
+                            }),
+                        };
+
+                        // Start the single iteration judge as child execution
+                        let exec_id = self
+                            .execution_service
+                            .start_child_execution(judge_id, input, execution_id)
+                            .await
+                            .map_err(|e| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Failed to spawn judge child execution: {}",
+                                    e
+                                ))
+                            })?;
+
+                        let poll_interval_ms = 500u64;
+                        let max_attempts = (*timeout_seconds * 1000) / poll_interval_ms;
+                        let mut attempts = 0;
+
+                        loop {
+                            if attempts >= max_attempts {
+                                return Err(SmcpSessionError::SignatureVerificationFailed(format!("Inner-loop semantic judge '{}' timed out after {} seconds.", judge_agent, timeout_seconds)));
+                            }
+
+                            let exec = self
+                                .execution_service
+                                .get_execution(exec_id)
+                                .await
+                                .map_err(|e| {
+                                    SmcpSessionError::SignatureVerificationFailed(e.to_string())
+                                })?;
+
+                            match exec.status {
+                                crate::domain::execution::ExecutionStatus::Completed => {
+                                    let last_iter = exec.iterations().last().ok_or_else(|| {
+                                        SmcpSessionError::SignatureVerificationFailed(
+                                            "Judge completed but has no iterations".to_string(),
+                                        )
+                                    })?;
+                                    let output_str =
+                                        last_iter.output.as_ref().ok_or_else(|| {
+                                            SmcpSessionError::SignatureVerificationFailed(
+                                                "Judge completed but has no output".to_string(),
+                                            )
+                                        })?;
+
+                                    let json_str = extract_json_from_text(output_str)
+                                        .unwrap_or_else(|| output_str.clone());
+                                    let result: crate::domain::validation::GradientResult =
+                                        serde_json::from_str(&json_str).map_err(|e| {
+                                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                                "Failed to parse judge output: {}",
+                                                e
+                                            ))
+                                        })?;
+
+                                    if !(result.score >= *min_score
+                                        && result.confidence >= *min_confidence)
+                                    {
+                                        return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                                             "Inner-loop tool execution rejected by semantic judge (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
+                                             result.score, min_score, result.reasoning
+                                         )));
+                                    }
+                                    break;
+                                }
+                                crate::domain::execution::ExecutionStatus::Failed
+                                | crate::domain::execution::ExecutionStatus::Cancelled => {
+                                    return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
+                                }
+                                _ => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        poll_interval_ms,
+                                    ))
+                                    .await;
+                                    attempts += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // --- End Pre-Execution Validation ---
+
         // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
         match crate::application::tools::try_invoke_builtin(
             &tool_name,
@@ -310,6 +471,87 @@ mod tests {
         }
     }
 
+    use crate::domain::agent::{Agent, AgentManifest};
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{Execution, Iteration};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    struct MockAgentLifecycleService;
+    #[async_trait]
+    impl AgentLifecycleService for MockAgentLifecycleService {
+        async fn deploy_agent(&self, _: AgentManifest) -> Result<AgentId> {
+            unimplemented!()
+        }
+        async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+            unimplemented!()
+        }
+        async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn delete_agent(&self, _: AgentId) -> Result<()> {
+            unimplemented!()
+        }
+        async fn list_agents(&self) -> Result<Vec<Agent>> {
+            unimplemented!()
+        }
+        async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
+            unimplemented!()
+        }
+    }
+
+    struct MockExecutionService;
+    #[async_trait]
+    impl ExecutionService for MockExecutionService {
+        async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+            unimplemented!()
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            unimplemented!()
+        }
+        async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
+            unimplemented!()
+        }
+        async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+            unimplemented!()
+        }
+        async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+            unimplemented!()
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            unimplemented!()
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            unimplemented!()
+        }
+        async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+            unimplemented!()
+        }
+        async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+            unimplemented!()
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
     #[tokio::test]
     async fn test_invoke_tool_no_session() {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
@@ -330,6 +572,8 @@ mod tests {
             router,
             fsal,
             volume_registry,
+            Arc::new(MockAgentLifecycleService),
+            Arc::new(MockExecutionService),
         );
         let agent_id = AgentId::new();
         let envelope = DummyEnvelope { valid: true };
@@ -376,6 +620,8 @@ mod tests {
             router,
             fsal,
             volume_registry,
+            Arc::new(MockAgentLifecycleService),
+            Arc::new(MockExecutionService),
         );
         let envelope = DummyEnvelope { valid: false };
 
@@ -448,6 +694,8 @@ mod tests {
             router.clone(),
             fsal,
             volume_registry,
+            Arc::new(MockAgentLifecycleService),
+            Arc::new(MockExecutionService),
         );
 
         // 1. Local Tool

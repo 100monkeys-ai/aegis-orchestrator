@@ -806,6 +806,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             tool_router.clone(),
             nfs_gateway.fsal().clone(),
             nfs_gateway.volume_registry().clone(),
+            agent_service.clone(),
+            execution_service.clone(),
         ),
     );
 
@@ -1928,12 +1930,7 @@ async fn dispatch_gateway_handler(
             Some(model_alias.clone()),
         ),
         AgentMessage::DispatchResult { execution_id, .. } => {
-            (
-                Uuid::parse_str(execution_id).ok(),
-                0,
-                None,
-                None,
-            )
+            (Uuid::parse_str(execution_id).ok(), 0, None, None)
         }
     };
 
