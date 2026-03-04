@@ -197,7 +197,7 @@ impl LLMProvider for AnthropicAdapter {
             .filter(|b| b.block_type == "tool_use")
             .map(|b| ChatToolCall {
                 id: b.id.clone(),
-                name: b.name.replace('_', "."),  // Reverse outbound sanitization
+                name: b.name.replace('_', "."), // Reverse outbound sanitization
                 arguments: b.input.clone(),
             })
             .collect();

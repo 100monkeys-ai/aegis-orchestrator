@@ -293,7 +293,7 @@ impl ToolRouter {
                         "properties": {
                             "command": {
                                 "type": "string",
-                                "description": "Command to execute (must be on the agent's allowlist)"
+                                "description": "Command to execute"
                             }
                         },
                         "required": ["command"]
@@ -331,6 +331,118 @@ impl ToolRouter {
                             }
                         },
                         "required": ["path"]
+                    }),
+                    "fs.create_dir" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the directory to create."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    "fs.delete" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file or directory to delete."
+                            },
+                            "recursive": {
+                                "type": "boolean",
+                                "description": "Set to true to delete a directory and all its contents."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    "fs.edit" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to edit."
+                            },
+                            "target_content": {
+                                "type": "string",
+                                "description": "Exact string content to find and replace. Must match exactly once."
+                            },
+                            "replacement_content": {
+                                "type": "string",
+                                "description": "New string content to insert in place of target_content."
+                            }
+                        },
+                        "required": ["path", "target_content", "replacement_content"]
+                    }),
+                    "fs.multi_edit" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to edit."
+                            },
+                            "edits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target_content": { "type": "string" },
+                                        "replacement_content": { "type": "string" }
+                                    },
+                                    "required": ["target_content", "replacement_content"]
+                                },
+                                "description": "Array of edits to apply sequentially."
+                            }
+                        },
+                        "required": ["path", "edits"]
+                    }),
+                    "fs.grep" => json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Regex pattern to search for."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Directory path to start the recursive search from."
+                            }
+                        },
+                        "required": ["pattern", "path"]
+                    }),
+                    "fs.glob" => json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Glob pattern to match files (e.g. *.rs)."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Directory path to start the recursive search from."
+                            }
+                        },
+                        "required": ["pattern", "path"]
+                    }),
+                    "web.search" => json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
+                    "web.fetch" => json!({
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL to fetch content from."
+                            }
+                        },
+                        "required": ["url"]
                     }),
                     _ => json!({ "type": "object" }),
                 };

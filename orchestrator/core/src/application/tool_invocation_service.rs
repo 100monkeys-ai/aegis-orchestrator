@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::DispatchAction;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
+use crate::domain::fsal::AegisFSAL;
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::infrastructure::smcp::middleware::SmcpMiddleware;
@@ -180,153 +180,19 @@ impl ToolInvocationService {
             )));
         }
 
-        // Handle Dispatch Protocol tools (ADR-040)
-        if tool_name == "cmd.run" {
-            let command = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            return Ok(ToolInvocationResult::DispatchRequired(
-                DispatchAction::Exec {
-                    command,
-                    args: vec![],
-                    cwd: "/workspace".to_string(),
-                    env_additions: std::collections::HashMap::new(),
-                    timeout_secs: 300,
-                    max_output_bytes: 1048576,
-                },
-            ));
-        }
-
-        // Handle built-in FSAL tools (ADR-033 Path 1, ADR-047)
-        // These execute on the orchestrator host via AegisFSAL, which handles:
-        // - Authorization (execution owns volume)
-        // - Path sanitization (traversal prevention)
-        // - Policy enforcement (read/write allowlists)
-        // - Quota checking
-        // - Audit events (StorageEvent publishing)
-        if tool_name == "fs.write" || tool_name == "fs.read" || tool_name == "fs.list" {
-            // Resolve the agent's volume context from execution_id
-            let vol_ctx = self
-                .volume_registry
-                .find_by_execution(execution_id)
-                .ok_or_else(|| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
-                        "No volume registered for execution {}",
-                        execution_id
-                    ))
-                })?;
-
-            let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
-
-            match tool_name.as_str() {
-                "fs.write" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    tracing::info!(
-                        "FSAL fs.write: path={:?} content_len={} execution={}",
-                        path,
-                        content.len(),
-                        execution_id
-                    );
-
-                    // Create file first, then write content
-                    let _file_handle = self
-                        .fsal
-                        .create_file(
-                            vol_ctx.execution_id,
-                            vol_ctx.volume_id,
-                            path,
-                            &vol_ctx.policy,
-                        )
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL create_file error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let bytes_written = self
-                        .fsal
-                        .write(&handle, path, &vol_ctx.policy, 0, content.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL write error: {}",
-                                e
-                            ))
-                        })?;
-
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "bytes_written": bytes_written
-                    })));
-                }
-                "fs.read" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    tracing::info!("FSAL fs.read: path={:?} execution={}", path, execution_id);
-
-                    let data = self
-                        .fsal
-                        .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024) // 10MB max
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL read error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let content = String::from_utf8_lossy(&data).to_string();
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "content": content,
-                        "size_bytes": data.len()
-                    })));
-                }
-                "fs.list" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                    tracing::info!("FSAL fs.list: path={:?} execution={}", path, execution_id);
-
-                    let entries = self
-                        .fsal
-                        .readdir(
-                            vol_ctx.execution_id,
-                            vol_ctx.volume_id,
-                            path,
-                            &vol_ctx.policy,
-                        )
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL readdir error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let entries_json: Vec<serde_json::Value> = entries
-                        .iter()
-                        .map(|e| {
-                            serde_json::json!({
-                                "name": e.name,
-                                "file_type": format!("{:?}", e.file_type),
-                            })
-                        })
-                        .collect();
-
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "entries": entries_json
-                    })));
-                }
-                _ => unreachable!(),
-            }
+        // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
+        match crate::application::tools::try_invoke_builtin(
+            &tool_name,
+            &args,
+            execution_id,
+            &self.fsal,
+            &self.volume_registry,
+        )
+        .await
+        {
+            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => return Ok(result),
+            Ok(crate::application::tools::BuiltinToolResult::NotBuiltin) => {} // Continue to dynamic routing
+            Err(e) => return Err(e),
         }
 
         let server_id = self

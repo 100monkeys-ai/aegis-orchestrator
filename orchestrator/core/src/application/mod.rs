@@ -40,6 +40,7 @@ pub mod attestation_service;
 pub mod execution;
 pub mod lifecycle;
 pub mod tool_invocation_service;
+pub mod tools;
 pub mod validation_service;
 
 pub mod policy;

@@ -186,7 +186,7 @@ impl LLMProvider for OllamaAdapter {
                 .enumerate()
                 .map(|(i, tc)| ChatToolCall {
                     id: format!("ollama-call-{}", i),
-                    name: tc.function.name.replace('_', "."),  // Reverse outbound sanitization
+                    name: tc.function.name.replace('_', "."), // Reverse outbound sanitization
                     arguments: tc.function.arguments,
                 })
                 .collect();
