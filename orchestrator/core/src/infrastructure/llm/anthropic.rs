@@ -95,6 +95,7 @@ impl LLMProvider for AnthropicAdapter {
             role: "user".to_string(),
             content: prompt.to_string(),
             tool_call_id: None,
+            tool_calls: None,
         }];
         match self.generate_chat(&messages, &[], options).await? {
             ChatResponse::FinalText(r) => Ok(r),
@@ -124,6 +125,26 @@ impl LLMProvider for AnthropicAdapter {
                     AnthropicMessage {
                         role: "user".to_string(), // Anthropic requires user role for tool results
                         content,
+                    }
+                } else if m.role == "assistant" && m.tool_calls.is_some() {
+                    let mut content_blocks = Vec::new();
+                    if !m.content.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": m.content,
+                        }));
+                    }
+                    for tc in m.tool_calls.as_ref().unwrap() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name.replace('.', "_"),
+                            "input": tc.arguments,
+                        }));
+                    }
+                    AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: serde_json::Value::Array(content_blocks),
                     }
                 } else {
                     AnthropicMessage {

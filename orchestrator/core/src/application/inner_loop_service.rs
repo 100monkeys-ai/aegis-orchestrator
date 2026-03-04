@@ -28,9 +28,11 @@ pub struct ConversationMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -91,6 +93,7 @@ impl InnerLoopService {
                         role: "user".to_string(),
                         content: prompt.clone(),
                         tool_call_id: None,
+                        tool_calls: None,
                     });
                 }
 
@@ -140,6 +143,7 @@ impl InnerLoopService {
                     role: "tool".to_string(),
                     content: result_json.to_string(),
                     tool_call_id: Some(tool_call_id),
+                    tool_calls: None,
                 });
 
                 ctx.pending_dispatch_id = None;
@@ -205,6 +209,7 @@ impl InnerLoopService {
                         role: "assistant".to_string(),
                         content: text.clone(),
                         tool_call_id: None,
+                        tool_calls: None,
                     });
 
                     let final_msg = OrchestratorMessage::Final {
@@ -222,24 +227,11 @@ impl InnerLoopService {
                 LlmOutput::ToolCalls(tool_calls) => {
                     ctx.iterations += 1;
 
-                    let tool_call_summary: Vec<Value> = tool_calls
-                        .iter()
-                        .map(|tc| {
-                            serde_json::json!({
-                                "id": tc.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tc.name,
-                                    "arguments": tc.arguments.to_string(),
-                                }
-                            })
-                        })
-                        .collect();
-
                     ctx.conversation.push(ConversationMessage {
                         role: "assistant".to_string(),
-                        content: serde_json::to_string(&tool_call_summary).unwrap_or_default(),
+                        content: "".to_string(),
                         tool_call_id: None,
+                        tool_calls: Some(tool_calls.clone()),
                     });
 
                     // Update memory before executing so changes aren't lost if we yield execution
@@ -280,6 +272,7 @@ impl InnerLoopService {
                                     role: "tool".to_string(),
                                     content: tool_result,
                                     tool_call_id: Some(tool_call.id.clone()),
+                                    tool_calls: None,
                                 });
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
@@ -290,6 +283,7 @@ impl InnerLoopService {
                                     role: "tool".to_string(),
                                     content: tool_result,
                                     tool_call_id: Some(tool_call.id.clone()),
+                                    tool_calls: None,
                                 });
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
@@ -312,6 +306,15 @@ impl InnerLoopService {
                 role: m.role.clone(),
                 content: m.content.clone(),
                 tool_call_id: m.tool_call_id.clone(),
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| crate::domain::llm::ChatToolCall {
+                            id: tc.id.clone(),
+                            name: tc.name.clone(),
+                            arguments: tc.arguments.clone(),
+                        })
+                        .collect()
+                }),
             })
             .collect();
 

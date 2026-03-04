@@ -361,11 +361,20 @@ impl Supervisor {
                 .await;
 
             if let Some(ref pipeline) = validation_pipeline {
+                // Filter out internal bootstrap debug logs so they don't penalize the validation score
+                let validation_stderr = output
+                    .logs
+                    .iter()
+                    .filter(|line| !line.starts_with("[BOOTSTRAP "))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join("\n");
+
                 let ctx = ValidationContext {
                     task: original_intent.clone(),
                     output: stdout.clone(),
                     exit_code: output.exit_code,
-                    stderr: stderr.clone(),
+                    stderr: validation_stderr,
                 };
                 match pipeline.validate(&ctx).await {
                     Ok(pipeline_result) => {

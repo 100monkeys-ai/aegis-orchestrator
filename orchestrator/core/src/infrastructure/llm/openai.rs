@@ -129,6 +129,7 @@ impl LLMProvider for OpenAIAdapter {
             role: "user".to_string(),
             content: prompt.to_string(),
             tool_call_id: None,
+            tool_calls: None,
         }];
         match self.generate_chat(&messages, &[], options).await? {
             ChatResponse::FinalText(r) => Ok(r),
@@ -149,8 +150,23 @@ impl LLMProvider for OpenAIAdapter {
             .iter()
             .map(|m| OpenAIMessage {
                 role: m.role.clone(),
-                content: Some(m.content.clone()),
-                tool_calls: None,
+                content: if m.content.is_empty() && m.role == "assistant" {
+                    None
+                } else {
+                    Some(m.content.clone())
+                },
+                tool_calls: m.tool_calls.as_ref().map(|tcs| {
+                    tcs.iter()
+                        .map(|tc| OpenAIToolCall {
+                            id: tc.id.clone(),
+                            call_type: "function".to_string(),
+                            function: OpenAIToolFunction {
+                                name: tc.name.replace('.', "_"),
+                                arguments: tc.arguments.to_string(),
+                            },
+                        })
+                        .collect()
+                }),
                 tool_call_id: m.tool_call_id.clone(),
             })
             .collect();

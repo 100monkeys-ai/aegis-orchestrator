@@ -1160,7 +1160,7 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             get(get_agent_handler).delete(delete_agent_handler),
         )
         .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
-        .route("/v1/dispatch-gateway", post(llm_generate_handler))
+        .route("/v1/dispatch-gateway", post(dispatch_gateway_handler))
         .route(
             "/v1/workflows",
             post(register_temporal_workflow_handler).get(list_workflows_handler),
@@ -1908,64 +1908,46 @@ async fn lookup_agent_handler(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct LlmGenerateRequest {
-    execution_id: Option<Uuid>,
-    iteration_number: Option<u8>,
-    model_alias: Option<String>,
-    prompt: String,
-}
-
-async fn llm_generate_handler(
+async fn dispatch_gateway_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<LlmGenerateRequest>,
+    Json(agent_msg): Json<aegis_orchestrator_core::domain::dispatch::AgentMessage>,
 ) -> impl IntoResponse {
-    use aegis_orchestrator_core::application::inner_loop_service::ConversationMessage;
     use aegis_orchestrator_core::domain::dispatch::{AgentMessage, OrchestratorMessage};
 
-    // Resolve agent_id for event logging and inner loop request
-    let (agent_id, agent_id_str) = if let Some(exec_id) = req.execution_id {
-        let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
-        if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
-            let id = exec.agent_id;
-            let s = id.0.to_string();
-            (id, s)
-        } else {
-            tracing::warn!("Could not find execution {} for LLM event", exec_id);
+    let (exec_id_opt, iteration_number, prompt_opt, model_opt) = match &agent_msg {
+        AgentMessage::Generate {
+            execution_id,
+            iteration_number,
+            prompt,
+            model_alias,
+            ..
+        } => (
+            Uuid::parse_str(execution_id).ok(),
+            *iteration_number,
+            Some(prompt.clone()),
+            Some(model_alias.clone()),
+        ),
+        AgentMessage::DispatchResult { execution_id, .. } => {
             (
-                aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
-                Uuid::nil().to_string(),
+                Uuid::parse_str(execution_id).ok(),
+                0,
+                None,
+                None,
             )
         }
-    } else {
-        (
-            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
-            Uuid::nil().to_string(),
-        )
     };
 
-    let execution_id_str = req
-        .execution_id
-        .map(|id| id.to_string())
-        .unwrap_or_else(|| Uuid::nil().to_string());
-
-    let model_alias = req
-        .model_alias
-        .clone()
-        .unwrap_or_else(|| "default".to_string());
-
-    // Build the inner loop request, seeding the conversation with the rendered prompt
-    let agent_msg = AgentMessage::Generate {
-        agent_id: agent_id_str,
-        execution_id: execution_id_str.clone(),
-        iteration_number: req.iteration_number.unwrap_or(0),
-        prompt: req.prompt.clone(),
-        model_alias: model_alias.clone(),
-        messages: vec![ConversationMessage {
-            role: "user".to_string(),
-            content: req.prompt.clone(),
-            tool_call_id: None,
-        }],
+    // Resolve agent_id for event logging and inner loop request
+    let agent_id = if let Some(exec_id) = exec_id_opt {
+        let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
+        if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
+            exec.agent_id
+        } else {
+            tracing::warn!("Could not find execution {} for LLM event", exec_id);
+            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
+        }
+    } else {
+        aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
     };
 
     match state
@@ -1980,19 +1962,21 @@ async fn llm_generate_handler(
         }) => {
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
-                if let Some(exec_id) = req.execution_id {
+                if let (Some(exec_id), Some(prompt), Some(model_alias)) =
+                    (exec_id_opt, prompt_opt, model_opt)
+                {
                     let event =
                         aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
                             execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(
                                 exec_id,
                             ),
                             agent_id,
-                            iteration_number: req.iteration_number.unwrap_or(0),
+                            iteration_number,
                             provider: "orchestrator".to_string(),
                             model: model_alias.clone(),
                             input_tokens: None,
                             output_tokens: None,
-                            prompt: req.prompt.clone(),
+                            prompt: prompt.clone(),
                             response: content.clone(),
                             timestamp: chrono::Utc::now(),
                         };
@@ -2001,7 +1985,7 @@ async fn llm_generate_handler(
                     let interaction = aegis_orchestrator_core::domain::execution::LlmInteraction {
                         provider: "orchestrator".to_string(),
                         model: model_alias.clone(),
-                        prompt: req.prompt.clone(),
+                        prompt: prompt.clone(),
                         response: content.clone(),
                         timestamp: chrono::Utc::now(),
                     };
@@ -2009,7 +1993,7 @@ async fn llm_generate_handler(
                         .execution_service
                         .record_llm_interaction(
                             aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
-                            req.iteration_number.unwrap_or(0),
+                            iteration_number,
                             interaction,
                         )
                         .await;

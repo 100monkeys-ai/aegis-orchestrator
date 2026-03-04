@@ -97,6 +97,7 @@ impl LLMProvider for OllamaAdapter {
             role: "user".to_string(),
             content: prompt.to_string(),
             tool_call_id: None,
+            tool_calls: None,
         }];
         match self.generate_chat(&messages, &[], options).await? {
             ChatResponse::FinalText(r) => Ok(r),
