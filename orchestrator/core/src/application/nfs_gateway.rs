@@ -31,6 +31,7 @@ use crate::infrastructure::storage::{LocalHostStorageProvider, SmcpStorageProvid
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::debug;
@@ -81,6 +82,7 @@ impl NfsVolumeRegistry {
         container_uid: u32,
         container_gid: u32,
         policy: FilesystemPolicy,
+        mount_point: PathBuf,
     ) {
         let context = NfsVolumeContext {
             execution_id,
@@ -88,6 +90,7 @@ impl NfsVolumeRegistry {
             container_uid,
             container_gid,
             policy,
+            mount_point,
         };
         self.contexts.write().insert(volume_id, context);
         debug!(
@@ -292,6 +295,7 @@ impl NfsGatewayService {
         container_uid: u32,
         container_gid: u32,
         policy: FilesystemPolicy,
+        mount_point: PathBuf,
     ) {
         self.volume_registry.register(
             volume_id,
@@ -299,6 +303,7 @@ impl NfsGatewayService {
             container_uid,
             container_gid,
             policy,
+            mount_point,
         );
     }
 

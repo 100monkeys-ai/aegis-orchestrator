@@ -4,7 +4,30 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
 use crate::domain::smcp_session::SmcpSessionError;
 use serde_json::Value;
+use std::path::Path;
 use std::sync::Arc;
+
+/// Strips the volume mount-point prefix from a container-absolute path.
+///
+/// Converts paths like `/workspace/solution.py` → `/solution.py` so they are
+/// volume-relative before being passed to AegisFSAL. Paths that do not begin
+/// with the mount point are returned unchanged.
+fn to_volume_relative(mount_point: &Path, path: &str) -> String {
+    let base = mount_point
+        .to_str()
+        .unwrap_or("/workspace")
+        .trim_end_matches('/');
+    if let Some(stripped) = path.strip_prefix(base) {
+        if stripped.is_empty() {
+            return "/".to_string();
+        }
+        if stripped.starts_with('/') {
+            return stripped.to_string();
+        }
+        return format!("/{}", stripped);
+    }
+    path.to_string()
+}
 
 pub async fn invoke_fs_tool(
     tool_name: &str,
@@ -26,14 +49,15 @@ pub async fn invoke_fs_tool(
 
     match tool_name {
         "fs.write" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
             let _file_handle = fsal
                 .create_file(
                     vol_ctx.execution_id,
                     vol_ctx.volume_id,
-                    path,
+                    &path,
                     &vol_ctx.policy,
                 )
                 .await
@@ -45,7 +69,7 @@ pub async fn invoke_fs_tool(
                 })?;
 
             let bytes_written = fsal
-                .write(&handle, path, &vol_ctx.policy, 0, content.as_bytes())
+                .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
@@ -56,15 +80,16 @@ pub async fn invoke_fs_tool(
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
-                "path": path,
+                "path": path_arg,
                 "bytes_written": bytes_written
             })))
         }
         "fs.read" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             let data = fsal
-                .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
+                .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!("FSAL read error: {}", e))
@@ -73,19 +98,20 @@ pub async fn invoke_fs_tool(
             let content = String::from_utf8_lossy(&data).to_string();
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
-                "path": path,
+                "path": path_arg,
                 "content": content,
                 "size_bytes": data.len()
             })))
         }
         "fs.list" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             let entries = fsal
                 .readdir(
                     vol_ctx.execution_id,
                     vol_ctx.volume_id,
-                    path,
+                    &path,
                     &vol_ctx.policy,
                 )
                 .await
@@ -108,17 +134,18 @@ pub async fn invoke_fs_tool(
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
-                "path": path,
+                "path": path_arg,
                 "entries": entries_json
             })))
         }
         "fs.create_dir" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             fsal.create_directory(
                 vol_ctx.execution_id,
                 vol_ctx.volume_id,
-                path,
+                &path,
                 &vol_ctx.policy,
             )
             .await
@@ -131,11 +158,12 @@ pub async fn invoke_fs_tool(
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
-                "path": path
+                "path": path_arg
             })))
         }
         "fs.delete" => {
-            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
             let recursive = args
                 .get("recursive")
                 .and_then(|v| v.as_bool())
@@ -145,7 +173,7 @@ pub async fn invoke_fs_tool(
                 fsal.delete_directory(
                     vol_ctx.execution_id,
                     vol_ctx.volume_id,
-                    path,
+                    &path,
                     &vol_ctx.policy,
                 )
                 .await
@@ -159,7 +187,7 @@ pub async fn invoke_fs_tool(
                 fsal.delete_file(
                     vol_ctx.execution_id,
                     vol_ctx.volume_id,
-                    path,
+                    &path,
                     &vol_ctx.policy,
                 )
                 .await
@@ -173,7 +201,7 @@ pub async fn invoke_fs_tool(
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
-                "path": path
+                "path": path_arg
             })))
         }
         "fs.edit" => invoke_edit(args, execution_id, fsal, vol_ctx).await,
@@ -193,7 +221,8 @@ async fn invoke_edit(
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
 ) -> Result<ToolInvocationResult, SmcpSessionError> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
     let target = args
         .get("target_content")
         .and_then(|v| v.as_str())
@@ -207,7 +236,7 @@ async fn invoke_edit(
 
     // Read current content
     let data = fsal
-        .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
+        .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!("Edit error (read): {}", e))
@@ -233,7 +262,7 @@ async fn invoke_edit(
 
     // Write back
     let _ = fsal
-        .write(&handle, path, &vol_ctx.policy, 0, new_content.as_bytes())
+        .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
         .map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!("Edit error (write): {}", e))
@@ -241,7 +270,7 @@ async fn invoke_edit(
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
-        "path": path,
+        "path": path_arg,
         "message": "File edited successfully"
     })))
 }
@@ -252,11 +281,12 @@ async fn invoke_multi_edit(
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
 ) -> Result<ToolInvocationResult, SmcpSessionError> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+    let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
     let data = fsal
-        .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
+        .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {}", e))
@@ -315,7 +345,7 @@ async fn invoke_multi_edit(
         .create_file(
             vol_ctx.execution_id,
             vol_ctx.volume_id,
-            path,
+            &path,
             &vol_ctx.policy,
         )
         .await
@@ -327,7 +357,7 @@ async fn invoke_multi_edit(
         })?;
 
     let _ = fsal
-        .write(&handle, path, &vol_ctx.policy, 0, content.as_bytes())
+        .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
         .map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!(
@@ -338,7 +368,7 @@ async fn invoke_multi_edit(
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
-        "path": path,
+        "path": path_arg,
         "edits_applied": success_count
     })))
 }
@@ -350,7 +380,8 @@ async fn invoke_grep(
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
 ) -> Result<ToolInvocationResult, SmcpSessionError> {
     let pattern_str = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
     // Parse regex
     let regex = regex::Regex::new(pattern_str).map_err(|e| {
@@ -359,7 +390,7 @@ async fn invoke_grep(
 
     // We will do a recursive walk using AegisFSAL
     let mut matches = Vec::new();
-    let mut stack = vec![path.to_string()];
+    let mut stack = vec![path];
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
 
     while let Some(current_dir) = stack.pop() {
@@ -428,7 +459,8 @@ async fn invoke_glob(
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
 ) -> Result<ToolInvocationResult, SmcpSessionError> {
     let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
+    let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
     // We will do a generic recursive walk using AegisFSAL
     // For simplicity, we just do string suffix/prefix matching or Regex if globset isn't used
@@ -442,7 +474,7 @@ async fn invoke_glob(
     })?;
 
     let mut matches = Vec::new();
-    let mut stack = vec![path.to_string()];
+    let mut stack = vec![path];
 
     while let Some(current_dir) = stack.pop() {
         if matches.len() > 1000 {

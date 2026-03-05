@@ -710,6 +710,7 @@ impl ExecutionService for StandardExecutionService {
                     1000, // container_uid
                     1000, // container_gid
                     policy,
+                    mount.mount_point.clone(),
                 );
                 tracing::info!(
                     "Registered volume {} with NFS gateway for execution {}",

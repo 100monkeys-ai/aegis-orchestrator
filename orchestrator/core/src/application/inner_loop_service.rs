@@ -262,6 +262,12 @@ impl InnerLoopService {
 
             match llm_output {
                 LlmOutput::FinalText(text) => {
+                    tracing::debug!(
+                        execution_id = %execution_id_str,
+                        iterations = ctx.iterations,
+                        "LLM produced final text response (inner loop complete)"
+                    );
+
                     ctx.conversation.push(ConversationMessage {
                         role: "assistant".to_string(),
                         content: text.clone(),
@@ -284,6 +290,14 @@ impl InnerLoopService {
                 LlmOutput::ToolCalls(tool_calls) => {
                     ctx.iterations += 1;
 
+                    tracing::debug!(
+                        execution_id = %execution_id_str,
+                        iteration = ctx.iterations,
+                        tool_count = tool_calls.len(),
+                        tools = ?tool_calls.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+                        "LLM requested tool calls"
+                    );
+
                     ctx.conversation.push(ConversationMessage {
                         role: "assistant".to_string(),
                         content: "".to_string(),
@@ -298,6 +312,14 @@ impl InnerLoopService {
                         .insert(execution_id_str.to_string(), ctx.clone());
 
                     for tool_call in tool_calls {
+                        tracing::debug!(
+                            execution_id = %execution_id_str,
+                            tool = %tool_call.name,
+                            tool_call_id = %tool_call.id,
+                            arguments = %tool_call.arguments,
+                            "Invoking tool"
+                        );
+
                         let exec_result = self
                             .tool_invocation_service
                             .invoke_tool_internal(
@@ -310,6 +332,13 @@ impl InnerLoopService {
 
                         match exec_result {
                             Ok(crate::application::tool_invocation_service::ToolInvocationResult::DispatchRequired(action)) => {
+                                tracing::debug!(
+                                    execution_id = %execution_id_str,
+                                    tool = %tool_call.name,
+                                    tool_call_id = %tool_call.id,
+                                    "Tool requires dispatch (yielding inner loop)"
+                                );
+
                                 let dispatch_id = DispatchId::new();
 
                                 let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
@@ -323,6 +352,14 @@ impl InnerLoopService {
                                 });
                             }
                             Ok(crate::application::tool_invocation_service::ToolInvocationResult::Direct(value)) => {
+                                tracing::debug!(
+                                    execution_id = %execution_id_str,
+                                    tool = %tool_call.name,
+                                    tool_call_id = %tool_call.id,
+                                    result = %serde_json::to_string(&value).unwrap_or_default(),
+                                    "Tool returned direct result"
+                                );
+
                                 let tool_result = serde_json::to_string(&value).unwrap_or_default();
                                 let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
                                 next_ctx.conversation.push(ConversationMessage {
@@ -373,6 +410,13 @@ impl InnerLoopService {
                                 // Recoverable errors (e.g. MalformedPayload, SessionExpired)
                                 // are fed back to the LLM as tool error messages so it can
                                 // adjust its approach.
+                                tracing::debug!(
+                                    execution_id = %execution_id_str,
+                                    tool = %tool_call.name,
+                                    tool_call_id = %tool_call.id,
+                                    error = %e,
+                                    "Tool returned recoverable error — feeding back to LLM"
+                                );
                                 let tool_result = format!("Tool execution error: {}", e);
                                 let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
                                 next_ctx.conversation.push(ConversationMessage {
