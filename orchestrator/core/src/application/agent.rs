@@ -30,12 +30,18 @@ use async_trait::async_trait;
 pub trait AgentLifecycleService: Send + Sync {
     /// Parse, validate, and persist a new agent manifest, returning the assigned [`AgentId`].
     ///
+    /// When `force` is `false` the call fails if an agent with the same `metadata.name` **and**
+    /// `metadata.version` already exists.  Set `force = true` to silently overwrite that agent
+    /// in place (same [`AgentId`] is preserved).
+    ///
+    /// A different `metadata.version` will always update the existing agent regardless of `force`.
+    ///
     /// # Errors
     ///
     /// - Manifest schema validation failures
-    /// - Duplicate agent name conflicts
+    /// - Same name + same version already deployed and `force = false`
     /// - Database write errors
-    async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId>;
+    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId>;
 
     /// Retrieve a fully-hydrated [`Agent`] by its UUID.
     ///

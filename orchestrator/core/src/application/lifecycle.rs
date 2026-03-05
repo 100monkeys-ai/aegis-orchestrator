@@ -34,34 +34,46 @@ impl StandardAgentLifecycleService {
 
 #[async_trait]
 impl AgentLifecycleService for StandardAgentLifecycleService {
-    async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
+    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
 
-        // Check if agent with same name exists
+        // Check if an agent with the same name already exists
         if let Some(existing) = self
             .repository
             .find_by_name(&manifest.metadata.name)
             .await?
         {
-            // Need to decide: Update existing or Fail?
-            // "Deploy" usually implies creating or updating.
-            // If ID matches, it's an update (handled by update_agent).
-            // If ID is different but name matches, it's a conflict.
+            let existing_version = &existing.manifest.metadata.version;
+            let incoming_version = &manifest.metadata.version;
 
-            // For now, let's enforce uniqueness strictly for new deployments.
-            // If the user wants to update, they should use update_agent or we can support upsert logic here.
-            // But since AgentId is generated on 'new', we can't easily match unless searching by name IS the identity.
-            // Let's return error if name exists.
+            if existing_version == incoming_version {
+                // Same name AND same version — only allowed when --force is set
+                if !force {
+                    anyhow::bail!(
+                        "Agent '{}' version '{}' is already deployed (ID: {}). \
+                         Use --force to overwrite it.",
+                        existing.name,
+                        existing_version,
+                        existing.id.0
+                    );
+                }
+                // --force: overwrite the existing agent's manifest in place,
+                // preserving its AgentId so existing execution references remain valid.
+                let mut updated = existing.clone();
+                updated.update_manifest(manifest);
+                self.repository.save(&updated).await?;
+                return Ok(updated.id);
+            }
 
-            anyhow::bail!(
-                "Agent with name '{}' already exists (ID: {}). Use 'agent update' to modify it.",
-                existing.name,
-                existing.id.0
-            );
+            // Different version — treat as an in-place update (new version replaces old).
+            let mut updated = existing.clone();
+            updated.update_manifest(manifest);
+            self.repository.save(&updated).await?;
+            return Ok(updated.id);
         }
 
-        // Create new agent from manifest
+        // No existing agent with this name — create a fresh one
         let agent = Agent::new(manifest);
         self.repository.save(&agent).await?;
         Ok(agent.id)

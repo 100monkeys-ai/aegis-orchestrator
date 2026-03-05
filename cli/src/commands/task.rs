@@ -213,7 +213,7 @@ async fn execute_daemon(
                     serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
 
                 // Deploy (will fail if name exists, so user sees error, which is good)
-                match client.deploy_agent(agent_manifest).await {
+                match client.deploy_agent(agent_manifest, false).await {
                     Ok(id) => id,
                     Err(e) => {
                         // Simplify error for user
@@ -329,7 +329,7 @@ async fn execute_embedded(
                 let manifest_content = std::fs::read_to_string(&manifest_path)?;
                 let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
                     serde_yaml::from_str(&manifest_content)?;
-                executor.deploy_agent(agent_manifest).await?
+                executor.deploy_agent(agent_manifest, false).await?
             } else {
                 anyhow::bail!("Agent '{}' not found and not a valid manifest path.", agent);
             }

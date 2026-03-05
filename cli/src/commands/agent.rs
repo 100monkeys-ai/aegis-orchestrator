@@ -31,6 +31,12 @@ pub enum AgentCommand {
         /// Validate manifest without deploying
         #[arg(long)]
         validate_only: bool,
+
+        /// Overwrite an existing agent that has the same name and version.
+        /// Without this flag the command fails if an agent with the same name
+        /// and version is already deployed.
+        #[arg(long)]
+        force: bool,
     },
 
     /// Show agent configuration (YAML)
@@ -109,7 +115,8 @@ pub async fn handle_command(
         AgentCommand::Deploy {
             manifest,
             validate_only,
-        } => deploy_agent(manifest, validate_only, client).await,
+            force,
+        } => deploy_agent(manifest, validate_only, force, client).await,
         AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
         AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
         AgentCommand::Logs {
@@ -161,7 +168,12 @@ async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     Ok(())
 }
 
-async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClient) -> Result<()> {
+async fn deploy_agent(
+    manifest: PathBuf,
+    validate_only: bool,
+    force: bool,
+    client: DaemonClient,
+) -> Result<()> {
     let manifest_content = std::fs::read_to_string(&manifest)
         .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
 
@@ -203,7 +215,7 @@ async fn deploy_agent(manifest: PathBuf, validate_only: bool, client: DaemonClie
 
     println!("Deploying agent: {}", agent_manifest.metadata.name.bold());
 
-    let agent_id = client.deploy_agent(agent_manifest).await?;
+    let agent_id = client.deploy_agent(agent_manifest, force).await?;
 
     println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
 

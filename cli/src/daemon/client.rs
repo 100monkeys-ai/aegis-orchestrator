@@ -37,10 +37,15 @@ impl DaemonClient {
         Ok(Self { client, base_url })
     }
 
-    pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
+    pub async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<Uuid> {
+        let url = if force {
+            format!("{}/v1/agents?force=true", self.base_url)
+        } else {
+            format!("{}/v1/agents", self.base_url)
+        };
         let response = self
             .client
-            .post(format!("{}/v1/agents", self.base_url))
+            .post(url)
             .json(&manifest)
             .send()
             .await

@@ -1249,12 +1249,24 @@ async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::
     }))
 }
 
+#[derive(serde::Deserialize, Default)]
+struct DeployAgentQuery {
+    /// Set to `true` to overwrite an existing agent that has the same name and version.
+    #[serde(default)]
+    force: bool,
+}
+
 async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<DeployAgentQuery>,
     Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
     // SDK now re-exports core types, so no conversion needed
-    match state.agent_service.deploy_agent(manifest).await {
+    match state
+        .agent_service
+        .deploy_agent(manifest, query.force)
+        .await
+    {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

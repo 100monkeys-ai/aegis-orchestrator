@@ -121,7 +121,38 @@ use crate::domain::agent::AgentManifest;
 
 #[async_trait]
 impl AgentLifecycleService for InMemoryAgentRepository {
-    async fn deploy_agent(&self, manifest: AgentManifest) -> anyhow::Result<AgentId> {
+    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> anyhow::Result<AgentId> {
+        if let Some(existing) = self.find_by_name(&manifest.metadata.name).await? {
+            let existing_version = &existing.manifest.metadata.version;
+            let incoming_version = &manifest.metadata.version;
+
+            if existing_version == incoming_version {
+                if !force {
+                    anyhow::bail!(
+                        "Agent '{}' version '{}' is already deployed (ID: {}). \
+                         Use --force to overwrite it.",
+                        existing.name,
+                        existing_version,
+                        existing.id.0
+                    );
+                }
+                let mut updated = existing.clone();
+                updated.update_manifest(manifest);
+                self.save(&updated)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
+                return Ok(updated.id);
+            }
+
+            // Different version — update in place.
+            let mut updated = existing.clone();
+            updated.update_manifest(manifest);
+            self.save(&updated)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
+            return Ok(updated.id);
+        }
+
         let agent = Agent::new(manifest);
         let id = agent.id;
         self.save(&agent)

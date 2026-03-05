@@ -491,7 +491,7 @@ mod tests {
     struct MockAgentLifecycleService;
     #[async_trait]
     impl AgentLifecycleService for MockAgentLifecycleService {
-        async fn deploy_agent(&self, _: AgentManifest) -> Result<AgentId> {
+        async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
             unimplemented!()
         }
         async fn get_agent(&self, _: AgentId) -> Result<Agent> {

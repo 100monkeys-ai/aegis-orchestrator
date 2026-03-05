@@ -48,10 +48,10 @@ impl EmbeddedExecutor {
         Err(anyhow::anyhow!("Embedded mode does not yet support volume management. Please use daemon mode by starting the daemon with 'aegis-orchestrator daemon start'"))
     }
 
-    pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<AgentId> {
+    pub async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
         let core_manifest: aegis_orchestrator_core::domain::agent::AgentManifest =
             serde_json::from_value(serde_json::to_value(manifest).unwrap()).unwrap();
-        self.agent_service.deploy_agent(core_manifest).await
+        self.agent_service.deploy_agent(core_manifest, force).await
     }
 
     pub async fn execute_agent(
