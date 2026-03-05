@@ -136,6 +136,10 @@ impl ExecutionId {
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
+
+    pub fn from_string(s: &str) -> std::result::Result<Self, uuid::Error> {
+        uuid::Uuid::parse_str(s).map(Self)
+    }
 }
 
 impl Default for ExecutionId {

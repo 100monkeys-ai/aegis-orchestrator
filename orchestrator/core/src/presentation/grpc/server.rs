@@ -145,8 +145,36 @@ impl AegisRuntime for AegisRuntimeService {
                 }))
                 .await;
 
+            // Check for ADR-016 nested execution
+            let start_result = if let Some(parent_id_str) = req.parent_execution_id {
+                let parent_id =
+                    match crate::domain::execution::ExecutionId::from_string(&parent_id_str) {
+                        Ok(id) => id,
+                        Err(e) => {
+                            let _ = tx_clone
+                                .send(Ok(ExecutionEvent {
+                                    event: Some(execution_event::Event::ExecutionFailed(
+                                        ExecutionFailed {
+                                            execution_id: uuid::Uuid::new_v4().to_string(),
+                                            reason: format!("Invalid parent_execution_id: {}", e),
+                                            total_iterations: 0,
+                                            failed_at: Utc::now().to_rfc3339(),
+                                        },
+                                    )),
+                                }))
+                                .await;
+                            return;
+                        }
+                    };
+                execution_service
+                    .start_child_execution(agent_id, input, parent_id)
+                    .await
+            } else {
+                execution_service.start_execution(agent_id, input).await
+            };
+
             // Start execution
-            match execution_service.start_execution(agent_id, input).await {
+            match start_result {
                 Ok(execution_id) => {
                     // Stream execution events
                     match execution_service.stream_execution(execution_id).await {
@@ -268,57 +296,85 @@ impl AegisRuntime for AegisRuntimeService {
     ) -> Result<Response<ValidateResponse>, Status> {
         let req = request.into_inner();
 
-        // Parse judge agent IDs
-        let judge_ids: Vec<AgentId> = req
+        // Parse judge agent IDs and preserve per-judge weights (ADR-017)
+        let judge_configs: Vec<(AgentId, f64)> = req
             .judges
-            .into_iter()
-            .map(|j| AgentId::from_string(&j.agent_id))
+            .iter()
+            .map(|j| {
+                AgentId::from_string(&j.agent_id)
+                    .map(|id| (id, if j.weight > 0.0 { j.weight as f64 } else { 1.0 }))
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {}", e)))?;
 
-        // Convert to Vec<(AgentId, f64)> with default weight of 1.0
-        let judge_configs: Vec<(AgentId, f64)> =
-            judge_ids.into_iter().map(|id| (id, 1.0)).collect();
+        // Parse context_json once; extract execution_id/agent_id for proper child-execution linking
+        let context_value: Option<serde_json::Value> = if req.context_json.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&req.context_json).map_err(|e| {
+                Status::invalid_argument(format!("Invalid context_json: {}", e))
+            })?)
+        };
 
-        // Parse context if available
-        let context =
-            if req.context_json.is_empty() {
-                None
-            } else {
-                Some(serde_json::from_str(&req.context_json).map_err(|e| {
-                    Status::invalid_argument(format!("Invalid context_json: {}", e))
-                })?)
+        let exec_id = context_value
+            .as_ref()
+            .and_then(|v| v["execution_id"].as_str())
+            .and_then(|s| crate::domain::execution::ExecutionId::from_string(s).ok())
+            .unwrap_or_else(crate::domain::execution::ExecutionId::new);
+
+        let agent_id = context_value
+            .as_ref()
+            .and_then(|v| v["agent_id"].as_str())
+            .and_then(|s| AgentId::from_string(s).ok())
+            .unwrap_or_else(AgentId::new);
+
+        // Map proto ConsensusConfig → domain ConsensusConfig (ADR-017)
+        use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy};
+        let consensus_config: Option<ConsensusConfig> = req.consensus.map(|c| {
+            let strategy = match c.strategy {
+                1 => ConsensusStrategy::Majority,
+                2 => ConsensusStrategy::Unanimous,
+                _ => ConsensusStrategy::WeightedAverage,
             };
+            ConsensusConfig {
+                strategy,
+                threshold: c.threshold.map(|t| t as f64),
+                min_agreement_confidence: c.agreement.map(|a| a as f64),
+                n: c.n.map(|n| n as usize),
+                min_judges_required: 1,
+                confidence_weighting: None,
+            }
+        });
 
-        // Create validation request
+        // Determine binary pass/fail threshold — ADR-017 §3 specifies default 0.8
+        let binary_threshold = consensus_config
+            .as_ref()
+            .and_then(|c| c.threshold)
+            .unwrap_or(0.8);
+
+        // Build domain ValidationRequest
         use crate::domain::validation::ValidationRequest;
         let validation_req = ValidationRequest {
             content: req.output,
             criteria: req.task,
-            context,
+            context: context_value,
         };
 
-        // TODO: Get actual execution_id and agent_id from context
-        let dummy_exec_id = crate::domain::execution::ExecutionId::new();
-        let dummy_agent_id = crate::domain::agent::AgentId::new();
-
-        // Call validation service with default configuration
         match self
             .validation_service
             .validate_with_judges(
-                dummy_exec_id,
-                dummy_agent_id,
-                0, // iteration_number: not tracked in gRPC validation endpoint
+                exec_id,
+                agent_id,
+                0, // iteration_number tracked by Temporal workflow, not this endpoint
                 validation_req,
                 judge_configs,
-                None, // Use default consensus config
-                60,   // 60 second timeout
-                500,  // 500ms poll interval
+                consensus_config,
+                60,  // 60 second timeout
+                500, // 500ms poll interval
             )
             .await
         {
             Ok(consensus) => {
-                // Convert to protobuf
                 let individual_results = consensus
                     .individual_results
                     .into_iter()
@@ -334,7 +390,7 @@ impl AegisRuntime for AegisRuntimeService {
                     score: consensus.final_score as f32,
                     confidence: consensus.consensus_confidence as f32,
                     reasoning: format!("Consensus reached with strategy: {}", consensus.strategy),
-                    binary_valid: consensus.final_score > 0.5,
+                    binary_valid: consensus.final_score >= binary_threshold,
                     individual_results,
                 }))
             }

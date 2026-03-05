@@ -287,6 +287,19 @@ pub enum StateKind {
         /// Optional isolation override
         #[serde(default)]
         isolation: Option<IsolationMode>,
+
+        /// Judge agents that validate each iteration output (ADR-016 / ADR-017)
+        #[serde(default)]
+        judges: Vec<JudgeConfig>,
+
+        /// Maximum iterations for the 100monkeys inner refinement loop
+        /// (overrides global default of 10)
+        #[serde(default)]
+        max_iterations: Option<u32>,
+
+        /// Optional judge agent ID for pre-execution semantic tool validation (ADR-049 Pillar 1)
+        #[serde(default)]
+        pre_execution_validator: Option<String>,
     },
 
     /// Execute system command
@@ -320,6 +333,11 @@ pub enum StateKind {
 
         /// Consensus configuration
         consensus: ConsensusConfig,
+
+        /// External judge agents for validating the combined parallel output (ADR-016)
+        /// These must be distinct from the workers in `agents` (agents cannot judge themselves)
+        #[serde(default)]
+        judges_for_parallel: Vec<JudgeConfig>,
     },
 }
 
@@ -336,6 +354,21 @@ pub enum IsolationMode {
     Docker,
     /// No isolation (dangerous, for debugging only)
     Process,
+}
+
+/// Configuration for a single judge agent (ADR-016, ADR-017, ADR-049)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeConfig {
+    /// Agent identifier for this judge
+    pub agent_id: String,
+
+    /// Optional Handlebars input template (overrides default judge prompt)
+    #[serde(default)]
+    pub input_template: Option<String>,
+
+    /// Consensus weight for this judge (default: 1.0)
+    #[serde(default = "default_weight")]
+    pub weight: f64,
 }
 
 /// Configuration for a single agent in parallel execution
@@ -524,6 +557,9 @@ pub enum TransitionCondition {
 
     /// Confidence above threshold
     ConfidenceAbove { threshold: f64 },
+
+    /// Both validation score AND confidence are above the same threshold (ADR-049)
+    ScoreAndConfidenceAbove { threshold: f64 },
 
     /// Consensus reached (for ParallelAgents)
     Consensus { threshold: f64, agreement: f64 },
@@ -829,6 +865,24 @@ mod tests {
         assert!(WorkflowMetadata::validate_name("My-Workflow").is_err()); // Uppercase
         assert!(WorkflowMetadata::validate_name("my_workflow").is_err()); // Underscore
         assert!(WorkflowMetadata::validate_name("-invalid").is_err()); // Starts with hyphen
+    }
+
+    #[test]
+    fn test_score_and_confidence_above_roundtrip() {
+        // Ensure ScoreAndConfidenceAbove can be serialized/deserialized and is
+        // distinct from ScoreAbove and ConfidenceAbove (regression guard for
+        // the TypeScript evaluateCondition dead-code bug fixed in this PR).
+        let condition = TransitionCondition::ScoreAndConfidenceAbove { threshold: 0.85 };
+        let json = serde_json::to_string(&condition).unwrap();
+        assert!(json.contains("score_and_confidence_above"), "wrong tag: {}", json);
+        assert!(json.contains("0.85"), "threshold missing: {}", json);
+
+        let round_tripped: TransitionCondition = serde_json::from_str(&json).unwrap();
+        if let TransitionCondition::ScoreAndConfidenceAbove { threshold } = round_tripped {
+            assert!((threshold - 0.85).abs() < f64::EPSILON);
+        } else {
+            panic!("Round-trip produced wrong variant");
+        }
     }
 
     #[test]
