@@ -26,6 +26,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -112,9 +114,25 @@ impl LLMProvider for AnthropicAdapter {
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
         // Map domain ChatMessage → Anthropic message.
+        // role="system" is extracted to the top-level `system` parameter; Anthropic's
+        // Messages API rejects system role entries inside the messages array.
         // role="tool" becomes a "tool_result" content-block array (Anthropic pattern).
+        let system_prompt: Option<String> = {
+            let parts: Vec<&str> = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        };
+
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
+            .filter(|m| m.role != "system")
             .map(|m| {
                 if m.role == "tool" {
                     let content = serde_json::json!([{
@@ -178,6 +196,7 @@ impl LLMProvider for AnthropicAdapter {
             model: self.model.clone(),
             messages: anthropic_messages,
             max_tokens: options.max_tokens.unwrap_or(4096),
+            system: system_prompt,
             temperature: options.temperature,
             tools: anthropic_tools,
         };
@@ -305,6 +324,7 @@ mod tests {
                 content: serde_json::Value::String("Hello".to_string()),
             }],
             max_tokens: 1024,
+            system: None,
             temperature: Some(0.7),
             tools: None,
         };

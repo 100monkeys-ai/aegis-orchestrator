@@ -22,6 +22,44 @@ use crate::infrastructure::llm::registry::ProviderRegistry;
 /// Maximum number of tool-call iterations before the inner loop is forcibly terminated.
 const MAX_INNER_LOOP_ITERATIONS: usize = 50;
 
+/// System-level guidance injected at the start of every conversation.
+///
+/// Instructs the agent to use the most specific available tool for each task rather than
+/// routing everything through `cmd.run`. Using `cmd.run` to circumvent a purpose-built tool
+/// (e.g. running `cat` instead of `fs.read`, or `grep` instead of `fs.grep`) is treated as a
+/// policy violation and may cause the execution to be terminated.
+///
+/// Also communicates that the tool list is policy-scoped: if a purpose-built tool is absent
+/// from the context, that operation is explicitly blocked by policy and must not be attempted
+/// via `cmd.run` or any other workaround.
+const TOOL_USE_POLICY_SYSTEM_MESSAGE: &str = "\
+You have access to a set of purpose-built tools. You MUST use the most appropriate tool for \
+each task. Do NOT default to `cmd.run` when a dedicated tool is available — doing so is a \
+policy violation and the execution will be terminated.\n\
+\n\
+Additional tools may be present in your context, provided by MCP servers configured for this \
+execution. Always prefer the most specific tool available for any given task.\n\
+\n\
+IMPORTANT: The tools listed below may or may not be present in your context. Their availability \
+is determined by the security policy applied to this execution. If a purpose-built tool is NOT \
+present in your context, that is a definitive signal that the operation it performs is \
+policy-blocked. You MUST NOT attempt to work around its absence using `cmd.run` or any other \
+tool — doing so is a policy violation and the execution will be terminated.\n\
+\n\
+Tool selection rules (apply these strictly, subject to tool availability):\n\
+- Use `fs.read` to read file contents — not `cmd.run` with `cat` or `head`.\n\
+- Use `fs.write` to write or overwrite a file — not `cmd.run` with `tee` or shell redirection.\n\
+- Use `fs.edit` or `fs.multi_edit` to make targeted edits to existing files.\n\
+- Use `fs.grep` to search file contents — not `cmd.run` with `grep` or `rg`.\n\
+- Use `fs.glob` to find files by name pattern — not `cmd.run` with `find` or `ls`.\n\
+- Use `fs.list` to list directory contents.\n\
+- Use `fs.create_dir` to create directories — not `cmd.run` with `mkdir`.\n\
+- Use `fs.delete` to remove files or directories — not `cmd.run` with `rm`.\n\
+- Reserve `cmd.run` strictly for tasks that no other available tool can accomplish.\n\
+\n\
+Attempting to use `cmd.run` as a substitute for any of the above tools, or to circumvent a \
+policy-blocked operation, is a policy violation.";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversationMessage {
     pub role: String,
@@ -89,12 +127,31 @@ impl InnerLoopService {
                 let parsed_agent_id = AgentId::from_string(&agent_id)?;
                 let mut conversation = messages.clone();
                 if conversation.is_empty() {
+                    // Prepend tool-use policy guidance as a system message so the agent
+                    // knows to use purpose-built tools rather than routing through cmd.run.
+                    conversation.push(ConversationMessage {
+                        role: "system".to_string(),
+                        content: TOOL_USE_POLICY_SYSTEM_MESSAGE.to_string(),
+                        tool_call_id: None,
+                        tool_calls: None,
+                    });
                     conversation.push(ConversationMessage {
                         role: "user".to_string(),
                         content: prompt.clone(),
                         tool_call_id: None,
                         tool_calls: None,
                     });
+                } else if !conversation.iter().any(|m| m.role == "system") {
+                    // If the caller supplied prior messages but no system message, prepend one.
+                    conversation.insert(
+                        0,
+                        ConversationMessage {
+                            role: "system".to_string(),
+                            content: TOOL_USE_POLICY_SYSTEM_MESSAGE.to_string(),
+                            tool_call_id: None,
+                            tool_calls: None,
+                        },
+                    );
                 }
 
                 self.active_executions.write().await.insert(
