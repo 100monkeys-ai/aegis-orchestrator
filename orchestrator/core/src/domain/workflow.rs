@@ -874,7 +874,11 @@ mod tests {
         // the TypeScript evaluateCondition dead-code bug fixed in this PR).
         let condition = TransitionCondition::ScoreAndConfidenceAbove { threshold: 0.85 };
         let json = serde_json::to_string(&condition).unwrap();
-        assert!(json.contains("score_and_confidence_above"), "wrong tag: {}", json);
+        assert!(
+            json.contains("score_and_confidence_above"),
+            "wrong tag: {}",
+            json
+        );
         assert!(json.contains("0.85"), "threshold missing: {}", json);
 
         let round_tripped: TransitionCondition = serde_json::from_str(&json).unwrap();

@@ -1188,9 +1188,9 @@ impl ExecutionService for StandardExecutionService {
                 // this is the worker's workspace that the judge needs read access to.
                 let parent_workspace_vol_id = self
                     .volume_service
-                    .list_volumes_by_ownership(
-                        &crate::domain::volume::VolumeOwnership::execution(parent_execution_id),
-                    )
+                    .list_volumes_by_ownership(&crate::domain::volume::VolumeOwnership::execution(
+                        parent_execution_id,
+                    ))
                     .await
                     .ok()
                     .and_then(|vols| vols.into_iter().next().map(|v| v.id));

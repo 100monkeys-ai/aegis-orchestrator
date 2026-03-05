@@ -198,20 +198,40 @@ pub enum TransitionConditionYaml {
     OnFailure,
     ExitCodeZero,
     ExitCodeNonZero,
-    ExitCode { value: i32 },
-    ScoreAbove { threshold: f64 },
-    ScoreBelow { threshold: f64 },
-    ScoreBetween { min: f64, max: f64 },
-    ConfidenceAbove { threshold: f64 },
+    ExitCode {
+        value: i32,
+    },
+    ScoreAbove {
+        threshold: f64,
+    },
+    ScoreBelow {
+        threshold: f64,
+    },
+    ScoreBetween {
+        min: f64,
+        max: f64,
+    },
+    ConfidenceAbove {
+        threshold: f64,
+    },
     /// Both validation score AND confidence are above the same threshold (ADR-049)
-    ScoreAndConfidenceAbove { threshold: f64 },
-    Consensus { threshold: f64, agreement: f64 },
+    ScoreAndConfidenceAbove {
+        threshold: f64,
+    },
+    Consensus {
+        threshold: f64,
+        agreement: f64,
+    },
     AllApproved,
     AnyRejected,
-    InputEquals { value: String },
+    InputEquals {
+        value: String,
+    },
     InputEqualsYes,
     InputEqualsNo,
-    Custom { expression: String },
+    Custom {
+        expression: String,
+    },
 }
 
 // ============================================================================

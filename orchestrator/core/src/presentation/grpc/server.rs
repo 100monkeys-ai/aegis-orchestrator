@@ -308,13 +308,14 @@ impl AegisRuntime for AegisRuntimeService {
             .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {}", e)))?;
 
         // Parse context_json once; extract execution_id/agent_id for proper child-execution linking
-        let context_value: Option<serde_json::Value> = if req.context_json.is_empty() {
-            None
-        } else {
-            Some(serde_json::from_str(&req.context_json).map_err(|e| {
-                Status::invalid_argument(format!("Invalid context_json: {}", e))
-            })?)
-        };
+        let context_value: Option<serde_json::Value> =
+            if req.context_json.is_empty() {
+                None
+            } else {
+                Some(serde_json::from_str(&req.context_json).map_err(|e| {
+                    Status::invalid_argument(format!("Invalid context_json: {}", e))
+                })?)
+            };
 
         let exec_id = context_value
             .as_ref()
