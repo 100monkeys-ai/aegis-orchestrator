@@ -252,6 +252,11 @@ impl RunParallelContainerStepsUseCase {
         let failed = step_count - succeeded;
 
         // Publish aggregated event.
+        let strategy = match completion {
+            ParallelCompletionStrategy::AllSucceed => "all_succeed",
+            ParallelCompletionStrategy::AnySucceed => "any_succeed",
+            ParallelCompletionStrategy::BestEffort => "best_effort",
+        };
         self.event_bus.publish_container_run_event(
             ContainerRunEvent::ParallelContainerRunAggregated {
                 execution_id,
@@ -259,7 +264,7 @@ impl RunParallelContainerStepsUseCase {
                 total_steps: step_count,
                 succeeded,
                 failed,
-                strategy: format!("{:?}", completion).to_lowercase(),
+                strategy: strategy.to_string(),
                 aggregated_at: Utc::now(),
             },
         );

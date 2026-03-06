@@ -445,9 +445,13 @@ impl TemporalWorkflowMapper {
                 retry,
                 shell,
             } => {
-                let pull_policy_str = image_pull_policy
-                    .as_ref()
-                    .map(|p| format!("{:?}", p).to_lowercase());
+                let pull_policy_str = image_pull_policy.as_ref().map(|p| match p {
+                    crate::domain::agent::ImagePullPolicy::Always => "always".to_string(),
+                    crate::domain::agent::ImagePullPolicy::IfNotPresent => {
+                        "if_not_present".to_string()
+                    }
+                    crate::domain::agent::ImagePullPolicy::Never => "never".to_string(),
+                });
 
                 Ok(TemporalWorkflowState {
                     kind: "ContainerRun".to_string(),
@@ -862,5 +866,58 @@ mod tests {
         assert_eq!(temporal_def.states.len(), 2);
         assert_eq!(temporal_def.states.get("START").unwrap().kind, "Agent");
         assert_eq!(temporal_def.states.get("END").unwrap().kind, "System");
+    }
+
+    #[test]
+    fn test_container_run_image_pull_policy_maps_to_snake_case() {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("BUILD").unwrap(),
+            WorkflowState {
+                kind: StateKind::ContainerRun {
+                    name: "build".to_string(),
+                    image: "rust:1.75".to_string(),
+                    image_pull_policy: Some(crate::domain::agent::ImagePullPolicy::IfNotPresent),
+                    command: vec!["cargo".to_string(), "build".to_string()],
+                    env: HashMap::new(),
+                    workdir: None,
+                    volumes: vec![],
+                    resources: None,
+                    registry_credentials: None,
+                    retry: None,
+                    shell: false,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+
+        let workflow = Workflow::new(
+            WorkflowMetadata {
+                name: "container-policy-map".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("BUILD").unwrap(),
+                context: HashMap::new(),
+                states,
+                volumes: vec![],
+            },
+        )
+        .unwrap();
+
+        let temporal_def = TemporalWorkflowMapper::to_temporal_definition(&workflow).unwrap();
+        assert_eq!(
+            temporal_def
+                .states
+                .get("BUILD")
+                .unwrap()
+                .container_run_image_pull_policy
+                .as_deref(),
+            Some("if_not_present")
+        );
     }
 }

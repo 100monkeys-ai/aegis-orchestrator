@@ -86,6 +86,51 @@ impl DockerContainerStepRunner {
             secrets_manager,
         }
     }
+
+    fn failure_reason_for_error(error: &ContainerStepError) -> ContainerRunFailureReason {
+        match error {
+            ContainerStepError::ImagePullFailed { image, error } => {
+                ContainerRunFailureReason::ImagePullFailed {
+                    image: image.clone(),
+                    error: error.clone(),
+                }
+            }
+            ContainerStepError::TimeoutExpired { timeout_secs } => {
+                ContainerRunFailureReason::TimeoutExpired {
+                    timeout_secs: *timeout_secs,
+                }
+            }
+            ContainerStepError::VolumeMountFailed { volume, error } => {
+                ContainerRunFailureReason::VolumeMountFailed {
+                    volume: volume.clone(),
+                    error: error.clone(),
+                }
+            }
+            ContainerStepError::ResourceExhausted { detail } => {
+                ContainerRunFailureReason::ResourceExhausted {
+                    detail: detail.clone(),
+                }
+            }
+            ContainerStepError::DockerError(msg) => ContainerRunFailureReason::ResourceExhausted {
+                detail: msg.clone(),
+            },
+        }
+    }
+
+    fn publish_failed_event(
+        &self,
+        config: &ContainerStepConfig,
+        reason: ContainerRunFailureReason,
+    ) {
+        self.event_bus
+            .publish_container_run_event(ContainerRunEvent::ContainerRunFailed {
+                execution_id: config.execution_id,
+                state_name: config.state_name.to_string(),
+                step_name: config.name.clone(),
+                reason,
+                failed_at: Utc::now(),
+            });
+    }
 }
 
 #[async_trait]
@@ -118,46 +163,57 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         // ─── 2. Resolve per-step registry credentials (ADR-050) ───────────────
         // Supports `None` (anonymous), `env:VAR_NAME`, and `vault:engine/path`.
         // Any other format is rejected immediately so misconfigurations fail fast.
-        let credentials_override: Option<bollard::auth::DockerCredentials> =
-            match &config.registry_credentials {
-                None => None,
-                Some(s) if s.starts_with("env:") => {
-                    let var_name = s.strip_prefix("env:").unwrap();
-                    let raw = std::env::var(var_name).map_err(|_| {
-                        ContainerStepError::ImagePullFailed {
-                            image: config.image.clone(),
-                            error: format!(
+        let credentials_override_result: Result<
+            Option<bollard::auth::DockerCredentials>,
+            ContainerStepError,
+        > = match &config.registry_credentials {
+            None => Ok(None),
+            Some(s) if s.starts_with("env:") => {
+                let var_name = s.strip_prefix("env:").unwrap();
+                let resolved =
+                    (|| -> Result<bollard::auth::DockerCredentials, ContainerStepError> {
+                        let raw = std::env::var(var_name).map_err(|_| {
+                            ContainerStepError::ImagePullFailed {
+                                image: config.image.clone(),
+                                error: format!(
                                 "environment variable '{}' (from registry_credentials) is not set",
                                 var_name
                             ),
-                        }
-                    })?;
-                    // Expected format: "username:password@serveraddress" or "username:password".
-                    // Split on the last '@' so passwords that contain '@' still work.
-                    let (user_pass, serveraddress) = if let Some(pos) = raw.rfind('@') {
-                        (&raw[..pos], Some(raw[pos + 1..].to_string()))
-                    } else {
-                        (raw.as_str(), None)
-                    };
-                    let (username, password) = user_pass.split_once(':').ok_or_else(|| {
-                        ContainerStepError::ImagePullFailed {
-                            image: config.image.clone(),
-                            error: format!(
-                                "env var '{}' must be in format 'username:password' or \
+                            }
+                        })?;
+
+                        // Expected format: "username:password@serveraddress" or "username:password".
+                        // Split on the last '@' so passwords that contain '@' still work.
+                        let (user_pass, serveraddress) = if let Some(pos) = raw.rfind('@') {
+                            (&raw[..pos], Some(raw[pos + 1..].to_string()))
+                        } else {
+                            (raw.as_str(), None)
+                        };
+
+                        let (username, password) = user_pass.split_once(':').ok_or_else(|| {
+                            ContainerStepError::ImagePullFailed {
+                                image: config.image.clone(),
+                                error: format!(
+                                    "env var '{}' must be in format 'username:password' or \
                                      'username:password@serveraddress'",
-                                var_name
-                            ),
-                        }
-                    })?;
-                    Some(bollard::auth::DockerCredentials {
-                        username: Some(username.to_string()),
-                        password: Some(password.to_string()),
-                        serveraddress,
-                        ..Default::default()
-                    })
-                }
-                Some(s) if s.starts_with("vault:") => {
-                    let vault_path = s.strip_prefix("vault:").unwrap();
+                                    var_name
+                                ),
+                            }
+                        })?;
+
+                        Ok(bollard::auth::DockerCredentials {
+                            username: Some(username.to_string()),
+                            password: Some(password.to_string()),
+                            serveraddress,
+                            ..Default::default()
+                        })
+                    })();
+
+                resolved.map(Some)
+            }
+            Some(s) if s.starts_with("vault:") => {
+                let vault_path = s.strip_prefix("vault:").unwrap();
+                let resolved = async {
                     let (engine, secret_path) = vault_path.split_once('/').ok_or_else(|| {
                         ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
@@ -168,6 +224,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ),
                         }
                     })?;
+
                     let ctx = AccessContext::system("orchestrator");
                     let fields = self
                         .secrets_manager
@@ -180,6 +237,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                                 vault_path, e
                             ),
                         })?;
+
                     let username = fields.get("username").ok_or_else(|| {
                         ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
@@ -189,6 +247,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ),
                         }
                     })?;
+
                     let password = fields.get("password").ok_or_else(|| {
                         ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
@@ -198,38 +257,56 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ),
                         }
                     })?;
-                    let serveraddress = fields.get("serveraddress").map(|s| s.expose().to_string());
-                    Some(bollard::auth::DockerCredentials {
-                        username: Some(username.expose().to_string()),
-                        password: Some(password.expose().to_string()),
-                        serveraddress,
-                        ..Default::default()
-                    })
+
+                    let serveraddress = fields.get("serveraddress").map(|v| v.expose().to_string());
+                    Ok::<bollard::auth::DockerCredentials, ContainerStepError>(
+                        bollard::auth::DockerCredentials {
+                            username: Some(username.expose().to_string()),
+                            password: Some(password.expose().to_string()),
+                            serveraddress,
+                            ..Default::default()
+                        },
+                    )
                 }
-                Some(s) => {
-                    return Err(ContainerStepError::ImagePullFailed {
-                        image: config.image.clone(),
-                        error: format!(
-                            "unrecognised registry_credentials format '{}'; \
+                .await;
+
+                resolved.map(Some)
+            }
+            Some(s) => Err(ContainerStepError::ImagePullFailed {
+                image: config.image.clone(),
+                error: format!(
+                    "unrecognised registry_credentials format '{}'; \
                              expected 'env:VAR_NAME' or 'vault:engine/path'",
-                            s
-                        ),
-                    });
-                }
-            };
+                    s
+                ),
+            }),
+        };
+
+        let credentials_override = match credentials_override_result {
+            Ok(value) => value,
+            Err(error) => {
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                return Err(error);
+            }
+        };
 
         // ─── 3. Pull image ─────────────────────────────────────────────────────
-        self.image_manager
+        if let Err(e) = self
+            .image_manager
             .ensure_image(
                 &config.image,
                 config.image_pull_policy,
                 credentials_override,
             )
             .await
-            .map_err(|e| ContainerStepError::ImagePullFailed {
+        {
+            let error = ContainerStepError::ImagePullFailed {
                 image: config.image.clone(),
                 error: e.to_string(),
-            })?;
+            };
+            self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+            return Err(error);
+        }
 
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
         let host_config = {
@@ -364,25 +441,45 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             .docker
             .create_container(Some(options), container_config)
             .await
-            .map_err(|e| ContainerStepError::DockerError(format!("create_container: {}", e)))?;
+            .map_err(|e| {
+                if e.to_string().to_lowercase().contains("mount") {
+                    ContainerStepError::VolumeMountFailed {
+                        volume: "unknown".to_string(),
+                        error: format!("create_container: {}", e),
+                    }
+                } else {
+                    ContainerStepError::DockerError(format!("create_container: {}", e))
+                }
+            });
+
+        let container = match container {
+            Ok(container) => container,
+            Err(error) => {
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                return Err(error);
+            }
+        };
 
         let container_id = container.id.clone();
 
         // ─── 7. Start container ───────────────────────────────────────────────
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container(&container_id, None::<StartContainerOptions<String>>)
             .await
-            .map_err(|e| {
-                // Best-effort cleanup: explicitly drop the future (cannot await inside map_err).
-                std::mem::drop(self.docker.remove_container(
-                    &container_id,
-                    Some(RemoveContainerOptions {
-                        force: true,
-                        ..Default::default()
-                    }),
-                ));
-                ContainerStepError::DockerError(format!("start_container: {}", e))
-            })?;
+        {
+            // Best-effort cleanup: explicitly drop the future (cannot await in error path).
+            std::mem::drop(self.docker.remove_container(
+                &container_id,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            ));
+            let error = ContainerStepError::DockerError(format!("start_container: {}", e));
+            self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+            return Err(error);
+        }
 
         debug!(
             container_id = %container_id,
@@ -420,26 +517,14 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         // ─── 11. Map capture result to domain result / event ───────────────────
         match capture_result {
             Err(CaptureError::Timeout { timeout_secs }) => {
-                self.event_bus
-                    .publish_container_run_event(ContainerRunEvent::ContainerRunFailed {
-                        execution_id: config.execution_id,
-                        state_name: config.state_name.to_string(),
-                        step_name: config.name.clone(),
-                        reason: ContainerRunFailureReason::TimeoutExpired { timeout_secs },
-                        failed_at: Utc::now(),
-                    });
-                Err(ContainerStepError::TimeoutExpired { timeout_secs })
+                let error = ContainerStepError::TimeoutExpired { timeout_secs };
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                Err(error)
             }
             Err(CaptureError::Docker(msg)) => {
-                self.event_bus
-                    .publish_container_run_event(ContainerRunEvent::ContainerRunFailed {
-                        execution_id: config.execution_id,
-                        state_name: config.state_name.to_string(),
-                        step_name: config.name.clone(),
-                        reason: ContainerRunFailureReason::NonZeroExitCode { code: -1 },
-                        failed_at: Utc::now(),
-                    });
-                Err(ContainerStepError::DockerError(msg))
+                let error = ContainerStepError::DockerError(msg);
+                self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                Err(error)
             }
             Ok(captured) => {
                 let result = ContainerStepResult {
@@ -449,18 +534,27 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                     duration_ms,
                 };
 
-                self.event_bus.publish_container_run_event(
-                    ContainerRunEvent::ContainerRunCompleted {
-                        execution_id: config.execution_id,
-                        state_name: config.state_name.to_string(),
-                        step_name: config.name.clone(),
-                        exit_code: result.exit_code,
-                        stdout_bytes: result.stdout.len() as u64,
-                        stderr_bytes: result.stderr.len() as u64,
-                        duration_ms,
-                        completed_at: Utc::now(),
-                    },
-                );
+                if result.exit_code == 0 {
+                    self.event_bus.publish_container_run_event(
+                        ContainerRunEvent::ContainerRunCompleted {
+                            execution_id: config.execution_id,
+                            state_name: config.state_name.to_string(),
+                            step_name: config.name.clone(),
+                            exit_code: result.exit_code,
+                            stdout_bytes: result.stdout.len() as u64,
+                            stderr_bytes: result.stderr.len() as u64,
+                            duration_ms,
+                            completed_at: Utc::now(),
+                        },
+                    );
+                } else {
+                    self.publish_failed_event(
+                        &config,
+                        ContainerRunFailureReason::NonZeroExitCode {
+                            code: result.exit_code,
+                        },
+                    );
+                }
 
                 info!(
                     container_id = %container_id,
@@ -590,7 +684,13 @@ async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutpu
 /// Returns `None` if the string cannot be parsed.
 fn parse_memory_string(s: &str) -> Option<i64> {
     let s = s.trim().to_lowercase();
-    if let Some(num) = s.strip_suffix('g') {
+    if let Some(num) = s.strip_suffix("gi") {
+        num.trim().parse::<i64>().ok().map(|n| n * 1_073_741_824)
+    } else if let Some(num) = s.strip_suffix("mi") {
+        num.trim().parse::<i64>().ok().map(|n| n * 1_048_576)
+    } else if let Some(num) = s.strip_suffix("ki") {
+        num.trim().parse::<i64>().ok().map(|n| n * 1_024)
+    } else if let Some(num) = s.strip_suffix('g') {
         num.trim().parse::<i64>().ok().map(|n| n * 1_073_741_824)
     } else if let Some(num) = s.strip_suffix("gb") {
         num.trim().parse::<i64>().ok().map(|n| n * 1_073_741_824)
@@ -604,5 +704,24 @@ fn parse_memory_string(s: &str) -> Option<i64> {
         num.trim().parse::<i64>().ok().map(|n| n * 1_024)
     } else {
         s.parse::<i64>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory_string;
+
+    #[test]
+    fn parse_memory_string_supports_iec_units() {
+        assert_eq!(parse_memory_string("4Gi"), Some(4 * 1_073_741_824));
+        assert_eq!(parse_memory_string("512Mi"), Some(512 * 1_048_576));
+        assert_eq!(parse_memory_string("64Ki"), Some(64 * 1_024));
+    }
+
+    #[test]
+    fn parse_memory_string_supports_decimal_units() {
+        assert_eq!(parse_memory_string("2g"), Some(2 * 1_073_741_824));
+        assert_eq!(parse_memory_string("256m"), Some(256 * 1_048_576));
+        assert_eq!(parse_memory_string("1024k"), Some(1024 * 1_024));
     }
 }

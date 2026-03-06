@@ -146,6 +146,128 @@ impl Workflow {
             }
         }
 
+        // Validate: Container state invariants (ADR-050)
+        for (state_name, state) in &spec.states {
+            match &state.kind {
+                StateKind::ContainerRun {
+                    name,
+                    image,
+                    command,
+                    volumes,
+                    ..
+                } => {
+                    if name.trim().is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.name cannot be empty".to_string(),
+                        });
+                    }
+                    if image.trim().is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.image cannot be empty".to_string(),
+                        });
+                    }
+                    if command.is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.command must contain at least one token"
+                                .to_string(),
+                        });
+                    }
+
+                    for mount in volumes {
+                        if mount.name.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: "ContainerRun volume name cannot be empty".to_string(),
+                            });
+                        }
+                        if mount.mount_path.trim().is_empty() || !mount.mount_path.starts_with('/')
+                        {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ContainerRun mount_path '{}' must be an absolute path",
+                                    mount.mount_path
+                                ),
+                            });
+                        }
+                    }
+                }
+                StateKind::ParallelContainerRun { steps, .. } => {
+                    if steps.is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ParallelContainerRun.steps must contain at least one step"
+                                .to_string(),
+                        });
+                    }
+
+                    let mut step_names = std::collections::HashSet::new();
+                    for step in steps {
+                        if step.name.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: "ParallelContainerRun step name cannot be empty"
+                                    .to_string(),
+                            });
+                        }
+                        if !step_names.insert(step.name.clone()) {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step name '{}' must be unique",
+                                    step.name
+                                ),
+                            });
+                        }
+                        if step.image.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step '{}' has empty image",
+                                    step.name
+                                ),
+                            });
+                        }
+                        if step.command.is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step '{}' command must contain at least one token",
+                                    step.name
+                                ),
+                            });
+                        }
+                        for mount in &step.volumes {
+                            if mount.name.trim().is_empty() {
+                                return Err(WorkflowError::InvalidContainerState {
+                                    state: state_name.clone(),
+                                    detail: format!(
+                                        "ParallelContainerRun step '{}' has empty volume name",
+                                        step.name
+                                    ),
+                                });
+                            }
+                            if mount.mount_path.trim().is_empty()
+                                || !mount.mount_path.starts_with('/')
+                            {
+                                return Err(WorkflowError::InvalidContainerState {
+                                    state: state_name.clone(),
+                                    detail: format!(
+                                        "ParallelContainerRun step '{}' has non-absolute mount_path '{}'",
+                                        step.name, mount.mount_path
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Validate: All ContainerVolumeMount names resolve to declared spec.volumes
         // (only enforced when spec.volumes is non-empty — opt-in per ADR-050)
         if !spec.volumes.is_empty() {
@@ -1022,6 +1144,9 @@ pub enum WorkflowError {
         state: StateName,
         volume_name: String,
     },
+
+    #[error("Invalid container state configuration in state '{state}': {detail}")]
+    InvalidContainerState { state: StateName, detail: String },
 }
 
 // ============================================================================
@@ -1196,6 +1321,156 @@ mod tests {
         assert!(matches!(
             result,
             Err(WorkflowError::InitialStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_container_run_requires_non_empty_command() {
+        let metadata = WorkflowMetadata {
+            name: "container-command-required".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("BUILD").unwrap(),
+            WorkflowState {
+                kind: StateKind::ContainerRun {
+                    name: "build".to_string(),
+                    image: "rust:1.75".to_string(),
+                    image_pull_policy: None,
+                    command: vec![],
+                    env: HashMap::new(),
+                    workdir: None,
+                    volumes: vec![],
+                    resources: None,
+                    registry_credentials: None,
+                    retry: None,
+                    shell: false,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("BUILD").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parallel_container_run_rejects_duplicate_step_names() {
+        let metadata = WorkflowMetadata {
+            name: "parallel-duplicate-steps".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TEST").unwrap(),
+            WorkflowState {
+                kind: StateKind::ParallelContainerRun {
+                    steps: vec![
+                        ContainerRunConfig {
+                            name: "lint".to_string(),
+                            image: "rust:1.75".to_string(),
+                            command: vec!["cargo".to_string(), "clippy".to_string()],
+                            env: HashMap::new(),
+                            workdir: None,
+                            volumes: vec![],
+                            resources: None,
+                            registry_credentials: None,
+                            shell: false,
+                        },
+                        ContainerRunConfig {
+                            name: "lint".to_string(),
+                            image: "rust:1.75".to_string(),
+                            command: vec!["cargo".to_string(), "fmt".to_string()],
+                            env: HashMap::new(),
+                            workdir: None,
+                            volumes: vec![],
+                            resources: None,
+                            registry_credentials: None,
+                            shell: false,
+                        },
+                    ],
+                    completion: ParallelCompletionStrategy::AllSucceed,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TEST").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_mount_path_must_be_absolute() {
+        let metadata = WorkflowMetadata {
+            name: "container-mount-path".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("BUILD").unwrap(),
+            WorkflowState {
+                kind: StateKind::ContainerRun {
+                    name: "build".to_string(),
+                    image: "rust:1.75".to_string(),
+                    image_pull_policy: None,
+                    command: vec!["cargo".to_string(), "build".to_string()],
+                    env: HashMap::new(),
+                    workdir: None,
+                    volumes: vec![ContainerVolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: "workspace".to_string(),
+                        read_only: false,
+                    }],
+                    resources: None,
+                    registry_credentials: None,
+                    retry: None,
+                    shell: false,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("BUILD").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
         ));
     }
 }
