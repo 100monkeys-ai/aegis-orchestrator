@@ -3,7 +3,7 @@
 //! # IAM/OIDC HTTP Auth Middleware (ADR-041)
 //!
 //! Axum middleware layer that validates IAM/OIDC Bearer JWTs on incoming HTTP
-//! requests. When authentication succeeds, the resolved [`UserIdentity`] is
+//! requests. When authentication succeeds, the resolved [`crate::domain::iam::UserIdentity`] is
 //! inserted into the request's extensions for use by downstream handlers.
 //!
 //! ## Exempt Paths
