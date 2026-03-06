@@ -33,7 +33,6 @@ use tracing::info;
 
 mod commands;
 mod daemon;
-mod embedded;
 
 use commands::{AgentCommand, ConfigCommand, DaemonCommand, TaskCommand, WorkflowCommand};
 
@@ -136,7 +135,7 @@ async fn main() -> Result<()> {
             commands::daemon::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Task { command }) => {
-            commands::task::handle_command(command, cli.config, &cli.host, cli.port).await
+            commands::task::handle_command(command, &cli.host, cli.port).await
         }
         Some(Commands::Config { command }) => {
             commands::config::handle_command(command, cli.config).await

@@ -142,10 +142,10 @@ impl TemporalEventMapper {
             Some(id_str) => match Uuid::parse_str(id_str) {
                 Ok(uuid) => WorkflowId(uuid),
                 Err(err) => {
-                    eprintln!(
-                        "TemporalEventMapper: invalid workflow_id '{}': {}. Falling back to nil UUID.",
-                        id_str,
-                        err
+                    tracing::warn!(
+                        workflow_id = %id_str,
+                        error = %err,
+                        "TemporalEventMapper: invalid workflow_id encountered; falling back to nil UUID"
                     );
                     WorkflowId(Uuid::nil())
                 }

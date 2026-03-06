@@ -174,10 +174,12 @@ impl NfsGatewayService {
         bind_port: Option<u16>,
     ) -> Self {
         // Build StorageRouter to support diverse backends
-        let local_provider = Arc::new(
-            LocalHostStorageProvider::new("/tmp/aegis")
-                .unwrap_or_else(|_| LocalHostStorageProvider::new("/tmp").unwrap()),
-        );
+        let local_provider = Arc::new(LocalHostStorageProvider::new("/tmp/aegis").unwrap_or_else(
+            |_| {
+                LocalHostStorageProvider::new("/tmp")
+                    .expect("failed to initialize fallback local storage provider at /tmp")
+            },
+        ));
         let smcp_provider = Arc::new(SmcpStorageProvider::new());
         let storage_router = Arc::new(StorageRouter::new(
             storage_provider,

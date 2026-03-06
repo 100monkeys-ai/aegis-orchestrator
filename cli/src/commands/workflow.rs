@@ -532,16 +532,25 @@ async fn delete_workflow(
         }
     }
 
-    // Confirmation prompt
+    // Confirmation prompt — run blocking stdin/stdout I/O on a dedicated
+    // thread so we don't park the Tokio executor while waiting for user input.
     if !skip_confirmation {
-        use std::io::{self, Write};
-        print!("{}", format!("Delete workflow '{}' (y/N)? ", name).yellow());
-        io::stdout().flush()?;
+        let name_for_prompt = name.clone();
+        let confirmed = tokio::task::spawn_blocking(move || {
+            use std::io::{self, Write};
+            print!(
+                "{}",
+                format!("Delete workflow '{}' (y/N)? ", name_for_prompt).yellow()
+            );
+            io::stdout().flush()?;
+            let mut response = String::new();
+            io::stdin().read_line(&mut response)?;
+            Ok::<bool, anyhow::Error>(response.trim().eq_ignore_ascii_case("y"))
+        })
+        .await
+        .context("Confirmation prompt failed")??;
 
-        let mut response = String::new();
-        io::stdin().read_line(&mut response)?;
-
-        if !response.trim().eq_ignore_ascii_case("y") {
+        if !confirmed {
             println!("{}", "Cancelled.".yellow());
             return Ok(());
         }

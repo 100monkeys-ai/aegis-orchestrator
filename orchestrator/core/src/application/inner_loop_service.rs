@@ -325,7 +325,15 @@ impl InnerLoopService {
 
                                 let dispatch_id = DispatchId::new();
 
-                                let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
+                                let mut next_ctx = {
+                                    let lock = self.active_executions.read().await;
+                                    lock.get(execution_id_str)
+                                        .cloned()
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "execution context for '{}' not found in active_executions",
+                                            execution_id_str
+                                        ))?
+                                };
                                 next_ctx.pending_dispatch_id = Some(dispatch_id);
                                 next_ctx.pending_tool_call_id = Some(tool_call.id.clone());
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
@@ -345,7 +353,15 @@ impl InnerLoopService {
                                 );
 
                                 let tool_result = serde_json::to_string(&value).unwrap_or_default();
-                                let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
+                                let mut next_ctx = {
+                                    let lock = self.active_executions.read().await;
+                                    lock.get(execution_id_str)
+                                        .cloned()
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "execution context for '{}' not found in active_executions",
+                                            execution_id_str
+                                        ))?
+                                };
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,
@@ -402,7 +418,15 @@ impl InnerLoopService {
                                     "Tool returned recoverable error — feeding back to LLM"
                                 );
                                 let tool_result = format!("Tool execution error: {}", e);
-                                let mut next_ctx = self.active_executions.read().await.get(execution_id_str).unwrap().clone();
+                                let mut next_ctx = {
+                                    let lock = self.active_executions.read().await;
+                                    lock.get(execution_id_str)
+                                        .cloned()
+                                        .ok_or_else(|| anyhow::anyhow!(
+                                            "execution context for '{}' not found in active_executions",
+                                            execution_id_str
+                                        ))?
+                                };
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,

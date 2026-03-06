@@ -648,7 +648,10 @@ impl VolumeService for StandardVolumeService {
                                 .and_then(|v| VolumeId::from_string(v).ok())
                                 .unwrap_or_else(VolumeId::new),
                         },
-                        _ => unreachable!(),
+                        _ => unreachable!(
+                            "outer match arm guarantees only 'opendal', 'hostPath', or 'smcp' \
+                             strings reach this inner match; got an impossible arm"
+                        ),
                     };
 
                     let volume_id = VolumeId::new();
@@ -862,7 +865,7 @@ mod tests {
         assert_eq!(volume.size_limit_bytes, 100 * 1024 * 1024);
 
         // Verify storage provider calls
-        let directories = storage_provider.directories.lock().unwrap();
+        let directories = storage_provider.directories.lock().await;
         let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
         assert!(directories.contains_key(&remote_path));
     }
@@ -959,7 +962,7 @@ mod tests {
         );
 
         // Verify storage provider deleted directory
-        let directories = storage_provider.directories.lock().unwrap();
+        let directories = storage_provider.directories.lock().await;
         assert!(
             !directories.contains_key(&remote_path),
             "Directory should be deleted"

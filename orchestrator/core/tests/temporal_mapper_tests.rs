@@ -83,6 +83,7 @@ fn test_map_100monkeys_workflow() {
             initial_state: StateName::new("GENERATE").unwrap(),
             context: HashMap::from([("task".to_string(), serde_json::json!("Write fibonacci"))]),
             states,
+            volumes: vec![],
         },
     )
     .unwrap();

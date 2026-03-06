@@ -334,7 +334,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     aegis_orchestrator_core::infrastructure::storage::StorageBackend::SeaweedFS {
                         filer_url: filer_url.clone(),
                     },
-                )
+                )?
             }
             "local_host" => {
                 let mount_point = storage_config
@@ -346,7 +346,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     aegis_orchestrator_core::infrastructure::storage::StorageBackend::LocalHost {
                         mount_point,
                     },
-                )
+                )?
             }
             "opendal" => {
                 let opendal_config = storage_config.opendal.as_ref().cloned().unwrap_or_default();
@@ -360,7 +360,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         provider: opendal_config.provider,
                         options: resolved_options,
                     },
-                )
+                )?
             }
             other => return Err(anyhow::anyhow!("Unsupported storage backend: {}", other)),
         };

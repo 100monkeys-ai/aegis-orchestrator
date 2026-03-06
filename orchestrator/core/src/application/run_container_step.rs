@@ -143,8 +143,13 @@ impl RunContainerStepUseCase {
             }
         }
 
-        // Unreachable: the loop always returns or returns Err on last attempt.
-        unreachable!("retry loop should have returned or errored")
+        // SAFETY: Unreachable in practice — the `for` loop over `1..=max_attempts` covers all
+        // attempts, and the final attempt's `Err(e)` arm (above) always executes `return Err(e)`.
+        // `max_attempts` is clamped to ≥ 1 at construction, so the loop body runs at least once.
+        unreachable!(
+            "retry loop exhausted without returning — \
+             max_attempts({max_attempts}) invariant violated"
+        )
     }
 }
 

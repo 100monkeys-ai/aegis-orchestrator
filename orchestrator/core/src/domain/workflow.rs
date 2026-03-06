@@ -146,6 +146,35 @@ impl Workflow {
             }
         }
 
+        // Validate: All ContainerVolumeMount names resolve to declared spec.volumes
+        // (only enforced when spec.volumes is non-empty — opt-in per ADR-050)
+        if !spec.volumes.is_empty() {
+            let declared: std::collections::HashSet<&str> =
+                spec.volumes.iter().map(|v| v.name.as_str()).collect();
+
+            for (state_name, state) in &spec.states {
+                let mounts: Vec<&str> = match &state.kind {
+                    StateKind::ContainerRun { volumes, .. } => {
+                        volumes.iter().map(|m| m.name.as_str()).collect()
+                    }
+                    StateKind::ParallelContainerRun { steps, .. } => steps
+                        .iter()
+                        .flat_map(|s| s.volumes.iter().map(|m| m.name.as_str()))
+                        .collect(),
+                    _ => vec![],
+                };
+
+                for mount_name in mounts {
+                    if !declared.contains(mount_name) {
+                        return Err(WorkflowError::UndeclaredVolume {
+                            state: state_name.clone(),
+                            volume_name: mount_name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             id: WorkflowId::new(),
             metadata,
@@ -240,6 +269,39 @@ impl WorkflowMetadata {
     }
 }
 
+/// Storage class for a workflow-level volume declaration
+///
+/// Workflows may declare named volumes in `spec.volumes`; these are referenced
+/// by `ContainerVolumeMount.name` inside `ContainerRun` and `ParallelContainerRun` states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStorageClass {
+    /// Ephemeral volume — auto-cleaned after workflow execution ends
+    #[default]
+    Ephemeral,
+    /// Persistent volume — survives workflow execution boundaries
+    Persistent,
+}
+
+/// Declarative volume specification at the workflow level (ADR-050)
+///
+/// Volumes declared here are matched by name in `ContainerVolumeMount` entries.
+/// Volume provisioning itself is handled by the Storage Gateway Context (ADR-036/ADR-032);
+/// this declaration is the intent layer consumed by the manifest parser and Temporal mapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowVolumeSpec {
+    /// Logical name referenced by `ContainerVolumeMount.name`
+    pub name: String,
+
+    /// Storage class governing lifecycle (default: ephemeral)
+    #[serde(default)]
+    pub storage_class: WorkflowStorageClass,
+
+    /// Optional hard quota in bytes enforced by the Storage Gateway
+    #[serde(default)]
+    pub size_limit_bytes: Option<u64>,
+}
+
 /// Workflow specification (state machine definition)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowSpec {
@@ -252,6 +314,13 @@ pub struct WorkflowSpec {
 
     /// State machine definition (state_name -> state)
     pub states: HashMap<StateName, WorkflowState>,
+
+    /// Named volumes available to `ContainerRun` and `ParallelContainerRun` states (ADR-050)
+    ///
+    /// When non-empty, every `ContainerVolumeMount.name` in any container state must
+    /// resolve to a volume declared here (validated in `Workflow::new()`).
+    #[serde(default)]
+    pub volumes: Vec<WorkflowVolumeSpec>,
 }
 
 /// Individual state in the workflow FSM
@@ -945,6 +1014,14 @@ pub enum WorkflowError {
 
     #[error("Timeout exceeded for state '{0}'")]
     TimeoutExceeded(StateName),
+
+    #[error(
+        "Volume '{volume_name}' referenced in state '{state}' is not declared in spec.volumes"
+    )]
+    UndeclaredVolume {
+        state: StateName,
+        volume_name: String,
+    },
 }
 
 // ============================================================================
@@ -1077,6 +1154,7 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states: HashMap::new(),
+            volumes: vec![],
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1111,6 +1189,7 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
+            volumes: vec![],
         };
 
         let result = Workflow::new(metadata, spec);

@@ -114,6 +114,13 @@ impl StandardRuntimeRegistry {
     ///
     /// Returns [`RegistryError::FileNotFound`] if the file does not exist,
     /// or [`RegistryError::ParseError`] if the YAML is malformed.
+    ///
+    /// # Blocking I/O
+    ///
+    /// This function performs **synchronous** file I/O via [`std::fs::read_to_string`].
+    /// It is intentionally synchronous because it is only called once at daemon startup,
+    /// before the Tokio runtime processes any requests. Do **not** call this function
+    /// from within an `async` context — use `tokio::task::spawn_blocking` if needed.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RegistryError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path)

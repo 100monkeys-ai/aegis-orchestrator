@@ -183,6 +183,10 @@ pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
 fn get_pid_file_path() -> PathBuf {
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid()` is always safe to call — it has no preconditions,
+        // never fails, and cannot cause undefined behaviour. A safe wrapper
+        // (e.g. `nix::unistd::geteuid()`) could be used instead if the `nix`
+        // crate is added as a dependency.
         let uid = unsafe { libc::geteuid() };
         if uid == 0 {
             PathBuf::from(PID_FILE)
@@ -200,7 +204,13 @@ fn get_pid_file_path() -> PathBuf {
 fn process_exists(_pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(_pid as i32, 0) == 0 }
+        // SAFETY: `kill(pid, 0)` sends no signal and is the POSIX-standard way
+        // to test whether a process exists. The only precondition is that `pid`
+        // fits in `i32`; we guard against overflow with `try_from`.
+        let Ok(pid_i32) = i32::try_from(_pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid_i32, 0) == 0 }
     }
 
     #[cfg(windows)]
@@ -212,10 +222,14 @@ fn process_exists(_pid: u32) -> bool {
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> Result<()> {
-    unsafe {
-        if libc::kill(pid as i32, signal) != 0 {
-            anyhow::bail!("Failed to send signal {} to process {}", signal, pid);
-        }
+    let pid_i32 = i32::try_from(pid)
+        .map_err(|_| anyhow::anyhow!("PID {} overflows i32; cannot send signal", pid))?;
+    // SAFETY: `libc::kill` is safe when `pid_i32` is a valid process ID (which
+    // we have just verified fits in `i32`) and `signal` is a valid signal
+    // number supplied by the caller from named `libc::SIG*` constants.
+    let rc = unsafe { libc::kill(pid_i32, signal) };
+    if rc != 0 {
+        anyhow::bail!("Failed to send signal {} to process {}", signal, pid);
     }
     Ok(())
 }
