@@ -17,6 +17,10 @@
 //! - `aegis daemon start|stop|status|install|uninstall` - Manage daemon lifecycle
 //! - `aegis task deploy|execute|status|logs` - Agent operations
 //! - `aegis config show|validate|generate` - Configuration management
+//! - `aegis init` - Interactive setup wizard
+//! - `aegis up [--yes]` - Start the stack (runs init automatically if needed)
+//! - `aegis down [--volumes]` - Stop the Docker Compose stack
+//! - `aegis uninstall [-y]` - Stop stack and remove the ~/.aegis directory
 //!
 //! See ADR-008 for architecture details.
 //!
@@ -35,7 +39,8 @@ mod commands;
 mod daemon;
 
 use commands::{
-    AgentCommand, ConfigCommand, DaemonCommand, InitArgs, TaskCommand, WorkflowCommand,
+    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, TaskCommand, UninstallArgs,
+    UpArgs, WorkflowCommand,
 };
 
 /// AEGIS Agent Host - Enable autonomous agent execution
@@ -123,6 +128,27 @@ enum Commands {
         #[command(flatten)]
         args: InitArgs,
     },
+
+    /// Stop the local AEGIS Docker Compose stack
+    #[command(name = "down")]
+    Down {
+        #[command(flatten)]
+        args: DownArgs,
+    },
+
+    /// Start the AEGIS stack (runs `aegis init` automatically if not set up)
+    #[command(name = "up")]
+    Up {
+        #[command(flatten)]
+        args: UpArgs,
+    },
+
+    /// Stop the stack and permanently remove the AEGIS data directory
+    #[command(name = "uninstall")]
+    Uninstall {
+        #[command(flatten)]
+        args: UninstallArgs,
+    },
 }
 
 #[tokio::main]
@@ -157,6 +183,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Update { command }) => commands::update::execute(command, cli.config).await,
         Some(Commands::Init { args }) => commands::init::run(args).await,
+        Some(Commands::Down { args }) => commands::down::run(args).await,
+        Some(Commands::Up { args }) => commands::up::run(args).await,
+        Some(Commands::Uninstall { args }) => commands::uninstall::run(args).await,
         None => {
             // No command provided - show help
             eprintln!("{}", "No command specified. Use --help for usage.".yellow());

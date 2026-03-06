@@ -106,6 +106,15 @@ pub async fn run(args: InitArgs) -> Result<()> {
         std::fs::set_permissions(&db_script_path, perms)?;
     }
 
+    // Write the Temporal dynamic config file that the compose volume mount expects:
+    // ./temporal/ → /etc/temporal/config/dynamicconfig/ inside the container
+    let temporal_dir = node_config.working_dir.join("temporal");
+    std::fs::create_dir_all(&temporal_dir)?;
+    std::fs::write(
+        temporal_dir.join("development-sql.yaml"),
+        &stack.temporal_dynamic_config,
+    )?;
+
     // ─── Step 5: Pull images & start services ────────────────────────────────
     print_step(5, 7, "Starting Docker Compose stack");
     let runner = ComposeRunner::new(node_config.working_dir.clone());

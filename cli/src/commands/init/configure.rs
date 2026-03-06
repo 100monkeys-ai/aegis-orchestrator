@@ -123,29 +123,13 @@ impl ConfigWizard {
             working_dir: working_dir.clone(),
         };
 
-        // Write files
-        std::fs::create_dir_all(&working_dir)
-            .with_context(|| format!("Failed to create directory {}", working_dir.display()))?;
-
-        let aegis_config_content = self.render_aegis_config(&node_config, components);
-        let env_content = self.render_env(&node_config, components);
-
         let config_path = working_dir.join("aegis-config.yaml");
         let env_path = working_dir.join(".env");
         let compose_path = working_dir.join("docker-compose.yml");
         let runtime_registry_path = working_dir.join("runtime-registry.yaml");
 
-        std::fs::write(&config_path, &aegis_config_content)
-            .with_context(|| format!("Failed to write {}", config_path.display()))?;
-        std::fs::write(&env_path, &env_content)
-            .with_context(|| format!("Failed to write {}", env_path.display()))?;
-        std::fs::write(&compose_path, compose_content)
-            .with_context(|| format!("Failed to write {}", compose_path.display()))?;
-        std::fs::write(&runtime_registry_path, runtime_registry_content)
-            .with_context(|| format!("Failed to write {}", runtime_registry_path.display()))?;
-
-        let already_exists = config_path.exists();
-        if already_exists && !self.yes {
+        // Check for existing config *before* writing anything.
+        if config_path.exists() && !self.yes {
             let overwrite = Confirm::new()
                 .with_prompt(format!(
                     "{} already exists. Overwrite?",
@@ -158,6 +142,22 @@ impl ConfigWizard {
                 return Ok(node_config);
             }
         }
+
+        // Write files
+        std::fs::create_dir_all(&working_dir)
+            .with_context(|| format!("Failed to create directory {}", working_dir.display()))?;
+
+        let aegis_config_content = self.render_aegis_config(&node_config, components);
+        let env_content = self.render_env(&node_config, components);
+
+        std::fs::write(&config_path, &aegis_config_content)
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        std::fs::write(&env_path, &env_content)
+            .with_context(|| format!("Failed to write {}", env_path.display()))?;
+        std::fs::write(&compose_path, compose_content)
+            .with_context(|| format!("Failed to write {}", compose_path.display()))?;
+        std::fs::write(&runtime_registry_path, runtime_registry_content)
+            .with_context(|| format!("Failed to write {}", runtime_registry_path.display()))?;
 
         println!("  {} {}", "✓".green(), config_path.display());
         println!("  {} {}", "✓".green(), env_path.display());
@@ -267,7 +267,7 @@ impl ConfigWizard {
         } else {
             r#"
   storage:
-    backend: "local"
+    backend: "local_host"
 "#
         };
 

@@ -48,9 +48,60 @@ impl ComposeRunner {
     pub async fn up(&self) -> Result<()> {
         println!();
         println!("{}", "Starting services...".bold());
-        self.run_compose(&["up", "-d", "--wait"])?;
+
+        if let Err(e) = self.run_compose(&["up", "-d", "--wait"]) {
+            // Print container logs so the user can see *why* a service crashed
+            // without having to manually run `docker compose logs`.
+            eprintln!();
+            eprintln!(
+                "{}",
+                "── Container logs ──────────────────────────────".dimmed()
+            );
+            let logs = self.collect_logs();
+            if logs.trim().is_empty() {
+                eprintln!("{}", "  (no container logs captured)".dimmed());
+            } else {
+                for line in logs.lines() {
+                    eprintln!("  {}", line);
+                }
+            }
+            eprintln!(
+                "{}",
+                "────────────────────────────────────────────────".dimmed()
+            );
+            eprintln!();
+            eprintln!("{}  To inspect logs at any time run:", "tip:".cyan().bold());
+            eprintln!(
+                "      docker compose -f {} logs --follow",
+                self.dir.join("docker-compose.yml").display()
+            );
+            eprintln!();
+            return Err(e);
+        }
+
         println!("  {} Services started", "✓".green());
         Ok(())
+    }
+
+    /// Collect recent logs from all services for post-failure diagnostics.
+    /// Returns an empty string if the command fails (best-effort).
+    fn collect_logs(&self) -> String {
+        let output = Command::new("docker")
+            .arg("compose")
+            .args(["logs", "--tail=60", "--no-color"])
+            .current_dir(&self.dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output();
+
+        match output {
+            Ok(o) => {
+                let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+                let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+                format!("{}{}", stdout, stderr)
+            }
+            Err(_) => String::new(),
+        }
     }
 
     // ─── Private helpers ──────────────────────────────────────────────────────

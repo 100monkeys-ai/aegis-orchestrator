@@ -48,6 +48,11 @@ const FILES: &[RemoteFile] = &[
         path: "agents/hello-world/agent.yaml",
         label: "hello-world/agent.yaml",
     },
+    RemoteFile {
+        repo: EXAMPLES_REPO,
+        path: "deploy/temporal/development-sql.yaml",
+        label: "temporal/development-sql.yaml",
+    },
 ];
 
 /// Bundle of all downloaded stack files.
@@ -56,6 +61,7 @@ pub struct StackFiles {
     pub init_db_script: String,
     pub runtime_registry: String,
     pub hello_world_agent: String,
+    pub temporal_dynamic_config: String,
 }
 
 /// Download the AEGIS stack from GitHub.
@@ -105,5 +111,6 @@ pub async fn fetch_stack() -> Result<StackFiles> {
         init_db_script: contents[1].clone(),
         runtime_registry: contents[2].clone(),
         hello_world_agent: contents[3].clone(),
+        temporal_dynamic_config: contents[4].clone(),
     })
 }
