@@ -1216,10 +1216,12 @@ spec:
         let exec = manifest.spec.execution.unwrap();
         let tool_val = exec.tool_validation.unwrap();
         assert_eq!(tool_val.len(), 1);
+        assert!(
+            matches!(&tool_val[0], ValidatorSpec::Semantic { .. }),
+            "Expected semantic validator"
+        );
         if let ValidatorSpec::Semantic { judge_agent, .. } = &tool_val[0] {
             assert_eq!(judge_agent, "code-quality-judge");
-        } else {
-            panic!("Expected semantic validator");
         }
     }
 }

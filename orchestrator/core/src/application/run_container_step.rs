@@ -143,13 +143,9 @@ impl RunContainerStepUseCase {
             }
         }
 
-        // SAFETY: Unreachable in practice — the `for` loop over `1..=max_attempts` covers all
-        // attempts, and the final attempt's `Err(e)` arm (above) always executes `return Err(e)`.
-        // `max_attempts` is clamped to ≥ 1 at construction, so the loop body runs at least once.
-        unreachable!(
-            "retry loop exhausted without returning — \
-             max_attempts({max_attempts}) invariant violated"
-        )
+        Err(ContainerStepError::DockerError(format!(
+            "retry loop exhausted without returning (max_attempts={max_attempts})"
+        )))
     }
 }
 

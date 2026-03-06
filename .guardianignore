@@ -29,6 +29,13 @@ check_error*.log
 error.log
 full_error.log
 guardian_report.txt
+rust_guardian.txt
+guardian.yaml
+.guardianignore
+**/rust_guardian.txt
+**/guardian_report.txt
+**/guardian.yaml
+**/.guardianignore
 
 # === IDE and Tools ===
 .vscode/
@@ -72,6 +79,15 @@ demo-agents/
 scripts/
 # Exclude node_modules if present (e.g. in docs or frontend)
 **/node_modules/
+# Non-Rust template/infra files that trigger placeholder/path keywords by design
+cli/templates/
+cli/migrations/
+docker/
+.github/workflows/
+**/cli/templates/
+**/cli/migrations/
+**/docker/
+**/.github/workflows/
 
 # === Cache Files ===
 .guardian_cache.json

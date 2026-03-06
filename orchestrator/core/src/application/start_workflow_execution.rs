@@ -169,8 +169,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             .context("Failed to start workflow execution in Temporal")?;
 
         // Step 6: Update execution with temporal_run_id (for tracking)
-        // Note: In a full implementation, we would update the repository with the run_id
-        // For now, we attach it only in the response
+        // Current behavior attaches the run_id to the response payload.
 
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(

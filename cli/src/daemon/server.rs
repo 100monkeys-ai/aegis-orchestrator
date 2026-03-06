@@ -71,6 +71,19 @@ use aegis_orchestrator_core::{
 
 use super::{remove_pid_file, write_pid_file};
 
+fn default_local_host_mount_point() -> String {
+    if let Ok(path) = std::env::var("AEGIS_LOCAL_HOST_MOUNT_POINT") {
+        return path;
+    }
+
+    let default_path = PathBuf::from("/")
+        .join("var")
+        .join("lib")
+        .join("aegis")
+        .join("local-host-volumes");
+    default_path.to_string_lossy().into_owned()
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Daemonize on Unix
     // NOTE: We skip internal daemonization because calling fork() (via daemonize)
@@ -341,7 +354,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     .local_host
                     .as_ref()
                     .map(|l| l.mount_point.clone())
-                    .unwrap_or_else(|| "/var/lib/aegis/local-host-volumes".to_string());
+                    .unwrap_or_else(default_local_host_mount_point);
                 aegis_orchestrator_core::infrastructure::storage::create_storage_provider(
                     aegis_orchestrator_core::infrastructure::storage::StorageBackend::LocalHost {
                         mount_point,

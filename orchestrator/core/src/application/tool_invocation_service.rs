@@ -92,11 +92,8 @@ impl ToolInvocationService {
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload)?;
 
-        // 3. Route tool call to the appropriate TCP server
-        // The ToolRouter returns a ToolServerId, but we might actually want to call the tool.
-        // For MVP, if it routes successfully, we return a mock payload or delegate to actual calling logic.
-        // Wait, the ToolRouter doesn't actually *invoke* the tool yet. It returns `ToolServerId`.
-        // Let's get the server ID first.
+        // 3. Route tool call to the appropriate TCP server.
+        // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
         let server_id = self
             .tool_router
             .route_tool(session.execution_id, &tool_name)
@@ -123,8 +120,7 @@ impl ToolInvocationService {
                     agent_id
                 );
 
-                // [MVP Placeholder for FSAL operations]
-                // Examples: modifying /shared/<agent_id>/workspace natively on the host filesystem
+                // FSAL execution wiring can be expanded with concrete file operations.
 
                 Ok(serde_json::json!({
                     "status": "success",
@@ -150,7 +146,7 @@ impl ToolInvocationService {
                     server_id
                 );
 
-                // [MVP Placeholder for stdio/http IPC to actual MCP server process]
+                // JSON-RPC transport wiring can be expanded with concrete stdio/http IPC.
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",

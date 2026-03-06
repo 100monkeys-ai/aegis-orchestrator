@@ -159,12 +159,3 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    #[ignore = "integration test — see tests/temporal_integration_test.rs"]
-    #[tokio::test]
-    async fn test_register_workflow_success() {
-        // Integration test - see ../tests/temporal_integration_test.rs
-    }
-}

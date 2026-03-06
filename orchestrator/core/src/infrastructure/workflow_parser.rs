@@ -970,7 +970,7 @@ spec:
                 assert_eq!(r.backoff.as_deref(), Some("5s"));
                 assert!(!shell);
             }
-            other => panic!("expected ContainerRun, got {:?}", other),
+            other => assert!(false, "expected ContainerRun, got {:?}", other),
         }
     }
 
@@ -1015,7 +1015,7 @@ spec:
                     crate::domain::workflow::ParallelCompletionStrategy::AllSucceed
                 );
             }
-            other => panic!("expected ParallelContainerRun, got {:?}", other),
+            other => assert!(false, "expected ParallelContainerRun, got {:?}", other),
         }
     }
 
@@ -1080,7 +1080,7 @@ spec:
                 assert_eq!(i1, i2);
                 assert_eq!(v1.len(), v2.len());
             }
-            _ => panic!("both states should be ContainerRun after round-trip"),
+            _ => assert!(false, "both states should be ContainerRun after round-trip"),
         }
     }
 

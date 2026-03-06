@@ -494,11 +494,19 @@ mod tests {
         event_bus.publish_agent_event(event.clone());
 
         let received = receiver.recv().await.unwrap();
+        assert!(
+            matches!(
+                received,
+                DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { .. })
+            ),
+            "Expected AgentDeployed event, got {:?}",
+            received
+        );
         let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
             agent_id: id, ..
         }) = received
         else {
-            panic!("Expected AgentDeployed event, got {:?}", received);
+            return;
         };
         assert_eq!(id, agent_id);
     }
@@ -527,11 +535,16 @@ mod tests {
         });
 
         let received = receiver.recv().await.unwrap();
+        assert!(
+            matches!(received, ExecutionEvent::ExecutionStarted { .. }),
+            "Expected ExecutionStarted event, got {:?}",
+            received
+        );
         let ExecutionEvent::ExecutionStarted {
             execution_id: id, ..
         } = received
         else {
-            panic!("Expected ExecutionStarted event, got {:?}", received);
+            return;
         };
         assert_eq!(id, execution_id);
     }

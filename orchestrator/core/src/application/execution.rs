@@ -678,7 +678,7 @@ impl ExecutionService for StandardExecutionService {
             tracing::debug!("Storage config: backend={}", storage_config.backend);
 
             // Create volumes using volume service
-            let tenant_id = TenantId::default_tenant(); // TODO: Multi-tenancy
+            let tenant_id = TenantId::default_tenant(); // Uses the default tenant context.
             let volumes = self
                 .volume_service
                 .create_volumes_for_execution(

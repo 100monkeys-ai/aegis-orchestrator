@@ -163,7 +163,7 @@ async fn execute_daemon(
         } else {
             // Deploy manifest and use resulting ID
             let manifest_path = PathBuf::from(&agent);
-            if manifest_path.exists() {
+            if tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
                 let manifest_content = tokio::fs::read_to_string(&manifest_path)
                     .await
                     .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;

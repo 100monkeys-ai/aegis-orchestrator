@@ -10,12 +10,14 @@
 pub mod agent;
 pub mod config;
 pub mod daemon;
+pub mod init;
 pub mod task;
 pub mod workflow;
 
 pub use self::agent::AgentCommand;
 pub use self::config::ConfigCommand;
 pub use self::daemon::DaemonCommand;
+pub use self::init::InitArgs;
 pub use self::task::TaskCommand;
 pub use self::workflow::WorkflowCommand;
 pub mod update;

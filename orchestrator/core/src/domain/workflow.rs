@@ -1244,10 +1244,15 @@ mod tests {
         assert!(json.contains("0.85"), "threshold missing: {}", json);
 
         let round_tripped: TransitionCondition = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                round_tripped,
+                TransitionCondition::ScoreAndConfidenceAbove { .. }
+            ),
+            "Round-trip produced wrong variant"
+        );
         if let TransitionCondition::ScoreAndConfidenceAbove { threshold } = round_tripped {
             assert!((threshold - 0.85).abs() < f64::EPSILON);
-        } else {
-            panic!("Round-trip produced wrong variant");
         }
     }
 

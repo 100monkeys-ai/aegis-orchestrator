@@ -34,7 +34,9 @@ use tracing::info;
 mod commands;
 mod daemon;
 
-use commands::{AgentCommand, ConfigCommand, DaemonCommand, TaskCommand, WorkflowCommand};
+use commands::{
+    AgentCommand, ConfigCommand, DaemonCommand, InitArgs, TaskCommand, WorkflowCommand,
+};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -114,6 +116,13 @@ enum Commands {
         #[command(flatten)]
         command: commands::UpdateCommand,
     },
+
+    /// Interactive setup wizard — install and configure AEGIS from scratch
+    #[command(name = "init")]
+    Init {
+        #[command(flatten)]
+        args: InitArgs,
+    },
 }
 
 #[tokio::main]
@@ -147,6 +156,7 @@ async fn main() -> Result<()> {
             commands::workflow::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Update { command }) => commands::update::execute(command, cli.config).await,
+        Some(Commands::Init { args }) => commands::init::run(args).await,
         None => {
             // No command provided - show help
             eprintln!("{}", "No command specified. Use --help for usage.".yellow());

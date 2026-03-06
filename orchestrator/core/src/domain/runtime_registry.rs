@@ -285,7 +285,11 @@ spec:
             Err(RegistryError::UnsupportedLanguage { language, .. }) => {
                 assert_eq!(language, "ruby");
             }
-            other => panic!("Expected UnsupportedLanguage error, got: {:?}", other),
+            other => assert!(
+                false,
+                "Expected UnsupportedLanguage error, got: {:?}",
+                other
+            ),
         }
     }
 
@@ -314,7 +318,7 @@ spec:
                 assert_eq!(language, "python");
                 assert_eq!(version, "3.9");
             }
-            other => panic!("Expected UnsupportedVersion error, got: {:?}", other),
+            other => assert!(false, "Expected UnsupportedVersion error, got: {:?}", other),
         }
     }
 

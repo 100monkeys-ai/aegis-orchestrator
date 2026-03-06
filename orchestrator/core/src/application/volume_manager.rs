@@ -593,7 +593,7 @@ impl VolumeService for StandardVolumeService {
             // Attempt to create volume
             let volume_id = match spec.volume_type.as_str() {
                 "seaweedfs" | "local_host" | "opendal_memory" => {
-                    // Try SeaweedFS / Local / Default standard workflow for now
+                    // Handle SeaweedFS / Local / Default standard workflow.
                     match self
                         .create_volume(
                             spec.name.clone(),
@@ -616,7 +616,7 @@ impl VolumeService for StandardVolumeService {
                 }
                 "opendal" | "hostPath" | "smcp" => {
                     // Custom non-standard volume types.
-                    // For now, we will construct the backend appropriately and store directly to bypass standard seaweedsfs creation routine.
+                    // Construct backend directly and persist without the standard SeaweedFS routine.
                     let backend = match spec.volume_type.as_str() {
                         "opendal" => VolumeBackend::OpenDal {
                             provider: spec.provider.clone().unwrap_or_else(|| "s3".to_string()),
@@ -629,7 +629,13 @@ impl VolumeService for StandardVolumeService {
                                     .as_ref()
                                     .and_then(|c| c.get("path"))
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("/tmp/aegis"),
+                                    .map(std::borrow::ToOwned::to_owned)
+                                    .unwrap_or_else(|| {
+                                        std::env::temp_dir()
+                                            .join("aegis")
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    }),
                             ),
                         },
                         "smcp" => VolumeBackend::Smcp {
@@ -648,10 +654,12 @@ impl VolumeService for StandardVolumeService {
                                 .and_then(|v| VolumeId::from_string(v).ok())
                                 .unwrap_or_else(VolumeId::new),
                         },
-                        _ => unreachable!(
-                            "outer match arm guarantees only 'opendal', 'hostPath', or 'smcp' \
-                             strings reach this inner match; got an impossible arm"
-                        ),
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Invalid custom volume type '{}'",
+                                spec.volume_type
+                            ));
+                        }
                     };
 
                     let volume_id = VolumeId::new();
@@ -749,12 +757,12 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    // Mock VolumeRepository for testing
-    struct MockVolumeRepository {
+    // Test repository for volume persistence behavior.
+    struct TestVolumeRepository {
         volumes: Arc<Mutex<HashMap<VolumeId, Volume>>>,
     }
 
-    impl MockVolumeRepository {
+    impl TestVolumeRepository {
         fn new() -> Self {
             Self {
                 volumes: Arc::new(Mutex::new(HashMap::new())),
@@ -763,7 +771,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl VolumeRepository for MockVolumeRepository {
+    impl VolumeRepository for TestVolumeRepository {
         async fn save(&self, volume: &Volume) -> Result<(), RepositoryError> {
             let mut volumes = self.volumes.lock().await;
             volumes.insert(volume.id, volume.clone());
@@ -817,10 +825,10 @@ mod tests {
 
     fn create_test_service() -> (
         StandardVolumeService,
-        Arc<MockVolumeRepository>,
+        Arc<TestVolumeRepository>,
         Arc<MockStorageProvider>,
     ) {
-        let repository = Arc::new(MockVolumeRepository::new());
+        let repository = Arc::new(TestVolumeRepository::new());
         let storage_provider = Arc::new(MockStorageProvider::new());
         let event_bus = Arc::new(EventBus::with_default_capacity());
 

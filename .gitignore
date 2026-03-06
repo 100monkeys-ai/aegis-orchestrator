@@ -28,6 +28,7 @@ aegis-config.yaml
 
 # Rust Guardian
 guardian_report.*
+rust_guardian.*
 
 # Protocol Buffers
 cli/tools/*

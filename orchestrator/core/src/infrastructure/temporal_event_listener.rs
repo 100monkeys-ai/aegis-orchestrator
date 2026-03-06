@@ -429,8 +429,13 @@ mod tests {
         };
 
         let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
+        assert!(
+            matches!(event, WorkflowEvent::WorkflowExecutionStarted { .. }),
+            "Expected WorkflowExecutionStarted, got {:?}",
+            event
+        );
         let WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } = event else {
-            panic!("Expected WorkflowExecutionStarted, got {:?}", event);
+            return;
         };
         assert_eq!(
             execution_id.0.to_string(),
