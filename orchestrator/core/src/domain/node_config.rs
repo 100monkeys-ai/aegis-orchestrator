@@ -153,6 +153,16 @@ pub struct NodeConfigSpec {
     /// Named security contexts for SMCP (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_contexts: Option<Vec<SecurityContextDefinition>>,
+
+    /// Keycloak IAM configuration (ADR-041)
+    /// If omitted, all auth middleware is disabled (pass-through for local development).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keycloak: Option<KeycloakConfig>,
+
+    /// gRPC authentication configuration (ADR-041)
+    /// If omitted, gRPC endpoints are unauthenticated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_auth: Option<GrpcAuthConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -957,6 +967,88 @@ pub struct RateLimitDefinition {
     pub per_seconds: u32,
 }
 
+/// Keycloak IAM configuration (ADR-041 §Node Configuration).
+///
+/// Defines the trusted Keycloak realms, JWKS cache TTL, and custom claim names.
+/// When this section is present in `aegis-config.yaml`, all HTTP and gRPC
+/// auth middleware is enabled. When absent, auth is disabled (local dev mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeycloakConfig {
+    /// All known realms — determines which JWKS endpoints to trust and cache.
+    /// The platform validates JWTs against the realm matching the JWT's "iss" claim.
+    pub realms: Vec<KeycloakRealmConfig>,
+
+    /// JWKS cache TTL in seconds — keys refreshed this often to support key rotation.
+    /// Default: 300 (5 minutes).
+    #[serde(default = "default_jwks_cache_ttl")]
+    pub jwks_cache_ttl_seconds: u64,
+
+    /// Custom claim names for Keycloak attribute mappers.
+    #[serde(default)]
+    pub claims: KeycloakClaimsConfig,
+}
+
+/// Individual realm configuration entry within `spec.keycloak.realms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeycloakRealmConfig {
+    /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
+    pub slug: String,
+    /// Full issuer URL: https://auth.myzaru.com/realms/{slug}
+    pub issuer_url: String,
+    /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
+    pub jwks_uri: String,
+    /// Expected "aud" claim value for tokens from this realm
+    pub audience: String,
+    /// Realm classification: "system", "consumer", or "tenant"
+    pub kind: String,
+}
+
+/// Custom claim names for Keycloak attribute mappers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeycloakClaimsConfig {
+    /// Custom claim mapper name for ZaruTier. Default: "zaru_tier"
+    #[serde(default = "default_zaru_tier_claim")]
+    pub zaru_tier: String,
+    /// Role attribute name in aegis-system realm. Default: "aegis_role"
+    #[serde(default = "default_aegis_role_claim")]
+    pub aegis_role: String,
+}
+
+impl Default for KeycloakClaimsConfig {
+    fn default() -> Self {
+        Self {
+            zaru_tier: default_zaru_tier_claim(),
+            aegis_role: default_aegis_role_claim(),
+        }
+    }
+}
+
+fn default_jwks_cache_ttl() -> u64 {
+    300
+}
+
+fn default_zaru_tier_claim() -> String {
+    "zaru_tier".to_string()
+}
+
+fn default_aegis_role_claim() -> String {
+    "aegis_role".to_string()
+}
+
+/// gRPC authentication configuration (ADR-041 §gRPC Authentication Amendment).
+///
+/// When enabled, a `KeycloakAuthInterceptor` is installed on the gRPC server
+/// that validates Bearer JWTs on every call except exempted methods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcAuthConfig {
+    /// Whether gRPC JWT auth is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Methods exempt from token auth (e.g. inner loop bootstrap channel).
+    #[serde(default)]
+    pub exempt_methods: Vec<String>,
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -1122,6 +1214,8 @@ impl Default for NodeConfigSpec {
             openbao: None,
             smcp: None,
             security_contexts: None,
+            keycloak: None,
+            grpc_auth: None,
         }
     }
 }
@@ -1493,6 +1587,8 @@ mod tests {
                 smcp: None,
                 security_contexts: None,
                 registry_credentials: vec![],
+                keycloak: None,
+                grpc_auth: None,
             },
         };
 

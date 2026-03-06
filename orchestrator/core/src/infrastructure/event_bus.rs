@@ -35,6 +35,7 @@
 //! | `Policy` | BC-4 | — |
 //! | `Stimulus` | BC-8 | ADR-021 |
 //! | `ImageManagement` | BC-2 | ADR-045 |
+//! | `Iam` | BC-13 | ADR-041 |
 //!
 //! ## Phase Notes
 //!
@@ -52,9 +53,9 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{
-    AgentLifecycleEvent, ExecutionEvent, ImageManagementEvent, LearningEvent, MCPToolEvent,
-    PolicyEvent, SmcpEvent, StimulusEvent, StorageEvent, ValidationEvent, VolumeEvent,
-    WorkflowEvent,
+    AgentLifecycleEvent, ExecutionEvent, IamEvent, ImageManagementEvent, LearningEvent,
+    MCPToolEvent, PolicyEvent, SmcpEvent, StimulusEvent, StorageEvent, ValidationEvent,
+    VolumeEvent, WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -79,6 +80,8 @@ pub enum DomainEvent {
     Stimulus(StimulusEvent),
     /// BC-2 container image pull lifecycle events (ADR-045)
     ImageManagement(ImageManagementEvent),
+    /// BC-13 IAM & Identity Federation events (ADR-041)
+    Iam(IamEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -151,6 +154,11 @@ impl EventBus {
     /// Publish a container image management event (BC-2 ADR-045)
     pub fn publish_image_event(&self, event: ImageManagementEvent) {
         self.publish(DomainEvent::ImageManagement(event));
+    }
+
+    /// Publish an IAM event (BC-13 ADR-041)
+    pub fn publish_iam_event(&self, event: IamEvent) {
+        self.publish(DomainEvent::Iam(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -396,6 +404,7 @@ impl AgentEventReceiver {
             },
             DomainEvent::Stimulus(_) => false, // Stimulus events are system-wide, not per-agent
             DomainEvent::ImageManagement(_) => false, // Image management events are system-wide, not per-agent
+            DomainEvent::Iam(_) => false,             // IAM events are system-wide, not per-agent
         }
     }
 }

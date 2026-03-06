@@ -1,0 +1,382 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+//! # IAM & Identity Federation Domain Types (BC-13, ADR-041)
+//!
+//! Keycloak is the single trusted OIDC issuer for all human and service-account
+//! authentication on the AEGIS platform. This module defines the aggregate roots,
+//! entities, value objects, domain service traits, and error types for BC-13.
+//!
+//! ## Key Types
+//!
+//! | Type | Role | Description |
+//! |------|------|-------------|
+//! | [`KeycloakRealm`] | Aggregate Root | Configured Keycloak realm known to AEGIS |
+//! | [`OidcClient`] | Entity | Registered OIDC client within a realm |
+//! | [`UserIdentity`] | Value Object | Resolved identity from a validated JWT |
+//! | [`ValidatedKeycloakToken`] | Value Object | Immutable decoded JWT (never constructed directly) |
+//! | [`KeycloakIamService`] | Domain Service | Token validation, tier/role resolution |
+//! | [`RealmRepository`] | Repository | Persistence for known realms |
+//!
+//! ## Design Notes
+//!
+//! - `UserIdentity` is **never persisted** — reconstructed from JWT on every request.
+//! - `ZaruTier` is owned by BC-13 (IAM) and sourced from a Keycloak custom claim.
+//!   Previously defined on `ZaruSession` in BC-12; the source of truth has moved.
+//! - SMCP agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
+//!   Keycloak is for human and service-account identities only.
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+// ── Aggregate Root: KeycloakRealm ────────────────────────────────────────────
+
+/// Represents a configured Keycloak realm known to the AEGIS platform.
+/// Each realm corresponds to an OpenBao namespace (ADR-034 alignment).
+/// The realm is the top-level trust boundary for all tokens issued within it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeycloakRealm {
+    /// Realm identifier: "aegis-system" | "zaru-consumer" | "tenant-{slug}"
+    pub realm_slug: String,
+    /// Full issuer URL: https://auth.myzaru.com/realms/{slug}
+    pub issuer_url: String,
+    /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
+    pub jwks_uri: String,
+    /// Expected "aud" claim value for tokens from this realm
+    pub audience: String,
+    /// Classification of this realm
+    pub realm_kind: RealmKind,
+}
+
+/// Classification of Keycloak realms.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RealmKind {
+    /// "aegis-system" — operators, SDK service accounts
+    System,
+    /// "zaru-consumer" — individual Zaru users
+    Consumer,
+    /// "tenant-{slug}" — enterprise tenant users
+    Tenant { slug: String },
+}
+
+// ── Entity: OidcClient ───────────────────────────────────────────────────────
+
+/// A registered OIDC client within a Keycloak realm.
+/// Service accounts use ClientCredentials grant.
+/// UI applications use AuthorizationCode + PKCE.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcClient {
+    /// Keycloak client_id (e.g. "aegis-control-plane", "aegis-sdk-python")
+    pub client_id: String,
+    /// Which realm this client belongs to
+    pub realm_slug: String,
+    /// OAuth2 grant type used by this client
+    pub grant_type: GrantType,
+    /// Scopes this client is allowed to request
+    pub allowed_scopes: Vec<String>,
+}
+
+/// OAuth2 grant type for OIDC clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GrantType {
+    /// Control Plane UI, LibreChat
+    AuthorizationCodePkce,
+    /// SDK clients, CI/CD pipelines
+    ClientCredentials,
+}
+
+// ── Value Objects ────────────────────────────────────────────────────────────
+
+/// Resolved identity from a validated Keycloak JWT.
+/// This is the canonical human/service identity used throughout the application layer.
+/// Never persisted — reconstructed from JWT on every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserIdentity {
+    /// Keycloak subject UUID (stable per user per realm)
+    pub sub: String,
+    /// Which realm issued this token
+    pub realm_slug: String,
+    /// User email if present in claims
+    pub email: Option<String>,
+    /// Classification of this identity
+    pub identity_kind: IdentityKind,
+}
+
+/// Classification of the authenticated entity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdentityKind {
+    /// zaru-consumer realm user
+    ConsumerUser { zaru_tier: ZaruTier },
+    /// aegis-system realm human operator
+    Operator { aegis_role: AegisRole },
+    /// aegis-system realm M2M client
+    ServiceAccount { client_id: String },
+    /// tenant-{slug} realm enterprise user
+    TenantUser { tenant_slug: String },
+}
+
+/// ZaruTier is owned by BC-13 (IAM) and sourced from a Keycloak custom claim.
+/// Maps to SMCP SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ZaruTier {
+    Free,
+    Pro,
+    Enterprise,
+}
+
+impl ZaruTier {
+    /// Map to SMCP SecurityContext name (consumed by ZaruAuthMiddleware → AttestationService).
+    pub fn to_security_context_name(&self) -> &'static str {
+        match self {
+            ZaruTier::Free => "zaru-free",
+            ZaruTier::Pro => "zaru-pro",
+            ZaruTier::Enterprise => "zaru-enterprise",
+        }
+    }
+
+    /// Parse from the string value in the Keycloak `zaru_tier` custom claim.
+    pub fn from_claim(value: &str) -> Option<ZaruTier> {
+        match value {
+            "free" => Some(ZaruTier::Free),
+            "pro" => Some(ZaruTier::Pro),
+            "enterprise" => Some(ZaruTier::Enterprise),
+            _ => None,
+        }
+    }
+}
+
+/// Role for operators authenticated via the aegis-system realm.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AegisRole {
+    /// "aegis:admin" — full platform access
+    Admin,
+    /// "aegis:operator" — deploy/manage agents, view executions
+    Operator,
+    /// "aegis:readonly" — view-only access to all surfaces
+    Readonly,
+}
+
+impl AegisRole {
+    /// Parse from the string value in the Keycloak `aegis_role` custom claim.
+    pub fn from_claim(value: &str) -> Option<AegisRole> {
+        match value {
+            "aegis:admin" => Some(AegisRole::Admin),
+            "aegis:operator" => Some(AegisRole::Operator),
+            "aegis:readonly" => Some(AegisRole::Readonly),
+            _ => None,
+        }
+    }
+
+    /// Convert to the canonical claim string representation.
+    pub fn as_claim_str(&self) -> &'static str {
+        match self {
+            AegisRole::Admin => "aegis:admin",
+            AegisRole::Operator => "aegis:operator",
+            AegisRole::Readonly => "aegis:readonly",
+        }
+    }
+}
+
+/// A validated, decoded Keycloak JWT. Immutable value object.
+/// Constructed by `KeycloakIamService::validate_token()`; never constructed directly.
+#[derive(Debug, Clone)]
+pub struct ValidatedKeycloakToken {
+    /// Resolved identity from the token claims
+    pub identity: UserIdentity,
+    /// When the token was issued
+    pub issued_at: DateTime<Utc>,
+    /// When the token expires
+    pub expires_at: DateTime<Utc>,
+    /// Full claims for audit trail
+    pub raw_claims: serde_json::Value,
+}
+
+/// Represents a Keycloak tenant realm with its JWKS endpoint.
+/// Used during tenant onboarding (Phase 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TenantRealm {
+    /// Tenant slug identifier
+    pub slug: String,
+    /// Full issuer URL for this tenant realm
+    pub issuer_url: String,
+    /// JWKS endpoint for token validation
+    pub jwks_uri: String,
+}
+
+// ── Domain Service: KeycloakIamService ───────────────────────────────────────
+
+/// Domain service for Keycloak IAM token validation and identity resolution.
+///
+/// Implementations validate Bearer JWTs against the appropriate realm's JWKS
+/// endpoint, extract custom claims (zaru_tier, aegis_role), and resolve
+/// the canonical `UserIdentity` for use in authorization decisions.
+#[async_trait]
+pub trait KeycloakIamService: Send + Sync {
+    /// Validate a Bearer JWT against the appropriate realm's JWKS.
+    /// Realm is determined from the JWT's `iss` claim.
+    /// Returns a resolved `ValidatedKeycloakToken` or an `IamError`.
+    async fn validate_token(&self, raw_jwt: &str) -> Result<ValidatedKeycloakToken, IamError>;
+
+    /// Resolve the ZaruTier for a consumer user (extracts zaru_tier claim).
+    /// Only valid for tokens from the zaru-consumer realm or a tenant realm.
+    fn resolve_tier(&self, token: &ValidatedKeycloakToken) -> Result<ZaruTier, IamError>;
+
+    /// Resolve the AegisRole for an operator (extracts aegis_role claim).
+    /// Only valid for tokens from the aegis-system realm.
+    fn resolve_role(&self, token: &ValidatedKeycloakToken) -> Result<AegisRole, IamError>;
+
+    /// List all configured realms (used for JWKS cache warm-up on startup).
+    fn known_realms(&self) -> Vec<KeycloakRealm>;
+}
+
+// ── Error Type ───────────────────────────────────────────────────────────────
+
+/// Errors from IAM token validation and identity resolution.
+#[derive(Debug, thiserror::Error)]
+pub enum IamError {
+    #[error("JWT signature verification failed: {0}")]
+    SignatureInvalid(String),
+
+    #[error("JWT expired at {expired_at}")]
+    TokenExpired { expired_at: DateTime<Utc> },
+
+    #[error("Issuer {issuer} is not a trusted Keycloak realm")]
+    UnknownIssuer { issuer: String },
+
+    #[error("Required claim {claim} missing from token")]
+    MissingClaim { claim: &'static str },
+
+    #[error("JWKS fetch failed for realm {realm}: {reason}")]
+    JwksFetchFailed { realm: String, reason: String },
+
+    #[error("Invalid claim value for {claim}: {value}")]
+    InvalidClaimValue { claim: &'static str, value: String },
+
+    #[error("JWT decode error: {0}")]
+    DecodeError(String),
+}
+
+// ── Repository: RealmRepository ──────────────────────────────────────────────
+
+/// Repository trait for persisting and querying known Keycloak realms.
+///
+/// Phase 1: in-memory implementation backed by the node config.
+/// Phase 2: PostgreSQL-backed for dynamic tenant realm discovery.
+#[async_trait]
+pub trait RealmRepository: Send + Sync {
+    /// Persist a realm configuration.
+    async fn save(&self, realm: KeycloakRealm) -> anyhow::Result<()>;
+
+    /// Look up a realm by its slug identifier.
+    async fn find_by_slug(&self, slug: &str) -> anyhow::Result<Option<KeycloakRealm>>;
+
+    /// List all known realms.
+    async fn list_all(&self) -> anyhow::Result<Vec<KeycloakRealm>>;
+
+    /// Remove a realm configuration.
+    async fn delete(&self, slug: &str) -> anyhow::Result<()>;
+}
+
+// ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zaru_tier_to_security_context_name() {
+        assert_eq!(ZaruTier::Free.to_security_context_name(), "zaru-free");
+        assert_eq!(ZaruTier::Pro.to_security_context_name(), "zaru-pro");
+        assert_eq!(
+            ZaruTier::Enterprise.to_security_context_name(),
+            "zaru-enterprise"
+        );
+    }
+
+    #[test]
+    fn zaru_tier_from_claim() {
+        assert_eq!(ZaruTier::from_claim("free"), Some(ZaruTier::Free));
+        assert_eq!(ZaruTier::from_claim("pro"), Some(ZaruTier::Pro));
+        assert_eq!(
+            ZaruTier::from_claim("enterprise"),
+            Some(ZaruTier::Enterprise)
+        );
+        assert_eq!(ZaruTier::from_claim("invalid"), None);
+    }
+
+    #[test]
+    fn aegis_role_from_claim() {
+        assert_eq!(AegisRole::from_claim("aegis:admin"), Some(AegisRole::Admin));
+        assert_eq!(
+            AegisRole::from_claim("aegis:operator"),
+            Some(AegisRole::Operator)
+        );
+        assert_eq!(
+            AegisRole::from_claim("aegis:readonly"),
+            Some(AegisRole::Readonly)
+        );
+        assert_eq!(AegisRole::from_claim("unknown"), None);
+    }
+
+    #[test]
+    fn aegis_role_as_claim_str_roundtrip() {
+        for role in [AegisRole::Admin, AegisRole::Operator, AegisRole::Readonly] {
+            let claim_str = role.as_claim_str();
+            let parsed = AegisRole::from_claim(claim_str).unwrap();
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn realm_kind_equality() {
+        assert_eq!(RealmKind::System, RealmKind::System);
+        assert_eq!(RealmKind::Consumer, RealmKind::Consumer);
+        assert_eq!(
+            RealmKind::Tenant {
+                slug: "acme".to_string()
+            },
+            RealmKind::Tenant {
+                slug: "acme".to_string()
+            }
+        );
+        assert_ne!(
+            RealmKind::Tenant {
+                slug: "acme".to_string()
+            },
+            RealmKind::Tenant {
+                slug: "beta".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn user_identity_serialization_roundtrip() {
+        let identity = UserIdentity {
+            sub: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: Some("user@example.com".to_string()),
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Pro,
+            },
+        };
+        let json = serde_json::to_string(&identity).unwrap();
+        let deserialized: UserIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized, identity);
+    }
+
+    #[test]
+    fn keycloak_realm_serialization_roundtrip() {
+        let realm = KeycloakRealm {
+            realm_slug: "aegis-system".to_string(),
+            issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
+            jwks_uri: "https://auth.myzaru.com/realms/aegis-system/protocol/openid-connect/certs"
+                .to_string(),
+            audience: "aegis-orchestrator".to_string(),
+            realm_kind: RealmKind::System,
+        };
+        let json = serde_json::to_string(&realm).unwrap();
+        let deserialized: KeycloakRealm = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.realm_slug, "aegis-system");
+        assert_eq!(deserialized.realm_kind, RealmKind::System);
+    }
+}

@@ -101,7 +101,7 @@ pub enum CredentialStoreType {
     /// Read from the orchestrator process's environment variables.
     /// Suitable for development; not recommended for production.
     Environment,
-    /// Read from OpenBao (ADR-034). Requires Phase 4 implementation.
+    /// Read from OpenBao (ADR-034). Resolved via `SecretsManager::resolve_credential()`.
     OpenBao,
 }
 

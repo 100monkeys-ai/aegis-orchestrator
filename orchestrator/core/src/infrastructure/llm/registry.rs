@@ -427,6 +427,8 @@ mod tests {
                 openbao: None,
                 builtin_dispatchers: None,
                 registry_credentials: vec![],
+                keycloak: None,
+                grpc_auth: None,
             },
         };
 

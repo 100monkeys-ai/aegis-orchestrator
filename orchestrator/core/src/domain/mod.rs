@@ -33,12 +33,14 @@
 //! | [`validation`] | BC-2 Execution | `ValidationConfig`, gradient validation types (ADR-017) |
 //! | [`llm`] | Cross-cutting | `LLMProvider` trait, LLM request/response value objects |
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
+//! | [`iam`] | BC-13 IAM & Identity Federation | `KeycloakRealm`, `UserIdentity`, `KeycloakIamService` trait (ADR-041) |
 
 pub mod agent;
 pub mod dispatch;
 pub mod events;
 pub mod execution;
 pub mod fsal;
+pub mod iam;
 pub mod llm;
 pub mod mcp;
 pub mod node_config;

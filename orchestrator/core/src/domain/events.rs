@@ -22,6 +22,7 @@
 //! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
+//! | [`IamEvent`] | BC-13 IAM & Identity Federation | Keycloak authentication, realm lifecycle, JWKS cache events (ADR-041) |
 //!
 //! ## Phase 2 Note
 //!
@@ -750,6 +751,132 @@ pub enum StimulusEvent {
         error: String,
         failed_at: DateTime<Utc>,
     },
+}
+
+/// IAM & Identity Federation events (BC-13, ADR-041).
+///
+/// Published by `StandardKeycloakIamService` during token validation,
+/// realm lifecycle operations, and JWKS cache refresh cycles.
+/// Consumed by:
+/// - Cortex for security pattern learning (e.g. detecting brute-force token validation failures)
+/// - Control Plane for IAM audit dashboard
+/// - SOC 2 audit trail export (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IamEvent {
+    // ─── Authentication Events ────────────────────────────────────────────────
+    /// A JWT was successfully validated against a Keycloak realm's JWKS.
+    UserAuthenticated {
+        sub: String,
+        realm_slug: String,
+        /// "consumer_user" | "operator" | "service_account" | "tenant_user"
+        identity_kind: String,
+        authenticated_at: DateTime<Utc>,
+    },
+    /// JWT validation failed (bad signature, expired, unknown issuer, etc.).
+    TokenValidationFailed {
+        /// None if the issuer claim could not be parsed.
+        realm_slug: Option<String>,
+        reason: String,
+        attempted_at: DateTime<Utc>,
+    },
+
+    // ─── Realm Lifecycle ──────────────────────────────────────────────────────
+    /// A new realm was registered in the trusted realm set.
+    RealmRegistered {
+        realm_slug: String,
+        /// "system" | "consumer" | "tenant"
+        realm_kind: String,
+        issuer_url: String,
+        registered_at: DateTime<Utc>,
+    },
+    /// A tenant realm was provisioned (Phase 2 — Keycloak Admin API + OpenBao namespace).
+    TenantRealmProvisioned {
+        tenant_slug: String,
+        realm_id: String,
+        /// Mirrors ADR-034 namespace alignment.
+        openbao_namespace: String,
+        provisioned_at: DateTime<Utc>,
+    },
+
+    // ─── Service Account Lifecycle ────────────────────────────────────────────
+    /// A service account OIDC client was created.
+    ServiceAccountProvisioned {
+        client_id: String,
+        realm_slug: String,
+        /// "client_credentials" | "authorization_code_pkce"
+        grant_type: String,
+        provisioned_at: DateTime<Utc>,
+    },
+    /// A service account was revoked.
+    ServiceAccountRevoked {
+        client_id: String,
+        realm_slug: String,
+        reason: String,
+        revoked_at: DateTime<Utc>,
+    },
+
+    // ─── JWKS Cache Events ────────────────────────────────────────────────────
+    /// The JWKS key set for a realm was successfully refreshed.
+    JwksCacheRefreshed {
+        realm_slug: String,
+        key_count: usize,
+        refreshed_at: DateTime<Utc>,
+    },
+    /// JWKS refresh failed (network error, invalid response, etc.).
+    JwksCacheRefreshFailed {
+        realm_slug: String,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+
+#[cfg(test)]
+mod tests_iam {
+    use super::*;
+
+    #[test]
+    fn test_iam_event_user_authenticated_serialization() {
+        let event = IamEvent::UserAuthenticated {
+            sub: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            identity_kind: "consumer_user".to_string(),
+            authenticated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: IamEvent = serde_json::from_str(&json).unwrap();
+        let IamEvent::UserAuthenticated {
+            sub, realm_slug, ..
+        } = deserialized
+        else {
+            panic!("Expected UserAuthenticated variant");
+        };
+        assert_eq!(sub, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(realm_slug, "zaru-consumer");
+    }
+
+    #[test]
+    fn test_iam_event_token_validation_failed_serialization() {
+        let event = IamEvent::TokenValidationFailed {
+            realm_slug: Some("aegis-system".to_string()),
+            reason: "JWT expired".to_string(),
+            attempted_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("TokenValidationFailed"));
+        assert!(json.contains("JWT expired"));
+    }
+
+    #[test]
+    fn test_iam_event_jwks_cache_refreshed_serialization() {
+        let event = IamEvent::JwksCacheRefreshed {
+            realm_slug: "aegis-system".to_string(),
+            key_count: 2,
+            refreshed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("JwksCacheRefreshed"));
+        assert!(json.contains("\"key_count\":2"));
+    }
 }
 
 #[cfg(test)]
