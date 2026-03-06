@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Examples loading step of `aegis init`.
 //!
-//! Offers to deploy the `hello-world` example agent as a smoke-test after the
-//! stack is running. Reuses the existing `agent deploy` HTTP client path so
-//! there is no duplication.
+//! Offers to deploy the `hello-world` example agent (and required judge agents)
+//! as a smoke-test after the stack is running. Reuses the existing `agent
+//! deploy` HTTP client path so there is no duplication.
 //!
 //! # Architecture
 //!
@@ -17,7 +17,7 @@ use dialoguer::Confirm;
 
 use crate::daemon::DaemonClient;
 
-/// Offers to deploy the `hello-world` example agent.
+/// Offers to deploy the `hello-world` example and companion judge agents.
 pub struct ExamplesLoader {
     host: String,
     port: u16,
@@ -33,10 +33,15 @@ impl ExamplesLoader {
         }
     }
 
-    /// Prompt (if not `--yes`) and deploy `hello-world` agent.
+    /// Prompt (if not `--yes`) and deploy `hello-world` plus
+    /// `tool-call-policy-judge`.
     ///
-    /// `agent_yaml` is the raw YAML string downloaded from `aegis-examples`.
-    pub async fn maybe_load_hello_world(&self, agent_yaml: &str) -> Result<()> {
+    /// YAML inputs are raw strings downloaded from `aegis-examples`.
+    pub async fn maybe_load_hello_world(
+        &self,
+        hello_world_yaml: &str,
+        tool_call_policy_judge_yaml: &str,
+    ) -> Result<()> {
         println!();
 
         let should_load = if self.yes {
@@ -53,24 +58,50 @@ impl ExamplesLoader {
             return Ok(());
         }
 
-        println!("{}", "Deploying hello-world example agent...".bold());
+        println!(
+            "{}",
+            "Deploying hello-world example and tool-call-policy-judge...".bold()
+        );
 
-        let manifest: aegis_orchestrator_sdk::AgentManifest =
-            serde_yaml::from_str(agent_yaml).context("Failed to parse hello-world agent.yaml")?;
+        let hello_world_manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(hello_world_yaml)
+                .context("Failed to parse hello-world agent.yaml")?;
+        let tool_call_policy_judge_manifest: aegis_orchestrator_sdk::AgentManifest =
+            serde_yaml::from_str(tool_call_policy_judge_yaml)
+                .context("Failed to parse tool-call-policy-judge.yaml")?;
 
-        manifest
+        hello_world_manifest
             .validate()
             .map_err(|e| anyhow::anyhow!("hello-world manifest validation failed: {}", e))?;
+        tool_call_policy_judge_manifest.validate().map_err(|e| {
+            anyhow::anyhow!("tool-call-policy-judge manifest validation failed: {}", e)
+        })?;
 
         let client = DaemonClient::new(&self.host, self.port)?;
-        let agent_id = client.deploy_agent(manifest, false).await?;
+        let hello_world_agent_id = client.deploy_agent(hello_world_manifest, false).await?;
+        let judge_agent_id = client
+            .deploy_agent(tool_call_policy_judge_manifest, false)
+            .await?;
 
-        println!("  {} hello-world agent deployed: {}", "✓".green(), agent_id);
+        println!(
+            "  {} hello-world agent deployed: {}",
+            "✓".green(),
+            hello_world_agent_id
+        );
+        println!(
+            "  {} tool-call-policy-judge deployed: {}",
+            "✓".green(),
+            judge_agent_id
+        );
         println!();
         println!("  Run a task to test it:");
         println!(
             "    {}",
-            format!("aegis task execute --agent {} 'Hello, AEGIS!'", agent_id).cyan()
+            format!(
+                "aegis task execute --agent {} 'Hello, AEGIS!'",
+                hello_world_agent_id
+            )
+            .cyan()
         );
 
         Ok(())

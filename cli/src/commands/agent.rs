@@ -3,6 +3,7 @@
 //! Agent
 //!
 //! Provides agent functionality for the system.
+//! Includes list/deploy/show/remove/logs and generate operations.
 //!
 //! # Architecture
 //!
@@ -12,10 +13,21 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+
+const AGENT_GENERATOR_NAME: &str = "agent-creator-agent";
+const AGENT_GENERATOR_TEMPLATE: &str =
+    include_str!("../../templates/agents/agent-creator-agent.yaml");
+const AGENT_GENERATOR_JUDGE_NAME: &str = "agent-generator-judge";
+const AGENT_GENERATOR_JUDGE_TEMPLATE: &str =
+    include_str!("../../templates/agents/agent-generator-judge.yaml");
+const WORKFLOW_GENERATOR_JUDGE_NAME: &str = "workflow-generator-judge";
+const WORKFLOW_GENERATOR_JUDGE_TEMPLATE: &str =
+    include_str!("../../templates/agents/workflow-generator-judge.yaml");
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
@@ -71,11 +83,22 @@ pub enum AgentCommand {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// Generate an agent from natural-language input
+    Generate {
+        /// Natural-language intent for the agent to create
+        #[arg(value_name = "INPUT")]
+        input: String,
+
+        /// Follow generator execution logs
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 pub async fn handle_command(
     command: AgentCommand,
-    _config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     host: &str,
     port: u16,
 ) -> Result<()> {
@@ -124,6 +147,9 @@ pub async fn handle_command(
             errors,
             verbose,
         } => logs_agent(agent_id, follow, errors, verbose, client).await,
+        AgentCommand::Generate { input, follow } => {
+            generate_agent(input, follow, client, config_path.as_ref()).await
+        }
     }
 }
 
@@ -255,4 +281,158 @@ async fn logs_agent(
         .await?;
 
     Ok(())
+}
+
+async fn generate_agent(
+    input: String,
+    follow: bool,
+    client: DaemonClient,
+    config_path: Option<&PathBuf>,
+) -> Result<()> {
+    let templates_root = resolve_templates_root(config_path);
+    sync_generator_templates_to_disk(&templates_root)?;
+
+    let _agent_judge_id = ensure_generator_agent_deployed(
+        &client,
+        AGENT_GENERATOR_JUDGE_NAME,
+        AGENT_GENERATOR_JUDGE_TEMPLATE,
+    )
+    .await?;
+    let _workflow_judge_id = ensure_generator_agent_deployed(
+        &client,
+        WORKFLOW_GENERATOR_JUDGE_NAME,
+        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    )
+    .await?;
+    let generator_id =
+        ensure_generator_agent_deployed(&client, AGENT_GENERATOR_NAME, AGENT_GENERATOR_TEMPLATE)
+            .await?;
+
+    println!(
+        "{}",
+        format!(
+            "Generating agent via '{}' (id: {})...",
+            AGENT_GENERATOR_NAME, generator_id
+        )
+        .cyan()
+    );
+
+    let execution_id = client
+        .execute_agent(generator_id, serde_json::Value::String(input))
+        .await
+        .context("Failed to start agent generation execution")?;
+
+    println!(
+        "{}",
+        format!("✓ Agent generation execution started: {}", execution_id).green()
+    );
+
+    if follow {
+        client.stream_logs(execution_id, true, false, false).await?;
+    } else {
+        wait_for_execution_completion(execution_id, &client).await?;
+    }
+
+    Ok(())
+}
+
+fn resolve_templates_root(config_path: Option<&PathBuf>) -> PathBuf {
+    let base_dir = config_path
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
+        .unwrap_or_else(|| PathBuf::from(".aegis"));
+    base_dir.join("templates")
+}
+
+fn sync_generator_templates_to_disk(templates_root: &Path) -> Result<()> {
+    persist_template(
+        templates_root,
+        "agents",
+        "agent-creator-agent.yaml",
+        AGENT_GENERATOR_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "agent-generator-judge.yaml",
+        AGENT_GENERATOR_JUDGE_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "workflow-generator-judge.yaml",
+        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    )?;
+    Ok(())
+}
+
+fn persist_template(
+    templates_root: &Path,
+    category: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<()> {
+    let dir = templates_root.join(category);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create template directory {}", dir.display()))?;
+    let file_path = dir.join(file_name);
+    std::fs::write(&file_path, content)
+        .with_context(|| format!("Failed to write bundled template {}", file_path.display()))?;
+    Ok(())
+}
+
+async fn ensure_generator_agent_deployed(
+    client: &DaemonClient,
+    name: &str,
+    template_yaml: &str,
+) -> Result<Uuid> {
+    if let Some(id) = client.lookup_agent(name).await? {
+        return Ok(id);
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Generator agent '{}' not found. Deploying template...",
+            name
+        )
+        .yellow()
+    );
+
+    let manifest: aegis_orchestrator_sdk::AgentManifest =
+        serde_yaml::from_str(template_yaml).context("Failed to parse generator template YAML")?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {}", e))?;
+
+    client
+        .deploy_agent(manifest, false)
+        .await
+        .context("Failed to deploy generator template")
+}
+
+async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {
+    const MAX_POLLS: u32 = 300;
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    for _ in 0..MAX_POLLS {
+        let execution = client.get_execution(execution_id).await?;
+        let normalized = execution.status.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "completed" | "failed" | "cancelled" | "canceled"
+        ) {
+            println!(
+                "Generation execution {} finished with status: {}",
+                execution.id, execution.status
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    anyhow::bail!(
+        "Timed out waiting for generation execution {} to finish",
+        execution_id
+    );
 }

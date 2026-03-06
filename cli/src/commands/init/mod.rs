@@ -120,6 +120,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let runner = ComposeRunner::new(node_config.working_dir.clone());
     runner.pull().await?;
     runner.up().await?;
+    if components.ollama_llm && !node_config.ollama_model.is_empty() {
+        runner.pull_ollama_model(&node_config.ollama_model).await?;
+    }
 
     // ─── Step 6: Run database migrations ─────────────────────────────────────
     print_step(6, 7, "Running database migrations");
@@ -133,7 +136,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // ─── Optional: Load examples ──────────────────────────────────────────────
     let loader = ExamplesLoader::new(&args.host, args.port, args.yes);
     loader
-        .maybe_load_hello_world(&stack.hello_world_agent)
+        .maybe_load_hello_world(&stack.hello_world_agent, &stack.tool_call_policy_judge)
         .await?;
 
     // ─── Done ─────────────────────────────────────────────────────────────────

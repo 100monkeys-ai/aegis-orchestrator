@@ -1,0 +1,104 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: agent-generator-judge
+  version: "1.0.0"
+  description: Judge agent for validating generated agent manifests and generation results.
+  labels:
+    role: judge
+    category: validation
+    capability: agent-generation-judging
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: judge
+
+  task:
+    instruction: |
+      You evaluate outputs from agent generation flows.
+
+      Input typically includes:
+      - user objective or generation task
+      - generated manifest YAML and/or deployment result summary
+      - optional criteria and validation context
+
+      Score output quality for:
+      - correctness
+      - manifest completeness
+      - safety and policy alignment
+      - deployability
+      - objective alignment
+
+      Return JSON only:
+      {
+        "score": 0.0-1.0,
+        "confidence": 0.0-1.0,
+        "reasoning": "2-4 sentence explanation",
+        "signals": [
+          {"category": "correctness", "score": 0.0-1.0, "message": "short note"},
+          {"category": "completeness", "score": 0.0-1.0, "message": "short note"},
+          {"category": "safety", "score": 0.0-1.0, "message": "short note"},
+          {"category": "deployability", "score": 0.0-1.0, "message": "short note"},
+          {"category": "alignment", "score": 0.0-1.0, "message": "short note"}
+        ]
+      }
+    prompt_template: |
+      {{instruction}}
+
+      Input to evaluate:
+      {{input}}
+
+      Judge:
+
+  execution:
+    mode: iterative
+    max_iterations: 3
+    llm_timeout_seconds: 180
+    validation:
+      - type: json_schema
+        schema:
+          type: object
+          required: [score, confidence, reasoning, signals]
+          properties:
+            score:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            confidence:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+            reasoning:
+              type: string
+              minLength: 20
+            signals:
+              type: array
+              minItems: 5
+              maxItems: 5
+              items:
+                type: object
+                required: [category, score, message]
+                properties:
+                  category:
+                    type: string
+                  score:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                  message:
+                    type: string
+                    minLength: 5
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+      timeout: 180s

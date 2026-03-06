@@ -1,0 +1,52 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: builtin-workflow-generator
+  version: "1.0.0"
+  description: Built-in one-command workflow generator that discovers existing agents, generates missing agents, and registers a final runnable workflow.
+  labels:
+    category: platform
+    type: builtin-generator
+spec:
+  initial_state: PLAN
+  states:
+    PLAN:
+      kind: Agent
+      agent: workflow-generator-planner-agent
+      input: |
+        Build a complete generation plan for this workflow request:
+        {{workflow.input}}
+      transitions:
+        - condition: on_success
+          target: GENERATE_MISSING_AGENTS
+
+    GENERATE_MISSING_AGENTS:
+      kind: Agent
+      agent: agent-creator-agent
+      input: |
+        Use this planner output:
+        {{PLAN.output}}
+
+        Create all missing agents listed in `missing_agents` using `generation_prompts`.
+        If there are no missing agents, return a JSON no-op summary with empty `created`.
+      transitions:
+        - condition: on_success
+          target: GENERATE_AND_REGISTER_WORKFLOW
+        - condition: on_failure
+          target: GENERATE_AND_REGISTER_WORKFLOW
+
+    GENERATE_AND_REGISTER_WORKFLOW:
+      kind: Agent
+      agent: workflow-creator-validator-agent
+      input: |
+        Original workflow request:
+        {{workflow.input}}
+
+        Planner output:
+        {{PLAN.output}}
+
+        Agent generation output:
+        {{GENERATE_MISSING_AGENTS.output}}
+
+        Generate and register the final workflow so it is runnable immediately.
+      transitions: []

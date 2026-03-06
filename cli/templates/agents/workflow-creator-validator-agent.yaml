@@ -1,0 +1,80 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: workflow-creator-validator-agent
+  version: "1.0.0"
+  description: Creates workflow manifests and enforces strict deterministic + semantic validation before registration.
+  labels:
+    role: worker
+    category: platform
+    capability: workflow-authoring
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+
+  task:
+    instruction: |
+      You are a Workflow Authoring and Validation specialist.
+      Build workflows in 100monkeys.ai/v1 format aligned to DDD and ADR-015/ADR-050.
+
+      Requirements:
+      - Produce one complete workflow YAML manifest.
+      - Ensure state transitions are explicit and safe.
+      - Ensure all referenced states and volumes are declared.
+      - Favor clear state names and deterministic transitions.
+
+      Then call `aegis.workflow.create_and_validate` with:
+      {
+        "manifest_yaml": "<full yaml>",
+        "task_context": "<short summary of user objective>",
+        "judge_agents": ["workflow-generator-judge"],
+        "min_score": 0.8,
+        "min_confidence": 0.7
+      }
+
+      If validation fails, revise and retry until max iterations is reached.
+      Return a concise summary with workflow name, score/confidence, and deployment result.
+    prompt_template: |
+      {{instruction}}
+
+      User request:
+      {{input}}
+
+      Agent:
+
+  execution:
+    mode: iterative
+    max_iterations: 5
+    llm_timeout_seconds: 300
+    validation:
+      - type: semantic
+        judge_agent: workflow-generator-judge
+        criteria: Ensure generated workflow manifests are correct, complete, safe, and aligned with the requested business objective.
+        min_score: 0.85
+        min_confidence: 0.75
+        timeout_seconds: 120
+    tool_validation:
+      - type: semantic
+        judge_agent: tool-call-policy-judge
+        criteria: Ensure tool usage follows policy and arguments are valid for workflow authoring actions.
+        min_score: 0.8
+        min_confidence: 0.7
+        timeout_seconds: 90
+
+  tools:
+    - aegis.workflow.create_and_validate
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+      timeout: 300s

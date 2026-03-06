@@ -84,6 +84,15 @@ fn default_local_host_mount_point() -> String {
     default_path.to_string_lossy().into_owned()
 }
 
+fn resolve_generated_artifacts_root(config_path: Option<&PathBuf>) -> PathBuf {
+    let base_dir = config_path
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
+        .unwrap_or_else(|| PathBuf::from(".aegis"));
+
+    base_dir.join("generated")
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Daemonize on Unix
     // NOTE: We skip internal daemonization because calling fork() (via daemonize)
@@ -104,6 +113,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let _guard = PidFileGuard;
 
     info!("AEGIS daemon starting (PID: {})", pid);
+    let generated_artifacts_root = resolve_generated_artifacts_root(config_path.as_ref());
 
     // Load configuration
     println!("Loading configuration...");
@@ -384,6 +394,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             storage_provider.clone(),
             event_bus.clone(),
             filer_url,
+            storage_config.backend.clone(),
         )?,
     );
 
@@ -717,6 +728,66 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.create")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.create".to_string(),
+                description: "Parses, validates, and deploys an Agent manifest to the registry."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.create".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.list")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.list".to_string(),
+                description: "Lists currently deployed agents and metadata.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.create_and_validate")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.create_and_validate".to_string(),
+                description:
+                    "Performs strict deterministic and semantic workflow validation, then registers on pass."
+                        .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.create_and_validate".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+
     let tool_router = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
             tool_registry.clone(),
@@ -962,7 +1033,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
             ),
-        ),
+        )
+        .with_workflow_authoring(
+            register_workflow_use_case.clone(),
+            validation_service.clone(),
+        )
+        .with_generated_manifests_root(generated_artifacts_root.clone()),
+    );
+    println!(
+        "Generated manifests will be written to: {}",
+        generated_artifacts_root.display()
     );
 
     let inner_loop_service = Arc::new(

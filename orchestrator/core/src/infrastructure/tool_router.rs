@@ -446,6 +446,51 @@ impl ToolRouter {
                         },
                         "required": ["url"]
                     }),
+                    "aegis.agent.create" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Agent manifest YAML to parse, validate, and deploy."
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing deployed agent with the same name/version."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
+                    "aegis.agent.list" => json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                    "aegis.workflow.create_and_validate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Workflow manifest YAML to parse, validate, semantically judge, and register."
+                            },
+                            "task_context": {
+                                "type": "string",
+                                "description": "Optional task context to guide semantic judges."
+                            },
+                            "judge_agents": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Judge agent names to use for semantic validation."
+                            },
+                            "min_score": {
+                                "type": "number",
+                                "description": "Minimum consensus score required for deployment."
+                            },
+                            "min_confidence": {
+                                "type": "number",
+                                "description": "Minimum consensus confidence required for deployment."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
                     _ => json!({ "type": "object" }),
                 };
 
@@ -786,6 +831,7 @@ impl ToolServerManager {
 mod tests {
     use super::*;
     use crate::domain::mcp::*;
+    use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -924,5 +970,62 @@ mod tests {
         let other_exec = ExecutionId::new();
         let other_tools = registry.get_tools_for_agent(other_exec).await.unwrap();
         assert_eq!(other_tools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_includes_aegis_authoring_tool_schemas() {
+        let registry = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+
+        let builtins = vec![
+            BuiltinDispatcherConfig {
+                name: "aegis.agent.create".to_string(),
+                description: "Create and deploy agent manifests".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.agent.create".to_string(),
+                    skip_judge: false,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.create_and_validate".to_string(),
+                description: "Create, validate, and register workflows".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.create_and_validate".to_string(),
+                    skip_judge: false,
+                }],
+            },
+        ];
+
+        let router = ToolRouter::new(registry, servers, builtins);
+        let tools = router.list_tools().await.unwrap();
+
+        let agent_tool = tools.iter().find(|t| t.name == "aegis.agent.create");
+        assert!(agent_tool.is_some(), "expected aegis.agent.create tool");
+        let agent_schema = &agent_tool.unwrap().input_schema;
+        assert_eq!(
+            agent_schema["required"][0].as_str(),
+            Some("manifest_yaml"),
+            "manifest_yaml must be required for aegis.agent.create"
+        );
+
+        let workflow_tool = tools
+            .iter()
+            .find(|t| t.name == "aegis.workflow.create_and_validate");
+        assert!(
+            workflow_tool.is_some(),
+            "expected aegis.workflow.create_and_validate tool"
+        );
+        let workflow_schema = &workflow_tool.unwrap().input_schema;
+        assert_eq!(
+            workflow_schema["required"][0].as_str(),
+            Some("manifest_yaml"),
+            "manifest_yaml must be required for aegis.workflow.create_and_validate"
+        );
+        assert!(
+            workflow_schema["properties"]["judge_agents"].is_object(),
+            "judge_agents property should be present in workflow schema"
+        );
     }
 }

@@ -50,6 +50,11 @@ const FILES: &[RemoteFile] = &[
     },
     RemoteFile {
         repo: EXAMPLES_REPO,
+        path: "agents/judges/tool-call-policy-judge.yaml",
+        label: "judges/tool-call-policy-judge.yaml",
+    },
+    RemoteFile {
+        repo: EXAMPLES_REPO,
         path: "deploy/temporal/development-sql.yaml",
         label: "temporal/development-sql.yaml",
     },
@@ -61,6 +66,7 @@ pub struct StackFiles {
     pub init_db_script: String,
     pub runtime_registry: String,
     pub hello_world_agent: String,
+    pub tool_call_policy_judge: String,
     pub temporal_dynamic_config: String,
 }
 
@@ -111,6 +117,7 @@ pub async fn fetch_stack() -> Result<StackFiles> {
         init_db_script: contents[1].clone(),
         runtime_registry: contents[2].clone(),
         hello_world_agent: contents[3].clone(),
-        temporal_dynamic_config: contents[4].clone(),
+        tool_call_policy_judge: contents[4].clone(),
+        temporal_dynamic_config: contents[5].clone(),
     })
 }

@@ -165,6 +165,7 @@ pub struct StandardVolumeService {
     storage_provider: Arc<dyn StorageProvider>,
     event_bus: Arc<EventBus>,
     filer_endpoint: FilerEndpoint,
+    storage_mode: String,
 }
 
 impl StandardVolumeService {
@@ -173,6 +174,7 @@ impl StandardVolumeService {
         storage_provider: Arc<dyn StorageProvider>,
         event_bus: Arc<EventBus>,
         filer_url: String,
+        storage_mode: impl Into<String>,
     ) -> Result<Self> {
         let filer_endpoint = FilerEndpoint::new(filer_url).context("Invalid filer URL")?;
 
@@ -181,6 +183,7 @@ impl StandardVolumeService {
             storage_provider,
             event_bus,
             filer_endpoint,
+            storage_mode: storage_mode.into(),
         })
     }
 }
@@ -200,14 +203,30 @@ impl VolumeService for StandardVolumeService {
             name, tenant_id, storage_class, size_limit_mb
         );
 
-        // Determine backend based on inputs
-        // For standard volume service creating standard volumes, we use SeaweedFS
-        // Construct remote path: /aegis/volumes/{tenant_id}/{volume_id}
+        // Construct storage-relative path: /aegis/volumes/{tenant_id}/{volume_id}
         let volume_id = VolumeId::new();
         let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
-        let backend = VolumeBackend::SeaweedFS {
-            filer_endpoint: self.filer_endpoint.clone(),
-            remote_path: remote_path.clone(),
+        let backend = match self.storage_mode.as_str() {
+            "seaweedfs" => VolumeBackend::SeaweedFS {
+                filer_endpoint: self.filer_endpoint.clone(),
+                remote_path: remote_path.clone(),
+            },
+            // local_host still uses storage-relative paths; the provider maps
+            // them into the configured host mount point.
+            "local_host" => VolumeBackend::HostPath {
+                path: PathBuf::from(remote_path.clone()),
+            },
+            "opendal_memory" | "opendal" => VolumeBackend::OpenDal {
+                provider: "memory".to_string(),
+                config: None,
+                cache_path: None,
+            },
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported storage mode for standard volume creation: {}",
+                    other
+                ));
+            }
         };
 
         // Create volume aggregate
@@ -227,13 +246,13 @@ impl VolumeService for StandardVolumeService {
             expires_at: storage_class.calculate_expiry(Utc::now()),
         };
 
-        // Create directory on SeaweedFS
+        // Provision directory on the selected storage backend.
         self.storage_provider
             .create_directory(&remote_path)
             .await
             .context("Failed to create volume directory on storage backend")?;
 
-        // Set quota on SeaweedFS
+        // Set backend quota (no-op for providers that do not enforce quotas).
         self.storage_provider
             .set_quota(&remote_path, size_limit_bytes)
             .await
@@ -607,8 +626,9 @@ impl VolumeService for StandardVolumeService {
                         Ok(id) => id,
                         Err(e) => {
                             return Err(anyhow::anyhow!(
-                                "SeaweedFS volume creation failed for '{}': {}",
+                                "Volume creation failed for '{}' (storage_mode='{}'): {}",
                                 spec.name,
+                                storage_mode,
                                 e
                             ));
                         }
@@ -837,6 +857,7 @@ mod tests {
             storage_provider.clone(),
             event_bus,
             "http://localhost:8888".to_string(),
+            "seaweedfs",
         )
         .expect("Failed to create test service");
 

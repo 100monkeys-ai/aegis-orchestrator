@@ -149,6 +149,7 @@ impl ConfigWizard {
         // Write files
         std::fs::create_dir_all(&working_dir)
             .with_context(|| format!("Failed to create directory {}", working_dir.display()))?;
+        ensure_local_volumes_dir_permissions(&working_dir)?;
 
         let aegis_config_content = self.render_aegis_config(&node_config, components);
         let env_content = self.render_env(&node_config, components)?;
@@ -189,6 +190,16 @@ impl ConfigWizard {
           capabilities: ["code", "reasoning"]
           context_window: 8192
           cost_per_1k_tokens: 0.0
+        - alias: "smart"
+          model: "{model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+        - alias: "judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
 
   llm_selection:
     strategy: "prefer-local"
@@ -208,6 +219,16 @@ impl ConfigWizard {
         - alias: "default"
           model: "gpt-4o"
           capabilities: ["code", "reasoning"]
+          context_window: 128000
+          cost_per_1k_tokens: 0.005
+        - alias: "smart"
+          model: "gpt-4o"
+          capabilities: ["code", "reasoning"]
+          context_window: 128000
+          cost_per_1k_tokens: 0.005
+        - alias: "judge"
+          model: "gpt-4o"
+          capabilities: ["reasoning"]
           context_window: 128000
           cost_per_1k_tokens: 0.005
 
@@ -230,6 +251,16 @@ impl ConfigWizard {
           capabilities: ["code", "reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
+        - alias: "smart"
+          model: "claude-3-5-sonnet-20241022"
+          capabilities: ["code", "reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
+        - alias: "judge"
+          model: "claude-3-5-sonnet-20241022"
+          capabilities: ["reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
 
   llm_selection:
     strategy: "prefer-local"
@@ -245,6 +276,92 @@ impl ConfigWizard {
     url: "env:AEGIS_DATABASE_URL"
     max_connections: 5
     connect_timeout_seconds: 5
+"#;
+
+        let builtin_dispatchers_section = r#"
+  builtin_dispatchers:
+    - name: "cmd.run"
+      enabled: true
+      description: "Executes a shell command inside the agent's ephemeral container environment."
+      capabilities:
+        - name: "cmd.run"
+    - name: "fs.read"
+      enabled: true
+      description: "Read the contents of a file at the given POSIX path."
+      capabilities:
+        - name: "fs.read"
+          skip_judge: true
+    - name: "fs.write"
+      enabled: true
+      description: "Write content to a file at the given POSIX path."
+      capabilities:
+        - name: "fs.write"
+    - name: "fs.list"
+      enabled: true
+      description: "List the contents of a directory."
+      capabilities:
+        - name: "fs.list"
+          skip_judge: true
+    - name: "fs.create_dir"
+      enabled: true
+      description: "Creates a new directory along with any necessary parent directories."
+      capabilities:
+        - name: "fs.create_dir"
+    - name: "fs.delete"
+      enabled: true
+      description: "Deletes a file or directory."
+      capabilities:
+        - name: "fs.delete"
+    - name: "fs.edit"
+      enabled: true
+      description: "Performs an exact string replacement in a file."
+      capabilities:
+        - name: "fs.edit"
+    - name: "fs.multi_edit"
+      enabled: true
+      description: "Performs multiple sequential string replacements in a file."
+      capabilities:
+        - name: "fs.multi_edit"
+    - name: "fs.grep"
+      enabled: true
+      description: "Recursively searches for a regex pattern within files in a given directory."
+      capabilities:
+        - name: "fs.grep"
+          skip_judge: true
+    - name: "fs.glob"
+      enabled: true
+      description: "Recursively matches files against a glob pattern."
+      capabilities:
+        - name: "fs.glob"
+          skip_judge: true
+    - name: "web.search"
+      enabled: true
+      description: "Performs an internet search query."
+      capabilities:
+        - name: "web.search"
+          skip_judge: true
+    - name: "web.fetch"
+      enabled: true
+      description: "Fetches content from a URL, optionally converting HTML to Markdown."
+      capabilities:
+        - name: "web.fetch"
+          skip_judge: true
+    - name: "aegis.agent.create"
+      enabled: true
+      description: "Parses, validates, and deploys an Agent manifest."
+      capabilities:
+        - name: "aegis.agent.create"
+    - name: "aegis.agent.list"
+      enabled: true
+      description: "Lists currently deployed agents and metadata."
+      capabilities:
+        - name: "aegis.agent.list"
+          skip_judge: true
+    - name: "aegis.workflow.create_and_validate"
+      enabled: true
+      description: "Performs strict deterministic + semantic workflow validation and registers the workflow on pass."
+      capabilities:
+        - name: "aegis.workflow.create_and_validate"
 "#;
 
         let temporal_section = if components.temporal {
@@ -294,6 +411,7 @@ spec:
     type: "edge"
 
 {llm_section}
+{builtin_dispatchers_section}
   runtime:
     docker_network_mode: "env:AEGIS_DOCKER_NETWORK"
     orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
@@ -310,6 +428,7 @@ spec:
             node_name = config.node_name,
             node_id = config.node_id,
             llm_section = llm_section,
+            builtin_dispatchers_section = builtin_dispatchers_section,
             database_section = database_section,
             temporal_section = temporal_section,
             storage_section = storage_section,
@@ -390,6 +509,40 @@ fn generate_smcp_private_key_env_value() -> Result<String> {
         .to_pkcs1_pem(LineEnding::LF)
         .context("Failed to encode SMCP RSA private key as PEM")?;
     Ok(pem.trim_end().to_string())
+}
+
+/// Ensure `./local-volumes` exists with permissions that allow the non-root
+/// runtime container user to create execution volume directories.
+fn ensure_local_volumes_dir_permissions(working_dir: &Path) -> Result<()> {
+    let local_volumes_dir = working_dir.join("local-volumes");
+    std::fs::create_dir_all(&local_volumes_dir).with_context(|| {
+        format!(
+            "Failed to create local volumes directory {}",
+            local_volumes_dir.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&local_volumes_dir)
+            .with_context(|| {
+                format!(
+                    "Failed to read metadata for {}",
+                    local_volumes_dir.display()
+                )
+            })?
+            .permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&local_volumes_dir, perms).with_context(|| {
+            format!(
+                "Failed to set permissions on {}",
+                local_volumes_dir.display()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 /// Expand a leading `~` to the user's home directory.

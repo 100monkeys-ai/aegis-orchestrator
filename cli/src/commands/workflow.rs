@@ -13,6 +13,7 @@
 //! - `aegis workflow list` - List registered workflows
 //! - `aegis workflow describe <name>` - Show workflow details
 //! - `aegis workflow logs <execution_id>` - Stream workflow execution logs
+//! - `aegis workflow generate <input>` - Generate a workflow from natural language
 //!
 //! # Architecture
 //!
@@ -22,10 +23,29 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+
+const WORKFLOW_GENERATOR_WORKFLOW_NAME: &str = "builtin-workflow-generator";
+const WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE: &str =
+    include_str!("../../templates/workflows/builtin-workflow-generator.yaml");
+const WORKFLOW_GENERATOR_PLANNER_AGENT_NAME: &str = "workflow-generator-planner-agent";
+const WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/workflow-generator-planner-agent.yaml");
+const AGENT_GENERATOR_AGENT_NAME: &str = "agent-creator-agent";
+const AGENT_GENERATOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/agent-creator-agent.yaml");
+const AGENT_GENERATOR_JUDGE_NAME: &str = "agent-generator-judge";
+const AGENT_GENERATOR_JUDGE_TEMPLATE: &str =
+    include_str!("../../templates/agents/agent-generator-judge.yaml");
+const WORKFLOW_GENERATOR_JUDGE_NAME: &str = "workflow-generator-judge";
+const WORKFLOW_GENERATOR_JUDGE_TEMPLATE: &str =
+    include_str!("../../templates/agents/workflow-generator-judge.yaml");
+const WORKFLOW_CREATOR_AGENT_NAME: &str = "workflow-creator-validator-agent";
+const WORKFLOW_CREATOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/workflow-creator-validator-agent.yaml");
 
 #[derive(Subcommand)]
 pub enum WorkflowCommand {
@@ -109,11 +129,22 @@ pub enum WorkflowCommand {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+
+    /// Generate a workflow from natural-language input
+    Generate {
+        /// Natural-language workflow objective
+        #[arg(value_name = "INPUT")]
+        input: String,
+
+        /// Follow generator execution logs
+        #[arg(short, long)]
+        follow: bool,
+    },
 }
 
 pub async fn handle_command(
     command: WorkflowCommand,
-    _config_path: Option<PathBuf>,
+    config_path: Option<PathBuf>,
     host: &str,
     port: u16,
 ) -> Result<()> {
@@ -136,6 +167,9 @@ pub async fn handle_command(
             transitions,
         } => stream_workflow_logs(execution_id, follow, transitions, host, port).await,
         WorkflowCommand::Delete { name, yes } => delete_workflow(name, yes, host, port).await,
+        WorkflowCommand::Generate { input, follow } => {
+            generate_workflow(input, follow, host, port, config_path.as_ref()).await
+        }
     }
 }
 
@@ -325,6 +359,241 @@ async fn run_workflow(
     }
 
     Ok(())
+}
+
+async fn generate_workflow(
+    input: String,
+    follow: bool,
+    host: &str,
+    port: u16,
+    config_path: Option<&PathBuf>,
+) -> Result<()> {
+    let daemon_status = check_daemon_running(host, port).await;
+    match daemon_status {
+        Ok(DaemonStatus::Running { .. }) => {}
+        Ok(DaemonStatus::Unhealthy { pid, error }) => {
+            println!(
+                "{}",
+                format!(
+                    "⚠ Daemon is running (PID: {}) but unhealthy: {}",
+                    pid, error
+                )
+                .yellow()
+            );
+            println!("Run 'aegis daemon status' for more info.");
+            return Ok(());
+        }
+        _ => {
+            println!(
+                "{}",
+                "Workflow generation requires the daemon to be running.".red()
+            );
+            println!("Run 'aegis daemon start' to start the daemon.");
+            return Ok(());
+        }
+    }
+
+    let templates_root = resolve_templates_root(config_path);
+    sync_generator_templates_to_disk(&templates_root)?;
+
+    let client = DaemonClient::new(host, port)?;
+    let _agent_generator_judge_id = ensure_generator_agent_deployed(
+        &client,
+        AGENT_GENERATOR_JUDGE_NAME,
+        AGENT_GENERATOR_JUDGE_TEMPLATE,
+    )
+    .await?;
+    let _workflow_generator_judge_id = ensure_generator_agent_deployed(
+        &client,
+        WORKFLOW_GENERATOR_JUDGE_NAME,
+        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    )
+    .await?;
+    let _planner_agent_id = ensure_generator_agent_deployed(
+        &client,
+        WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
+        WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+    )
+    .await?;
+    let _agent_generator_id = ensure_generator_agent_deployed(
+        &client,
+        AGENT_GENERATOR_AGENT_NAME,
+        AGENT_GENERATOR_AGENT_TEMPLATE,
+    )
+    .await?;
+    let _workflow_creator_id = ensure_generator_agent_deployed(
+        &client,
+        WORKFLOW_CREATOR_AGENT_NAME,
+        WORKFLOW_CREATOR_AGENT_TEMPLATE,
+    )
+    .await?;
+    ensure_generator_workflow_deployed(
+        &client,
+        WORKFLOW_GENERATOR_WORKFLOW_NAME,
+        WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+    )
+    .await?;
+
+    println!(
+        "{}",
+        format!(
+            "Generating workflow via built-in workflow '{}'...",
+            WORKFLOW_GENERATOR_WORKFLOW_NAME
+        )
+        .cyan()
+    );
+
+    let execution_id = client
+        .run_workflow(
+            WORKFLOW_GENERATOR_WORKFLOW_NAME,
+            serde_json::json!({
+                "input": input
+            }),
+        )
+        .await
+        .context("Failed to start workflow generation execution")?;
+
+    println!(
+        "{}",
+        format!("✓ Workflow generation execution started: {}", execution_id).green()
+    );
+
+    if follow {
+        client.stream_workflow_logs(execution_id).await?;
+    } else {
+        println!(
+            "Follow generator workflow logs with:\n  aegis workflow logs {} --follow",
+            execution_id
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_templates_root(config_path: Option<&PathBuf>) -> PathBuf {
+    let base_dir = config_path
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
+        .unwrap_or_else(|| PathBuf::from(".aegis"));
+    base_dir.join("templates")
+}
+
+fn sync_generator_templates_to_disk(templates_root: &Path) -> Result<()> {
+    persist_template(
+        templates_root,
+        "agents",
+        "workflow-generator-planner-agent.yaml",
+        WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "agent-creator-agent.yaml",
+        AGENT_GENERATOR_AGENT_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "agent-generator-judge.yaml",
+        AGENT_GENERATOR_JUDGE_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "workflow-generator-judge.yaml",
+        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "workflow-creator-validator-agent.yaml",
+        WORKFLOW_CREATOR_AGENT_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "workflows",
+        "builtin-workflow-generator.yaml",
+        WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+    )?;
+    Ok(())
+}
+
+fn persist_template(
+    templates_root: &Path,
+    category: &str,
+    file_name: &str,
+    content: &str,
+) -> Result<()> {
+    let dir = templates_root.join(category);
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("Failed to create template directory {}", dir.display()))?;
+    let file_path = dir.join(file_name);
+    std::fs::write(&file_path, content)
+        .with_context(|| format!("Failed to write bundled template {}", file_path.display()))?;
+    Ok(())
+}
+
+async fn ensure_generator_agent_deployed(
+    client: &DaemonClient,
+    name: &str,
+    template_yaml: &str,
+) -> Result<Uuid> {
+    if let Some(id) = client.lookup_agent(name).await? {
+        return Ok(id);
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Generator agent '{}' not found. Deploying template...",
+            name
+        )
+        .yellow()
+    );
+
+    let manifest: aegis_orchestrator_sdk::AgentManifest =
+        serde_yaml::from_str(template_yaml).context("Failed to parse generator template YAML")?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {}", e))?;
+
+    client
+        .deploy_agent(manifest, false)
+        .await
+        .context("Failed to deploy generator template")
+}
+
+async fn ensure_generator_workflow_deployed(
+    client: &DaemonClient,
+    name: &str,
+    template_yaml: &str,
+) -> Result<()> {
+    if client.describe_workflow(name).await.is_ok() {
+        return Ok(());
+    }
+
+    println!(
+        "{}",
+        format!(
+            "Generator workflow '{}' not found. Deploying template...",
+            name
+        )
+        .yellow()
+    );
+
+    // Validate template before deployment.
+    let workflow =
+        aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+            template_yaml,
+        )
+        .context("Failed to parse generator workflow template YAML")?;
+    aegis_orchestrator_core::domain::workflow::WorkflowValidator::check_for_cycles(&workflow)
+        .context("Generator workflow template failed cycle validation")?;
+
+    client
+        .deploy_workflow_manifest(template_yaml)
+        .await
+        .context("Failed to deploy generator workflow template")
 }
 
 /// List registered workflows

@@ -1,0 +1,69 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: workflow-generator-planner-agent
+  version: "1.0.0"
+  description: Plans workflow composition by discovering existing agents and identifying missing agent capabilities.
+  labels:
+    role: worker
+    category: platform
+    capability: workflow-planning
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+
+  task:
+    instruction: |
+      You are a workflow planning specialist.
+
+      First, call `aegis.agent.list` to inspect currently deployed agents.
+      Then analyze the user workflow request step-by-step. For each required workflow step:
+      - map it to an existing deployed agent when possible
+      - only mark it as missing when no suitable deployed agent exists
+
+      Produce a concise JSON plan with:
+      - required_agents: array of agent names/capabilities needed for the workflow
+      - existing_agents: array of matching deployed agents
+      - missing_agents: array of agent requirements that need generation
+      - generation_prompts: array of natural-language prompts to create each missing agent
+      - workflow_prompt: a complete natural-language prompt for generating the final workflow,
+        explicitly referencing existing and newly generated agent names and which step each serves.
+
+      Return JSON only.
+    prompt_template: |
+      {{instruction}}
+
+      Workflow request:
+      {{input}}
+
+      Planner:
+
+  execution:
+    mode: iterative
+    max_iterations: 4
+    llm_timeout_seconds: 300
+    validation:
+      - type: semantic
+        judge_agent: workflow-generator-judge
+        criteria: Ensure the workflow planning output correctly maps required steps to existing agents and identifies only genuinely missing agents.
+        min_score: 0.85
+        min_confidence: 0.75
+        timeout_seconds: 120
+
+  tools:
+    - aegis.agent.list
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+      timeout: 300s

@@ -20,6 +20,7 @@
 //! - `aegis init` - Interactive setup wizard
 //! - `aegis up [--yes]` - Start the stack (runs init automatically if needed)
 //! - `aegis down [--volumes]` - Stop the Docker Compose stack
+//! - `aegis restart [--profile <name>]` - Restart the Docker Compose services
 //! - `aegis uninstall [-y]` - Stop stack and remove the ~/.aegis directory
 //!
 //! See ADR-008 for architecture details.
@@ -39,8 +40,8 @@ mod commands;
 mod daemon;
 
 use commands::{
-    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, TaskCommand, UninstallArgs,
-    UpArgs, WorkflowCommand,
+    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, RestartArgs, TaskCommand,
+    UninstallArgs, UpArgs, WorkflowCommand,
 };
 
 /// AEGIS Agent Host - Enable autonomous agent execution
@@ -143,6 +144,13 @@ enum Commands {
         args: UpArgs,
     },
 
+    /// Restart local AEGIS Docker Compose services
+    #[command(name = "restart")]
+    Restart {
+        #[command(flatten)]
+        args: RestartArgs,
+    },
+
     /// Stop the stack and permanently remove the AEGIS data directory
     #[command(name = "uninstall")]
     Uninstall {
@@ -185,6 +193,7 @@ async fn main() -> Result<()> {
         Some(Commands::Init { args }) => commands::init::run(args).await,
         Some(Commands::Down { args }) => commands::down::run(args).await,
         Some(Commands::Up { args }) => commands::up::run(args).await,
+        Some(Commands::Restart { args }) => commands::restart::run(args).await,
         Some(Commands::Uninstall { args }) => commands::uninstall::run(args).await,
         None => {
             // No command provided - show help

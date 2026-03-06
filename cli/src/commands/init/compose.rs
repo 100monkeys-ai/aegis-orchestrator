@@ -83,6 +83,37 @@ impl ComposeRunner {
         Ok(())
     }
 
+    /// Pull an Ollama model inside the running `ollama` service container.
+    pub async fn pull_ollama_model(&self, model: &str) -> Result<()> {
+        println!();
+        println!("{} {}", "Pulling Ollama model:".bold(), model.bold().cyan());
+        self.run_compose(&["exec", "-T", "ollama", "ollama", "pull", model])?;
+        println!("  {} Ollama model pulled: {}", "✓".green(), model);
+        Ok(())
+    }
+
+    /// Restart running services. When `profile` is set, only services in that
+    /// compose profile are restarted.
+    pub async fn restart(&self, profile: Option<&str>) -> Result<()> {
+        println!();
+        match profile {
+            Some(profile) => {
+                println!(
+                    "{}",
+                    format!("Restarting services in profile `{profile}`...").bold()
+                );
+                self.run_compose_with_profile(&["restart"], Some(profile))?;
+            }
+            None => {
+                println!("{}", "Restarting all services...".bold());
+                self.run_compose_with_profile(&["restart"], None)?;
+            }
+        }
+
+        println!("  {} Services restarted", "✓".green());
+        Ok(())
+    }
+
     /// Collect recent logs from all services for post-failure diagnostics.
     /// Returns an empty string if the command fails (best-effort).
     fn collect_logs(&self) -> String {
@@ -110,6 +141,12 @@ impl ComposeRunner {
     /// terminal. Returns `Ok(())` if the command exits 0, otherwise an error
     /// containing the last non-empty stderr line.
     fn run_compose(&self, args: &[&str]) -> Result<()> {
+        self.run_compose_with_profile(args, None)
+    }
+
+    /// Run a `docker compose` sub-command, optionally scoping enabled services
+    /// using a compose profile.
+    fn run_compose_with_profile(&self, args: &[&str], profile: Option<&str>) -> Result<()> {
         let spinner = ProgressBar::new_spinner();
         spinner.set_style(
             ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -120,6 +157,10 @@ impl ComposeRunner {
 
         let mut cmd = Command::new("docker");
         cmd.arg("compose");
+        if let Some(profile) = profile {
+            cmd.arg("--profile");
+            cmd.arg(profile);
+        }
         cmd.args(args);
         cmd.current_dir(&self.dir);
         cmd.stdout(Stdio::piped());
@@ -172,9 +213,13 @@ impl ComposeRunner {
 
         if !status.success() {
             let msg = last_stderr.lock().unwrap().clone();
+            let rendered_args = match profile {
+                Some(profile) => format!("--profile {profile} {}", args.join(" ")),
+                None => args.join(" "),
+            };
             bail!(
                 "`docker compose {}` failed (exit {}): {}",
-                args.join(" "),
+                rendered_args,
                 status.code().unwrap_or(-1),
                 msg
             );

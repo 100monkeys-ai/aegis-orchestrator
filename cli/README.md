@@ -57,6 +57,7 @@ aegis agent deploy agent.yaml    # Deploy an agent from a manifest
 aegis agent list                 # List all deployed agents
 aegis agent logs <name>          # Stream live agent logs
 aegis agent remove <id>          # Remove a deployed agent
+aegis agent generate "..."       # Generate and deploy an agent from natural language
 ```
 
 ### Tasks (Executions)
@@ -66,6 +67,44 @@ aegis task execute <agent> --input "..."   # Submit a task
 aegis task list                            # List recent executions
 aegis task logs <execution-id>             # View execution logs
 aegis task cancel <execution-id>           # Cancel a running execution
+```
+
+### Workflows
+
+```bash
+aegis workflow generate "..."    # Generate and register a workflow from natural language
+```
+
+Generated manifests are also persisted locally by the daemon for source control:
+
+- `~/.aegis/generated/agents/<name>/<version>.yaml`
+- `~/.aegis/generated/workflows/<name>/<version>.yaml`
+
+Bundled generator templates are also materialized by the CLI:
+
+- `~/.aegis/templates/agents/*.yaml`
+- `~/.aegis/templates/workflows/*.yaml`
+
+### Authoring Agent Templates
+
+```bash
+# Agent that creates/deploys agent manifests
+cli/templates/agents/agent-creator-agent.yaml
+
+# Agent that plans workflow generation and discovers existing agents
+cli/templates/agents/workflow-generator-planner-agent.yaml
+
+# Agent that creates/validates/registers workflow manifests
+cli/templates/agents/workflow-creator-validator-agent.yaml
+
+# Judge for agent generation quality
+cli/templates/agents/agent-generator-judge.yaml
+
+# Judge for workflow generation quality
+cli/templates/agents/workflow-generator-judge.yaml
+
+# Built-in workflow that orchestrates planner -> missing-agent generation -> workflow registration
+cli/templates/workflows/builtin-workflow-generator.yaml
 ```
 
 ### Debug Logging
