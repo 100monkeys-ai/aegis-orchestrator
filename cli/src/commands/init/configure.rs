@@ -268,6 +268,8 @@ impl ConfigWizard {
             r#"
   storage:
     backend: "local_host"
+    local_host:
+      mount_point: "/tmp/aegis-volumes"
 "#
         };
 
