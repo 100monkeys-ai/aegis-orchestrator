@@ -13,7 +13,7 @@
 //! | `storage` | SeaweedFS filer endpoints, local volume root |
 //! | `nfs_gateway` | Bind address / port for NFS Server Gateway |
 //! | `llm` | Provider credentials and model aliases |
-//! | `openbao` | Secrets backend connection (Phase 4) |
+//! | `openbao` | Secrets backend connection (ADR-034) |
 //! | `telemetry` | OTLP exporter endpoints |
 //!
 //! See AGENTS.md §Aegis Node, §Aegis Host.
@@ -141,6 +141,10 @@ pub struct NodeConfigSpec {
     /// If omitted, the orchestrator runs in memoryless mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cortex: Option<CortexConfig>,
+
+    /// OpenBao secrets management configuration (ADR-034)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openbao: Option<OpenBaoConfig>,
 
     /// SMCP protocol configuration (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -813,6 +817,61 @@ pub struct CortexConfig {
     pub grpc_url: Option<String>,
 }
 
+/// OpenBao secrets backend configuration (ADR-034)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenBaoConfig {
+    /// OpenBao server API address (e.g. "https://openbao.internal:8200")
+    pub address: String,
+
+    /// Authentication method (must be "approle" for orchestrators)
+    #[serde(default = "default_openbao_auth_method")]
+    pub auth_method: String,
+
+    /// AppRole authentication credentials
+    pub approle: AppRoleConfig,
+
+    /// Default namespace for this node (e.g. "tenant-acme", "aegis-system")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
+    /// TLS configuration for communicating with OpenBao
+    #[serde(default)]
+    pub tls: OpenBaoTlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRoleConfig {
+    /// The public Role ID assigned to this orchestrator node
+    pub role_id: String,
+
+    /// The environment variable name containing the Secret ID (default: "OPENBAO_SECRET_ID")
+    #[serde(default = "default_openbao_secret_id_env_var")]
+    pub secret_id_env_var: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct OpenBaoTlsConfig {
+    /// Path to a custom CA certificate PEM file to trust
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+
+    /// Path to the client certificate PEM file (for mTLS)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    /// Path to the client private key PEM file (for mTLS)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+}
+
+fn default_openbao_auth_method() -> String {
+    "approle".to_string()
+}
+
+fn default_openbao_secret_id_env_var() -> String {
+    "OPENBAO_SECRET_ID".to_string()
+}
+
 /// SMCP protocol configuration (ADR-035 §6)
 ///
 /// Defines the RSA key material used by the orchestrator to sign and verify
@@ -1060,6 +1119,7 @@ impl Default for NodeConfigSpec {
             database: None,
             temporal: None,
             cortex: None,
+            openbao: None,
             smcp: None,
             security_contexts: None,
         }
@@ -1427,6 +1487,7 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
+                openbao: None,
                 mcp_servers: None,
                 builtin_dispatchers: None,
                 smcp: None,
