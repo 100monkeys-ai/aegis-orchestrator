@@ -31,7 +31,7 @@
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server + cortex client | ADR-042 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
-//! | [`iam`] | `StandardKeycloakIamService` — JWKS-based JWT validation | ADR-041 |
+//! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
 
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;

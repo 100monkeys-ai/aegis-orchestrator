@@ -13,6 +13,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
@@ -163,7 +164,8 @@ async fn execute_daemon(
             // Deploy manifest and use resulting ID
             let manifest_path = PathBuf::from(&agent);
             if manifest_path.exists() {
-                let manifest_content = std::fs::read_to_string(&manifest_path)
+                let manifest_content = tokio::fs::read_to_string(&manifest_path)
+                    .await
                     .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
 
                 let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
@@ -184,7 +186,7 @@ async fn execute_daemon(
     };
 
     // Parse input
-    let input_data = parse_input(input)?;
+    let input_data = parse_input(input).await?;
 
     println!("Executing agent {}...", agent_id);
 
@@ -198,8 +200,8 @@ async fn execute_daemon(
     if follow {
         logs_daemon(execution_id, true, false, false, client).await?;
     } else if wait {
-        // TODO: Poll status until completion
         println!("Waiting for completion...");
+        wait_for_execution_completion(execution_id, &client).await?;
     }
 
     Ok(())
@@ -265,12 +267,13 @@ async fn list_daemon(agent_id: Option<Uuid>, limit: usize, client: DaemonClient)
 }
 
 // Helpers
-fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
+async fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
     match input {
         None => Ok(serde_json::json!({})),
         Some(s) if s.starts_with('@') => {
             let path = &s[1..];
-            let content = std::fs::read_to_string(path)
+            let content = tokio::fs::read_to_string(path)
+                .await
                 .with_context(|| format!("Failed to read input file: {}", path))?;
             serde_json::from_str(&content).context("Failed to parse input JSON")
         }
@@ -284,6 +287,29 @@ fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
             }
         }
     }
+}
+
+async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {
+    const MAX_POLLS: u32 = 300;
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    for _ in 0..MAX_POLLS {
+        let execution = client.get_execution(execution_id).await?;
+        let normalized = execution.status.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "completed" | "failed" | "cancelled" | "canceled"
+        ) {
+            println!(
+                "Execution {} finished with status: {}",
+                execution.id, execution.status
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    anyhow::bail!("Timed out waiting for execution {} to finish", execution_id);
 }
 
 fn format_status(status: &str) -> colored::ColoredString {

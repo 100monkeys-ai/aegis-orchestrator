@@ -91,7 +91,7 @@ impl Default for ToolInvocationId {
 pub struct CredentialRef {
     /// Which backend holds the credential.
     pub store_type: CredentialStoreType,
-    /// Key or path within that backend (e.g. `"env:GMAIL_TOKEN"` or `"vault:tenant/kv/gmail"`).
+    /// Key or path within that backend (e.g. `"env:GMAIL_TOKEN"` or `"secret:tenant/kv/gmail"`).
     pub key: String,
 }
 
@@ -101,8 +101,8 @@ pub enum CredentialStoreType {
     /// Read from the orchestrator process's environment variables.
     /// Suitable for development; not recommended for production.
     Environment,
-    /// Read from OpenBao (ADR-034). Resolved via `SecretsManager::resolve_credential()`.
-    OpenBao,
+    /// Read from the orchestrator-managed secret store ACL (ADR-034).
+    SecretStore,
 }
 
 impl CredentialRef {
@@ -113,10 +113,10 @@ impl CredentialRef {
         }
     }
 
-    pub fn from_vault(path: &str) -> Self {
+    pub fn from_secret_store(path: &str) -> Self {
         Self {
-            store_type: CredentialStoreType::OpenBao,
-            key: format!("vault:{}", path),
+            store_type: CredentialStoreType::SecretStore,
+            key: format!("secret:{}", path),
         }
     }
 }
@@ -263,8 +263,8 @@ impl ToolServer {
             .map(|(env_key, v)| {
                 let cred_ref = if let Some(env_val) = v.strip_prefix("env:") {
                     CredentialRef::from_env(env_val)
-                } else if let Some(vault_val) = v.strip_prefix("vault:") {
-                    CredentialRef::from_vault(vault_val)
+                } else if let Some(secret_val) = v.strip_prefix("secret:") {
+                    CredentialRef::from_secret_store(secret_val)
                 } else {
                     CredentialRef::from_env(v)
                 };

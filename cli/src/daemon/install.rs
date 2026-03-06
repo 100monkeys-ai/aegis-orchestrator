@@ -59,8 +59,10 @@ async fn install_systemd(binary_path: Option<PathBuf>, user: Option<String>) -> 
     info!("Installing systemd service");
 
     // Determine binary path
-    let binary =
-        binary_path.unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
+    let binary = match binary_path {
+        Some(path) => path,
+        None => std::env::current_exe().context("Failed to get current executable path")?,
+    };
 
     // Verify binary exists
     if !binary.exists() {
@@ -158,8 +160,10 @@ async fn install_launchd(binary_path: Option<PathBuf>, _user: Option<String>) ->
     info!("Installing LaunchDaemon");
 
     // Determine binary path
-    let binary =
-        binary_path.unwrap_or_else(|| std::env::current_exe().expect("Failed to get current exe"));
+    let binary = match binary_path {
+        Some(path) => path,
+        None => std::env::current_exe().context("Failed to get current executable path")?,
+    };
 
     if !binary.exists() {
         anyhow::bail!("Binary not found: {:?}", binary);

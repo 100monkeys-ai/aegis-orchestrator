@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Keycloak HTTP Auth Middleware (ADR-041)
+//! # IAM/OIDC HTTP Auth Middleware (ADR-041)
 //!
-//! Axum middleware layer that validates Keycloak Bearer JWTs on incoming HTTP
+//! Axum middleware layer that validates IAM/OIDC Bearer JWTs on incoming HTTP
 //! requests. When authentication succeeds, the resolved [`UserIdentity`] is
 //! inserted into the request's extensions for use by downstream handlers.
 //!
@@ -17,7 +17,7 @@
 //! - `/v1/webhooks/*` — webhook ingestion (HMAC auth)
 //! - `/v1/temporal-events` — Temporal callbacks (HMAC auth)
 
-use crate::domain::iam::KeycloakIamService;
+use crate::domain::iam::IdentityProvider;
 use axum::{
     extract::Request,
     http::{header, StatusCode},
@@ -27,7 +27,7 @@ use axum::{
 use std::sync::Arc;
 use tracing::warn;
 
-/// Paths exempt from Keycloak JWT auth.
+/// Paths exempt from IAM/OIDC JWT auth.
 /// These endpoints use other auth mechanisms (SMCP attestation, HMAC, or are unauthenticated).
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
@@ -38,26 +38,26 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/v1/temporal-events",
 ];
 
-/// Check whether a request path is exempt from Keycloak auth.
+/// Check whether a request path is exempt from IAM/OIDC auth.
 fn is_exempt(path: &str) -> bool {
     EXEMPT_PATH_PREFIXES
         .iter()
         .any(|prefix| path.starts_with(prefix))
 }
 
-/// Axum middleware function for Keycloak JWT authentication.
+/// Axum middleware function for IAM/OIDC JWT authentication.
 ///
 /// Usage:
 /// ```rust,ignore
 /// use axum::middleware;
 ///
-/// let iam_service: Arc<dyn KeycloakIamService> = /* ... */;
+/// let iam_service: Arc<dyn IdentityProvider> = /* ... */;
 /// let app = Router::new()
 ///     .route("/v1/stimuli", post(handle_stimulus))
-///     .layer(middleware::from_fn_with_state(iam_service, keycloak_auth_middleware));
+///     .layer(middleware::from_fn_with_state(iam_service, iam_auth_middleware));
 /// ```
-pub async fn keycloak_auth_middleware(
-    axum::extract::State(iam_service): axum::extract::State<Arc<dyn KeycloakIamService>>,
+pub async fn iam_auth_middleware(
+    axum::extract::State(iam_service): axum::extract::State<Arc<dyn IdentityProvider>>,
     mut request: Request,
     next: Next,
 ) -> Response {

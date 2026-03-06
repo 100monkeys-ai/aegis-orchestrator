@@ -79,9 +79,8 @@ pub async fn handle_command(
     host: &str,
     port: u16,
 ) -> Result<()> {
-    // Agents are currently only managed via Daemon.
-    // Embedded mode might support it through direct repository access,
-    // but for now we'll focus on Daemon interaction as per architecture.
+    // Agents are currently managed via the daemon.
+    // Embedded mode may later support direct repository access.
 
     let daemon_status = check_daemon_running(host, port).await;
     match daemon_status {
@@ -174,7 +173,8 @@ async fn deploy_agent(
     force: bool,
     client: DaemonClient,
 ) -> Result<()> {
-    let manifest_content = std::fs::read_to_string(&manifest)
+    let manifest_content = tokio::fs::read_to_string(&manifest)
+        .await
         .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
 
     // Parse with SDK types (now using core domain re-exports)

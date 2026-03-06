@@ -427,7 +427,7 @@ mod tests {
                 secrets: None,
                 builtin_dispatchers: None,
                 registry_credentials: vec![],
-                keycloak: None,
+                iam: None,
                 grpc_auth: None,
             },
         };

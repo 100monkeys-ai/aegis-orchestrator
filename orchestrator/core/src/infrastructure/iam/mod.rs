@@ -7,4 +7,4 @@
 
 pub mod keycloak_iam_service;
 
-pub use keycloak_iam_service::StandardKeycloakIamService;
+pub use keycloak_iam_service::StandardIamService;

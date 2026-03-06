@@ -374,7 +374,7 @@ pub struct ContainerStepConfig {
     /// CPU, memory, and timeout limits
     pub resources: Option<ContainerResources>,
 
-    /// OpenBao path (`vault:path/to/secret`) for private registry credentials
+    /// Secret-backend path (`secret:path/to/secret`) for private registry credentials
     pub registry_credentials: Option<String>,
 
     /// Correlation — links this step to the parent workflow execution

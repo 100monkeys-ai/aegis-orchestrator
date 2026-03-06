@@ -21,7 +21,7 @@
 //! | `POST` | `/v1/smcp/attest` | SMCP attestation handshake (ADR-035) |
 //! | `POST` | `/v1/smcp/invoke` | SMCP tool invocation (ADR-033) |
 //! | `POST` | `/v1/dispatch-gateway` | Dispatch gateway — inner loop orchestration (ADR-038) |
-//! | `POST` | `/v1/stimuli` | Stimulus ingestion — Keycloak Bearer auth (ADR-021) |
+//! | `POST` | `/v1/stimuli` | Stimulus ingestion — IAM/OIDC Bearer auth (ADR-021) |
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
 

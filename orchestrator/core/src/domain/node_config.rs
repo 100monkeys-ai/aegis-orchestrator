@@ -13,7 +13,7 @@
 //! | `storage` | SeaweedFS filer endpoints, local volume root |
 //! | `nfs_gateway` | Bind address / port for NFS Server Gateway |
 //! | `llm` | Provider credentials and model aliases |
-//! | `openbao` | Secrets backend connection (ADR-034) |
+//! | `secrets.backend` | Secrets backend connection (ADR-034) |
 //! | `telemetry` | OTLP exporter endpoints |
 //!
 //! See AGENTS.md §Aegis Node, §Aegis Host.
@@ -153,10 +153,10 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_contexts: Option<Vec<SecurityContextDefinition>>,
 
-    /// Keycloak IAM configuration (ADR-041)
+    /// OIDC IAM configuration (ADR-041)
     /// If omitted, all auth middleware is disabled (pass-through for local development).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub keycloak: Option<KeycloakConfig>,
+    pub iam: Option<IamConfig>,
 
     /// gRPC authentication configuration (ADR-041)
     /// If omitted, gRPC endpoints are unauthenticated.
@@ -750,7 +750,7 @@ impl Default for McpResourceLimitsConfig {
 pub struct DatabaseConfig {
     /// PostgreSQL connection URL.
     /// Supports `env:VAR_NAME` for environment variable resolution
-    /// and `vault:namespace/mount/path` for OpenBao secrets (Phase 2).
+    /// and `secret:namespace/mount/path` for secret-backend references (Phase 2).
     /// Example: `"env:AEGIS_DATABASE_URL"` or `"postgresql://user:pass@host:5432/db"`
     pub url: String,
 
@@ -783,7 +783,7 @@ pub struct TemporalConfig {
     pub worker_http_endpoint: String,
 
     /// Shared HMAC secret for authenticating Temporal event callbacks.
-    /// Supports `env:VAR_NAME` and `vault:` credential resolution patterns.
+    /// Supports `env:VAR_NAME` and `secret:` credential resolution patterns.
     /// If omitted, the `/v1/temporal-events` endpoint is unauthenticated (warns at startup).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_secret: Option<String>,
@@ -829,51 +829,49 @@ pub struct CortexConfig {
 /// Top-level secrets configuration wrapper (ADR-034).
 ///
 /// Placed at `spec.secrets` in `aegis-config.yaml` and deserialized into
-/// [`NodeConfigSpec::secrets`]. The extra level of indirection keeps the
-/// `NodeConfigSpec` namespace clean and matches the ADR-034 spec path
-/// (`spec.secrets.openbao`).
+/// [`NodeConfigSpec::secrets`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsConfig {
-    /// OpenBao backend configuration.
+    /// Secret backend configuration.
     /// If `None`, the orchestrator uses `MockSecretStore` (dev/test only).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openbao: Option<OpenBaoConfig>,
+    pub backend: Option<SecretBackendConfig>,
 }
 
-/// OpenBao secrets backend configuration (ADR-034)
+/// Secret backend configuration (ADR-034).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OpenBaoConfig {
-    /// OpenBao server API address (e.g. "<https://openbao.internal:8200>")
+pub struct SecretBackendConfig {
+    /// Backend API address (e.g. "<https://secrets.internal:8200>")
     pub address: String,
 
     /// Authentication method (must be "approle" for orchestrators)
-    #[serde(default = "default_openbao_auth_method")]
+    #[serde(default = "default_secret_backend_auth_method")]
     pub auth_method: String,
 
     /// AppRole authentication credentials
-    pub approle: AppRoleConfig,
+    pub approle: SecretBackendAppRoleConfig,
 
     /// Default namespace for this node (e.g. "tenant-acme", "aegis-system")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
 
-    /// TLS configuration for communicating with OpenBao
+    /// TLS configuration for communicating with the secret backend
     #[serde(default)]
-    pub tls: OpenBaoTlsConfig,
+    pub tls: SecretBackendTlsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AppRoleConfig {
+pub struct SecretBackendAppRoleConfig {
     /// The public Role ID assigned to this orchestrator node
     pub role_id: String,
 
-    /// The environment variable name containing the Secret ID (default: "OPENBAO_SECRET_ID")
-    #[serde(default = "default_openbao_secret_id_env_var")]
+    /// The environment variable name containing the Secret ID.
+    #[serde(default = "default_secret_backend_secret_id_env_var")]
     pub secret_id_env_var: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OpenBaoTlsConfig {
+pub struct SecretBackendTlsConfig {
     /// Path to a custom CA certificate PEM file to trust
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ca_cert: Option<String>,
@@ -887,11 +885,11 @@ pub struct OpenBaoTlsConfig {
     pub client_key: Option<String>,
 }
 
-fn default_openbao_auth_method() -> String {
+fn default_secret_backend_auth_method() -> String {
     "approle".to_string()
 }
 
-fn default_openbao_secret_id_env_var() -> String {
+fn default_secret_backend_secret_id_env_var() -> String {
     "OPENBAO_SECRET_ID".to_string()
 }
 
@@ -981,30 +979,30 @@ pub struct RateLimitDefinition {
     pub per_seconds: u32,
 }
 
-/// Keycloak IAM configuration (ADR-041 §Node Configuration).
+/// OIDC IAM configuration (ADR-041 §Node Configuration).
 ///
-/// Defines the trusted Keycloak realms, JWKS cache TTL, and custom claim names.
+/// Defines the trusted identity realms, JWKS cache TTL, and custom claim names.
 /// When this section is present in `aegis-config.yaml`, all HTTP and gRPC
 /// auth middleware is enabled. When absent, auth is disabled (local dev mode).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeycloakConfig {
+pub struct IamConfig {
     /// All known realms — determines which JWKS endpoints to trust and cache.
     /// The platform validates JWTs against the realm matching the JWT's "iss" claim.
-    pub realms: Vec<KeycloakRealmConfig>,
+    pub realms: Vec<IamRealmConfig>,
 
     /// JWKS cache TTL in seconds — keys refreshed this often to support key rotation.
     /// Default: 300 (5 minutes).
     #[serde(default = "default_jwks_cache_ttl")]
     pub jwks_cache_ttl_seconds: u64,
 
-    /// Custom claim names for Keycloak attribute mappers.
+    /// Custom claim names for OIDC attribute mappers.
     #[serde(default)]
-    pub claims: KeycloakClaimsConfig,
+    pub claims: IamClaimsConfig,
 }
 
-/// Individual realm configuration entry within `spec.keycloak.realms`.
+/// Individual realm configuration entry within `spec.iam.realms`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeycloakRealmConfig {
+pub struct IamRealmConfig {
     /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
     pub slug: String,
     /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
@@ -1017,9 +1015,9 @@ pub struct KeycloakRealmConfig {
     pub kind: String,
 }
 
-/// Custom claim names for Keycloak attribute mappers.
+/// Custom claim names for OIDC attribute mappers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct KeycloakClaimsConfig {
+pub struct IamClaimsConfig {
     /// Custom claim mapper name for ZaruTier. Default: "zaru_tier"
     #[serde(default = "default_zaru_tier_claim")]
     pub zaru_tier: String,
@@ -1028,7 +1026,7 @@ pub struct KeycloakClaimsConfig {
     pub aegis_role: String,
 }
 
-impl Default for KeycloakClaimsConfig {
+impl Default for IamClaimsConfig {
     fn default() -> Self {
         Self {
             zaru_tier: default_zaru_tier_claim(),
@@ -1051,7 +1049,7 @@ fn default_aegis_role_claim() -> String {
 
 /// gRPC authentication configuration (ADR-041 §gRPC Authentication Amendment).
 ///
-/// When enabled, a `KeycloakAuthInterceptor` is installed on the gRPC server
+/// When enabled, a `OIDCAuthInterceptor` is installed on the gRPC server
 /// that validates Bearer JWTs on every call except exempted methods.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrpcAuthConfig {
@@ -1228,7 +1226,7 @@ impl Default for NodeConfigSpec {
             secrets: None,
             smcp: None,
             security_contexts: None,
-            keycloak: None,
+            iam: None,
             grpc_auth: None,
         }
     }
@@ -1511,7 +1509,7 @@ impl NodeConfigManifest {
 /// | `env:VAR` | `env:OPENAI_API_KEY` | Read `$OPENAI_API_KEY` from process env |
 /// | literal | `sk-abcdef...` | Return as-is |
 ///
-/// Phase 2 will add `vault:namespace/mount/path` for OpenBao secrets.
+/// Phase 2 will add `secret:namespace/mount/path` for secret-backend references.
 pub fn resolve_env_value(raw: &str) -> anyhow::Result<String> {
     if let Some(var_name) = raw.strip_prefix("env:") {
         std::env::var(var_name).map_err(|_| {
@@ -1601,7 +1599,7 @@ mod tests {
                 smcp: None,
                 security_contexts: None,
                 registry_credentials: vec![],
-                keycloak: None,
+                iam: None,
                 grpc_auth: None,
             },
         };

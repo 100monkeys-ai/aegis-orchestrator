@@ -6,7 +6,7 @@
 //!
 //! | Method | Path | Auth | Handler |
 //! |--------|------|------|---------|
-//! | `POST` | `/v1/stimuli` | Keycloak Bearer JWT | [`ingest_stimulus_handler`] |
+//! | `POST` | `/v1/stimuli` | IAM/OIDC Bearer JWT | [`ingest_stimulus_handler`] |
 //! | `POST` | `/v1/webhooks/{source}` | HMAC-SHA256 (`X-Aegis-Signature`) | [`webhook_handler`] |
 //!
 //! Both endpoints:
@@ -78,10 +78,10 @@ fn stimulus_error_response(e: StimulusError) -> (StatusCode, axum::Json<serde_js
 // Handlers
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// `POST /v1/stimuli` — Authenticated (Keycloak Bearer JWT)
+/// `POST /v1/stimuli` — Authenticated (IAM/OIDC Bearer JWT)
 ///
 /// Accepts a stimulus from any authenticated caller. Auth is enforced by the
-/// upstream middleware tower layer (Phase 2: `KeycloakAuthInterceptor`).
+/// upstream middleware tower layer (Phase 2: `GrpcIamAuthInterceptor`).
 /// In Phase 1, the route is present and functional; a `TODO` tower middleware
 /// guard will be added in ADR-041 wiring.
 ///

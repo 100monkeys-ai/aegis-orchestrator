@@ -1,34 +1,34 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Keycloak gRPC Auth Interceptor (ADR-041)
+//! # IAM/OIDC gRPC Auth Interceptor (ADR-041)
 //!
-//! Tonic interceptor that validates Keycloak Bearer JWTs on incoming gRPC calls.
+//! Tonic interceptor that validates IAM/OIDC Bearer JWTs on incoming gRPC calls.
 //! Exempted methods (e.g. inner loop channels) are configured via
 //! `spec.grpc_auth.exempt_methods` in `aegis-config.yaml`.
 //!
 //! When authentication succeeds, the resolved [`UserIdentity`] is inserted into
 //! the request's extensions so downstream handlers can access it.
 
-use crate::domain::iam::{KeycloakIamService, UserIdentity};
+use crate::domain::iam::{IdentityProvider, UserIdentity};
 use crate::domain::node_config::GrpcAuthConfig;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::{Request, Status};
 use tracing::warn;
 
-/// gRPC interceptor that validates Keycloak Bearer JWTs.
+/// gRPC interceptor that validates IAM/OIDC Bearer JWTs.
 ///
 /// Installed on the tonic server via `InterceptedService` when
 /// `spec.grpc_auth.enabled` is `true` in the node config.
 #[derive(Clone)]
-pub struct KeycloakAuthInterceptor {
-    iam_service: Arc<dyn KeycloakIamService>,
+pub struct GrpcIamAuthInterceptor {
+    iam_service: Arc<dyn IdentityProvider>,
     exempt_methods: HashSet<String>,
 }
 
-impl KeycloakAuthInterceptor {
+impl GrpcIamAuthInterceptor {
     /// Create a new interceptor from config.
-    pub fn new(iam_service: Arc<dyn KeycloakIamService>, config: &GrpcAuthConfig) -> Self {
+    pub fn new(iam_service: Arc<dyn IdentityProvider>, config: &GrpcAuthConfig) -> Self {
         Self {
             iam_service,
             exempt_methods: config.exempt_methods.iter().cloned().collect(),
@@ -59,7 +59,7 @@ impl KeycloakAuthInterceptor {
 /// from within the async gRPC handler methods. The handler calls this before processing
 /// the request and rejects with `Status::Unauthenticated` if validation fails.
 pub async fn validate_grpc_request<T>(
-    interceptor: &KeycloakAuthInterceptor,
+    interceptor: &GrpcIamAuthInterceptor,
     request: &Request<T>,
     method: &str,
 ) -> Result<Option<UserIdentity>, Status> {

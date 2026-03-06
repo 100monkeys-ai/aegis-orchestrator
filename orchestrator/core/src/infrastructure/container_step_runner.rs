@@ -59,7 +59,7 @@ pub struct DockerContainerStepRunner {
     nfs_mountport: u16,
     event_bus: Arc<EventBus>,
     /// Used to resolve per-step registry credentials stored in OpenBao (ADR-050).
-    /// When `ContainerStepConfig::registry_credentials` is `Some("vault:engine/path")`,
+    /// When `ContainerStepConfig::registry_credentials` is `Some("secret:engine/path")`,
     /// the runner reads `username`, `password`, and optionally `serveraddress` from
     /// the vault secret and passes them as a `DockerCredentials` override to
     /// [`DockerImageManager::ensure_image`].
@@ -161,7 +161,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             });
 
         // ─── 2. Resolve per-step registry credentials (ADR-050) ───────────────
-        // Supports `None` (anonymous), `env:VAR_NAME`, and `vault:engine/path`.
+        // Supports `None` (anonymous), `env:VAR_NAME`, and `secret:engine/path`.
         // Any other format is rejected immediately so misconfigurations fail fast.
         let credentials_override_result: Result<
             Option<bollard::auth::DockerCredentials>,
@@ -211,19 +211,20 @@ impl ContainerStepRunner for DockerContainerStepRunner {
 
                 resolved.map(Some)
             }
-            Some(s) if s.starts_with("vault:") => {
-                let vault_path = s.strip_prefix("vault:").unwrap();
+            Some(s) if s.starts_with("secret:") => {
+                let secret_ref_path = s.strip_prefix("secret:").unwrap();
                 let resolved = async {
-                    let (engine, secret_path) = vault_path.split_once('/').ok_or_else(|| {
-                        ContainerStepError::ImagePullFailed {
-                            image: config.image.clone(),
-                            error: format!(
-                                "vault registry_credentials '{}' must be in format \
-                                     'vault:engine/path'",
-                                s
-                            ),
-                        }
-                    })?;
+                    let (engine, secret_path) =
+                        secret_ref_path.split_once('/').ok_or_else(|| {
+                            ContainerStepError::ImagePullFailed {
+                                image: config.image.clone(),
+                                error: format!(
+                                    "secret registry_credentials '{}' must be in format \
+                                     'secret:engine/path'",
+                                    s
+                                ),
+                            }
+                        })?;
 
                     let ctx = AccessContext::system("orchestrator");
                     let fields = self
@@ -234,7 +235,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             image: config.image.clone(),
                             error: format!(
                                 "failed to read registry credentials from OpenBao at '{}': {}",
-                                vault_path, e
+                                secret_ref_path, e
                             ),
                         })?;
 
@@ -243,7 +244,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             image: config.image.clone(),
                             error: format!(
                                 "OpenBao secret at '{}' is missing required field 'username'",
-                                vault_path
+                                secret_ref_path
                             ),
                         }
                     })?;
@@ -253,7 +254,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             image: config.image.clone(),
                             error: format!(
                                 "OpenBao secret at '{}' is missing required field 'password'",
-                                vault_path
+                                secret_ref_path
                             ),
                         }
                     })?;
@@ -276,7 +277,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                 image: config.image.clone(),
                 error: format!(
                     "unrecognised registry_credentials format '{}'; \
-                             expected 'env:VAR_NAME' or 'vault:engine/path'",
+                             expected 'env:VAR_NAME' or 'secret:engine/path'",
                     s
                 ),
             }),

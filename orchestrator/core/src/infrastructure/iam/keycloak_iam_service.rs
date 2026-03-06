@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # StandardKeycloakIamService — Production JWKS-based JWT Validation (ADR-041)
+//! # StandardIamService — Production JWKS-based JWT Validation (ADR-041)
 //!
-//! Implements [`KeycloakIamService`] by fetching and caching JWKS key sets from
+//! Implements [`IdentityProvider`] by fetching and caching JWKS key sets from
 //! Keycloak realms, validating JWT signatures using RS256, and extracting custom
 //! claims (`zaru_tier`, `aegis_role`) to resolve [`UserIdentity`].
 //!
@@ -15,10 +15,10 @@
 
 use crate::domain::events::IamEvent;
 use crate::domain::iam::{
-    AegisRole, IamError, IdentityKind, KeycloakIamService, KeycloakRealm, RealmKind, UserIdentity,
-    ValidatedKeycloakToken, ZaruTier,
+    AegisRole, IamError, IdentityKind, IdentityProvider, IdentityRealm, RealmKind, UserIdentity,
+    ValidatedIdentityToken, ZaruTier,
 };
-use crate::domain::node_config::{KeycloakClaimsConfig, KeycloakConfig, KeycloakRealmConfig};
+use crate::domain::node_config::{IamClaimsConfig, IamConfig, IamRealmConfig};
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -96,13 +96,13 @@ struct KeycloakClaims {
     extra: HashMap<String, serde_json::Value>,
 }
 
-/// Production implementation of [`KeycloakIamService`].
+/// Production implementation of [`IdentityProvider`].
 ///
 /// Validates JWTs against Keycloak realm JWKS endpoints with in-memory caching.
 /// Publishes [`IamEvent`]s to the event bus for audit trail.
-pub struct StandardKeycloakIamService {
+pub struct StandardIamService {
     /// Known realms configured from `aegis-config.yaml`.
-    realms: Vec<KeycloakRealm>,
+    realms: Vec<IdentityRealm>,
     /// Issuer URL → realm index for O(1) lookup.
     issuer_to_realm: HashMap<String, usize>,
     /// Per-realm JWKS cache.
@@ -110,17 +110,17 @@ pub struct StandardKeycloakIamService {
     /// HTTP client for JWKS fetching.
     http_client: reqwest::Client,
     /// Custom claim names from config.
-    claims_config: KeycloakClaimsConfig,
+    claims_config: IamClaimsConfig,
     /// Event bus for publishing IAM events.
     event_bus: Arc<EventBus>,
     /// JWKS cache TTL.
     cache_ttl: Duration,
 }
 
-impl StandardKeycloakIamService {
+impl StandardIamService {
     /// Create a new service from node configuration.
-    pub fn new(config: &KeycloakConfig, event_bus: Arc<EventBus>) -> Self {
-        let realms: Vec<KeycloakRealm> = config.realms.iter().map(realm_from_config).collect();
+    pub fn new(config: &IamConfig, event_bus: Arc<EventBus>) -> Self {
+        let realms: Vec<IdentityRealm> = config.realms.iter().map(realm_from_config).collect();
 
         let issuer_to_realm: HashMap<String, usize> = realms
             .iter()
@@ -130,7 +130,7 @@ impl StandardKeycloakIamService {
 
         info!(
             realm_count = realms.len(),
-            "StandardKeycloakIamService initialized with {} trusted realms",
+            "StandardIamService initialized with {} trusted realms",
             realms.len()
         );
 
@@ -146,7 +146,7 @@ impl StandardKeycloakIamService {
     }
 
     /// Fetch JWKS from a realm's endpoint and update the cache.
-    async fn refresh_jwks(&self, realm: &KeycloakRealm) -> Result<(), IamError> {
+    async fn refresh_jwks(&self, realm: &IdentityRealm) -> Result<(), IamError> {
         debug!(realm = %realm.realm_slug, jwks_uri = %realm.jwks_uri, "Fetching JWKS");
 
         let response = self
@@ -210,7 +210,7 @@ impl StandardKeycloakIamService {
     }
 
     /// Get or refresh the JWKS for a realm, returning a reference to the cached keys.
-    async fn get_jwks(&self, realm: &KeycloakRealm) -> Result<JwksResponse, IamError> {
+    async fn get_jwks(&self, realm: &IdentityRealm) -> Result<JwksResponse, IamError> {
         // Check cache first
         {
             let cache = self.jwks_cache.read().await;
@@ -235,7 +235,7 @@ impl StandardKeycloakIamService {
     }
 
     /// Find the realm matching a JWT's issuer claim.
-    fn find_realm_by_issuer(&self, issuer: &str) -> Option<&KeycloakRealm> {
+    fn find_realm_by_issuer(&self, issuer: &str) -> Option<&IdentityRealm> {
         self.issuer_to_realm
             .get(issuer)
             .map(|&idx| &self.realms[idx])
@@ -245,7 +245,7 @@ impl StandardKeycloakIamService {
     fn resolve_identity_kind(
         &self,
         claims: &KeycloakClaims,
-        realm: &KeycloakRealm,
+        realm: &IdentityRealm,
     ) -> Result<IdentityKind, IamError> {
         match &realm.realm_kind {
             RealmKind::Consumer => {
@@ -320,8 +320,8 @@ impl StandardKeycloakIamService {
 }
 
 #[async_trait]
-impl KeycloakIamService for StandardKeycloakIamService {
-    async fn validate_token(&self, raw_jwt: &str) -> Result<ValidatedKeycloakToken, IamError> {
+impl IdentityProvider for StandardIamService {
+    async fn validate_token(&self, raw_jwt: &str) -> Result<ValidatedIdentityToken, IamError> {
         // 1. Decode header to get kid + determine issuer from unvalidated claims
         let header = decode_header(raw_jwt).map_err(|e| IamError::DecodeError(e.to_string()))?;
 
@@ -428,7 +428,7 @@ impl KeycloakIamService for StandardKeycloakIamService {
             obj.insert("aud".to_string(), claims.aud.clone());
         }
 
-        Ok(ValidatedKeycloakToken {
+        Ok(ValidatedIdentityToken {
             identity,
             issued_at,
             expires_at,
@@ -436,7 +436,7 @@ impl KeycloakIamService for StandardKeycloakIamService {
         })
     }
 
-    fn resolve_tier(&self, token: &ValidatedKeycloakToken) -> Result<ZaruTier, IamError> {
+    fn resolve_tier(&self, token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
         match &token.identity.identity_kind {
             IdentityKind::ConsumerUser { zaru_tier } => Ok(zaru_tier.clone()),
             IdentityKind::TenantUser { .. } => {
@@ -455,7 +455,7 @@ impl KeycloakIamService for StandardKeycloakIamService {
         }
     }
 
-    fn resolve_role(&self, token: &ValidatedKeycloakToken) -> Result<AegisRole, IamError> {
+    fn resolve_role(&self, token: &ValidatedIdentityToken) -> Result<AegisRole, IamError> {
         match &token.identity.identity_kind {
             IdentityKind::Operator { aegis_role } => Ok(aegis_role.clone()),
             _ => {
@@ -472,13 +472,13 @@ impl KeycloakIamService for StandardKeycloakIamService {
         }
     }
 
-    fn known_realms(&self) -> Vec<KeycloakRealm> {
+    fn known_realms(&self) -> Vec<IdentityRealm> {
         self.realms.clone()
     }
 }
 
-/// Convert a `KeycloakRealmConfig` from YAML to a `KeycloakRealm` domain value.
-fn realm_from_config(config: &KeycloakRealmConfig) -> KeycloakRealm {
+/// Convert a `IamRealmConfig` from YAML to a `IdentityRealm` domain value.
+fn realm_from_config(config: &IamRealmConfig) -> IdentityRealm {
     let realm_kind = match config.kind.as_str() {
         "system" => RealmKind::System,
         "consumer" => RealmKind::Consumer,
@@ -493,7 +493,7 @@ fn realm_from_config(config: &KeycloakRealmConfig) -> KeycloakRealm {
         }
     };
 
-    KeycloakRealm {
+    IdentityRealm {
         realm_slug: config.slug.clone(),
         issuer_url: config.issuer_url.clone(),
         jwks_uri: config.jwks_uri.clone(),
@@ -508,7 +508,7 @@ mod tests {
 
     #[test]
     fn realm_from_config_system() {
-        let config = KeycloakRealmConfig {
+        let config = IamRealmConfig {
             slug: "aegis-system".to_string(),
             issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
             jwks_uri: "https://auth.myzaru.com/realms/aegis-system/protocol/openid-connect/certs"
@@ -523,7 +523,7 @@ mod tests {
 
     #[test]
     fn realm_from_config_consumer() {
-        let config = KeycloakRealmConfig {
+        let config = IamRealmConfig {
             slug: "zaru-consumer".to_string(),
             issuer_url: "https://auth.myzaru.com/realms/zaru-consumer".to_string(),
             jwks_uri: "https://auth.myzaru.com/realms/zaru-consumer/protocol/openid-connect/certs"
@@ -537,7 +537,7 @@ mod tests {
 
     #[test]
     fn realm_from_config_tenant() {
-        let config = KeycloakRealmConfig {
+        let config = IamRealmConfig {
             slug: "tenant-acme".to_string(),
             issuer_url: "https://auth.myzaru.com/realms/tenant-acme".to_string(),
             jwks_uri: "https://auth.myzaru.com/realms/tenant-acme/protocol/openid-connect/certs"
@@ -556,9 +556,9 @@ mod tests {
 
     #[test]
     fn service_creation_from_config() {
-        let config = KeycloakConfig {
+        let config = IamConfig {
             realms: vec![
-                KeycloakRealmConfig {
+                IamRealmConfig {
                     slug: "aegis-system".to_string(),
                     issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
                     jwks_uri:
@@ -567,7 +567,7 @@ mod tests {
                     audience: "aegis-orchestrator".to_string(),
                     kind: "system".to_string(),
                 },
-                KeycloakRealmConfig {
+                IamRealmConfig {
                     slug: "zaru-consumer".to_string(),
                     issuer_url: "https://auth.myzaru.com/realms/zaru-consumer".to_string(),
                     jwks_uri:
@@ -578,10 +578,10 @@ mod tests {
                 },
             ],
             jwks_cache_ttl_seconds: 300,
-            claims: KeycloakClaimsConfig::default(),
+            claims: IamClaimsConfig::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardKeycloakIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus);
 
         assert_eq!(service.known_realms().len(), 2);
         assert!(service
@@ -597,15 +597,15 @@ mod tests {
 
     #[test]
     fn resolve_tier_from_consumer_identity() {
-        let config = KeycloakConfig {
+        let config = IamConfig {
             realms: vec![],
             jwks_cache_ttl_seconds: 300,
-            claims: KeycloakClaimsConfig::default(),
+            claims: IamClaimsConfig::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardKeycloakIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus);
 
-        let token = ValidatedKeycloakToken {
+        let token = ValidatedIdentityToken {
             identity: UserIdentity {
                 sub: "test-sub".to_string(),
                 realm_slug: "zaru-consumer".to_string(),
@@ -625,15 +625,15 @@ mod tests {
 
     #[test]
     fn resolve_role_from_operator_identity() {
-        let config = KeycloakConfig {
+        let config = IamConfig {
             realms: vec![],
             jwks_cache_ttl_seconds: 300,
-            claims: KeycloakClaimsConfig::default(),
+            claims: IamClaimsConfig::default(),
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
-        let service = StandardKeycloakIamService::new(&config, event_bus);
+        let service = StandardIamService::new(&config, event_bus);
 
-        let token = ValidatedKeycloakToken {
+        let token = ValidatedIdentityToken {
             identity: UserIdentity {
                 sub: "test-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),

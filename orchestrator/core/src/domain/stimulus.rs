@@ -60,11 +60,11 @@ impl Default for StimulusId {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StimulusSource {
     /// External system POSTing to `/v1/webhooks/{source_name}`.
-    /// Authenticated by HMAC-SHA256; no Keycloak account required.
+    /// Authenticated by HMAC-SHA256; no OIDC account required.
     Webhook { source_name: String },
 
     /// Internal operator or SDK calling `POST /v1/stimuli`.
-    /// Authenticated by Keycloak JWT Bearer.
+    /// Authenticated by OIDC JWT Bearer.
     HttpApi,
 
     /// Always-on stdin sensor (SensorService loop).

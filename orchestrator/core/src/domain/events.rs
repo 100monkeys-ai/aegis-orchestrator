@@ -22,7 +22,7 @@
 //! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
-//! | [`IamEvent`] | BC-13 IAM & Identity Federation | Keycloak authentication, realm lifecycle, JWKS cache events (ADR-041) |
+//! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
 //! | [`SecretEvent`] | BC-11 Secrets & Identity | Secret access, dynamic credential generation, and access denial audit (ADR-034) |
 //!
 //! ## Phase 2 Note
@@ -831,7 +831,7 @@ pub enum StimulusEvent {
 
 /// IAM & Identity Federation events (BC-13, ADR-041).
 ///
-/// Published by `StandardKeycloakIamService` during token validation,
+/// Published by `StandardOIDCIamService` during token validation,
 /// realm lifecycle operations, and JWKS cache refresh cycles.
 /// Consumed by:
 /// - Cortex for security pattern learning (e.g. detecting brute-force token validation failures)
@@ -840,7 +840,7 @@ pub enum StimulusEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IamEvent {
     // ─── Authentication Events ────────────────────────────────────────────────
-    /// A JWT was successfully validated against a Keycloak realm's JWKS.
+    /// A JWT was successfully validated against a OIDC realm's JWKS.
     UserAuthenticated {
         sub: String,
         realm_slug: String,
@@ -865,12 +865,12 @@ pub enum IamEvent {
         issuer_url: String,
         registered_at: DateTime<Utc>,
     },
-    /// A tenant realm was provisioned (Phase 2 — Keycloak Admin API + OpenBao namespace).
+    /// A tenant realm was provisioned (Phase 2 — OIDC Admin API + secret namespace).
     TenantRealmProvisioned {
         tenant_slug: String,
         realm_id: String,
         /// Mirrors ADR-034 namespace alignment.
-        openbao_namespace: String,
+        secret_namespace: String,
         provisioned_at: DateTime<Utc>,
     },
 

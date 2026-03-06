@@ -297,7 +297,7 @@ Full documentation is available at **[docs.100monkeys.ai](https://docs.100monkey
 | [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model) | Isolation, network control, secrets, audit trail |
 | [Deployment — Docker](https://docs.100monkeys.ai/docs/deployment/docker) | Run the orchestrator with Docker |
 | [Deployment — Firecracker](https://docs.100monkeys.ai/docs/deployment/firecracker) | Production micro-VM setup |
-| [Secrets Management](https://docs.100monkeys.ai/docs/deployment/secrets) | OpenBao / Vault integration (Keymaster Pattern) |
+| [Secrets Management](https://docs.100monkeys.ai/docs/deployment/secrets) | OpenBao integration via secret-store ACL (Keymaster Pattern) |
 | [IAM](https://docs.100monkeys.ai/docs/deployment/iam) | Keycloak identity and access management |
 | [Configuration Reference](https://docs.100monkeys.ai/docs/reference/node-config) | `NodeConfig` YAML reference (`aegis-config.yaml`) |
 | [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) | `AgentManifest` YAML field reference |

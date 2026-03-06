@@ -541,7 +541,7 @@ pub struct ContainerRunConfig {
     #[serde(default)]
     pub resources: Option<ContainerResources>,
 
-    /// OpenBao secret path for registry credentials (e.g. "vault:cicd/docker-registry")
+    /// Secret-backend path for registry credentials (e.g. "secret:cicd/docker-registry")
     #[serde(default)]
     pub registry_credentials: Option<String>,
 
@@ -666,7 +666,7 @@ pub enum StateKind {
         #[serde(default)]
         resources: Option<ContainerResources>,
 
-        /// OpenBao secret path for private registry credentials (ADR-034, ADR-045)
+        /// Secret-backend path for private registry credentials (ADR-034, ADR-045)
         #[serde(default)]
         registry_credentials: Option<String>,
 

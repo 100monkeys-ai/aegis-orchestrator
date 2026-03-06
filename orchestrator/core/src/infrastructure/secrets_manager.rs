@@ -20,7 +20,7 @@
 
 use crate::domain::events::SecretEvent;
 use crate::domain::mcp::{CredentialRef, CredentialStoreType};
-use crate::domain::node_config::OpenBaoConfig;
+use crate::domain::node_config::SecretBackendConfig;
 use crate::domain::secrets::{
     AccessContext, DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
 };
@@ -62,7 +62,7 @@ pub struct OpenBaoSecretStore {
 
 impl OpenBaoSecretStore {
     /// Creates a new `OpenBaoSecretStore`, authenticates via AppRole, and spawns the renewal loop.
-    pub async fn new(config: OpenBaoConfig) -> Result<Self, SecretsError> {
+    pub async fn new(config: SecretBackendConfig) -> Result<Self, SecretsError> {
         let unauthenticated = Self::build_client(&config)?;
         let authenticated = Self::authenticate(unauthenticated, &config).await?;
 
@@ -79,7 +79,7 @@ impl OpenBaoSecretStore {
     }
 
     /// Build an unauthenticated `VaultClient` from the given config.
-    fn build_client(config: &OpenBaoConfig) -> Result<VaultClient, SecretsError> {
+    fn build_client(config: &SecretBackendConfig) -> Result<VaultClient, SecretsError> {
         let mut builder = VaultClientSettingsBuilder::default();
         builder.address(&config.address);
 
@@ -100,7 +100,7 @@ impl OpenBaoSecretStore {
     /// Perform AppRole authentication and return the authenticated client.
     async fn authenticate(
         mut client: VaultClient,
-        config: &OpenBaoConfig,
+        config: &SecretBackendConfig,
     ) -> Result<VaultClient, SecretsError> {
         if config.auth_method != "approle" {
             return Err(SecretsError::ConfigError(format!(
@@ -129,7 +129,10 @@ impl OpenBaoSecretStore {
     /// Background loop: renew the token every 30 minutes.
     /// On renewal failure, re-authenticates from scratch so that subsequent
     /// secret operations are not permanently broken by an expired token.
-    async fn token_renewal_loop(client: Arc<RwLock<VaultClient>>, config: Arc<OpenBaoConfig>) {
+    async fn token_renewal_loop(
+        client: Arc<RwLock<VaultClient>>,
+        config: Arc<SecretBackendConfig>,
+    ) {
         let mut interval = tokio::time::interval(Duration::from_secs(1800));
         loop {
             interval.tick().await;
@@ -482,9 +485,9 @@ impl SecretStore for MockSecretStore {
     }
 
     async fn transit_sign(&self, key_name: &str, data: &[u8]) -> Result<String, SecretsError> {
-        // Deterministic mock signature: "vault:v1:<key_name>:<base64(data)>"
+        // Deterministic mock signature: "secret:v1:<key_name>:<base64(data)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-        Ok(format!("vault:v1:{}:{}", key_name, encoded))
+        Ok(format!("secret:v1:{}:{}", key_name, encoded))
     }
 
     async fn transit_verify(
@@ -502,9 +505,9 @@ impl SecretStore for MockSecretStore {
         key_name: &str,
         plaintext: &[u8],
     ) -> Result<String, SecretsError> {
-        // Deterministic mock ciphertext: "vault:v1:<key_name>:<base64(plaintext)>"
+        // Deterministic mock ciphertext: "secret:v1:<key_name>:<base64(plaintext)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
-        Ok(format!("vault:v1:{}:{}", key_name, encoded))
+        Ok(format!("secret:v1:{}:{}", key_name, encoded))
     }
 
     async fn transit_decrypt(
@@ -512,7 +515,7 @@ impl SecretStore for MockSecretStore {
         key_name: &str,
         ciphertext: &str,
     ) -> Result<Vec<u8>, SecretsError> {
-        let prefix = format!("vault:v1:{}:", key_name);
+        let prefix = format!("secret:v1:{}:", key_name);
         let encoded = ciphertext.strip_prefix(&prefix).ok_or_else(|| {
             SecretsError::TransitError(format!(
                 "Invalid mock ciphertext format (expected prefix '{}')",
@@ -556,7 +559,7 @@ pub struct SecretsManager {
 impl SecretsManager {
     /// Creates a new `SecretsManager` backed by a live OpenBao connection.
     pub async fn from_config(
-        config: &OpenBaoConfig,
+        config: &SecretBackendConfig,
         event_bus: Arc<EventBus>,
     ) -> Result<Self, SecretsError> {
         let store = OpenBaoSecretStore::new(config.clone()).await?;
@@ -792,11 +795,11 @@ impl SecretsManager {
     ///
     /// Dispatches to the appropriate backend:
     /// - `CredentialStoreType::Environment` → reads from `std::env::var`
-    /// - `CredentialStoreType::OpenBao` → reads from KV engine via the store
+    /// - `CredentialStoreType::SecretStore` → reads from KV engine via the store
     ///
     /// The `key` field encodes the lookup coordinates:
     /// - Environment: raw env-var name (e.g. `"GMAIL_TOKEN"`)
-    /// - OpenBao: `"vault:engine/path#field"` or `"vault:engine/path"`
+    /// - OpenBao: `"secret:engine/path#field"` or `"secret:engine/path"`
     pub async fn resolve_credential(
         &self,
         credential: &CredentialRef,
@@ -811,11 +814,11 @@ impl SecretsManager {
                         credential.key
                     ))
                 }),
-            CredentialStoreType::OpenBao => {
-                // Parse "vault:engine/path" or "vault:engine/path#field"
+            CredentialStoreType::SecretStore => {
+                // Parse "secret:engine/path" or "secret:engine/path#field"
                 let raw = credential
                     .key
-                    .strip_prefix("vault:")
+                    .strip_prefix("secret:")
                     .unwrap_or(&credential.key);
 
                 let (kv_path, field) = if let Some((path, f)) = raw.rsplit_once('#') {
@@ -1137,8 +1140,8 @@ mod tests {
             .unwrap();
 
         let cred = CredentialRef {
-            store_type: CredentialStoreType::OpenBao,
-            key: "vault:kv/mcp-tools/gmail#oauth_token".to_string(),
+            store_type: CredentialStoreType::SecretStore,
+            key: "secret:kv/mcp-tools/gmail#oauth_token".to_string(),
         };
         let value = manager.resolve_credential(&cred, &ctx).await.unwrap();
         assert_eq!(value.expose(), "ya29.vault-token");
@@ -1157,8 +1160,8 @@ mod tests {
             .unwrap();
 
         let cred = CredentialRef {
-            store_type: CredentialStoreType::OpenBao,
-            key: "vault:kv/simple/secret".to_string(),
+            store_type: CredentialStoreType::SecretStore,
+            key: "secret:kv/simple/secret".to_string(),
         };
         let value = manager.resolve_credential(&cred, &ctx).await.unwrap();
         assert_eq!(value.expose(), "single-secret");
@@ -1169,8 +1172,8 @@ mod tests {
         let manager = mock_manager();
         let ctx = test_context();
         let cred = CredentialRef {
-            store_type: CredentialStoreType::OpenBao,
-            key: "vault:no-slash-here".to_string(),
+            store_type: CredentialStoreType::SecretStore,
+            key: "secret:no-slash-here".to_string(),
         };
         let result = manager.resolve_credential(&cred, &ctx).await;
         assert!(matches!(result, Err(SecretsError::InvalidPath(_))));
