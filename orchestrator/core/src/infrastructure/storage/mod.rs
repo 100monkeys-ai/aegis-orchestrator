@@ -65,11 +65,13 @@ pub fn create_storage_provider(
             Ok(Arc::new(provider))
         }
         StorageBackend::OpenDal { provider, options } => {
+            let scheme_name = provider.clone();
             let scheme: opendal::Scheme = provider
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{}'", provider))?;
-            let op =
-                Operator::via_iter(scheme, options).context("Failed to create OpenDAL operator")?;
+                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{}'", scheme_name))?;
+            let op = Operator::via_iter(scheme, options).with_context(|| {
+                format!("Failed to create OpenDAL operator for scheme '{scheme_name}'")
+            })?;
             Ok(Arc::new(OpenDalStorageProvider::new(op)))
         }
         StorageBackend::Mock => Ok(Arc::new(mock::MockStorageProvider::new())),
