@@ -94,10 +94,16 @@ pub trait DockerImageManager: Send + Sync {
     ///
     /// Returns [`PullSource::Cached`] when the image was already present and
     /// [`PullSource::Downloaded`] when a network pull was performed.
+    ///
+    /// `credentials_override` — when `Some`, bypasses the node-config
+    /// [`CredentialResolver`] and uses the supplied credentials directly.
+    /// Used by [`crate::infrastructure::container_step_runner::DockerContainerStepRunner`]
+    /// when per-step registry credentials are resolved from OpenBao (ADR-050).
     async fn ensure_image(
         &self,
         image: &str,
         policy: ImagePullPolicy,
+        credentials_override: Option<DockerCredentials>,
     ) -> Result<PullSource, RuntimeError>;
 }
 
@@ -132,6 +138,7 @@ impl DockerImageManager for StandardDockerImageManager {
         &self,
         image: &str,
         policy: ImagePullPolicy,
+        credentials_override: Option<DockerCredentials>,
     ) -> Result<PullSource, RuntimeError> {
         let image_exists = self.docker.inspect_image(image).await.is_ok();
 
@@ -156,22 +163,30 @@ impl DockerImageManager for StandardDockerImageManager {
             return Ok(PullSource::Cached);
         }
 
-        // Resolve credentials for this registry (Phase 1: static node-config).
-        let credentials = self.credential_resolver.resolve(image).await;
-        let auth = credentials.map(|cred| {
-            // Resolve env:VAR_NAME substitution on the password if present.
-            let password = if let Some(var) = cred.password.strip_prefix("env:") {
-                std::env::var(var).unwrap_or(cred.password.clone())
-            } else {
-                cred.password.clone()
-            };
-            DockerCredentials {
-                username: Some(cred.username.clone()),
-                password: Some(password),
-                serveraddress: Some(cred.registry.clone()),
-                ..Default::default()
-            }
-        });
+        // Use the per-call override when provided (ADR-050 per-step registry auth),
+        // otherwise fall back to the node-config CredentialResolver (ADR-045).
+        // SAFETY: DockerCredentials is passed directly to bollard::Docker::create_image()
+        // and is never Debug-logged or included in any log/trace call. The `password` field
+        // is a resolved credential used solely for registry authentication.
+        let auth = if let Some(override_creds) = credentials_override {
+            Some(override_creds)
+        } else {
+            let credentials = self.credential_resolver.resolve(image).await;
+            credentials.map(|cred| {
+                // Resolve env:VAR_NAME substitution on the password if present.
+                let password = if let Some(var) = cred.password.strip_prefix("env:") {
+                    std::env::var(var).unwrap_or(cred.password.clone())
+                } else {
+                    cred.password.clone()
+                };
+                DockerCredentials {
+                    username: Some(cred.username.clone()),
+                    password: Some(password),
+                    serveraddress: Some(cred.registry.clone()),
+                    ..Default::default()
+                }
+            })
+        };
 
         info!("Pulling image: {}", image);
         let options = Some(CreateImageOptions {

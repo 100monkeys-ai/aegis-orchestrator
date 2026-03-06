@@ -5,11 +5,34 @@
 //! Value objects and types defining the bidirectional Dispatch Protocol channel
 //! between the orchestrator (`InnerLoopGateway`) and the agent container (`bootstrap.py`).
 
-use crate::application::inner_loop_service::ConversationMessage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use uuid::Uuid;
+
+/// Conversation message exchanged in the inner loop (ADR-038).
+///
+/// Defined in the domain layer so it can be referenced by both `AgentMessage`/`OrchestratorMessage`
+/// (dispatch protocol) and `InnerLoopService` (application layer) without creating an upward
+/// dependency from domain → application.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConversationMessage {
+    pub role: String,
+    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+/// A single LLM tool call within a conversation message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+}
 
 /// Unique identifier for a dispatch request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -126,6 +126,34 @@ pub enum StateKindYaml {
         #[serde(default)]
         judges_for_parallel: Vec<JudgeConfigYaml>,
     },
+    /// Deterministic CI/CD container step — no LLM loop (ADR-050)
+    ContainerRun {
+        name: String,
+        image: String,
+        #[serde(default)]
+        image_pull_policy: Option<crate::domain::agent::ImagePullPolicy>,
+        #[serde(default)]
+        command: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        workdir: Option<String>,
+        #[serde(default)]
+        volumes: Vec<crate::domain::workflow::ContainerVolumeMount>,
+        #[serde(default)]
+        resources: Option<crate::domain::workflow::ContainerResources>,
+        #[serde(default)]
+        registry_credentials: Option<String>,
+        #[serde(default)]
+        retry: Option<crate::domain::workflow::RetryConfig>,
+        #[serde(default)]
+        shell: bool,
+    },
+    /// Parallel deterministic container steps — no LLM loop (ADR-050)
+    ParallelContainerRun {
+        steps: Vec<crate::domain::workflow::ContainerRunConfig>,
+        completion: crate::domain::workflow::ParallelCompletionStrategy,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -411,6 +439,34 @@ impl WorkflowParser {
                     judges_for_parallel: judges_for_parallel_configs,
                 }
             }
+            StateKindYaml::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            } => StateKind::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            },
+            StateKindYaml::ParallelContainerRun { steps, completion } => {
+                StateKind::ParallelContainerRun { steps, completion }
+            }
         })
     }
 
@@ -590,6 +646,37 @@ impl WorkflowParser {
                     })
                     .collect(),
             },
+            StateKind::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            } => StateKindYaml::ContainerRun {
+                name: name.clone(),
+                image: image.clone(),
+                image_pull_policy: *image_pull_policy,
+                command: command.clone(),
+                env: env.clone(),
+                workdir: workdir.clone(),
+                volumes: volumes.clone(),
+                resources: resources.clone(),
+                registry_credentials: registry_credentials.clone(),
+                retry: retry.clone(),
+                shell: *shell,
+            },
+            StateKind::ParallelContainerRun { steps, completion } => {
+                StateKindYaml::ParallelContainerRun {
+                    steps: steps.clone(),
+                    completion: *completion,
+                }
+            }
         }
     }
 

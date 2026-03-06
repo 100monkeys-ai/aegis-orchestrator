@@ -49,6 +49,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Docker client (needed to construct DockerContainerStepRunner in daemon)
+bollard = { workspace = true }
+
 # Internal [dependencies]
 aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.5.0-pre-alpha" }
 aegis-orchestrator-sdk = { path = "../sdks", version = "0.5.0-pre-alpha" }

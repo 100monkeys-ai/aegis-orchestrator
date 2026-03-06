@@ -36,6 +36,7 @@
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
 pub mod agentskills_client;
+pub mod container_step_runner;
 pub mod context_loader;
 pub mod cortex_client;
 pub mod db;

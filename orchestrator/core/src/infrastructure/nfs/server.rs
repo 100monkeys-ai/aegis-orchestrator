@@ -1060,6 +1060,7 @@ impl NfsServer {
 mod tests {
     // Future tests will use specific imports as needed
 
+    #[ignore = "placeholder: expand with full FSAL mock setup"]
     #[test]
     fn test_nfs_server_creation() {
         // Test will be expanded with full FSAL mock setup

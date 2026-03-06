@@ -492,22 +492,22 @@ mod tests {
     #[async_trait]
     impl AgentLifecycleService for MockAgentLifecycleService {
         async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::deploy_agent not exercised in this test")
         }
         async fn get_agent(&self, _: AgentId) -> Result<Agent> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::get_agent not exercised in this test")
         }
         async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::update_agent not exercised in this test")
         }
         async fn delete_agent(&self, _: AgentId) -> Result<()> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::delete_agent not exercised in this test")
         }
         async fn list_agents(&self) -> Result<Vec<Agent>> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::list_agents not exercised in this test")
         }
         async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
-            unimplemented!()
+            unimplemented!("MockAgentLifecycleService::lookup_agent not exercised in this test")
         }
     }
 
@@ -515,7 +515,7 @@ mod tests {
     #[async_trait]
     impl ExecutionService for MockExecutionService {
         async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::start_execution not exercised in this test")
         }
         async fn start_child_execution(
             &self,
@@ -523,34 +523,34 @@ mod tests {
             _: ExecutionInput,
             _: ExecutionId,
         ) -> Result<ExecutionId> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::start_child_execution not exercised in this test")
         }
         async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::get_execution not exercised in this test")
         }
         async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::get_iterations not exercised in this test")
         }
         async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::cancel_execution not exercised in this test")
         }
         async fn stream_execution(
             &self,
             _: ExecutionId,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::stream_execution not exercised in this test")
         }
         async fn stream_agent_events(
             &self,
             _: AgentId,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::stream_agent_events not exercised in this test")
         }
         async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::list_executions not exercised in this test")
         }
         async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
-            unimplemented!()
+            unimplemented!("MockExecutionService::delete_execution not exercised in this test")
         }
         async fn record_llm_interaction(
             &self,
@@ -558,7 +558,9 @@ mod tests {
             _: u8,
             _: crate::domain::execution::LlmInteraction,
         ) -> Result<()> {
-            unimplemented!()
+            unimplemented!(
+                "MockExecutionService::record_llm_interaction not exercised in this test"
+            )
         }
         async fn store_iteration_trajectory(
             &self,
@@ -566,7 +568,9 @@ mod tests {
             _: u8,
             _: Vec<crate::domain::execution::TrajectoryStep>,
         ) -> Result<()> {
-            unimplemented!()
+            unimplemented!(
+                "MockExecutionService::store_iteration_trajectory not exercised in this test"
+            )
         }
     }
 

@@ -344,12 +344,14 @@ mod tests {
     // Note: Full integration tests require nfsserve implementation
     // These are unit tests for service lifecycle only
 
+    #[ignore = "placeholder: requires mock FSAL setup"]
     #[tokio::test]
     async fn test_gateway_lifecycle() {
         // Mock dependencies would go here
         // For now, this is a placeholder for future tests
     }
 
+    #[ignore = "placeholder: requires mock FSAL setup"]
     #[test]
     fn test_gateway_creation() {
         // Test basic construction

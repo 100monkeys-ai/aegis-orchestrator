@@ -12,6 +12,7 @@ dependencies = [
  "async-stream",
  "axum 0.7.9",
  "base64",
+ "bollard",
  "chrono",
  "clap",
  "colored",

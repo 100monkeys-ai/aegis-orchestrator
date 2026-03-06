@@ -843,7 +843,7 @@ pub struct SecretsConfig {
 /// OpenBao secrets backend configuration (ADR-034)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenBaoConfig {
-    /// OpenBao server API address (e.g. "https://openbao.internal:8200")
+    /// OpenBao server API address (e.g. "<https://openbao.internal:8200>")
     pub address: String,
 
     /// Authentication method (must be "approle" for orchestrators)
@@ -1007,7 +1007,7 @@ pub struct KeycloakConfig {
 pub struct KeycloakRealmConfig {
     /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
     pub slug: String,
-    /// Full issuer URL: https://auth.myzaru.com/realms/{slug}
+    /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
     pub issuer_url: String,
     /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
     pub jwks_uri: String,

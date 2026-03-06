@@ -24,6 +24,7 @@
 //! - **Layer:** Domain Layer
 //! - **Purpose:** Implements internal responsibilities for workflow
 
+use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -272,6 +273,104 @@ pub struct WorkflowState {
 // Value Objects: State Kinds
 // ============================================================================
 
+// ─── CI/CD Container Value Objects (ADR-050) ─────────────────────────────────
+
+/// Volume mount binding for a ContainerRun step
+///
+/// Binds a workflow-level volume into a CI/CD container at a specific path.
+/// Volumes are always accessed via the NFS Server Gateway (ADR-036) — never
+/// via direct bind mounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerVolumeMount {
+    /// Volume name (references a workflow-level or execution-level volume)
+    pub name: String,
+
+    /// Absolute path inside the container where the volume appears
+    pub mount_path: String,
+
+    /// Whether the volume is mounted read-only (default: false)
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Resource limits for a ContainerRun step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerResources {
+    /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
+    #[serde(default)]
+    pub cpu: Option<u32>,
+
+    /// Memory limit as a string (e.g., "512Mi", "2Gi")
+    #[serde(default)]
+    pub memory: Option<String>,
+
+    /// Hard wall-clock timeout for the entire container execution
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub timeout: Option<Duration>,
+}
+
+/// Retry configuration for a ContainerRun step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of additional attempts after the first (0 = no retries)
+    #[serde(default)]
+    pub max_attempts: u32,
+
+    /// Initial backoff between retries as a human-readable duration (e.g., "5s", "1m")
+    #[serde(default)]
+    pub backoff: Option<String>,
+}
+
+/// Configuration for a single step in ParallelContainerRun
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerRunConfig {
+    /// Unique label for this step; used as the blackboard key for its output
+    pub name: String,
+
+    /// Container image reference (RegistryImage or StandardRuntime alias)
+    pub image: String,
+
+    /// Shell command or argv to execute inside the container
+    pub command: Vec<String>,
+
+    /// Environment variables (Handlebars templates evaluated against the blackboard)
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// Working directory inside the container (default: /workspace)
+    #[serde(default)]
+    pub workdir: Option<String>,
+
+    /// Volume mounts — accessed via the NFS Server Gateway (ADR-036)
+    #[serde(default)]
+    pub volumes: Vec<ContainerVolumeMount>,
+
+    /// CPU, memory, and timeout resource limits
+    #[serde(default)]
+    pub resources: Option<ContainerResources>,
+
+    /// OpenBao secret path for registry credentials (e.g. "vault:cicd/docker-registry")
+    #[serde(default)]
+    pub registry_credentials: Option<String>,
+
+    /// When true the command is joined with spaces and executed via `sh -c`
+    #[serde(default)]
+    pub shell: bool,
+}
+
+/// Aggregation strategy for a ParallelContainerRun state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelCompletionStrategy {
+    /// All steps must exit with code 0 — any non-zero exit causes the state to fail
+    AllSucceed,
+    /// At least one step must exit with code 0 — all-failed causes the state to fail
+    AnySucceed,
+    /// Always succeeds as a state; individual step failures are reflected in output
+    BestEffort,
+}
+
 /// State kind determines how the state is executed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "PascalCase")]
@@ -338,6 +437,67 @@ pub enum StateKind {
         /// These must be distinct from the workers in `agents` (agents cannot judge themselves)
         #[serde(default)]
         judges_for_parallel: Vec<JudgeConfig>,
+    },
+
+    /// Execute a deterministic command in an isolated container without an LLM loop (ADR-050)
+    ///
+    /// Suitable for CI/CD steps such as `cargo build`, `docker push`, `npm test`.
+    /// No bootstrap.py is injected; no AEGIS_ORCHESTRATOR_URL is set.
+    /// Volumes are accessed via the NFS Server Gateway (ADR-036).
+    ContainerRun {
+        /// Human-readable label for this step (used in events and Synapse UI)
+        name: String,
+
+        /// Container image reference — RegistryImage or StandardRuntime alias
+        /// (e.g., "rust:1.75-alpine", "ghcr.io/myorg/builder:v2")
+        image: String,
+
+        /// Image pull policy (default: IfNotPresent)
+        #[serde(default)]
+        image_pull_policy: Option<ImagePullPolicy>,
+
+        /// Argv to execute inside the container
+        command: Vec<String>,
+
+        /// Environment variables (Handlebars templates evaluated against the blackboard)
+        #[serde(default)]
+        env: HashMap<String, String>,
+
+        /// Working directory inside the container (default: /workspace)
+        #[serde(default)]
+        workdir: Option<String>,
+
+        /// Volume mounts — accessed via the NFS Server Gateway (ADR-036)
+        #[serde(default)]
+        volumes: Vec<ContainerVolumeMount>,
+
+        /// CPU, memory, and timeout resource limits
+        #[serde(default)]
+        resources: Option<ContainerResources>,
+
+        /// OpenBao secret path for private registry credentials (ADR-034, ADR-045)
+        #[serde(default)]
+        registry_credentials: Option<String>,
+
+        /// Retry configuration (overrides Temporal activity default)
+        #[serde(default)]
+        retry: Option<RetryConfig>,
+
+        /// When true the command entries are joined and passed to `sh -c`
+        #[serde(default)]
+        shell: bool,
+    },
+
+    /// Execute multiple container steps concurrently within a single workflow state (ADR-050)
+    ///
+    /// Results are aggregated according to `completion`. Each step's output is
+    /// stored on the blackboard under `STATE_NAME.output.<step_name>`.
+    ParallelContainerRun {
+        /// Ordered list of container steps to run concurrently
+        steps: Vec<ContainerRunConfig>,
+
+        /// How to aggregate the individual step results into a state outcome
+        completion: ParallelCompletionStrategy,
     },
 }
 

@@ -15,6 +15,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::application::execution::ExecutionService;
+use crate::application::run_container_step::RunContainerStepUseCase;
 use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
@@ -39,6 +40,8 @@ pub struct AegisRuntimeService {
     cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
     /// BC-8: Stimulus routing service (ADR-021). Optional until wired.
     stimulus_service: Option<Arc<dyn StimulusService>>,
+    /// BC-3: Container step runner use case (ADR-050). Optional until wired.
+    run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
 }
 
 impl AegisRuntimeService {
@@ -53,6 +56,7 @@ impl AegisRuntimeService {
             tool_invocation_service: None,
             cortex_client: None,
             stimulus_service: None,
+            run_container_step_use_case: None,
         }
     }
 
@@ -81,6 +85,12 @@ impl AegisRuntimeService {
     /// Set the Stimulus routing service (optional — omit if BC-8 is not deployed)
     pub fn with_stimulus(mut self, stimulus_service: Arc<dyn StimulusService>) -> Self {
         self.stimulus_service = Some(stimulus_service);
+        self
+    }
+
+    /// Set the container step runner use case (optional — omit if BC-3 ADR-050 is not needed)
+    pub fn with_container_step_runner(mut self, use_case: Arc<RunContainerStepUseCase>) -> Self {
+        self.run_container_step_use_case = Some(use_case);
         self
     }
 
@@ -563,6 +573,135 @@ impl AegisRuntime for AegisRuntimeService {
             workflow_execution_id,
         }))
     }
+
+    /// Execute a deterministic CI/CD container step (ADR-050).
+    async fn execute_container_run(
+        &self,
+        request: Request<ExecuteContainerRunRequest>,
+    ) -> Result<Response<ExecuteContainerRunResponse>, Status> {
+        let req = request.into_inner();
+
+        let use_case = self
+            .run_container_step_use_case
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("ContainerRun is not configured on this node"))?;
+
+        use crate::application::run_container_step::RunContainerStepInput;
+        use crate::domain::agent::ImagePullPolicy;
+        use crate::domain::execution::ExecutionId;
+        use crate::domain::workflow::{ContainerResources, ContainerVolumeMount, StateName};
+        use std::collections::HashMap;
+
+        let execution_id = ExecutionId::from_string(&req.execution_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {}", e)))?;
+
+        let state_name = StateName::new(req.state_name.clone())
+            .map_err(|e| Status::invalid_argument(format!("Invalid state_name: {}", e)))?;
+
+        let image_pull_policy = match req.image_pull_policy.to_lowercase().as_str() {
+            "always" => ImagePullPolicy::Always,
+            "never" => ImagePullPolicy::Never,
+            _ => ImagePullPolicy::IfNotPresent,
+        };
+
+        let volumes: Vec<ContainerVolumeMount> = req
+            .volumes
+            .into_iter()
+            .map(|v| ContainerVolumeMount {
+                name: v.name,
+                mount_path: v.mount_path,
+                read_only: v.read_only,
+            })
+            .collect();
+
+        let resources = if let Some(res) = req.resources {
+            let timeout = if res.timeout.is_empty() {
+                None
+            } else {
+                humantime_serde::re::humantime::parse_duration(&res.timeout).ok()
+            };
+            Some(ContainerResources {
+                cpu: if res.cpu_millicores == 0 {
+                    None
+                } else {
+                    Some(res.cpu_millicores)
+                },
+                memory: if res.memory.is_empty() {
+                    None
+                } else {
+                    Some(res.memory)
+                },
+                timeout,
+            })
+        } else {
+            None
+        };
+
+        let env: HashMap<String, String> = req.env;
+        let max_attempts = if req.max_attempts == 0 {
+            1
+        } else {
+            req.max_attempts
+        };
+
+        let input = RunContainerStepInput {
+            execution_id,
+            state_name,
+            name: req.name,
+            image: req.image,
+            image_pull_policy,
+            command: req.command,
+            env,
+            workdir: if req.workdir.is_empty() {
+                None
+            } else {
+                Some(req.workdir)
+            },
+            volumes,
+            resources,
+            registry_credentials: if req.registry_credentials.is_empty() {
+                None
+            } else {
+                Some(req.registry_credentials)
+            },
+            max_attempts,
+            shell: req.shell,
+        };
+
+        match use_case.execute(input).await {
+            Ok(output) => Ok(Response::new(ExecuteContainerRunResponse {
+                exit_code: output.exit_code,
+                stdout: output.stdout,
+                stderr: output.stderr,
+                duration_ms: output.duration_ms,
+                attempts: output.attempts,
+            })),
+            Err(e) => {
+                use crate::domain::runtime::ContainerStepError;
+                let status = match &e {
+                    ContainerStepError::ImagePullFailed { image, error } => {
+                        Status::unavailable(format!("Image pull failed for '{}': {}", image, error))
+                    }
+                    ContainerStepError::TimeoutExpired { timeout_secs } => {
+                        Status::deadline_exceeded(format!(
+                            "Container step timed out after {}s",
+                            timeout_secs
+                        ))
+                    }
+                    ContainerStepError::VolumeMountFailed { volume, error } => {
+                        Status::internal(format!("Volume mount failed for '{}': {}", volume, error))
+                    }
+                    ContainerStepError::ResourceExhausted { detail } => {
+                        Status::resource_exhausted(format!("Resource exhausted: {}", detail))
+                    }
+                    ContainerStepError::DockerError(msg) => {
+                        Status::internal(format!("Docker error: {}", msg))
+                    }
+                };
+                Err(status)
+            }
+        }
+    }
 }
 
 // ── BC-8: IngestStimulus gRPC helper ──────────────────────────────────────────
@@ -734,6 +873,7 @@ pub async fn start_grpc_server(
         Arc<crate::application::tool_invocation_service::ToolInvocationService>,
     >,
     cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
+    run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut service = AegisRuntimeService::new(execution_service, validation_service);
 
@@ -743,6 +883,10 @@ pub async fn start_grpc_server(
 
     if let Some(c) = cortex_client {
         service = service.with_cortex(c);
+    }
+
+    if let Some(uc) = run_container_step_use_case {
+        service = service.with_container_step_runner(uc);
     }
 
     let server = service.into_server();

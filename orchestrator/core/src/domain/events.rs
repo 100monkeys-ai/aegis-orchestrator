@@ -631,6 +631,80 @@ pub enum MCPToolEvent {
     },
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BC-3 CI/CD Container Step Events  (ADR-050)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reason a ContainerRun or ParallelContainerRun step could not complete (ADR-050).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContainerRunFailureReason {
+    /// The container exited with a non-zero exit code
+    NonZeroExitCode { code: i32 },
+    /// The step exceeded the configured wall-clock timeout
+    TimeoutExpired { timeout_secs: u64 },
+    /// The container image could not be pulled from the registry
+    ImagePullFailed { image: String, error: String },
+    /// A required volume could not be mounted
+    VolumeMountFailed { volume: String, error: String },
+    /// The container was killed due to memory or CPU exhaustion
+    ResourceExhausted { detail: String },
+}
+
+/// Domain events for deterministic CI/CD container steps (BC-3, ADR-050).
+///
+/// Published by [`crate::application::run_container_step::RunContainerStepUseCase`].
+/// Consumed by:
+/// - The Synapse UI for real-time CI/CD step visualization alongside agent iterations
+/// - Cortex for learning which build/test patterns succeed reliably
+/// - Audit trail (SOC 2 / compliance)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContainerRunEvent {
+    /// A container step was started — image pull and container creation initiated
+    ContainerRunStarted {
+        execution_id: ExecutionId,
+        /// Logical workflow state name (e.g., "BUILD")
+        state_name: String,
+        /// Human-readable step label (e.g., "Compile and Build")
+        step_name: String,
+        image: String,
+        command: Vec<String>,
+        started_at: DateTime<Utc>,
+    },
+
+    /// A container step completed successfully (exit code 0)
+    ContainerRunCompleted {
+        execution_id: ExecutionId,
+        state_name: String,
+        step_name: String,
+        exit_code: i32,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+        duration_ms: u64,
+        completed_at: DateTime<Utc>,
+    },
+
+    /// A container step failed (non-zero exit, timeout, image pull failure, etc.)
+    ContainerRunFailed {
+        execution_id: ExecutionId,
+        state_name: String,
+        step_name: String,
+        reason: ContainerRunFailureReason,
+        failed_at: DateTime<Utc>,
+    },
+
+    /// A ParallelContainerRun state finished aggregating all step results
+    ParallelContainerRunAggregated {
+        execution_id: ExecutionId,
+        state_name: String,
+        total_steps: u32,
+        succeeded: u32,
+        failed: u32,
+        /// Serialized `ParallelCompletionStrategy` variant name
+        strategy: String,
+        aggregated_at: DateTime<Utc>,
+    },
+}
+
 /// Commands executed inside the container via Dispatch Protocol (ADR-040).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandExecutionEvent {

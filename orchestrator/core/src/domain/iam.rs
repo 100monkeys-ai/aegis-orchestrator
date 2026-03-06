@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 pub struct KeycloakRealm {
     /// Realm identifier: "aegis-system" | "zaru-consumer" | "tenant-{slug}"
     pub realm_slug: String,
-    /// Full issuer URL: https://auth.myzaru.com/realms/{slug}
+    /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
     pub issuer_url: String,
     /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
     pub jwks_uri: String,

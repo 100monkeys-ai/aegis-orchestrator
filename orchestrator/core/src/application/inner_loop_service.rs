@@ -6,7 +6,6 @@
 //! This is the entry-point for agent code: `bootstrap.py` makes `POST /v1/dispatch-gateway`
 //! requests sending `AgentMessage`, and receives `OrchestratorMessage` in return.
 
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,7 +13,9 @@ use tokio::sync::RwLock;
 
 use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
-use crate::domain::dispatch::{AgentMessage, DispatchId, OrchestratorMessage};
+use crate::domain::dispatch::{
+    AgentMessage, ConversationMessage, DispatchId, OrchestratorMessage, ToolCall,
+};
 use crate::domain::execution::ExecutionId;
 use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
 use crate::infrastructure::llm::registry::ProviderRegistry;
@@ -59,23 +60,6 @@ Tool selection rules (apply these strictly, subject to tool availability):\n\
 \n\
 Attempting to use `cmd.run` as a substitute for any of the above tools, or to circumvent a \
 policy-blocked operation, is a policy violation.";
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConversationMessage {
-    pub role: String,
-    pub content: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_calls: Option<Vec<ToolCall>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolCall {
-    pub id: String,
-    pub name: String,
-    pub arguments: Value,
-}
 
 #[derive(Debug, Clone)]
 pub enum LlmOutput {

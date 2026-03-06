@@ -632,6 +632,9 @@ const CACHE_CAPACITY: usize = 128;
 /// How long a cached KV secret is considered fresh before a live read is issued.
 const CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// LRU cache mapping `"engine/path"` → `(secret values, population Instant)`.
+type SecretsCache = LruCache<String, (HashMap<String, SensitiveString>, Instant)>;
+
 /// The main entry point for the Application layer to interact with secrets,
 /// following the Keymaster architectural pattern (ADR-034).
 ///
@@ -644,8 +647,7 @@ const CACHE_TTL: Duration = Duration::from_secs(30);
 pub struct SecretsManager {
     store: Arc<dyn SecretStore>,
     event_bus: Arc<EventBus>,
-    /// Cache key: `"engine/path"` → `(values, Instant of population)`
-    cache: Arc<Mutex<LruCache<String, (HashMap<String, SensitiveString>, Instant)>>>,
+    cache: Arc<Mutex<SecretsCache>>,
 }
 
 impl SecretsManager {

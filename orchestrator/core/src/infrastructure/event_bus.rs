@@ -54,8 +54,8 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{
-    AgentLifecycleEvent, ExecutionEvent, IamEvent, ImageManagementEvent, LearningEvent,
-    MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
+    AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
+    LearningEvent, MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
     ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,8 @@ pub enum DomainEvent {
     Iam(IamEvent),
     /// BC-11 Secrets & Identity Management events (ADR-034)
     Secrets(SecretEvent),
+    /// BC-3 CI/CD container step lifecycle events (ADR-050)
+    ContainerRun(ContainerRunEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -152,6 +154,11 @@ impl EventBus {
     /// Publish a stimulus ingestion/routing event (BC-8 ADR-021)
     pub fn publish_stimulus_event(&self, event: StimulusEvent) {
         self.publish(DomainEvent::Stimulus(event));
+    }
+
+    /// Publish a CI/CD container step event (ADR-050)
+    pub fn publish_container_run_event(&self, event: ContainerRunEvent) {
+        self.publish(DomainEvent::ContainerRun(event));
     }
 
     /// Publish a container image management event (BC-2 ADR-045)
@@ -414,6 +421,7 @@ impl AgentEventReceiver {
             DomainEvent::ImageManagement(_) => false, // Image management events are system-wide, not per-agent
             DomainEvent::Iam(_) => false,             // IAM events are system-wide, not per-agent
             DomainEvent::Secrets(_) => false, // Secrets events are system-wide, not per-agent
+            DomainEvent::ContainerRun(_) => false, // ContainerRun events are keyed by execution_id, not agent_id
         }
     }
 }

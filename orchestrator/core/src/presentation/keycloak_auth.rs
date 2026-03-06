@@ -106,11 +106,9 @@ pub async fn keycloak_auth_middleware(
         }
         Err(e) => {
             warn!(path, error = %e, "HTTP JWT validation failed");
-            (
-                StatusCode::UNAUTHORIZED,
-                format!("Token validation failed: {}", e),
-            )
-                .into_response()
+            // Return a static message — do not echo JWT error detail to the caller
+            // to prevent leaking token contents or internal error paths.
+            (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
         }
     }
 }

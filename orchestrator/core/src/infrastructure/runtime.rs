@@ -307,7 +307,7 @@ impl AgentRuntime for DockerRuntime {
             });
         let pull_source = match self
             .image_manager
-            .ensure_image(&image, config.image_pull_policy)
+            .ensure_image(&image, config.image_pull_policy, None)
             .await
         {
             Ok(source) => {

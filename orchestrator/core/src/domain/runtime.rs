@@ -336,3 +336,109 @@ pub trait AgentRuntime: Send + Sync {
     /// Returns [`RuntimeError::InstanceNotFound`] if `id` is unknown.
     async fn status(&self, id: &InstanceId) -> Result<InstanceStatus, RuntimeError>;
 }
+
+// ============================================================================
+// Container Step Runner (ADR-050)
+// ============================================================================
+
+use crate::domain::workflow::{ContainerResources, ContainerVolumeMount, StateName};
+
+/// Configuration for a single deterministic CI/CD container step (ADR-050).
+///
+/// Unlike [`RuntimeConfig`], this does NOT inject bootstrap.py or
+/// `AEGIS_ORCHESTRATOR_URL`. The container runs the `command` directly and exits.
+#[derive(Debug, Clone)]
+pub struct ContainerStepConfig {
+    /// Human-readable step label — used in events and Synapse UI
+    pub name: String,
+
+    /// Container image reference (already resolved; may be a RegistryImage)
+    pub image: String,
+
+    /// Image pull policy
+    pub image_pull_policy: ImagePullPolicy,
+
+    /// Argv to execute inside the container (`sh -c` wrapping applied externally
+    /// when the caller sets `shell: true` before constructing this config)
+    pub command: Vec<String>,
+
+    /// Environment variables
+    pub env: HashMap<String, String>,
+
+    /// Working directory inside the container
+    pub workdir: Option<String>,
+
+    /// Volume mounts — resolved to NFS mount options by the infrastructure layer
+    pub volumes: Vec<ContainerVolumeMount>,
+
+    /// CPU, memory, and timeout limits
+    pub resources: Option<ContainerResources>,
+
+    /// OpenBao path (`vault:path/to/secret`) for private registry credentials
+    pub registry_credentials: Option<String>,
+
+    /// Correlation — links this step to the parent workflow execution
+    pub execution_id: ExecutionId,
+
+    /// Logical name of the workflow state that triggered this step
+    pub state_name: StateName,
+}
+
+/// Result of a successfully completed container step (ADR-050).
+#[derive(Debug, Clone)]
+pub struct ContainerStepResult {
+    /// Process exit code (0 = success by convention)
+    pub exit_code: i32,
+
+    /// Captured stdout (tail-truncated at 1 MiB)
+    pub stdout: String,
+
+    /// Captured stderr (tail-truncated at 1 MiB)
+    pub stderr: String,
+
+    /// Wall-clock duration of the container execution in milliseconds
+    pub duration_ms: u64,
+}
+
+/// Errors that can arise during a container step execution (ADR-050).
+#[derive(Debug, Error)]
+pub enum ContainerStepError {
+    /// The container image could not be pulled from the registry
+    #[error("image pull failed for '{image}': {error}")]
+    ImagePullFailed { image: String, error: String },
+
+    /// The step exceeded its configured timeout
+    #[error("container step timed out after {timeout_secs}s")]
+    TimeoutExpired { timeout_secs: u64 },
+
+    /// A required volume could not be mounted
+    #[error("volume mount failed for '{volume}': {error}")]
+    VolumeMountFailed { volume: String, error: String },
+
+    /// The container was killed because it exceeded a resource limit
+    #[error("resource exhausted: {detail}")]
+    ResourceExhausted { detail: String },
+
+    /// An unexpected Docker API error
+    #[error("docker error: {0}")]
+    DockerError(String),
+}
+
+/// Domain trait for executing deterministic CI/CD container steps (ADR-050).
+///
+/// # Invariants
+/// - Implementors MUST NOT inject bootstrap.py or set `AEGIS_ORCHESTRATOR_URL`
+/// - Implementors MUST clean up the container (stop + remove) on both success and error
+/// - Volumes MUST be mounted via the NFS Server Gateway (ADR-036), never via direct bind mounts
+/// - stdout + stderr MUST be tail-truncated at 1 MiB to prevent memory exhaustion
+#[async_trait]
+pub trait ContainerStepRunner: Send + Sync {
+    /// Execute a single CI/CD container step and return its result.
+    ///
+    /// The implementation is responsible for the full container lifecycle:
+    /// pull image → create → start → capture output → inspect exit code → remove.
+    async fn run_step(
+        &self,
+        config: ContainerStepConfig,
+    ) -> Result<ContainerStepResult, ContainerStepError>;
+}

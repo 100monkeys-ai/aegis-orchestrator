@@ -271,7 +271,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             socket_path: config.spec.runtime.docker_socket_path.clone(),
             network_mode,
             orchestrator_url,
-            nfs_server_host,
+            nfs_server_host: nfs_server_host.clone(),
             nfs_port: config.spec.runtime.nfs_port,
             nfs_mountport: config.spec.runtime.nfs_mountport,
             event_bus: event_bus.clone(),
@@ -850,6 +850,48 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         };
 
+    // ─── Container Step Runner (ADR-050) ──────────────────────────────────────
+    // Dedicated Docker client + image manager + step runner for CI/CD container
+    // steps executed by ContainerRun / ParallelContainerRun workflow states.
+    // Delegates credential resolution to SecretsManager for vault:// paths and
+    // to environment variables for env:// paths.
+    let docker_for_steps = bollard::Docker::connect_with_local_defaults()
+        .context("Failed to connect Docker daemon for ContainerStepRunner (ADR-050)")?;
+    let step_credential_resolver: Arc<
+        dyn aegis_orchestrator_core::infrastructure::image_manager::CredentialResolver,
+    > = Arc::new(
+        aegis_orchestrator_core::infrastructure::image_manager::NodeConfigCredentialResolver::new(
+            config.spec.registry_credentials.clone(),
+        ),
+    );
+    let step_image_manager: Arc<
+        dyn aegis_orchestrator_core::infrastructure::image_manager::DockerImageManager,
+    > = Arc::new(
+        aegis_orchestrator_core::infrastructure::image_manager::StandardDockerImageManager::new(
+            docker_for_steps.clone(),
+            step_credential_resolver,
+        ),
+    );
+    let container_step_runner: Arc<
+        dyn aegis_orchestrator_core::domain::runtime::ContainerStepRunner,
+    > = Arc::new(
+        aegis_orchestrator_core::infrastructure::container_step_runner::DockerContainerStepRunner::new(
+            docker_for_steps,
+            step_image_manager,
+            nfs_server_host,
+            config.spec.runtime.nfs_port,
+            config.spec.runtime.nfs_mountport,
+            event_bus.clone(),
+            secrets_manager.clone(),
+        ),
+    );
+    let run_container_step_use_case = Arc::new(
+        aegis_orchestrator_core::application::run_container_step::RunContainerStepUseCase::new(
+            container_step_runner,
+        ),
+    );
+    println!("✓ Container step runner initialized (ADR-050).");
+
     let tool_manager = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
             tool_registry,
@@ -984,6 +1026,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Some(attestation_service),
             Some(tool_invocation_service),
             cortex_client,
+            Some(run_container_step_use_case),
         )
         .await
         {
@@ -2175,19 +2218,75 @@ async fn delete_workflow_handler(
 }
 
 /// GET /v1/workflows/executions/:execution_id - Get execution details
-///
-/// TODO: Implement execution state retrieval once WorkflowEngine exposes active executions
-/// Tracked in #WORKFLOW-EXECUTION-STATE
 async fn get_workflow_execution_handler(
-    State(_state): State<Arc<AppState>>,
-    Path(_execution_id): Path<Uuid>,
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        Json(serde_json::json!({
-            "error": "Workflow execution retrieval not yet implemented"
-        })),
-    )
+    let guard = state.temporal_client_container.read().await;
+    let client = match guard.as_ref() {
+        Some(c) => c.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "Temporal client not yet connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+    drop(guard);
+
+    match client
+        .get_workflow_history(execution_id.to_string(), None)
+        .await
+    {
+        Ok(history) => {
+            let event_count = history.len();
+            let status = if let Some(last) = history.last() {
+                let event_label = format!("{:?}", last.event_type());
+                if event_label.contains("Completed") {
+                    "completed"
+                } else if event_label.contains("Failed") {
+                    "failed"
+                } else if event_label.contains("TimedOut") {
+                    "timed_out"
+                } else if event_label.contains("Terminated") || event_label.contains("Cancelled") {
+                    "cancelled"
+                } else {
+                    "running"
+                }
+            } else {
+                "pending"
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "execution_id": execution_id.to_string(),
+                    "status": status,
+                    "event_count": event_count,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("NOT_FOUND") || msg.contains("not found") {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": "Workflow execution not found"
+                    })),
+                )
+                    .into_response();
+            }
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response()
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]

@@ -96,6 +96,36 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub judges_for_parallel: Option<Vec<TemporalJudgeConfig>>,
 
+    // ContainerRun-specific fields (ADR-050)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_image: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_image_pull_policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_command: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_env: Option<HashMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_volumes: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_resources: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_registry_credentials: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_retry: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_shell: Option<bool>,
+
+    // ParallelContainerRun-specific fields (ADR-050)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_container_steps: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parallel_container_completion: Option<String>,
+
     // Transitions
     pub transitions: Vec<TemporalTransitionRule>,
 }
@@ -235,6 +265,19 @@ impl TemporalWorkflowMapper {
                     agents: None,
                     consensus: None,
                     judges_for_parallel: None,
+                    container_run_name: None,
+                    container_run_image: None,
+                    container_run_image_pull_policy: None,
+                    container_run_command: None,
+                    container_run_env: None,
+                    container_run_workdir: None,
+                    container_run_volumes: None,
+                    container_run_resources: None,
+                    container_run_registry_credentials: None,
+                    container_run_retry: None,
+                    container_run_shell: None,
+                    parallel_container_steps: None,
+                    parallel_container_completion: None,
                     transitions,
                 })
             }
@@ -260,6 +303,19 @@ impl TemporalWorkflowMapper {
                 agents: None,
                 consensus: None,
                 judges_for_parallel: None,
+                container_run_name: None,
+                container_run_image: None,
+                container_run_image_pull_policy: None,
+                container_run_command: None,
+                container_run_env: None,
+                container_run_workdir: None,
+                container_run_volumes: None,
+                container_run_resources: None,
+                container_run_registry_credentials: None,
+                container_run_retry: None,
+                container_run_shell: None,
+                parallel_container_steps: None,
+                parallel_container_completion: None,
                 transitions,
             }),
 
@@ -283,6 +339,19 @@ impl TemporalWorkflowMapper {
                 agents: None,
                 consensus: None,
                 judges_for_parallel: None,
+                container_run_name: None,
+                container_run_image: None,
+                container_run_image_pull_policy: None,
+                container_run_command: None,
+                container_run_env: None,
+                container_run_workdir: None,
+                container_run_volumes: None,
+                container_run_resources: None,
+                container_run_registry_credentials: None,
+                container_run_retry: None,
+                container_run_shell: None,
+                parallel_container_steps: None,
+                parallel_container_completion: None,
                 transitions,
             }),
 
@@ -339,6 +408,120 @@ impl TemporalWorkflowMapper {
                     agents: Some(temporal_agents),
                     consensus: Some(temporal_consensus),
                     judges_for_parallel: mapped_judges_for_parallel,
+                    container_run_name: None,
+                    container_run_image: None,
+                    container_run_image_pull_policy: None,
+                    container_run_command: None,
+                    container_run_env: None,
+                    container_run_workdir: None,
+                    container_run_volumes: None,
+                    container_run_resources: None,
+                    container_run_registry_credentials: None,
+                    container_run_retry: None,
+                    container_run_shell: None,
+                    parallel_container_steps: None,
+                    parallel_container_completion: None,
+                    transitions,
+                })
+            }
+
+            StateKind::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            } => {
+                let pull_policy_str = image_pull_policy
+                    .as_ref()
+                    .map(|p| format!("{:?}", p).to_lowercase());
+
+                Ok(TemporalWorkflowState {
+                    kind: "ContainerRun".to_string(),
+                    agent: None,
+                    input: None,
+                    isolation: None,
+                    timeout,
+                    judges: None,
+                    max_iterations: None,
+                    pre_execution_validator: None,
+                    command: None,
+                    env: None,
+                    workdir: None,
+                    prompt: None,
+                    default_response: None,
+                    agents: None,
+                    consensus: None,
+                    judges_for_parallel: None,
+                    container_run_name: Some(name.clone()),
+                    container_run_image: Some(image.clone()),
+                    container_run_image_pull_policy: pull_policy_str,
+                    container_run_command: Some(command.clone()),
+                    container_run_env: Some(env.clone()),
+                    container_run_workdir: workdir.clone(),
+                    container_run_volumes: Some(
+                        serde_json::to_value(volumes).unwrap_or(serde_json::json!([])),
+                    ),
+                    container_run_resources: resources
+                        .as_ref()
+                        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::json!({}))),
+                    container_run_registry_credentials: registry_credentials.clone(),
+                    container_run_retry: retry
+                        .as_ref()
+                        .map(|r| serde_json::to_value(r).unwrap_or(serde_json::json!({}))),
+                    container_run_shell: Some(*shell),
+                    parallel_container_steps: None,
+                    parallel_container_completion: None,
+                    transitions,
+                })
+            }
+
+            StateKind::ParallelContainerRun { steps, completion } => {
+                let completion_str = match completion {
+                    ParallelCompletionStrategy::AllSucceed => "all_succeed",
+                    ParallelCompletionStrategy::AnySucceed => "any_succeed",
+                    ParallelCompletionStrategy::BestEffort => "best_effort",
+                }
+                .to_string();
+
+                Ok(TemporalWorkflowState {
+                    kind: "ParallelContainerRun".to_string(),
+                    agent: None,
+                    input: None,
+                    isolation: None,
+                    timeout,
+                    judges: None,
+                    max_iterations: None,
+                    pre_execution_validator: None,
+                    command: None,
+                    env: None,
+                    workdir: None,
+                    prompt: None,
+                    default_response: None,
+                    agents: None,
+                    consensus: None,
+                    judges_for_parallel: None,
+                    container_run_name: None,
+                    container_run_image: None,
+                    container_run_image_pull_policy: None,
+                    container_run_command: None,
+                    container_run_env: None,
+                    container_run_workdir: None,
+                    container_run_volumes: None,
+                    container_run_resources: None,
+                    container_run_registry_credentials: None,
+                    container_run_retry: None,
+                    container_run_shell: None,
+                    parallel_container_steps: Some(
+                        serde_json::to_value(steps).unwrap_or(serde_json::json!([])),
+                    ),
+                    parallel_container_completion: Some(completion_str),
                     transitions,
                 })
             }
@@ -569,7 +752,35 @@ impl TemporalWorkflowMapper {
                             })?;
                     }
                 }
-                _ => {}
+                StateKind::ContainerRun { env, .. } => {
+                    for (key, value) in env {
+                        handlebars
+                            .render_template(value, &serde_json::json!({}))
+                            .with_context(|| {
+                                format!(
+                                    "Invalid template in ContainerRun state {} env {}: {}",
+                                    state_name, key, value
+                                )
+                            })?;
+                    }
+                }
+                StateKind::ParallelContainerRun { steps, .. } => {
+                    for step in steps {
+                        for (key, value) in &step.env {
+                            handlebars
+                                .render_template(value, &serde_json::json!({}))
+                                .with_context(|| {
+                                    format!(
+                                        "Invalid template in ParallelContainerRun state {} step {} env {}: {}",
+                                        state_name, step.name, key, value
+                                    )
+                                })?;
+                        }
+                    }
+                }
+                StateKind::Human { .. } => {
+                    // Human states have no Handlebars templates to validate.
+                }
             }
         }
 
