@@ -60,6 +60,8 @@ aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.5.0-pre-
 aegis-orchestrator-sdk = { path = "../sdks", version = "0.5.0-pre-alpha" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]

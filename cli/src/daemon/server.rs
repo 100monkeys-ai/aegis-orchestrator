@@ -838,6 +838,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
              (PEM-encoded RSA private key; see ADR-034/ADR-035)"
         )
     })?;
+    let private_key = normalize_smcp_private_key(&private_key);
     let token_issuer = Arc::new(
         aegis_orchestrator_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
             &private_key,
@@ -1093,6 +1094,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     info!("Daemon shutting down");
 
     Ok(())
+}
+
+/// Support `.env` single-line PEM values where newlines are escaped as `\n`.
+fn normalize_smcp_private_key(raw: &str) -> String {
+    if raw.contains("\\n") && !raw.contains('\n') {
+        raw.replace("\\n", "\n")
+    } else {
+        raw.to_string()
+    }
 }
 
 struct PidFileGuard;
