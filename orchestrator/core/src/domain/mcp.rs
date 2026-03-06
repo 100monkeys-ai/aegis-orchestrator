@@ -242,7 +242,10 @@ pub struct ToolServer {
     pub last_health_check: Option<DateTime<Utc>>,
 
     // Security
-    pub credentials: Option<CredentialRef>,
+    /// Credentials to inject as environment variables before spawning the server
+    /// process. Maps `ENV_VAR_NAME → CredentialRef` so multiple credentials can
+    /// be provided (e.g. `GITHUB_TOKEN`, `OPENAI_API_KEY` for the same server).
+    pub credentials: HashMap<String, CredentialRef>,
     pub resource_limits: ResourceLimits,
 
     // Metadata
@@ -254,15 +257,20 @@ impl ToolServer {
     pub fn from_config(config: &crate::domain::node_config::McpServerConfig) -> Self {
         let execution_mode = ExecutionMode::Local;
 
-        let credentials = config.credentials.iter().next().map(|(_, v)| {
-            if let Some(env_val) = v.strip_prefix("env:") {
-                CredentialRef::from_env(env_val)
-            } else if let Some(vault_val) = v.strip_prefix("vault:") {
-                CredentialRef::from_vault(vault_val)
-            } else {
-                CredentialRef::from_env(v)
-            }
-        });
+        let credentials: HashMap<String, CredentialRef> = config
+            .credentials
+            .iter()
+            .map(|(env_key, v)| {
+                let cred_ref = if let Some(env_val) = v.strip_prefix("env:") {
+                    CredentialRef::from_env(env_val)
+                } else if let Some(vault_val) = v.strip_prefix("vault:") {
+                    CredentialRef::from_vault(vault_val)
+                } else {
+                    CredentialRef::from_env(v)
+                };
+                (env_key.clone(), cred_ref)
+            })
+            .collect();
 
         let capabilities: Vec<String> =
             config.capabilities.iter().map(|c| c.name.clone()).collect();
@@ -701,7 +709,7 @@ mod tests {
             process_id: None,
             health_check_interval: Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,

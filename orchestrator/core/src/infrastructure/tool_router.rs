@@ -20,7 +20,9 @@
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
 use crate::domain::node_config::BuiltinDispatcherConfig;
+use crate::domain::secrets::AccessContext;
 use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::secrets_manager::SecretsManager;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -520,6 +522,7 @@ pub struct ToolServerManager {
     registry: Arc<dyn ToolRegistry>,
     servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
     event_bus: Arc<EventBus>,
+    secrets_manager: Arc<SecretsManager>,
 }
 
 impl ToolServerManager {
@@ -527,11 +530,13 @@ impl ToolServerManager {
         registry: Arc<dyn ToolRegistry>,
         servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
         event_bus: Arc<EventBus>,
+        secrets_manager: Arc<SecretsManager>,
     ) -> Self {
         Self {
             registry,
             servers,
             event_bus,
+            secrets_manager,
         }
     }
 
@@ -600,6 +605,28 @@ impl ToolServerManager {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+
+        // Inject credentials as environment variables (ADR-034 Keymaster pattern).
+        // Credentials are resolved from the secret store and injected here;
+        // the subprocess never receives vault tokens or raw secret paths.
+        let cred_context = AccessContext::system("orchestrator");
+        for (env_key, cred_ref) in &server.credentials {
+            match self
+                .secrets_manager
+                .resolve_credential(cred_ref, &cred_context)
+                .await
+            {
+                Ok(sensitive_value) => {
+                    command.env(env_key, sensitive_value.expose());
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve credential '{}' for server '{}': {}",
+                        env_key, server.name, e
+                    );
+                }
+            }
+        }
 
         let child = command.spawn().map_err(|e| {
             // Revert domain state on spawn failure
@@ -775,7 +802,7 @@ mod tests {
             process_id: None,
             health_check_interval: Duration::from_secs(60),
             last_health_check: None,
-            credentials: None,
+            credentials: HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: Some(512),
                 max_cpu_shares: Some(1000),

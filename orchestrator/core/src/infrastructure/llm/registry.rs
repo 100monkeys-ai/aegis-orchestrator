@@ -424,7 +424,7 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
-                openbao: None,
+                secrets: None,
                 builtin_dispatchers: None,
                 registry_credentials: vec![],
                 keycloak: None,

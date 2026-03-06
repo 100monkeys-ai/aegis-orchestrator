@@ -66,9 +66,7 @@ pub struct ManifestMetadata {
 
 /// Credentials for pulling container images from a private container registry (ADR-045).
 ///
-/// Phase 1: sourced from `aegis-config.yaml` via `spec.registry_credentials`.
-/// Phase 2: sourced from OpenBao KV at execution time (ADR-034).
-///
+/// Sourced from `spec.registry_credentials` in `aegis-config.yaml`.
 /// The `registry` field is matched as a **prefix** of the resolved image reference
 /// (e.g. `"ghcr.io"` matches `"ghcr.io/myorg/agent:v1.0"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,8 +120,7 @@ pub struct NodeConfigSpec {
     pub builtin_dispatchers: Option<Vec<BuiltinDispatcherConfig>>,
 
     /// Private container registry credentials for pulling images (ADR-045).
-    /// Each entry covers one registry host prefix. Phase 1: static node-config;
-    /// Phase 2: resolved from OpenBao at execution time.
+    /// Each entry covers one registry host prefix.
     #[serde(default)]
     pub registry_credentials: Vec<RegistryCredentials>,
 
@@ -142,9 +139,11 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cortex: Option<CortexConfig>,
 
-    /// OpenBao secrets management configuration (ADR-034)
+    /// Secrets management configuration (ADR-034).
+    /// Placed at `spec.secrets` in `aegis-config.yaml`.
+    /// If omitted, the orchestrator uses `MockSecretStore` (dev/test only, logs a warning).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub openbao: Option<OpenBaoConfig>,
+    pub secrets: Option<SecretsConfig>,
 
     /// SMCP protocol configuration (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -827,6 +826,20 @@ pub struct CortexConfig {
     pub grpc_url: Option<String>,
 }
 
+/// Top-level secrets configuration wrapper (ADR-034).
+///
+/// Placed at `spec.secrets` in `aegis-config.yaml` and deserialized into
+/// [`NodeConfigSpec::secrets`]. The extra level of indirection keeps the
+/// `NodeConfigSpec` namespace clean and matches the ADR-034 spec path
+/// (`spec.secrets.openbao`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    /// OpenBao backend configuration.
+    /// If `None`, the orchestrator uses `MockSecretStore` (dev/test only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub openbao: Option<OpenBaoConfig>,
+}
+
 /// OpenBao secrets backend configuration (ADR-034)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenBaoConfig {
@@ -887,8 +900,9 @@ fn default_openbao_secret_id_env_var() -> String {
 /// Defines the RSA key material used by the orchestrator to sign and verify
 /// SecurityTokens (JWTs) during the SMCP attestation handshake.
 ///
-/// ⚠️ Phase 1 — keys are loaded from PEM files on disk. Phase 3 will use OpenBao
-///   Transit Engine so that the private key never touches process memory.
+/// Signing keys are loaded from PEM files on disk (paths specified by
+/// `private_key_path` and `public_key_path`). The private key material
+/// is read once at startup into process memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpConfig {
     /// Path to RSA private key PEM file (for signing SecurityTokens).
@@ -1211,7 +1225,7 @@ impl Default for NodeConfigSpec {
             database: None,
             temporal: None,
             cortex: None,
-            openbao: None,
+            secrets: None,
             smcp: None,
             security_contexts: None,
             keycloak: None,
@@ -1581,7 +1595,7 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
-                openbao: None,
+                secrets: None,
                 mcp_servers: None,
                 builtin_dispatchers: None,
                 smcp: None,

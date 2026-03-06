@@ -729,7 +729,7 @@ mod tests {
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: std::collections::HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,
@@ -762,7 +762,7 @@ mod tests {
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: std::collections::HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,

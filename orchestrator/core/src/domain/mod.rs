@@ -28,6 +28,7 @@
 //! | [`fsal`] | BC-7 Storage Gateway | `AegisFSAL` transport-agnostic security boundary (ADR-036) |
 //! | [`path_sanitizer`] | BC-7 Storage Gateway | Path canonicalization and traversal-rejection |
 //! | [`mcp`] | BC-12 SMCP / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
+//! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
 //! | [`events`] | Cross-cutting | All domain events — single catalog used by the event bus (ADR-030) |
 //! | [`repository`] | Cross-cutting | Repository traits for all aggregate roots |
 //! | [`validation`] | BC-2 Execution | `ValidationConfig`, gradient validation types (ADR-017) |
@@ -49,6 +50,7 @@ pub mod policy;
 pub mod repository;
 pub mod runtime;
 pub mod runtime_registry;
+pub mod secrets;
 pub mod security_context;
 pub mod smcp_session;
 pub mod smcp_session_repository;

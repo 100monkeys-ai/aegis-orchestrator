@@ -797,14 +797,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new(),
     );
 
-    // Token Issuer (using env var for security; falls back to dev key for local dev)
-    // WARNING: The fallback key is for local development only - never use in production!
-    // Set AEGIS_SMCP_PRIVATE_KEY environment variable in production deployments
-    let private_key = std::env::var("AEGIS_SMCP_PRIVATE_KEY").unwrap_or_else(|_| {
-        warn!("AEGIS_SMCP_PRIVATE_KEY not set, using insecure default key (dev only!)");
-        // Dev-only fallback key (ADR-035/ADR-034 delay for OpenBao integration)
-        "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N0BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoIIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1Vky2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPXTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----".to_string()
-    });
+    // Token Issuer — AEGIS_SMCP_PRIVATE_KEY must be set to a PEM-encoded RSA private key.
+    // See aegis-config.yaml and ADR-034/ADR-035 for configuration guidance.
+    let private_key = std::env::var("AEGIS_SMCP_PRIVATE_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "SMCP private key not configured: set AEGIS_SMCP_PRIVATE_KEY \
+             (PEM-encoded RSA private key; see ADR-034/ADR-035)"
+        )
+    })?;
     let token_issuer = Arc::new(
         aegis_orchestrator_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
             &private_key,
@@ -824,11 +824,38 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    // Secrets Manager — initialise from spec.secrets.openbao if present, else use Mock (dev/test).
+    let secrets_manager: Arc<aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager> =
+        match config.spec.secrets.as_ref().and_then(|s| s.openbao.as_ref()) {
+            Some(openbao_config) => {
+                match aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager::from_config(
+                    openbao_config,
+                    event_bus.clone(),
+                ).await {
+                    Ok(manager) => {
+                        info!("OpenBao secrets manager initialised");
+                        Arc::new(manager)
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to initialise OpenBao secrets manager: {}", e));
+                    }
+                }
+            }
+            None => {
+                warn!("No spec.secrets.openbao configured — using MockSecretStore (dev/test only, NOT production-safe)");
+                Arc::new(aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager::from_store(
+                    Arc::new(aegis_orchestrator_core::infrastructure::secrets_manager::MockSecretStore::new()),
+                    event_bus.clone(),
+                ))
+            }
+        };
+
     let tool_manager = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
             tool_registry,
             tool_servers.clone(),
             event_bus.clone(),
+            secrets_manager.clone(),
         ),
     );
 

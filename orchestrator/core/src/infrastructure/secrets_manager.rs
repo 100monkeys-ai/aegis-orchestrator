@@ -18,16 +18,22 @@
 //!
 //! See ADR-034 (OpenBao Secrets Management), AGENTS.md §BC-11.
 
+use crate::domain::events::SecretEvent;
 use crate::domain::mcp::{CredentialRef, CredentialStoreType};
 use crate::domain::node_config::OpenBaoConfig;
+use crate::domain::secrets::{AccessContext, DomainDynamicSecret, SensitiveString};
+use crate::infrastructure::event_bus::EventBus;
 use anyhow::Result;
 use async_trait::async_trait;
 use base64::Engine;
+use chrono::Utc;
+use lru::LruCache;
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tracing::{debug, info, warn};
 use vaultrs::client::{Client, VaultClient, VaultClientSettingsBuilder};
 
@@ -93,15 +99,18 @@ pub struct DynamicSecret {
 #[async_trait]
 pub trait SecretStore: Send + Sync {
     /// Read static secret from KV store.
-    async fn read(&self, engine: &str, path: &str)
-        -> Result<HashMap<String, String>, SecretsError>;
+    async fn read(
+        &self,
+        engine: &str,
+        path: &str,
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError>;
 
     /// Write static secret to KV store.
     async fn write(
         &self,
         engine: &str,
         path: &str,
-        secret: HashMap<String, String>,
+        secret: HashMap<String, SensitiveString>,
     ) -> Result<(), SecretsError>;
 
     /// Generate dynamic credentials (e.g. database engine).
@@ -159,7 +168,23 @@ pub struct OpenBaoSecretStore {
 impl OpenBaoSecretStore {
     /// Creates a new `OpenBaoSecretStore`, authenticates via AppRole, and spawns the renewal loop.
     pub async fn new(config: OpenBaoConfig) -> Result<Self, SecretsError> {
-        // 1. Create client (unauthenticated)
+        let unauthenticated = Self::build_client(&config)?;
+        let authenticated = Self::authenticate(unauthenticated, &config).await?;
+
+        let config = Arc::new(config);
+        let shared_client = Arc::new(RwLock::new(authenticated));
+
+        let renewal_client = shared_client.clone();
+        let renewal_config = config.clone();
+        tokio::spawn(Self::token_renewal_loop(renewal_client, renewal_config));
+
+        Ok(Self {
+            client: shared_client,
+        })
+    }
+
+    /// Build an unauthenticated `VaultClient` from the given config.
+    fn build_client(config: &OpenBaoConfig) -> Result<VaultClient, SecretsError> {
         let mut builder = VaultClientSettingsBuilder::default();
         builder.address(&config.address);
 
@@ -174,12 +199,14 @@ impl OpenBaoSecretStore {
         let settings = builder
             .build()
             .map_err(|e| SecretsError::ConfigError(e.to_string()))?;
-        let mut client =
-            VaultClient::new(settings).map_err(|e| SecretsError::ConfigError(e.to_string()))?;
+        VaultClient::new(settings).map_err(|e| SecretsError::ConfigError(e.to_string()))
+    }
 
-        // 2. Authenticate via AppRole
-        let secret_id = std::env::var(&config.approle.secret_id_env_var).unwrap_or_default();
-
+    /// Perform AppRole authentication and return the authenticated client.
+    async fn authenticate(
+        mut client: VaultClient,
+        config: &OpenBaoConfig,
+    ) -> Result<VaultClient, SecretsError> {
         if config.auth_method != "approle" {
             return Err(SecretsError::ConfigError(format!(
                 "Unsupported auth method: {}",
@@ -187,37 +214,61 @@ impl OpenBaoSecretStore {
             )));
         }
 
-        debug!("Authenticating with OpenBao AppRole...");
+        let secret_id = std::env::var(&config.approle.secret_id_env_var).map_err(|_| {
+            SecretsError::ConfigError(format!(
+                "Environment variable '{}' for AppRole Secret ID is not set",
+                config.approle.secret_id_env_var
+            ))
+        })?;
 
+        debug!("Authenticating with OpenBao AppRole...");
         let auth_response =
             vaultrs::auth::approle::login(&client, "approle", &config.approle.role_id, &secret_id)
                 .await?;
 
-        // 3. Set token in client
         client.set_token(&auth_response.client_token);
         info!("Successfully authenticated with OpenBao AppRole");
-
-        let shared_client = Arc::new(RwLock::new(client));
-
-        // 4. Start token renewal background task
-        let renewal_client = shared_client.clone();
-        tokio::spawn(Self::token_renewal_loop(renewal_client));
-
-        Ok(Self {
-            client: shared_client,
-        })
+        Ok(client)
     }
 
-    async fn token_renewal_loop(client: Arc<RwLock<VaultClient>>) {
-        // Renew every 30 minutes (token TTL is 1 hour per ADR-034 §Authentication)
+    /// Background loop: renew the token every 30 minutes.
+    /// On renewal failure, re-authenticates from scratch so that subsequent
+    /// secret operations are not permanently broken by an expired token.
+    async fn token_renewal_loop(client: Arc<RwLock<VaultClient>>, config: Arc<OpenBaoConfig>) {
         let mut interval = tokio::time::interval(Duration::from_secs(1800));
         loop {
             interval.tick().await;
 
-            let client_guard = client.read().await;
-            match vaultrs::token::renew_self(&*client_guard, None).await {
+            let mut client_write = client.write().await;
+            match vaultrs::token::renew_self(&*client_write, None).await {
                 Ok(_) => debug!("Successfully renewed OpenBao token"),
-                Err(e) => warn!("Failed to renew OpenBao token: {}", e),
+                Err(renew_err) => {
+                    warn!(
+                        "OpenBao token renewal failed ({}); attempting re-authentication...",
+                        renew_err
+                    );
+                    match Self::build_client(&config) {
+                        Ok(new_client) => match Self::authenticate(new_client, &config).await {
+                            Ok(authenticated) => {
+                                *client_write = authenticated;
+                                info!("OpenBao re-authentication succeeded after renewal failure");
+                            }
+                            Err(re_auth_err) => {
+                                warn!(
+                                        "OpenBao re-authentication failed: {}. \
+                                        Subsequent secret operations will fail until the token is valid.",
+                                        re_auth_err
+                                    );
+                            }
+                        },
+                        Err(build_err) => {
+                            warn!(
+                                "Failed to rebuild OpenBao client for re-auth: {}",
+                                build_err
+                            );
+                        }
+                    }
+                }
             }
         }
     }
@@ -229,20 +280,28 @@ impl SecretStore for OpenBaoSecretStore {
         &self,
         engine: &str,
         path: &str,
-    ) -> Result<HashMap<String, String>, SecretsError> {
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
         let client = self.client.read().await;
-        let secret: HashMap<String, String> = vaultrs::kv2::read(&*client, engine, path).await?;
-        Ok(secret)
+        let raw: HashMap<String, String> = vaultrs::kv2::read(&*client, engine, path).await?;
+        Ok(raw
+            .into_iter()
+            .map(|(k, v)| (k, SensitiveString::new(v)))
+            .collect())
     }
 
     async fn write(
         &self,
         engine: &str,
         path: &str,
-        secret: HashMap<String, String>,
+        secret: HashMap<String, SensitiveString>,
     ) -> Result<(), SecretsError> {
         let client = self.client.read().await;
-        vaultrs::kv2::set(&*client, engine, path, &secret).await?;
+        // Expose sensitive values only at the point of transmission to OpenBao.
+        let raw: HashMap<String, String> = secret
+            .iter()
+            .map(|(k, v)| (k.clone(), v.expose().to_owned()))
+            .collect();
+        vaultrs::kv2::set(&*client, engine, path, &raw).await?;
         Ok(())
     }
 
@@ -252,33 +311,58 @@ impl SecretStore for OpenBaoSecretStore {
         role: &str,
     ) -> Result<DynamicSecret, SecretsError> {
         let client = self.client.read().await;
-        // Dynamic secrets are read from `{engine}/creds/{role}`.
-        // The vaultrs crate models individual database engines, but we use
-        // the generic logical read to support *any* dynamic engine uniformly.
-        let creds_path = format!("{}/creds/{}", engine_path, role);
-        let response: HashMap<String, String> =
-            vaultrs::kv2::read(&*client, engine_path, &format!("creds/{}", role))
-                .await
-                .map_err(|e| {
-                    SecretsError::DynamicSecretError(format!(
-                        "Failed to generate dynamic secret at {}: {}",
-                        creds_path, e
-                    ))
-                })?;
+        // Dynamic secrets are generated via GET /v1/{engine}/creds/{role}.
+        // This uses the OpenBao logical read path, not the KV2 API.
+        // vaultrs 0.7 does not expose a generic logical Read endpoint, so we
+        // use raw reqwest (same pattern already used for lease management).
+        let address = client.settings().address.clone();
+        let token = client.settings().token.clone();
+        let url = format!("{}v1/{}/creds/{}", address, engine_path, role);
+        let http_resp = reqwest::Client::new()
+            .get(&url)
+            .header("X-Vault-Token", &token)
+            .send()
+            .await
+            .map_err(|e| {
+                SecretsError::DynamicSecretError(format!(
+                    "HTTP GET {}/{}/creds/{} failed: {}",
+                    address, engine_path, role, e
+                ))
+            })?;
+
+        if !http_resp.status().is_success() {
+            return Err(SecretsError::DynamicSecretError(format!(
+                "Dynamic secret generation returned status {} for {}/creds/{}",
+                http_resp.status(),
+                engine_path,
+                role
+            )));
+        }
+
+        let resp_json: serde_json::Value = http_resp.json().await.map_err(|e| {
+            SecretsError::DynamicSecretError(format!("Dynamic secret response parse failed: {}", e))
+        })?;
+
+        let lease_id = resp_json["lease_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let lease_duration_secs = resp_json["lease_duration"].as_u64().unwrap_or(300);
+        let renewable = resp_json["renewable"].as_bool().unwrap_or(false);
+        let data: HashMap<String, String> = resp_json["data"]
+            .as_object()
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         Ok(DynamicSecret {
-            lease_id: response.get("lease_id").cloned().unwrap_or_default(),
-            lease_duration: Duration::from_secs(
-                response
-                    .get("lease_duration")
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .unwrap_or(300),
-            ),
-            renewable: response
-                .get("renewable")
-                .map(|v| v == "true")
-                .unwrap_or(false),
-            data: response,
+            lease_id,
+            lease_duration: Duration::from_secs(lease_duration_secs),
+            renewable,
+            data,
         })
     }
 
@@ -418,7 +502,7 @@ impl SecretStore for OpenBaoSecretStore {
 /// Stores KV data in a `HashMap`, returns deterministic results for transit
 /// operations, and generates synthetic dynamic secrets.
 pub struct MockSecretStore {
-    kv_store: RwLock<HashMap<String, HashMap<String, String>>>,
+    kv_store: RwLock<HashMap<String, HashMap<String, SensitiveString>>>,
 }
 
 impl MockSecretStore {
@@ -445,7 +529,7 @@ impl SecretStore for MockSecretStore {
         &self,
         engine: &str,
         path: &str,
-    ) -> Result<HashMap<String, String>, SecretsError> {
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
         let store = self.kv_store.read().await;
         store
             .get(&Self::kv_key(engine, path))
@@ -459,7 +543,7 @@ impl SecretStore for MockSecretStore {
         &self,
         engine: &str,
         path: &str,
-        secret: HashMap<String, String>,
+        secret: HashMap<String, SensitiveString>,
     ) -> Result<(), SecretsError> {
         let mut store = self.kv_store.write().await;
         store.insert(Self::kv_key(engine, path), secret);
@@ -542,48 +626,120 @@ impl SecretStore for MockSecretStore {
 // SecretsManager — Application-layer facade (Keymaster pattern)
 // ---------------------------------------------------------------------------
 
+/// Total capacity of the read-through LRU cache inside `SecretsManager`.
+const CACHE_CAPACITY: usize = 128;
+
+/// How long a cached KV secret is considered fresh before a live read is issued.
+const CACHE_TTL: Duration = Duration::from_secs(30);
+
 /// The main entry point for the Application layer to interact with secrets,
 /// following the Keymaster architectural pattern (ADR-034).
 ///
 /// Only the orchestrator accesses the secret store; agents never communicate
 /// with OpenBao directly. This struct wraps a `SecretStore` implementation
-/// and provides convenience methods including credential resolution.
+/// and provides convenience methods including:
+/// - a 30-second read-through LRU cache (capacity 128) to reduce vault pressure
+/// - structured `AccessContext` on every call for the audit trail
+/// - `SecretEvent` publishing to the `EventBus` after each operation
 pub struct SecretsManager {
     store: Arc<dyn SecretStore>,
+    event_bus: Arc<EventBus>,
+    /// Cache key: `"engine/path"` → `(values, Instant of population)`
+    cache: Arc<Mutex<LruCache<String, (HashMap<String, SensitiveString>, Instant)>>>,
 }
 
 impl SecretsManager {
-    /// Creates a new `SecretsManager` with the underlying OpenBao store.
-    pub async fn from_config(config: &OpenBaoConfig) -> Result<Self, SecretsError> {
+    /// Creates a new `SecretsManager` backed by a live OpenBao connection.
+    pub async fn from_config(
+        config: &OpenBaoConfig,
+        event_bus: Arc<EventBus>,
+    ) -> Result<Self, SecretsError> {
         let store = OpenBaoSecretStore::new(config.clone()).await?;
         Ok(Self {
             store: Arc::new(store),
+            event_bus,
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
+            ))),
         })
     }
 
-    /// Creates a new `SecretsManager` wrapping an arbitrary `SecretStore`
-    /// (used for testing with `MockSecretStore`).
-    pub fn from_store(store: Arc<dyn SecretStore>) -> Self {
-        Self { store }
+    /// Creates a `SecretsManager` wrapping an arbitrary `SecretStore`.
+    /// Used in tests via `MockSecretStore` and in dev/CI via a no-op store.
+    pub fn from_store(store: Arc<dyn SecretStore>, event_bus: Arc<EventBus>) -> Self {
+        Self {
+            store,
+            event_bus,
+            cache: Arc::new(Mutex::new(LruCache::new(
+                NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
+            ))),
+        }
     }
 
-    /// Read a secret from OpenBao KV engine.
+    fn cache_key(engine: &str, path: &str) -> String {
+        format!("{}/{}", engine, path)
+    }
+
+    /// Read a secret from the KV engine, served from cache when fresh.
     pub async fn read_secret(
         &self,
         engine: &str,
         path: &str,
-    ) -> Result<HashMap<String, String>, SecretsError> {
-        self.store.read(engine, path).await
+        context: &AccessContext,
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError> {
+        let key = Self::cache_key(engine, path);
+
+        // Cache hit
+        {
+            let mut cache = self.cache.lock().await;
+            if let Some((values, populated_at)) = cache.get(&key) {
+                if populated_at.elapsed() < CACHE_TTL {
+                    return Ok(values.clone());
+                }
+            }
+        }
+
+        // Cache miss — live read
+        let result = self.store.read(engine, path).await;
+
+        match &result {
+            Ok(values) => {
+                {
+                    let mut cache = self.cache.lock().await;
+                    cache.put(key, (values.clone(), Instant::now()));
+                }
+                self.event_bus
+                    .publish_secret_event(SecretEvent::SecretRetrieved {
+                        engine: engine.to_string(),
+                        path: path.to_string(),
+                        access_context: context.clone(),
+                        retrieved_at: Utc::now(),
+                    });
+            }
+            Err(e) => {
+                self.event_bus
+                    .publish_secret_event(SecretEvent::SecretAccessDenied {
+                        engine: Some(engine.to_string()),
+                        path: Some(path.to_string()),
+                        reason: e.to_string(),
+                        access_context: context.clone(),
+                        denied_at: Utc::now(),
+                    });
+            }
+        }
+
+        result
     }
 
-    /// Read a single value from a KV engine path.
+    /// Read a single field from a KV engine path.
     pub async fn read_secret_field(
         &self,
         engine: &str,
         path: &str,
         field: &str,
-    ) -> Result<String, SecretsError> {
-        let mut secret = self.store.read(engine, path).await?;
+        context: &AccessContext,
+    ) -> Result<SensitiveString, SecretsError> {
+        let mut secret = self.read_secret(engine, path, context).await?;
         secret
             .remove(field)
             .ok_or_else(|| SecretsError::SecretNotFound {
@@ -591,13 +747,88 @@ impl SecretsManager {
             })
     }
 
-    /// Generate a dynamic secret (e.g., database credentials with TTL).
+    /// Write a secret to the KV engine and invalidate the cache entry.
+    pub async fn write_secret(
+        &self,
+        engine: &str,
+        path: &str,
+        secret: HashMap<String, SensitiveString>,
+        context: &AccessContext,
+    ) -> Result<(), SecretsError> {
+        let result = self.store.write(engine, path, secret).await;
+        // Invalidate cache regardless of success/failure
+        self.cache.lock().await.pop(&Self::cache_key(engine, path));
+
+        match &result {
+            Ok(()) => {
+                self.event_bus
+                    .publish_secret_event(SecretEvent::SecretWritten {
+                        engine: engine.to_string(),
+                        path: path.to_string(),
+                        access_context: context.clone(),
+                        written_at: Utc::now(),
+                    });
+            }
+            Err(e) => {
+                self.event_bus
+                    .publish_secret_event(SecretEvent::SecretAccessDenied {
+                        engine: Some(engine.to_string()),
+                        path: Some(path.to_string()),
+                        reason: e.to_string(),
+                        access_context: context.clone(),
+                        denied_at: Utc::now(),
+                    });
+            }
+        }
+
+        result
+    }
+
+    /// Generate short-lived credentials from a dynamic engine (e.g. database/PKI).
     pub async fn generate_dynamic_secret(
         &self,
         engine: &str,
         role: &str,
-    ) -> Result<DynamicSecret, SecretsError> {
-        self.store.generate_dynamic(engine, role).await
+        context: &AccessContext,
+    ) -> Result<DomainDynamicSecret, SecretsError> {
+        let result = self.store.generate_dynamic(engine, role).await;
+
+        match &result {
+            Ok(raw) => {
+                let domain = DomainDynamicSecret {
+                    lease_id: raw.lease_id.clone(),
+                    values: raw
+                        .data
+                        .iter()
+                        .map(|(k, v)| (k.clone(), SensitiveString::new(v.clone())))
+                        .collect(),
+                    lease_duration: raw.lease_duration,
+                    renewable: raw.renewable,
+                    created_at: Instant::now(),
+                };
+                self.event_bus
+                    .publish_secret_event(SecretEvent::DynamicSecretGenerated {
+                        engine: engine.to_string(),
+                        role: role.to_string(),
+                        lease_id: raw.lease_id.clone(),
+                        lease_duration_secs: raw.lease_duration.as_secs(),
+                        access_context: context.clone(),
+                        generated_at: Utc::now(),
+                    });
+                Ok(domain)
+            }
+            Err(e) => {
+                self.event_bus
+                    .publish_secret_event(SecretEvent::SecretAccessDenied {
+                        engine: Some(engine.to_string()),
+                        path: Some(format!("creds/{}", role)),
+                        reason: e.to_string(),
+                        access_context: context.clone(),
+                        denied_at: Utc::now(),
+                    });
+                Err(result.unwrap_err())
+            }
+        }
     }
 
     /// Renew a dynamic secret lease.
@@ -605,13 +836,37 @@ impl SecretsManager {
         &self,
         lease_id: &str,
         increment: Duration,
+        context: &AccessContext,
     ) -> Result<Duration, SecretsError> {
-        self.store.renew_lease(lease_id, increment).await
+        let result = self.store.renew_lease(lease_id, increment).await;
+        if let Ok(new_duration) = &result {
+            self.event_bus
+                .publish_secret_event(SecretEvent::LeaseRenewed {
+                    lease_id: lease_id.to_string(),
+                    new_duration_secs: new_duration.as_secs(),
+                    access_context: context.clone(),
+                    renewed_at: Utc::now(),
+                });
+        }
+        result
     }
 
     /// Revoke a dynamic secret lease early.
-    pub async fn revoke_lease(&self, lease_id: &str) -> Result<(), SecretsError> {
-        self.store.revoke_lease(lease_id).await
+    pub async fn revoke_lease(
+        &self,
+        lease_id: &str,
+        context: &AccessContext,
+    ) -> Result<(), SecretsError> {
+        let result = self.store.revoke_lease(lease_id).await;
+        if result.is_ok() {
+            self.event_bus
+                .publish_secret_event(SecretEvent::LeaseRevoked {
+                    lease_id: lease_id.to_string(),
+                    access_context: context.clone(),
+                    revoked_at: Utc::now(),
+                });
+        }
+        result
     }
 
     /// Sign data using OpenBao Transit Engine.
@@ -639,7 +894,7 @@ impl SecretsManager {
         self.store.transit_decrypt(key_name, ciphertext).await
     }
 
-    /// Resolve a [`CredentialRef`] to its plaintext value.
+    /// Resolve a [`CredentialRef`] to its sensitive value.
     ///
     /// Dispatches to the appropriate backend:
     /// - `CredentialStoreType::Environment` → reads from `std::env::var`
@@ -647,18 +902,21 @@ impl SecretsManager {
     ///
     /// The `key` field encodes the lookup coordinates:
     /// - Environment: raw env-var name (e.g. `"GMAIL_TOKEN"`)
-    /// - OpenBao: `"vault:<namespace>/<mount>/<path>#<field>"` or `"vault:<mount>/<path>"`
+    /// - OpenBao: `"vault:engine/path#field"` or `"vault:engine/path"`
     pub async fn resolve_credential(
         &self,
         credential: &CredentialRef,
-    ) -> Result<String, SecretsError> {
+        context: &AccessContext,
+    ) -> Result<SensitiveString, SecretsError> {
         match credential.store_type {
-            CredentialStoreType::Environment => std::env::var(&credential.key).map_err(|_| {
-                SecretsError::CredentialResolutionError(format!(
-                    "Environment variable '{}' not set",
-                    credential.key
-                ))
-            }),
+            CredentialStoreType::Environment => std::env::var(&credential.key)
+                .map(SensitiveString::new)
+                .map_err(|_| {
+                    SecretsError::CredentialResolutionError(format!(
+                        "Environment variable '{}' not set",
+                        credential.key
+                    ))
+                }),
             CredentialStoreType::OpenBao => {
                 // Parse "vault:engine/path" or "vault:engine/path#field"
                 let raw = credential
@@ -672,7 +930,6 @@ impl SecretsManager {
                     (raw, None)
                 };
 
-                // Split "engine/rest/of/path"
                 let (engine, path) = kv_path.split_once('/').ok_or_else(|| {
                     SecretsError::InvalidPath(format!(
                         "OpenBao credential key must contain at least engine/path: '{}'",
@@ -681,10 +938,9 @@ impl SecretsManager {
                 })?;
 
                 if let Some(field) = field {
-                    self.read_secret_field(engine, path, field).await
+                    self.read_secret_field(engine, path, field, context).await
                 } else {
-                    // Return first value when no field specified
-                    let secret = self.store.read(engine, path).await?;
+                    let secret = self.read_secret(engine, path, context).await?;
                     secret
                         .into_values()
                         .next()
@@ -701,8 +957,27 @@ impl SecretsManager {
 mod tests {
     use super::*;
 
+    fn mock_store() -> Arc<MockSecretStore> {
+        Arc::new(MockSecretStore::new())
+    }
+
+    fn mock_event_bus() -> Arc<EventBus> {
+        Arc::new(EventBus::new(16))
+    }
+
     fn mock_manager() -> SecretsManager {
-        SecretsManager::from_store(Arc::new(MockSecretStore::new()))
+        SecretsManager::from_store(mock_store(), mock_event_bus())
+    }
+
+    fn test_context() -> AccessContext {
+        AccessContext::system("test-orchestrator")
+    }
+
+    fn sensitive_map(pairs: &[(&str, &str)]) -> HashMap<String, SensitiveString> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), SensitiveString::new(v.to_string())))
+            .collect()
     }
 
     // -- MockSecretStore KV tests --
@@ -710,14 +985,12 @@ mod tests {
     #[tokio::test]
     async fn test_mock_secret_store_read_write() {
         let store = MockSecretStore::new();
-        let data = HashMap::from([
-            ("api_key".to_string(), "sk-abc123".to_string()),
-            ("region".to_string(), "us-east-1".to_string()),
-        ]);
+        let data = sensitive_map(&[("api_key", "sk-abc123"), ("region", "us-east-1")]);
 
         store.write("kv", "openai", data.clone()).await.unwrap();
         let result = store.read("kv", "openai").await.unwrap();
-        assert_eq!(result, data);
+        assert_eq!(result["api_key"].expose(), data["api_key"].expose());
+        assert_eq!(result["region"].expose(), data["region"].expose());
     }
 
     #[tokio::test]
@@ -816,10 +1089,8 @@ mod tests {
     #[tokio::test]
     async fn test_secrets_manager_read_secret_field() {
         let manager = mock_manager();
-        let data = HashMap::from([
-            ("oauth_token".to_string(), "ya29.mock".to_string()),
-            ("client_id".to_string(), "123.apps".to_string()),
-        ]);
+        let ctx = test_context();
+        let data = sensitive_map(&[("oauth_token", "ya29.mock"), ("client_id", "123.apps")]);
 
         manager
             .store
@@ -828,14 +1099,14 @@ mod tests {
             .unwrap();
 
         let token = manager
-            .read_secret_field("kv", "mcp-tools/gmail", "oauth_token")
+            .read_secret_field("kv", "mcp-tools/gmail", "oauth_token", &ctx)
             .await
             .unwrap();
-        assert_eq!(token, "ya29.mock");
+        assert_eq!(token.expose(), "ya29.mock");
 
         // Missing field returns error
         let result = manager
-            .read_secret_field("kv", "mcp-tools/gmail", "nonexistent")
+            .read_secret_field("kv", "mcp-tools/gmail", "nonexistent", &ctx)
             .await;
         assert!(matches!(result, Err(SecretsError::SecretNotFound { .. })));
     }
@@ -863,33 +1134,96 @@ mod tests {
         assert_eq!(pt, plaintext);
     }
 
+    #[tokio::test]
+    async fn test_secrets_manager_read_cache() {
+        let manager = mock_manager();
+        let ctx = test_context();
+        let data = sensitive_map(&[("key", "value-123")]);
+        manager
+            .store
+            .write("kv", "cached/path", data)
+            .await
+            .unwrap();
+
+        // First read hits store
+        let first = manager
+            .read_secret("kv", "cached/path", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(first["key"].expose(), "value-123");
+
+        // Second read within TTL returns same value from cache
+        let second = manager
+            .read_secret("kv", "cached/path", &ctx)
+            .await
+            .unwrap();
+        assert_eq!(second["key"].expose(), "value-123");
+    }
+
+    #[tokio::test]
+    async fn test_secrets_manager_write_invalidates_cache() {
+        let manager = mock_manager();
+        let ctx = test_context();
+
+        let initial = sensitive_map(&[("secret", "original")]);
+        manager.store.write("kv", "my/path", initial).await.unwrap();
+        // warm the cache
+        manager.read_secret("kv", "my/path", &ctx).await.unwrap();
+
+        // write via facade should invalidate cache
+        let updated = sensitive_map(&[("secret", "updated")]);
+        manager
+            .write_secret("kv", "my/path", updated, &ctx)
+            .await
+            .unwrap();
+
+        // next read should go to store and get the updated value
+        let result = manager.read_secret("kv", "my/path", &ctx).await.unwrap();
+        assert_eq!(result["secret"].expose(), "updated");
+    }
+
+    #[tokio::test]
+    async fn test_secrets_manager_dynamic_secret() {
+        let manager = mock_manager();
+        let ctx = test_context();
+
+        let domain = manager
+            .generate_dynamic_secret("database", "agent-readonly", &ctx)
+            .await
+            .unwrap();
+        assert!(domain.lease_id.contains("agent-readonly"));
+        assert!(domain.values.contains_key("username"));
+        assert!(domain.values.contains_key("password"));
+        assert!(!domain.is_expired());
+    }
+
     // -- Credential Resolution tests --
 
     #[tokio::test]
     async fn test_credential_ref_resolution_env() {
         let manager = mock_manager();
-        // Set an env var for test (best-effort; concurrent tests may race)
+        let ctx = test_context();
         std::env::set_var("AEGIS_TEST_SECRET_XYZ", "test-value-123");
 
         let cred = CredentialRef {
             store_type: CredentialStoreType::Environment,
             key: "AEGIS_TEST_SECRET_XYZ".to_string(),
         };
-        let value = manager.resolve_credential(&cred).await.unwrap();
-        assert_eq!(value, "test-value-123");
+        let value = manager.resolve_credential(&cred, &ctx).await.unwrap();
+        assert_eq!(value.expose(), "test-value-123");
 
-        // Clean up
         std::env::remove_var("AEGIS_TEST_SECRET_XYZ");
     }
 
     #[tokio::test]
     async fn test_credential_ref_resolution_env_missing() {
         let manager = mock_manager();
+        let ctx = test_context();
         let cred = CredentialRef {
             store_type: CredentialStoreType::Environment,
             key: "AEGIS_NONEXISTENT_VAR_Z9X8".to_string(),
         };
-        let result = manager.resolve_credential(&cred).await;
+        let result = manager.resolve_credential(&cred, &ctx).await;
         assert!(matches!(
             result,
             Err(SecretsError::CredentialResolutionError(_))
@@ -899,29 +1233,29 @@ mod tests {
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao() {
         let manager = mock_manager();
+        let ctx = test_context();
 
-        // Pre-populate the mock store
-        let data = HashMap::from([("oauth_token".to_string(), "ya29.vault-token".to_string())]);
+        let data = sensitive_map(&[("oauth_token", "ya29.vault-token")]);
         manager
             .store
             .write("kv", "mcp-tools/gmail", data)
             .await
             .unwrap();
 
-        // Resolve with field specifier
         let cred = CredentialRef {
             store_type: CredentialStoreType::OpenBao,
             key: "vault:kv/mcp-tools/gmail#oauth_token".to_string(),
         };
-        let value = manager.resolve_credential(&cred).await.unwrap();
-        assert_eq!(value, "ya29.vault-token");
+        let value = manager.resolve_credential(&cred, &ctx).await.unwrap();
+        assert_eq!(value.expose(), "ya29.vault-token");
     }
 
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao_no_field() {
         let manager = mock_manager();
+        let ctx = test_context();
 
-        let data = HashMap::from([("value".to_string(), "single-secret".to_string())]);
+        let data = sensitive_map(&[("value", "single-secret")]);
         manager
             .store
             .write("kv", "simple/secret", data)
@@ -932,18 +1266,19 @@ mod tests {
             store_type: CredentialStoreType::OpenBao,
             key: "vault:kv/simple/secret".to_string(),
         };
-        let value = manager.resolve_credential(&cred).await.unwrap();
-        assert_eq!(value, "single-secret");
+        let value = manager.resolve_credential(&cred, &ctx).await.unwrap();
+        assert_eq!(value.expose(), "single-secret");
     }
 
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao_invalid_path() {
         let manager = mock_manager();
+        let ctx = test_context();
         let cred = CredentialRef {
             store_type: CredentialStoreType::OpenBao,
             key: "vault:no-slash-here".to_string(),
         };
-        let result = manager.resolve_credential(&cred).await;
+        let result = manager.resolve_credential(&cred, &ctx).await;
         assert!(matches!(result, Err(SecretsError::InvalidPath(_))));
     }
 }
