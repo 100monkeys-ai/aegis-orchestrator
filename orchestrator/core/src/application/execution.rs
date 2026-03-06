@@ -1524,7 +1524,10 @@ impl StandardExecutionService {
                         let cortex_clone = cortex.clone();
                         tokio::spawn(async move {
                             if let Err(e) = cortex_clone.store_trajectory_pattern(req).await {
-                                tracing::warn!("Failed to store trajectory pattern in Cortex: {}", e);
+                                tracing::warn!(
+                                    "Failed to store trajectory pattern in Cortex: {}",
+                                    e
+                                );
                             } else {
                                 tracing::info!("Successfully stored TrajectoryPattern in Cortex");
                             }

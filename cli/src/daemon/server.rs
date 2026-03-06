@@ -2021,10 +2021,13 @@ async fn dispatch_gateway_handler(
                     for msg in conversation {
                         if let Some(calls) = msg.tool_calls {
                             for call in calls {
-                                trajectory.push(aegis_orchestrator_core::domain::execution::TrajectoryStep {
-                                    tool_name: call.name.clone(),
-                                    arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
-                                });
+                                trajectory.push(
+                                    aegis_orchestrator_core::domain::execution::TrajectoryStep {
+                                        tool_name: call.name.clone(),
+                                        arguments_json: serde_json::to_string(&call.arguments)
+                                            .unwrap_or_default(),
+                                    },
+                                );
                             }
                         }
                     }
