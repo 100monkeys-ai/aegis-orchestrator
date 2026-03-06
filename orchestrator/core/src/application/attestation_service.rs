@@ -145,6 +145,6 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
             nbf: claims.nbf,
         };
 
-        SecurityTokenIssuer::issue(self, &mut inner_claims).map_err(Into::into)
+        SecurityTokenIssuer::issue(self, &mut inner_claims)
     }
 }
