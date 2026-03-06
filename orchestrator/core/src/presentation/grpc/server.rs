@@ -321,13 +321,13 @@ impl AegisRuntime for AegisRuntimeService {
             .as_ref()
             .and_then(|v| v["execution_id"].as_str())
             .and_then(|s| crate::domain::execution::ExecutionId::from_string(s).ok())
-            .unwrap_or_else(crate::domain::execution::ExecutionId::new);
+            .unwrap_or_default();
 
         let agent_id = context_value
             .as_ref()
             .and_then(|v| v["agent_id"].as_str())
             .and_then(|s| AgentId::from_string(s).ok())
-            .unwrap_or_else(AgentId::new);
+            .unwrap_or_default();
 
         // Map proto ConsensusConfig → domain ConsensusConfig (ADR-017)
         use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy};

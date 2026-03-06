@@ -1501,7 +1501,7 @@ impl StandardExecutionService {
                             .validation_results
                             .as_ref()
                             .and_then(|vr| vr.gradient.as_ref())
-                            .map(|g| g.score as f64)
+                            .map(|g| g.score)
                             .unwrap_or(1.0);
 
                         let task_signature = exec.input.intent.clone().unwrap_or_default();
