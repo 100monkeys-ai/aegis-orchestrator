@@ -810,7 +810,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             &private_key,
             "aegis-orchestrator",
         )
-        .unwrap(),
+        .map_err(|e| anyhow::anyhow!("Failed to initialize SMCP token issuer from AEGIS_SMCP_PRIVATE_KEY: {}", e))?,
     );
 
     // Application Services
@@ -1103,7 +1103,7 @@ async fn register_temporal_workflow_handler(
         .register_workflow(&body)
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
+        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).expect("RegisteredWorkflow must be JSON-serializable"))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1125,7 +1125,7 @@ async fn execute_temporal_workflow_handler(
         .start_execution(request)
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).unwrap())).into_response(),
+        Ok(res) => (StatusCode::OK, Json(serde_json::to_value(&res).expect("StartWorkflowExecutionResponse must be JSON-serializable"))).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
