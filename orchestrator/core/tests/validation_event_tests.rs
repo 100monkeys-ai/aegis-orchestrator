@@ -94,6 +94,7 @@ impl ExecutionService for MockExecutionService {
             started_at: chrono::Utc::now(),
             ended_at: Some(chrono::Utc::now()),
             llm_interactions: vec![],
+            trajectory: None,
         };
         Ok(vec![iteration])
     }
@@ -132,6 +133,14 @@ impl ExecutionService for MockExecutionService {
         _execution_id: ExecutionId,
         _iteration: u8,
         _interaction: LlmInteraction,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _execution_id: ExecutionId,
+        _iteration: u8,
+        _trajectory: Vec<aegis_orchestrator_core::domain::execution::TrajectoryStep>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

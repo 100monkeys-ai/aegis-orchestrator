@@ -218,6 +218,14 @@ pub struct Iteration {
     pub ended_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub llm_interactions: Vec<LlmInteraction>,
+    #[serde(default)]
+    pub trajectory: Option<Vec<TrajectoryStep>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrajectoryStep {
+    pub tool_name: String,
+    pub arguments_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -371,6 +379,7 @@ impl Execution {
             started_at: Utc::now(),
             ended_at: None,
             llm_interactions: Vec::new(),
+            trajectory: None,
         };
 
         self.iterations.push(iteration);
@@ -396,6 +405,23 @@ impl Execution {
             .find(|i| i.number == iteration_number)
         {
             iter.validation_results = Some(results);
+            Ok(())
+        } else {
+            Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
+
+    pub fn store_iteration_trajectory(
+        &mut self,
+        iteration_number: u8,
+        trajectory: Vec<TrajectoryStep>,
+    ) -> Result<(), ExecutionError> {
+        if let Some(iter) = self
+            .iterations
+            .iter_mut()
+            .find(|i| i.number == iteration_number)
+        {
+            iter.trajectory = Some(trajectory);
             Ok(())
         } else {
             Err(ExecutionError::IterationNotFound(iteration_number))

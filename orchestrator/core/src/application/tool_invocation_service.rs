@@ -560,6 +560,14 @@ mod tests {
         ) -> Result<()> {
             unimplemented!()
         }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
     }
 
     #[tokio::test]

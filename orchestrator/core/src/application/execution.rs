@@ -168,6 +168,14 @@ pub trait ExecutionService: Send + Sync {
         iteration: u8,
         interaction: crate::domain::execution::LlmInteraction,
     ) -> Result<()>;
+
+    /// Store the recorded sequence of tool invocations for an iteration
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()>;
 }
 
 pub struct StandardExecutionService {
@@ -192,6 +200,8 @@ pub struct StandardExecutionService {
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
+    /// Optional CortexClient to upload learned trajectories (ADR-049).
+    cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
 }
 
 impl StandardExecutionService {
@@ -215,6 +225,7 @@ impl StandardExecutionService {
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
             tool_router: None,
+            cortex_client: None,
         }
     }
 
@@ -256,6 +267,15 @@ impl StandardExecutionService {
         tool_router: Arc<crate::infrastructure::tool_router::ToolRouter>,
     ) -> Self {
         self.tool_router = Some(tool_router);
+        self
+    }
+
+    /// Attach a CortexClient for Trajectory Consolidation (ADR-049).
+    pub fn with_cortex_client(
+        mut self,
+        cortex_client: Arc<crate::infrastructure::CortexGrpcClient>,
+    ) -> Self {
+        self.cortex_client = Some(cortex_client);
         self
     }
 }
@@ -848,6 +868,7 @@ impl ExecutionService for StandardExecutionService {
         self.cancellation_tokens
             .insert(execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
+        let cortex_client = self.cortex_client.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -871,6 +892,8 @@ impl ExecutionService for StandardExecutionService {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
+
+                        StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                             execution_id,
@@ -1331,6 +1354,7 @@ impl ExecutionService for StandardExecutionService {
         self.cancellation_tokens
             .insert(child_execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
+        let cortex_client = self.cortex_client.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -1352,6 +1376,9 @@ impl ExecutionService for StandardExecutionService {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
+
+                        StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
+
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                             execution_id: child_execution_id,
                             agent_id,
@@ -1437,5 +1464,74 @@ impl ExecutionService for StandardExecutionService {
             }
         }
         Ok(())
+    }
+
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+            if let Err(e) = exec.store_iteration_trajectory(iteration, trajectory) {
+                tracing::warn!(
+                    "Failed to record trajectory for execution {} iteration {}: {}",
+                    execution_id.0,
+                    iteration,
+                    e
+                );
+            } else {
+                self.repository.save(&exec).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StandardExecutionService {
+    fn store_trajectory_in_cortex(
+        cortex_client_opt: &Option<Arc<crate::infrastructure::cortex_client::CortexGrpcClient>>,
+        exec: &Execution,
+    ) {
+        if let Some(cortex) = cortex_client_opt {
+            if let Some(last_iter) = exec.iterations().last() {
+                if let Some(trajectory) = last_iter.trajectory.clone() {
+                    if !trajectory.is_empty() {
+                        let score = last_iter
+                            .validation_results
+                            .as_ref()
+                            .and_then(|vr| vr.gradient.as_ref())
+                            .map(|g| g.score as f64)
+                            .unwrap_or(1.0);
+
+                        let task_signature = exec.input.intent.clone().unwrap_or_default();
+                        let steps = trajectory
+                            .into_iter()
+                            .map(|step| {
+                                crate::infrastructure::aegis_runtime_proto::TrajectoryStep {
+                                    tool_name: step.tool_name,
+                                    arguments_json: step.arguments_json,
+                                }
+                            })
+                            .collect();
+
+                        let req = crate::infrastructure::aegis_runtime_proto::StoreTrajectoryPatternRequest {
+                            task_signature,
+                            steps,
+                            success_score: score,
+                        };
+
+                        let cortex_clone = cortex.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cortex_clone.store_trajectory_pattern(req).await {
+                                tracing::warn!("Failed to store trajectory pattern in Cortex: {}", e);
+                            } else {
+                                tracing::info!("Successfully stored TrajectoryPattern in Cortex");
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
 }

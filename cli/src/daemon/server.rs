@@ -695,20 +695,58 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Build initial capabilities index
     tool_router.rebuild_index().await;
 
+    // Connect to the standalone Cortex service if configured (ADR-042).
+    // Absence of spec.cortex.grpc_url means memoryless mode — no error, no retry.
+    let cortex_grpc_url: Option<String> = config
+        .spec
+        .cortex
+        .as_ref()
+        .and_then(|c| c.grpc_url.as_ref())
+        .and_then(|url| resolve_env_value(url).ok());
+    let cortex_client: Option<
+        std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>,
+    > = match cortex_grpc_url {
+        Some(url) => {
+            match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await
+            {
+                Ok(client) => {
+                    tracing::info!(url = %url, "Connected to Cortex gRPC service");
+                    Some(std::sync::Arc::new(client))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        url = %url,
+                        error = %e,
+                        "Failed to connect to Cortex gRPC service; running in memoryless mode"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
+            None
+        }
+    };
+
     // Finally initialize ExecutionService now that ToolRouter is ready
-    let execution_service = Arc::new(
-        StandardExecutionService::new(
-            agent_service.clone(),
-            volume_service.clone(),
-            supervisor,
-            execution_repo.clone(),
-            event_bus.clone(),
-            Arc::new(config.clone()),
-        )
-        .with_nfs_gateway(nfs_gateway.clone())
-        .with_runtime_registry(runtime_registry) // No Arc::new needed per signature
-        .with_tool_router(tool_router.clone()),
-    );
+    let mut execution_service_builder = StandardExecutionService::new(
+        agent_service.clone(),
+        volume_service.clone(),
+        supervisor,
+        execution_repo.clone(),
+        event_bus.clone(),
+        Arc::new(config.clone()),
+    )
+    .with_nfs_gateway(nfs_gateway.clone())
+    .with_runtime_registry(runtime_registry) // No Arc::new needed per signature
+    .with_tool_router(tool_router.clone());
+
+    if let Some(c_client) = cortex_client.clone() {
+        execution_service_builder = execution_service_builder.with_cortex_client(c_client);
+    }
+
+    let execution_service = Arc::new(execution_service_builder);
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
     execution_service.set_child_execution_service(execution_service.clone());
 
@@ -904,40 +942,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             let _ = sec_repo.save(default_context).await;
         }
     });
-
-    // Connect to the standalone Cortex service if configured (ADR-042).
-    // Absence of spec.cortex.grpc_url means memoryless mode — no error, no retry.
-    let cortex_grpc_url: Option<String> = config
-        .spec
-        .cortex
-        .as_ref()
-        .and_then(|c| c.grpc_url.as_ref())
-        .and_then(|url| resolve_env_value(url).ok());
-    let cortex_client: Option<
-        std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>,
-    > = match cortex_grpc_url {
-        Some(url) => {
-            match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await
-            {
-                Ok(client) => {
-                    tracing::info!(url = %url, "Connected to Cortex gRPC service");
-                    Some(std::sync::Arc::new(client))
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        url = %url,
-                        error = %e,
-                        "Failed to connect to Cortex gRPC service; running in memoryless mode"
-                    );
-                    None
-                }
-            }
-        }
-        None => {
-            tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
-            None
-        }
-    };
 
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
@@ -1972,7 +1976,7 @@ async fn dispatch_gateway_handler(
         Ok(OrchestratorMessage::Final {
             content,
             tool_calls_executed,
-            ..
+            conversation,
         }) => {
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
@@ -2011,6 +2015,29 @@ async fn dispatch_gateway_handler(
                             interaction,
                         )
                         .await;
+
+                    // ADR-049: Extract tool trajectory from conversation and store it
+                    let mut trajectory = Vec::new();
+                    for msg in conversation {
+                        if let Some(calls) = msg.tool_calls {
+                            for call in calls {
+                                trajectory.push(aegis_orchestrator_core::domain::execution::TrajectoryStep {
+                                    tool_name: call.name.clone(),
+                                    arguments_json: serde_json::to_string(&call.arguments).unwrap_or_default(),
+                                });
+                            }
+                        }
+                    }
+                    if !trajectory.is_empty() {
+                        let _ = state
+                            .execution_service
+                            .store_iteration_trajectory(
+                                aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
+                                iteration_number,
+                                trajectory,
+                            )
+                            .await;
+                    }
                 }
             }
 
