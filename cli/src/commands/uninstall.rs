@@ -110,8 +110,27 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!();
     println!("{}", format!("Removing {}...", dir.display()).bold());
 
-    std::fs::remove_dir_all(&dir)
-        .map_err(|e| anyhow::anyhow!("Failed to remove {}: {}", dir.display(), e))?;
+    match std::fs::remove_dir_all(&dir) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            println!(
+                "  {} Permission denied while removing {}. Attempting automatic permission repair...",
+                "⚠".yellow(),
+                dir.display()
+            );
+            repair_permissions_for_removal(&dir)?;
+            std::fs::remove_dir_all(&dir).map_err(|retry_err| {
+                anyhow::anyhow!(
+                    "Failed to remove {} after permission repair: {}",
+                    dir.display(),
+                    retry_err
+                )
+            })?;
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("Failed to remove {}: {}", dir.display(), e));
+        }
+    }
 
     println!("  {} {} removed.", "✓".green(), dir.display());
 
@@ -133,4 +152,41 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+/// Best-effort permission repair for docker-created root-owned files.
+/// Uses a root container to recursively chmod the target directory.
+fn repair_permissions_for_removal(dir: &Path) -> Result<()> {
+    let mount_arg = format!("{}:/target", dir.display());
+    let status = std::process::Command::new("docker")
+        .args([
+            "run",
+            "--rm",
+            "-v",
+            &mount_arg,
+            "alpine:3.20",
+            "sh",
+            "-c",
+            "chmod -R a+rwx /target",
+        ])
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            println!(
+                "  {} Repaired permissions in {}",
+                "✓".green(),
+                dir.display()
+            );
+            Ok(())
+        }
+        Ok(s) => Err(anyhow::anyhow!(
+            "Permission repair container exited {}",
+            s.code().unwrap_or(-1)
+        )),
+        Err(e) => Err(anyhow::anyhow!(
+            "Failed to run docker permission repair: {}",
+            e
+        )),
+    }
 }

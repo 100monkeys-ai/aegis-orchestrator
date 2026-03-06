@@ -182,7 +182,7 @@ impl ConfigWizard {
                 r#"  llm_providers:
     - name: "local"
       type: "ollama"
-      endpoint: "http://localhost:11434"
+      endpoint: "http://ollama:11434"
       enabled: true
       models:
         - alias: "default"
@@ -368,7 +368,7 @@ impl ConfigWizard {
             r#"
   temporal:
     address: "temporal:7233"
-    worker_http_endpoint: "http://localhost:3000"
+    worker_http_endpoint: "http://temporal-worker:3000"
     worker_secret: "env:TEMPORAL_WORKER_SECRET"
     namespace: "default"
     task_queue: "aegis-agents"

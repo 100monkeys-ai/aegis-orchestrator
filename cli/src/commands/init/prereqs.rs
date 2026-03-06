@@ -2,8 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Prerequisite detection and installation step of `aegis init`.
 //!
-//! Checks for Docker, Docker Compose, and Ollama (when the llm profile is
-//! selected). On supported platforms it can auto-install missing tools via the
+//! Checks for Docker and Docker Compose. On supported platforms it can auto-install missing tools via the
 //! platform-native package manager; pass `manual = true` to skip auto-install
 //! and print instructions instead.
 //!
@@ -49,24 +48,17 @@ const PREREQS: &[Prereq] = &[
     },
 ];
 
-const OLLAMA_PREREQ: Prereq = Prereq {
-    binary: "ollama",
-    label: "Ollama",
-    auto_installable: true,
-    instructions: "Install Ollama from https://ollama.ai/download",
-};
-
 /// Prerequisite checker for the init wizard.
 pub struct PrereqChecker {
     manual: bool,
-    need_ollama: bool,
+    _need_ollama: bool,
 }
 
 impl PrereqChecker {
     pub fn new(manual: bool, need_ollama: bool) -> Self {
         Self {
             manual,
-            need_ollama,
+            _need_ollama: need_ollama,
         }
     }
 
@@ -74,10 +66,7 @@ impl PrereqChecker {
     /// any that are missing. Returns an error if any required prerequisite is
     /// still missing after the install attempt.
     pub async fn check_and_install(&self) -> Result<()> {
-        let mut prereqs: Vec<&Prereq> = PREREQS.iter().collect();
-        if self.need_ollama {
-            prereqs.push(&OLLAMA_PREREQ);
-        }
+        let prereqs: Vec<&Prereq> = PREREQS.iter().collect();
 
         let mut any_missing = false;
 
@@ -189,7 +178,6 @@ fn try_install(binary: &str) -> Result<()> {
 fn install_macos(binary: &str) -> Result<()> {
     let pkg = match binary {
         "docker" => "docker",
-        "ollama" => "ollama",
         other => bail!("No brew formula known for '{}'", other),
     };
     let status = std::process::Command::new("brew")
@@ -213,14 +201,6 @@ fn install_linux(binary: &str) -> Result<()> {
                 bail!("Docker convenience install script exited with {}", status);
             }
         }
-        "ollama" => {
-            let status = std::process::Command::new("sh")
-                .args(["-c", "curl -fsSL https://ollama.ai/install.sh | sh"])
-                .status()?;
-            if !status.success() {
-                bail!("Ollama install script exited with {}", status);
-            }
-        }
         other => bail!("No auto-install known for '{}' on Linux", other),
     }
     Ok(())
@@ -230,7 +210,6 @@ fn install_linux(binary: &str) -> Result<()> {
 fn install_windows(binary: &str) -> Result<()> {
     let pkg = match binary {
         "docker" => "Docker.DockerDesktop",
-        "ollama" => "Ollama.Ollama",
         other => bail!("No winget package known for '{}'", other),
     };
     let status = std::process::Command::new("winget")

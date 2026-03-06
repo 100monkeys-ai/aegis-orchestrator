@@ -89,7 +89,7 @@ impl ComponentSelector {
         // Default: temporal=true, storage=false, iam=false, llm=Ollama
         if self.yes {
             return Ok(SelectedComponents {
-                temporal: false,
+                temporal: true,
                 storage: false,
                 iam: false,
                 ollama_llm: true,
@@ -104,7 +104,7 @@ impl ComponentSelector {
             "Ollama (local LLM runtime — no API key needed)",
         ];
 
-        let defaults = vec![false, false, false, true];
+        let defaults = vec![true, false, false, true];
 
         let selections = MultiSelect::new()
             .with_prompt("Use SPACE to toggle, ENTER to confirm")

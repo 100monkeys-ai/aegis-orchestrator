@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
@@ -87,8 +88,52 @@ impl ComposeRunner {
     pub async fn pull_ollama_model(&self, model: &str) -> Result<()> {
         println!();
         println!("{} {}", "Pulling Ollama model:".bold(), model.bold().cyan());
-        self.run_compose(&["exec", "-T", "ollama", "ollama", "pull", model])?;
-        println!("  {} Ollama model pulled: {}", "✓".green(), model);
+
+        // Run quietly so Ollama's animated progress output does not corrupt
+        // subsequent wizard prompts and step output.
+        let status = Command::new("docker")
+            .arg("compose")
+            .args(["exec", "-T", "ollama", "ollama", "pull", model])
+            .current_dir(&self.dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .context("Failed to run `docker compose exec ollama ollama pull`")?;
+
+        if !status.success() {
+            bail!(
+                "Failed to pull Ollama model '{}' (exit {})",
+                model,
+                status.code().unwrap_or(-1)
+            );
+        }
+
+        // Ensure model is actually available before continuing.
+        let deadline = Instant::now() + Duration::from_secs(300);
+        loop {
+            let show_status = Command::new("docker")
+                .arg("compose")
+                .args(["exec", "-T", "ollama", "ollama", "show", model])
+                .current_dir(&self.dir)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .context("Failed to verify pulled Ollama model")?;
+
+            if show_status.success() {
+                break;
+            }
+
+            if Instant::now() >= deadline {
+                bail!(
+                    "Timed out waiting for Ollama model '{}' to become available",
+                    model
+                );
+            }
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        println!("  {} Ollama model ready: {}", "✓".green(), model);
         Ok(())
     }
 
