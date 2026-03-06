@@ -48,7 +48,7 @@ async fn create_attached_test_volume(
         StorageClass::persistent(),
         VolumeBackend::SeaweedFS {
             filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
-            remote_path: "/dummy".to_string(),
+            remote_path: "/volume-path".to_string(),
         },
         quota_bytes,
         VolumeOwnership::Execution { execution_id },
@@ -61,11 +61,11 @@ async fn create_attached_test_volume(
     volume_id
 }
 
-// Mock Storage Provider for testing
-struct MockStorageProvider;
+// Test Storage Provider for testing
+struct TestStorageProvider;
 
 #[async_trait]
-impl StorageProvider for MockStorageProvider {
+impl StorageProvider for TestStorageProvider {
     async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
         Ok(FileHandle(uuid::Uuid::new_v4().as_bytes().to_vec()))
     }
@@ -152,12 +152,12 @@ impl StorageProvider for MockStorageProvider {
     }
 }
 
-// Mock Volume Repository
-struct MockVolumeRepository {
+// Test Volume Repository
+struct TestVolumeRepository {
     volumes: Arc<tokio::sync::RwLock<Vec<Volume>>>,
 }
 
-impl MockVolumeRepository {
+impl TestVolumeRepository {
     fn new() -> Self {
         Self {
             volumes: Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -170,7 +170,7 @@ impl MockVolumeRepository {
 }
 
 #[async_trait]
-impl VolumeRepository for MockVolumeRepository {
+impl VolumeRepository for TestVolumeRepository {
     async fn save(&self, volume: &Volume) -> Result<(), RepositoryError> {
         self.add_volume(volume.clone()).await;
         Ok(())
@@ -205,9 +205,9 @@ impl VolumeRepository for MockVolumeRepository {
 
 #[tokio::test]
 async fn test_nfs_gateway_lifecycle() {
-    // Create mock dependencies
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    // Create test dependencies
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -244,9 +244,9 @@ async fn test_nfs_gateway_lifecycle() {
 
 #[tokio::test]
 async fn test_fsal_mode_validation() {
-    // Create FSAL with mock dependencies
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    // Create FSAL with test dependencies
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -280,9 +280,9 @@ async fn test_fsal_mode_validation() {
 
 #[tokio::test]
 async fn test_fsal_path_traversal_prevention() {
-    // Create FSAL with mock dependencies
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    // Create FSAL with test dependencies
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -324,9 +324,9 @@ async fn test_fsal_path_traversal_prevention() {
 
 #[tokio::test]
 async fn test_fsal_policy_enforcement() {
-    // Create FSAL with mock dependencies
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    // Create FSAL with test dependencies
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -381,8 +381,8 @@ async fn test_fsal_policy_enforcement() {
 #[tokio::test]
 async fn test_fsal_audit_events() {
     // Create FSAL with event bus
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -431,9 +431,9 @@ async fn test_fsal_audit_events() {
 
 #[tokio::test]
 async fn test_fsal_quota_enforcement() {
-    // Create FSAL with mock dependencies
-    let storage_provider = Arc::new(MockStorageProvider) as Arc<dyn StorageProvider>;
-    let volume_repository = Arc::new(MockVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    // Create FSAL with test dependencies
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
     let event_bus = Arc::new(EventBus::new(1000));
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
@@ -457,7 +457,7 @@ async fn test_fsal_quota_enforcement() {
     let handle =
         aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(execution_id, volume_id, path);
 
-    // MockStorageProvider.get_usage() returns 5120 bytes (5KB)
+    // TestStorageProvider.get_usage() returns 5120 bytes (5KB)
     // Volume quota is 1024 bytes (1KB)
     // Any write attempt should fail with QuotaExceeded
 
@@ -479,7 +479,8 @@ async fn test_fsal_quota_enforcement() {
             assert_eq!(available_bytes, 0); // Quota already exceeded (5120 > 1024)
         }
         other => {
-            panic!("Expected QuotaExceeded error, got: {:?}", other);
+            assert!(false, "Expected QuotaExceeded error, got: {:?}", other);
+            return;
         }
     }
 

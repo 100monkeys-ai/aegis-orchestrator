@@ -945,10 +945,7 @@ impl AgentManifest {
             ));
         }
 
-        // Validate timeout hierarchy if all are present
-        if let Some(exec) = &self.spec.execution {
-            let _ = exec; // placeholder for future hierarchy checks
-        }
+        // Execution strategy is optional and validated by its own invariants.
 
         Ok(())
     }

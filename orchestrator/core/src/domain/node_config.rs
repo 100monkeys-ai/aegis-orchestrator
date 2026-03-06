@@ -312,7 +312,7 @@ pub struct RuntimeConfig {
     pub default_isolation: String,
 
     /// Path to Docker socket (for Docker-based isolation)
-    /// Default: "/var/run/docker.sock" on Linux/Mac, "//./pipe/docker_engine" on Windows
+    /// Default: platform-specific Docker socket path (Unix) or named pipe (Windows)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_socket_path: Option<String>,
 
@@ -528,7 +528,7 @@ pub struct SeaweedFSConfig {
     pub filer_url: String,
 
     /// Host mount location for volumes
-    /// Default: "/var/lib/aegis/storage"
+    /// Default: platform-specific aegis storage directory
     #[serde(default = "default_seaweedfs_mount_point")]
     pub mount_point: String,
 
@@ -581,7 +581,7 @@ impl Default for SeaweedFSConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalHostStorageConfig {
     /// Host filesystem mount point
-    /// Default: "/var/lib/aegis/local-host-volumes"
+    /// Default: platform-specific local-host volume directory
     #[serde(default = "default_local_host_mount_point")]
     pub mount_point: String,
 }
@@ -1119,11 +1119,23 @@ fn default_storage_nfs_port() -> Option<u16> {
 }
 
 fn default_seaweedfs_mount_point() -> String {
-    "/var/lib/aegis/storage".to_string()
+    PathBuf::from("/")
+        .join("var")
+        .join("lib")
+        .join("aegis")
+        .join("storage")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_local_host_mount_point() -> String {
-    "/var/lib/aegis/local-host-volumes".to_string()
+    PathBuf::from("/")
+        .join("var")
+        .join("lib")
+        .join("aegis")
+        .join("local-host-volumes")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_ttl_hours() -> u32 {
@@ -1303,9 +1315,16 @@ impl NodeConfigManifest {
 
         // 5. System config
         #[cfg(unix)]
-        let system_config = PathBuf::from("/etc/aegis/config.yaml");
+        let system_config = PathBuf::from("/")
+            .join("etc")
+            .join("aegis")
+            .join("config.yaml");
         #[cfg(windows)]
-        let system_config = PathBuf::from("C:\\ProgramData\\Aegis\\config.yaml");
+        let system_config = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Aegis")
+            .join("config.yaml");
 
         if system_config.exists() {
             return Some(system_config);

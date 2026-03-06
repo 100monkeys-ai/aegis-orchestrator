@@ -68,8 +68,7 @@ pub struct ExecutionHierarchy {
 
 impl Default for ExecutionHierarchy {
     fn default() -> Self {
-        // Create a temporary execution ID for default
-        // This will be overridden when Execution is created
+        // Use a synthetic root ID for default initialization.
         let temp_id = ExecutionId::new();
         Self::root(temp_id)
     }

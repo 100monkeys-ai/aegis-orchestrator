@@ -1233,7 +1233,7 @@ mod tests {
     fn test_score_and_confidence_above_roundtrip() {
         // Ensure ScoreAndConfidenceAbove can be serialized/deserialized and is
         // distinct from ScoreAbove and ConfidenceAbove (regression guard for
-        // the TypeScript evaluateCondition dead-code bug fixed in this PR).
+        // a previously reported TypeScript evaluateCondition dead-code issue).
         let condition = TransitionCondition::ScoreAndConfidenceAbove { threshold: 0.85 };
         let json = serde_json::to_string(&condition).unwrap();
         assert!(

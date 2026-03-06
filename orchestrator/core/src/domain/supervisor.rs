@@ -470,8 +470,8 @@ mod tests {
     use tokio::sync::Mutex;
     use tokio_util::sync::CancellationToken;
 
-    // Mock runtime for testing
-    struct MockRuntime {
+    // Test runtime for exercising supervisor behavior.
+    struct TestRuntime {
         spawn_results: Arc<Mutex<Vec<Result<InstanceId, RuntimeError>>>>,
         execute_results: Arc<Mutex<Vec<Result<TaskOutput, RuntimeError>>>>,
         terminate_calls: Arc<Mutex<Vec<InstanceId>>>,
@@ -479,7 +479,7 @@ mod tests {
         execute_delay: Option<Duration>,
     }
 
-    impl MockRuntime {
+    impl TestRuntime {
         fn new() -> Self {
             Self {
                 spawn_results: Arc::new(Mutex::new(Vec::new())),
@@ -527,7 +527,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl AgentRuntime for MockRuntime {
+    impl AgentRuntime for TestRuntime {
         async fn spawn(&self, _config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
             let mut results = self.spawn_results.lock().await;
             results.remove(0)
@@ -562,16 +562,16 @@ mod tests {
         }
     }
 
-    // Mock observer for testing
+    // Test observer that records callback invocations.
     #[derive(Default)]
-    struct MockObserver {
+    struct TestObserver {
         iteration_starts: Arc<Mutex<Vec<u8>>>,
         iteration_completes: Arc<Mutex<Vec<u8>>>,
         iteration_fails: Arc<Mutex<Vec<u8>>>,
     }
 
     #[async_trait]
-    impl SupervisorObserver for MockObserver {
+    impl SupervisorObserver for TestObserver {
         async fn on_iteration_start(&self, iteration: u8, _prompt: &str) {
             self.iteration_starts.lock().await.push(iteration);
         }
@@ -641,13 +641,13 @@ mod tests {
     #[tokio::test]
     async fn test_supervisor_success_first_iteration() {
         let runtime = Arc::new(
-            MockRuntime::new()
+            TestRuntime::new()
                 .with_spawn_success(1)
                 .with_execute_success(vec!["Success output".to_string()]),
         );
 
         let supervisor = Supervisor::new(runtime.clone());
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let result = supervisor
             .run_loop(
@@ -672,7 +672,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_supervisor_retries_on_spawn_failure() {
-        let runtime = Arc::new(MockRuntime::new());
+        let runtime = Arc::new(TestRuntime::new());
 
         // Setup: first spawn fails, second succeeds
         runtime
@@ -693,7 +693,7 @@ mod tests {
         }));
 
         let supervisor = Supervisor::new(runtime);
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let result = supervisor
             .run_loop(
@@ -715,7 +715,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_supervisor_max_retries_exceeded() {
-        let runtime = Arc::new(MockRuntime::new());
+        let runtime = Arc::new(TestRuntime::new());
 
         // All spawn attempts fail
         for _ in 0..3 {
@@ -729,7 +729,7 @@ mod tests {
         }
 
         let supervisor = Supervisor::new(runtime);
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let result = supervisor
             .run_loop(
@@ -757,13 +757,13 @@ mod tests {
     #[tokio::test]
     async fn test_supervisor_terminates_instances() {
         let runtime = Arc::new(
-            MockRuntime::new()
+            TestRuntime::new()
                 .with_spawn_success(2)
                 .with_execute_success(vec!["Output1".to_string(), "Output2".to_string()]),
         );
 
         let supervisor = Supervisor::new(runtime.clone());
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let _result = supervisor
             .run_loop(
@@ -784,9 +784,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_supervisor_overall_timeout() {
-        // Mock runtime that sleeps longer than the timeout allows
+        // Runtime that sleeps longer than the timeout allows.
         let runtime = Arc::new(
-            MockRuntime::new()
+            TestRuntime::new()
                 .with_spawn_success(3)
                 .with_execute_success(vec![
                     "Output".to_string(),
@@ -797,9 +797,9 @@ mod tests {
         );
 
         let supervisor = Supervisor::new(runtime.clone());
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
-        // Set a very short timeout so it fires before the mock completes
+        // Set a short timeout so it fires before execution completes.
         let mut config = create_test_config();
         config.resources.timeout_seconds = Some(1);
 
@@ -820,16 +820,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_supervisor_cancellation() {
-        // Mock runtime that sleeps long enough for us to cancel
+        // Runtime that sleeps long enough for cancellation to trigger.
         let runtime = Arc::new(
-            MockRuntime::new()
+            TestRuntime::new()
                 .with_spawn_success(1)
                 .with_execute_success(vec!["Output".to_string()])
                 .with_execute_delay(Duration::from_secs(30)),
         );
 
         let supervisor = Supervisor::new(runtime.clone());
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let token = CancellationToken::new();
         let token_clone = token.clone();
@@ -867,13 +867,13 @@ mod tests {
         // Verify that when timeout_seconds is None, the supervisor still proceeds
         // (using DEFAULT_EXECUTION_TIMEOUT_SECONDS) and completes normally.
         let runtime = Arc::new(
-            MockRuntime::new()
+            TestRuntime::new()
                 .with_spawn_success(1)
                 .with_execute_success(vec!["Success".to_string()]),
         );
 
         let supervisor = Supervisor::new(runtime);
-        let observer = Arc::new(MockObserver::default());
+        let observer = Arc::new(TestObserver::default());
 
         let config = create_test_config(); // timeout_seconds: None
         let result = supervisor

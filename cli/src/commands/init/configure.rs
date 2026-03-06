@@ -11,7 +11,7 @@
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** configure step inside the `aegis init` wizard
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -369,12 +369,12 @@ AEGIS_KEEP_CONTAINER=false
 }
 
 /// Expand a leading `~` to the user's home directory.
-fn expand_tilde(path: &PathBuf) -> PathBuf {
+fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
     if s.starts_with('~') {
         if let Some(home) = dirs_next::home_dir() {
             return home.join(s.trim_start_matches("~/").trim_start_matches('~'));
         }
     }
-    path.clone()
+    path.to_path_buf()
 }

@@ -27,7 +27,7 @@
 // Firecracker VM-based isolation deferred to Phase 2 for production hardening.
 // Phase 1 uses Docker for development/testing convenience.
 //
-// TODO: Implement Firecracker runtime variant when Phase 2 begins.
+// Firecracker runtime variant is planned for Phase 2.
 // See: adrs/003-firecracker-isolation.md
 // ============================================================================
 

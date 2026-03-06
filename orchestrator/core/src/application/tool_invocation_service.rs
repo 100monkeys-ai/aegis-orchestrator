@@ -440,7 +440,7 @@ mod tests {
     use crate::domain::smcp_session::SmcpSession;
     use crate::infrastructure::repositories::InMemoryVolumeRepository;
     use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
-    use crate::infrastructure::storage::MockStorageProvider;
+    use crate::infrastructure::storage::LocalHostStorageProvider;
     use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
     use async_trait::async_trait;
 
@@ -451,9 +451,13 @@ mod tests {
         async fn publish_storage_event(&self, _event: StorageEvent) {}
     }
 
-    /// Create mock AegisFSAL + empty NfsVolumeRegistry for tests
-    fn mock_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
-        let storage = Arc::new(MockStorageProvider::new());
+    /// Create test FSAL dependencies and empty NFS volume registry.
+    fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
+        let storage_root = std::env::temp_dir().join("aegis-tool-invocation-tests");
+        let storage = Arc::new(
+            LocalHostStorageProvider::new(&storage_root)
+                .expect("failed to initialize LocalHostStorageProvider for tests"),
+        );
         let vol_repo = Arc::new(InMemoryVolumeRepository::new());
         let publisher = Arc::new(NoOpEventPublisher);
         let fsal = Arc::new(AegisFSAL::new(storage, vol_repo, publisher));
@@ -490,34 +494,34 @@ mod tests {
     use futures::Stream;
     use std::pin::Pin;
 
-    struct MockAgentLifecycleService;
+    struct TestAgentLifecycleService;
     #[async_trait]
-    impl AgentLifecycleService for MockAgentLifecycleService {
+    impl AgentLifecycleService for TestAgentLifecycleService {
         async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
-            anyhow::bail!("MockAgentLifecycleService::deploy_agent not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::deploy_agent not exercised in this test")
         }
         async fn get_agent(&self, _: AgentId) -> Result<Agent> {
-            anyhow::bail!("MockAgentLifecycleService::get_agent not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::get_agent not exercised in this test")
         }
         async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
-            anyhow::bail!("MockAgentLifecycleService::update_agent not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::update_agent not exercised in this test")
         }
         async fn delete_agent(&self, _: AgentId) -> Result<()> {
-            anyhow::bail!("MockAgentLifecycleService::delete_agent not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::delete_agent not exercised in this test")
         }
         async fn list_agents(&self) -> Result<Vec<Agent>> {
-            anyhow::bail!("MockAgentLifecycleService::list_agents not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::list_agents not exercised in this test")
         }
         async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
-            anyhow::bail!("MockAgentLifecycleService::lookup_agent not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
         }
     }
 
-    struct MockExecutionService;
+    struct TestExecutionService;
     #[async_trait]
-    impl ExecutionService for MockExecutionService {
+    impl ExecutionService for TestExecutionService {
         async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
-            anyhow::bail!("MockExecutionService::start_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
         }
         async fn start_child_execution(
             &self,
@@ -525,34 +529,34 @@ mod tests {
             _: ExecutionInput,
             _: ExecutionId,
         ) -> Result<ExecutionId> {
-            anyhow::bail!("MockExecutionService::start_child_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::start_child_execution not exercised in this test")
         }
         async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
-            anyhow::bail!("MockExecutionService::get_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::get_execution not exercised in this test")
         }
         async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
-            anyhow::bail!("MockExecutionService::get_iterations not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::get_iterations not exercised in this test")
         }
         async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
-            anyhow::bail!("MockExecutionService::cancel_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::cancel_execution not exercised in this test")
         }
         async fn stream_execution(
             &self,
             _: ExecutionId,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
-            anyhow::bail!("MockExecutionService::stream_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::stream_execution not exercised in this test")
         }
         async fn stream_agent_events(
             &self,
             _: AgentId,
         ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
-            anyhow::bail!("MockExecutionService::stream_agent_events not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::stream_agent_events not exercised in this test")
         }
         async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
-            anyhow::bail!("MockExecutionService::list_executions not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::list_executions not exercised in this test")
         }
         async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
-            anyhow::bail!("MockExecutionService::delete_execution not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::delete_execution not exercised in this test")
         }
         async fn record_llm_interaction(
             &self,
@@ -560,7 +564,7 @@ mod tests {
             _: u8,
             _: crate::domain::execution::LlmInteraction,
         ) -> Result<()> {
-            anyhow::bail!("MockExecutionService::record_llm_interaction not exercised in this test — add mock logic if needed")
+            anyhow::bail!("TestExecutionService::record_llm_interaction not exercised in this test")
         }
         async fn store_iteration_trajectory(
             &self,
@@ -568,7 +572,9 @@ mod tests {
             _: u8,
             _: Vec<crate::domain::execution::TrajectoryStep>,
         ) -> Result<()> {
-            anyhow::bail!("MockExecutionService::store_iteration_trajectory not exercised in this test — add mock logic if needed")
+            anyhow::bail!(
+                "TestExecutionService::store_iteration_trajectory not exercised in this test"
+            )
         }
     }
 
@@ -584,7 +590,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -592,8 +598,8 @@ mod tests {
             router,
             fsal,
             volume_registry,
-            Arc::new(MockAgentLifecycleService),
-            Arc::new(MockExecutionService),
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let agent_id = AgentId::new();
@@ -633,7 +639,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -641,8 +647,8 @@ mod tests {
             router,
             fsal,
             volume_registry,
-            Arc::new(MockAgentLifecycleService),
-            Arc::new(MockExecutionService),
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let envelope = DummyEnvelope { valid: false };
@@ -708,7 +714,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -716,8 +722,8 @@ mod tests {
             router.clone(),
             fsal,
             volume_registry,
-            Arc::new(MockAgentLifecycleService),
-            Arc::new(MockExecutionService),
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
 

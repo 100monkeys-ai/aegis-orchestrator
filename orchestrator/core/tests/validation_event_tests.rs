@@ -152,7 +152,7 @@ impl ExecutionService for MockExecutionService {
 
 // If the Execution struct stores iterations internally and we can't populate them via constructor,
 // then MockExecutionService::get_execution needs to return an Execution with iterations.
-// Let's assume Execution has a way to add iterations or we can mock it differently?
+// Let's assume Execution has a way to add iterations or we can represent it differently?
 // Or maybe we can rely on `get_iterations` being called?
 // No, `run_judge` calls `exec.iterations().last()`.
 // If `Execution` struct manages iterations, we need to populate them.
@@ -205,7 +205,12 @@ async fn test_validation_event_streaming() {
         ..
     }) = event1
     else {
-        panic!("Expected GradientValidationPerformed, got {:?}", event1);
+        assert!(
+            false,
+            "Expected GradientValidationPerformed, got {:?}",
+            event1
+        );
+        return;
     };
     assert_eq!(eid, execution_id);
     assert_eq!(score, 0.95);
@@ -222,7 +227,8 @@ async fn test_validation_event_streaming() {
         ..
     }) = event2
     else {
-        panic!("Expected MultiJudgeConsensus, got {:?}", event2);
+        assert!(false, "Expected MultiJudgeConsensus, got {:?}", event2);
+        return;
     };
     assert_eq!(eid, execution_id);
     // Consensus of one judge with 0.95 and high confidence should be close to 0.95

@@ -85,11 +85,11 @@ impl ComposeRunner {
         // Read stdout in this thread
         let stdout_lines: Vec<String> = BufReader::new(stdout)
             .lines()
-            .filter_map(|l| l.ok())
+            .map_while(Result::ok)
             .collect();
 
         // Read stderr
-        for line in BufReader::new(stderr).lines().filter_map(|l| l.ok()) {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             if !line.trim().is_empty() {
                 last_stderr = line.clone();
                 spinner.set_message(line.clone());

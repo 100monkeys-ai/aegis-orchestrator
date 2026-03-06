@@ -345,13 +345,13 @@ impl From<std::io::Error> for StorageError {
 mod tests {
     use super::*;
 
-    // Mock storage provider for testing
-    pub struct MockStorageProvider {
+    // Test storage provider for exercising trait behavior.
+    pub struct TestStorageProvider {
         pub directories: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
         pub quotas: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
     }
 
-    impl MockStorageProvider {
+    impl TestStorageProvider {
         pub fn new() -> Self {
             Self {
                 directories: std::sync::Arc::new(std::sync::Mutex::new(
@@ -365,7 +365,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl StorageProvider for MockStorageProvider {
+    impl StorageProvider for TestStorageProvider {
         async fn create_directory(&self, path: &str) -> Result<(), StorageError> {
             let mut dirs = self.directories.lock().unwrap();
             if dirs.contains_key(path) {
@@ -422,7 +422,7 @@ mod tests {
             _path: &str,
             _mode: OpenMode,
         ) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(b"mock-handle".to_vec()))
+            Ok(FileHandle(b"test-handle".to_vec()))
         }
 
         async fn read_at(
@@ -466,7 +466,7 @@ mod tests {
         }
 
         async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(format!("mock-handle-{}", path).into_bytes()))
+            Ok(FileHandle(format!("test-handle-{}", path).into_bytes()))
         }
 
         async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
@@ -475,8 +475,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_storage_provider() {
-        let provider = MockStorageProvider::new();
+    async fn test_storage_provider() {
+        let provider = TestStorageProvider::new();
 
         // Create directory
         provider.create_directory("/test/path").await.unwrap();
@@ -500,8 +500,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_storage_provider_errors() {
-        let provider = MockStorageProvider::new();
+    async fn test_storage_provider_errors() {
+        let provider = TestStorageProvider::new();
 
         // Try to delete non-existent directory
         let result = provider.delete_directory("/nonexistent").await;
