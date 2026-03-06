@@ -16,6 +16,7 @@ use crate::infrastructure::tool_router::ToolRouter;
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
+use crate::application::ports::ExternalWebToolPort;
 use crate::domain::execution::ExecutionInput;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::validation::extract_json_from_text;
@@ -39,6 +40,8 @@ pub struct ToolInvocationService {
     agent_lifecycle: Arc<dyn AgentLifecycleService>,
     /// Execution service for spawning inner-loop judges
     execution_service: Arc<dyn ExecutionService>,
+    /// Adapter for external web tools (Path 2).
+    web_tool_port: Arc<dyn ExternalWebToolPort>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -52,6 +55,7 @@ impl ToolInvocationService {
         volume_registry: NfsVolumeRegistry,
         agent_lifecycle: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
+        web_tool_port: Arc<dyn ExternalWebToolPort>,
     ) -> Self {
         Self {
             smcp_session_repo,
@@ -62,6 +66,7 @@ impl ToolInvocationService {
             volume_registry,
             agent_lifecycle,
             execution_service,
+            web_tool_port,
         }
     }
 
@@ -358,6 +363,7 @@ impl ToolInvocationService {
             execution_id,
             &self.fsal,
             &self.volume_registry,
+            &self.web_tool_port,
         )
         .await
         {
@@ -592,6 +598,7 @@ mod tests {
             volume_registry,
             Arc::new(MockAgentLifecycleService),
             Arc::new(MockExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let agent_id = AgentId::new();
         let envelope = DummyEnvelope { valid: true };
@@ -640,6 +647,7 @@ mod tests {
             volume_registry,
             Arc::new(MockAgentLifecycleService),
             Arc::new(MockExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let envelope = DummyEnvelope { valid: false };
 
@@ -714,6 +722,7 @@ mod tests {
             volume_registry,
             Arc::new(MockAgentLifecycleService),
             Arc::new(MockExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
 
         // 1. Local Tool

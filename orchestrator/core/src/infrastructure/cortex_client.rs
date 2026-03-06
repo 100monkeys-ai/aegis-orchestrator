@@ -25,6 +25,8 @@
 //! - **Purpose:** gRPC proxy to standalone Cortex service
 //! - **Related ADRs:** ADR-042 (Separate Cortex Repository)
 
+use crate::application::ports::{CortexPatternPort, StoreTrajectoryPatternCommand};
+use async_trait::async_trait;
 use tonic::transport::Channel;
 use tonic::Status;
 
@@ -81,5 +83,33 @@ impl CortexGrpcClient {
         let mut client = self.client.clone();
         let response = client.store_trajectory_pattern(request).await?;
         Ok(response.into_inner())
+    }
+}
+
+#[async_trait]
+impl CortexPatternPort for CortexGrpcClient {
+    async fn store_trajectory_pattern(
+        &self,
+        request: StoreTrajectoryPatternCommand,
+    ) -> anyhow::Result<()> {
+        let proto_request = StoreTrajectoryPatternRequest {
+            task_signature: request.task_signature,
+            steps: request
+                .steps
+                .into_iter()
+                .map(
+                    |s| crate::infrastructure::aegis_runtime_proto::TrajectoryStep {
+                        tool_name: s.tool_name,
+                        arguments_json: s.arguments_json,
+                    },
+                )
+                .collect(),
+            success_score: request.success_score,
+        };
+
+        CortexGrpcClient::store_trajectory_pattern(self, proto_request)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 }

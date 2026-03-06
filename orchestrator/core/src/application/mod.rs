@@ -44,6 +44,7 @@ pub mod tools;
 pub mod validation_service;
 
 pub mod policy;
+pub mod ports;
 // pub mod workflow_engine; Removed during Temporal integration
 pub mod complete_workflow_execution;
 pub mod inner_loop_service;

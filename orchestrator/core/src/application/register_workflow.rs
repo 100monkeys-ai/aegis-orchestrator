@@ -36,9 +36,9 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for register workflow
 
+use crate::application::ports::WorkflowEnginePort;
 use crate::domain::repository::WorkflowRepository;
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::temporal_client::TemporalClient;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -80,19 +80,19 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
 /// Standard implementation of RegisterWorkflowUseCase
 pub struct StandardRegisterWorkflowUseCase {
     workflow_repository: Arc<dyn WorkflowRepository>,
-    temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+    workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
     event_bus: Arc<EventBus>,
 }
 
 impl StandardRegisterWorkflowUseCase {
     pub fn new(
         workflow_repository: Arc<dyn WorkflowRepository>,
-        temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+        workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
         event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             workflow_repository,
-            temporal_client,
+            workflow_engine,
             event_bus,
         }
     }
@@ -123,14 +123,14 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .context("Failed to map workflow to Temporal definition")?;
 
         // Step 3: Register with Temporal via HTTP to TypeScript worker
-        let client = {
-            let lock = self.temporal_client.read().await;
+        let engine = {
+            let lock = self.workflow_engine.read().await;
             lock.clone()
-                .ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
+                .ok_or_else(|| anyhow::anyhow!("Workflow engine not connected yet"))?
         };
 
-        client
-            .register_temporal_workflow(&temporal_definition)
+        engine
+            .register_workflow(&temporal_definition)
             .await
             .context("Failed to register workflow with Temporal server")?;
 

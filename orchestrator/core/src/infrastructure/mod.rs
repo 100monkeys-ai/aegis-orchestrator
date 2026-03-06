@@ -58,6 +58,7 @@ pub mod temporal_client;
 pub mod temporal_event_listener;
 pub mod temporal_proto;
 pub mod tool_router;
+pub mod web_tools;
 pub mod workflow_parser;
 
 pub use cortex_client::CortexGrpcClient;

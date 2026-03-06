@@ -32,6 +32,9 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::nfs_gateway::NfsGatewayService;
+use crate::application::ports::{
+    CortexPatternPort, StoreTrajectoryPatternCommand, TrajectoryStepCommand,
+};
 use crate::application::validation_service::build_validation_pipeline;
 use crate::application::volume_manager::VolumeService;
 use crate::domain::agent::AgentId;
@@ -200,8 +203,8 @@ pub struct StandardExecutionService {
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
-    /// Optional CortexClient to upload learned trajectories (ADR-049).
-    cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
+    /// Optional Cortex integration port to upload learned trajectories (ADR-049).
+    cortex_client: Option<Arc<dyn CortexPatternPort>>,
 }
 
 impl StandardExecutionService {
@@ -270,11 +273,8 @@ impl StandardExecutionService {
         self
     }
 
-    /// Attach a CortexClient for Trajectory Consolidation (ADR-049).
-    pub fn with_cortex_client(
-        mut self,
-        cortex_client: Arc<crate::infrastructure::CortexGrpcClient>,
-    ) -> Self {
+    /// Attach a Cortex port for Trajectory Consolidation (ADR-049).
+    pub fn with_cortex_client(mut self, cortex_client: Arc<dyn CortexPatternPort>) -> Self {
         self.cortex_client = Some(cortex_client);
         self
     }
@@ -1490,7 +1490,7 @@ impl ExecutionService for StandardExecutionService {
 
 impl StandardExecutionService {
     fn store_trajectory_in_cortex(
-        cortex_client_opt: &Option<Arc<crate::infrastructure::cortex_client::CortexGrpcClient>>,
+        cortex_client_opt: &Option<Arc<dyn CortexPatternPort>>,
         exec: &Execution,
     ) {
         if let Some(cortex) = cortex_client_opt {
@@ -1507,15 +1507,13 @@ impl StandardExecutionService {
                         let task_signature = exec.input.intent.clone().unwrap_or_default();
                         let steps = trajectory
                             .into_iter()
-                            .map(|step| {
-                                crate::infrastructure::aegis_runtime_proto::TrajectoryStep {
-                                    tool_name: step.tool_name,
-                                    arguments_json: step.arguments_json,
-                                }
+                            .map(|step| TrajectoryStepCommand {
+                                tool_name: step.tool_name,
+                                arguments_json: step.arguments_json,
                             })
                             .collect();
 
-                        let req = crate::infrastructure::aegis_runtime_proto::StoreTrajectoryPatternRequest {
+                        let req = StoreTrajectoryPatternCommand {
                             task_signature,
                             steps,
                             success_score: score,

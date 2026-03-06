@@ -563,9 +563,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         temporal_address
     );
 
-    // Create a shared container for the client that relies on interior mutability
-    let temporal_client_container = Arc::new(tokio::sync::RwLock::new(None));
+    // Create shared containers for the concrete Temporal client and the workflow engine port.
+    let temporal_client_container: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
+        >,
+    > = Arc::new(tokio::sync::RwLock::new(None));
+    let workflow_engine_container: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<dyn aegis_orchestrator_core::application::ports::WorkflowEnginePort>>,
+        >,
+    > = Arc::new(tokio::sync::RwLock::new(None));
     let temporal_client_container_clone = temporal_client_container.clone();
+    let workflow_engine_container_clone = workflow_engine_container.clone();
 
     // Clone for async task
     let temporal_address_clone = temporal_address.clone();
@@ -587,8 +597,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             {
                 Ok(client) => {
                     println!("Async: Temporal Client connected successfully.");
+                    let client = Arc::new(client);
                     let mut lock = temporal_client_container_clone.write().await;
-                    *lock = Some(Arc::new(client));
+                    *lock = Some(client.clone());
+                    drop(lock);
+
+                    let mut workflow_lock = workflow_engine_container_clone.write().await;
+                    *workflow_lock = Some(
+                        client
+                            as Arc<
+                                dyn aegis_orchestrator_core::application::ports::WorkflowEnginePort,
+                            >,
+                    );
                     break;
                 }
                 Err(e) => {
@@ -770,14 +790,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
         workflow_repo.clone(),
-        temporal_client_container.clone(),
+        workflow_engine_container.clone(),
         event_bus.clone(),
     ));
 
     let start_workflow_execution_use_case = Arc::new(StandardStartWorkflowExecutionUseCase::new(
         workflow_repo.clone(),
         workflow_execution_repo.clone(),
-        temporal_client_container.clone(),
+        workflow_engine_container.clone(),
         event_bus.clone(),
     ));
 
@@ -925,6 +945,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             nfs_gateway.volume_registry().clone(),
             agent_service.clone(),
             execution_service.clone(),
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
+            ),
         ),
     );
 

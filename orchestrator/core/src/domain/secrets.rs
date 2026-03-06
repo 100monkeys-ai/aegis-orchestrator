@@ -16,10 +16,12 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use thiserror::Error;
 
 // ---------------------------------------------------------------------------
 // SensitiveString — credential wrapper that prevents accidental logging
@@ -183,6 +185,90 @@ pub struct DomainDynamicSecret {
     pub renewable: bool,
     /// Monotonic clock time at which this secret was created locally.
     pub created_at: Instant,
+}
+
+// ---------------------------------------------------------------------------
+// SecretStore Port + Error
+// ---------------------------------------------------------------------------
+
+/// Errors for Secrets & Identity operations (BC-11).
+#[derive(Debug, Error)]
+pub enum SecretsError {
+    #[error("Secret not found: {path}")]
+    SecretNotFound { path: String },
+
+    #[error("Secret store connection error: {0}")]
+    ConnectionError(String),
+
+    #[error("Invalid secret path: {0}")]
+    InvalidPath(String),
+
+    #[error("Invalid configuration: {0}")]
+    ConfigError(String),
+
+    #[error("Dynamic secret error: {0}")]
+    DynamicSecretError(String),
+
+    #[error("Transit operation error: {0}")]
+    TransitError(String),
+
+    #[error("Credential resolution error: {0}")]
+    CredentialResolutionError(String),
+}
+
+/// Domain/application-owned secret storage abstraction (ADR-034).
+///
+/// Implementations in infrastructure map these calls to concrete backends
+/// such as OpenBao (`OpenBaoSecretStore`) or in-memory test doubles.
+#[async_trait]
+pub trait SecretStore: Send + Sync {
+    async fn read(
+        &self,
+        engine: &str,
+        path: &str,
+    ) -> Result<HashMap<String, SensitiveString>, SecretsError>;
+
+    async fn write(
+        &self,
+        engine: &str,
+        path: &str,
+        secret: HashMap<String, SensitiveString>,
+    ) -> Result<(), SecretsError>;
+
+    async fn generate_dynamic(
+        &self,
+        engine: &str,
+        role: &str,
+    ) -> Result<DomainDynamicSecret, SecretsError>;
+
+    async fn renew_lease(
+        &self,
+        lease_id: &str,
+        increment: Duration,
+    ) -> Result<Duration, SecretsError>;
+
+    async fn revoke_lease(&self, lease_id: &str) -> Result<(), SecretsError>;
+
+    async fn transit_sign(&self, key_name: &str, data: &[u8]) -> Result<String, SecretsError>;
+
+    async fn transit_verify(
+        &self,
+        key_name: &str,
+        data: &[u8],
+        signature: &str,
+    ) -> Result<bool, SecretsError>;
+
+    async fn transit_encrypt(
+        &self,
+        key_name: &str,
+        plaintext: &[u8],
+    ) -> Result<String, SecretsError>;
+
+    async fn transit_decrypt(
+        &self,
+        key_name: &str,
+        ciphertext: &str,
+    ) -> Result<Vec<u8>, SecretsError>;
 }
 
 impl DomainDynamicSecret {
