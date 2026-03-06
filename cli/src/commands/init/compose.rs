@@ -15,6 +15,8 @@
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{bail, Context, Result};
 use colored::Colorize;
@@ -76,32 +78,41 @@ impl ComposeRunner {
             .spawn()
             .context("Failed to spawn `docker compose` — is Docker installed?")?;
 
-        // Drain stdout
         let stdout = child.stdout.take().unwrap();
         let stderr = child.stderr.take().unwrap();
 
-        let mut last_stderr = String::new();
+        // Shared last-seen stderr line for the error message on failure.
+        let last_stderr: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
 
-        // Read stdout in this thread
-        let stdout_lines: Vec<String> = BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-            .collect();
-
-        // Read stderr
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-            if !line.trim().is_empty() {
-                last_stderr = line.clone();
-                spinner.set_message(line.clone());
+        // Drain stdout on a background thread, updating the spinner in real-time.
+        let spinner_stdout = spinner.clone();
+        let stdout_thread = thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    spinner_stdout.set_message(trimmed);
+                }
             }
-        }
+        });
 
-        // Also update spinner from stdout
-        for line in &stdout_lines {
-            if !line.trim().is_empty() {
-                spinner.set_message(line.clone());
+        // Drain stderr on a background thread — same real-time spinner updates
+        // and capture of the last line for error reporting.
+        let spinner_stderr = spinner.clone();
+        let last_stderr_clone = Arc::clone(&last_stderr);
+        let stderr_thread = thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let trimmed = line.trim().to_string();
+                if !trimmed.is_empty() {
+                    spinner_stderr.set_message(trimmed.clone());
+                    *last_stderr_clone.lock().unwrap() = trimmed;
+                }
             }
-        }
+        });
+
+        // Wait for both reader threads before waiting on the child process,
+        // so we never block with a full pipe buffer.
+        stdout_thread.join().ok();
+        stderr_thread.join().ok();
 
         let status = child
             .wait()
@@ -109,11 +120,12 @@ impl ComposeRunner {
         spinner.finish_and_clear();
 
         if !status.success() {
+            let msg = last_stderr.lock().unwrap().clone();
             bail!(
                 "`docker compose {}` failed (exit {}): {}",
                 args.join(" "),
                 status.code().unwrap_or(-1),
-                last_stderr
+                msg
             );
         }
 
