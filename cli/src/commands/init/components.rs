@@ -22,8 +22,10 @@ pub struct SelectedComponents {
     pub temporal: bool,
     /// SeaweedFS distributed storage (master, volume, filer, webdav)
     pub storage: bool,
-    /// Keycloak (OIDC IAM) + OpenBao (secrets management)
+    /// Keycloak (OIDC IAM)
     pub iam: bool,
+    /// OpenBao (secrets management)
+    pub secrets: bool,
     /// Local Ollama LLM runtime
     pub ollama_llm: bool,
     /// LLM backend choice
@@ -57,6 +59,9 @@ impl SelectedComponents {
         if self.iam {
             profiles.push("iam");
         }
+        if self.secrets {
+            profiles.push("secrets");
+        }
         if self.ollama_llm {
             profiles.push("llm");
         }
@@ -86,12 +91,13 @@ impl ComponentSelector {
         );
         println!();
 
-        // Default: temporal=true, storage=false, iam=false, llm=Ollama
+        // Default: temporal=true, storage=false, iam=false, secrets=false, llm=Ollama
         if self.yes {
             return Ok(SelectedComponents {
                 temporal: true,
                 storage: false,
                 iam: false,
+                secrets: false,
                 ollama_llm: true,
                 llm: LlmChoice::Ollama,
             });
@@ -100,11 +106,12 @@ impl ComponentSelector {
         let items = vec![
             "Temporal (workflow engine, UI, and worker)  [recommended for workflows]",
             "SeaweedFS (distributed storage for agent volumes)",
-            "IAM (Keycloak OIDC + OpenBao secrets)       [needed for multi-user / Zaru]",
+            "IAM (Keycloak OIDC identity provider)        [needed for multi-user / Zaru]",
+            "Secrets (OpenBao secrets backend)            [needed for secret manager integration]",
             "Ollama (local LLM runtime — no API key needed)",
         ];
 
-        let defaults = vec![true, false, false, true];
+        let defaults = vec![true, false, false, false, true];
 
         let selections = MultiSelect::new()
             .with_prompt("Use SPACE to toggle, ENTER to confirm")
@@ -115,7 +122,8 @@ impl ComponentSelector {
         let temporal = selections.contains(&0);
         let storage = selections.contains(&1);
         let iam = selections.contains(&2);
-        let ollama_llm = selections.contains(&3);
+        let secrets = selections.contains(&3);
+        let ollama_llm = selections.contains(&4);
 
         // If Ollama was not selected, ask which cloud LLM to use
         let llm = if ollama_llm {
@@ -150,9 +158,14 @@ impl ComponentSelector {
                 "  · SeaweedFS (skipped)"
             },
             if iam {
-                "  ✓ Keycloak + OpenBao"
+                "  ✓ Keycloak (IAM)"
             } else {
                 "  · IAM (skipped)"
+            },
+            if secrets {
+                "  ✓ OpenBao (Secrets)"
+            } else {
+                "  · Secrets (skipped)"
             },
             match &llm {
                 LlmChoice::Ollama => "  ✓ Ollama (local)",
@@ -171,6 +184,7 @@ impl ComponentSelector {
             temporal,
             storage,
             iam,
+            secrets,
             ollama_llm,
             llm,
         })

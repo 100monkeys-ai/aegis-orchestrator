@@ -198,6 +198,8 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
     }
     if components.iam {
         println!("  {}  http://localhost:8180", "Keycloak".bold());
+    }
+    if components.secrets {
         println!("  {}    http://localhost:8200", "OpenBao".bold());
     }
     if components.storage {

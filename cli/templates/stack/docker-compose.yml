@@ -175,7 +175,7 @@ services:
   openbao:
     image: openbao/openbao:latest
     container_name: aegis-openbao
-    profiles: [iam]
+    profiles: [secrets]
     ports:
       - "8200:8200"
     environment:
@@ -334,34 +334,6 @@ services:
     networks:
       - aegis-network
     restart: unless-stopped
-
-  # One-shot service: registers built-in workflow manifests (e.g. The Forge) on
-  # every stack startup.  Uses the temporal-worker's HTTP /register-workflow
-  # endpoint (port 3000).  Set restart:no so it runs exactly once per `up`.
-  workflow-seeder:
-    image: curlimages/curl:latest
-    container_name: aegis-workflow-seeder
-    profiles: [temporal]
-    depends_on:
-      temporal-worker:
-        condition: service_started
-      aegis-runtime:
-        condition: service_healthy
-    volumes:
-      - ../agents/workflows:/workflows:ro
-    # Wait for temporal-worker HTTP port to accept connections before posting.
-    command:
-      - sh
-      - -ec
-      - |
-        echo 'Waiting for temporal-worker HTTP API...' &&
-        until curl -sf http://temporal-worker:3000/health > /dev/null; do sleep 2; done &&
-        echo 'Registering The Forge workflow...' &&
-        curl -sf -X POST http://temporal-worker:3000/register-workflow -H 'Content-Type: application/x-yaml' --data-binary @/workflows/the-forge.yaml &&
-        echo 'The Forge workflow registered successfully'
-    networks:
-      - aegis-network
-    restart: "no"
 
 networks:
   aegis-network:

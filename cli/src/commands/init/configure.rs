@@ -150,7 +150,9 @@ impl ConfigWizard {
             }
         };
 
-        let advanced = self.collect_advanced_config()?;
+        let mut advanced = self.collect_advanced_config()?;
+        self.collect_iam_config(components, &mut advanced)?;
+        self.collect_secrets_config(components, &mut advanced)?;
 
         let node_config = NodeConfig {
             node_name,
@@ -292,15 +294,8 @@ impl ConfigWizard {
                 .with_prompt("AEGIS_NFS_HOST")
                 .default(defaults.nfs_host.clone())
                 .interact_text()?,
-            keycloak_admin_password: Password::new()
-                .with_prompt("KEYCLOAK_ADMIN_PASSWORD")
-                .with_confirmation("Confirm KEYCLOAK_ADMIN_PASSWORD", "Passwords mismatch")
-                .allow_empty_password(true)
-                .interact()?,
-            openbao_secret_id: Input::new()
-                .with_prompt("OPENBAO_SECRET_ID")
-                .default(defaults.openbao_secret_id.clone())
-                .interact_text()?,
+            keycloak_admin_password: defaults.keycloak_admin_password.clone(),
+            openbao_secret_id: defaults.openbao_secret_id.clone(),
             database_url: Input::new()
                 .with_prompt("AEGIS_DATABASE_URL")
                 .default(defaults.database_url.clone())
@@ -398,6 +393,53 @@ impl ConfigWizard {
                 defaults.gemini_judge_model.clone()
             },
         })
+    }
+
+    /// Collect IAM-specific settings whenever IAM profile is enabled so users
+    /// can configure Keycloak without needing advanced mode.
+    fn collect_iam_config(
+        &self,
+        components: &SelectedComponents,
+        advanced: &mut AdvancedConfig,
+    ) -> Result<()> {
+        if self.yes || !components.iam {
+            return Ok(());
+        }
+
+        println!();
+        println!("{}", "IAM configuration (Keycloak):".bold());
+
+        let keycloak_password: String = Password::new()
+            .with_prompt("KEYCLOAK_ADMIN_PASSWORD (blank to keep default 'admin')")
+            .allow_empty_password(true)
+            .interact()?;
+        if !keycloak_password.is_empty() {
+            advanced.keycloak_admin_password = keycloak_password;
+        }
+
+        Ok(())
+    }
+
+    /// Collect secrets-backend settings whenever OpenBao profile is enabled so
+    /// users can configure secrets independently from IAM.
+    fn collect_secrets_config(
+        &self,
+        components: &SelectedComponents,
+        advanced: &mut AdvancedConfig,
+    ) -> Result<()> {
+        if self.yes || !components.secrets {
+            return Ok(());
+        }
+
+        println!();
+        println!("{}", "Secrets configuration (OpenBao):".bold());
+
+        advanced.openbao_secret_id = Input::new()
+            .with_prompt("OPENBAO_SECRET_ID")
+            .default(advanced.openbao_secret_id.clone())
+            .interact_text()?;
+
+        Ok(())
     }
 
     /// Render the `aegis-config.yaml` content from collected inputs.
@@ -807,7 +849,7 @@ spec:
 
 # ─── Compose Profiles ─────────────────────────────────────────────────────────
 # Controls which optional services are started.
-# Profiles: core (always), temporal, storage, iam, llm
+# Profiles: core (always), temporal, storage, iam, secrets, llm
 COMPOSE_PROFILES={profiles}
 
 # ─── LLM Provider ─────────────────────────────────────────────────────────────
