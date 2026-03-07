@@ -73,7 +73,7 @@ opendal = "0.52.0"
 vaultrs = "0.7"
 
 # Secrets Manager (ADR-034)
-lru = "0.12"
+lru = "0.16"
 
 [dev-dependencies]
 tokio-test = "0.4"
