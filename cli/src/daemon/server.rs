@@ -2055,10 +2055,7 @@ async fn list_executions_handler(
     axum::extract::Query(query): axum::extract::Query<ListExecutionsQuery>,
 ) -> Json<serde_json::Value> {
     let agent_id = query.agent_id.map(AgentId);
-    let limit = query
-        .limit
-        .unwrap_or(20)
-        .min(MAX_EXECUTION_LIST_LIMIT);
+    let limit = query.limit.unwrap_or(20).min(MAX_EXECUTION_LIST_LIMIT);
 
     match state
         .execution_service

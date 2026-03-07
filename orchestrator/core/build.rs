@@ -134,11 +134,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Only compile if we have proto files to compile
     if !protos.is_empty() {
-        let include_refs: Vec<&str> = include_dirs.iter().map(|dir| dir.as_str()).collect();
-        tonic_build::configure()
+        tonic_prost_build::configure()
             .build_server(true)
             .build_client(true)
-            .compile_protos(&protos, &include_refs)?;
+            .compile_protos(&protos, &include_dirs)?;
     }
 
     // Trigger rebuild if proto files change (development mode)

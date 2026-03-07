@@ -123,13 +123,15 @@ pub async fn run(args: UpArgs) -> Result<()> {
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
 
-    if (s == "~" || s.starts_with("~/")) && let Some(home) = dirs_next::home_dir() {
-        if s == "~" {
-            return home;
-        } else {
-            // Safe to slice from index 2 because we've confirmed the prefix "~/".
-            let rest = &s[2..];
-            return home.join(rest);
+    if s == "~" || s.starts_with("~/") {
+        if let Some(home) = dirs_next::home_dir() {
+            if s == "~" {
+                return home;
+            } else {
+                // Safe to slice from index 2 because we've confirmed the prefix "~/".
+                let rest = &s[2..];
+                return home.join(rest);
+            }
         }
     }
 

@@ -40,12 +40,13 @@ use crate::infrastructure::image_manager::{
     CredentialResolver, DockerImageManager, StandardDockerImageManager,
 };
 use async_trait::async_trait;
-use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, RemoveContainerOptions, StartContainerOptions,
-    UploadToContainerOptions,
-};
+use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-use bollard::models::{Mount, MountTypeEnum};
+use bollard::models::{ContainerCreateBody, Mount, MountTypeEnum};
+use bollard::query_parameters::{
+    CreateContainerOptions, PruneImagesOptions, RemoveContainerOptions, StartContainerOptions,
+    StatsOptions, UploadToContainerOptions,
+};
 use bollard::Docker;
 use chrono::Utc;
 use futures::StreamExt;
@@ -188,11 +189,12 @@ impl DockerRuntime {
     /// running containers are never affected because Docker only prunes images with
     /// no active consumer.
     pub async fn cleanup_images(&self) -> Result<(), RuntimeError> {
-        use bollard::image::PruneImagesOptions;
         let mut filters = std::collections::HashMap::new();
-        filters.insert("dangling", vec!["true"]);
+        filters.insert("dangling".to_string(), vec!["true".to_string()]);
         self.docker
-            .prune_images(Some(PruneImagesOptions { filters }))
+            .prune_images(Some(PruneImagesOptions {
+                filters: Some(filters),
+            }))
             .await
             .map_err(|e| RuntimeError::SpawnFailed(format!("Image prune failed: {}", e)))?;
         Ok(())
@@ -239,7 +241,7 @@ impl DockerRuntime {
                     .docker
                     .stats(
                         id,
-                        Some(bollard::container::StatsOptions {
+                        Some(StatsOptions {
                             stream: false,
                             one_shot: true,
                         }),
@@ -249,20 +251,28 @@ impl DockerRuntime {
                 {
                     Some(Ok(stats)) => {
                         // Calculate CPU percentage
-                        let cpu_percent =
-                            if let (Some(system_cpu_usage), Some(presystem_cpu_usage)) = (
-                                stats.cpu_stats.system_cpu_usage,
-                                stats.precpu_stats.system_cpu_usage,
+                        let cpu_percent = if let (Some(cpu_stats), Some(precpu_stats)) =
+                            (stats.cpu_stats.as_ref(), stats.precpu_stats.as_ref())
+                        {
+                            if let (
+                                Some(system_cpu_usage),
+                                Some(presystem_cpu_usage),
+                                Some(cpu_usage),
+                                Some(precpu_usage),
+                            ) = (
+                                cpu_stats.system_cpu_usage,
+                                precpu_stats.system_cpu_usage,
+                                cpu_stats.cpu_usage.as_ref(),
+                                precpu_stats.cpu_usage.as_ref(),
                             ) {
-                                let cpu_usage = &stats.cpu_stats.cpu_usage;
-                                let precpu_usage = &stats.precpu_stats.cpu_usage;
                                 let cpu_delta = cpu_usage
                                     .total_usage
-                                    .saturating_sub(precpu_usage.total_usage)
+                                    .unwrap_or(0)
+                                    .saturating_sub(precpu_usage.total_usage.unwrap_or(0))
                                     as f64;
                                 let system_delta =
                                     system_cpu_usage.saturating_sub(presystem_cpu_usage) as f64;
-                                let num_cpus = stats.cpu_stats.online_cpus.unwrap_or(1) as f64;
+                                let num_cpus = cpu_stats.online_cpus.unwrap_or(1) as f64;
                                 if system_delta > 0.0 {
                                     (cpu_delta / system_delta) * num_cpus * 100.0
                                 } else {
@@ -270,10 +280,17 @@ impl DockerRuntime {
                                 }
                             } else {
                                 0.0
-                            };
+                            }
+                        } else {
+                            0.0
+                        };
 
                         // Get memory usage
-                        let memory_bytes = stats.memory_stats.usage.unwrap_or(0);
+                        let memory_bytes = stats
+                            .memory_stats
+                            .as_ref()
+                            .and_then(|memory| memory.usage)
+                            .unwrap_or(0);
 
                         Some((cpu_percent, memory_bytes, uptime))
                     }
@@ -337,7 +354,7 @@ impl AgentRuntime for DockerRuntime {
 
         // Build host config with resource limits
 
-        let mut host_config = bollard::service::HostConfig {
+        let mut host_config = bollard::models::HostConfig {
             mounts: None, // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
             network_mode: self.network_mode.clone(), // Optional Docker network (None = default)
             ..Default::default()
@@ -439,8 +456,8 @@ impl AgentRuntime for DockerRuntime {
         // Removed container_config that was causing move issues and unused var warning
 
         let options = CreateContainerOptions {
-            name: format!("aegis-agent-{}", uuid::Uuid::new_v4()),
-            platform: None,
+            name: Some(format!("aegis-agent-{}", uuid::Uuid::new_v4())),
+            platform: String::new(),
         };
 
         // Convert map to "KEY=VALUE" strings
@@ -467,7 +484,7 @@ impl AgentRuntime for DockerRuntime {
         ];
 
         // Create container configuration
-        let container_config = Config {
+        let container_config = ContainerCreateBody {
             image: Some(image.clone()),
             tty: Some(true),
             attach_stdout: Some(true),
@@ -493,7 +510,7 @@ impl AgentRuntime for DockerRuntime {
             .insert(id.clone(), config.keep_container_on_failure);
 
         self.docker
-            .start_container(&id, None::<StartContainerOptions<String>>)
+            .start_container(&id, None::<StartContainerOptions>)
             .await
             .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to start container: {}", e)))?;
 
@@ -804,12 +821,16 @@ impl DockerRuntime {
 
         // Upload to container at /usr/local/bin/
         let options = UploadToContainerOptions {
-            path: "/usr/local/bin/",
+            path: "/usr/local/bin/".to_string(),
             ..Default::default()
         };
 
         self.docker
-            .upload_to_container(container_id, Some(options), tar_data.into())
+            .upload_to_container(
+                container_id,
+                Some(options),
+                bollard::body_full(tar_data.into()),
+            )
             .await
             .map_err(|e| {
                 RuntimeError::SpawnFailed(format!(

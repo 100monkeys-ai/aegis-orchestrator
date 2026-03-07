@@ -45,12 +45,13 @@ tokio-util = "0.7"
 tower-http.workspace = true
 hostname = "0.4"
 dirs = "6.0"
-reqwest = { version = "0.13", features = ["json", "multipart"] }
+reqwest = { version = "0.13", features = ["json", "multipart", "query"] }
 walkdir = "2.4"
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
-prost-types = "0.13"
+prost-types = "0.14"
+tonic-prost = "0.14"
 tar = "0.4"
 regex = "1"
 jsonschema = "0.28"
@@ -81,7 +82,7 @@ tempfile = "3.10"
 rand = "0.8"
 
 [build-dependencies]
-tonic-build = "0.13"
+tonic-prost-build = "0.14"
 protoc-bin-vendored = "3.0"
 
 [package.metadata.docs.rs]

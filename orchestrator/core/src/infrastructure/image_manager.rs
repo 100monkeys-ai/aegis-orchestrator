@@ -24,7 +24,7 @@ use crate::domain::node_config::RegistryCredentials;
 use crate::domain::runtime::RuntimeError;
 use async_trait::async_trait;
 use bollard::auth::DockerCredentials;
-use bollard::image::CreateImageOptions;
+use bollard::query_parameters::CreateImageOptions;
 use bollard::Docker;
 use futures::StreamExt;
 use std::sync::Arc;
@@ -190,7 +190,7 @@ impl DockerImageManager for StandardDockerImageManager {
 
         info!("Pulling image: {}", image);
         let options = Some(CreateImageOptions {
-            from_image: image,
+            from_image: Some(image.to_string()),
             ..Default::default()
         });
 

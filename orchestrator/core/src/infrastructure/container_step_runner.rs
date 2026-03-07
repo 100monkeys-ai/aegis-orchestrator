@@ -27,12 +27,14 @@ use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::image_manager::DockerImageManager;
 use crate::infrastructure::secrets_manager::SecretsManager;
 use async_trait::async_trait;
-use bollard::container::{
-    Config, CreateContainerOptions, LogOutput, LogsOptions, RemoveContainerOptions,
-    StartContainerOptions, WaitContainerOptions,
-};
+use bollard::container::LogOutput;
 use bollard::models::{
-    HostConfig, Mount, MountTypeEnum, MountVolumeOptions, MountVolumeOptionsDriverConfig,
+    ContainerCreateBody, HostConfig, Mount, MountTypeEnum, MountVolumeOptions,
+    MountVolumeOptionsDriverConfig,
+};
+use bollard::query_parameters::{
+    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -420,7 +422,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             uuid::Uuid::new_v4()
         );
 
-        let container_config = Config {
+        let container_config = ContainerCreateBody {
             image: Some(config.image.clone()),
             cmd: Some(cmd),
             env: Some(env_strings),
@@ -434,8 +436,8 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         };
 
         let options = CreateContainerOptions {
-            name: container_name.clone(),
-            platform: None,
+            name: Some(container_name.clone()),
+            platform: String::new(),
         };
 
         let container = self
@@ -466,7 +468,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         // ─── 7. Start container ───────────────────────────────────────────────
         if let Err(e) = self
             .docker
-            .start_container(&container_id, None::<StartContainerOptions<String>>)
+            .start_container(&container_id, None::<StartContainerOptions>)
             .await
         {
             // Best-effort cleanup: explicitly drop the future (cannot await in error path).
@@ -608,7 +610,7 @@ async fn capture_logs_and_wait(
 
 async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutput, CaptureError> {
     // Stream logs with follow=true — this blocks until the container stops.
-    let log_opts = LogsOptions::<String> {
+    let log_opts = LogsOptions {
         stdout: true,
         stderr: true,
         follow: true,
@@ -659,7 +661,7 @@ async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutpu
 
     // Wait for container exit to get the exit code.
     let wait_opts = WaitContainerOptions {
-        condition: "not-running",
+        condition: "not-running".to_string(),
     };
     let mut wait_stream = docker.wait_container(container_id, Some(wait_opts));
 
