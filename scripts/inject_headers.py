@@ -127,7 +127,19 @@ def process_file(filepath):
                 arch_idx = next(i for i, line in enumerate(doc_lines) if '//! # Architecture' in line)
                 # insert after Layer / Purpose
                 insert_idx = arch_idx + 1
-                while insert_idx < len(doc_lines) and doc_lines[insert_idx].strip() != '//!' and doc_lines[insert_idx].startswith('//!-') == False and 'Related ADRs' not in doc_lines[insert_idx] and doc_lines[insert_idx].startswith('//! -'):
+                def _should_advance_past_architecture_line(line: str) -> bool:
+                    """
+                    Return True while we are still within the Architecture
+                    section header and its immediate descriptive lines.
+                    """
+                    return (
+                        line.strip() != '//!'
+                        and not line.startswith('//!-')
+                        and 'Related ADRs' not in line
+                        and line.startswith('//! -')
+                    )
+
+                while insert_idx < len(doc_lines) and _should_advance_past_architecture_line(doc_lines[insert_idx]):
                     insert_idx += 1
                 # Find the end of the bulleted list under Architecture
                 while insert_idx < len(doc_lines) and doc_lines[insert_idx].startswith('//! -'):
@@ -154,7 +166,12 @@ def process_file(filepath):
         print(f"Updated: {filepath}")
 
 def main():
-    repo_dir = r"c:/Users/travi/Documents/git_repos/aegis-greenfield/repos/aegis-orchestrator"
+    # Determine repository root: allow override via REPO_DIR env var, otherwise
+    # default to the parent directory of this script (assumed repo root).
+    repo_dir = os.environ.get(
+        "REPO_DIR",
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
     
     for root, dirs, files in os.walk(repo_dir):
         # ignore node_modules, target, dist

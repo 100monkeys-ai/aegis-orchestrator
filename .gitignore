@@ -38,3 +38,4 @@ orchestrator/core/proto-vendor/
 
 # Sources
 sources/
+scripts/__pycache__/
