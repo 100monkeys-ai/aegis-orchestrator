@@ -41,10 +41,12 @@ impl ExamplesLoader {
 
     /// Prompt (if not `--yes`) and deploy `hello-world` plus
     /// companion judge templates bundled with the CLI.
-    pub async fn maybe_load_hello_world(&self) -> Result<()> {
+    pub async fn maybe_load_hello_world(&self, decision_override: Option<bool>) -> Result<()> {
         println!();
 
-        let should_load = if self.yes {
+        let should_load = if let Some(decision) = decision_override {
+            decision
+        } else if self.yes {
             false // In --yes mode skip the example to avoid side effects
         } else {
             Confirm::new()

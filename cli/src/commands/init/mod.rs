@@ -140,7 +140,9 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // ─── Optional: Load examples ──────────────────────────────────────────────
     let loader = ExamplesLoader::new(&args.host, args.port, args.yes);
-    loader.maybe_load_hello_world().await?;
+    loader
+        .maybe_load_hello_world(node_config.advanced.deploy_smoketest_agents)
+        .await?;
 
     // ─── Done ─────────────────────────────────────────────────────────────────
     print_success(&args.host, args.port, &components);

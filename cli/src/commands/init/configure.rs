@@ -66,6 +66,7 @@ pub struct AdvancedConfig {
     pub gemini_api_key: String,
     pub gemini_smart_model: String,
     pub gemini_judge_model: String,
+    pub deploy_smoketest_agents: Option<bool>,
 }
 
 /// Drives the interactive configuration step.
@@ -240,6 +241,7 @@ impl ConfigWizard {
             gemini_api_key: String::new(),
             gemini_smart_model: "gemini-2.5-flash".to_string(),
             gemini_judge_model: "gemini-2.5-pro".to_string(),
+            deploy_smoketest_agents: None,
         };
 
         if self.yes {
@@ -271,6 +273,10 @@ impl ConfigWizard {
         let enable_gemini = Confirm::new()
             .with_prompt("Enable Gemini provider (OpenAI-compatible endpoint)?")
             .default(defaults.enable_gemini)
+            .interact()?;
+        let deploy_smoketest_agents = Confirm::new()
+            .with_prompt("Install smoke-test agents during init?")
+            .default(true)
             .interact()?;
 
         Ok(AdvancedConfig {
@@ -400,6 +406,7 @@ impl ConfigWizard {
             } else {
                 defaults.gemini_judge_model.clone()
             },
+            deploy_smoketest_agents: Some(deploy_smoketest_agents),
         })
     }
 
@@ -456,10 +463,10 @@ impl ConfigWizard {
         config: &NodeConfig,
         components: &SelectedComponents,
     ) -> String {
-        let llm_section = match &components.llm {
-            LlmChoice::Ollama => format!(
-                r#"  llm_providers:
-    - name: "local"
+        let (base_provider_section, default_provider) = match &components.llm {
+            LlmChoice::Ollama => (
+                format!(
+                    r#"    - name: "local"
       type: "ollama"
       endpoint: "http://ollama:11434"
       enabled: true
@@ -479,17 +486,13 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 8192
           cost_per_1k_tokens: 0.0
-
-  llm_selection:
-    strategy: "prefer-local"
-    default_provider: "local"
-    max_retries: 3
-    retry_delay_ms: 1000
 "#,
-                model = config.ollama_model
+                    model = config.ollama_model
+                ),
+                "local",
             ),
-            LlmChoice::OpenAI => r#"  llm_providers:
-    - name: "openai"
+            LlmChoice::OpenAI => (
+                r#"    - name: "openai"
       type: "openai"
       endpoint: "https://api.openai.com/v1"
       enabled: true
@@ -510,16 +513,12 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 128000
           cost_per_1k_tokens: 0.005
-
-  llm_selection:
-    strategy: "prefer-local"
-    default_provider: "openai"
-    max_retries: 3
-    retry_delay_ms: 1000
 "#
-            .to_string(),
-            LlmChoice::Anthropic => r#"  llm_providers:
-    - name: "anthropic"
+                .to_string(),
+                "openai",
+            ),
+            LlmChoice::Anthropic => (
+                r#"    - name: "anthropic"
       type: "anthropic"
       endpoint: "https://api.anthropic.com"
       enabled: true
@@ -540,14 +539,10 @@ impl ConfigWizard {
           capabilities: ["reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
-
-  llm_selection:
-    strategy: "prefer-local"
-    default_provider: "anthropic"
-    max_retries: 3
-    retry_delay_ms: 1000
 "#
-            .to_string(),
+                .to_string(),
+                "anthropic",
+            ),
         };
         let extra_lmstudio_section = if config.advanced.enable_lmstudio {
             format!(
@@ -631,8 +626,20 @@ impl ConfigWizard {
             String::new()
         };
         let llm_section = format!(
-            "{}{}{}{}",
-            llm_section, extra_lmstudio_section, extra_anthropic_section, extra_gemini_section
+            r#"  llm_providers:
+{base_provider_section}{extra_lmstudio_section}{extra_anthropic_section}{extra_gemini_section}
+
+  llm_selection:
+    strategy: "prefer-local"
+    default_provider: "{default_provider}"
+    max_retries: 3
+    retry_delay_ms: 1000
+"#,
+            base_provider_section = base_provider_section,
+            extra_lmstudio_section = extra_lmstudio_section,
+            extra_anthropic_section = extra_anthropic_section,
+            extra_gemini_section = extra_gemini_section,
+            default_provider = default_provider,
         );
 
         let database_section = r#"
