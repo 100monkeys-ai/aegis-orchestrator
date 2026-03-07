@@ -99,7 +99,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!();
     println!("{}", "Starting AEGIS stack...".bold());
 
-    let runner = ComposeRunner::new(dir);
+    let runner = ComposeRunner::new(dir.clone());
     runner.up_with_profile(args.profile.as_deref()).await?;
 
     println!();
@@ -108,8 +108,8 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!(
         "\n  Run {} to view real-time logs.",
         format!(
-            "docker compose -f {}/.aegis/docker-compose.yml logs --follow",
-            dirs_next::home_dir().unwrap_or_default().display()
+            "docker compose -f {}/docker-compose.yml logs --follow",
+            dir.display()
         )
         .cyan()
     );
@@ -121,10 +121,17 @@ pub async fn run(args: UpArgs) -> Result<()> {
 
 /// Expand a leading `~` to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
-    if let Ok(stripped) = path.strip_prefix("~") {
-        if let Some(home) = dirs_next::home_dir() {
-            return home.join(stripped);
+    let s = path.to_string_lossy();
+
+    if (s == "~" || s.starts_with("~/")) && let Some(home) = dirs_next::home_dir() {
+        if s == "~" {
+            return home;
+        } else {
+            // Safe to slice from index 2 because we've confirmed the prefix "~/".
+            let rest = &s[2..];
+            return home.join(rest);
         }
     }
+
     path.to_path_buf()
 }
