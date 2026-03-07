@@ -119,6 +119,17 @@ services:
     #   dockerfile: docker/Dockerfile.runtime
     container_name: aegis-runtime
     profiles: [core]
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-lc"]
+    command: >
+      SOCK_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)";
+      if [ -n "$SOCK_GID" ]; then
+        if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
+          groupadd -f -g "$SOCK_GID" hostdocker >/dev/null 2>&1 || true;
+        fi;
+        usermod -aG "$SOCK_GID" aegis >/dev/null 2>&1 || true;
+      fi;
+      exec su -s /bin/sh aegis -c "aegis-runtime --daemon"
     depends_on:
       postgres:
         condition: service_healthy
