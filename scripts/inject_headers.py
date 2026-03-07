@@ -141,9 +141,6 @@ def process_file(filepath):
 
                 while insert_idx < len(doc_lines) and _should_advance_past_architecture_line(doc_lines[insert_idx]):
                     insert_idx += 1
-                # Find the end of the bulleted list under Architecture
-                while insert_idx < len(doc_lines) and doc_lines[insert_idx].startswith('//! -'):
-                    insert_idx += 1
                 doc_lines.insert(insert_idx, f"//! - **Related ADRs:** {', '.join(adrs)}")
 
     # Add the doc lines to out_lines
