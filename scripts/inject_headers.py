@@ -134,7 +134,7 @@ def process_file(filepath):
                     """
                     return (
                         line.strip() != '//!'
-                        and not line.startswith('//!-')
+                        and not line.startswith('//! -')
                         and 'Related ADRs' not in line
                         and line.startswith('//! -')
                     )
