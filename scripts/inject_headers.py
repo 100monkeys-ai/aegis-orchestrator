@@ -50,15 +50,15 @@ def process_file(filepath):
     
     # 1. Look for Copyright header
     copyright_present = False
-    idx = 0
-    while idx < len(lines):
-        if lines[idx].startswith('// Copyright (c)') or lines[idx].startswith('// SPDX-License-Identifier'):
+    original_content_idx = 0
+    while original_content_idx < len(lines):
+        if lines[original_content_idx].startswith('// Copyright (c)') or lines[original_content_idx].startswith('// SPDX-License-Identifier'):
             copyright_present = True
-            out_lines.append(lines[idx])
-            idx += 1
-        elif lines[idx].strip() == '' and copyright_present and idx < 2:
-            out_lines.append(lines[idx])
-            idx += 1
+            out_lines.append(lines[original_content_idx])
+            original_content_idx += 1
+        elif lines[original_content_idx].strip() == '' and copyright_present and original_content_idx < 2:
+            out_lines.append(lines[original_content_idx])
+            original_content_idx += 1
         else:
             break
             
@@ -68,17 +68,18 @@ def process_file(filepath):
             "// SPDX-License-Identifier: AGPL-3.0",
             ""
         ] + out_lines
-        idx = 0 # reset because we didn't consume any copyright lines
+        # Start processing the original file content from the beginning; the copyright header is already in out_lines.
+        original_content_idx = 0
 
     # 2. Look for existing doc comments (start with //!)
     doc_lines = []
-    while idx < len(lines):
-        if lines[idx].startswith('//!') or lines[idx].strip() == '':
-            if lines[idx].strip() == '' and len(doc_lines) == 0:
-                idx += 1
+    while original_content_idx < len(lines):
+        if lines[original_content_idx].startswith('//!') or lines[original_content_idx].strip() == '':
+            if lines[original_content_idx].strip() == '' and len(doc_lines) == 0:
+                original_content_idx += 1
                 continue
-            doc_lines.append(lines[idx])
-            idx += 1
+            doc_lines.append(lines[original_content_idx])
+            original_content_idx += 1
         else:
             break
 
