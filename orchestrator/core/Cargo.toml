@@ -62,7 +62,7 @@ bincode = { workspace = true }
 parking_lot = "0.12"
 
 url = "2.5.8"
-scraper = "0.20"
+scraper = "0.25"
 html2md = "0.2"
 urlencoding = "2.1"
 
