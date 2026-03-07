@@ -23,7 +23,7 @@ tokio-util = "0.7"
 # Web Framework
 axum = "0.7"
 tower = "0.4"
-tower-http = "0.5"
+tower-http = "0.6"
 hyper = "1.0"
 
 # Serialization
