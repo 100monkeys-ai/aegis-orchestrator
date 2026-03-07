@@ -20,6 +20,7 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use colored::Colorize;
+use dialoguer::Confirm;
 use indicatif::{ProgressBar, ProgressStyle};
 
 /// Arguments for `aegis down`
@@ -29,9 +30,17 @@ pub struct DownArgs {
     #[arg(long, default_value = "~/.aegis")]
     pub dir: String,
 
+    /// Stop only services in this Docker Compose profile
+    #[arg(long)]
+    pub profile: Option<String>,
+
     /// Also remove named volumes — destroys all persistent data (database, secrets, etc.)
     #[arg(long)]
     pub volumes: bool,
+
+    /// Skip destructive-action confirmation prompt
+    #[arg(long, short = 'y')]
+    pub yes: bool,
 }
 
 /// Run `aegis down`.
@@ -55,9 +64,19 @@ pub async fn run(args: DownArgs) -> Result<()> {
             "  {} --volumes set: named volumes (database, secrets, etc.) will be removed",
             "⚠".yellow().bold()
         );
+        if !args.yes {
+            let confirmed = Confirm::new()
+                .with_prompt("This will permanently destroy local AEGIS data volumes. Continue?")
+                .default(false)
+                .interact()?;
+            if !confirmed {
+                println!("  Aborted — no changes made.");
+                return Ok(());
+            }
+        }
     }
 
-    run_compose(&dir, &compose_args)?;
+    run_compose(&dir, &compose_args, args.profile.as_deref())?;
 
     println!();
     println!("  {} Stack stopped.", "✓".green().bold());
@@ -75,7 +94,7 @@ pub async fn run(args: DownArgs) -> Result<()> {
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
-fn run_compose(dir: &Path, args: &[&str]) -> Result<()> {
+fn run_compose(dir: &Path, args: &[&str], profile: Option<&str>) -> Result<()> {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::with_template("  {spinner:.cyan} {msg}")
@@ -86,6 +105,10 @@ fn run_compose(dir: &Path, args: &[&str]) -> Result<()> {
 
     let mut cmd = Command::new("docker");
     cmd.arg("compose");
+    if let Some(profile) = profile {
+        cmd.arg("--profile");
+        cmd.arg(profile);
+    }
     cmd.args(args);
     cmd.current_dir(dir);
     cmd.stdout(Stdio::piped());
@@ -132,9 +155,13 @@ fn run_compose(dir: &Path, args: &[&str]) -> Result<()> {
 
     if !status.success() {
         let msg = last_stderr.lock().unwrap().clone();
+        let rendered_args = match profile {
+            Some(profile) => format!("--profile {profile} {}", args.join(" ")),
+            None => args.join(" "),
+        };
         bail!(
             "`docker compose {}` failed (exit {}): {}",
-            args.join(" "),
+            rendered_args,
             status.code().unwrap_or(-1),
             msg
         );

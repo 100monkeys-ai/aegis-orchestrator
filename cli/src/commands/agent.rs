@@ -87,7 +87,7 @@ pub enum AgentCommand {
     /// Generate an agent from natural-language input
     Generate {
         /// Natural-language intent for the agent to create
-        #[arg(value_name = "INPUT")]
+        #[arg(long, short = 'i', value_name = "INPUT")]
         input: String,
 
         /// Follow generator execution logs

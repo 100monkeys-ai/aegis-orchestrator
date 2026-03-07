@@ -48,10 +48,9 @@ use commands::{
 #[derive(Parser)]
 #[command(name = "aegis")]
 #[command(version, about, long_about = None)]
-#[command(propagate_version = true)]
 struct Cli {
     /// Run as background daemon service
-    #[arg(long, global = true)]
+    #[arg(long)]
     daemon: bool,
 
     /// Path to configuration file (overrides discovery)

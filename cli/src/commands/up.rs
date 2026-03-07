@@ -41,6 +41,10 @@ pub struct UpArgs {
     /// triggered automatically (suitable for CI)
     #[arg(long)]
     pub yes: bool,
+
+    /// Start only services in this Docker Compose profile
+    #[arg(long)]
+    pub profile: Option<String>,
 }
 
 /// Run `aegis up`.
@@ -67,6 +71,13 @@ pub async fn run(args: UpArgs) -> Result<()> {
         })
         .await?;
 
+        if args.profile.is_some() {
+            println!(
+                "  {} `--profile` is ignored during first-time setup (`aegis init` controls initial profile selection).",
+                "ℹ".cyan()
+            );
+        }
+
         // init already starts the stack; nothing more to do.
         return Ok(());
     }
@@ -76,7 +87,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!("{}", "Starting AEGIS stack...".bold());
 
     let runner = ComposeRunner::new(dir);
-    runner.up().await?;
+    runner.up_with_profile(args.profile.as_deref()).await?;
 
     println!();
     println!("{}", "  ✓  AEGIS is up!".green().bold());

@@ -47,10 +47,21 @@ impl ComposeRunner {
 
     /// Start all services in detached mode.
     pub async fn up(&self) -> Result<()> {
-        println!();
-        println!("{}", "Starting services...".bold());
+        self.up_with_profile(None).await
+    }
 
-        if let Err(e) = self.run_compose(&["up", "-d", "--wait"]) {
+    /// Start services in detached mode, optionally limited to a compose profile.
+    pub async fn up_with_profile(&self, profile: Option<&str>) -> Result<()> {
+        println!();
+        match profile {
+            Some(profile) => println!(
+                "{}",
+                format!("Starting services in profile `{profile}`...").bold()
+            ),
+            None => println!("{}", "Starting services...".bold()),
+        }
+
+        if let Err(e) = self.run_compose_with_profile(&["up", "-d", "--wait"], profile) {
             // Print container logs so the user can see *why* a service crashed
             // without having to manually run `docker compose logs`.
             eprintln!();
@@ -147,11 +158,13 @@ impl ComposeRunner {
                     "{}",
                     format!("Restarting services in profile `{profile}`...").bold()
                 );
-                self.run_compose_with_profile(&["restart"], Some(profile))?;
+                self.run_compose_with_profile(&["down"], Some(profile))?;
+                self.run_compose_with_profile(&["up", "-d", "--wait"], Some(profile))?;
             }
             None => {
                 println!("{}", "Restarting all services...".bold());
-                self.run_compose_with_profile(&["restart"], None)?;
+                self.run_compose_with_profile(&["down"], None)?;
+                self.run_compose_with_profile(&["up", "-d", "--wait"], None)?;
             }
         }
 

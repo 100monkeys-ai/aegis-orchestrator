@@ -13,7 +13,7 @@
 //! - `aegis workflow list` - List registered workflows
 //! - `aegis workflow describe <name>` - Show workflow details
 //! - `aegis workflow logs <execution_id>` - Stream workflow execution logs
-//! - `aegis workflow generate <input>` - Generate a workflow from natural language
+//! - `aegis workflow generate --input <text>` - Generate a workflow from natural language
 //!
 //! # Architecture
 //!
@@ -133,7 +133,7 @@ pub enum WorkflowCommand {
     /// Generate a workflow from natural-language input
     Generate {
         /// Natural-language workflow objective
-        #[arg(value_name = "INPUT")]
+        #[arg(long, short = 'i', value_name = "INPUT")]
         input: String,
 
         /// Follow generator execution logs
