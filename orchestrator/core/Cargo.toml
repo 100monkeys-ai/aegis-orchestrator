@@ -28,7 +28,7 @@ chrono = { workspace = true }
 humantime-serde = "1.1"
 thiserror = { workspace = true }
 anyhow = { workspace = true }
-handlebars = "5.1"
+handlebars = "6.4"
 async-trait = "0.1"
 futures = { workspace = true }
 sha2 = "0.10"
