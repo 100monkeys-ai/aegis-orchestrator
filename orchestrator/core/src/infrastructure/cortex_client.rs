@@ -25,12 +25,15 @@
 //! - **Purpose:** gRPC proxy to standalone Cortex service
 //! - **Related ADRs:** ADR-042 (Separate Cortex Repository)
 
+use crate::application::ports::{CortexPatternPort, StoreTrajectoryPatternCommand};
+use async_trait::async_trait;
 use tonic::transport::Channel;
 use tonic::Status;
 
 use crate::infrastructure::aegis_runtime_proto::{
     aegis_runtime_client::AegisRuntimeClient, QueryCortexRequest, QueryCortexResponse,
-    StoreCortexPatternRequest, StoreCortexPatternResponse,
+    StoreCortexPatternRequest, StoreCortexPatternResponse, StoreTrajectoryPatternRequest,
+    StoreTrajectoryPatternResponse,
 };
 
 /// Thin wrapper around `AegisRuntimeClient` that exposes only the Cortex RPCs.
@@ -70,5 +73,43 @@ impl CortexGrpcClient {
         let mut client = self.client.clone();
         let response = client.store_cortex_pattern(request).await?;
         Ok(response.into_inner())
+    }
+
+    /// Forward a `StoreTrajectoryPattern` RPC to the Cortex service (ADR-049).
+    pub async fn store_trajectory_pattern(
+        &self,
+        request: StoreTrajectoryPatternRequest,
+    ) -> Result<StoreTrajectoryPatternResponse, Status> {
+        let mut client = self.client.clone();
+        let response = client.store_trajectory_pattern(request).await?;
+        Ok(response.into_inner())
+    }
+}
+
+#[async_trait]
+impl CortexPatternPort for CortexGrpcClient {
+    async fn store_trajectory_pattern(
+        &self,
+        request: StoreTrajectoryPatternCommand,
+    ) -> anyhow::Result<()> {
+        let proto_request = StoreTrajectoryPatternRequest {
+            task_signature: request.task_signature,
+            steps: request
+                .steps
+                .into_iter()
+                .map(
+                    |s| crate::infrastructure::aegis_runtime_proto::TrajectoryStep {
+                        tool_name: s.tool_name,
+                        arguments_json: s.arguments_json,
+                    },
+                )
+                .collect(),
+            success_score: request.success_score,
+        };
+
+        CortexGrpcClient::store_trajectory_pattern(self, proto_request)
+            .await
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 }

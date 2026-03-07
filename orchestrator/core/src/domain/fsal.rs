@@ -98,6 +98,8 @@ impl AegisFileHandle {
         use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
+        execution_id.0.hash(&mut hasher);
+        volume_id.0.hash(&mut hasher);
         path.hash(&mut hasher);
         let path_hash = hasher.finish();
 
@@ -776,7 +778,7 @@ impl AegisFSAL {
         let volume = self.authorize(execution_id, volume_id).await?;
 
         // 2. Sanitize path
-        let canonical = self.path_sanitizer.canonicalize(path, Some("/workspace"))?;
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy
@@ -833,12 +835,8 @@ impl AegisFSAL {
         let volume = self.authorize(execution_id, volume_id).await?;
 
         // 2. Sanitize both paths
-        let from_canonical = self
-            .path_sanitizer
-            .canonicalize(from_path, Some("/workspace"))?;
-        let to_canonical = self
-            .path_sanitizer
-            .canonicalize(to_path, Some("/workspace"))?;
+        let from_canonical = self.path_sanitizer.canonicalize(from_path, Some("/"))?;
+        let to_canonical = self.path_sanitizer.canonicalize(to_path, Some("/"))?;
         let from_str = from_canonical.to_str().unwrap();
         let to_str = to_canonical.to_str().unwrap();
 

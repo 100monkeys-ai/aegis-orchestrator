@@ -182,11 +182,13 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         // Assert: Event was persisted
+        assert!(
+            matches!(event, StorageEvent::FileOpened { .. }),
+            "Test setup error: expected FileOpened event, got {:?}",
+            event
+        );
         let StorageEvent::FileOpened { volume_id, .. } = &event else {
-            panic!(
-                "Test setup error: expected FileOpened event, got {:?}",
-                event
-            );
+            return;
         };
         let volume_id = *volume_id;
         let persisted_events = repository

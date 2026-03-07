@@ -24,6 +24,7 @@
 //! - **Layer:** Domain Layer
 //! - **Purpose:** Implements internal responsibilities for workflow
 
+use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -145,6 +146,157 @@ impl Workflow {
             }
         }
 
+        // Validate: Container state invariants (ADR-050)
+        for (state_name, state) in &spec.states {
+            match &state.kind {
+                StateKind::ContainerRun {
+                    name,
+                    image,
+                    command,
+                    volumes,
+                    ..
+                } => {
+                    if name.trim().is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.name cannot be empty".to_string(),
+                        });
+                    }
+                    if image.trim().is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.image cannot be empty".to_string(),
+                        });
+                    }
+                    if command.is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ContainerRun.command must contain at least one token"
+                                .to_string(),
+                        });
+                    }
+
+                    for mount in volumes {
+                        if mount.name.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: "ContainerRun volume name cannot be empty".to_string(),
+                            });
+                        }
+                        if mount.mount_path.trim().is_empty() || !mount.mount_path.starts_with('/')
+                        {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ContainerRun mount_path '{}' must be an absolute path",
+                                    mount.mount_path
+                                ),
+                            });
+                        }
+                    }
+                }
+                StateKind::ParallelContainerRun { steps, .. } => {
+                    if steps.is_empty() {
+                        return Err(WorkflowError::InvalidContainerState {
+                            state: state_name.clone(),
+                            detail: "ParallelContainerRun.steps must contain at least one step"
+                                .to_string(),
+                        });
+                    }
+
+                    let mut step_names = std::collections::HashSet::new();
+                    for step in steps {
+                        if step.name.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: "ParallelContainerRun step name cannot be empty"
+                                    .to_string(),
+                            });
+                        }
+                        if !step_names.insert(step.name.clone()) {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step name '{}' must be unique",
+                                    step.name
+                                ),
+                            });
+                        }
+                        if step.image.trim().is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step '{}' has empty image",
+                                    step.name
+                                ),
+                            });
+                        }
+                        if step.command.is_empty() {
+                            return Err(WorkflowError::InvalidContainerState {
+                                state: state_name.clone(),
+                                detail: format!(
+                                    "ParallelContainerRun step '{}' command must contain at least one token",
+                                    step.name
+                                ),
+                            });
+                        }
+                        for mount in &step.volumes {
+                            if mount.name.trim().is_empty() {
+                                return Err(WorkflowError::InvalidContainerState {
+                                    state: state_name.clone(),
+                                    detail: format!(
+                                        "ParallelContainerRun step '{}' has empty volume name",
+                                        step.name
+                                    ),
+                                });
+                            }
+                            if mount.mount_path.trim().is_empty()
+                                || !mount.mount_path.starts_with('/')
+                            {
+                                return Err(WorkflowError::InvalidContainerState {
+                                    state: state_name.clone(),
+                                    detail: format!(
+                                        "ParallelContainerRun step '{}' has non-absolute mount_path '{}'",
+                                        step.name, mount.mount_path
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Validate: All ContainerVolumeMount names resolve to declared spec.volumes
+        // (only enforced when spec.volumes is non-empty — opt-in per ADR-050)
+        if !spec.volumes.is_empty() {
+            let declared: std::collections::HashSet<&str> =
+                spec.volumes.iter().map(|v| v.name.as_str()).collect();
+
+            for (state_name, state) in &spec.states {
+                let mounts: Vec<&str> = match &state.kind {
+                    StateKind::ContainerRun { volumes, .. } => {
+                        volumes.iter().map(|m| m.name.as_str()).collect()
+                    }
+                    StateKind::ParallelContainerRun { steps, .. } => steps
+                        .iter()
+                        .flat_map(|s| s.volumes.iter().map(|m| m.name.as_str()))
+                        .collect(),
+                    _ => vec![],
+                };
+
+                for mount_name in mounts {
+                    if !declared.contains(mount_name) {
+                        return Err(WorkflowError::UndeclaredVolume {
+                            state: state_name.clone(),
+                            volume_name: mount_name.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             id: WorkflowId::new(),
             metadata,
@@ -239,6 +391,39 @@ impl WorkflowMetadata {
     }
 }
 
+/// Storage class for a workflow-level volume declaration
+///
+/// Workflows may declare named volumes in `spec.volumes`; these are referenced
+/// by `ContainerVolumeMount.name` inside `ContainerRun` and `ParallelContainerRun` states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowStorageClass {
+    /// Ephemeral volume — auto-cleaned after workflow execution ends
+    #[default]
+    Ephemeral,
+    /// Persistent volume — survives workflow execution boundaries
+    Persistent,
+}
+
+/// Declarative volume specification at the workflow level (ADR-050)
+///
+/// Volumes declared here are matched by name in `ContainerVolumeMount` entries.
+/// Volume provisioning itself is handled by the Storage Gateway Context (ADR-036/ADR-032);
+/// this declaration is the intent layer consumed by the manifest parser and Temporal mapper.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkflowVolumeSpec {
+    /// Logical name referenced by `ContainerVolumeMount.name`
+    pub name: String,
+
+    /// Storage class governing lifecycle (default: ephemeral)
+    #[serde(default)]
+    pub storage_class: WorkflowStorageClass,
+
+    /// Optional hard quota in bytes enforced by the Storage Gateway
+    #[serde(default)]
+    pub size_limit_bytes: Option<u64>,
+}
+
 /// Workflow specification (state machine definition)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowSpec {
@@ -251,6 +436,13 @@ pub struct WorkflowSpec {
 
     /// State machine definition (state_name -> state)
     pub states: HashMap<StateName, WorkflowState>,
+
+    /// Named volumes available to `ContainerRun` and `ParallelContainerRun` states (ADR-050)
+    ///
+    /// When non-empty, every `ContainerVolumeMount.name` in any container state must
+    /// resolve to a volume declared here (validated in `Workflow::new()`).
+    #[serde(default)]
+    pub volumes: Vec<WorkflowVolumeSpec>,
 }
 
 /// Individual state in the workflow FSM
@@ -272,6 +464,104 @@ pub struct WorkflowState {
 // Value Objects: State Kinds
 // ============================================================================
 
+// ─── CI/CD Container Value Objects (ADR-050) ─────────────────────────────────
+
+/// Volume mount binding for a ContainerRun step
+///
+/// Binds a workflow-level volume into a CI/CD container at a specific path.
+/// Volumes are always accessed via the NFS Server Gateway (ADR-036) — never
+/// via direct bind mounts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerVolumeMount {
+    /// Volume name (references a workflow-level or execution-level volume)
+    pub name: String,
+
+    /// Absolute path inside the container where the volume appears
+    pub mount_path: String,
+
+    /// Whether the volume is mounted read-only (default: false)
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Resource limits for a ContainerRun step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerResources {
+    /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
+    #[serde(default)]
+    pub cpu: Option<u32>,
+
+    /// Memory limit as a string (e.g., "512Mi", "2Gi")
+    #[serde(default)]
+    pub memory: Option<String>,
+
+    /// Hard wall-clock timeout for the entire container execution
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    pub timeout: Option<Duration>,
+}
+
+/// Retry configuration for a ContainerRun step
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryConfig {
+    /// Maximum number of additional attempts after the first (0 = no retries)
+    #[serde(default)]
+    pub max_attempts: u32,
+
+    /// Initial backoff between retries as a human-readable duration (e.g., "5s", "1m")
+    #[serde(default)]
+    pub backoff: Option<String>,
+}
+
+/// Configuration for a single step in ParallelContainerRun
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContainerRunConfig {
+    /// Unique label for this step; used as the blackboard key for its output
+    pub name: String,
+
+    /// Container image reference (RegistryImage or StandardRuntime alias)
+    pub image: String,
+
+    /// Shell command or argv to execute inside the container
+    pub command: Vec<String>,
+
+    /// Environment variables (Handlebars templates evaluated against the blackboard)
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+
+    /// Working directory inside the container (default: /workspace)
+    #[serde(default)]
+    pub workdir: Option<String>,
+
+    /// Volume mounts — accessed via the NFS Server Gateway (ADR-036)
+    #[serde(default)]
+    pub volumes: Vec<ContainerVolumeMount>,
+
+    /// CPU, memory, and timeout resource limits
+    #[serde(default)]
+    pub resources: Option<ContainerResources>,
+
+    /// Secret-backend path for registry credentials (e.g. "secret:cicd/docker-registry")
+    #[serde(default)]
+    pub registry_credentials: Option<String>,
+
+    /// When true the command is joined with spaces and executed via `sh -c`
+    #[serde(default)]
+    pub shell: bool,
+}
+
+/// Aggregation strategy for a ParallelContainerRun state
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelCompletionStrategy {
+    /// All steps must exit with code 0 — any non-zero exit causes the state to fail
+    AllSucceed,
+    /// At least one step must exit with code 0 — all-failed causes the state to fail
+    AnySucceed,
+    /// Always succeeds as a state; individual step failures are reflected in output
+    BestEffort,
+}
+
 /// State kind determines how the state is executed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "PascalCase")]
@@ -287,6 +577,19 @@ pub enum StateKind {
         /// Optional isolation override
         #[serde(default)]
         isolation: Option<IsolationMode>,
+
+        /// Judge agents that validate each iteration output (ADR-016 / ADR-017)
+        #[serde(default)]
+        judges: Vec<JudgeConfig>,
+
+        /// Maximum iterations for the 100monkeys inner refinement loop
+        /// (overrides global default of 10)
+        #[serde(default)]
+        max_iterations: Option<u32>,
+
+        /// Optional judge agent ID for pre-execution semantic tool validation (ADR-049 Pillar 1)
+        #[serde(default)]
+        pre_execution_validator: Option<String>,
     },
 
     /// Execute system command
@@ -320,6 +623,72 @@ pub enum StateKind {
 
         /// Consensus configuration
         consensus: ConsensusConfig,
+
+        /// External judge agents for validating the combined parallel output (ADR-016)
+        /// These must be distinct from the workers in `agents` (agents cannot judge themselves)
+        #[serde(default)]
+        judges_for_parallel: Vec<JudgeConfig>,
+    },
+
+    /// Execute a deterministic command in an isolated container without an LLM loop (ADR-050)
+    ///
+    /// Suitable for CI/CD steps such as `cargo build`, `docker push`, `npm test`.
+    /// No bootstrap.py is injected; no AEGIS_ORCHESTRATOR_URL is set.
+    /// Volumes are accessed via the NFS Server Gateway (ADR-036).
+    ContainerRun {
+        /// Human-readable label for this step (used in events and Synapse UI)
+        name: String,
+
+        /// Container image reference — RegistryImage or StandardRuntime alias
+        /// (e.g., "rust:1.75-alpine", "ghcr.io/myorg/builder:v2")
+        image: String,
+
+        /// Image pull policy (default: IfNotPresent)
+        #[serde(default)]
+        image_pull_policy: Option<ImagePullPolicy>,
+
+        /// Argv to execute inside the container
+        command: Vec<String>,
+
+        /// Environment variables (Handlebars templates evaluated against the blackboard)
+        #[serde(default)]
+        env: HashMap<String, String>,
+
+        /// Working directory inside the container (default: /workspace)
+        #[serde(default)]
+        workdir: Option<String>,
+
+        /// Volume mounts — accessed via the NFS Server Gateway (ADR-036)
+        #[serde(default)]
+        volumes: Vec<ContainerVolumeMount>,
+
+        /// CPU, memory, and timeout resource limits
+        #[serde(default)]
+        resources: Option<ContainerResources>,
+
+        /// Secret-backend path for private registry credentials (ADR-034, ADR-045)
+        #[serde(default)]
+        registry_credentials: Option<String>,
+
+        /// Retry configuration (overrides Temporal activity default)
+        #[serde(default)]
+        retry: Option<RetryConfig>,
+
+        /// When true the command entries are joined and passed to `sh -c`
+        #[serde(default)]
+        shell: bool,
+    },
+
+    /// Execute multiple container steps concurrently within a single workflow state (ADR-050)
+    ///
+    /// Results are aggregated according to `completion`. Each step's output is
+    /// stored on the blackboard under `STATE_NAME.output.<step_name>`.
+    ParallelContainerRun {
+        /// Ordered list of container steps to run concurrently
+        steps: Vec<ContainerRunConfig>,
+
+        /// How to aggregate the individual step results into a state outcome
+        completion: ParallelCompletionStrategy,
     },
 }
 
@@ -336,6 +705,21 @@ pub enum IsolationMode {
     Docker,
     /// No isolation (dangerous, for debugging only)
     Process,
+}
+
+/// Configuration for a single judge agent (ADR-016, ADR-017, ADR-049)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeConfig {
+    /// Agent identifier for this judge
+    pub agent_id: String,
+
+    /// Optional Handlebars input template (overrides default judge prompt)
+    #[serde(default)]
+    pub input_template: Option<String>,
+
+    /// Consensus weight for this judge (default: 1.0)
+    #[serde(default = "default_weight")]
+    pub weight: f64,
 }
 
 /// Configuration for a single agent in parallel execution
@@ -524,6 +908,9 @@ pub enum TransitionCondition {
 
     /// Confidence above threshold
     ConfidenceAbove { threshold: f64 },
+
+    /// Both validation score AND confidence are above the same threshold (ADR-049)
+    ScoreAndConfidenceAbove { threshold: f64 },
 
     /// Consensus reached (for ParallelAgents)
     Consensus { threshold: f64, agreement: f64 },
@@ -749,6 +1136,17 @@ pub enum WorkflowError {
 
     #[error("Timeout exceeded for state '{0}'")]
     TimeoutExceeded(StateName),
+
+    #[error(
+        "Volume '{volume_name}' referenced in state '{state}' is not declared in spec.volumes"
+    )]
+    UndeclaredVolume {
+        state: StateName,
+        volume_name: String,
+    },
+
+    #[error("Invalid container state configuration in state '{state}': {detail}")]
+    InvalidContainerState { state: StateName, detail: String },
 }
 
 // ============================================================================
@@ -832,6 +1230,33 @@ mod tests {
     }
 
     #[test]
+    fn test_score_and_confidence_above_roundtrip() {
+        // Ensure ScoreAndConfidenceAbove can be serialized/deserialized and is
+        // distinct from ScoreAbove and ConfidenceAbove (regression guard for
+        // a previously reported TypeScript evaluateCondition dead-code issue).
+        let condition = TransitionCondition::ScoreAndConfidenceAbove { threshold: 0.85 };
+        let json = serde_json::to_string(&condition).unwrap();
+        assert!(
+            json.contains("score_and_confidence_above"),
+            "wrong tag: {}",
+            json
+        );
+        assert!(json.contains("0.85"), "threshold missing: {}", json);
+
+        let round_tripped: TransitionCondition = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                round_tripped,
+                TransitionCondition::ScoreAndConfidenceAbove { .. }
+            ),
+            "Round-trip produced wrong variant"
+        );
+        if let TransitionCondition::ScoreAndConfidenceAbove { threshold } = round_tripped {
+            assert!((threshold - 0.85).abs() < f64::EPSILON);
+        }
+    }
+
+    #[test]
     fn test_blackboard_operations() {
         let mut blackboard = Blackboard::new();
 
@@ -859,6 +1284,7 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states: HashMap::new(),
+            volumes: vec![],
         };
 
         let result = Workflow::new(metadata, spec);
@@ -893,12 +1319,163 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
+            volumes: vec![],
         };
 
         let result = Workflow::new(metadata, spec);
         assert!(matches!(
             result,
             Err(WorkflowError::InitialStateNotFound(_))
+        ));
+    }
+
+    #[test]
+    fn test_container_run_requires_non_empty_command() {
+        let metadata = WorkflowMetadata {
+            name: "container-command-required".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("BUILD").unwrap(),
+            WorkflowState {
+                kind: StateKind::ContainerRun {
+                    name: "build".to_string(),
+                    image: "rust:1.75".to_string(),
+                    image_pull_policy: None,
+                    command: vec![],
+                    env: HashMap::new(),
+                    workdir: None,
+                    volumes: vec![],
+                    resources: None,
+                    registry_credentials: None,
+                    retry: None,
+                    shell: false,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("BUILD").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_parallel_container_run_rejects_duplicate_step_names() {
+        let metadata = WorkflowMetadata {
+            name: "parallel-duplicate-steps".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TEST").unwrap(),
+            WorkflowState {
+                kind: StateKind::ParallelContainerRun {
+                    steps: vec![
+                        ContainerRunConfig {
+                            name: "lint".to_string(),
+                            image: "rust:1.75".to_string(),
+                            command: vec!["cargo".to_string(), "clippy".to_string()],
+                            env: HashMap::new(),
+                            workdir: None,
+                            volumes: vec![],
+                            resources: None,
+                            registry_credentials: None,
+                            shell: false,
+                        },
+                        ContainerRunConfig {
+                            name: "lint".to_string(),
+                            image: "rust:1.75".to_string(),
+                            command: vec!["cargo".to_string(), "fmt".to_string()],
+                            env: HashMap::new(),
+                            workdir: None,
+                            volumes: vec![],
+                            resources: None,
+                            registry_credentials: None,
+                            shell: false,
+                        },
+                    ],
+                    completion: ParallelCompletionStrategy::AllSucceed,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TEST").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
+        ));
+    }
+
+    #[test]
+    fn test_container_mount_path_must_be_absolute() {
+        let metadata = WorkflowMetadata {
+            name: "container-mount-path".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("BUILD").unwrap(),
+            WorkflowState {
+                kind: StateKind::ContainerRun {
+                    name: "build".to_string(),
+                    image: "rust:1.75".to_string(),
+                    image_pull_policy: None,
+                    command: vec!["cargo".to_string(), "build".to_string()],
+                    env: HashMap::new(),
+                    workdir: None,
+                    volumes: vec![ContainerVolumeMount {
+                        name: "workspace".to_string(),
+                        mount_path: "workspace".to_string(),
+                        read_only: false,
+                    }],
+                    resources: None,
+                    registry_credentials: None,
+                    retry: None,
+                    shell: false,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("BUILD").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+
+        let result = Workflow::new(metadata, spec);
+        assert!(matches!(
+            result,
+            Err(WorkflowError::InvalidContainerState { .. })
         ));
     }
 }

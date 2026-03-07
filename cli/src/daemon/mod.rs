@@ -30,11 +30,6 @@ pub mod server;
 pub use client::DaemonClient;
 pub use server::start_daemon;
 
-#[cfg(unix)]
-const PID_FILE: &str = "/var/run/aegis/aegis.pid";
-#[cfg(unix)]
-const PID_FILE_FALLBACK: &str = "/tmp/aegis.pid";
-
 #[derive(Debug, Clone)]
 pub enum DaemonStatus {
     Running { pid: u32, uptime: Option<u64> },
@@ -63,7 +58,7 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
     // We check the PID file primarily to return the PID in the Running status if available locally.
     // If not available (remote), we return 0 or another indicator.
     let pid_file = get_pid_file_path();
-    let local_pid = match std::fs::read_to_string(&pid_file) {
+    let local_pid = match tokio::fs::read_to_string(&pid_file).await {
         Ok(content) => content.trim().parse::<u32>().ok(),
         Err(_) => None,
     };
@@ -77,10 +72,8 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
                 .ok()
                 .and_then(|v| v["uptime_seconds"].as_u64());
 
-            // If we have a local PID, use it. Otherwise, we might be remote.
-            // For now, if local PID is missing but HTTP works, we assume "Running" but maybe without a known PID?
-            // Or we just don't return a PID in that case (DaemonStatus might need update or just use 0).
-            // Existing `DaemonStatus::Running` requires `pid: u32`. Let's use 0 if unknown/remote.
+            // If we have a local PID, use it. Otherwise, this may be a remote daemon.
+            // Existing `DaemonStatus::Running` requires `pid: u32`, so use 0 when unknown.
             let pid = local_pid.unwrap_or(0);
 
             Ok(DaemonStatus::Running { pid, uptime })
@@ -112,7 +105,7 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
                     })
                 } else {
                     // Stale PID file
-                    let _ = std::fs::remove_file(&pid_file);
+                    let _ = tokio::fs::remove_file(&pid_file).await;
                     Ok(DaemonStatus::Stopped)
                 }
             } else {
@@ -127,7 +120,8 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
 pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
     let pid_file = get_pid_file_path();
 
-    let pid = std::fs::read_to_string(&pid_file)
+    let pid = tokio::fs::read_to_string(&pid_file)
+        .await
         .context("Failed to read PID file")?
         .trim()
         .parse::<u32>()
@@ -143,7 +137,7 @@ pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
         for _ in 0.._timeout_secs {
             if !process_exists(pid) {
                 info!("Daemon stopped gracefully");
-                let _ = std::fs::remove_file(&pid_file);
+                let _ = tokio::fs::remove_file(&pid_file).await;
                 return Ok(());
             }
             sleep(Duration::from_secs(1)).await;
@@ -161,9 +155,10 @@ pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
     #[cfg(windows)]
     {
         // Use taskkill to kill the process by PID
-        let output = std::process::Command::new("taskkill")
+        let output = tokio::process::Command::new("taskkill")
             .args(&["/PID", &pid.to_string(), "/F"])
             .output()
+            .await
             .context("Failed to execute taskkill")?;
 
         if !output.status.success() {
@@ -176,46 +171,76 @@ pub async fn stop_daemon(_force: bool, _timeout_secs: u64) -> Result<()> {
         info!("Daemon stopped (killed via taskkill)");
     }
 
-    let _ = std::fs::remove_file(&pid_file);
+    let _ = tokio::fs::remove_file(&pid_file).await;
     Ok(())
 }
 
 fn get_pid_file_path() -> PathBuf {
     #[cfg(unix)]
     {
+        // SAFETY: `geteuid()` is always safe to call — it has no preconditions,
+        // never fails, and cannot cause undefined behaviour. A safe wrapper
+        // (e.g. `nix::unistd::geteuid()`) could be used instead if the `nix`
+        // crate is added as a dependency.
         let uid = unsafe { libc::geteuid() };
-        if uid == 0 {
-            PathBuf::from(PID_FILE)
-        } else {
-            PathBuf::from(PID_FILE_FALLBACK)
+
+        if let Some(explicit_file) = std::env::var_os("AEGIS_PID_FILE") {
+            return PathBuf::from(explicit_file);
         }
+
+        let base_dir = if uid == 0 {
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(std::env::temp_dir)
+        } else {
+            std::env::temp_dir()
+        };
+
+        base_dir.join("aegis").join("aegis.pid")
     }
 
     #[cfg(windows)]
     {
-        PathBuf::from("C:\\ProgramData\\aegis\\aegis.pid")
+        if let Some(explicit_file) = std::env::var_os("AEGIS_PID_FILE") {
+            return PathBuf::from(explicit_file);
+        }
+
+        let base = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        base.join("aegis").join("aegis.pid")
     }
 }
 
 fn process_exists(_pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(_pid as i32, 0) == 0 }
+        // SAFETY: `kill(pid, 0)` sends no signal and is the POSIX-standard way
+        // to test whether a process exists. The only precondition is that `pid`
+        // fits in `i32`; we guard against overflow with `try_from`.
+        let Ok(pid_i32) = i32::try_from(_pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid_i32, 0) == 0 }
     }
 
     #[cfg(windows)]
     {
-        // TODO: Implement Windows process check
+        // Windows implementation can be added when daemon process management is required.
         true
     }
 }
 
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> Result<()> {
-    unsafe {
-        if libc::kill(pid as i32, signal) != 0 {
-            anyhow::bail!("Failed to send signal {} to process {}", signal, pid);
-        }
+    let pid_i32 = i32::try_from(pid)
+        .map_err(|_| anyhow::anyhow!("PID {} overflows i32; cannot send signal", pid))?;
+    // SAFETY: `libc::kill` is safe when `pid_i32` is a valid process ID (which
+    // we have just verified fits in `i32`) and `signal` is a valid signal
+    // number supplied by the caller from named `libc::SIG*` constants.
+    let rc = unsafe { libc::kill(pid_i32, signal) };
+    if rc != 0 {
+        anyhow::bail!("Failed to send signal {} to process {}", signal, pid);
     }
     Ok(())
 }
@@ -223,6 +248,10 @@ fn send_signal(pid: u32, signal: i32) -> Result<()> {
 /// Write PID file
 pub fn write_pid_file(pid: u32) -> Result<()> {
     let pid_file = get_pid_file_path();
+    if let Some(parent) = pid_file.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create PID directory: {:?}", parent))?;
+    }
     std::fs::write(&pid_file, pid.to_string())
         .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
     info!("Wrote PID file: {:?}", pid_file);

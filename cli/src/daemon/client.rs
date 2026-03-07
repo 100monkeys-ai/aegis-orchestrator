@@ -37,10 +37,15 @@ impl DaemonClient {
         Ok(Self { client, base_url })
     }
 
-    pub async fn deploy_agent(&self, manifest: AgentManifest) -> Result<Uuid> {
+    pub async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<Uuid> {
+        let url = if force {
+            format!("{}/v1/agents?force=true", self.base_url)
+        } else {
+            format!("{}/v1/agents", self.base_url)
+        };
         let response = self
             .client
-            .post(format!("{}/v1/agents", self.base_url))
+            .post(url)
             .json(&manifest)
             .send()
             .await
@@ -547,12 +552,16 @@ impl DaemonClient {
     pub async fn deploy_workflow(&self, file: &std::path::Path) -> Result<()> {
         let workflow_yaml =
             std::fs::read_to_string(file).context("Failed to read workflow file")?;
+        self.deploy_workflow_manifest(&workflow_yaml).await
+    }
 
+    /// Deploy a workflow from YAML content.
+    pub async fn deploy_workflow_manifest(&self, workflow_yaml: &str) -> Result<()> {
         let response = self
             .client
             .post(format!("{}/v1/workflows", self.base_url))
             .header("Content-Type", "application/x-yaml")
-            .body(workflow_yaml)
+            .body(workflow_yaml.to_string())
             .send()
             .await
             .context("Failed to deploy workflow")?;

@@ -35,6 +35,8 @@
 //! | `Policy` | BC-4 | — |
 //! | `Stimulus` | BC-8 | ADR-021 |
 //! | `ImageManagement` | BC-2 | ADR-045 |
+//! | `Iam` | BC-13 | ADR-041 |
+//! | `Secrets` | BC-11 | ADR-034 |
 //!
 //! ## Phase Notes
 //!
@@ -52,9 +54,9 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::events::{
-    AgentLifecycleEvent, ExecutionEvent, ImageManagementEvent, LearningEvent, MCPToolEvent,
-    PolicyEvent, SmcpEvent, StimulusEvent, StorageEvent, ValidationEvent, VolumeEvent,
-    WorkflowEvent,
+    AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
+    LearningEvent, MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
+    ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -79,6 +81,12 @@ pub enum DomainEvent {
     Stimulus(StimulusEvent),
     /// BC-2 container image pull lifecycle events (ADR-045)
     ImageManagement(ImageManagementEvent),
+    /// BC-13 IAM & Identity Federation events (ADR-041)
+    Iam(IamEvent),
+    /// BC-11 Secrets & Identity Management events (ADR-034)
+    Secrets(SecretEvent),
+    /// BC-3 CI/CD container step lifecycle events (ADR-050)
+    ContainerRun(ContainerRunEvent),
 }
 
 /// Event bus for publishing and subscribing to domain events
@@ -148,9 +156,24 @@ impl EventBus {
         self.publish(DomainEvent::Stimulus(event));
     }
 
+    /// Publish a CI/CD container step event (ADR-050)
+    pub fn publish_container_run_event(&self, event: ContainerRunEvent) {
+        self.publish(DomainEvent::ContainerRun(event));
+    }
+
     /// Publish a container image management event (BC-2 ADR-045)
     pub fn publish_image_event(&self, event: ImageManagementEvent) {
         self.publish(DomainEvent::ImageManagement(event));
+    }
+
+    /// Publish an IAM event (BC-13 ADR-041)
+    pub fn publish_iam_event(&self, event: IamEvent) {
+        self.publish(DomainEvent::Iam(event));
+    }
+
+    /// Publish a secrets management event (BC-11 ADR-034)
+    pub fn publish_secret_event(&self, event: SecretEvent) {
+        self.publish(DomainEvent::Secrets(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -396,6 +419,9 @@ impl AgentEventReceiver {
             },
             DomainEvent::Stimulus(_) => false, // Stimulus events are system-wide, not per-agent
             DomainEvent::ImageManagement(_) => false, // Image management events are system-wide, not per-agent
+            DomainEvent::Iam(_) => false,             // IAM events are system-wide, not per-agent
+            DomainEvent::Secrets(_) => false, // Secrets events are system-wide, not per-agent
+            DomainEvent::ContainerRun(_) => false, // ContainerRun events are keyed by execution_id, not agent_id
         }
     }
 }
@@ -468,11 +494,19 @@ mod tests {
         event_bus.publish_agent_event(event.clone());
 
         let received = receiver.recv().await.unwrap();
+        assert!(
+            matches!(
+                received,
+                DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { .. })
+            ),
+            "Expected AgentDeployed event, got {:?}",
+            received
+        );
         let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
             agent_id: id, ..
         }) = received
         else {
-            panic!("Expected AgentDeployed event, got {:?}", received);
+            return;
         };
         assert_eq!(id, agent_id);
     }
@@ -501,11 +535,16 @@ mod tests {
         });
 
         let received = receiver.recv().await.unwrap();
+        assert!(
+            matches!(received, ExecutionEvent::ExecutionStarted { .. }),
+            "Expected ExecutionStarted event, got {:?}",
+            received
+        );
         let ExecutionEvent::ExecutionStarted {
             execution_id: id, ..
         } = received
         else {
-            panic!("Expected ExecutionStarted event, got {:?}", received);
+            return;
         };
         assert_eq!(id, execution_id);
     }

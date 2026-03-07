@@ -1,0 +1,89 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "hello-world"
+  version: "1.0.0"
+  description: "Introductory agent that writes, tests, and validates a Python function"
+  labels:
+    role: "worker"
+    category: "demo"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "smart"
+    isolation: "inherit"
+
+  task:
+    instruction: |
+      You are a Python programming assistant. Given a task description, write a
+      correct Python function, save it to /workspace/solution.py, write a test
+      script to /workspace/test_solution.py that exercises the function, and
+      run the tests. Fix any errors until all tests pass.
+    prompt_template: |
+      {{instruction}}
+
+      Task: {{input}}
+
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+      mount_path: "/workspace"
+      access_mode: "read-write"
+      size_limit: "1Gi"
+      ttl_hours: 1
+
+  execution:
+    mode: "iterative"         # Enable the 100monkeys refinement loop
+    max_iterations: 5
+    iteration_timeout: "180s" # Per-iteration timeout (180 seconds)
+    memory: false             # No Cortex memory needed for a hello-world demo
+
+    validation:
+      - type: exit_code
+        expected: 0
+
+    tool_validation:
+          - type: semantic
+            judge_agent: "tool-call-policy-judge"
+            criteria: |
+              Strictly assess the proposed tool call for policy compliance, safety, and task alignment.
+              
+              1. POLICY ENFORCEMENT (CRITICAL): The agent MUST NOT use `cmd.run` as a substitute for purpose-built `fs.*` tools. 
+                - Reject `cmd.run` with `cat`, `head`, or `tail` (must use `fs.read`).
+                - Reject `cmd.run` with `tee` or redirect `>` (must use `fs.write` or `fs.edit`).
+                - Reject `cmd.run` with `grep` or `rg` (must use `fs.grep`).
+                - Reject `cmd.run` with `ls`, `find`, `mkdir`, or `rm` (must use `fs.list`, `fs.glob`, `fs.create_dir`, `fs.delete`).
+              2. TOOL SPECIFICITY: Ensure the most granular, appropriate tool is selected (e.g., using `fs.edit` instead of overwriting a whole file with `fs.write` for a 1-line change).
+              3. EXECUTION SAFETY: Verify the arguments do not pose a catastrophic security risk (e.g., unbounded recursive deletion, exposing secrets, or running untrusted internet binaries).
+              4. INTENT ALIGNMENT: Confirm the requested operation logically and directly advances the agent's current task without unnecessary detours.
+            min_score: 0.85
+            timeout_seconds: 60
+
+  security:
+    network:
+      mode: "allow"
+      allowlist: []  # LLM routing is handled by the orchestrator — agents do not call LLM APIs directly
+
+    filesystem:
+      read:
+        - "/workspace"
+      write:
+        - "/workspace"
+
+    resources:
+      cpu: 500          # 0.5 CPU core
+      memory: "512Mi"
+      timeout: "600s"
+
+  tools:
+    - "cmd.run"             # Execute Python scripts in the container
+    - "fs.write"            # Write solution and test files
+    - "fs.read"             # Read files for verification
+    - "fs.list"             # List files in the workspace
+    - "fs.create_dir"       # Create directories
+    - "fs.delete"           # Delete files
+    - "fs.edit"             # Edit files
+    - "fs.multi_edit"       # Edit multiple items in file

@@ -91,7 +91,7 @@ impl Default for ToolInvocationId {
 pub struct CredentialRef {
     /// Which backend holds the credential.
     pub store_type: CredentialStoreType,
-    /// Key or path within that backend (e.g. `"env:GMAIL_TOKEN"` or `"vault:tenant/kv/gmail"`).
+    /// Key or path within that backend (e.g. `"env:GMAIL_TOKEN"` or `"secret:tenant/kv/gmail"`).
     pub key: String,
 }
 
@@ -101,8 +101,8 @@ pub enum CredentialStoreType {
     /// Read from the orchestrator process's environment variables.
     /// Suitable for development; not recommended for production.
     Environment,
-    /// Read from OpenBao (ADR-034). Requires Phase 4 implementation.
-    OpenBao,
+    /// Read from the orchestrator-managed secret store ACL (ADR-034).
+    SecretStore,
 }
 
 impl CredentialRef {
@@ -113,10 +113,10 @@ impl CredentialRef {
         }
     }
 
-    pub fn from_vault(path: &str) -> Self {
+    pub fn from_secret_store(path: &str) -> Self {
         Self {
-            store_type: CredentialStoreType::OpenBao,
-            key: format!("vault:{}", path),
+            store_type: CredentialStoreType::SecretStore,
+            key: format!("secret:{}", path),
         }
     }
 }
@@ -229,6 +229,12 @@ pub struct ToolServer {
     pub args: Vec<String>,
     pub capabilities: Vec<String>,
 
+    /// Set of tool names for which the inner-loop semantic judge should be skipped.
+    /// Derived from `CapabilityConfig.skip_judge` entries in the node configuration.
+    /// See `NODE_CONFIGURATION_SPEC_V1.md § spec.mcp_servers[].capabilities[].skip_judge`.
+    #[serde(default)]
+    pub skip_judge_tools: std::collections::HashSet<String>,
+
     // Lifecycle
     pub status: ToolServerStatus,
     pub process_id: Option<u32>,
@@ -236,7 +242,10 @@ pub struct ToolServer {
     pub last_health_check: Option<DateTime<Utc>>,
 
     // Security
-    pub credentials: Option<CredentialRef>,
+    /// Credentials to inject as environment variables before spawning the server
+    /// process. Maps `ENV_VAR_NAME → CredentialRef` so multiple credentials can
+    /// be provided (e.g. `GITHUB_TOKEN`, `OPENAI_API_KEY` for the same server).
+    pub credentials: HashMap<String, CredentialRef>,
     pub resource_limits: ResourceLimits,
 
     // Metadata
@@ -248,15 +257,30 @@ impl ToolServer {
     pub fn from_config(config: &crate::domain::node_config::McpServerConfig) -> Self {
         let execution_mode = ExecutionMode::Local;
 
-        let credentials = config.credentials.iter().next().map(|(_, v)| {
-            if let Some(env_val) = v.strip_prefix("env:") {
-                CredentialRef::from_env(env_val)
-            } else if let Some(vault_val) = v.strip_prefix("vault:") {
-                CredentialRef::from_vault(vault_val)
-            } else {
-                CredentialRef::from_env(v)
-            }
-        });
+        let credentials: HashMap<String, CredentialRef> = config
+            .credentials
+            .iter()
+            .map(|(env_key, v)| {
+                let cred_ref = if let Some(env_val) = v.strip_prefix("env:") {
+                    CredentialRef::from_env(env_val)
+                } else if let Some(secret_val) = v.strip_prefix("secret:") {
+                    CredentialRef::from_secret_store(secret_val)
+                } else {
+                    CredentialRef::from_env(v)
+                };
+                (env_key.clone(), cred_ref)
+            })
+            .collect();
+
+        let capabilities: Vec<String> =
+            config.capabilities.iter().map(|c| c.name.clone()).collect();
+
+        let skip_judge_tools: std::collections::HashSet<String> = config
+            .capabilities
+            .iter()
+            .filter(|c| c.skip_judge)
+            .map(|c| c.name.clone())
+            .collect();
 
         Self {
             id: ToolServerId::new(),
@@ -264,7 +288,8 @@ impl ToolServer {
             execution_mode,
             executable_path: PathBuf::from(&config.executable),
             args: config.args.clone(),
-            capabilities: config.capabilities.clone(),
+            capabilities,
+            skip_judge_tools,
             status: ToolServerStatus::Stopped,
             process_id: None,
             health_check_interval: Duration::from_secs(config.health_check.interval_seconds),
@@ -277,6 +302,12 @@ impl ToolServer {
             started_at: None,
             stopped_at: None,
         }
+    }
+
+    /// Returns `true` if the operator has flagged this specific tool to skip the
+    /// inner-loop semantic judge (see `CapabilityConfig.skip_judge` in node config).
+    pub fn is_skip_judge(&self, tool_name: &str) -> bool {
+        self.skip_judge_tools.contains(tool_name)
     }
 
     pub fn start(&mut self) -> Result<MCPToolEvent, DomainError> {
@@ -673,11 +704,12 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test.*".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Stopped,
             process_id: None,
             health_check_interval: Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,

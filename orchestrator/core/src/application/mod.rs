@@ -40,15 +40,18 @@ pub mod attestation_service;
 pub mod execution;
 pub mod lifecycle;
 pub mod tool_invocation_service;
+pub mod tools;
 pub mod validation_service;
 
 pub mod policy;
+pub mod ports;
 // pub mod workflow_engine; Removed during Temporal integration
 pub mod complete_workflow_execution;
 pub mod inner_loop_service;
 pub mod nfs_gateway;
 pub mod register_workflow;
 pub mod repository_factory;
+pub mod run_container_step;
 pub mod start_workflow_execution;
 pub mod stimulus;
 pub mod storage_event_persister;

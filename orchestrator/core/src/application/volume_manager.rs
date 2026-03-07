@@ -165,6 +165,7 @@ pub struct StandardVolumeService {
     storage_provider: Arc<dyn StorageProvider>,
     event_bus: Arc<EventBus>,
     filer_endpoint: FilerEndpoint,
+    storage_mode: String,
 }
 
 impl StandardVolumeService {
@@ -173,6 +174,7 @@ impl StandardVolumeService {
         storage_provider: Arc<dyn StorageProvider>,
         event_bus: Arc<EventBus>,
         filer_url: String,
+        storage_mode: impl Into<String>,
     ) -> Result<Self> {
         let filer_endpoint = FilerEndpoint::new(filer_url).context("Invalid filer URL")?;
 
@@ -181,6 +183,7 @@ impl StandardVolumeService {
             storage_provider,
             event_bus,
             filer_endpoint,
+            storage_mode: storage_mode.into(),
         })
     }
 }
@@ -200,14 +203,30 @@ impl VolumeService for StandardVolumeService {
             name, tenant_id, storage_class, size_limit_mb
         );
 
-        // Determine backend based on inputs
-        // For standard volume service creating standard volumes, we use SeaweedFS
-        // Construct remote path: /aegis/volumes/{tenant_id}/{volume_id}
+        // Construct storage-relative path: /aegis/volumes/{tenant_id}/{volume_id}
         let volume_id = VolumeId::new();
         let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
-        let backend = VolumeBackend::SeaweedFS {
-            filer_endpoint: self.filer_endpoint.clone(),
-            remote_path: remote_path.clone(),
+        let backend = match self.storage_mode.as_str() {
+            "seaweedfs" => VolumeBackend::SeaweedFS {
+                filer_endpoint: self.filer_endpoint.clone(),
+                remote_path: remote_path.clone(),
+            },
+            // local_host still uses storage-relative paths; the provider maps
+            // them into the configured host mount point.
+            "local_host" => VolumeBackend::HostPath {
+                path: PathBuf::from(remote_path.clone()),
+            },
+            "opendal_memory" | "opendal" => VolumeBackend::OpenDal {
+                provider: "memory".to_string(),
+                config: None,
+                cache_path: None,
+            },
+            other => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported storage mode for standard volume creation: {}",
+                    other
+                ));
+            }
         };
 
         // Create volume aggregate
@@ -227,13 +246,13 @@ impl VolumeService for StandardVolumeService {
             expires_at: storage_class.calculate_expiry(Utc::now()),
         };
 
-        // Create directory on SeaweedFS
+        // Provision directory on the selected storage backend.
         self.storage_provider
             .create_directory(&remote_path)
             .await
             .context("Failed to create volume directory on storage backend")?;
 
-        // Set quota on SeaweedFS
+        // Set backend quota (no-op for providers that do not enforce quotas).
         self.storage_provider
             .set_quota(&remote_path, size_limit_bytes)
             .await
@@ -593,7 +612,7 @@ impl VolumeService for StandardVolumeService {
             // Attempt to create volume
             let volume_id = match spec.volume_type.as_str() {
                 "seaweedfs" | "local_host" | "opendal_memory" => {
-                    // Try SeaweedFS / Local / Default standard workflow for now
+                    // Handle SeaweedFS / Local / Default standard workflow.
                     match self
                         .create_volume(
                             spec.name.clone(),
@@ -607,8 +626,9 @@ impl VolumeService for StandardVolumeService {
                         Ok(id) => id,
                         Err(e) => {
                             return Err(anyhow::anyhow!(
-                                "SeaweedFS volume creation failed for '{}': {}",
+                                "Volume creation failed for '{}' (storage_mode='{}'): {}",
                                 spec.name,
+                                storage_mode,
                                 e
                             ));
                         }
@@ -616,7 +636,7 @@ impl VolumeService for StandardVolumeService {
                 }
                 "opendal" | "hostPath" | "smcp" => {
                     // Custom non-standard volume types.
-                    // For now, we will construct the backend appropriately and store directly to bypass standard seaweedsfs creation routine.
+                    // Construct backend directly and persist without the standard SeaweedFS routine.
                     let backend = match spec.volume_type.as_str() {
                         "opendal" => VolumeBackend::OpenDal {
                             provider: spec.provider.clone().unwrap_or_else(|| "s3".to_string()),
@@ -629,7 +649,13 @@ impl VolumeService for StandardVolumeService {
                                     .as_ref()
                                     .and_then(|c| c.get("path"))
                                     .and_then(|v| v.as_str())
-                                    .unwrap_or("/tmp/aegis"),
+                                    .map(std::borrow::ToOwned::to_owned)
+                                    .unwrap_or_else(|| {
+                                        std::env::temp_dir()
+                                            .join("aegis")
+                                            .to_string_lossy()
+                                            .into_owned()
+                                    }),
                             ),
                         },
                         "smcp" => VolumeBackend::Smcp {
@@ -648,7 +674,12 @@ impl VolumeService for StandardVolumeService {
                                 .and_then(|v| VolumeId::from_string(v).ok())
                                 .unwrap_or_else(VolumeId::new),
                         },
-                        _ => unreachable!(),
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Invalid custom volume type '{}'",
+                                spec.volume_type
+                            ));
+                        }
                     };
 
                     let volume_id = VolumeId::new();
@@ -746,12 +777,12 @@ mod tests {
     use std::collections::HashMap;
     use tokio::sync::Mutex;
 
-    // Mock VolumeRepository for testing
-    struct MockVolumeRepository {
+    // Test repository for volume persistence behavior.
+    struct TestVolumeRepository {
         volumes: Arc<Mutex<HashMap<VolumeId, Volume>>>,
     }
 
-    impl MockVolumeRepository {
+    impl TestVolumeRepository {
         fn new() -> Self {
             Self {
                 volumes: Arc::new(Mutex::new(HashMap::new())),
@@ -760,7 +791,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl VolumeRepository for MockVolumeRepository {
+    impl VolumeRepository for TestVolumeRepository {
         async fn save(&self, volume: &Volume) -> Result<(), RepositoryError> {
             let mut volumes = self.volumes.lock().await;
             volumes.insert(volume.id, volume.clone());
@@ -814,10 +845,10 @@ mod tests {
 
     fn create_test_service() -> (
         StandardVolumeService,
-        Arc<MockVolumeRepository>,
+        Arc<TestVolumeRepository>,
         Arc<MockStorageProvider>,
     ) {
-        let repository = Arc::new(MockVolumeRepository::new());
+        let repository = Arc::new(TestVolumeRepository::new());
         let storage_provider = Arc::new(MockStorageProvider::new());
         let event_bus = Arc::new(EventBus::with_default_capacity());
 
@@ -826,6 +857,7 @@ mod tests {
             storage_provider.clone(),
             event_bus,
             "http://localhost:8888".to_string(),
+            "seaweedfs",
         )
         .expect("Failed to create test service");
 
@@ -862,7 +894,7 @@ mod tests {
         assert_eq!(volume.size_limit_bytes, 100 * 1024 * 1024);
 
         // Verify storage provider calls
-        let directories = storage_provider.directories.lock().unwrap();
+        let directories = storage_provider.directories.lock().await;
         let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
         assert!(directories.contains_key(&remote_path));
     }
@@ -959,7 +991,7 @@ mod tests {
         );
 
         // Verify storage provider deleted directory
-        let directories = storage_provider.directories.lock().unwrap();
+        let directories = storage_provider.directories.lock().await;
         assert!(
             !directories.contains_key(&remote_path),
             "Directory should be deleted"

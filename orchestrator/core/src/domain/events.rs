@@ -22,6 +22,8 @@
 //! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
+//! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
+//! | [`SecretEvent`] | BC-11 Secrets & Identity | Secret access, dynamic credential generation, and access denial audit (ADR-034) |
 //!
 //! ## Phase 2 Note
 //!
@@ -32,6 +34,7 @@ use crate::domain::agent::{AgentId, AgentManifest, ImagePullPolicy};
 use crate::domain::dispatch::DispatchId;
 use crate::domain::execution::{CodeDiff, ExecutionId, IterationError};
 use crate::domain::runtime::InstanceId;
+use crate::domain::secrets::AccessContext;
 use crate::domain::volume::{StorageClass, VolumeId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -628,6 +631,80 @@ pub enum MCPToolEvent {
     },
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// BC-3 CI/CD Container Step Events  (ADR-050)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Reason a ContainerRun or ParallelContainerRun step could not complete (ADR-050).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContainerRunFailureReason {
+    /// The container exited with a non-zero exit code
+    NonZeroExitCode { code: i32 },
+    /// The step exceeded the configured wall-clock timeout
+    TimeoutExpired { timeout_secs: u64 },
+    /// The container image could not be pulled from the registry
+    ImagePullFailed { image: String, error: String },
+    /// A required volume could not be mounted
+    VolumeMountFailed { volume: String, error: String },
+    /// The container was killed due to memory or CPU exhaustion
+    ResourceExhausted { detail: String },
+}
+
+/// Domain events for deterministic CI/CD container steps (BC-3, ADR-050).
+///
+/// Published by [`crate::application::run_container_step::RunContainerStepUseCase`].
+/// Consumed by:
+/// - The Synapse UI for real-time CI/CD step visualization alongside agent iterations
+/// - Cortex for learning which build/test patterns succeed reliably
+/// - Audit trail (SOC 2 / compliance)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ContainerRunEvent {
+    /// A container step was started — image pull and container creation initiated
+    ContainerRunStarted {
+        execution_id: ExecutionId,
+        /// Logical workflow state name (e.g., "BUILD")
+        state_name: String,
+        /// Human-readable step label (e.g., "Compile and Build")
+        step_name: String,
+        image: String,
+        command: Vec<String>,
+        started_at: DateTime<Utc>,
+    },
+
+    /// A container step completed successfully (exit code 0)
+    ContainerRunCompleted {
+        execution_id: ExecutionId,
+        state_name: String,
+        step_name: String,
+        exit_code: i32,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
+        duration_ms: u64,
+        completed_at: DateTime<Utc>,
+    },
+
+    /// A container step failed (non-zero exit, timeout, image pull failure, etc.)
+    ContainerRunFailed {
+        execution_id: ExecutionId,
+        state_name: String,
+        step_name: String,
+        reason: ContainerRunFailureReason,
+        failed_at: DateTime<Utc>,
+    },
+
+    /// A ParallelContainerRun state finished aggregating all step results
+    ParallelContainerRunAggregated {
+        execution_id: ExecutionId,
+        state_name: String,
+        total_steps: u32,
+        succeeded: u32,
+        failed: u32,
+        /// Serialized `ParallelCompletionStrategy` variant name
+        strategy: String,
+        aggregated_at: DateTime<Utc>,
+    },
+}
+
 /// Commands executed inside the container via Dispatch Protocol (ADR-040).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandExecutionEvent {
@@ -752,6 +829,196 @@ pub enum StimulusEvent {
     },
 }
 
+/// IAM & Identity Federation events (BC-13, ADR-041).
+///
+/// Published by `StandardOIDCIamService` during token validation,
+/// realm lifecycle operations, and JWKS cache refresh cycles.
+/// Consumed by:
+/// - Cortex for security pattern learning (e.g. detecting brute-force token validation failures)
+/// - Control Plane for IAM audit dashboard
+/// - SOC 2 audit trail export (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum IamEvent {
+    // ─── Authentication Events ────────────────────────────────────────────────
+    /// A JWT was successfully validated against a OIDC realm's JWKS.
+    UserAuthenticated {
+        sub: String,
+        realm_slug: String,
+        /// "consumer_user" | "operator" | "service_account" | "tenant_user"
+        identity_kind: String,
+        authenticated_at: DateTime<Utc>,
+    },
+    /// JWT validation failed (bad signature, expired, unknown issuer, etc.).
+    TokenValidationFailed {
+        /// None if the issuer claim could not be parsed.
+        realm_slug: Option<String>,
+        reason: String,
+        attempted_at: DateTime<Utc>,
+    },
+
+    // ─── Realm Lifecycle ──────────────────────────────────────────────────────
+    /// A new realm was registered in the trusted realm set.
+    RealmRegistered {
+        realm_slug: String,
+        /// "system" | "consumer" | "tenant"
+        realm_kind: String,
+        issuer_url: String,
+        registered_at: DateTime<Utc>,
+    },
+    /// A tenant realm was provisioned (Phase 2 — OIDC Admin API + secret namespace).
+    TenantRealmProvisioned {
+        tenant_slug: String,
+        realm_id: String,
+        /// Mirrors ADR-034 namespace alignment.
+        secret_namespace: String,
+        provisioned_at: DateTime<Utc>,
+    },
+
+    // ─── Service Account Lifecycle ────────────────────────────────────────────
+    /// A service account OIDC client was created.
+    ServiceAccountProvisioned {
+        client_id: String,
+        realm_slug: String,
+        /// "client_credentials" | "authorization_code_pkce"
+        grant_type: String,
+        provisioned_at: DateTime<Utc>,
+    },
+    /// A service account was revoked.
+    ServiceAccountRevoked {
+        client_id: String,
+        realm_slug: String,
+        reason: String,
+        revoked_at: DateTime<Utc>,
+    },
+
+    // ─── JWKS Cache Events ────────────────────────────────────────────────────
+    /// The JWKS key set for a realm was successfully refreshed.
+    JwksCacheRefreshed {
+        realm_slug: String,
+        key_count: usize,
+        refreshed_at: DateTime<Utc>,
+    },
+    /// JWKS refresh failed (network error, invalid response, etc.).
+    JwksCacheRefreshFailed {
+        realm_slug: String,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BC-11 Secrets & Identity Management Events  (ADR-034)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Domain events for the Secrets & Identity Management bounded context (BC-11).
+///
+/// These events form the cryptographic audit trail required by ADR-034 for
+/// every secret access, dynamic credential generation, and policy denial.
+/// They are consumed by the Cortex and the compliance reporting pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum SecretEvent {
+    // ─── Static Secret Access ─────────────────────────────────────────────────
+    /// A static secret was successfully read from the store.
+    SecretRetrieved {
+        engine: String,
+        path: String,
+        access_context: AccessContext,
+        retrieved_at: DateTime<Utc>,
+    },
+    /// A static secret was written (created or updated) in the store.
+    SecretWritten {
+        engine: String,
+        path: String,
+        access_context: AccessContext,
+        written_at: DateTime<Utc>,
+    },
+    // ─── Dynamic Credentials ──────────────────────────────────────────────────
+    /// A short-lived dynamic secret was generated by the database/PKI engine.
+    DynamicSecretGenerated {
+        engine: String,
+        role: String,
+        lease_id: String,
+        lease_duration_secs: u64,
+        access_context: AccessContext,
+        generated_at: DateTime<Utc>,
+    },
+    /// An active lease was successfully renewed, extending its TTL.
+    LeaseRenewed {
+        lease_id: String,
+        new_duration_secs: u64,
+        access_context: AccessContext,
+        renewed_at: DateTime<Utc>,
+    },
+    /// A lease was explicitly revoked before its natural expiry.
+    LeaseRevoked {
+        lease_id: String,
+        access_context: AccessContext,
+        revoked_at: DateTime<Utc>,
+    },
+    // ─── Security Violations ──────────────────────────────────────────────────
+    /// A secret access was denied (permission error, missing path, policy block).
+    SecretAccessDenied {
+        engine: Option<String>,
+        path: Option<String>,
+        reason: String,
+        access_context: AccessContext,
+        denied_at: DateTime<Utc>,
+    },
+}
+
+#[cfg(test)]
+mod tests_iam {
+    use super::*;
+
+    #[test]
+    fn test_iam_event_user_authenticated_serialization() {
+        let event = IamEvent::UserAuthenticated {
+            sub: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            identity_kind: "consumer_user".to_string(),
+            authenticated_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: IamEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, IamEvent::UserAuthenticated { .. }),
+            "Expected UserAuthenticated variant"
+        );
+        let IamEvent::UserAuthenticated {
+            sub, realm_slug, ..
+        } = deserialized
+        else {
+            return;
+        };
+        assert_eq!(sub, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(realm_slug, "zaru-consumer");
+    }
+
+    #[test]
+    fn test_iam_event_token_validation_failed_serialization() {
+        let event = IamEvent::TokenValidationFailed {
+            realm_slug: Some("aegis-system".to_string()),
+            reason: "JWT expired".to_string(),
+            attempted_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("TokenValidationFailed"));
+        assert!(json.contains("JWT expired"));
+    }
+
+    #[test]
+    fn test_iam_event_jwks_cache_refreshed_serialization() {
+        let event = IamEvent::JwksCacheRefreshed {
+            realm_slug: "aegis-system".to_string(),
+            key_count: 2,
+            refreshed_at: Utc::now(),
+        };
+        let json = serde_json::to_string(&event).unwrap();
+        assert!(json.contains("JwksCacheRefreshed"));
+        assert!(json.contains("\"key_count\":2"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,11 +1042,16 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, StorageEvent::FileOpened { .. }),
+            "Expected FileOpened variant, got: {:?}",
+            deserialized
+        );
         let StorageEvent::FileOpened {
             path, open_mode, ..
         } = deserialized
         else {
-            panic!("Expected FileOpened variant, got: {:?}", deserialized);
+            return;
         };
         assert_eq!(path, "/workspace/file.txt");
         assert_eq!(open_mode, "read");
@@ -811,8 +1083,13 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ExecutionEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, ExecutionEvent::ExecutionStarted { .. }),
+            "Expected ExecutionStarted variant, got: {:?}",
+            deserialized
+        );
         let ExecutionEvent::ExecutionStarted { execution_id, .. } = deserialized else {
-            panic!("Expected ExecutionStarted variant, got: {:?}", deserialized);
+            return;
         };
         assert_eq!(execution_id, exec_id);
     }
@@ -861,14 +1138,19 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: ValidationEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(
+                deserialized,
+                ValidationEvent::GradientValidationPerformed { .. }
+            ),
+            "Expected GradientValidationPerformed variant, got: {:?}",
+            deserialized
+        );
         let ValidationEvent::GradientValidationPerformed {
             score, confidence, ..
         } = deserialized
         else {
-            panic!(
-                "Expected GradientValidationPerformed variant, got: {:?}",
-                deserialized
-            );
+            return;
         };
         assert_eq!(score, 0.9);
         assert_eq!(confidence, 0.85);
@@ -928,11 +1210,13 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
+        assert!(
+            matches!(deserialized, PolicyEvent::PolicyViolationBlocked { .. }),
+            "Expected PolicyViolationBlocked variant, got: {:?}",
+            deserialized
+        );
         let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized else {
-            panic!(
-                "Expected PolicyViolationBlocked variant, got: {:?}",
-                deserialized
-            );
+            return;
         };
         assert_eq!(violation_type, "network");
     }

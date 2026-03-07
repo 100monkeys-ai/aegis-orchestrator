@@ -7,11 +7,13 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Core domain and runtime primitives for the 100monkeys.ai AEGIS orchestrator"
+readme = "README.md"
 
 # Include proto-vendor in published packages (created by CI)
 include = [
     "src/**/*.rs",
     "Cargo.toml",
+    "README.md",
     "build.rs",
     "proto-vendor/**/*.proto",
 ]
@@ -59,12 +61,19 @@ bincode = { workspace = true }
 parking_lot = "0.12"
 
 url = "2.5.8"
+scraper = "0.20"
+html2md = "0.2"
+urlencoding = "2.1"
 
 # Cryptography & Security (SMCP)
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 base64 = "0.22"
 jsonwebtoken = "10.3.0"
 opendal = "0.52.0"
+vaultrs = "0.7"
+
+# Secrets Manager (ADR-034)
+lru = "0.12"
 
 [dev-dependencies]
 tokio-test = "0.4"

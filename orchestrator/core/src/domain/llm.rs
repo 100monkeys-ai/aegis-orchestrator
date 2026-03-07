@@ -79,6 +79,9 @@ pub struct ChatMessage {
     /// Tool call ID (required when `role == "tool"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Tool calls requested by the assistant (required when `role == "assistant"` and it generated tool calls).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ChatToolCall>>,
 }
 
 /// JSON Schema description of a single tool available to the LLM.

@@ -26,6 +26,9 @@ fn test_map_100monkeys_workflow() {
                 agent: "coder".to_string(),
                 input: "Task: {{task}}".to_string(),
                 isolation: Some(IsolationMode::Docker),
+                judges: vec![],
+                max_iterations: None,
+                pre_execution_validator: None,
             },
             transitions: vec![TransitionRule {
                 condition: TransitionCondition::OnSuccess,
@@ -80,6 +83,7 @@ fn test_map_100monkeys_workflow() {
             initial_state: StateName::new("GENERATE").unwrap(),
             context: HashMap::from([("task".to_string(), serde_json::json!("Write fibonacci"))]),
             states,
+            volumes: vec![],
         },
     )
     .unwrap();

@@ -21,13 +21,14 @@
 //! | `POST` | `/v1/smcp/attest` | SMCP attestation handshake (ADR-035) |
 //! | `POST` | `/v1/smcp/invoke` | SMCP tool invocation (ADR-033) |
 //! | `POST` | `/v1/dispatch-gateway` | Dispatch gateway — inner loop orchestration (ADR-038) |
-//! | `POST` | `/v1/stimuli` | Stimulus ingestion — Keycloak Bearer auth (ADR-021) |
+//! | `POST` | `/v1/stimuli` | Stimulus ingestion — IAM/OIDC Bearer auth (ADR-021) |
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
 
 use crate::application::execution::ExecutionService;
 use crate::application::inner_loop_service::InnerLoopService;
 use crate::application::stimulus::StimulusService;
+use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
@@ -56,6 +57,8 @@ pub struct AppState {
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     /// BC-8: HMAC secret provider for webhook requests. Defaults to EnvWebhookSecretProvider.
     pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
+    /// SMCP tool invocation service (ADR-033). Optional until wired.
+    pub tool_invocation_service: Option<Arc<ToolInvocationService>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -77,6 +80,7 @@ pub fn app(
         inner_loop_service: None,
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+        tool_invocation_service: None,
     });
 
     Router::new()
@@ -111,6 +115,7 @@ pub fn app_with_inner_loop(
         inner_loop_service: Some(inner_loop_service),
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+        tool_invocation_service: None,
     });
 
     Router::new()
@@ -337,8 +342,12 @@ async fn smcp_attestation(
 pub struct SmcpToolInvokeRequest {
     /// Agent ID (UUID).
     pub agent_id: String,
-    /// The SMCP envelope containing the signed tool call.
-    pub envelope: serde_json::Value,
+    /// Signed SMCP security token (JWT issued at attestation).
+    pub security_token: String,
+    /// Ed25519 signature over the serialized `payload`.
+    pub signature: String,
+    /// Inner MCP payload (tool name + arguments).
+    pub payload: serde_json::Value,
 }
 
 /// Handle SMCP tool invocation (ADR-033 §3).
@@ -347,20 +356,50 @@ pub struct SmcpToolInvokeRequest {
 /// ephemeral key. The orchestrator verifies the signature, evaluates the
 /// SecurityContext policy, and routes to the appropriate tool server.
 async fn smcp_tool_invoke(
-    State(_state): State<Arc<AppState>>,
-    Json(payload): Json<SmcpToolInvokeRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SmcpToolInvokeRequest>,
 ) -> impl IntoResponse {
-    // Phase 1: Return a placeholder response.
-    // Phase 2 will wire to ToolInvocationService for full SMCP flow.
-    tracing::info!(
-        agent_id = %payload.agent_id,
-        "SMCP tool invocation request received"
-    );
+    tracing::info!(agent_id = %req.agent_id, "SMCP tool invocation request received");
 
-    Json(json!({
-        "status": "not_implemented",
-        "message": "SMCP tool invocation endpoint active; full flow pending Phase 2 wiring"
-    }))
+    let tool_svc = match &state.tool_invocation_service {
+        Some(svc) => svc.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                Json(json!({
+                    "error": "SMCP tool invocation service not wired in this configuration"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let agent_id = match uuid::Uuid::parse_str(&req.agent_id) {
+        Ok(uid) => AgentId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Invalid agent_id" })),
+            )
+                .into_response();
+        }
+    };
+
+    let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
+    let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
+        security_token: req.security_token,
+        signature: req.signature,
+        inner_mcp,
+    };
+
+    match tool_svc.invoke_tool(&agent_id, &envelope).await {
+        Ok(res) => (axum::http::StatusCode::OK, Json(res)).into_response(),
+        Err(e) => (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 // ============================================================================

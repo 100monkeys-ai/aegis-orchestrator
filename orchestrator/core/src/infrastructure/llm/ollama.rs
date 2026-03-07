@@ -97,6 +97,7 @@ impl LLMProvider for OllamaAdapter {
             role: "user".to_string(),
             content: prompt.to_string(),
             tool_call_id: None,
+            tool_calls: None,
         }];
         match self.generate_chat(&messages, &[], options).await? {
             ChatResponse::FinalText(r) => Ok(r),
@@ -186,7 +187,7 @@ impl LLMProvider for OllamaAdapter {
                 .enumerate()
                 .map(|(i, tc)| ChatToolCall {
                     id: format!("ollama-call-{}", i),
-                    name: tc.function.name.replace('_', "."),  // Reverse outbound sanitization
+                    name: tc.function.name.replace('_', "."), // Reverse outbound sanitization
                     arguments: tc.function.arguments,
                 })
                 .collect();

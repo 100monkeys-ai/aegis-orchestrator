@@ -32,6 +32,9 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::nfs_gateway::NfsGatewayService;
+use crate::application::ports::{
+    CortexPatternPort, StoreTrajectoryPatternCommand, TrajectoryStepCommand,
+};
 use crate::application::validation_service::build_validation_pipeline;
 use crate::application::volume_manager::VolumeService;
 use crate::domain::agent::AgentId;
@@ -168,6 +171,14 @@ pub trait ExecutionService: Send + Sync {
         iteration: u8,
         interaction: crate::domain::execution::LlmInteraction,
     ) -> Result<()>;
+
+    /// Store the recorded sequence of tool invocations for an iteration
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()>;
 }
 
 pub struct StandardExecutionService {
@@ -192,6 +203,8 @@ pub struct StandardExecutionService {
     /// Optional ToolRouter used to validate that an agent's requested tools actually exist
     /// before spawning the container (Safety & Polish).
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
+    /// Optional Cortex integration port to upload learned trajectories (ADR-049).
+    cortex_client: Option<Arc<dyn CortexPatternPort>>,
 }
 
 impl StandardExecutionService {
@@ -215,6 +228,7 @@ impl StandardExecutionService {
             cancellation_tokens: Arc::new(dashmap::DashMap::new()),
             child_executor: std::sync::OnceLock::new(),
             tool_router: None,
+            cortex_client: None,
         }
     }
 
@@ -256,6 +270,12 @@ impl StandardExecutionService {
         tool_router: Arc<crate::infrastructure::tool_router::ToolRouter>,
     ) -> Self {
         self.tool_router = Some(tool_router);
+        self
+    }
+
+    /// Attach a Cortex port for Trajectory Consolidation (ADR-049).
+    pub fn with_cortex_client(mut self, cortex_client: Arc<dyn CortexPatternPort>) -> Self {
+        self.cortex_client = Some(cortex_client);
         self
     }
 }
@@ -658,7 +678,7 @@ impl ExecutionService for StandardExecutionService {
             tracing::debug!("Storage config: backend={}", storage_config.backend);
 
             // Create volumes using volume service
-            let tenant_id = TenantId::default_tenant(); // TODO: Multi-tenancy
+            let tenant_id = TenantId::default_tenant(); // Uses the default tenant context.
             let volumes = self
                 .volume_service
                 .create_volumes_for_execution(
@@ -710,6 +730,7 @@ impl ExecutionService for StandardExecutionService {
                     1000, // container_uid
                     1000, // container_gid
                     policy,
+                    mount.mount_point.clone(),
                 );
                 tracing::info!(
                     "Registered volume {} with NFS gateway for execution {}",
@@ -847,6 +868,7 @@ impl ExecutionService for StandardExecutionService {
         self.cancellation_tokens
             .insert(execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
+        let cortex_client = self.cortex_client.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -870,6 +892,8 @@ impl ExecutionService for StandardExecutionService {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
+
+                        StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                             execution_id,
@@ -1170,6 +1194,67 @@ impl ExecutionService for StandardExecutionService {
             }
         };
 
+        // ADR-049 Pillar 3: Build judge proxy volume mount before runtime_config so we can
+        // use async lookups and later register the volume with the NFS gateway.
+        // Non-fatal: if the parent has no volumes yet, the judge is spawned without
+        // workspace visibility rather than blocking the spawn entirely.
+        let judge_proxy_mount: Option<crate::domain::volume::VolumeMount> = {
+            let is_judge = agent
+                .manifest
+                .metadata
+                .labels
+                .get("role")
+                .map(|s| s.as_str())
+                == Some("judge");
+            if is_judge {
+                // Resolve the first ReadWrite volume owned by the parent execution;
+                // this is the worker's workspace that the judge needs read access to.
+                let parent_workspace_vol_id = self
+                    .volume_service
+                    .list_volumes_by_ownership(&crate::domain::volume::VolumeOwnership::execution(
+                        parent_execution_id,
+                    ))
+                    .await
+                    .ok()
+                    .and_then(|vols| vols.into_iter().next().map(|v| v.id));
+
+                let proxy_backend = crate::domain::volume::VolumeBackend::Smcp {
+                    node_id: "local".to_string(),
+                    // Routing key: SmcpStorageProvider forwards reads to this volume ID.
+                    remote_volume_id: parent_workspace_vol_id
+                        .unwrap_or_else(crate::domain::volume::VolumeId::new),
+                };
+                let proxy_volume = crate::domain::volume::Volume {
+                    id: crate::domain::volume::VolumeId::new(),
+                    name: "worker-state".to_string(),
+                    tenant_id: crate::domain::volume::TenantId::default_tenant(),
+                    storage_class: crate::domain::volume::StorageClass::persistent(),
+                    status: crate::domain::volume::VolumeStatus::Available,
+                    ownership: crate::domain::volume::VolumeOwnership::Execution {
+                        execution_id: parent_execution_id,
+                    },
+                    size_limit_bytes: 1024 * 1024 * 100, // 100 MiB cap
+                    created_at: chrono::Utc::now(),
+                    attached_at: None,
+                    detached_at: None,
+                    expires_at: None,
+                    backend: proxy_backend,
+                };
+                let mount = proxy_volume.to_mount(
+                    std::path::PathBuf::from("/workspace/worker-state"),
+                    crate::domain::volume::AccessMode::ReadOnly,
+                );
+                tracing::info!(
+                    "ADR-049: injecting read-only worker-state volume (parent={}, judge={})",
+                    parent_execution_id,
+                    child_execution_id
+                );
+                Some(mount)
+            } else {
+                None
+            }
+        };
+
         let runtime_config = crate::domain::runtime::RuntimeConfig {
             language: agent
                 .manifest
@@ -1190,7 +1275,8 @@ impl ExecutionService for StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            volumes: Vec::new(), // Judge agents do not mount volumes
+            // ADR-049 Pillar 3: judge_proxy_mount was computed above (async-safe).
+            volumes: judge_proxy_mount.clone().into_iter().collect(),
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
@@ -1205,6 +1291,30 @@ impl ExecutionService for StandardExecutionService {
                 .and_then(|a| a.bootstrap_path.clone()),
             execution_id: child_execution_id,
         };
+
+        // ADR-049 Pillar 3: Register judge proxy volume with NFS gateway so the NFS FSAL
+        // can authorize file-handle requests from the judge container.
+        // The proxy volume_id is keyed to child_execution_id; SmcpStorageProvider routes
+        // reads through to the parent workspace via VolumeBackend::Smcp.remote_volume_id.
+        if let (Some(ref gw), Some(ref proxy_mount)) = (&self.nfs_gateway, &judge_proxy_mount) {
+            let read_policy = crate::domain::policy::FilesystemPolicy {
+                read: vec!["/*".to_string()],
+                write: vec![],
+            };
+            gw.register_volume(
+                proxy_mount.volume_id,
+                child_execution_id,
+                1000, // container_uid
+                1000, // container_gid
+                read_policy,
+                proxy_mount.mount_point.clone(),
+            );
+            tracing::info!(
+                "ADR-049: registered read-only NFS volume {} for judge execution {}",
+                proxy_mount.volume_id,
+                child_execution_id
+            );
+        }
 
         // 6. Run Supervisor loop in background task.
         let supervisor = self.supervisor.clone();
@@ -1244,6 +1354,7 @@ impl ExecutionService for StandardExecutionService {
         self.cancellation_tokens
             .insert(child_execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
+        let cortex_client = self.cortex_client.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -1265,6 +1376,9 @@ impl ExecutionService for StandardExecutionService {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
+
+                        StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
+
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                             execution_id: child_execution_id,
                             agent_id,
@@ -1350,5 +1464,75 @@ impl ExecutionService for StandardExecutionService {
             }
         }
         Ok(())
+    }
+
+    async fn store_iteration_trajectory(
+        &self,
+        execution_id: ExecutionId,
+        iteration: u8,
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+            if let Err(e) = exec.store_iteration_trajectory(iteration, trajectory) {
+                tracing::warn!(
+                    "Failed to record trajectory for execution {} iteration {}: {}",
+                    execution_id.0,
+                    iteration,
+                    e
+                );
+            } else {
+                self.repository.save(&exec).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl StandardExecutionService {
+    fn store_trajectory_in_cortex(
+        cortex_client_opt: &Option<Arc<dyn CortexPatternPort>>,
+        exec: &Execution,
+    ) {
+        if let Some(cortex) = cortex_client_opt {
+            if let Some(last_iter) = exec.iterations().last() {
+                if let Some(trajectory) = last_iter.trajectory.clone() {
+                    if !trajectory.is_empty() {
+                        let score = last_iter
+                            .validation_results
+                            .as_ref()
+                            .and_then(|vr| vr.gradient.as_ref())
+                            .map(|g| g.score)
+                            .unwrap_or(1.0);
+
+                        let task_signature = exec.input.intent.clone().unwrap_or_default();
+                        let steps = trajectory
+                            .into_iter()
+                            .map(|step| TrajectoryStepCommand {
+                                tool_name: step.tool_name,
+                                arguments_json: step.arguments_json,
+                            })
+                            .collect();
+
+                        let req = StoreTrajectoryPatternCommand {
+                            task_signature,
+                            steps,
+                            success_score: score,
+                        };
+
+                        let cortex_clone = cortex.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cortex_clone.store_trajectory_pattern(req).await {
+                                tracing::warn!(
+                                    "Failed to store trajectory pattern in Cortex: {}",
+                                    e
+                                );
+                            } else {
+                                tracing::info!("Successfully stored TrajectoryPattern in Cortex");
+                            }
+                        });
+                    }
+                }
+            }
+        }
     }
 }

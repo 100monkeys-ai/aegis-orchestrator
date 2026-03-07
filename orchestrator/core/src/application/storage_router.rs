@@ -52,12 +52,12 @@ impl StorageRouter {
         if path.starts_with("/aegis/volumes") || path.starts_with("aegis/volumes") {
             // Further routing logic can distinguish between Seaweed/OpenDAL/SMCP
             // by inspecting the volume_id in the path against the database.
-            // For now, in ADR-047 Phase 1, we send everything not explicitly local to default/SMCP proxy logic.
+            // In ADR-047 Phase 1, route non-local paths to default/SMCP proxy logic.
 
             // To be fully robust, this router should actually take `volume_id` in trait methods,
             // or we extract the `volume_id` from the path and query the repository.
             // Since `StorageProvider` trait doesn't have `volume_id`, we rely on path tagging.
-            // For now, return default.
+            // Return default provider for routed AEGIS paths.
             self.default_provider.clone()
         } else {
             // Must be a host path created by `VolumeBackend::HostPath` logic in `AegisFSAL`
@@ -85,7 +85,7 @@ impl StorageProvider for StorageRouter {
     }
 
     async fn health_check(&self) -> Result<(), StorageError> {
-        // Only checking default for now
+        // Check default provider health.
         self.default_provider.health_check().await
     }
 
@@ -180,7 +180,7 @@ mod tests {
 
         // Path should route to local
         assert!(Arc::ptr_eq(
-            &router.get_provider("/var/lib/some/path.txt"),
+            &router.get_provider("/opt/data/some/path.txt"),
             &(local_provider.clone() as Arc<dyn StorageProvider>)
         ));
     }

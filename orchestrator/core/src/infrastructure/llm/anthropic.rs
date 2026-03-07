@@ -26,6 +26,8 @@ struct AnthropicRequest {
     messages: Vec<AnthropicMessage>,
     max_tokens: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<serde_json::Value>>,
@@ -95,6 +97,7 @@ impl LLMProvider for AnthropicAdapter {
             role: "user".to_string(),
             content: prompt.to_string(),
             tool_call_id: None,
+            tool_calls: None,
         }];
         match self.generate_chat(&messages, &[], options).await? {
             ChatResponse::FinalText(r) => Ok(r),
@@ -111,9 +114,25 @@ impl LLMProvider for AnthropicAdapter {
         options: &GenerationOptions,
     ) -> Result<ChatResponse, LLMError> {
         // Map domain ChatMessage → Anthropic message.
+        // role="system" is extracted to the top-level `system` parameter; Anthropic's
+        // Messages API rejects system role entries inside the messages array.
         // role="tool" becomes a "tool_result" content-block array (Anthropic pattern).
+        let system_prompt: Option<String> = {
+            let parts: Vec<&str> = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        };
+
         let anthropic_messages: Vec<AnthropicMessage> = messages
             .iter()
+            .filter(|m| m.role != "system")
             .map(|m| {
                 if m.role == "tool" {
                     let content = serde_json::json!([{
@@ -124,6 +143,26 @@ impl LLMProvider for AnthropicAdapter {
                     AnthropicMessage {
                         role: "user".to_string(), // Anthropic requires user role for tool results
                         content,
+                    }
+                } else if m.role == "assistant" && m.tool_calls.is_some() {
+                    let mut content_blocks = Vec::new();
+                    if !m.content.is_empty() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "text",
+                            "text": m.content,
+                        }));
+                    }
+                    for tc in m.tool_calls.as_ref().unwrap() {
+                        content_blocks.push(serde_json::json!({
+                            "type": "tool_use",
+                            "id": tc.id,
+                            "name": tc.name.replace('.', "_"),
+                            "input": tc.arguments,
+                        }));
+                    }
+                    AnthropicMessage {
+                        role: "assistant".to_string(),
+                        content: serde_json::Value::Array(content_blocks),
                     }
                 } else {
                     AnthropicMessage {
@@ -157,6 +196,7 @@ impl LLMProvider for AnthropicAdapter {
             model: self.model.clone(),
             messages: anthropic_messages,
             max_tokens: options.max_tokens.unwrap_or(4096),
+            system: system_prompt,
             temperature: options.temperature,
             tools: anthropic_tools,
         };
@@ -197,7 +237,7 @@ impl LLMProvider for AnthropicAdapter {
             .filter(|b| b.block_type == "tool_use")
             .map(|b| ChatToolCall {
                 id: b.id.clone(),
-                name: b.name.replace('_', "."),  // Reverse outbound sanitization
+                name: b.name.replace('_', "."), // Reverse outbound sanitization
                 arguments: b.input.clone(),
             })
             .collect();
@@ -284,6 +324,7 @@ mod tests {
                 content: serde_json::Value::String("Hello".to_string()),
             }],
             max_tokens: 1024,
+            system: None,
             temperature: Some(0.7),
             tools: None,
         };

@@ -1,0 +1,71 @@
+version: 2
+
+updates:
+  # ─── Rust / Cargo workspace ──────────────────────────────────────────────────
+  # A single entry at "/" covers all four workspace members:
+  #   orchestrator/core  (aegis-orchestrator-core)
+  #   orchestrator/swarm (aegis-orchestrator-swarm)
+  #   sdks               (aegis-orchestrator-sdk)
+  #   cli                (aegis-orchestrator)
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 10
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      production-dependencies:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+      development-dependencies:
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+
+  # ─── Docker ──────────────────────────────────────────────────────────────────
+  # Targets docker/Dockerfile.runtime
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: "chore(deps)"
+
+  # ─── GitHub Actions ──────────────────────────────────────────────────────────
+  # Covers all workflows under .github/workflows/:
+  #   ci.yml, crates-publish.yml, docker-publish.yml,
+  #   docs-verification.yml, release.yml
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - github-actions
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

@@ -13,7 +13,7 @@
 //! | `storage` | SeaweedFS filer endpoints, local volume root |
 //! | `nfs_gateway` | Bind address / port for NFS Server Gateway |
 //! | `llm` | Provider credentials and model aliases |
-//! | `openbao` | Secrets backend connection (Phase 4) |
+//! | `secrets.backend` | Secrets backend connection (ADR-034) |
 //! | `telemetry` | OTLP exporter endpoints |
 //!
 //! See AGENTS.md §Aegis Node, §Aegis Host.
@@ -66,9 +66,7 @@ pub struct ManifestMetadata {
 
 /// Credentials for pulling container images from a private container registry (ADR-045).
 ///
-/// Phase 1: sourced from `aegis-config.yaml` via `spec.registry_credentials`.
-/// Phase 2: sourced from OpenBao KV at execution time (ADR-034).
-///
+/// Sourced from `spec.registry_credentials` in `aegis-config.yaml`.
 /// The `registry` field is matched as a **prefix** of the resolved image reference
 /// (e.g. `"ghcr.io"` matches `"ghcr.io/myorg/agent:v1.0"`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -122,8 +120,7 @@ pub struct NodeConfigSpec {
     pub builtin_dispatchers: Option<Vec<BuiltinDispatcherConfig>>,
 
     /// Private container registry credentials for pulling images (ADR-045).
-    /// Each entry covers one registry host prefix. Phase 1: static node-config;
-    /// Phase 2: resolved from OpenBao at execution time.
+    /// Each entry covers one registry host prefix.
     #[serde(default)]
     pub registry_credentials: Vec<RegistryCredentials>,
 
@@ -142,6 +139,12 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cortex: Option<CortexConfig>,
 
+    /// Secrets management configuration (ADR-034).
+    /// Placed at `spec.secrets` in `aegis-config.yaml`.
+    /// If omitted, the orchestrator uses `MockSecretStore` (dev/test only, logs a warning).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<SecretsConfig>,
+
     /// SMCP protocol configuration (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smcp: Option<SmcpConfig>,
@@ -149,6 +152,16 @@ pub struct NodeConfigSpec {
     /// Named security contexts for SMCP (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_contexts: Option<Vec<SecurityContextDefinition>>,
+
+    /// OIDC IAM configuration (ADR-041)
+    /// If omitted, all auth middleware is disabled (pass-through for local development).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iam: Option<IamConfig>,
+
+    /// gRPC authentication configuration (ADR-041)
+    /// If omitted, gRPC endpoints are unauthenticated.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grpc_auth: Option<GrpcAuthConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -205,7 +218,7 @@ pub struct LLMProviderConfig {
 
     /// Provider type
     #[serde(rename = "type")]
-    pub provider_type: String, // "ollama", "openai", "anthropic", "openai-compatible"
+    pub provider_type: String, // "ollama", "openai", "anthropic", "gemini", "openai-compatible"
 
     /// API endpoint URL
     pub endpoint: String,
@@ -226,7 +239,7 @@ impl LLMProviderConfig {
     /// Returns `true` when this provider runs inference locally (no external API call).
     ///
     /// Local provider types: `"ollama"`, `"openai-compatible"` (e.g. LM Studio, vLLM).
-    /// Cloud provider types: `"openai"`, `"anthropic"`.
+    /// Cloud provider types: `"openai"`, `"anthropic"`, `"gemini"`.
     /// Used by `ProviderRegistry::build_alias_map` to implement `LLMSelectionStrategy`.
     pub fn is_local(&self) -> bool {
         matches!(self.provider_type.as_str(), "ollama" | "openai-compatible")
@@ -299,7 +312,7 @@ pub struct RuntimeConfig {
     pub default_isolation: String,
 
     /// Path to Docker socket (for Docker-based isolation)
-    /// Default: "/var/run/docker.sock" on Linux/Mac, "//./pipe/docker_engine" on Windows
+    /// Default: platform-specific Docker socket path (Unix) or named pipe (Windows)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_socket_path: Option<String>,
 
@@ -515,7 +528,7 @@ pub struct SeaweedFSConfig {
     pub filer_url: String,
 
     /// Host mount location for volumes
-    /// Default: "/var/lib/aegis/storage"
+    /// Default: platform-specific aegis storage directory
     #[serde(default = "default_seaweedfs_mount_point")]
     pub mount_point: String,
 
@@ -568,7 +581,7 @@ impl Default for SeaweedFSConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LocalHostStorageConfig {
     /// Host filesystem mount point
-    /// Default: "/var/lib/aegis/local-host-volumes"
+    /// Default: platform-specific local-host volume directory
     #[serde(default = "default_local_host_mount_point")]
     pub mount_point: String,
 }
@@ -601,6 +614,28 @@ impl Default for OpenDalConfig {
     }
 }
 
+/// Per-tool capability configuration, including operator-level judge optimization flags.
+///
+/// Replaces the previous flat `Vec<String>` capabilities list on both
+/// `BuiltinDispatcherConfig` and `McpServerConfig`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapabilityConfig {
+    /// Tool name exposed to agents (e.g. `"fs.read"`, `"cmd.run"`, `"gmail.send"`)
+    pub name: String,
+
+    /// When `true`, the inner-loop semantic judge (if enabled on the agent manifest via
+    /// `spec.execution.tool_validation`) is skipped for this specific tool call.
+    ///
+    /// Intended for read-only or low-risk tools (e.g. `fs.read`, `fs.list`) where the
+    /// latency cost of spawning a judge child execution is undesirable and the operation
+    /// carries no write-side risk. Defaults to `false` (judge always runs when configured).
+    ///
+    /// **Security note**: This is an operator-level infrastructure opt-out set in the
+    /// node configuration, not an agent-level privilege. Agents cannot influence this flag.
+    #[serde(default)]
+    pub skip_judge: bool,
+}
+
 /// Built-in tools configured directly inside the Orchestrator via Dispatch Protocol (ADR-040)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BuiltinDispatcherConfig {
@@ -616,7 +651,7 @@ pub struct BuiltinDispatcherConfig {
 
     /// Capabilities provided by this dispatcher
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<CapabilityConfig>,
 }
 
 /// MCP Server configuration
@@ -636,9 +671,10 @@ pub struct McpServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
 
-    /// Tool names this server provides
+    /// Tool capabilities provided by this server.
+    /// Use object form to control per-tool `skip_judge` behaviour.
     #[serde(default)]
-    pub capabilities: Vec<String>,
+    pub capabilities: Vec<CapabilityConfig>,
 
     /// API keys/tokens for external services
     #[serde(default)]
@@ -714,7 +750,7 @@ impl Default for McpResourceLimitsConfig {
 pub struct DatabaseConfig {
     /// PostgreSQL connection URL.
     /// Supports `env:VAR_NAME` for environment variable resolution
-    /// and `vault:namespace/mount/path` for OpenBao secrets (Phase 2).
+    /// and `secret:namespace/mount/path` for secret-backend references (Phase 2).
     /// Example: `"env:AEGIS_DATABASE_URL"` or `"postgresql://user:pass@host:5432/db"`
     pub url: String,
 
@@ -747,7 +783,7 @@ pub struct TemporalConfig {
     pub worker_http_endpoint: String,
 
     /// Shared HMAC secret for authenticating Temporal event callbacks.
-    /// Supports `env:VAR_NAME` and `vault:` credential resolution patterns.
+    /// Supports `env:VAR_NAME` and `secret:` credential resolution patterns.
     /// If omitted, the `/v1/temporal-events` endpoint is unauthenticated (warns at startup).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_secret: Option<String>,
@@ -790,13 +826,81 @@ pub struct CortexConfig {
     pub grpc_url: Option<String>,
 }
 
+/// Top-level secrets configuration wrapper (ADR-034).
+///
+/// Placed at `spec.secrets` in `aegis-config.yaml` and deserialized into
+/// [`NodeConfigSpec::secrets`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsConfig {
+    /// Secret backend configuration.
+    /// If `None`, the orchestrator uses `MockSecretStore` (dev/test only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<SecretBackendConfig>,
+}
+
+/// Secret backend configuration (ADR-034).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretBackendConfig {
+    /// Backend API address (e.g. "<https://secrets.internal:8200>")
+    pub address: String,
+
+    /// Authentication method (must be "approle" for orchestrators)
+    #[serde(default = "default_secret_backend_auth_method")]
+    pub auth_method: String,
+
+    /// AppRole authentication credentials
+    pub approle: SecretBackendAppRoleConfig,
+
+    /// Default namespace for this node (e.g. "tenant-acme", "aegis-system")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+
+    /// TLS configuration for communicating with the secret backend
+    #[serde(default)]
+    pub tls: SecretBackendTlsConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretBackendAppRoleConfig {
+    /// The public Role ID assigned to this orchestrator node
+    pub role_id: String,
+
+    /// The environment variable name containing the Secret ID.
+    #[serde(default = "default_secret_backend_secret_id_env_var")]
+    pub secret_id_env_var: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SecretBackendTlsConfig {
+    /// Path to a custom CA certificate PEM file to trust
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert: Option<String>,
+
+    /// Path to the client certificate PEM file (for mTLS)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cert: Option<String>,
+
+    /// Path to the client private key PEM file (for mTLS)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+}
+
+fn default_secret_backend_auth_method() -> String {
+    "approle".to_string()
+}
+
+fn default_secret_backend_secret_id_env_var() -> String {
+    "OPENBAO_SECRET_ID".to_string()
+}
+
 /// SMCP protocol configuration (ADR-035 §6)
 ///
 /// Defines the RSA key material used by the orchestrator to sign and verify
 /// SecurityTokens (JWTs) during the SMCP attestation handshake.
 ///
-/// ⚠️ Phase 1 — keys are loaded from PEM files on disk. Phase 3 will use OpenBao
-///   Transit Engine so that the private key never touches process memory.
+/// Signing keys are loaded from PEM files on disk (paths specified by
+/// `private_key_path` and `public_key_path`). The private key material
+/// is read once at startup into process memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpConfig {
     /// Path to RSA private key PEM file (for signing SecurityTokens).
@@ -875,6 +979,88 @@ pub struct RateLimitDefinition {
     pub per_seconds: u32,
 }
 
+/// OIDC IAM configuration (ADR-041 §Node Configuration).
+///
+/// Defines the trusted identity realms, JWKS cache TTL, and custom claim names.
+/// When this section is present in `aegis-config.yaml`, all HTTP and gRPC
+/// auth middleware is enabled. When absent, auth is disabled (local dev mode).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IamConfig {
+    /// All known realms — determines which JWKS endpoints to trust and cache.
+    /// The platform validates JWTs against the realm matching the JWT's "iss" claim.
+    pub realms: Vec<IamRealmConfig>,
+
+    /// JWKS cache TTL in seconds — keys refreshed this often to support key rotation.
+    /// Default: 300 (5 minutes).
+    #[serde(default = "default_jwks_cache_ttl")]
+    pub jwks_cache_ttl_seconds: u64,
+
+    /// Custom claim names for OIDC attribute mappers.
+    #[serde(default)]
+    pub claims: IamClaimsConfig,
+}
+
+/// Individual realm configuration entry within `spec.iam.realms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IamRealmConfig {
+    /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
+    pub slug: String,
+    /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
+    pub issuer_url: String,
+    /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
+    pub jwks_uri: String,
+    /// Expected "aud" claim value for tokens from this realm
+    pub audience: String,
+    /// Realm classification: "system", "consumer", or "tenant"
+    pub kind: String,
+}
+
+/// Custom claim names for OIDC attribute mappers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IamClaimsConfig {
+    /// Custom claim mapper name for ZaruTier. Default: "zaru_tier"
+    #[serde(default = "default_zaru_tier_claim")]
+    pub zaru_tier: String,
+    /// Role attribute name in aegis-system realm. Default: "aegis_role"
+    #[serde(default = "default_aegis_role_claim")]
+    pub aegis_role: String,
+}
+
+impl Default for IamClaimsConfig {
+    fn default() -> Self {
+        Self {
+            zaru_tier: default_zaru_tier_claim(),
+            aegis_role: default_aegis_role_claim(),
+        }
+    }
+}
+
+fn default_jwks_cache_ttl() -> u64 {
+    300
+}
+
+fn default_zaru_tier_claim() -> String {
+    "zaru_tier".to_string()
+}
+
+fn default_aegis_role_claim() -> String {
+    "aegis_role".to_string()
+}
+
+/// gRPC authentication configuration (ADR-041 §gRPC Authentication Amendment).
+///
+/// When enabled, a `OIDCAuthInterceptor` is installed on the gRPC server
+/// that validates Bearer JWTs on every call except exempted methods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GrpcAuthConfig {
+    /// Whether gRPC JWT auth is enabled.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Methods exempt from token auth (e.g. inner loop bootstrap channel).
+    #[serde(default)]
+    pub exempt_methods: Vec<String>,
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -933,11 +1119,23 @@ fn default_storage_nfs_port() -> Option<u16> {
 }
 
 fn default_seaweedfs_mount_point() -> String {
-    "/var/lib/aegis/storage".to_string()
+    PathBuf::from("/")
+        .join("var")
+        .join("lib")
+        .join("aegis")
+        .join("storage")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_local_host_mount_point() -> String {
-    "/var/lib/aegis/local-host-volumes".to_string()
+    PathBuf::from("/")
+        .join("var")
+        .join("lib")
+        .join("aegis")
+        .join("local-host-volumes")
+        .to_string_lossy()
+        .into_owned()
 }
 
 fn default_ttl_hours() -> u32 {
@@ -1037,8 +1235,11 @@ impl Default for NodeConfigSpec {
             database: None,
             temporal: None,
             cortex: None,
+            secrets: None,
             smcp: None,
             security_contexts: None,
+            iam: None,
+            grpc_auth: None,
         }
     }
 }
@@ -1114,9 +1315,16 @@ impl NodeConfigManifest {
 
         // 5. System config
         #[cfg(unix)]
-        let system_config = PathBuf::from("/etc/aegis/config.yaml");
+        let system_config = PathBuf::from("/")
+            .join("etc")
+            .join("aegis")
+            .join("config.yaml");
         #[cfg(windows)]
-        let system_config = PathBuf::from("C:\\ProgramData\\Aegis\\config.yaml");
+        let system_config = std::env::var_os("ProgramData")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("Aegis")
+            .join("config.yaml");
 
         if system_config.exists() {
             return Some(system_config);
@@ -1320,7 +1528,7 @@ impl NodeConfigManifest {
 /// | `env:VAR` | `env:OPENAI_API_KEY` | Read `$OPENAI_API_KEY` from process env |
 /// | literal | `sk-abcdef...` | Return as-is |
 ///
-/// Phase 2 will add `vault:namespace/mount/path` for OpenBao secrets.
+/// Phase 2 will add `secret:namespace/mount/path` for secret-backend references.
 pub fn resolve_env_value(raw: &str) -> anyhow::Result<String> {
     if let Some(var_name) = raw.strip_prefix("env:") {
         std::env::var(var_name).map_err(|_| {
@@ -1404,11 +1612,14 @@ mod tests {
                 database: None,
                 temporal: None,
                 cortex: None,
+                secrets: None,
                 mcp_servers: None,
                 builtin_dispatchers: None,
                 smcp: None,
                 security_contexts: None,
                 registry_credentials: vec![],
+                iam: None,
+                grpc_auth: None,
             },
         };
 

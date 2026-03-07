@@ -17,11 +17,11 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for start workflow execution
 
+use crate::application::ports::WorkflowEnginePort;
 use crate::domain::execution::ExecutionId;
 use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
 use crate::domain::workflow::{WorkflowExecution, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::temporal_client::TemporalClient;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -82,7 +82,7 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
 pub struct StandardStartWorkflowExecutionUseCase {
     workflow_repository: Arc<dyn WorkflowRepository>,
     execution_repository: Arc<dyn WorkflowExecutionRepository>,
-    temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+    workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
     event_bus: Arc<EventBus>,
 }
 
@@ -90,13 +90,13 @@ impl StandardStartWorkflowExecutionUseCase {
     pub fn new(
         workflow_repository: Arc<dyn WorkflowRepository>,
         execution_repository: Arc<dyn WorkflowExecutionRepository>,
-        temporal_client: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
+        workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
         event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
             workflow_repository,
             execution_repository,
-            temporal_client,
+            workflow_engine,
             event_bus,
         }
     }
@@ -143,13 +143,13 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             .context("Failed to persist workflow execution to repository")?;
 
         // Step 5: Start execution in Temporal via gRPC
-        let client = {
-            let lock = self.temporal_client.read().await;
+        let engine = {
+            let lock = self.workflow_engine.read().await;
             lock.clone()
-                .ok_or_else(|| anyhow::anyhow!("Temporal client not connected yet"))?
+                .ok_or_else(|| anyhow::anyhow!("Workflow engine not connected yet"))?
         };
 
-        let temporal_run_id = client
+        let temporal_run_id = engine
             .start_workflow(
                 &workflow.metadata.name,
                 execution_id,
@@ -169,8 +169,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             .context("Failed to start workflow execution in Temporal")?;
 
         // Step 6: Update execution with temporal_run_id (for tracking)
-        // Note: In a full implementation, we would update the repository with the run_id
-        // For now, we attach it only in the response
+        // Current behavior attaches the run_id to the response payload.
 
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(

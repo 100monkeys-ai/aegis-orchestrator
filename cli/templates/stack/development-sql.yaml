@@ -1,0 +1,49 @@
+# Temporal Dynamic Configuration for AEGIS
+# Development settings for SQL backend (PostgreSQL)
+# See: https://docs.temporal.io/references/configuration
+
+# Workflow execution timeouts
+system.forceSearchAttributesCacheRefreshOnRead:
+  - value: true
+    constraints: {}
+
+# Enable long poll for worker connections
+frontend.enableClientVersionCheck:
+  - value: true
+    constraints: {}
+
+# History service settings
+history.defaultActivityRetryPolicy:
+  - value:
+      InitialIntervalInSeconds: 1
+      MaximumIntervalInSeconds: 100
+      BackoffCoefficient: 2.0
+      MaximumAttempts: 0
+    constraints: {}
+
+history.defaultWorkflowRetryPolicy:
+  - value:
+      InitialIntervalInSeconds: 1
+      MaximumIntervalInSeconds: 100
+      BackoffCoefficient: 2.0
+      MaximumAttempts: 0
+    constraints: {}
+
+# Limits
+limit.maxIDLength:
+  - value: 255
+    constraints: {}
+
+# History event limits
+limit.blobSize.error:
+  - value: 2097152
+    constraints: {}
+
+limit.blobSize.warn:
+  - value: 524288
+    constraints: {}
+
+# Retention settings
+system.enableNamespaceNotActiveAutoForwarding:
+  - value: true
+    constraints: {}

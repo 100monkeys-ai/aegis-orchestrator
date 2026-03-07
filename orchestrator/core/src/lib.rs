@@ -15,7 +15,7 @@
 //! | **BC-3 Workflow Orchestration** | [`domain::workflow`] | ADR-015 |
 //! | **BC-4 Security Policy** | [`domain::policy`], [`domain::security_context`] | ADR-035 |
 //! | **BC-7 Storage Gateway** | [`domain::volume`], [`domain::fsal`] | ADR-032, ADR-036 |
-//! | **BC-11 Secrets & Identity** | Secrets management (Phase 4) | ADR-034 |
+//! | **BC-11 Secrets & Identity** | [`infrastructure::secrets_manager`] | ADR-034 |
 //! | **BC-12 SMCP Protocol** | [`domain::smcp_session`] | ADR-035 |
 //!
 //! ## Layer Structure

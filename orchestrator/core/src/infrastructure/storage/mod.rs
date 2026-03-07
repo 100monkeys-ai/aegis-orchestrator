@@ -25,6 +25,7 @@ pub mod smcp_provider;
 use opendal::Operator;
 pub use smcp_provider::SmcpStorageProvider;
 
+use anyhow::Context as _;
 use std::sync::Arc;
 
 /// Storage backend configuration
@@ -46,26 +47,34 @@ pub enum StorageBackend {
     Mock,
 }
 
-/// Factory function to create storage provider from configuration
-pub fn create_storage_provider(backend: StorageBackend) -> Arc<dyn StorageProvider> {
+/// Factory function to create storage provider from configuration.
+///
+/// # Errors
+///
+/// Returns an error if the backend configuration is invalid (e.g., unrecognised
+/// OpenDAL scheme or a `LocalHost` mount point that cannot be initialised).
+/// Callers should handle this at startup; a bad storage config is fatal.
+pub fn create_storage_provider(
+    backend: StorageBackend,
+) -> Result<Arc<dyn StorageProvider>, anyhow::Error> {
     match backend {
-        StorageBackend::SeaweedFS { filer_url } => Arc::new(SeaweedFSAdapter::new(filer_url)),
-        StorageBackend::LocalHost { mount_point } => Arc::new(
-            LocalHostStorageProvider::new(mount_point)
-                .expect("Failed to create LocalHostStorageProvider"),
-        ),
+        StorageBackend::SeaweedFS { filer_url } => Ok(Arc::new(SeaweedFSAdapter::new(filer_url))),
+        StorageBackend::LocalHost { mount_point } => {
+            let provider = LocalHostStorageProvider::new(mount_point)
+                .context("Failed to create LocalHostStorageProvider")?;
+            Ok(Arc::new(provider))
+        }
         StorageBackend::OpenDal { provider, options } => {
+            let scheme_name = provider.clone();
             let scheme: opendal::Scheme = provider
                 .parse()
-                .unwrap_or_else(|_| panic!("Invalid OpenDAL scheme: {}", provider));
-            let op =
-                Operator::via_iter(scheme, options).expect("Failed to create OpenDAL operator");
-            Arc::new(OpenDalStorageProvider::new(op))
+                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{}'", scheme_name))?;
+            let op = Operator::via_iter(scheme, options).with_context(|| {
+                format!("Failed to create OpenDAL operator for scheme '{scheme_name}'")
+            })?;
+            Ok(Arc::new(OpenDalStorageProvider::new(op)))
         }
-        StorageBackend::Mock => {
-            // Return mock implementation
-            Arc::new(mock::MockStorageProvider::new())
-        }
+        StorageBackend::Mock => Ok(Arc::new(mock::MockStorageProvider::new())),
     }
 }
 
@@ -77,7 +86,8 @@ mod mock {
     use crate::domain::storage::StorageError;
     use async_trait::async_trait;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
 
     pub struct MockStorageProvider {
         pub directories: Arc<Mutex<HashMap<String, u64>>>,
@@ -102,7 +112,7 @@ mod mock {
     #[async_trait]
     impl StorageProvider for MockStorageProvider {
         async fn create_directory(&self, path: &str) -> Result<(), StorageError> {
-            let mut dirs = self.directories.lock().unwrap();
+            let mut dirs = self.directories.lock().await;
             if dirs.contains_key(path) {
                 return Err(StorageError::AlreadyExists(path.to_string()));
             }
@@ -111,28 +121,29 @@ mod mock {
         }
 
         async fn delete_directory(&self, path: &str) -> Result<(), StorageError> {
-            let mut dirs = self.directories.lock().unwrap();
+            let mut dirs = self.directories.lock().await;
             if !dirs.contains_key(path) {
                 return Err(StorageError::NotFound(path.to_string()));
             }
             dirs.remove(path);
-            let mut quotas = self.quotas.lock().unwrap();
+            let mut quotas = self.quotas.lock().await;
             quotas.remove(path);
             Ok(())
         }
 
         async fn set_quota(&self, path: &str, bytes: u64) -> Result<(), StorageError> {
-            let dirs = self.directories.lock().unwrap();
+            let dirs = self.directories.lock().await;
             if !dirs.contains_key(path) {
                 return Err(StorageError::NotFound(path.to_string()));
             }
-            let mut quotas = self.quotas.lock().unwrap();
+            drop(dirs);
+            let mut quotas = self.quotas.lock().await;
             quotas.insert(path.to_string(), bytes);
             Ok(())
         }
 
         async fn get_usage(&self, path: &str) -> Result<u64, StorageError> {
-            let dirs = self.directories.lock().unwrap();
+            let dirs = self.directories.lock().await;
             dirs.get(path)
                 .copied()
                 .ok_or_else(|| StorageError::NotFound(path.to_string()))
@@ -213,17 +224,45 @@ mod tests {
     fn test_factory_seaweedfs() {
         let provider = create_storage_provider(StorageBackend::SeaweedFS {
             filer_url: "http://localhost:8888".to_string(),
-        });
+        })
+        .expect("SeaweedFS storage provider should be created successfully");
 
-        // Should not panic
-        assert!(Arc::strong_count(&provider) == 1);
+        assert_eq!(
+            Arc::strong_count(&provider),
+            1,
+            "unexpected extra Arc references"
+        );
     }
 
     #[test]
     fn test_factory_mock() {
-        let provider = create_storage_provider(StorageBackend::Mock);
+        let provider = create_storage_provider(StorageBackend::Mock)
+            .expect("Mock storage provider should be created successfully");
 
-        // Should not panic
-        assert!(Arc::strong_count(&provider) == 1);
+        assert_eq!(
+            Arc::strong_count(&provider),
+            1,
+            "unexpected extra Arc references"
+        );
+    }
+
+    #[test]
+    fn test_factory_invalid_opendal_scheme_returns_error() {
+        let result = create_storage_provider(StorageBackend::OpenDal {
+            provider: "not-a-real-scheme".to_string(),
+            options: std::collections::HashMap::new(),
+        });
+        assert!(
+            result.is_err(),
+            "invalid OpenDAL scheme should return Err, not panic"
+        );
+        let err_msg = result
+            .err()
+            .expect("invalid OpenDAL scheme should return Err")
+            .to_string();
+        assert!(
+            err_msg.contains("not-a-real-scheme"),
+            "error message should identify the bad scheme; got: {err_msg}"
+        );
     }
 }

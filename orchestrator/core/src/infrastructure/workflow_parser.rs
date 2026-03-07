@@ -2,14 +2,29 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Workflow YAML Parser
 //!
-//! This module provides infrastructure for parsing workflow YAML manifests
-//! into domain objects.
+//! Infrastructure-layer service that parses workflow YAML manifests into
+//! validated domain objects, and serialises domain objects back to YAML.
 //!
-//! # Architecture
+//! # Architectural Context
 //!
+//! - **Bounded Context:** Workflow Orchestration Context (BC-3)
 //! - **Layer:** Infrastructure
-//! - **Purpose:** Parse external YAML → Domain objects
-//! - **Anti-Corruption:** Translates YAML schema to domain model
+//! - **Purpose:** Anti-Corruption Layer — translates external YAML schema to/from domain model
+//! - **Related ADRs:** ADR-015 (Workflow Engine Architecture), ADR-031 (Handlebars Template Engine)
+//!
+//! # Design Principles
+//!
+//! 1. **Anti-Corruption:** YAML schema structs (`WorkflowManifest`, `StateKindYaml`, etc.) never
+//!    bleed into the domain layer; only `Workflow` domain types cross the boundary.
+//! 2. **Single Responsibility:** Parse and serialize only — no side effects beyond file I/O.
+//! 3. **Fail Fast:** Full manifest validation before returning a `Workflow` domain object.
+//! 4. **Round-trip Safe:** `parse_yaml(to_yaml(w)) ≡ w` for all valid workflows.
+//!
+//! # Code Quality Principles
+//!
+//! - All public APIs return `Result` — no panics in production paths.
+//! - Errors carry full context (path, YAML snippet, field name).
+//! - Tests validate both happy-path and error-path behaviour with explicit assertions.
 //!
 //! # Manifest Format
 //!
@@ -77,6 +92,9 @@ pub struct WorkflowSpecYaml {
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
     pub states: HashMap<String, WorkflowStateYaml>,
+    /// Named volumes available to ContainerRun / ParallelContainerRun states (ADR-050)
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub volumes: Vec<crate::domain::workflow::WorkflowVolumeSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +115,15 @@ pub enum StateKindYaml {
         input: String,
         #[serde(default)]
         isolation: Option<IsolationMode>,
+        /// Judge agents declared per-state (ADR-016 / ADR-017)
+        #[serde(default)]
+        judges: Vec<JudgeConfigYaml>,
+        /// Maximum inner-loop iterations for this state (overrides global default)
+        #[serde(default)]
+        max_iterations: Option<u32>,
+        /// Optional pre-execution validator agent ID (ADR-049 Pillar 1)
+        #[serde(default)]
+        pre_execution_validator: Option<String>,
     },
     System {
         command: String,
@@ -113,6 +140,37 @@ pub enum StateKindYaml {
     ParallelAgents {
         agents: Vec<ParallelAgentConfigYaml>,
         consensus: ConsensusConfigYaml,
+        /// External judge agents for validating combined parallel output (ADR-016)
+        #[serde(default)]
+        judges_for_parallel: Vec<JudgeConfigYaml>,
+    },
+    /// Deterministic CI/CD container step — no LLM loop (ADR-050)
+    ContainerRun {
+        name: String,
+        image: String,
+        #[serde(default)]
+        image_pull_policy: Option<crate::domain::agent::ImagePullPolicy>,
+        #[serde(default)]
+        command: Vec<String>,
+        #[serde(default)]
+        env: HashMap<String, String>,
+        #[serde(default)]
+        workdir: Option<String>,
+        #[serde(default)]
+        volumes: Vec<crate::domain::workflow::ContainerVolumeMount>,
+        #[serde(default)]
+        resources: Option<crate::domain::workflow::ContainerResources>,
+        #[serde(default)]
+        registry_credentials: Option<String>,
+        #[serde(default)]
+        retry: Option<crate::domain::workflow::RetryConfig>,
+        #[serde(default)]
+        shell: bool,
+    },
+    /// Parallel deterministic container steps — no LLM loop (ADR-050)
+    ParallelContainerRun {
+        steps: Vec<crate::domain::workflow::ContainerRunConfig>,
+        completion: crate::domain::workflow::ParallelCompletionStrategy,
     },
 }
 
@@ -123,21 +181,21 @@ pub struct ParallelAgentConfigYaml {
     #[serde(default = "default_weight")]
     pub weight: f64,
     #[serde(default = "default_timeout")]
-    pub timeout_seconds: Option<u64>,
+    pub timeout_seconds: u64,
     #[serde(default = "default_poll_interval")]
-    pub poll_interval_ms: Option<u64>,
+    pub poll_interval_ms: u64,
 }
 
 fn default_weight() -> f64 {
     1.0
 }
 
-fn default_timeout() -> Option<u64> {
-    Some(60)
+fn default_timeout() -> u64 {
+    60
 }
 
-fn default_poll_interval() -> Option<u64> {
-    Some(500)
+fn default_poll_interval() -> u64 {
+    500
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -159,6 +217,16 @@ fn default_min_judges() -> Option<usize> {
     Some(1)
 }
 
+/// YAML representation of a judge agent configuration (ADR-016 / ADR-017)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JudgeConfigYaml {
+    pub agent_id: String,
+    #[serde(default)]
+    pub input_template: Option<String>,
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TransitionRuleYaml {
     #[serde(flatten)]
@@ -176,18 +244,40 @@ pub enum TransitionConditionYaml {
     OnFailure,
     ExitCodeZero,
     ExitCodeNonZero,
-    ExitCode { value: i32 },
-    ScoreAbove { threshold: f64 },
-    ScoreBelow { threshold: f64 },
-    ScoreBetween { min: f64, max: f64 },
-    ConfidenceAbove { threshold: f64 },
-    Consensus { threshold: f64, agreement: f64 },
+    ExitCode {
+        value: i32,
+    },
+    ScoreAbove {
+        threshold: f64,
+    },
+    ScoreBelow {
+        threshold: f64,
+    },
+    ScoreBetween {
+        min: f64,
+        max: f64,
+    },
+    ConfidenceAbove {
+        threshold: f64,
+    },
+    /// Both validation score AND confidence are above the same threshold (ADR-049)
+    ScoreAndConfidenceAbove {
+        threshold: f64,
+    },
+    Consensus {
+        threshold: f64,
+        agreement: f64,
+    },
     AllApproved,
     AnyRejected,
-    InputEquals { value: String },
+    InputEquals {
+        value: String,
+    },
     InputEqualsYes,
     InputEqualsNo,
-    Custom { expression: String },
+    Custom {
+        expression: String,
+    },
 }
 
 // ============================================================================
@@ -280,6 +370,7 @@ impl WorkflowParser {
             initial_state,
             context: manifest.spec.context,
             states,
+            volumes: manifest.spec.volumes,
         };
 
         // Create and validate workflow
@@ -293,10 +384,23 @@ impl WorkflowParser {
                 agent,
                 input,
                 isolation,
+                judges,
+                max_iterations,
+                pre_execution_validator,
             } => StateKind::Agent {
                 agent,
                 input,
                 isolation,
+                judges: judges
+                    .into_iter()
+                    .map(|j| crate::domain::workflow::JudgeConfig {
+                        agent_id: j.agent_id,
+                        input_template: j.input_template,
+                        weight: j.weight,
+                    })
+                    .collect(),
+                max_iterations,
+                pre_execution_validator,
             },
             StateKindYaml::System {
                 command,
@@ -314,15 +418,19 @@ impl WorkflowParser {
                 prompt,
                 default_response,
             },
-            StateKindYaml::ParallelAgents { agents, consensus } => {
+            StateKindYaml::ParallelAgents {
+                agents,
+                consensus,
+                judges_for_parallel,
+            } => {
                 let agent_configs = agents
                     .into_iter()
                     .map(|a| ParallelAgentConfig {
                         agent: a.agent,
                         input: a.input,
                         weight: a.weight,
-                        timeout_seconds: a.timeout_seconds.unwrap_or(60),
-                        poll_interval_ms: a.poll_interval_ms.unwrap_or(500),
+                        timeout_seconds: a.timeout_seconds,
+                        poll_interval_ms: a.poll_interval_ms,
                     })
                     .collect();
 
@@ -335,10 +443,48 @@ impl WorkflowParser {
                     confidence_weighting: consensus.confidence_weighting,
                 };
 
+                let judges_for_parallel_configs = judges_for_parallel
+                    .into_iter()
+                    .map(|j| crate::domain::workflow::JudgeConfig {
+                        agent_id: j.agent_id,
+                        input_template: j.input_template,
+                        weight: j.weight,
+                    })
+                    .collect();
+
                 StateKind::ParallelAgents {
                     agents: agent_configs,
                     consensus: consensus_config,
+                    judges_for_parallel: judges_for_parallel_configs,
                 }
+            }
+            StateKindYaml::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            } => StateKind::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            },
+            StateKindYaml::ParallelContainerRun { steps, completion } => {
+                StateKind::ParallelContainerRun { steps, completion }
             }
         })
     }
@@ -377,6 +523,9 @@ impl WorkflowParser {
             }
             TransitionConditionYaml::ConfidenceAbove { threshold } => {
                 TransitionCondition::ConfidenceAbove { threshold }
+            }
+            TransitionConditionYaml::ScoreAndConfidenceAbove { threshold } => {
+                TransitionCondition::ScoreAndConfidenceAbove { threshold }
             }
             TransitionConditionYaml::Consensus {
                 threshold,
@@ -434,6 +583,7 @@ impl WorkflowParser {
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states,
+            volumes: workflow.spec.volumes.clone(),
         };
 
         WorkflowManifest {
@@ -450,10 +600,23 @@ impl WorkflowParser {
                 agent,
                 input,
                 isolation,
+                judges,
+                max_iterations,
+                pre_execution_validator,
             } => StateKindYaml::Agent {
                 agent: agent.clone(),
                 input: input.clone(),
                 isolation: *isolation,
+                judges: judges
+                    .iter()
+                    .map(|j| JudgeConfigYaml {
+                        agent_id: j.agent_id.clone(),
+                        input_template: j.input_template.clone(),
+                        weight: j.weight,
+                    })
+                    .collect(),
+                max_iterations: *max_iterations,
+                pre_execution_validator: pre_execution_validator.clone(),
             },
             StateKind::System {
                 command,
@@ -471,15 +634,19 @@ impl WorkflowParser {
                 prompt: prompt.clone(),
                 default_response: default_response.clone(),
             },
-            StateKind::ParallelAgents { agents, consensus } => StateKindYaml::ParallelAgents {
+            StateKind::ParallelAgents {
+                agents,
+                consensus,
+                judges_for_parallel,
+            } => StateKindYaml::ParallelAgents {
                 agents: agents
                     .iter()
                     .map(|a| ParallelAgentConfigYaml {
                         agent: a.agent.clone(),
                         input: a.input.clone(),
                         weight: a.weight,
-                        timeout_seconds: Some(a.timeout_seconds),
-                        poll_interval_ms: Some(a.poll_interval_ms),
+                        timeout_seconds: a.timeout_seconds,
+                        poll_interval_ms: a.poll_interval_ms,
                     })
                     .collect(),
                 consensus: ConsensusConfigYaml {
@@ -490,7 +657,46 @@ impl WorkflowParser {
                     min_judges_required: Some(consensus.min_judges_required),
                     confidence_weighting: consensus.confidence_weighting.clone(),
                 },
+                judges_for_parallel: judges_for_parallel
+                    .iter()
+                    .map(|j| JudgeConfigYaml {
+                        agent_id: j.agent_id.clone(),
+                        input_template: j.input_template.clone(),
+                        weight: j.weight,
+                    })
+                    .collect(),
             },
+            StateKind::ContainerRun {
+                name,
+                image,
+                image_pull_policy,
+                command,
+                env,
+                workdir,
+                volumes,
+                resources,
+                registry_credentials,
+                retry,
+                shell,
+            } => StateKindYaml::ContainerRun {
+                name: name.clone(),
+                image: image.clone(),
+                image_pull_policy: *image_pull_policy,
+                command: command.clone(),
+                env: env.clone(),
+                workdir: workdir.clone(),
+                volumes: volumes.clone(),
+                resources: resources.clone(),
+                registry_credentials: registry_credentials.clone(),
+                retry: retry.clone(),
+                shell: *shell,
+            },
+            StateKind::ParallelContainerRun { steps, completion } => {
+                StateKindYaml::ParallelContainerRun {
+                    steps: steps.clone(),
+                    completion: *completion,
+                }
+            }
         }
     }
 
@@ -546,6 +752,11 @@ impl WorkflowParser {
             TransitionCondition::Custom { expression } => TransitionConditionYaml::Custom {
                 expression: expression.clone(),
             },
+            TransitionCondition::ScoreAndConfidenceAbove { threshold } => {
+                TransitionConditionYaml::ScoreAndConfidenceAbove {
+                    threshold: *threshold,
+                }
+            }
         }
     }
 }
@@ -601,11 +812,21 @@ spec:
 "#;
 
         let result = WorkflowParser::parse_yaml(yaml);
-        assert!(result.is_ok());
-
-        let workflow = result.unwrap();
-        assert_eq!(workflow.metadata.name, "test-workflow");
-        assert_eq!(workflow.spec.states.len(), 2);
+        assert!(
+            result.is_ok(),
+            "simple workflow YAML failed to parse: {:?}",
+            result.err()
+        );
+        let workflow = result.expect("simple workflow YAML should parse successfully");
+        assert_eq!(
+            workflow.metadata.name, "test-workflow",
+            "workflow name did not match expected value"
+        );
+        assert_eq!(
+            workflow.spec.states.len(),
+            2,
+            "expected exactly 2 states in the parsed workflow"
+        );
     }
 
     #[test]
@@ -625,10 +846,15 @@ spec:
 "#;
 
         let result = WorkflowParser::parse_yaml(yaml);
-        assert!(matches!(
-            result,
-            Err(WorkflowParseError::InvalidApiVersion { .. })
-        ));
+        assert!(
+            result.is_err(),
+            "expected parse to fail for invalid apiVersion, but it succeeded"
+        );
+        assert!(
+            matches!(result, Err(WorkflowParseError::InvalidApiVersion { .. })),
+            "expected InvalidApiVersion error variant, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -647,11 +873,252 @@ spec:
       transitions: []
 "#;
 
+        let workflow =
+            WorkflowParser::parse_yaml(yaml).expect("round-trip source YAML should parse");
+        let yaml_out = WorkflowParser::to_yaml(&workflow)
+            .expect("workflow domain object should serialize to YAML");
+        let workflow2 = WorkflowParser::parse_yaml(&yaml_out)
+            .expect("re-serialized YAML should parse without error");
+
+        assert_eq!(
+            workflow.metadata.name, workflow2.metadata.name,
+            "workflow name must survive round-trip serialization"
+        );
+        assert_eq!(
+            workflow.spec.states.len(),
+            workflow2.spec.states.len(),
+            "state count must survive round-trip serialization"
+        );
+    }
+
+    #[test]
+    fn test_parse_container_run_state() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: ci-build
+  version: "1.0.0"
+spec:
+  initial_state: build
+  volumes:
+    - name: cargo-cache
+      storage_class: persistent
+      size_limit_bytes: 2147483648
+  states:
+    build:
+      kind: ContainerRun
+      name: cargo-build
+      image: "rust:1.75-alpine"
+      command: ["cargo", "build", "--release"]
+      env:
+        CARGO_HOME: /cargo-cache
+      workdir: /workspace
+      volumes:
+        - name: cargo-cache
+          mount_path: /cargo-cache
+          read_only: false
+      resources:
+        cpu: 2000
+        memory: "4Gi"
+        timeout: 10m
+      retry:
+        max_attempts: 2
+        backoff: "5s"
+      shell: false
+      transitions: []
+"#;
+
+        let result = WorkflowParser::parse_yaml(yaml);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+
+        let workflow = result.unwrap();
+        assert_eq!(workflow.metadata.name, "ci-build");
+        assert_eq!(workflow.spec.volumes.len(), 1);
+        assert_eq!(workflow.spec.volumes[0].name, "cargo-cache");
+
+        let build_state = workflow
+            .spec
+            .states
+            .values()
+            .next()
+            .expect("expected one state");
+
+        match &build_state.kind {
+            crate::domain::workflow::StateKind::ContainerRun {
+                name,
+                image,
+                command,
+                volumes,
+                resources,
+                retry,
+                shell,
+                ..
+            } => {
+                assert_eq!(name, "cargo-build");
+                assert_eq!(image, "rust:1.75-alpine");
+                assert_eq!(command, &["cargo", "build", "--release"]);
+                assert_eq!(volumes.len(), 1);
+                assert_eq!(volumes[0].name, "cargo-cache");
+                assert_eq!(volumes[0].mount_path, "/cargo-cache");
+                assert!(!volumes[0].read_only);
+                let res = resources.as_ref().expect("resources should be present");
+                assert_eq!(res.cpu, Some(2000));
+                assert_eq!(res.memory.as_deref(), Some("4Gi"));
+                let r = retry.as_ref().expect("retry should be present");
+                assert_eq!(r.max_attempts, 2);
+                assert_eq!(r.backoff.as_deref(), Some("5s"));
+                assert!(!shell);
+            }
+            other => assert!(false, "expected ContainerRun, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_parse_parallel_container_run() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: parallel-tests
+spec:
+  initial_state: test
+  states:
+    test:
+      kind: ParallelContainerRun
+      completion: all_succeed
+      steps:
+        - name: unit-tests
+          image: "rust:1.75-alpine"
+          command: ["cargo", "test", "--lib"]
+          shell: false
+        - name: integration-tests
+          image: "rust:1.75-alpine"
+          command: ["cargo", "test", "--test", "*"]
+          shell: false
+      transitions: []
+"#;
+
+        let result = WorkflowParser::parse_yaml(yaml);
+        assert!(result.is_ok(), "parse failed: {:?}", result.err());
+
+        let workflow = result.unwrap();
+        let state = workflow.spec.states.values().next().unwrap();
+
+        match &state.kind {
+            crate::domain::workflow::StateKind::ParallelContainerRun { steps, completion } => {
+                assert_eq!(steps.len(), 2);
+                assert_eq!(steps[0].name, "unit-tests");
+                assert_eq!(steps[1].name, "integration-tests");
+                assert_eq!(
+                    *completion,
+                    crate::domain::workflow::ParallelCompletionStrategy::AllSucceed
+                );
+            }
+            other => assert!(false, "expected ParallelContainerRun, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_container_run_round_trip() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: container-roundtrip
+spec:
+  initial_state: build
+  volumes:
+    - name: workspace
+      storage_class: ephemeral
+  states:
+    build:
+      kind: ContainerRun
+      name: docker-build
+      image: "docker:24-dind"
+      command: ["docker", "build", "-t", "myapp:latest", "."]
+      env:
+        DOCKER_BUILDKIT: "1"
+      volumes:
+        - name: workspace
+          mount_path: /workspace
+      shell: false
+      transitions: []
+"#;
+
         let workflow = WorkflowParser::parse_yaml(yaml).unwrap();
         let yaml_out = WorkflowParser::to_yaml(&workflow).unwrap();
         let workflow2 = WorkflowParser::parse_yaml(&yaml_out).unwrap();
 
         assert_eq!(workflow.metadata.name, workflow2.metadata.name);
+        assert_eq!(workflow.spec.volumes.len(), workflow2.spec.volumes.len());
+        assert_eq!(
+            workflow.spec.volumes[0].name,
+            workflow2.spec.volumes[0].name
+        );
         assert_eq!(workflow.spec.states.len(), workflow2.spec.states.len());
+
+        // Verify ContainerRun fields survive the round-trip
+        let state1 = workflow.spec.states.values().next().unwrap();
+        let state2 = workflow2.spec.states.values().next().unwrap();
+        match (&state1.kind, &state2.kind) {
+            (
+                crate::domain::workflow::StateKind::ContainerRun {
+                    name: n1,
+                    image: i1,
+                    volumes: v1,
+                    ..
+                },
+                crate::domain::workflow::StateKind::ContainerRun {
+                    name: n2,
+                    image: i2,
+                    volumes: v2,
+                    ..
+                },
+            ) => {
+                assert_eq!(n1, n2);
+                assert_eq!(i1, i2);
+                assert_eq!(v1.len(), v2.len());
+            }
+            _ => assert!(false, "both states should be ContainerRun after round-trip"),
+        }
+    }
+
+    #[test]
+    fn test_spec_volumes_validation_rejects_undeclared_mount() {
+        // volume name in ContainerVolumeMount does not exist in spec.volumes
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: bad-volume-ref
+spec:
+  initial_state: build
+  volumes:
+    - name: declared-volume
+      storage_class: ephemeral
+  states:
+    build:
+      kind: ContainerRun
+      name: step
+      image: "alpine:3"
+      command: ["ls"]
+      volumes:
+        - name: undeclared-volume
+          mount_path: /data
+      shell: false
+      transitions: []
+"#;
+
+        let result = WorkflowParser::parse_yaml(yaml);
+        assert!(
+            result.is_err(),
+            "Expected parse to fail for undeclared volume mount"
+        );
+        let err_str = result.unwrap_err().to_string();
+        assert!(
+            err_str.contains("undeclared-volume"),
+            "Error message should mention the undeclared volume name, got: {err_str}"
+        );
     }
 }

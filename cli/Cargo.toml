@@ -7,6 +7,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "100monkeys.ai AEGIS orchestrator CLI and daemon"
+readme = "README.md"
 
 [lib]
 name = "aegis_orchestrator"
@@ -21,6 +22,9 @@ path = "src/main.rs"
 clap = { version = "4.5", features = ["derive", "cargo", "env"] }
 colored = "2.1"
 indicatif = "0.17"
+dialoguer = "0.11"
+which = "6"
+dirs-next = "2"
 
 # Async runtime
 tokio = { workspace = true }
@@ -48,11 +52,16 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
+# Docker client (needed to construct DockerContainerStepRunner in daemon)
+bollard = { workspace = true }
+
 # Internal [dependencies]
-aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.4.0-pre-alpha" }
-aegis-orchestrator-sdk = { path = "../sdks", version = "0.4.0-pre-alpha" }
+aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.7.0-pre-alpha" }
+aegis-orchestrator-sdk = { path = "../sdks", version = "0.7.0-pre-alpha" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]

@@ -20,7 +20,9 @@
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
 use crate::domain::node_config::BuiltinDispatcherConfig;
+use crate::domain::secrets::AccessContext;
 use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::secrets_manager::SecretsManager;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -287,13 +289,13 @@ impl ToolRouter {
 
         for dispatcher in &self.builtin_dispatchers {
             for cap in &dispatcher.capabilities {
-                let schema = match cap.as_str() {
+                let schema = match cap.name.as_str() {
                     "cmd.run" => json!({
                         "type": "object",
                         "properties": {
                             "command": {
                                 "type": "string",
-                                "description": "Command to execute (must be on the agent's allowlist)"
+                                "description": "Command to execute"
                             }
                         },
                         "required": ["command"]
@@ -332,11 +334,168 @@ impl ToolRouter {
                         },
                         "required": ["path"]
                     }),
+                    "fs.create_dir" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the directory to create."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    "fs.delete" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file or directory to delete."
+                            },
+                            "recursive": {
+                                "type": "boolean",
+                                "description": "Set to true to delete a directory and all its contents."
+                            }
+                        },
+                        "required": ["path"]
+                    }),
+                    "fs.edit" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to edit."
+                            },
+                            "target_content": {
+                                "type": "string",
+                                "description": "Exact string content to find and replace. Must match exactly once."
+                            },
+                            "replacement_content": {
+                                "type": "string",
+                                "description": "New string content to insert in place of target_content."
+                            }
+                        },
+                        "required": ["path", "target_content", "replacement_content"]
+                    }),
+                    "fs.multi_edit" => json!({
+                        "type": "object",
+                        "properties": {
+                            "path": {
+                                "type": "string",
+                                "description": "Absolute or relative POSIX path of the file to edit."
+                            },
+                            "edits": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "target_content": { "type": "string" },
+                                        "replacement_content": { "type": "string" }
+                                    },
+                                    "required": ["target_content", "replacement_content"]
+                                },
+                                "description": "Array of edits to apply sequentially."
+                            }
+                        },
+                        "required": ["path", "edits"]
+                    }),
+                    "fs.grep" => json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Regex pattern to search for."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Directory path to start the recursive search from."
+                            }
+                        },
+                        "required": ["pattern", "path"]
+                    }),
+                    "fs.glob" => json!({
+                        "type": "object",
+                        "properties": {
+                            "pattern": {
+                                "type": "string",
+                                "description": "Glob pattern to match files (e.g. *.rs)."
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Directory path to start the recursive search from."
+                            }
+                        },
+                        "required": ["pattern", "path"]
+                    }),
+                    "web.search" => json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Search query."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
+                    "web.fetch" => json!({
+                        "type": "object",
+                        "properties": {
+                            "url": {
+                                "type": "string",
+                                "description": "URL to fetch content from."
+                            }
+                        },
+                        "required": ["url"]
+                    }),
+                    "aegis.agent.create" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Agent manifest YAML to parse, validate, and deploy."
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing deployed agent with the same name/version."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
+                    "aegis.agent.list" => json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                    "aegis.workflow.create_and_validate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Workflow manifest YAML to parse, validate, semantically judge, and register."
+                            },
+                            "task_context": {
+                                "type": "string",
+                                "description": "Optional task context to guide semantic judges."
+                            },
+                            "judge_agents": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "description": "Judge agent names to use for semantic validation."
+                            },
+                            "min_score": {
+                                "type": "number",
+                                "description": "Minimum consensus score required for deployment."
+                            },
+                            "min_confidence": {
+                                "type": "number",
+                                "description": "Minimum consensus confidence required for deployment."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
                     _ => json!({ "type": "object" }),
                 };
 
                 all_tools.push(ToolMetadata {
-                    name: cap.clone(),
+                    name: cap.name.clone(),
                     description: dispatcher.description.clone(),
                     input_schema: schema,
                 });
@@ -344,6 +503,32 @@ impl ToolRouter {
         }
 
         Ok(all_tools)
+    }
+
+    /// Returns `true` if the operator has flagged `tool_name` to bypass the inner-loop
+    /// semantic judge.  Checks builtin dispatchers first, then MCP server entries.
+    ///
+    /// Called by `ToolInvocationService::invoke_tool_internal` before running the
+    /// `spec.execution.tool_validation` pipeline (see ADR-049 and NODE_CONFIGURATION_SPEC_V1.md).
+    pub async fn is_skip_judge(&self, tool_name: &str) -> bool {
+        // 1. Builtin dispatchers — iterate CapabilityConfig entries directly.
+        for dispatcher in &self.builtin_dispatchers {
+            for cap in &dispatcher.capabilities {
+                if cap.name == tool_name && cap.skip_judge {
+                    return true;
+                }
+            }
+        }
+
+        // 2. MCP server ToolServer entries — ask each server whether this tool is flagged.
+        let servers = self.servers.read().await;
+        for server in servers.values() {
+            if server.is_skip_judge(tool_name) {
+                return true;
+            }
+        }
+
+        false
     }
 }
 
@@ -382,6 +567,7 @@ pub struct ToolServerManager {
     registry: Arc<dyn ToolRegistry>,
     servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
     event_bus: Arc<EventBus>,
+    secrets_manager: Arc<SecretsManager>,
 }
 
 impl ToolServerManager {
@@ -389,11 +575,13 @@ impl ToolServerManager {
         registry: Arc<dyn ToolRegistry>,
         servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
         event_bus: Arc<EventBus>,
+        secrets_manager: Arc<SecretsManager>,
     ) -> Self {
         Self {
             registry,
             servers,
             event_bus,
+            secrets_manager,
         }
     }
 
@@ -462,6 +650,28 @@ impl ToolServerManager {
         command.stdin(std::process::Stdio::piped());
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
+
+        // Inject credentials as environment variables (ADR-034 Keymaster pattern).
+        // Credentials are resolved from the secret store and injected here;
+        // the subprocess never receives vault tokens or raw secret paths.
+        let cred_context = AccessContext::system("orchestrator");
+        for (env_key, cred_ref) in &server.credentials {
+            match self
+                .secrets_manager
+                .resolve_credential(cred_ref, &cred_context)
+                .await
+            {
+                Ok(sensitive_value) => {
+                    command.env(env_key, sensitive_value.expose());
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to resolve credential '{}' for server '{}': {}",
+                        env_key, server.name, e
+                    );
+                }
+            }
+        }
 
         let child = command.spawn().map_err(|e| {
             // Revert domain state on spawn failure
@@ -621,6 +831,7 @@ impl ToolServerManager {
 mod tests {
     use super::*;
     use crate::domain::mcp::*;
+    use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -632,11 +843,12 @@ mod tests {
             executable_path: PathBuf::from("/usr/local/bin/mcp-test"),
             args: vec![],
             capabilities: capabilities.into_iter().map(|s| s.to_string()).collect(),
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: Duration::from_secs(60),
             last_health_check: None,
-            credentials: None,
+            credentials: HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: Some(512),
                 max_cpu_shares: Some(1000),
@@ -758,5 +970,62 @@ mod tests {
         let other_exec = ExecutionId::new();
         let other_tools = registry.get_tools_for_agent(other_exec).await.unwrap();
         assert_eq!(other_tools.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_includes_aegis_authoring_tool_schemas() {
+        let registry = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+
+        let builtins = vec![
+            BuiltinDispatcherConfig {
+                name: "aegis.agent.create".to_string(),
+                description: "Create and deploy agent manifests".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.agent.create".to_string(),
+                    skip_judge: false,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.create_and_validate".to_string(),
+                description: "Create, validate, and register workflows".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.create_and_validate".to_string(),
+                    skip_judge: false,
+                }],
+            },
+        ];
+
+        let router = ToolRouter::new(registry, servers, builtins);
+        let tools = router.list_tools().await.unwrap();
+
+        let agent_tool = tools.iter().find(|t| t.name == "aegis.agent.create");
+        assert!(agent_tool.is_some(), "expected aegis.agent.create tool");
+        let agent_schema = &agent_tool.unwrap().input_schema;
+        assert_eq!(
+            agent_schema["required"][0].as_str(),
+            Some("manifest_yaml"),
+            "manifest_yaml must be required for aegis.agent.create"
+        );
+
+        let workflow_tool = tools
+            .iter()
+            .find(|t| t.name == "aegis.workflow.create_and_validate");
+        assert!(
+            workflow_tool.is_some(),
+            "expected aegis.workflow.create_and_validate tool"
+        );
+        let workflow_schema = &workflow_tool.unwrap().input_schema;
+        assert_eq!(
+            workflow_schema["required"][0].as_str(),
+            Some("manifest_yaml"),
+            "manifest_yaml must be required for aegis.workflow.create_and_validate"
+        );
+        assert!(
+            workflow_schema["properties"]["judge_agents"].is_object(),
+            "judge_agents property should be present in workflow schema"
+        );
     }
 }

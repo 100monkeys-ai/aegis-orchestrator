@@ -10,13 +10,23 @@
 pub mod agent;
 pub mod config;
 pub mod daemon;
+pub mod down;
+pub mod init;
+pub mod restart;
 pub mod task;
+pub mod uninstall;
+pub mod up;
 pub mod workflow;
 
 pub use self::agent::AgentCommand;
 pub use self::config::ConfigCommand;
 pub use self::daemon::DaemonCommand;
+pub use self::down::DownArgs;
+pub use self::init::InitArgs;
+pub use self::restart::RestartArgs;
 pub use self::task::TaskCommand;
+pub use self::uninstall::UninstallArgs;
+pub use self::up::UpArgs;
 pub use self::workflow::WorkflowCommand;
 pub mod update;
 pub use self::update::UpdateCommand;

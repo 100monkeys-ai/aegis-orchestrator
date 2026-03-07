@@ -28,9 +28,13 @@ aegis-config.yaml
 
 # Rust Guardian
 guardian_report.*
+rust_guardian.*
 
 # Protocol Buffers
 cli/tools/*
 
 # Proto vendor directory (created by CI for crates.io publishing)
 orchestrator/core/proto-vendor/
+
+# Sources
+sources/

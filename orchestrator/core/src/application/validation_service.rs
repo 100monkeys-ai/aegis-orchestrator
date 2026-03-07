@@ -65,9 +65,9 @@ use crate::application::execution::ExecutionService;
 use crate::domain::agent::{AgentId, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::validation::{
-    GradientResult, GradientValidator, MultiJudgeConsensus, OutputGradientValidator,
-    SystemGradientValidator, ValidationContext, ValidationPipeline, ValidationRequest,
-    ValidatorEntry, ValidatorKind,
+    extract_json_from_text, GradientResult, GradientValidator, MultiJudgeConsensus,
+    OutputGradientValidator, SystemGradientValidator, ValidationContext, ValidationPipeline,
+    ValidationRequest, ValidatorEntry, ValidatorKind,
 };
 use crate::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
 use anyhow::{anyhow, Context, Result};
@@ -264,7 +264,7 @@ impl ValidationService {
     }
 
     fn extract_json(text: &str) -> Option<String> {
-        extract_json_from_text(text)
+        crate::domain::validation::extract_json_from_text(text)
     }
 
     fn compute_consensus(
@@ -274,40 +274,6 @@ impl ValidationService {
     ) -> Result<MultiJudgeConsensus> {
         compute_consensus_for_strategy(results, config)
     }
-}
-
-// ── Module-level helpers ─────────────────────────────────────────────────────
-
-/// Extract the first JSON value from `text`, stripping markdown code fences.
-///
-/// Looks first for a ` ```json ... ``` ` block, then a generic ` ``` ... ``` ` block.
-/// Returns the trimmed interior, or `None` if neither fence is found.
-pub(crate) fn extract_json_from_text(text: &str) -> Option<String> {
-    let json_marker = "```json";
-    if let Some(start) = text.find(json_marker) {
-        let content_start = start + json_marker.len();
-        if let Some(end_offset) = text[content_start..].find("```") {
-            return Some(
-                text[content_start..content_start + end_offset]
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-
-    let generic_marker = "```";
-    if let Some(start) = text.find(generic_marker) {
-        let content_start = start + generic_marker.len();
-        if let Some(end_offset) = text[content_start..].find("```") {
-            return Some(
-                text[content_start..content_start + end_offset]
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
-
-    None
 }
 
 // ── Consensus helpers (free functions so validators can reuse them) ───────────
@@ -700,8 +666,9 @@ impl GradientValidator for MultiJudgeAgentValidator {
                                 .output
                                 .as_ref()
                                 .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
-                            let json_str = extract_json_from_text(output_str)
-                                .unwrap_or_else(|| output_str.clone());
+                            let json_str =
+                                crate::domain::validation::extract_json_from_text(output_str)
+                                    .unwrap_or_else(|| output_str.clone());
                             let result: GradientResult = serde_json::from_str(&json_str)
                                 .context(format!("Failed to parse judge output: {}", json_str))?;
                             return Ok((jid, result, w));

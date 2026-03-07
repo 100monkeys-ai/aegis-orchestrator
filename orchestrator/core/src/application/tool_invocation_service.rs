@@ -3,18 +3,30 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::application::nfs_gateway::NfsVolumeRegistry;
+use crate::application::register_workflow::RegisterWorkflowUseCase;
+use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::DispatchAction;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
+use crate::domain::fsal::AegisFSAL;
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
+use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy, WorkflowValidator};
+use crate::domain::{validation::ValidationRequest, workflow::ConfidenceWeighting};
 use crate::infrastructure::smcp::middleware::SmcpMiddleware;
 use crate::infrastructure::tool_router::ToolRouter;
 
+use crate::application::agent::AgentLifecycleService;
+use crate::application::execution::ExecutionService;
+use crate::application::ports::ExternalWebToolPort;
+use crate::domain::execution::ExecutionInput;
 use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::validation::extract_json_from_text;
+use crate::infrastructure::agent_manifest_parser::AgentManifestParser;
+use crate::infrastructure::workflow_parser::WorkflowParser;
 
 pub enum ToolInvocationResult {
     Direct(Value),
@@ -31,8 +43,21 @@ pub struct ToolInvocationService {
     fsal: Arc<AegisFSAL>,
     /// Volume registry for resolving execution_id → volume context
     volume_registry: NfsVolumeRegistry,
+    /// Agent lifecycle service for semantic validation
+    agent_lifecycle: Arc<dyn AgentLifecycleService>,
+    /// Execution service for spawning inner-loop judges
+    execution_service: Arc<dyn ExecutionService>,
+    /// Adapter for external web tools (Path 2).
+    web_tool_port: Arc<dyn ExternalWebToolPort>,
+    /// Optional workflow registration use case for built-in aegis workflow authoring tools.
+    register_workflow_use_case: Option<Arc<dyn RegisterWorkflowUseCase>>,
+    /// Optional validation service for semantic stage in workflow authoring tools.
+    validation_service: Option<Arc<ValidationService>>,
+    /// Optional root directory for persisting generated manifests on disk.
+    generated_manifests_root: Option<PathBuf>,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
     pub fn new(
         smcp_session_repo: Arc<dyn SmcpSessionRepository>,
@@ -41,6 +66,9 @@ impl ToolInvocationService {
         tool_router: Arc<ToolRouter>,
         fsal: Arc<AegisFSAL>,
         volume_registry: NfsVolumeRegistry,
+        agent_lifecycle: Arc<dyn AgentLifecycleService>,
+        execution_service: Arc<dyn ExecutionService>,
+        web_tool_port: Arc<dyn ExternalWebToolPort>,
     ) -> Self {
         Self {
             smcp_session_repo,
@@ -49,7 +77,30 @@ impl ToolInvocationService {
             tool_router,
             fsal,
             volume_registry,
+            agent_lifecycle,
+            execution_service,
+            web_tool_port,
+            register_workflow_use_case: None,
+            validation_service: None,
+            generated_manifests_root: None,
         }
+    }
+
+    /// Enables built-in workflow authoring tools that require registration and semantic validation.
+    pub fn with_workflow_authoring(
+        mut self,
+        register_workflow_use_case: Arc<dyn RegisterWorkflowUseCase>,
+        validation_service: Arc<ValidationService>,
+    ) -> Self {
+        self.register_workflow_use_case = Some(register_workflow_use_case);
+        self.validation_service = Some(validation_service);
+        self
+    }
+
+    /// Enables persistence of generated manifests to local disk.
+    pub fn with_generated_manifests_root(mut self, root: PathBuf) -> Self {
+        self.generated_manifests_root = Some(root);
+        self
     }
 
     /// Invokes a tool by validating the SMCP Envelope for the agent and routing to the right server
@@ -74,11 +125,8 @@ impl ToolInvocationService {
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload)?;
 
-        // 3. Route tool call to the appropriate TCP server
-        // The ToolRouter returns a ToolServerId, but we might actually want to call the tool.
-        // For MVP, if it routes successfully, we return a mock payload or delegate to actual calling logic.
-        // Wait, the ToolRouter doesn't actually *invoke* the tool yet. It returns `ToolServerId`.
-        // Let's get the server ID first.
+        // 3. Route tool call to the appropriate TCP server.
+        // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
         let server_id = self
             .tool_router
             .route_tool(session.execution_id, &tool_name)
@@ -105,8 +153,7 @@ impl ToolInvocationService {
                     agent_id
                 );
 
-                // [MVP Placeholder for FSAL operations]
-                // Examples: modifying /shared/<agent_id>/workspace natively on the host filesystem
+                // FSAL execution wiring can be expanded with concrete file operations.
 
                 Ok(serde_json::json!({
                     "status": "success",
@@ -132,7 +179,7 @@ impl ToolInvocationService {
                     server_id
                 );
 
-                // [MVP Placeholder for stdio/http IPC to actual MCP server process]
+                // JSON-RPC transport wiring can be expanded with concrete stdio/http IPC.
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",
@@ -180,153 +227,191 @@ impl ToolInvocationService {
             )));
         }
 
-        // Handle Dispatch Protocol tools (ADR-040)
-        if tool_name == "cmd.run" {
-            let command = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+        // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
+        // If the agent manifest specifies an inner-loop semantic validation step,
+        // execute it BEFORE the tool call is dispatched to external systems.
+        // This is a synchronous block that fails the tool call if the judge rejects it.
+        let agent = self
+            .agent_lifecycle
+            .get_agent(*agent_id)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to retrieve agent: {}",
+                    e
+                ))
+            })?;
 
-            return Ok(ToolInvocationResult::DispatchRequired(
-                DispatchAction::Exec {
-                    command,
-                    args: vec![],
-                    cwd: "/workspace".to_string(),
-                    env_additions: std::collections::HashMap::new(),
-                    timeout_secs: 300,
-                    max_output_bytes: 1048576,
-                },
-            ));
+        if let Some(exec_spec) = &agent.manifest.spec.execution {
+            // Check operator-level skip_judge flag before running the inner-loop semantic
+            // judge pipeline. When the node config marks a tool with `skip_judge: true`
+            // (e.g. read-only tools such as fs.read, fs.list), we bypass the judge entirely
+            // to reduce latency on low-risk operations (NODE_CONFIGURATION_SPEC_V1.md).
+            let skip_tool_judge = self.tool_router.is_skip_judge(&tool_name).await;
+            if skip_tool_judge {
+                tracing::debug!(
+                    tool_name = %tool_name,
+                    "Inner-loop semantic judge skipped (skip_judge=true in node config for this tool)"
+                );
+            } else if let Some(validation_pipeline) = &exec_spec.tool_validation {
+                for validator in validation_pipeline {
+                    // Check if this is an Inner-Loop Semantic Validator configuration
+                    if let crate::domain::agent::ValidatorSpec::Semantic {
+                        judge_agent,
+                        criteria,
+                        min_score,
+                        min_confidence,
+                        timeout_seconds,
+                    } = validator
+                    {
+                        tracing::info!(
+                            "Running inner-loop semantic validation for tool '{}' via judge '{}'",
+                            tool_name,
+                            judge_agent
+                        );
+
+                        let judge_id = self
+                            .agent_lifecycle
+                            .lookup_agent(judge_agent)
+                            .await
+                            .map_err(|e| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Failed to lookup judge: {}",
+                                    e
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Judge agent '{}' not found",
+                                    judge_agent
+                                ))
+                            })?;
+
+                        let semantic_input = format!(
+                            "Tool Call Request:\nTool: {}\nArguments: {}",
+                            tool_name,
+                            serde_json::to_string_pretty(&args).unwrap_or_default()
+                        );
+
+                        let input = ExecutionInput {
+                            intent: None,
+                            payload: serde_json::json!({
+                                "task": "Evaluate whether the agent's requested tool call adheres to constitutional policies and makes logical sense for the trajectory.",
+                                "output": semantic_input,
+                                "criteria": criteria,
+                                "validation_context": "semantic_judge_pre_execution_inner_loop"
+                            }),
+                        };
+
+                        // Start the single iteration judge as child execution
+                        let exec_id = self
+                            .execution_service
+                            .start_child_execution(judge_id, input, execution_id)
+                            .await
+                            .map_err(|e| {
+                                SmcpSessionError::SignatureVerificationFailed(format!(
+                                    "Failed to spawn judge child execution: {}",
+                                    e
+                                ))
+                            })?;
+
+                        let poll_interval_ms = 500u64;
+                        let max_attempts = (*timeout_seconds * 1000) / poll_interval_ms;
+                        let mut attempts = 0;
+
+                        loop {
+                            if attempts >= max_attempts {
+                                return Err(SmcpSessionError::SignatureVerificationFailed(format!("Inner-loop semantic judge '{}' timed out after {} seconds.", judge_agent, timeout_seconds)));
+                            }
+
+                            let exec = self
+                                .execution_service
+                                .get_execution(exec_id)
+                                .await
+                                .map_err(|e| {
+                                    SmcpSessionError::SignatureVerificationFailed(e.to_string())
+                                })?;
+
+                            match exec.status {
+                                crate::domain::execution::ExecutionStatus::Completed => {
+                                    let last_iter = exec.iterations().last().ok_or_else(|| {
+                                        SmcpSessionError::SignatureVerificationFailed(
+                                            "Judge completed but has no iterations".to_string(),
+                                        )
+                                    })?;
+                                    let output_str =
+                                        last_iter.output.as_ref().ok_or_else(|| {
+                                            SmcpSessionError::SignatureVerificationFailed(
+                                                "Judge completed but has no output".to_string(),
+                                            )
+                                        })?;
+
+                                    let json_str = extract_json_from_text(output_str)
+                                        .unwrap_or_else(|| output_str.clone());
+                                    let result: crate::domain::validation::GradientResult =
+                                        serde_json::from_str(&json_str).map_err(|e| {
+                                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                                "Failed to parse judge output: {}",
+                                                e
+                                            ))
+                                        })?;
+
+                                    if !(result.score >= *min_score
+                                        && result.confidence >= *min_confidence)
+                                    {
+                                        return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                                             "Inner-loop tool execution rejected by semantic judge (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
+                                             result.score, min_score, result.reasoning
+                                         )));
+                                    }
+                                    break;
+                                }
+                                crate::domain::execution::ExecutionStatus::Failed
+                                | crate::domain::execution::ExecutionStatus::Cancelled => {
+                                    return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
+                                }
+                                _ => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        poll_interval_ms,
+                                    ))
+                                    .await;
+                                    attempts += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // --- End Pre-Execution Validation ---
+
+        // Built-in orchestrator authoring tools
+        if tool_name == "aegis.agent.create" {
+            return self.invoke_aegis_agent_create_tool(&args).await;
+        }
+        if tool_name == "aegis.agent.list" {
+            return self.invoke_aegis_agent_list_tool().await;
+        }
+        if tool_name == "aegis.workflow.create_and_validate" {
+            return self
+                .invoke_aegis_workflow_create_and_validate_tool(&args, execution_id, *agent_id)
+                .await;
         }
 
-        // Handle built-in FSAL tools (ADR-033 Path 1, ADR-047)
-        // These execute on the orchestrator host via AegisFSAL, which handles:
-        // - Authorization (execution owns volume)
-        // - Path sanitization (traversal prevention)
-        // - Policy enforcement (read/write allowlists)
-        // - Quota checking
-        // - Audit events (StorageEvent publishing)
-        if tool_name == "fs.write" || tool_name == "fs.read" || tool_name == "fs.list" {
-            // Resolve the agent's volume context from execution_id
-            let vol_ctx = self
-                .volume_registry
-                .find_by_execution(execution_id)
-                .ok_or_else(|| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
-                        "No volume registered for execution {}",
-                        execution_id
-                    ))
-                })?;
-
-            let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
-
-            match tool_name.as_str() {
-                "fs.write" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                    tracing::info!(
-                        "FSAL fs.write: path={:?} content_len={} execution={}",
-                        path,
-                        content.len(),
-                        execution_id
-                    );
-
-                    // Create file first, then write content
-                    let _file_handle = self
-                        .fsal
-                        .create_file(
-                            vol_ctx.execution_id,
-                            vol_ctx.volume_id,
-                            path,
-                            &vol_ctx.policy,
-                        )
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL create_file error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let bytes_written = self
-                        .fsal
-                        .write(&handle, path, &vol_ctx.policy, 0, content.as_bytes())
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL write error: {}",
-                                e
-                            ))
-                        })?;
-
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "bytes_written": bytes_written
-                    })));
-                }
-                "fs.read" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                    tracing::info!("FSAL fs.read: path={:?} execution={}", path, execution_id);
-
-                    let data = self
-                        .fsal
-                        .read(&handle, path, &vol_ctx.policy, 0, 10 * 1024 * 1024) // 10MB max
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL read error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let content = String::from_utf8_lossy(&data).to_string();
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "content": content,
-                        "size_bytes": data.len()
-                    })));
-                }
-                "fs.list" => {
-                    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
-                    tracing::info!("FSAL fs.list: path={:?} execution={}", path, execution_id);
-
-                    let entries = self
-                        .fsal
-                        .readdir(
-                            vol_ctx.execution_id,
-                            vol_ctx.volume_id,
-                            path,
-                            &vol_ctx.policy,
-                        )
-                        .await
-                        .map_err(|e| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "FSAL readdir error: {}",
-                                e
-                            ))
-                        })?;
-
-                    let entries_json: Vec<serde_json::Value> = entries
-                        .iter()
-                        .map(|e| {
-                            serde_json::json!({
-                                "name": e.name,
-                                "file_type": format!("{:?}", e.file_type),
-                            })
-                        })
-                        .collect();
-
-                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                        "status": "success",
-                        "path": path,
-                        "entries": entries_json
-                    })));
-                }
-                _ => unreachable!(),
-            }
+        // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
+        match crate::application::tools::try_invoke_builtin(
+            &tool_name,
+            &args,
+            execution_id,
+            &self.fsal,
+            &self.volume_registry,
+            &self.web_tool_port,
+        )
+        .await
+        {
+            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => return Ok(result),
+            Ok(crate::application::tools::BuiltinToolResult::NotBuiltin) => {} // Continue to dynamic routing
+            Err(e) => return Err(e),
         }
 
         let server_id = self
@@ -388,6 +473,372 @@ impl ToolInvocationService {
             SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e))
         })
     }
+
+    async fn invoke_aegis_agent_create_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.agent.create requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.create",
+                    "validated": false,
+                    "deployed": false,
+                    "errors": [format!("Agent manifest parse/validation failed: {}", e)]
+                })));
+            }
+        };
+
+        match self
+            .agent_lifecycle
+            .deploy_agent(manifest.clone(), force)
+            .await
+        {
+            Ok(agent_id) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "agents",
+                        &manifest.metadata.name,
+                        &manifest.metadata.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Agent deployed but failed to persist manifest: {}",
+                            e
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.create",
+                    "validated": true,
+                    "deployed": true,
+                    "agent_id": agent_id.0.to_string(),
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "force": force,
+                    "manifest_path": persisted_path
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.create",
+                "validated": true,
+                "deployed": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [format!("Agent deployment failed: {}", e)]
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_agent_list_tool(&self) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let agents = self.agent_lifecycle.list_agents().await.map_err(|e| {
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list agents: {}", e))
+        })?;
+
+        let entries: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id.0.to_string(),
+                    "name": a.name,
+                    "version": a.manifest.metadata.version,
+                    "status": format!("{:?}", a.status).to_lowercase(),
+                    "labels": a.manifest.metadata.labels,
+                })
+            })
+            .collect();
+
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.agent.list",
+            "count": entries.len(),
+            "agents": entries
+        })))
+    }
+
+    async fn invoke_aegis_workflow_create_and_validate_tool(
+        &self,
+        args: &Value,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.workflow.create_and_validate requires 'manifest_yaml' string"
+                        .to_string(),
+                )
+            })?;
+
+        let task_context = args
+            .get("task_context")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let min_score = args
+            .get("min_score")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.8);
+        let min_confidence = args
+            .get("min_confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.7);
+
+        let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
+            Ok(w) => w,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.create_and_validate",
+                    "deterministic_validation": {
+                        "passed": false,
+                        "error": format!("Workflow parser validation failed: {}", e),
+                    },
+                    "semantic_validation": {"passed": false},
+                    "deployed": false
+                })));
+            }
+        };
+
+        if let Err(e) = WorkflowValidator::check_for_cycles(&workflow) {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.create_and_validate",
+                "deterministic_validation": {
+                    "passed": false,
+                    "error": format!("Workflow cycle validation failed: {}", e),
+                },
+                "semantic_validation": {"passed": false},
+                "deployed": false
+            })));
+        }
+
+        let validation_service = self.validation_service.as_ref().ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "Workflow semantic validation service not configured".to_string(),
+            )
+        })?;
+        let register_workflow_use_case =
+            self.register_workflow_use_case.as_ref().ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "Workflow registration use case not configured".to_string(),
+                )
+            })?;
+
+        let judge_names: Vec<String> = args
+            .get("judge_agents")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect::<Vec<String>>()
+            })
+            .unwrap_or_else(|| vec!["code-quality-judge".to_string()]);
+
+        if judge_names.is_empty() {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.create_and_validate",
+                "deterministic_validation": {"passed": true},
+                "semantic_validation": {
+                    "passed": false,
+                    "error": "No judge agents provided",
+                },
+                "deployed": false
+            })));
+        }
+
+        let mut judges: Vec<(AgentId, f64)> = Vec::with_capacity(judge_names.len());
+        for judge_name in &judge_names {
+            let judge_id = self
+                .agent_lifecycle
+                .lookup_agent(judge_name)
+                .await
+                .map_err(|e| {
+                    SmcpSessionError::SignatureVerificationFailed(format!(
+                        "Failed to lookup judge agent '{}': {}",
+                        judge_name, e
+                    ))
+                })?
+                .ok_or_else(|| {
+                    SmcpSessionError::SignatureVerificationFailed(format!(
+                        "Judge agent '{}' not found",
+                        judge_name
+                    ))
+                })?;
+            judges.push((judge_id, 1.0));
+        }
+
+        let criteria = if task_context.is_empty() {
+            "Evaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness.".to_string()
+        } else {
+            format!(
+                "Task Context:\n{}\n\nEvaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness.",
+                task_context
+            )
+        };
+
+        let semantic_request = ValidationRequest {
+            content: manifest_yaml.to_string(),
+            criteria,
+            context: Some(serde_json::json!({
+                "validation_context": "workflow_create_and_validate",
+                "workflow_name": workflow.metadata.name,
+                "state_count": workflow.spec.states.len(),
+            })),
+        };
+
+        let semantic_consensus = validation_service
+            .validate_with_judges(
+                execution_id,
+                agent_id,
+                0,
+                semantic_request,
+                judges,
+                Some(ConsensusConfig {
+                    strategy: ConsensusStrategy::WeightedAverage,
+                    threshold: Some(min_score),
+                    min_agreement_confidence: Some(min_confidence),
+                    n: None,
+                    min_judges_required: 1,
+                    confidence_weighting: Some(ConfidenceWeighting::default()),
+                }),
+                90,
+                500,
+            )
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Workflow semantic validation failed: {}",
+                    e
+                ))
+            })?;
+
+        let semantic_passed = semantic_consensus.final_score >= min_score
+            && semantic_consensus.consensus_confidence >= min_confidence;
+
+        if !semantic_passed {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.create_and_validate",
+                "deterministic_validation": {"passed": true},
+                "semantic_validation": {
+                    "passed": false,
+                    "score": semantic_consensus.final_score,
+                    "confidence": semantic_consensus.consensus_confidence,
+                    "thresholds": {
+                        "min_score": min_score,
+                        "min_confidence": min_confidence
+                    },
+                    "strategy": semantic_consensus.strategy,
+                },
+                "deployed": false
+            })));
+        }
+
+        match register_workflow_use_case
+            .register_workflow(manifest_yaml)
+            .await
+        {
+            Ok(registered) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "workflows",
+                        &registered.name,
+                        &registered.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Workflow deployed but failed to persist manifest: {}",
+                            e
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.create_and_validate",
+                    "deterministic_validation": {"passed": true},
+                    "semantic_validation": {
+                        "passed": true,
+                        "score": semantic_consensus.final_score,
+                        "confidence": semantic_consensus.consensus_confidence,
+                        "strategy": semantic_consensus.strategy,
+                    },
+                    "deployed": true,
+                    "workflow": {
+                        "workflow_id": registered.workflow_id,
+                        "name": registered.name,
+                        "version": registered.version,
+                        "status": registered.status
+                    },
+                    "manifest_path": persisted_path
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.create_and_validate",
+                "deterministic_validation": {"passed": true},
+                "semantic_validation": {
+                    "passed": true,
+                    "score": semantic_consensus.final_score,
+                    "confidence": semantic_consensus.consensus_confidence,
+                    "strategy": semantic_consensus.strategy,
+                },
+                "deployed": false,
+                "errors": [format!("Workflow registration failed: {}", e)]
+            }))),
+        }
+    }
+
+    fn persist_generated_manifest(
+        &self,
+        kind: &str,
+        name: &str,
+        version: &str,
+        manifest_yaml: &str,
+    ) -> std::io::Result<Option<String>> {
+        let Some(root) = &self.generated_manifests_root else {
+            return Ok(None);
+        };
+
+        let safe_name = sanitize_segment(name);
+        let safe_version = sanitize_segment(version);
+        let target_dir = root.join(kind).join(safe_name);
+        std::fs::create_dir_all(&target_dir)?;
+
+        let file_path = target_dir.join(format!("{}.yaml", safe_version));
+        std::fs::write(&file_path, manifest_yaml)?;
+        Ok(Some(path_to_string(&file_path)))
+    }
+}
+
+fn sanitize_segment(input: &str) -> String {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return "unversioned".to_string();
+    }
+
+    trimmed
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn path_to_string(path: &Path) -> String {
+    path.to_string_lossy().into_owned()
 }
 
 #[cfg(test)]
@@ -401,7 +852,7 @@ mod tests {
     use crate::domain::smcp_session::SmcpSession;
     use crate::infrastructure::repositories::InMemoryVolumeRepository;
     use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
-    use crate::infrastructure::storage::MockStorageProvider;
+    use crate::infrastructure::storage::LocalHostStorageProvider;
     use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
     use async_trait::async_trait;
 
@@ -412,9 +863,13 @@ mod tests {
         async fn publish_storage_event(&self, _event: StorageEvent) {}
     }
 
-    /// Create mock AegisFSAL + empty NfsVolumeRegistry for tests
-    fn mock_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
-        let storage = Arc::new(MockStorageProvider::new());
+    /// Create test FSAL dependencies and empty NFS volume registry.
+    fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
+        let storage_root = std::env::temp_dir().join("aegis-tool-invocation-tests");
+        let storage = Arc::new(
+            LocalHostStorageProvider::new(&storage_root)
+                .expect("failed to initialize LocalHostStorageProvider for tests"),
+        );
         let vol_repo = Arc::new(InMemoryVolumeRepository::new());
         let publisher = Arc::new(NoOpEventPublisher);
         let fsal = Arc::new(AegisFSAL::new(storage, vol_repo, publisher));
@@ -444,6 +899,97 @@ mod tests {
         }
     }
 
+    use crate::domain::agent::{Agent, AgentManifest};
+    use crate::domain::events::ExecutionEvent;
+    use crate::domain::execution::{Execution, Iteration};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use futures::Stream;
+    use std::pin::Pin;
+
+    struct TestAgentLifecycleService;
+    #[async_trait]
+    impl AgentLifecycleService for TestAgentLifecycleService {
+        async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
+            anyhow::bail!("TestAgentLifecycleService::deploy_agent not exercised in this test")
+        }
+        async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+            anyhow::bail!("TestAgentLifecycleService::get_agent not exercised in this test")
+        }
+        async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+            anyhow::bail!("TestAgentLifecycleService::update_agent not exercised in this test")
+        }
+        async fn delete_agent(&self, _: AgentId) -> Result<()> {
+            anyhow::bail!("TestAgentLifecycleService::delete_agent not exercised in this test")
+        }
+        async fn list_agents(&self) -> Result<Vec<Agent>> {
+            anyhow::bail!("TestAgentLifecycleService::list_agents not exercised in this test")
+        }
+        async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
+            anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
+        }
+    }
+
+    struct TestExecutionService;
+    #[async_trait]
+    impl ExecutionService for TestExecutionService {
+        async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+            anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
+        }
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("TestExecutionService::start_child_execution not exercised in this test")
+        }
+        async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
+            anyhow::bail!("TestExecutionService::get_execution not exercised in this test")
+        }
+        async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+            anyhow::bail!("TestExecutionService::get_iterations not exercised in this test")
+        }
+        async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("TestExecutionService::cancel_execution not exercised in this test")
+        }
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("TestExecutionService::stream_execution not exercised in this test")
+        }
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!("TestExecutionService::stream_agent_events not exercised in this test")
+        }
+        async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+            anyhow::bail!("TestExecutionService::list_executions not exercised in this test")
+        }
+        async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("TestExecutionService::delete_execution not exercised in this test")
+        }
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            anyhow::bail!("TestExecutionService::record_llm_interaction not exercised in this test")
+        }
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            anyhow::bail!(
+                "TestExecutionService::store_iteration_trajectory not exercised in this test"
+            )
+        }
+    }
+
     #[tokio::test]
     async fn test_invoke_tool_no_session() {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
@@ -456,7 +1002,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -464,6 +1010,9 @@ mod tests {
             router,
             fsal,
             volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let agent_id = AgentId::new();
         let envelope = DummyEnvelope { valid: true };
@@ -502,7 +1051,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -510,6 +1059,9 @@ mod tests {
             router,
             fsal,
             volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
         let envelope = DummyEnvelope { valid: false };
 
@@ -574,7 +1126,7 @@ mod tests {
         let security_context_repo = Arc::new(
             crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
         );
-        let (fsal, volume_registry) = mock_fsal_deps();
+        let (fsal, volume_registry) = test_fsal_deps();
         let service = ToolInvocationService::new(
             repo,
             security_context_repo,
@@ -582,6 +1134,9 @@ mod tests {
             router.clone(),
             fsal,
             volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         );
 
         // 1. Local Tool
@@ -592,11 +1147,12 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test_tool".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: std::collections::HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,
@@ -624,11 +1180,12 @@ mod tests {
             executable_path: PathBuf::from("/bin/true"),
             args: vec![],
             capabilities: vec!["test_tool_remote".to_string()],
+            skip_judge_tools: std::collections::HashSet::new(),
             status: ToolServerStatus::Running,
             process_id: None,
             health_check_interval: std::time::Duration::from_secs(30),
             last_health_check: None,
-            credentials: None,
+            credentials: std::collections::HashMap::new(),
             resource_limits: ResourceLimits {
                 max_memory_mb: None,
                 max_cpu_shares: None,

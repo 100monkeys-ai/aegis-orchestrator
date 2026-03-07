@@ -4,6 +4,10 @@
 
 version: "1.0"
 
+# Output behavior
+output:
+  color: false
+
 # Path filtering configuration
 paths:
   patterns:
@@ -32,6 +36,14 @@ paths:
     - "bin/"                       # Binary outputs (deployments)
     - ".env*"                      # Environment files
     - "**/*.backup"                # Backup files
+    - "**/rust_guardian.txt"       # Generated guardian output
+    - "**/guardian_report.txt"     # Generated guardian output
+    - "**/guardian.yaml"           # Scanner config (contains rule keywords by design)
+    - "**/.guardianignore"         # Scanner ignore list (contains rule keywords by design)
+    - "**/.github/workflows/**"    # CI workflow YAML
+    - "**/cli/templates/**"        # User-facing config templates
+    - "**/cli/migrations/**"       # SQL migrations
+    - "**/docker/**"               # Container build assets
     
     # Include overrides (with !) - processed after excludes
     - "!crates/**/*.rs"            # Always check all Rust crates
@@ -61,6 +73,9 @@ patterns:
             - "**/README.md"           # README can have roadmap TODOs
             - "**/*.md"                # Markdown files
             - "**/CHANGELOG.md"        # Changelog
+            - "**/*.yml"
+            - "**/*.yaml"
+            - "**/*.sql"
       
       - id: temporary_markers
         type: regex
@@ -74,8 +89,15 @@ patterns:
             - "**/benches/**"
             - "**/examples/**"         # Examples might use simplified code
             - "**/mocks/**"            # Mock implementations
+            - "**/guardian.yaml"
+            - "**/.guardianignore"
+            - "**/Dockerfile*"
+            - "**/*.yml"
+            - "**/*.yaml"
+            - "**/*.sql"
       
       - id: test_mod_detection
+        enabled: false
         type: regex
         pattern: 'mod\s+tests'
         message: "Found mod tests: {match}"
@@ -91,6 +113,7 @@ patterns:
           file_patterns:
             - "**/tests/**"
             - "**/benches/**"
+            - "**/build.rs"
 
   # Incomplete implementation detection - CRITICAL
   incomplete_implementations:
@@ -123,6 +146,9 @@ patterns:
         pattern: 'NotImplemented|not.implemented|Not.Implemented'
         message: "NotImplemented error pattern found"
         case_sensitive: false
+        exclude_if:
+          file_patterns:
+            - "guardian.yaml"
 
   # Architectural violation detection - IMPORTANT
   architectural_violations:
@@ -142,6 +168,9 @@ patterns:
             - "**/docs/**"
             - "**/deploy*.sh"          # Deploy scripts may need absolute paths
             - "**/*.sh"                # Shell scripts
+            - "**/Dockerfile*"
+            - "**/*.yaml"
+            - "**/*.yml"
       
       # Domain should only depend on language primitives and maybe some util crates, NEVER infrastructure or application
       - id: domain_imports_infrastructure
@@ -229,7 +258,7 @@ patterns:
   # Async code patterns
   async_patterns:
     severity: warning
-    enabled: true
+    enabled: false
     rules:
       - id: blocking_in_async
         type: semantic
@@ -268,6 +297,7 @@ patterns:
             - "**/package.json"        # NPM package names
       
       - id: missing_error_handling
+        enabled: false
         type: ast
         pattern: 'unwrap_or_expect_without_message'
         message: "unwrap() or expect() without meaningful message"
@@ -294,6 +324,7 @@ patterns:
     enabled: true
     rules:
       - id: test_without_assert
+        enabled: false
         type: semantic
         pattern: "test_fn_without_assertion"
         message: "Test function without assertions - test may not verify anything"

@@ -73,7 +73,7 @@ spec:
     #   enabled: false
 
   # storage:
-  #   backend: "local"  # Local filesystem (default) or "seaweedfs" for distributed storage
+  #   backend: "local_host"  # Local filesystem (default) or "seaweedfs" for distributed storage
   #   # For SeaweedFS configuration, see config-with-examples.yaml
 
   # database:

@@ -243,9 +243,9 @@ spec:
   # Distributed storage for agent file system volumes
   # See: ADR-032 Unified Storage via SeaweedFS
   storage:
-    # Backend: "seaweedfs" (distributed) or "local" (single-node)
-    # Default: "local" (no distributed storage)
-    backend: "local"
+    # Backend: "seaweedfs" (distributed) or "local_host" (single-node)
+    # Default: "local_host" (no distributed storage)
+    backend: "local_host"
     
     # SeaweedFS configuration (production multi-node deployments)
     # Requires SeaweedFS Filer + PostgreSQL

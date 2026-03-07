@@ -36,6 +36,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
 
+use crate::application::ports::{AttestationTokenClaims, SecurityTokenIssuerPort, TokenAudience};
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::security_context::repository::SecurityContextRepository;
@@ -44,7 +45,6 @@ use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::infrastructure::smcp::attestation::{
     AttestationRequest, AttestationResponse, AttestationService,
 };
-use crate::infrastructure::smcp::envelope::ContextClaims;
 use crate::infrastructure::smcp::signature::SecurityTokenIssuer;
 
 /// Concrete implementation of the SMCP attestation ceremony.
@@ -55,14 +55,14 @@ use crate::infrastructure::smcp::signature::SecurityTokenIssuer;
 pub struct AttestationServiceImpl {
     security_context_repo: Arc<dyn SecurityContextRepository>,
     smcp_session_repo: Arc<dyn SmcpSessionRepository>,
-    token_issuer: Arc<SecurityTokenIssuer>,
+    token_issuer: Arc<dyn SecurityTokenIssuerPort>,
 }
 
 impl AttestationServiceImpl {
     pub fn new(
         security_context_repo: Arc<dyn SecurityContextRepository>,
         smcp_session_repo: Arc<dyn SmcpSessionRepository>,
-        token_issuer: Arc<SecurityTokenIssuer>,
+        token_issuer: Arc<dyn SecurityTokenIssuerPort>,
     ) -> Self {
         Self {
             security_context_repo,
@@ -94,16 +94,12 @@ impl AttestationService for AttestationServiceImpl {
             })?;
 
         // 2. Generate Claims
-        let mut claims = ContextClaims {
+        let mut claims = AttestationTokenClaims {
             agent_id: request.agent_id.clone(),
             execution_id: request.execution_id.clone(),
             security_context: security_context.name.clone(),
             iss: None, // Filled by issuer
-            aud: Some(
-                crate::infrastructure::smcp::envelope::AudienceClaim::Single(
-                    "aegis-orchestrator".to_string(),
-                ),
-            ),
+            aud: Some(TokenAudience::Single("aegis-orchestrator".to_string())),
             exp: Some(chrono::Utc::now().timestamp() + 3600), // 1 hour expiration
             iat: Some(chrono::Utc::now().timestamp()),
             nbf: None,
@@ -126,5 +122,29 @@ impl AttestationService for AttestationServiceImpl {
         Ok(AttestationResponse {
             security_token: token,
         })
+    }
+}
+
+impl SecurityTokenIssuerPort for SecurityTokenIssuer {
+    fn issue(&self, claims: &mut AttestationTokenClaims) -> Result<String> {
+        use crate::infrastructure::smcp::envelope::{AudienceClaim, ContextClaims};
+
+        let aud = claims.aud.clone().map(|a| match a {
+            TokenAudience::Single(s) => AudienceClaim::Single(s),
+            TokenAudience::Multiple(v) => AudienceClaim::Multiple(v),
+        });
+
+        let mut inner_claims = ContextClaims {
+            agent_id: claims.agent_id.clone(),
+            execution_id: claims.execution_id.clone(),
+            security_context: claims.security_context.clone(),
+            iss: claims.iss.clone(),
+            aud,
+            exp: claims.exp,
+            iat: claims.iat,
+            nbf: claims.nbf,
+        };
+
+        SecurityTokenIssuer::issue(self, &mut inner_claims)
     }
 }

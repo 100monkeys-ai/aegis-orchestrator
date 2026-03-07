@@ -1,0 +1,86 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: agent-creator-agent
+  version: "1.0.0"
+  description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
+  labels:
+    role: worker
+    category: platform
+    capability: agent-authoring
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+
+  task:
+    instruction: |
+      You are an Agent Manifest Authoring specialist.
+      Convert user intent into valid 100monkeys.ai/v1 Agent manifests.
+
+      Requirements:
+      - Produce complete YAML manifest(s) with apiVersion/kind/metadata/spec.
+      - Use lowercase DNS-safe metadata.name.
+      - Keep runtime and security settings explicit.
+      - Prefer deterministic validation in execution.validation when feasible.
+      - If input includes a planner JSON with `missing_agents` and `generation_prompts`,
+        generate and deploy one agent per missing entry.
+      - If no missing agents are provided, do not call any deploy tool and return a no-op summary.
+
+      For each agent to create, call `aegis.agent.create` with:
+      {
+        "manifest_yaml": "<full yaml>",
+        "force": true
+      }
+
+      Return JSON only:
+      {
+        "created": [
+          {"name": "...", "version": "...", "deployed": true, "agent_id": "..."}
+        ],
+        "skipped": [{"requirement": "...", "reason": "..."}],
+        "errors": ["..."]
+      }
+    prompt_template: |
+      {{instruction}}
+
+      User request:
+      {{input}}
+
+      Agent:
+
+  execution:
+    mode: iterative
+    max_iterations: 4
+    llm_timeout_seconds: 300
+    validation:
+      - type: semantic
+        judge_agent: agent-generator-judge
+        criteria: Ensure generated agent manifests are correct, safe, and deployable for the requested capability.
+        min_score: 0.85
+        min_confidence: 0.75
+        timeout_seconds: 120
+    tool_validation:
+      - type: semantic
+        judge_agent: tool-call-policy-judge
+        criteria: Ensure tool usage follows policy and arguments are valid for authoring actions.
+        min_score: 0.8
+        min_confidence: 0.7
+        timeout_seconds: 90
+
+  tools:
+    - aegis.agent.create
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 1000
+      memory: 512Mi
+      disk: 1Gi
+      timeout: 300s

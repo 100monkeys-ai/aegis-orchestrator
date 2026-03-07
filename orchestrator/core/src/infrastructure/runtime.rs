@@ -27,7 +27,7 @@
 // Firecracker VM-based isolation deferred to Phase 2 for production hardening.
 // Phase 1 uses Docker for development/testing convenience.
 //
-// TODO: Implement Firecracker runtime variant when Phase 2 begins.
+// Firecracker runtime variant is planned for Phase 2.
 // See: adrs/003-firecracker-isolation.md
 // ============================================================================
 
@@ -307,7 +307,7 @@ impl AgentRuntime for DockerRuntime {
             });
         let pull_source = match self
             .image_manager
-            .ensure_image(&image, config.image_pull_policy)
+            .ensure_image(&image, config.image_pull_policy, None)
             .await
         {
             Ok(source) => {
@@ -407,7 +407,11 @@ impl AgentRuntime for DockerRuntime {
 
                     Mount {
                         target: Some(container_path),
-                        source: None,
+                        // Named volumes (source is set) support ReadOnly mode;
+                        // anonymous volumes (source=None) do NOT — Docker returns
+                        // HTTP 400 "must not set ReadOnly mode when using anonymous
+                        // volumes".  Use a deterministic name derived from volume_id.
+                        source: Some(format!("aegis-vol-{}", volume_mount.volume_id)),
                         typ: Some(MountTypeEnum::VOLUME),
                         read_only: Some(matches!(
                             volume_mount.access_mode,

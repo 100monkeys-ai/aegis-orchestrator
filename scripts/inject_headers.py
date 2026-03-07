@@ -1,6 +1,4 @@
 import os
-import re
-import sys
 
 # Mappings of file keywords or paths to their related ADRs
 ADR_MAPPINGS = {

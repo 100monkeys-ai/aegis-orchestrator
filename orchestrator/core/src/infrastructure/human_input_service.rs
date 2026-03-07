@@ -291,13 +291,18 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(
+            matches!(result, HumanInputStatus::Approved { .. }),
+            "Expected approval result, got {:?}",
+            result
+        );
         let HumanInputStatus::Approved {
             feedback,
             approved_by,
             ..
         } = result
         else {
-            panic!("Expected approval result, got {:?}", result);
+            return;
         };
         assert_eq!(feedback, Some("Looks good!".to_string()));
         assert_eq!(approved_by, Some("alice".to_string()));
@@ -332,13 +337,18 @@ mod tests {
             .await
             .unwrap();
 
+        assert!(
+            matches!(result, HumanInputStatus::Rejected { .. }),
+            "Expected rejection result, got {:?}",
+            result
+        );
         let HumanInputStatus::Rejected {
             reason,
             rejected_by,
             ..
         } = result
         else {
-            panic!("Expected rejection result, got {:?}", result);
+            return;
         };
         assert_eq!(reason, "Security concerns");
         assert_eq!(rejected_by, Some("bob".to_string()));

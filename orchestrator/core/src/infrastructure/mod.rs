@@ -19,6 +19,7 @@
 //! | [`storage`] | `SeaweedFSAdapter` implementing `StorageProvider` | ADR-032 |
 //! | [`security_context`] | `InMemorySecurityContextRepository` | ADR-035 |
 //! | [`tool_router`] | `ToolRouter` MCP proxy + `InMemorySmcpSessionRepository` | ADR-033 |
+//! | [`secrets_manager`] | `OpenBaoSecretStore`, `SecretsManager`, `MockSecretStore` | ADR-034 |
 //! | [`db`] | SQLx PostgreSQL connection pool | ADR-025 |
 //! | [`workflow_parser`] | YAML → `Workflow` aggregate deserializer | ADR-015/031 |
 //! | [`agent_manifest_parser`] | YAML → `AgentManifest` deserializer | — |
@@ -30,21 +31,25 @@
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server + cortex client | ADR-042 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
+//! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
 
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
 pub mod agentskills_client;
+pub mod container_step_runner;
 pub mod context_loader;
 pub mod cortex_client;
 pub mod db;
 pub mod event_bus;
 pub mod human_input_service;
+pub mod iam;
 pub mod image_manager;
 pub mod llm;
 pub mod nfs;
 pub mod prompt_template_engine;
 pub mod repositories;
 pub mod runtime;
+pub mod secrets_manager;
 pub mod security_context;
 pub mod sensor;
 pub mod smcp;
@@ -53,6 +58,7 @@ pub mod temporal_client;
 pub mod temporal_event_listener;
 pub mod temporal_proto;
 pub mod tool_router;
+pub mod web_tools;
 pub mod workflow_parser;
 
 pub use cortex_client::CortexGrpcClient;

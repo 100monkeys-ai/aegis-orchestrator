@@ -57,8 +57,10 @@
 //! - **Namespace**: Logical isolation boundary for workflows
 //! - **Task Queue**: Worker registration and task routing identifier
 
+use crate::application::ports::WorkflowEnginePort;
 use crate::domain::execution::ExecutionId;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use reqwest::Client as HttpClient;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -313,5 +315,24 @@ impl TemporalClient {
         }
 
         Ok(())
+    }
+}
+
+#[async_trait]
+impl WorkflowEnginePort for TemporalClient {
+    async fn register_workflow(
+        &self,
+        definition: &crate::application::temporal_mapper::TemporalWorkflowDefinition,
+    ) -> Result<()> {
+        self.register_temporal_workflow(definition).await
+    }
+
+    async fn start_workflow(
+        &self,
+        workflow_name: &str,
+        execution_id: ExecutionId,
+        input: HashMap<String, serde_json::Value>,
+    ) -> Result<String> {
+        TemporalClient::start_workflow(self, workflow_name, execution_id, input).await
     }
 }

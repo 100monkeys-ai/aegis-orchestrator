@@ -147,6 +147,38 @@ pub struct ValidationContext {
     pub stderr: String,
 }
 
+/// Extract the first JSON value from `text`, stripping markdown code fences.
+///
+/// Looks first for a ` ```json ... ``` ` block, then a generic ` ``` ... ``` ` block.
+/// Returns the trimmed interior, or `None` if neither fence is found.
+pub fn extract_json_from_text(text: &str) -> Option<String> {
+    let json_marker = "```json";
+    if let Some(start) = text.find(json_marker) {
+        let content_start = start + json_marker.len();
+        if let Some(end_offset) = text[content_start..].find("```") {
+            return Some(
+                text[content_start..content_start + end_offset]
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+
+    let generic_marker = "```";
+    if let Some(start) = text.find(generic_marker) {
+        let content_start = start + generic_marker.len();
+        if let Some(end_offset) = text[content_start..].find("```") {
+            return Some(
+                text[content_start..content_start + end_offset]
+                    .trim()
+                    .to_string(),
+            );
+        }
+    }
+
+    None
+}
+
 /// Domain trait for gradient validators (ADR-017).
 ///
 /// Each validator receives a [`ValidationContext`] and produces a [`GradientResult`].
