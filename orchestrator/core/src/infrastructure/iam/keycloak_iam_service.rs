@@ -329,14 +329,7 @@ impl IdentityProvider for StandardIamService {
 
         // 2. Decode claims without validation to extract issuer for realm lookup
         let unvalidated: KeycloakClaims = {
-            let mut validation = Validation::new(Algorithm::RS256);
-            validation.insecure_disable_signature_validation();
-            validation.validate_aud = false;
-            validation.validate_exp = false;
-
-            // Use a dummy key for decoding without verification
-            let dummy_key = DecodingKey::from_secret(b"dummy");
-            decode::<KeycloakClaims>(raw_jwt, &dummy_key, &validation)
+            jsonwebtoken::dangerous::insecure_decode::<KeycloakClaims>(raw_jwt)
                 .map_err(|e| IamError::DecodeError(e.to_string()))?
                 .claims
         };

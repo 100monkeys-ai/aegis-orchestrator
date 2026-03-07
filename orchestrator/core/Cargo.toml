@@ -68,7 +68,7 @@ urlencoding = "2.1"
 # Cryptography & Security (SMCP)
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 base64 = "0.22"
-jsonwebtoken = "9.3.0"
+jsonwebtoken = "10.3.0"
 opendal = "0.52.0"
 vaultrs = "0.7"
 

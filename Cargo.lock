@@ -21,7 +21,7 @@ dependencies = [
  "dirs-next",
  "futures",
  "indicatif",
- "jsonwebtoken 10.3.0",
+ "jsonwebtoken",
  "libc",
  "rand 0.8.5",
  "reqwest",
@@ -62,7 +62,7 @@ dependencies = [
  "html2md",
  "humantime-serde",
  "jsonschema",
- "jsonwebtoken 9.3.1",
+ "jsonwebtoken",
  "lru",
  "nfsserve",
  "opendal",
@@ -2011,21 +2011,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid-simd",
-]
-
-[[package]]
-name = "jsonwebtoken"
-version = "9.3.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a87cc7a48537badeae96744432de36f4be2b4a34a05a5ef32e9dd8a1c169dde"
-dependencies = [
- "base64",
- "js-sys",
- "pem",
- "ring",
- "serde",
- "serde_json",
- "simple_asn1",
 ]
 
 [[package]]
