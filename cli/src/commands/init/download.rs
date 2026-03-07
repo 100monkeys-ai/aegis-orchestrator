@@ -2,122 +2,40 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! GitHub download step of `aegis init`.
 //!
-//! Fetches the latest docker-compose stack and runtime-registry from the
-//! canonical AEGIS GitHub repositories. Files are fetched over HTTPS from
-//! `raw.githubusercontent.com` so the user always gets the latest version
-//! without a CLI upgrade.
+//! Loads bundled stack templates used by `aegis init`.
 //!
 //! # Architecture
 //!
 //! - **Layer:** Interface / Presentation Layer
-//! - **Purpose:** download step inside the `aegis init` wizard
+//! - **Purpose:** stack asset load step inside the `aegis init` wizard
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use colored::Colorize;
-use indicatif::{ProgressBar, ProgressStyle};
+const DOCKER_COMPOSE_TEMPLATE: &str = include_str!("../../../templates/stack/docker-compose.yml");
+const INIT_DB_SCRIPT_TEMPLATE: &str = include_str!("../../../templates/stack/init-multiple-dbs.sh");
+const RUNTIME_REGISTRY_TEMPLATE: &str =
+    include_str!("../../../templates/stack/runtime-registry.yaml");
+const TEMPORAL_DYNAMIC_CONFIG_TEMPLATE: &str =
+    include_str!("../../../templates/stack/development-sql.yaml");
 
-const EXAMPLES_REPO: &str = "100monkeys-ai/aegis-examples";
-const ORCHESTRATOR_REPO: &str = "100monkeys-ai/aegis-orchestrator";
-const BRANCH: &str = "main";
-
-/// Raw file manifests to download
-struct RemoteFile {
-    repo: &'static str,
-    path: &'static str,
-    label: &'static str,
-}
-
-const FILES: &[RemoteFile] = &[
-    RemoteFile {
-        repo: EXAMPLES_REPO,
-        path: "deploy/docker-compose.yml",
-        label: "docker-compose.yml",
-    },
-    RemoteFile {
-        repo: EXAMPLES_REPO,
-        path: "deploy/init-multiple-dbs.sh",
-        label: "init-multiple-dbs.sh",
-    },
-    RemoteFile {
-        repo: ORCHESTRATOR_REPO,
-        path: "runtime-registry.yaml",
-        label: "runtime-registry.yaml",
-    },
-    RemoteFile {
-        repo: EXAMPLES_REPO,
-        path: "agents/hello-world/agent.yaml",
-        label: "hello-world/agent.yaml",
-    },
-    RemoteFile {
-        repo: EXAMPLES_REPO,
-        path: "agents/judges/tool-call-policy-judge.yaml",
-        label: "judges/tool-call-policy-judge.yaml",
-    },
-    RemoteFile {
-        repo: EXAMPLES_REPO,
-        path: "deploy/temporal/development-sql.yaml",
-        label: "temporal/development-sql.yaml",
-    },
-];
-
-/// Bundle of all downloaded stack files.
+/// Bundle of stack files used by `aegis init`.
 pub struct StackFiles {
     pub docker_compose: String,
     pub init_db_script: String,
     pub runtime_registry: String,
-    pub hello_world_agent: String,
-    pub tool_call_policy_judge: String,
     pub temporal_dynamic_config: String,
 }
 
-/// Download the AEGIS stack from GitHub.
+/// Load stack files from bundled templates.
 pub async fn fetch_stack() -> Result<StackFiles> {
     println!();
-    println!("{}", "Downloading stack files from GitHub...".bold());
-
-    let client = reqwest::Client::builder()
-        .user_agent(concat!("aegis-init/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("Failed to build HTTP client")?;
-
-    let bar = ProgressBar::new(FILES.len() as u64);
-    bar.set_style(
-        ProgressStyle::with_template("  [{bar:40.cyan/blue}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("=>-"),
-    );
-
-    let mut contents: Vec<String> = Vec::with_capacity(FILES.len());
-
-    for file in FILES {
-        bar.set_message(file.label);
-        let url = format!(
-            "https://raw.githubusercontent.com/{}/{}/{}",
-            file.repo, BRANCH, file.path
-        );
-        let text = client
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {} failed", url))?
-            .error_for_status()
-            .with_context(|| format!("HTTP error fetching {}", file.label))?
-            .text()
-            .await
-            .with_context(|| format!("Failed to read body for {}", file.label))?;
-        contents.push(text);
-        bar.inc(1);
-    }
-
-    bar.finish_and_clear();
-    println!("  {} All stack files downloaded", "✓".green());
+    println!("{}", "Loading bundled stack templates...".bold());
+    println!("  {} Stack files ready", "✓".green());
 
     Ok(StackFiles {
-        docker_compose: contents[0].clone(),
-        init_db_script: contents[1].clone(),
-        runtime_registry: contents[2].clone(),
-        hello_world_agent: contents[3].clone(),
-        tool_call_policy_judge: contents[4].clone(),
-        temporal_dynamic_config: contents[5].clone(),
+        docker_compose: DOCKER_COMPOSE_TEMPLATE.to_string(),
+        init_db_script: INIT_DB_SCRIPT_TEMPLATE.to_string(),
+        runtime_registry: RUNTIME_REGISTRY_TEMPLATE.to_string(),
+        temporal_dynamic_config: TEMPORAL_DYNAMIC_CONFIG_TEMPLATE.to_string(),
     })
 }

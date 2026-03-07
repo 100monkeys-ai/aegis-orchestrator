@@ -84,8 +84,8 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let checker = PrereqChecker::new(args.manual, components.ollama_llm);
     checker.check_and_install().await?;
 
-    // ─── Step 3: Download stack from GitHub ───────────────────────────────────
-    print_step(3, 7, "Downloading stack");
+    // ─── Step 3: Prepare stack templates ──────────────────────────────────────
+    print_step(3, 7, "Preparing stack files");
     let stack = fetch_stack().await?;
 
     // ─── Step 4: Configure node ───────────────────────────────────────────────
@@ -135,9 +135,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // ─── Optional: Load examples ──────────────────────────────────────────────
     let loader = ExamplesLoader::new(&args.host, args.port, args.yes);
-    loader
-        .maybe_load_hello_world(&stack.hello_world_agent, &stack.tool_call_policy_judge)
-        .await?;
+    loader.maybe_load_hello_world().await?;
 
     // ─── Done ─────────────────────────────────────────────────────────────────
     print_success(&args.host, args.port, &components);

@@ -19,6 +19,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use super::anthropic::AnthropicAdapter;
+use super::gemini::GeminiAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
@@ -208,6 +209,11 @@ impl ProviderRegistry {
                 model.to_string(),
             )),
             "anthropic" => Arc::new(AnthropicAdapter::new(api_key, model.to_string())),
+            "gemini" => Arc::new(GeminiAdapter::new(
+                config.endpoint.clone(),
+                api_key,
+                model.to_string(),
+            )),
             // OpenAI-compatible APIs (LM Studio, vLLM, etc.)
             "openai-compatible" => Arc::new(OpenAIAdapter::new(
                 config.endpoint.clone(),

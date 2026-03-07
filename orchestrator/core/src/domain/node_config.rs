@@ -218,7 +218,7 @@ pub struct LLMProviderConfig {
 
     /// Provider type
     #[serde(rename = "type")]
-    pub provider_type: String, // "ollama", "openai", "anthropic", "openai-compatible"
+    pub provider_type: String, // "ollama", "openai", "anthropic", "gemini", "openai-compatible"
 
     /// API endpoint URL
     pub endpoint: String,
@@ -239,7 +239,7 @@ impl LLMProviderConfig {
     /// Returns `true` when this provider runs inference locally (no external API call).
     ///
     /// Local provider types: `"ollama"`, `"openai-compatible"` (e.g. LM Studio, vLLM).
-    /// Cloud provider types: `"openai"`, `"anthropic"`.
+    /// Cloud provider types: `"openai"`, `"anthropic"`, `"gemini"`.
     /// Used by `ProviderRegistry::build_alias_map` to implement `LLMSelectionStrategy`.
     pub fn is_local(&self) -> bool {
         matches!(self.provider_type.as_str(), "ollama" | "openai-compatible")

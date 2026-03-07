@@ -34,6 +34,38 @@ pub struct NodeConfig {
     pub api_key: Option<String>,
     /// The working directory where stack files will be written
     pub working_dir: PathBuf,
+    /// Extended init settings collected via advanced walkthrough
+    pub advanced: AdvancedConfig,
+}
+
+/// Expanded node/env settings for advanced init walkthrough.
+#[derive(Debug, Clone)]
+pub struct AdvancedConfig {
+    pub node_type: String,
+    pub bind_address: String,
+    pub api_port: u16,
+    pub log_level: String,
+    pub docker_network: String,
+    pub orchestrator_url: String,
+    pub nfs_host: String,
+    pub keycloak_admin_password: String,
+    pub openbao_secret_id: String,
+    pub database_url: String,
+    pub temporal_worker_secret: String,
+    pub keep_container: bool,
+    pub enable_lmstudio: bool,
+    pub lmstudio_endpoint: String,
+    pub lmstudio_smart_model: String,
+    pub lmstudio_judge_model: String,
+    pub enable_anthropic_extra: bool,
+    pub anthropic_api_key: String,
+    pub anthropic_smart_model: String,
+    pub anthropic_judge_model: String,
+    pub enable_gemini: bool,
+    pub gemini_endpoint: String,
+    pub gemini_api_key: String,
+    pub gemini_smart_model: String,
+    pub gemini_judge_model: String,
 }
 
 /// Drives the interactive configuration step.
@@ -118,12 +150,15 @@ impl ConfigWizard {
             }
         };
 
+        let advanced = self.collect_advanced_config()?;
+
         let node_config = NodeConfig {
             node_name,
             node_id,
             ollama_model,
             api_key,
             working_dir: working_dir.clone(),
+            advanced,
         };
 
         let config_path = working_dir.join("aegis-config.yaml");
@@ -169,6 +204,200 @@ impl ConfigWizard {
         println!("  {} {}", "✓".green(), runtime_registry_path.display());
 
         Ok(node_config)
+    }
+
+    fn collect_advanced_config(&self) -> Result<AdvancedConfig> {
+        let defaults = AdvancedConfig {
+            node_type: "edge".to_string(),
+            bind_address: "0.0.0.0".to_string(),
+            api_port: 8088,
+            log_level: "info".to_string(),
+            docker_network: "aegis-network".to_string(),
+            orchestrator_url: "http://aegis-runtime:8088".to_string(),
+            nfs_host: "127.0.0.1".to_string(),
+            keycloak_admin_password: "admin".to_string(),
+            openbao_secret_id: "test-secret-id".to_string(),
+            database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+            temporal_worker_secret: "dev-temporal-secret".to_string(),
+            keep_container: false,
+            enable_lmstudio: false,
+            lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
+            lmstudio_smart_model: "google/gemma-3-4b".to_string(),
+            lmstudio_judge_model: "google/gemma-3-4b".to_string(),
+            enable_anthropic_extra: false,
+            anthropic_api_key: String::new(),
+            anthropic_smart_model: "claude-3-5-sonnet-20241022".to_string(),
+            anthropic_judge_model: "claude-3-5-sonnet-20241022".to_string(),
+            enable_gemini: false,
+            gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
+            gemini_api_key: String::new(),
+            gemini_smart_model: "gemini-2.5-flash".to_string(),
+            gemini_judge_model: "gemini-2.5-pro".to_string(),
+        };
+
+        if self.yes {
+            return Ok(defaults);
+        }
+
+        let advanced = Confirm::new()
+            .with_prompt("Run advanced configuration walkthrough?")
+            .default(false)
+            .interact()?;
+        if !advanced {
+            return Ok(defaults);
+        }
+
+        println!();
+        println!("{}", "Advanced configuration:".bold());
+
+        let enable_lmstudio = Confirm::new()
+            .with_prompt("Enable LM Studio provider?")
+            .default(defaults.enable_lmstudio)
+            .interact()?;
+        let enable_anthropic_extra = Confirm::new()
+            .with_prompt("Enable Anthropic provider in addition to base LLM choice?")
+            .default(defaults.enable_anthropic_extra)
+            .interact()?;
+        let enable_gemini = Confirm::new()
+            .with_prompt("Enable Gemini provider (OpenAI-compatible endpoint)?")
+            .default(defaults.enable_gemini)
+            .interact()?;
+
+        Ok(AdvancedConfig {
+            node_type: Input::new()
+                .with_prompt("Node type")
+                .default(defaults.node_type.clone())
+                .interact_text()?,
+            bind_address: Input::new()
+                .with_prompt("API bind address")
+                .default(defaults.bind_address.clone())
+                .interact_text()?,
+            api_port: Input::new()
+                .with_prompt("API port")
+                .default(defaults.api_port)
+                .interact_text()?,
+            log_level: Input::new()
+                .with_prompt("Log level (trace/debug/info/warn/error)")
+                .default(defaults.log_level.clone())
+                .interact_text()?,
+            docker_network: Input::new()
+                .with_prompt("AEGIS_DOCKER_NETWORK")
+                .default(defaults.docker_network.clone())
+                .interact_text()?,
+            orchestrator_url: Input::new()
+                .with_prompt("AEGIS_ORCHESTRATOR_URL")
+                .default(defaults.orchestrator_url.clone())
+                .interact_text()?,
+            nfs_host: Input::new()
+                .with_prompt("AEGIS_NFS_HOST")
+                .default(defaults.nfs_host.clone())
+                .interact_text()?,
+            keycloak_admin_password: Password::new()
+                .with_prompt("KEYCLOAK_ADMIN_PASSWORD")
+                .with_confirmation("Confirm KEYCLOAK_ADMIN_PASSWORD", "Passwords mismatch")
+                .allow_empty_password(true)
+                .interact()?,
+            openbao_secret_id: Input::new()
+                .with_prompt("OPENBAO_SECRET_ID")
+                .default(defaults.openbao_secret_id.clone())
+                .interact_text()?,
+            database_url: Input::new()
+                .with_prompt("AEGIS_DATABASE_URL")
+                .default(defaults.database_url.clone())
+                .interact_text()?,
+            temporal_worker_secret: Password::new()
+                .with_prompt("TEMPORAL_WORKER_SECRET")
+                .with_confirmation("Confirm TEMPORAL_WORKER_SECRET", "Secrets mismatch")
+                .allow_empty_password(true)
+                .interact()?,
+            keep_container: Confirm::new()
+                .with_prompt("Set AEGIS_KEEP_CONTAINER=true for debugging?")
+                .default(defaults.keep_container)
+                .interact()?,
+            enable_lmstudio,
+            lmstudio_endpoint: if enable_lmstudio {
+                Input::new()
+                    .with_prompt("LM Studio endpoint")
+                    .default(defaults.lmstudio_endpoint.clone())
+                    .interact_text()?
+            } else {
+                defaults.lmstudio_endpoint.clone()
+            },
+            lmstudio_smart_model: if enable_lmstudio {
+                Input::new()
+                    .with_prompt("LM Studio smart model")
+                    .default(defaults.lmstudio_smart_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.lmstudio_smart_model.clone()
+            },
+            lmstudio_judge_model: if enable_lmstudio {
+                Input::new()
+                    .with_prompt("LM Studio judge model")
+                    .default(defaults.lmstudio_judge_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.lmstudio_judge_model.clone()
+            },
+            enable_anthropic_extra,
+            anthropic_api_key: if enable_anthropic_extra {
+                Password::new()
+                    .with_prompt("ANTHROPIC_API_KEY (optional; blank to set later)")
+                    .allow_empty_password(true)
+                    .interact()?
+            } else {
+                String::new()
+            },
+            anthropic_smart_model: if enable_anthropic_extra {
+                Input::new()
+                    .with_prompt("Anthropic smart model")
+                    .default(defaults.anthropic_smart_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.anthropic_smart_model.clone()
+            },
+            anthropic_judge_model: if enable_anthropic_extra {
+                Input::new()
+                    .with_prompt("Anthropic judge model")
+                    .default(defaults.anthropic_judge_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.anthropic_judge_model.clone()
+            },
+            enable_gemini,
+            gemini_endpoint: if enable_gemini {
+                Input::new()
+                    .with_prompt("Gemini endpoint")
+                    .default(defaults.gemini_endpoint.clone())
+                    .interact_text()?
+            } else {
+                defaults.gemini_endpoint.clone()
+            },
+            gemini_api_key: if enable_gemini {
+                Password::new()
+                    .with_prompt("GEMINI_API_KEY (optional; blank to set later)")
+                    .allow_empty_password(true)
+                    .interact()?
+            } else {
+                String::new()
+            },
+            gemini_smart_model: if enable_gemini {
+                Input::new()
+                    .with_prompt("Gemini smart model")
+                    .default(defaults.gemini_smart_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.gemini_smart_model.clone()
+            },
+            gemini_judge_model: if enable_gemini {
+                Input::new()
+                    .with_prompt("Gemini judge model")
+                    .default(defaults.gemini_judge_model.clone())
+                    .interact_text()?
+            } else {
+                defaults.gemini_judge_model.clone()
+            },
+        })
     }
 
     /// Render the `aegis-config.yaml` content from collected inputs.
@@ -270,6 +499,91 @@ impl ConfigWizard {
 "#
             .to_string(),
         };
+        let extra_lmstudio_section = if config.advanced.enable_lmstudio {
+            format!(
+                r#"
+    - name: "lmstudio"
+      type: "openai-compatible"
+      endpoint: "{endpoint}"
+      enabled: true
+      models:
+        - alias: "smart"
+          model: "{smart_model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+        - alias: "judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+"#,
+                endpoint = config.advanced.lmstudio_endpoint,
+                smart_model = config.advanced.lmstudio_smart_model,
+                judge_model = config.advanced.lmstudio_judge_model,
+            )
+        } else {
+            String::new()
+        };
+        let extra_anthropic_section = if config.advanced.enable_anthropic_extra
+            && !matches!(components.llm, LlmChoice::Anthropic)
+        {
+            format!(
+                r#"
+    - name: "anthropic-extra"
+      type: "anthropic"
+      endpoint: "https://api.anthropic.com"
+      enabled: true
+      api_key: "env:ANTHROPIC_API_KEY"
+      models:
+        - alias: "smart"
+          model: "{smart_model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
+        - alias: "judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 200000
+          cost_per_1k_tokens: 0.003
+"#,
+                smart_model = config.advanced.anthropic_smart_model,
+                judge_model = config.advanced.anthropic_judge_model,
+            )
+        } else {
+            String::new()
+        };
+        let extra_gemini_section = if config.advanced.enable_gemini {
+            format!(
+                r#"
+    - name: "gemini"
+      type: "gemini"
+      endpoint: "{endpoint}"
+      enabled: true
+      api_key: "env:GEMINI_API_KEY"
+      models:
+        - alias: "smart"
+          model: "{smart_model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+        - alias: "judge"
+          model: "{judge_model}"
+          capabilities: ["reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+"#,
+                endpoint = config.advanced.gemini_endpoint,
+                smart_model = config.advanced.gemini_smart_model,
+                judge_model = config.advanced.gemini_judge_model,
+            )
+        } else {
+            String::new()
+        };
+        let llm_section = format!(
+            "{}{}{}{}",
+            llm_section, extra_lmstudio_section, extra_anthropic_section, extra_gemini_section
+        );
 
         let database_section = r#"
   database:
@@ -408,7 +722,7 @@ metadata:
 spec:
   node:
     id: "{node_id}"
-    type: "edge"
+    type: "{node_type}"
 
 {llm_section}
 {builtin_dispatchers_section}
@@ -418,15 +732,19 @@ spec:
     nfs_server_host: "env:AEGIS_NFS_HOST"
 
   network:
-    bind_address: "0.0.0.0"
-    port: 8088
+    bind_address: "{bind_address}"
+    port: {api_port}
 
   observability:
     logging:
-      level: "info"
+      level: "{log_level}"
 {database_section}{temporal_section}{storage_section}"#,
             node_name = config.node_name,
             node_id = config.node_id,
+            node_type = config.advanced.node_type,
+            bind_address = config.advanced.bind_address,
+            api_port = config.advanced.api_port,
+            log_level = config.advanced.log_level,
             llm_section = llm_section,
             builtin_dispatchers_section = builtin_dispatchers_section,
             database_section = database_section,
@@ -457,6 +775,31 @@ spec:
                 config.api_key.as_deref().unwrap_or("sk-ant-...")
             ),
         };
+        let anthropic_key_line = if config.advanced.enable_anthropic_extra
+            && !matches!(components.llm, LlmChoice::Anthropic)
+        {
+            if config.advanced.anthropic_api_key.is_empty() {
+                "ANTHROPIC_API_KEY=sk-ant-...".to_string()
+            } else {
+                format!("ANTHROPIC_API_KEY={}", config.advanced.anthropic_api_key)
+            }
+        } else {
+            String::new()
+        };
+        let gemini_key_line = if config.advanced.enable_gemini {
+            if config.advanced.gemini_api_key.is_empty() {
+                "GEMINI_API_KEY=AIza...".to_string()
+            } else {
+                format!("GEMINI_API_KEY={}", config.advanced.gemini_api_key)
+            }
+        } else {
+            String::new()
+        };
+        let additional_provider_env = [anthropic_key_line, gemini_key_line]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
 
         Ok(format!(
             r#"# AEGIS Local Stack — generated by `aegis init`
@@ -469,31 +812,46 @@ COMPOSE_PROFILES={profiles}
 
 # ─── LLM Provider ─────────────────────────────────────────────────────────────
 {api_key_line}
+{additional_provider_env}
 
 # ─── Keycloak ─────────────────────────────────────────────────────────────────
-KEYCLOAK_ADMIN_PASSWORD=admin
+KEYCLOAK_ADMIN_PASSWORD={keycloak_admin_password}
 
 # ─── AEGIS Runtime Networking ─────────────────────────────────────────────────
-AEGIS_DOCKER_NETWORK=aegis-network
-AEGIS_ORCHESTRATOR_URL=http://aegis-runtime:8088
+AEGIS_DOCKER_NETWORK={docker_network}
+AEGIS_ORCHESTRATOR_URL={orchestrator_url}
 
 # NFS server host — set to the correct value for your platform:
 #   Linux native / WSL2  → 127.0.0.1
 #   Docker Desktop       → host.docker.internal
-# AEGIS_NFS_HOST=127.0.0.1
+AEGIS_NFS_HOST={nfs_host}
 
 # ─── Secrets Management (OpenBao) ─────────────────────────────────────────────
-OPENBAO_SECRET_ID=test-secret-id
+OPENBAO_SECRET_ID={openbao_secret_id}
 
 # ─── Database ─────────────────────────────────────────────────────────────────
-AEGIS_DATABASE_URL=postgresql://aegis:aegis@postgres:5432/aegis
+AEGIS_DATABASE_URL={database_url}
+TEMPORAL_WORKER_SECRET={temporal_worker_secret}
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
-AEGIS_KEEP_CONTAINER=false
+AEGIS_KEEP_CONTAINER={keep_container}
 AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
 "#,
             profiles = profiles,
             api_key_line = api_key_line,
+            additional_provider_env = additional_provider_env,
+            keycloak_admin_password = config.advanced.keycloak_admin_password,
+            docker_network = config.advanced.docker_network,
+            orchestrator_url = config.advanced.orchestrator_url,
+            nfs_host = config.advanced.nfs_host,
+            openbao_secret_id = config.advanced.openbao_secret_id,
+            database_url = config.advanced.database_url,
+            temporal_worker_secret = config.advanced.temporal_worker_secret,
+            keep_container = if config.advanced.keep_container {
+                "true"
+            } else {
+                "false"
+            },
             smcp_private_key = smcp_private_key,
         ))
     }

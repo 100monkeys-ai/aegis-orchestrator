@@ -12,6 +12,7 @@
 //! |--------|----------|-------|
 //! | [`openai`] | OpenAI `gpt-*` / Azure OpenAI | Default provider |
 //! | [`anthropic`] | Anthropic `claude-*` | |
+//! | [`gemini`] | Google Gemini `gemini-*` | Native Gemini API |
 //! | [`ollama`] | Ollama local models | Dev/offline use |
 //! | [`registry`] | `ProviderRegistry` | Selects provider by manifest `spec.runtime.model` |
 //!
@@ -23,6 +24,7 @@
 // Each provider adapter translates between our domain interface and external APIs.
 
 pub mod anthropic;
+pub mod gemini;
 pub mod ollama;
 pub mod openai;
 pub mod registry;

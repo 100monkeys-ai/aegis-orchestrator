@@ -1,0 +1,168 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+
+metadata:
+  name: "code-quality-judge"
+  version: "1.0.0"
+  description: |
+    Judge agent that evaluates the quality of AI-generated code.
+
+    Scores code on a 0.0–1.0 gradient scale across five dimensions:
+      - Correctness: Does the code correctly implement the stated intent without logic bugs?
+      - Security: Are there vulnerabilities (injection, exposed secrets, unvalidated input, etc.)?
+      - Maintainability: Is the code readable, well-structured, and appropriately documented?
+      - Performance: Are there obvious inefficiencies, unnecessary allocations, or O(n²) traps?
+      - Robustness: Are errors handled, edge cases covered, and defensive patterns applied?
+
+    Used as the judge_agent in spec.execution.validation for coder agents.
+
+  labels:
+    role: "judge"
+    category: "validation"
+    cognitive-function: "evaluation"
+
+  annotations:
+    judges: "coder"
+    input_context: |
+      Receives: { task, output, criteria, validation_context }
+      where `output` is the code produced by the coder agent.
+    output_schema: "GradientResult — { score, confidence, reasoning, signals }"
+
+spec:
+  runtime:
+    language: "python"
+    version: "3.11"
+    model: "judge"
+    isolation: "inherit"
+
+  task:
+    instruction: |
+      You are a Judge Agent specializing in evaluating the quality of AI-generated code.
+
+      You will receive a JSON input with these fields:
+        - "task": the original user request given to the coder agent
+        - "output": the code that agent produced
+        - "criteria": the evaluation criteria the code must satisfy
+        - "validation_context": always "semantic_judge" (for context only)
+
+      Evaluate the code across five signal categories. For each, assign a
+      score from 0.0 to 1.0 and write a one-sentence message.
+
+      Signal categories:
+        - "correctness"     — Does the code correctly implement the stated intent without logic bugs?
+        - "security"        — Is the code free of vulnerabilities (injection, exposed secrets,
+                              unvalidated input, unsafe deserialization, path traversal, etc.)?
+        - "maintainability" — Is the code readable, well-structured, and appropriately documented?
+        - "performance"     — Is the code free of obvious inefficiencies, unnecessary allocations,
+                              N+1 queries, or algorithmic traps?
+        - "robustness"      — Are errors handled, edge cases covered, and defensive patterns applied?
+
+      Scoring rubric for individual signals:
+        1.0 — Excellent: thorough, correct, with no meaningful gaps
+        0.8 — Good: adequate with only minor issues
+        0.6 — Fair: functional but with notable weaknesses
+        0.4 — Poor: significant problems that would require rework
+        0.0 — Failing: fundamentally broken or critically unsafe
+
+      Derive the overall `score` as a weighted average:
+        correctness     × 0.30
+        security        × 0.25
+        maintainability × 0.20
+        performance     × 0.15
+        robustness      × 0.10
+
+      Set `confidence` based on how clearly the code's quality is apparent:
+        0.9–1.0 — Very clear signal in either direction
+        0.7–0.8 — Moderate certainty
+        0.5–0.6 — Ambiguous; could go either way
+        < 0.5   — Insufficient content to judge
+
+      Your `reasoning` field must be 2–4 sentences explaining the overall verdict.
+
+      Return ONLY a single JSON object — no markdown fences, no surrounding text:
+      {
+        "score": <number 0.0–1.0>,
+        "confidence": <number 0.0–1.0>,
+        "reasoning": "<2–4 sentence explanation>",
+        "signals": [
+          { "category": "correctness",     "score": <0.0–1.0>, "message": "<one sentence>" },
+          { "category": "security",        "score": <0.0–1.0>, "message": "<one sentence>" },
+          { "category": "maintainability", "score": <0.0–1.0>, "message": "<one sentence>" },
+          { "category": "performance",     "score": <0.0–1.0>, "message": "<one sentence>" },
+          { "category": "robustness",      "score": <0.0–1.0>, "message": "<one sentence>" }
+        ]
+      }
+
+    prompt_template: |
+      {{instruction}}
+
+      ## Input to evaluate:
+      {{input}}
+
+      Judge:
+
+  execution:
+    mode: "iterative"  # Allow self-correction when the LLM emits malformed JSON
+    max_iterations: 3  # Up to 3 attempts; json_schema feedback guides the LLM to fix structure
+
+    validation:
+      - type: json_schema
+        schema:
+          type: object
+          required: [score, confidence, reasoning, signals]
+          properties:
+            score:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+              description: "Overall code quality score"
+            confidence:
+              type: number
+              minimum: 0.0
+              maximum: 1.0
+              description: "Confidence in the assigned score"
+            reasoning:
+              type: string
+              minLength: 20
+              description: "2–4 sentence explanation of the verdict"
+            signals:
+              type: array
+              minItems: 5
+              maxItems: 5
+              description: "Per-dimension breakdown"
+              items:
+                type: object
+                required: [category, score, message]
+                properties:
+                  category:
+                    type: string
+                    enum:
+                      - correctness
+                      - security
+                      - maintainability
+                      - performance
+                      - robustness
+                  score:
+                    type: number
+                    minimum: 0.0
+                    maximum: 1.0
+                  message:
+                    type: string
+                    minLength: 10
+
+  security:
+    network:
+      mode: "none"   # Judges reason offline — no network access needed
+
+    filesystem:
+      read:
+        - "/data/inputs"
+      write: []
+
+    resources:
+      cpu: 1000        # 1.0 CPU core
+      memory: "512Mi"
+      timeout: "300s"   # Must respond within the timeout; LLM calls can take 90–120 s

@@ -1,0 +1,66 @@
+# AEGIS StandardRuntime Registry
+# ================================
+# Canonical, vetted mapping of language+version → Docker image tags
+# All images use deterministic, production-grade variants (-slim, -alpine)
+# CustomRuntime images are not subject to this registry and are user-supplied
+#
+# Source of Truth: ADR-043 (AEGIS Agent Runtimes), ADR-045 (Container Registry Management)
+# Last Updated: 2026-02-25
+#
+apiVersion: aegis.ai/v1
+kind: RuntimeRegistry
+metadata:
+  name: standard-runtime-registry
+  namespace: aegis-system
+spec:
+  # Global registry URL for image pulls (Phase 1: Docker Hub only)
+  # Phase 2+: May support custom registry proxy or mirror
+  registry_url: "docker.io"
+  
+  # Certified runtimes: language → version → fully-qualified image reference
+  # Each mapping enforces:
+  #   1. Deterministic image tag (no "latest")
+  #   2. Production-grade variant (-slim for Debian-based, -alpine for Alpine)
+  #   3. Vetting and security scanning
+  runtimes:
+    python:
+      "3.9":
+        image: "python:3.9-slim"
+        description: "Python 3.9 with slim Debian base"
+      "3.10":
+        image: "python:3.10-slim"
+        description: "Python 3.10 with slim Debian base"
+      "3.11":
+        image: "python:3.11-slim"
+        description: "Python 3.11 with slim Debian base"
+    
+    javascript:
+      "18":
+        image: "node:18-alpine"
+        description: "Node.js 18 with Alpine base"
+      "20":
+        image: "node:20-alpine"
+        description: "Node.js 20 with Alpine base"
+    
+    typescript:
+      "5.1":
+        image: "node:20-alpine"
+        bootstrap_env:
+          TYPESCRIPT_VERSION: "5.1"
+        description: "TypeScript 5.1 via Node.js 20 with Alpine base; global install required"
+    
+    rust:
+      "1.74":
+        image: "rust:1.74-alpine"
+        description: "Rust 1.74 with Alpine base"
+      "1.75":
+        image: "rust:1.75-alpine"
+        description: "Rust 1.75 with Alpine base"
+    
+    go:
+      "1.20":
+        image: "golang:1.20-alpine"
+        description: "Go 1.20 with Alpine base"
+      "1.21":
+        image: "golang:1.21-alpine"
+        description: "Go 1.21 with Alpine base"
