@@ -365,8 +365,9 @@ impl AgentRuntime for DockerRuntime {
             host_config.memory = Some(memory_bytes as i64);
         }
         if let Some(cpu_millis) = config.resources.cpu_millis {
-            // Docker nano_cpus: 1 CPU = 1e9 nano CPUs, 1 milli CPU = 1e6 nano CPUs
-            host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000);
+            // Docker nano_cpus: 1 CPU = 1_000_000_000 (1e9) nano CPUs, 1000 millicores = 1 CPU
+            // Therefore: 1 millicore = 1_000_000 nano CPUs, so 1000m (1 CPU) = 1_000_000_000 nano CPUs.
+            host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000_000 / 1000);
         }
 
         // Apply NFS volume mounts if specified (ADR-036: Orchestrator Proxy Pattern)
