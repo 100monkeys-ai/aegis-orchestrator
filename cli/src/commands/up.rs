@@ -19,6 +19,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 use clap::Args;
 use colored::Colorize;
+use dialoguer::Confirm;
 
 use super::init::{self, compose::ComposeRunner, InitArgs};
 
@@ -62,12 +63,24 @@ pub async fn run(args: UpArgs) -> Result<()> {
         );
         println!();
 
+        let advanced_override = if args.yes {
+            Some(false)
+        } else {
+            Some(
+                Confirm::new()
+                    .with_prompt("Run advanced configuration walkthrough?")
+                    .default(false)
+                    .interact()?,
+            )
+        };
+
         init::run(InitArgs {
             yes: args.yes,
             manual: false,
             dir: args.dir.clone(),
             host: args.host.clone(),
             port: args.port,
+            advanced_override,
         })
         .await?;
 

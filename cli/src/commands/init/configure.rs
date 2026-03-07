@@ -72,11 +72,16 @@ pub struct AdvancedConfig {
 pub struct ConfigWizard {
     yes: bool,
     dir: PathBuf,
+    advanced_override: Option<bool>,
 }
 
 impl ConfigWizard {
-    pub fn new(yes: bool, dir: PathBuf) -> Self {
-        Self { yes, dir }
+    pub fn new(yes: bool, dir: PathBuf, advanced_override: Option<bool>) -> Self {
+        Self {
+            yes,
+            dir,
+            advanced_override,
+        }
     }
 
     /// Run the configuration step.
@@ -241,10 +246,13 @@ impl ConfigWizard {
             return Ok(defaults);
         }
 
-        let advanced = Confirm::new()
-            .with_prompt("Run advanced configuration walkthrough?")
-            .default(false)
-            .interact()?;
+        let advanced = match self.advanced_override {
+            Some(value) => value,
+            None => Confirm::new()
+                .with_prompt("Run advanced configuration walkthrough?")
+                .default(false)
+                .interact()?,
+        };
         if !advanced {
             return Ok(defaults);
         }

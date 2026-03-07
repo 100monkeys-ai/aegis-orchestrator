@@ -66,6 +66,11 @@ pub struct InitArgs {
     /// Orchestrator port to poll for health after startup (default: 8088)
     #[arg(long, default_value = "8088")]
     pub port: u16,
+
+    /// Internal override for whether to run the advanced walkthrough.
+    /// `None` keeps the normal interactive prompt behavior.
+    #[arg(skip = None)]
+    pub advanced_override: Option<bool>,
 }
 
 /// Run the `aegis init` wizard.
@@ -90,7 +95,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // ─── Step 4: Configure node ───────────────────────────────────────────────
     print_step(4, 7, "Configuring node");
-    let wizard = ConfigWizard::new(args.yes, dir.clone());
+    let wizard = ConfigWizard::new(args.yes, dir.clone(), args.advanced_override);
     let node_config =
         wizard.configure(&components, &stack.docker_compose, &stack.runtime_registry)?;
 
