@@ -60,7 +60,7 @@ sha2 = "0.10"
 blake3 = "1.5"
 
 # Networking
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.13", features = ["json"] }
 
 # NFS Server
 nfsserve = "0.10"
