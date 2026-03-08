@@ -206,10 +206,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     // NOTE: Only `parent_execution_id` is persisted, so we cannot
                     // reliably reconstruct full multi-level ancestry here without
                     // additional queries. We therefore preserve the direct parent link
-                    // but treat depth/path as local to this execution.
+                    // and use a minimal non-zero depth to indicate that this execution
+                    // is at least one level below some root. The true depth and full
+                    // path may be greater and cannot be reconstructed without further
+                    // queries.
                     ExecutionHierarchy {
                         parent_execution_id: Some(ExecutionId(parent_id)),
-                        depth: 0,
+                        depth: 1,
                         path: vec![ExecutionId(id)],
                     }
                 }
@@ -301,7 +304,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
             }?;
 
             let input: ExecutionInput =
-                serde_json::from_value(input_val).map_err(RepositoryError::from)?;
+                serde_json::from_value(input_val).map_err(|e| {
+                    RepositoryError::Serialization(format!(
+                        "Failed to deserialize execution input: {}",
+                        e
+                    ))
+                })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(
@@ -320,7 +328,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let hierarchy = match parent_execution_id {
                 Some(parent_id) => ExecutionHierarchy {
                     parent_execution_id: Some(ExecutionId(parent_id)),
-                    depth: 0,
+                    depth: 1,
                     path: vec![ExecutionId(id)],
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),
@@ -404,7 +412,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
             }?;
 
             let input: ExecutionInput =
-                serde_json::from_value(input_val).map_err(RepositoryError::from)?;
+                serde_json::from_value(input_val).map_err(|e| {
+                    RepositoryError::Serialization(format!(
+                        "Failed to deserialize execution input: {}",
+                        e
+                    ))
+                })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(
@@ -423,7 +436,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let hierarchy = match parent_execution_id {
                 Some(parent_id) => ExecutionHierarchy {
                     parent_execution_id: Some(ExecutionId(parent_id)),
-                    depth: 0,
+                    depth: 1,
                     path: vec![ExecutionId(id)],
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),

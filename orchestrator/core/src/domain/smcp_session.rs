@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # SMCP Session Aggregate (BC-12, ADR-035)
 //!
+//! `BC-12` refers to the bounded context that owns SMCP session lifecycle logic, and
+//! `ADR-035` is the architecture decision record that defines the design of this
+//! aggregate and its invariants (see the project's architecture decision records).
+//!
 //! Domain model for the **Secure Model Context Protocol** session lifecycle.
 //! Each agent execution that uses MCP tools goes through an attestation handshake
 //! (see [`crate::application::attestation_service`]) to receive a [`SmcpSession`],
@@ -53,6 +57,11 @@ pub struct SessionId(pub Uuid);
 
 impl SessionId {
     /// Generate a new random session ID.
+    ///
+    /// This uses a UUID v4 and relies on its statistical uniqueness; the probability of
+    /// collision is negligible for realistic volumes of sessions. Any additional collision
+    /// handling (for example, enforcing a unique constraint at the persistence layer) is
+    /// expected to be performed outside this constructor.
     pub fn new() -> Self {
         Self(Uuid::new_v4())
     }
@@ -206,7 +215,7 @@ impl SmcpSession {
             security_context,
             status: SessionStatus::Active,
             created_at: now,
-            expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
+            expires_at: now + chrono::TimeDelta::hours(SESSION_TTL_HOURS),
         }
     }
 
@@ -232,7 +241,7 @@ impl SmcpSession {
     /// This is the **single enforcement point** for all SMCP policy checks. Every
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
-    pub fn evaluate_call(&self, envelope: &impl EnvelopeVerifier) -> Result<(), SmcpSessionError> {
+    pub fn evaluate_call(&mut self, envelope: &impl EnvelopeVerifier) -> Result<(), SmcpSessionError> {
         let now = Utc::now();
 
         // 1. Check session is active
@@ -242,6 +251,9 @@ impl SmcpSession {
 
         // 2. Check not expired
         if now > self.expires_at {
+            // Once the session is past its expiry time, transition it to a terminal
+            // `Expired` state so that future calls observe a consistent status.
+            self.status = SessionStatus::Expired;
             return Err(SmcpSessionError::SessionExpired);
         }
 
