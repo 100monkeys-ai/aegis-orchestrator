@@ -893,7 +893,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     // --- Initialize SMCP / Tool Routing Services ---
-    println!("Initializing SMCP & Tool Routing services...");
+    println!("Configuring SMCP & Tool Routing repositories and services...");
 
     // Repositories
     let security_context_repo: Arc<
