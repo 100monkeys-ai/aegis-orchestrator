@@ -1361,23 +1361,23 @@ async fn temporal_events_handler(
 fn create_router(app_state: Arc<AppState>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
-        .route("/v1/agents/:agent_id/execute", post(execute_agent_handler))
-        .route("/v1/executions/:execution_id", get(get_execution_handler))
+        .route("/v1/agents/{agent_id}/execute", post(execute_agent_handler))
+        .route("/v1/executions/{execution_id}", get(get_execution_handler))
         .route(
-            "/v1/executions/:execution_id/cancel",
+            "/v1/executions/{execution_id}/cancel",
             post(cancel_execution_handler),
         )
         .route(
-            "/v1/executions/:execution_id/events",
+            "/v1/executions/{execution_id}/events",
             get(stream_events_handler),
         )
         .route(
-            "/v1/agents/:agent_id/events",
+            "/v1/agents/{agent_id}/events",
             get(stream_agent_events_handler),
         )
         .route("/v1/executions", get(list_executions_handler))
         .route(
-            "/v1/executions/:execution_id",
+            "/v1/executions/{execution_id}",
             axum::routing::delete(delete_execution_handler),
         )
         .route(
@@ -1385,20 +1385,20 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             post(deploy_agent_handler).get(list_agents_handler),
         )
         .route(
-            "/v1/agents/:id",
+            "/v1/agents/{id}",
             get(get_agent_handler).delete(delete_agent_handler),
         )
-        .route("/v1/agents/lookup/:name", get(lookup_agent_handler))
+        .route("/v1/agents/lookup/{name}", get(lookup_agent_handler))
         .route("/v1/dispatch-gateway", post(dispatch_gateway_handler))
         .route(
             "/v1/workflows",
             post(register_temporal_workflow_handler).get(list_workflows_handler),
         )
         .route(
-            "/v1/workflows/:name",
+            "/v1/workflows/{name}",
             get(get_workflow_handler).delete(delete_workflow_handler),
         )
-        .route("/v1/workflows/:name/run", post(run_workflow_legacy_handler))
+        .route("/v1/workflows/{name}/run", post(run_workflow_legacy_handler))
         // Note: `/v1/workflows/temporal/register` is an explicit alias of POST `/v1/workflows`
         // for Temporal workflow registration and is kept for compatibility/clarity.
         .route(
@@ -1410,26 +1410,26 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             post(execute_temporal_workflow_handler),
         )
         .route(
-            "/v1/workflows/executions/:execution_id",
+            "/v1/workflows/executions/{execution_id}",
             get(get_workflow_execution_handler),
         )
         .route(
-            "/v1/workflows/executions/:execution_id/logs",
+            "/v1/workflows/executions/{execution_id}/logs",
             get(stream_workflow_logs_handler),
         )
         .route(
-            "/v1/workflows/executions/:execution_id/signal",
+            "/v1/workflows/executions/{execution_id}/signal",
             post(signal_workflow_execution_handler),
         )
         .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
-        .route("/v1/human-approvals/:id", get(get_pending_approval_handler))
+        .route("/v1/human-approvals/{id}", get(get_pending_approval_handler))
         .route(
-            "/v1/human-approvals/:id/approve",
+            "/v1/human-approvals/{id}/approve",
             post(approve_request_handler),
         )
         .route(
-            "/v1/human-approvals/:id/reject",
+            "/v1/human-approvals/{id}/reject",
             post(reject_request_handler),
         )
         .route("/v1/smcp/attest", post(attest_smcp_handler))
