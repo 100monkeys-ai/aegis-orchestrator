@@ -1035,9 +1035,7 @@ impl ExecutionService for StandardExecutionService {
         limit: usize,
     ) -> Result<Vec<Execution>> {
         if let Some(aid) = agent_id {
-            let executions = self.repository.find_by_agent(aid).await?;
-            // Apply limit manually since repo doesn't support limit on find_by_agent yet
-            Ok(executions.into_iter().take(limit).collect())
+            Ok(self.repository.find_by_agent(aid, limit).await?)
         } else {
             Ok(self.repository.find_recent(limit).await?)
         }

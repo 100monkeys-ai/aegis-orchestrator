@@ -229,13 +229,19 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(executions.get(&id).cloned())
     }
 
-    async fn find_by_agent(&self, agent_id: AgentId) -> Result<Vec<Execution>, RepositoryError> {
+    async fn find_by_agent(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
-        Ok(executions
+        let mut results: Vec<Execution> = executions
             .values()
             .filter(|e| e.agent_id == agent_id)
             .cloned()
-            .collect())
+            .collect();
+        results.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(results.into_iter().take(limit).collect())
     }
 
     async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError> {
@@ -679,7 +685,7 @@ mod tests {
 
         // Test with empty repository
         let agent_id = AgentId::new();
-        let agent_executions = repo.find_by_agent(agent_id).await.unwrap();
+        let agent_executions = repo.find_by_agent(agent_id, 100).await.unwrap();
         assert_eq!(agent_executions.len(), 0);
 
         // Test finding non-existent execution

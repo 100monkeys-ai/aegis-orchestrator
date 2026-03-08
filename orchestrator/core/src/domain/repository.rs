@@ -80,8 +80,12 @@ pub trait ExecutionRepository: Send + Sync {
     /// Find execution by ID
     async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError>;
 
-    /// Find executions by agent ID
-    async fn find_by_agent(&self, agent_id: AgentId) -> Result<Vec<Execution>, RepositoryError>;
+    /// Find executions by agent ID (newest first, capped at `limit`)
+    async fn find_by_agent(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError>;
 
     /// Find recent executions (limit results)
     async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError>;

@@ -215,7 +215,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
         }
     }
 
-    async fn find_by_agent(&self, agent_id: AgentId) -> Result<Vec<Execution>, RepositoryError> {
+    async fn find_by_agent(
+        &self,
+        agent_id: AgentId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -225,9 +229,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
             FROM executions
             WHERE agent_id = $1
             ORDER BY started_at DESC
+            LIMIT $2
             "#,
         )
         .bind(agent_id.0)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
