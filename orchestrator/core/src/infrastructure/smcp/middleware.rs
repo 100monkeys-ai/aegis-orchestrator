@@ -68,7 +68,9 @@ impl SmcpMiddleware {
                 if let Some(args) = envelope.extract_arguments() {
                     Ok(args)
                 } else {
-                    Err(SmcpSessionError::MalformedPayload)
+                    Err(SmcpSessionError::MalformedPayload(
+                        "missing arguments after envelope verification".to_string(),
+                    ))
                 }
             }
             Err(e) => {

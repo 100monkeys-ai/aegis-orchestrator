@@ -85,7 +85,7 @@ pub enum SmcpSessionError {
     /// The tool call was rejected by the agent's [`crate::domain::security_context::SecurityContext`].
     PolicyViolation(PolicyViolation),
     /// The SMCP envelope could not be parsed (missing required fields).
-    MalformedPayload,
+    MalformedPayload(String),
     /// The Ed25519 signature on the envelope did not verify against the session's stored public key.
     SignatureVerificationFailed(String),
 }
@@ -96,7 +96,7 @@ impl std::fmt::Display for SmcpSessionError {
             Self::SessionInactive(status) => write!(f, "Session is inactive: {:?}", status),
             Self::SessionExpired => write!(f, "Session has expired"),
             Self::PolicyViolation(v) => write!(f, "Policy violation: {:?}", v),
-            Self::MalformedPayload => write!(f, "Malformed MCP payload"),
+            Self::MalformedPayload(msg) => write!(f, "Malformed MCP payload: {}", msg),
             Self::SignatureVerificationFailed(e) => {
                 write!(f, "Signature verification failed: {}", e)
             }
@@ -240,11 +240,11 @@ impl SmcpSession {
         // 4. Extract tool name from MCP payload
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload)?;
+            .ok_or(SmcpSessionError::MalformedPayload("missing tool name".to_string()))?;
 
         let args = envelope
             .extract_arguments()
-            .ok_or(SmcpSessionError::MalformedPayload)?;
+            .ok_or(SmcpSessionError::MalformedPayload("missing arguments".to_string()))?;
 
         // 5. Evaluate against SecurityContext
         self.security_context
