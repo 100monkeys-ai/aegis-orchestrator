@@ -244,13 +244,13 @@ pub enum IamError {
     UnknownIssuer { issuer: String },
 
     #[error("Required claim {claim} missing from token")]
-    MissingClaim { claim: &'static str },
+    MissingClaim { claim: String },
 
     #[error("JWKS fetch failed for realm {realm}: {reason}")]
     JwksFetchFailed { realm: String, reason: String },
 
     #[error("Invalid claim value for {claim}: {value}")]
-    InvalidClaimValue { claim: &'static str, value: String },
+    InvalidClaimValue { claim: String, value: String },
 
     #[error("JWT decode error: {0}")]
     DecodeError(String),
