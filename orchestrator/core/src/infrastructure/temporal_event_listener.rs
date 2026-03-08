@@ -325,7 +325,10 @@ impl TemporalEventListener {
                 .iteration_number
                 .ok_or_else(|| anyhow!("Missing iteration_number for RefinementApplied event"))?;
 
-            let diff_val = payload.code_diff.clone().unwrap_or_default();
+            let diff_val = payload
+                .code_diff
+                .clone()
+                .ok_or_else(|| anyhow!("Missing code_diff for RefinementApplied event"))?;
             let diff_str = match diff_val {
                 serde_json::Value::String(s) => s,
                 _ => diff_val.to_string(),
@@ -336,12 +339,17 @@ impl TemporalEventListener {
                 diff: diff_str,
             };
 
+            let applied_at = match DateTime::parse_from_rfc3339(&payload.timestamp) {
+                Ok(dt) => dt.with_timezone(&Utc),
+                Err(_) => Utc::now(),
+            };
+
             let domain_event = crate::domain::events::ExecutionEvent::RefinementApplied {
                 execution_id,
                 agent_id,
                 iteration_number,
                 code_diff,
-                applied_at: chrono::Utc::now(),
+                applied_at,
             };
 
             self.execution_repository
@@ -363,22 +371,28 @@ impl TemporalEventListener {
         let domain_event = TemporalEventMapper::to_domain_event(&payload)
             .context("Failed to map Temporal event to domain event")?;
 
+        // Definition-time event — no execution_id exists.
+        // Publish to the event bus so subscribers are notified, then return early.
+        if let WorkflowEvent::WorkflowRegistered { .. } = &domain_event {
+            self.event_bus
+                .publish_workflow_event(domain_event.clone());
+            return Ok(String::new());
+        }
+
+        // All remaining workflow events are execution-scoped and carry an execution_id.
         let execution_id_obj = match &domain_event {
-            WorkflowEvent::WorkflowRegistered { .. } => {
-                // Definition-time event — no execution_id exists.
-                // Publish to the event bus so subscribers are notified, then return early.
-                self.event_bus.publish_workflow_event(domain_event.clone());
-                return Ok(String::new());
+            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
+            | WorkflowEvent::WorkflowStateEntered { execution_id, .. }
+            | WorkflowEvent::WorkflowStateExited { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationStarted { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationCompleted { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationFailed { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
+                *execution_id
             }
-            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowStateEntered { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowStateExited { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowRegistered { .. } => unreachable!("handled above"),
         };
 
         let execution_id_str = execution_id_obj.0.to_string();
