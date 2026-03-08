@@ -84,19 +84,14 @@ impl ExecutionRepository for PostgresExecutionRepository {
             ExecutionStatus::Cancelled => "cancelled",
         };
 
-        // Note: We don't have workflow_execution_id in Execution struct yet.
-        // We also need to store hierarchy, but the table schema might not have it strictly defined as a column yet?
-        // Checking schema: executions table has input, status, iterations, current_iteration, max_iterations, final_output, error_message, started_at, completed_at.
-        // It does NOT have hierarchy column. We might need to store it in `input` or add a column.
-        // For now, let's assume hierarchy is part of the context or we might lose it if not stored.
-        // Wait, `iterations` is JSONB, so it stores full iteration history.
-        // `input` is JSONB.
+        // Note: the `executions` table currently has columns such as input, status, iterations,
+        // current_iteration, max_iterations, final_output, error_message, started_at, and completed_at,
+        // but does not have fields for `workflow_execution_id` or `hierarchy`.
+        //
+        // TODO: If workflow execution IDs or execution hierarchy need to be persisted, extend the schema
+        // and `Execution` struct accordingly and map those fields here.
 
-        // We will store hierarchy in the input payload or similar if we can't change schema.
-        // Actually, let's just save what we can map.
-        // If we need hierarchy persistence, we should probably update the schema, but I'll stick to the existing schema for now and maybe stash it in input if needed,
-        // OR just ignore it if it's not critical for the "empty table" issue.
-        // The user issue is "empty table", so primary goal is getting the main data in.
+        let parent_execution_id = execution.hierarchy.parent_execution_id.map(|id| id.0);
 
         sqlx::query(
             r#"
@@ -104,9 +99,9 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, 
                 current_iteration, max_iterations, final_output, error_message, 
                 container_uid, container_gid,
-                started_at, completed_at
+                started_at, completed_at, parent_execution_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 status = EXCLUDED.status,
                 iterations = EXCLUDED.iterations,
@@ -115,7 +110,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error_message = EXCLUDED.error_message,
                 container_uid = EXCLUDED.container_uid,
                 container_gid = EXCLUDED.container_gid,
-                completed_at = EXCLUDED.completed_at
+                completed_at = EXCLUDED.completed_at,
+                parent_execution_id = EXCLUDED.parent_execution_id
             "#,
         )
         .bind(execution.id.0)
@@ -131,6 +127,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(execution.container_gid as i32)
         .bind(execution.started_at)
         .bind(execution.ended_at)
+        .bind(parent_execution_id)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {}", e)))?;
@@ -144,7 +141,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
                 container_uid, container_gid,
-                started_at, completed_at, error_message
+                started_at, completed_at, error_message,
+                parent_execution_id
             FROM executions
             WHERE id = $1
             "#,
@@ -166,6 +164,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
+            let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -191,16 +190,26 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     ))
                 })?;
 
+            let hierarchy = match parent_execution_id {
+                None => ExecutionHierarchy::root(ExecutionId(id)),
+                Some(parent_id) => {
+                    // NOTE: Only `parent_execution_id` is persisted, so depth and path
+                    // are approximated here as a single-level child hierarchy. To support
+                    // full multi-level reconstruction, store `depth` and `path` in the
+                    // database or traverse ancestry recursively.
+                    ExecutionHierarchy {
+                        parent_execution_id: Some(ExecutionId(parent_id)),
+                        depth: 1,
+                        path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                    }
+                }
+            };
+
             Ok(Some(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
                 status,
-                iterations, // We need to access private field or use a constructor/struct update syntax?
-                // `iterations` field is private in `Execution` struct definition?
-                // Checked `execution.rs`: `iterations: Vec<Iteration>` is private (not pub).
-                // But `Execution` struct definition in `execution.rs` lines 128: `iterations: Vec<Iteration>,`
-                // Ensure it is pub or we have a way to reconstruct it.
-                // I need to check `execution.rs` again.
+                iterations,
                 max_iterations: max_iterations as u8,
                 container_uid: container_uid as u32,
                 container_gid: container_gid as u32,
@@ -208,7 +217,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 started_at,
                 ended_at: completed_at,
                 error: error_message,
-                hierarchy: ExecutionHierarchy::root(ExecutionId(id)), // Defaulting hierarchy as it's not persisted yet
+                hierarchy,
             }))
         } else {
             Ok(None)
@@ -264,12 +273,14 @@ impl ExecutionRepository for PostgresExecutionRepository {
             };
 
             let input: ExecutionInput =
-                serde_json::from_value(input_val).unwrap_or(ExecutionInput {
-                    intent: None,
-                    payload: serde_json::Value::Null,
-                });
+                serde_json::from_value(input_val).map_err(RepositoryError::from)?;
             let iterations: Vec<Iteration> =
-                serde_json::from_value(iterations_val).unwrap_or_default();
+                serde_json::from_value(iterations_val).map_err(|e| {
+                    RepositoryError::Serialization(format!(
+                        "failed to deserialize iterations: {}",
+                        e
+                    ))
+                })?;
 
             executions.push(Execution {
                 id: ExecutionId(id),
@@ -302,7 +313,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             LIMIT $1
             "#,
         )
-        .bind(limit as i32)
+        .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -331,12 +342,14 @@ impl ExecutionRepository for PostgresExecutionRepository {
             };
 
             let input: ExecutionInput =
-                serde_json::from_value(input_val).unwrap_or(ExecutionInput {
-                    intent: None,
-                    payload: serde_json::Value::Null,
-                });
+                serde_json::from_value(input_val).map_err(RepositoryError::from)?;
             let iterations: Vec<Iteration> =
-                serde_json::from_value(iterations_val).unwrap_or_default();
+                serde_json::from_value(iterations_val).map_err(|e| {
+                    RepositoryError::Serialization(format!(
+                        "failed to deserialize iterations: {}",
+                        e
+                    ))
+                })?;
 
             executions.push(Execution {
                 id: ExecutionId(id),
