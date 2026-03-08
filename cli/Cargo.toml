@@ -56,8 +56,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 bollard = { workspace = true }
 
 # Internal [dependencies]
-aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.7.0-pre-alpha" }
-aegis-orchestrator-sdk = { path = "../sdks", version = "0.7.0-pre-alpha" }
+aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.8.0-pre-alpha" }
+aegis-orchestrator-sdk = { path = "../sdks", version = "0.8.0-pre-alpha" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
 rsa = { version = "0.9", features = ["pem"] }
