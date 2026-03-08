@@ -240,11 +240,15 @@ impl SmcpSession {
         // 4. Extract tool name from MCP payload
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload("missing tool name".to_string()))?;
+            .ok_or(SmcpSessionError::MalformedPayload(
+                "missing tool name".to_string(),
+            ))?;
 
         let args = envelope
             .extract_arguments()
-            .ok_or(SmcpSessionError::MalformedPayload("missing arguments".to_string()))?;
+            .ok_or(SmcpSessionError::MalformedPayload(
+                "missing arguments".to_string(),
+            ))?;
 
         // 5. Evaluate against SecurityContext
         self.security_context

@@ -1398,7 +1398,10 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             "/v1/workflows/{name}",
             get(get_workflow_handler).delete(delete_workflow_handler),
         )
-        .route("/v1/workflows/{name}/run", post(run_workflow_legacy_handler))
+        .route(
+            "/v1/workflows/{name}/run",
+            post(run_workflow_legacy_handler),
+        )
         // Note: `/v1/workflows/temporal/register` is an explicit alias of POST `/v1/workflows`
         // for Temporal workflow registration and is kept for compatibility/clarity.
         .route(
@@ -1423,7 +1426,10 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         )
         .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
-        .route("/v1/human-approvals/{id}", get(get_pending_approval_handler))
+        .route(
+            "/v1/human-approvals/{id}",
+            get(get_pending_approval_handler),
+        )
         .route(
             "/v1/human-approvals/{id}/approve",
             post(approve_request_handler),

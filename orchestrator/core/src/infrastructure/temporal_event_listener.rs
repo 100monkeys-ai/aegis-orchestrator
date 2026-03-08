@@ -364,6 +364,12 @@ impl TemporalEventListener {
             .context("Failed to map Temporal event to domain event")?;
 
         let execution_id_str = match &domain_event {
+            WorkflowEvent::WorkflowRegistered { .. } => {
+                // Definition-time event — no execution_id exists.
+                // Publish to the event bus so subscribers are notified, then return early.
+                self.event_bus.publish_workflow_event(domain_event.clone());
+                return Ok(String::new());
+            }
             WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => {
                 execution_id.0.to_string()
             }

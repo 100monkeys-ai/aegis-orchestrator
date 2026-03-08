@@ -122,7 +122,9 @@ impl ToolInvocationService {
             .smcp_session_repo
             .find_active_by_agent(agent_id)
             .await
-            .map_err(|_| SmcpSessionError::MalformedPayload("session repository lookup failed".to_string()))? // generic fallback error
+            .map_err(|_| {
+                SmcpSessionError::MalformedPayload("session repository lookup failed".to_string())
+            })? // generic fallback error
             .ok_or(SmcpSessionError::SessionInactive(
                 crate::domain::smcp_session::SessionStatus::Expired,
             ))?;
@@ -131,7 +133,9 @@ impl ToolInvocationService {
         let args = self.smcp_middleware.verify_and_unwrap(&session, envelope)?;
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload("missing tool name".to_string()))?;
+            .ok_or(SmcpSessionError::MalformedPayload(
+                "missing tool name".to_string(),
+            ))?;
 
         // 3. Route tool call to the appropriate TCP server.
         // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
