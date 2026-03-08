@@ -66,7 +66,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
-const VALIDATION_FEEDBACK_FILE_PATH: &str = "validation_feedback";
+const VALIDATION_FEEDBACK_FILE_NAME: &str = "validation_feedback";
 
 /// External event payload from Temporal worker
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -332,7 +332,7 @@ impl TemporalEventListener {
             };
 
             let code_diff = crate::domain::execution::CodeDiff {
-                file_path: VALIDATION_FEEDBACK_FILE_PATH.to_string(),
+                file_path: VALIDATION_FEEDBACK_FILE_NAME.to_string(),
                 diff: diff_str,
             };
 
@@ -363,7 +363,7 @@ impl TemporalEventListener {
         let domain_event = TemporalEventMapper::to_domain_event(&payload)
             .context("Failed to map Temporal event to domain event")?;
 
-        let execution_id_str = match &domain_event {
+        let execution_id_obj = match &domain_event {
             WorkflowEvent::WorkflowRegistered { .. } => {
                 // Definition-time event — no execution_id exists.
                 // Publish to the event bus so subscribers are notified, then return early.
@@ -371,31 +371,31 @@ impl TemporalEventListener {
                 return Ok(String::new());
             }
             WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
-            WorkflowEvent::WorkflowStateEntered { execution_id, .. } => execution_id.0.to_string(),
-            WorkflowEvent::WorkflowStateExited { execution_id, .. } => execution_id.0.to_string(),
+            WorkflowEvent::WorkflowStateEntered { execution_id, .. } => execution_id.clone(),
+            WorkflowEvent::WorkflowStateExited { execution_id, .. } => execution_id.clone(),
             WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
             WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
             WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
             WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
             WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
             WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
-                execution_id.0.to_string()
+                execution_id.clone()
             }
         };
 
-        let execution_id_obj = ExecutionId(uuid::Uuid::parse_str(&execution_id_str)?);
+        let execution_id_str = execution_id_obj.0.to_string();
 
         // Step 2: Persist event to the repository for event sourcing
         self.execution_repository
