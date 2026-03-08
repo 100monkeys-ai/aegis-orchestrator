@@ -1,3 +1,4 @@
 [submodule "aegis-proto"]
 	path = aegis-proto
 	url = https://github.com/100monkeys-ai/aegis-proto.git
+	branch = main
