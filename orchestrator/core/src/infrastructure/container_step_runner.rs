@@ -320,8 +320,8 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             // Resource limits
             if let Some(ref res) = config.resources {
                 if let Some(cpu) = res.cpu {
-                    // cpu is in millicores; 1 milli CPU = 1_000_000 nano CPUs
-                    hc.nano_cpus = Some((cpu as i64) * 1_000_000);
+                    // cpu is in millicores; Docker expects nano CPUs (1 CPU = 1_000_000_000)
+                    hc.nano_cpus = Some((cpu as i64) * 1_000_000_000 / 1000);
                 }
                 if let Some(ref mem) = res.memory {
                     // Parse human-readable memory string (e.g. "512m", "2g")
