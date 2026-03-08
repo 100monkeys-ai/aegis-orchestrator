@@ -233,13 +233,15 @@ impl SmcpSession {
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
     pub fn evaluate_call(&self, envelope: &impl EnvelopeVerifier) -> Result<(), SmcpSessionError> {
+        let now = Utc::now();
+
         // 1. Check session is active
         if self.status != SessionStatus::Active {
             return Err(SmcpSessionError::SessionInactive(self.status.clone()));
         }
 
         // 2. Check not expired
-        if Utc::now() > self.expires_at {
+        if now > self.expires_at {
             return Err(SmcpSessionError::SessionExpired);
         }
 
@@ -271,6 +273,16 @@ impl SmcpSession {
     /// or when a security incident requires immediate session termination.
     /// After revocation, `evaluate_call` will return [`SmcpSessionError::SessionInactive`].
     pub fn revoke(&mut self, reason: String) {
-        self.status = SessionStatus::Revoked { reason };
+        // Make revocation idempotent: once the session has reached a terminal state
+        // (`Expired` or `Revoked`), do not change its status again. This avoids
+        // masking logic bugs where revocation is attempted multiple times.
+        match self.status {
+            SessionStatus::Active => {
+                self.status = SessionStatus::Revoked { reason };
+            }
+            SessionStatus::Revoked { .. } | SessionStatus::Expired => {
+                // Already in a terminal state; ignore subsequent revocation attempts.
+            }
+        }
     }
 }
