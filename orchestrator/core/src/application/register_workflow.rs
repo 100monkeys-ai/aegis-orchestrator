@@ -159,3 +159,226 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::temporal_mapper::TemporalWorkflowDefinition;
+    use crate::domain::events::WorkflowEvent;
+    use crate::domain::repository::{RepositoryError, WorkflowRepository};
+    use crate::domain::workflow::{Workflow, WorkflowId};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::InMemoryWorkflowRepository;
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    const VALID_WORKFLOW_YAML: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: registration-test-workflow
+  version: "1.2.3"
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: Agent
+      agent: coder-v1
+      input: "{{workflow.task}}"
+      transitions:
+        - condition: always
+          target: END
+    END:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#;
+
+    struct RecordingEngine {
+        registered: Mutex<Vec<TemporalWorkflowDefinition>>,
+    }
+
+    impl RecordingEngine {
+        fn new() -> Self {
+            Self {
+                registered: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn calls(&self) -> Vec<TemporalWorkflowDefinition> {
+            self.registered.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowEnginePort for RecordingEngine {
+        async fn register_workflow(&self, definition: &TemporalWorkflowDefinition) -> Result<()> {
+            self.registered.lock().unwrap().push(definition.clone());
+            Ok(())
+        }
+
+        async fn start_workflow(
+            &self,
+            _workflow_name: &str,
+            _execution_id: crate::domain::execution::ExecutionId,
+            _input: std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<String> {
+            Ok("unused".to_string())
+        }
+    }
+
+    struct FailingEngine;
+
+    #[async_trait]
+    impl WorkflowEnginePort for FailingEngine {
+        async fn register_workflow(&self, _definition: &TemporalWorkflowDefinition) -> Result<()> {
+            anyhow::bail!("temporal unavailable")
+        }
+
+        async fn start_workflow(
+            &self,
+            _workflow_name: &str,
+            _execution_id: crate::domain::execution::ExecutionId,
+            _input: std::collections::HashMap<String, serde_json::Value>,
+        ) -> Result<String> {
+            Ok("unused".to_string())
+        }
+    }
+
+    struct SaveFailRepo;
+
+    #[async_trait]
+    impl WorkflowRepository for SaveFailRepo {
+        async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
+            Err(RepositoryError::Database("write failed".to_string()))
+        }
+
+        async fn find_by_id(&self, _id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+            Ok(vec![])
+        }
+
+        async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn register_workflow_registers_persists_and_publishes_event() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let event_bus = Arc::new(EventBus::new(32));
+        let mut events = event_bus.subscribe();
+
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            event_bus,
+        );
+
+        let response = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap();
+        assert_eq!(response.name, "registration-test-workflow");
+        assert_eq!(response.version, "1.2.3");
+        assert_eq!(response.status, "registered");
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "registration-test-workflow");
+
+        let persisted = repo
+            .find_by_name("registration-test-workflow")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.metadata.version, Some("1.2.3".to_string()));
+
+        match events.recv().await.unwrap() {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowRegistered {
+                workflow_id, name, ..
+            }) => {
+                assert_eq!(name, "registration-test-workflow");
+                assert_eq!(workflow_id.to_string(), response.workflow_id);
+            }
+            other => panic!("unexpected event type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_workflow_fails_when_engine_missing() {
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Workflow engine not connected yet"));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_fails_when_engine_registration_fails() {
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
+            ))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to register workflow with Temporal server"));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_fails_when_persistence_fails() {
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(SaveFailRepo),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
+            ))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to persist workflow to repository"));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_fails_for_invalid_yaml() {
+        let invalid = json!({"not": "yaml"}).to_string();
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            Arc::new(EventBus::new(8)),
+        );
+        let err = service.register_workflow(&invalid).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to parse workflow YAML manifest"));
+    }
+}

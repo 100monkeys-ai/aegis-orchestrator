@@ -409,6 +409,9 @@ impl TemporalEventListener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::events::{ExecutionEvent, WorkflowEvent};
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository;
 
     #[test]
     fn test_map_workflow_execution_started() {
@@ -485,5 +488,80 @@ mod tests {
 
         let result = TemporalEventMapper::to_domain_event(&payload);
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_persists_and_publishes_workflow_event() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let listener = TemporalEventListener::new(event_bus.clone(), repo);
+        let mut receiver = event_bus.subscribe();
+
+        let payload = TemporalEventPayload {
+            event_type: "WorkflowExecutionStarted".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            temporal_sequence_number: 99,
+            workflow_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+            state_name: None,
+            output: None,
+            error: None,
+            iteration_number: None,
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: None,
+            code_diff: None,
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        let result_id = listener.handle_event(payload).await.unwrap();
+        assert_eq!(result_id, "550e8400-e29b-41d4-a716-446655440000");
+
+        match receiver.recv().await.unwrap() {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionStarted {
+                execution_id, ..
+            }) => {
+                assert_eq!(execution_id.0.to_string(), result_id);
+            }
+            other => panic!("expected workflow event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_refinement_applied_publishes_execution_event() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let listener = TemporalEventListener::new(event_bus.clone(), repo);
+        let mut receiver = event_bus.subscribe();
+
+        let payload = TemporalEventPayload {
+            event_type: "RefinementApplied".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            temporal_sequence_number: 5,
+            workflow_id: None,
+            state_name: None,
+            output: None,
+            error: None,
+            iteration_number: Some(2),
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+            code_diff: Some(serde_json::json!({"summary": "updated prompt"})),
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        let result_id = listener.handle_event(payload).await.unwrap();
+        assert_eq!(result_id, "550e8400-e29b-41d4-a716-446655440000");
+
+        match receiver.recv().await.unwrap() {
+            DomainEvent::Execution(ExecutionEvent::RefinementApplied {
+                execution_id,
+                iteration_number,
+                ..
+            }) => {
+                assert_eq!(execution_id.0.to_string(), result_id);
+                assert_eq!(iteration_number, 2);
+            }
+            other => panic!("expected execution refinement event, got {other:?}"),
+        }
     }
 }

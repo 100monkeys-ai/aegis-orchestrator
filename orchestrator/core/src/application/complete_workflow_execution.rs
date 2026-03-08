@@ -180,3 +180,195 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::events::WorkflowEvent;
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::repository::WorkflowExecutionRepository;
+    use crate::domain::workflow::{
+        StateKind, StateName, TransitionCondition, TransitionRule, Workflow, WorkflowExecution,
+        WorkflowMetadata, WorkflowSpec, WorkflowState,
+    };
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository;
+    use serde_json::json;
+    use std::collections::HashMap;
+
+    fn build_test_workflow(name: &str) -> Workflow {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo start".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![TransitionRule {
+                    condition: TransitionCondition::Always,
+                    target: StateName::new("END").unwrap(),
+                    feedback: None,
+                }],
+                timeout: None,
+            },
+        );
+        states.insert(
+            StateName::new("END").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo end".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+
+        Workflow::new(
+            WorkflowMetadata {
+                name: name.to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                volumes: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    async fn seed_execution(
+        repo: &InMemoryWorkflowExecutionRepository,
+        workflow_name: &str,
+    ) -> ExecutionId {
+        let workflow = build_test_workflow(workflow_name);
+        let execution_id = ExecutionId::new();
+        let mut execution = WorkflowExecution::new(&workflow, execution_id, json!({"task":"x"}));
+        execution.blackboard.set("existing", json!("keep"));
+        repo.save(&execution).await.unwrap();
+        execution_id
+    }
+
+    #[tokio::test]
+    async fn complete_execution_updates_status_merges_blackboard_and_publishes_event() {
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let execution_id = seed_execution(&repo, "complete-success").await;
+        let event_bus = Arc::new(EventBus::new(32));
+        let mut receiver = event_bus.subscribe();
+
+        let service = StandardCompleteWorkflowExecutionUseCase::new(repo.clone(), event_bus);
+        let response = service
+            .complete_execution(CompleteWorkflowExecutionRequest {
+                execution_id: execution_id.to_string(),
+                status: CompletionStatus::Success,
+                final_blackboard: Some(json!({
+                    "existing": "updated",
+                    "new_key": 42
+                })),
+                error_reason: None,
+                artifacts: Some(json!({"report":"ok"})),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, "completed");
+
+        let saved = repo.find_by_id(execution_id).await.unwrap().unwrap();
+        assert_eq!(saved.status, ExecutionStatus::Completed);
+        assert_eq!(saved.blackboard.get("existing"), Some(&json!("updated")));
+        assert_eq!(saved.blackboard.get("new_key"), Some(&json!(42)));
+
+        match receiver.recv().await.unwrap() {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionCompleted {
+                execution_id: eid,
+                final_blackboard,
+                artifacts,
+                ..
+            }) => {
+                assert_eq!(eid, execution_id);
+                assert_eq!(final_blackboard.get("new_key"), Some(&json!(42)));
+                assert_eq!(artifacts, Some(json!({"report":"ok"})));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_execution_handles_failed_status_and_non_object_blackboard() {
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let execution_id = seed_execution(&repo, "complete-failure").await;
+        let service =
+            StandardCompleteWorkflowExecutionUseCase::new(repo.clone(), Arc::new(EventBus::new(8)));
+
+        let response = service
+            .complete_execution(CompleteWorkflowExecutionRequest {
+                execution_id: execution_id.to_string(),
+                status: CompletionStatus::Failed,
+                final_blackboard: Some(json!(["not", "an", "object"])),
+                error_reason: Some("boom".to_string()),
+                artifacts: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, "failed");
+        let saved = repo.find_by_id(execution_id).await.unwrap().unwrap();
+        assert_eq!(saved.status, ExecutionStatus::Failed);
+        assert_eq!(saved.blackboard.get("existing"), Some(&json!("keep")));
+    }
+
+    #[tokio::test]
+    async fn complete_execution_rejects_invalid_execution_id_format() {
+        let service = StandardCompleteWorkflowExecutionUseCase::new(
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .complete_execution(CompleteWorkflowExecutionRequest {
+                execution_id: "not-a-uuid".to_string(),
+                status: CompletionStatus::Cancelled,
+                final_blackboard: None,
+                error_reason: None,
+                artifacts: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Invalid execution_id format (not a UUID)"));
+    }
+
+    #[tokio::test]
+    async fn complete_execution_returns_not_found_for_unknown_execution() {
+        let service = StandardCompleteWorkflowExecutionUseCase::new(
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let missing = ExecutionId::new().to_string();
+        let err = service
+            .complete_execution(CompleteWorkflowExecutionRequest {
+                execution_id: missing.clone(),
+                status: CompletionStatus::Cancelled,
+                final_blackboard: None,
+                error_reason: None,
+                artifacts: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains(&format!("Workflow execution not found: {}", missing)));
+    }
+}
