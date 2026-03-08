@@ -410,8 +410,11 @@ impl TemporalEventListener {
 mod tests {
     use super::*;
     use crate::domain::events::{ExecutionEvent, WorkflowEvent};
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
     use crate::infrastructure::event_bus::DomainEvent;
     use crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository;
+    use async_trait::async_trait;
 
     #[test]
     fn test_map_workflow_execution_started() {
@@ -490,6 +493,86 @@ mod tests {
         assert!(result.is_err());
     }
 
+    #[test]
+    fn test_map_state_entered_requires_state_name() {
+        let payload = TemporalEventPayload {
+            event_type: "WorkflowStateEntered".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            temporal_sequence_number: 10,
+            workflow_id: None,
+            state_name: None,
+            output: None,
+            error: None,
+            iteration_number: None,
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: None,
+            code_diff: None,
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
+        assert!(err.to_string().contains("state_name required"));
+    }
+
+    #[test]
+    fn test_map_state_exited_requires_output() {
+        let payload = TemporalEventPayload {
+            event_type: "WorkflowStateExited".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            temporal_sequence_number: 11,
+            workflow_id: None,
+            state_name: Some("BUILD".to_string()),
+            output: None,
+            error: None,
+            iteration_number: None,
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: None,
+            code_diff: None,
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
+        assert!(err.to_string().contains("output required"));
+    }
+
+    struct FailingAppendRepo;
+
+    #[async_trait]
+    impl WorkflowExecutionRepository for FailingAppendRepo {
+        async fn save(
+            &self,
+            _execution: &crate::domain::workflow::WorkflowExecution,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn find_by_id(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn find_active(
+            &self,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
+        }
+
+        async fn append_event(
+            &self,
+            _execution_id: ExecutionId,
+            _temporal_sequence_number: i64,
+            _event_type: String,
+            _payload: serde_json::Value,
+            _iteration_number: Option<u8>,
+        ) -> Result<(), RepositoryError> {
+            Err(RepositoryError::Database("append failed".to_string()))
+        }
+    }
+
     #[tokio::test]
     async fn test_handle_event_persists_and_publishes_workflow_event() {
         let event_bus = Arc::new(EventBus::new(16));
@@ -563,5 +646,34 @@ mod tests {
             }
             other => panic!("expected execution refinement event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_handle_event_does_not_publish_when_append_fails() {
+        let event_bus = Arc::new(EventBus::new(16));
+        let listener = TemporalEventListener::new(event_bus.clone(), Arc::new(FailingAppendRepo));
+        let mut receiver = event_bus.subscribe();
+
+        let payload = TemporalEventPayload {
+            event_type: "WorkflowExecutionStarted".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            temporal_sequence_number: 12,
+            workflow_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
+            state_name: None,
+            output: None,
+            error: None,
+            iteration_number: None,
+            final_blackboard: None,
+            artifacts: None,
+            agent_id: None,
+            code_diff: None,
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        let err = listener.handle_event(payload).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("Failed to persist execution event"));
+        assert!(receiver.try_recv().is_err());
     }
 }

@@ -167,7 +167,7 @@ mod tests {
     use crate::domain::events::WorkflowEvent;
     use crate::domain::repository::{RepositoryError, WorkflowRepository};
     use crate::domain::workflow::{Workflow, WorkflowId};
-    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::event_bus::{DomainEvent, EventBusError};
     use crate::infrastructure::repositories::InMemoryWorkflowRepository;
     use async_trait::async_trait;
     use serde_json::json;
@@ -366,6 +366,47 @@ spec:
         assert!(err
             .to_string()
             .contains("Failed to persist workflow to repository"));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_does_not_persist_when_engine_registration_fails() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
+            ))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let _ = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap_err();
+        let stored = repo
+            .find_by_name("registration-test-workflow")
+            .await
+            .unwrap();
+        assert!(stored.is_none());
+    }
+
+    #[tokio::test]
+    async fn register_workflow_does_not_publish_event_when_persistence_fails() {
+        let event_bus = Arc::new(EventBus::new(8));
+        let mut events = event_bus.subscribe();
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(SaveFailRepo),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
+            ))),
+            event_bus,
+        );
+
+        let _ = service
+            .register_workflow(VALID_WORKFLOW_YAML)
+            .await
+            .unwrap_err();
+        assert!(matches!(events.try_recv(), Err(EventBusError::Empty)));
     }
 
     #[tokio::test]
