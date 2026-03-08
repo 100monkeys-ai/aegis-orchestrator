@@ -530,10 +530,14 @@ impl ToolInvocationService {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let input_schema = item
+                .get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({"type":"object"}));
             converted.push(crate::infrastructure::tool_router::ToolMetadata {
                 name: name.to_string(),
                 description,
-                input_schema: serde_json::json!({"type": "object"}),
+                input_schema,
             });
         }
 
