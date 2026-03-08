@@ -41,6 +41,12 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::PolicyViolation;
 use crate::domain::security_context::SecurityContext;
 
+/// Default session time-to-live in hours.
+///
+/// Operators can adjust this constant to change how long SMCP sessions remain valid
+/// after creation, without modifying the rest of the session lifecycle logic.
+const SESSION_TTL_HOURS: i64 = 1;
+
 /// Opaque identifier for a single SMCP session (one per agent execution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
@@ -197,7 +203,7 @@ impl SmcpSession {
             security_context,
             status: SessionStatus::Active,
             created_at: now,
-            expires_at: now + chrono::Duration::hours(1),
+            expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
         }
     }
 
