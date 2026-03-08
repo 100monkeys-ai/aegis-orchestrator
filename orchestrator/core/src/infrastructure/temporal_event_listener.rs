@@ -374,8 +374,7 @@ impl TemporalEventListener {
         // Definition-time event — no execution_id exists.
         // Publish to the event bus so subscribers are notified, then return early.
         if let WorkflowEvent::WorkflowRegistered { .. } = &domain_event {
-            self.event_bus
-                .publish_workflow_event(domain_event.clone());
+            self.event_bus.publish_workflow_event(domain_event.clone());
             return Ok(String::new());
         }
 
@@ -389,9 +388,7 @@ impl TemporalEventListener {
             | WorkflowEvent::WorkflowIterationFailed { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
-            | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
-                *execution_id
-            }
+            | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
             WorkflowEvent::WorkflowRegistered { .. } => unreachable!("handled above"),
         };
 
