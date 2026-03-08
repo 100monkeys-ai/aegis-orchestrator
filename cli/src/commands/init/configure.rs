@@ -239,8 +239,8 @@ impl ConfigWizard {
             lmstudio_judge_model: "google/gemma-3-4b".to_string(),
             enable_anthropic_extra: false,
             anthropic_api_key: String::new(),
-            anthropic_smart_model: "claude-3-5-sonnet-20241022".to_string(),
-            anthropic_judge_model: "claude-3-5-sonnet-20241022".to_string(),
+            anthropic_smart_model: "claude-sonnet-4-5".to_string(),
+            anthropic_judge_model: "claude-sonnet-4-5".to_string(),
             enable_gemini: false,
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_api_key: String::new(),
@@ -530,17 +530,17 @@ impl ConfigWizard {
       api_key: "env:ANTHROPIC_API_KEY"
       models:
         - alias: "default"
-          model: "claude-3-5-sonnet-20241022"
+          model: "claude-haiku-4-5"
           capabilities: ["code", "reasoning"]
           context_window: 200000
-          cost_per_1k_tokens: 0.003
+          cost_per_1k_tokens: 0.0008
         - alias: "smart"
-          model: "claude-3-5-sonnet-20241022"
+          model: "claude-sonnet-4-5"
           capabilities: ["code", "reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
         - alias: "judge"
-          model: "claude-3-5-sonnet-20241022"
+          model: "claude-sonnet-4-5"
           capabilities: ["reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
