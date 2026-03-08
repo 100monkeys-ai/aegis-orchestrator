@@ -130,7 +130,9 @@ impl ToolInvocationService {
             ))?;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
-        let args = self.smcp_middleware.verify_and_unwrap(&mut session, envelope)?;
+        let args = self
+            .smcp_middleware
+            .verify_and_unwrap(&mut session, envelope)?;
         let tool_name = envelope
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload(

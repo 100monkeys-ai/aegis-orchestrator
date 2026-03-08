@@ -303,13 +303,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 ))),
             }?;
 
-            let input: ExecutionInput =
-                serde_json::from_value(input_val).map_err(|e| {
-                    RepositoryError::Serialization(format!(
-                        "Failed to deserialize execution input: {}",
-                        e
-                    ))
-                })?;
+            let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
+                RepositoryError::Serialization(format!(
+                    "Failed to deserialize execution input: {}",
+                    e
+                ))
+            })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(
@@ -411,13 +410,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 ))),
             }?;
 
-            let input: ExecutionInput =
-                serde_json::from_value(input_val).map_err(|e| {
-                    RepositoryError::Serialization(format!(
-                        "Failed to deserialize execution input: {}",
-                        e
-                    ))
-                })?;
+            let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
+                RepositoryError::Serialization(format!(
+                    "Failed to deserialize execution input: {}",
+                    e
+                ))
+            })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(

@@ -18,9 +18,7 @@ use aegis_orchestrator_sdk::AgentManifest;
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum WorkflowListResponse {
-    Wrapped {
-        workflows: Vec<serde_json::Value>,
-    },
+    Wrapped { workflows: Vec<serde_json::Value> },
     Bare(Vec<serde_json::Value>),
 }
 

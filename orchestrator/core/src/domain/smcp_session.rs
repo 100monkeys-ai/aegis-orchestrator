@@ -241,7 +241,10 @@ impl SmcpSession {
     /// This is the **single enforcement point** for all SMCP policy checks. Every
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
-    pub fn evaluate_call(&mut self, envelope: &impl EnvelopeVerifier) -> Result<(), SmcpSessionError> {
+    pub fn evaluate_call(
+        &mut self,
+        envelope: &impl EnvelopeVerifier,
+    ) -> Result<(), SmcpSessionError> {
         let now = Utc::now();
 
         // 1. Check session is active
