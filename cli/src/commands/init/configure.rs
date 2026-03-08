@@ -763,6 +763,14 @@ impl ConfigWizard {
       mount_point: "/tmp/aegis-volumes"
 "#
         };
+        let smcp_gateway_section = if components.smcp_gateway {
+            r#"
+  smcp_gateway:
+    url: "http://aegis-smcp-gateway:50055"
+"#
+        } else {
+            ""
+        };
 
         format!(
             r#"# AEGIS Agent Host — node configuration
@@ -795,7 +803,7 @@ spec:
   observability:
     logging:
       level: "{log_level}"
-{database_section}{temporal_section}{storage_section}"#,
+{database_section}{temporal_section}{storage_section}{smcp_gateway_section}"#,
             node_name = config.node_name,
             node_id = config.node_id,
             node_type = config.advanced.node_type,
@@ -807,6 +815,7 @@ spec:
             database_section = database_section,
             temporal_section = temporal_section,
             storage_section = storage_section,
+            smcp_gateway_section = smcp_gateway_section,
         )
     }
 

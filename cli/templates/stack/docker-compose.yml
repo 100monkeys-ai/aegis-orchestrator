@@ -179,6 +179,32 @@ services:
     restart: unless-stopped
 
   # ============================================================================
+  # SMCP Tooling Gateway (ADR-053)
+  # ============================================================================
+
+  aegis-smcp-gateway:
+    image: ghcr.io/100monkeys-ai/aegis-smcp-gateway:latest
+    container_name: aegis-smcp-gateway
+    profiles: [smcp-gateway]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      - RUST_LOG=info
+      - SMCP_GATEWAY_BIND=0.0.0.0:8089
+      - SMCP_GATEWAY_GRPC_BIND=0.0.0.0:50055
+      - SMCP_GATEWAY_DB=sqlite:///app/data/gateway.db
+      - SMCP_GATEWAY_AUTH_DISABLED=true
+    ports:
+      - "8089:8089"   # HTTP API
+      - "50055:50055" # gRPC API
+    networks:
+      - aegis-network
+    volumes:
+      - smcp-gateway-data:/app/data
+    restart: unless-stopped
+
+  # ============================================================================
   # Secrets Management (ADR-034)
   # ============================================================================
 
@@ -367,4 +393,6 @@ volumes:
   seaweedfs-filer-data:
     driver: local
   keycloak-data:
+    driver: local
+  smcp-gateway-data:
     driver: local

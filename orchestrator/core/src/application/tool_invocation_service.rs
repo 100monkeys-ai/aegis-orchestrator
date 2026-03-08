@@ -59,6 +59,8 @@ pub struct ToolInvocationService {
     validation_service: Option<Arc<ValidationService>>,
     /// Optional root directory for persisting generated manifests on disk.
     generated_manifests_root: Option<PathBuf>,
+    /// Optional ADR-053 SMCP gateway URL from node config.
+    smcp_gateway_url: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -73,6 +75,7 @@ impl ToolInvocationService {
         agent_lifecycle: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
         web_tool_port: Arc<dyn ExternalWebToolPort>,
+        smcp_gateway_url: Option<String>,
     ) -> Self {
         Self {
             smcp_session_repo,
@@ -87,6 +90,7 @@ impl ToolInvocationService {
             register_workflow_use_case: None,
             validation_service: None,
             generated_manifests_root: None,
+            smcp_gateway_url,
         }
     }
 
@@ -421,14 +425,9 @@ impl ToolInvocationService {
         let server_id = match self.tool_router.route_tool(execution_id, &tool_name).await {
             Ok(id) => id,
             Err(routing_err) => {
-                if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
+                if self.smcp_gateway_url.is_some() {
                     let gateway_result = self
-                        .invoke_smcp_gateway_internal_grpc(
-                            &gateway_url,
-                            execution_id,
-                            &tool_name,
-                            args.clone(),
-                        )
+                        .invoke_smcp_gateway_internal_grpc(execution_id, &tool_name, args.clone())
                         .await;
                     if let Ok(value) = gateway_result {
                         return Ok(ToolInvocationResult::Direct(value));
@@ -492,8 +491,8 @@ impl ToolInvocationService {
             SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e))
         })?;
 
-        if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
-            if let Ok(gateway_tools) = self.fetch_gateway_tools_grpc(&gateway_url).await {
+        if self.smcp_gateway_url.is_some() {
+            if let Ok(gateway_tools) = self.fetch_gateway_tools_grpc().await {
                 tools.extend(gateway_tools);
             }
         }
@@ -503,8 +502,12 @@ impl ToolInvocationService {
 
     async fn fetch_gateway_tools_grpc(
         &self,
-        gateway_url: &str,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+        let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "smcp_gateway.url is not configured".to_string(),
+            )
+        })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
             .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
@@ -539,11 +542,15 @@ impl ToolInvocationService {
 
     async fn invoke_smcp_gateway_internal_grpc(
         &self,
-        gateway_url: &str,
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, SmcpSessionError> {
+        let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "smcp_gateway.url is not configured".to_string(),
+            )
+        })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
             .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
@@ -1155,6 +1162,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            None,
         );
         let agent_id = AgentId::new();
         let envelope = DummyEnvelope { valid: true };
@@ -1204,6 +1212,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            None,
         );
         let envelope = DummyEnvelope { valid: false };
 
@@ -1279,6 +1288,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            None,
         );
 
         // 1. Local Tool

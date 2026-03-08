@@ -125,7 +125,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .context("Configuration validation failed")?;
 
     if let Some(smcp_gateway) = &config.spec.smcp_gateway {
-        std::env::set_var("AEGIS_SMCP_GATEWAY_URL", smcp_gateway.url.clone());
         tracing::info!(
             "Configured SMCP tooling gateway URL from node config: {}",
             smcp_gateway.url
@@ -1041,6 +1040,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
             ),
+            config
+                .spec
+                .smcp_gateway
+                .as_ref()
+                .map(|gateway| gateway.url.clone()),
         )
         .with_workflow_authoring(
             register_workflow_use_case.clone(),

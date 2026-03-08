@@ -212,6 +212,12 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
     if components.storage {
         println!("  {}  http://localhost:9333", "SeaweedFS".bold());
     }
+    if components.smcp_gateway {
+        println!(
+            "  {}  http://localhost:8089 (HTTP), localhost:50055 (gRPC)",
+            "SMCP Gateway".bold()
+        );
+    }
 
     println!();
     println!("  Next steps:");
