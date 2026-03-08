@@ -234,7 +234,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
                 container_uid, container_gid,
-                started_at, completed_at, error_message
+                started_at, completed_at, error_message, parent_execution_id
             FROM executions
             WHERE agent_id = $1
             ORDER BY started_at DESC
@@ -262,6 +262,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
+            let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -277,10 +278,19 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(
-                        "failed to deserialize iterations: {}",
+                        "Failed to deserialize iterations: {}",
                         e
                     ))
                 })?;
+
+            let hierarchy = match parent_execution_id {
+                Some(parent_id) => ExecutionHierarchy {
+                    parent_execution_id: Some(ExecutionId(parent_id)),
+                    depth: 1,
+                    path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                },
+                None => ExecutionHierarchy::root(ExecutionId(id)),
+            };
 
             executions.push(Execution {
                 id: ExecutionId(id),
@@ -294,7 +304,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 started_at,
                 ended_at: completed_at,
                 error: error_message,
-                hierarchy: ExecutionHierarchy::root(ExecutionId(id)),
+                hierarchy,
             });
         }
 
@@ -307,7 +317,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             SELECT 
                 id, agent_id, input, status, iterations, max_iterations, 
                 container_uid, container_gid,
-                started_at, completed_at, error_message
+                started_at, completed_at, error_message, parent_execution_id
             FROM executions
             ORDER BY started_at DESC
             LIMIT $1
@@ -331,6 +341,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
+            let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
                 "pending" => ExecutionStatus::Pending,
@@ -346,10 +357,19 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
                     RepositoryError::Serialization(format!(
-                        "failed to deserialize iterations: {}",
+                        "Failed to deserialize iterations: {}",
                         e
                     ))
                 })?;
+
+            let hierarchy = match parent_execution_id {
+                Some(parent_id) => ExecutionHierarchy {
+                    parent_execution_id: Some(ExecutionId(parent_id)),
+                    depth: 1,
+                    path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                },
+                None => ExecutionHierarchy::root(ExecutionId(id)),
+            };
 
             executions.push(Execution {
                 id: ExecutionId(id),
@@ -363,7 +383,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 started_at,
                 ended_at: completed_at,
                 error: error_message,
-                hierarchy: ExecutionHierarchy::root(ExecutionId(id)),
+                hierarchy,
             });
         }
         Ok(executions)
