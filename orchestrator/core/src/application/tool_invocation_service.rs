@@ -144,13 +144,11 @@ impl ToolInvocationService {
             .route_tool(session.execution_id, &tool_name)
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e))
+                SmcpSessionError::MalformedPayload(format!("Routing error: {}", e))
             })?;
 
         let server = self.tool_router.get_server(server_id).await.ok_or(
-            SmcpSessionError::SignatureVerificationFailed(
-                "Server vanished after routing".to_string(),
-            ),
+            SmcpSessionError::MalformedPayload("Server vanished after routing".to_string()),
         )?;
 
         // 4. Execute based on ExecutionMode (Gateway Retrofit)
@@ -337,7 +335,7 @@ impl ToolInvocationService {
 
                         loop {
                             if attempts >= max_attempts {
-                                return Err(SmcpSessionError::SignatureVerificationFailed(
+                                return Err(SmcpSessionError::JudgeTimeout(
                                     format!(
                                         "Inner-loop semantic judge '{}' timed out after {} seconds.",
                                         judge_agent,
@@ -993,7 +991,7 @@ fn sanitize_segment(input: &str) -> String {
         return "unversioned".to_string();
     }
 
-    trimmed
+    let sanitized: String = trimmed
         .chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
@@ -1002,7 +1000,19 @@ fn sanitize_segment(input: &str) -> String {
                 '_'
             }
         })
-        .collect()
+        .collect();
+
+    // Prevent path traversal patterns after character substitution.
+    // Treat empty or traversal-like segments as a safe default.
+    if sanitized.is_empty()
+        || sanitized == "."
+        || sanitized == ".."
+        || sanitized.contains("..")
+    {
+        "unversioned".to_string()
+    } else {
+        sanitized
+    }
 }
 
 fn path_to_string(path: &Path) -> String {
