@@ -40,7 +40,7 @@ bollard = "0.20"  # Docker API
 
 # Error Handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Logging & Tracing
 tracing = "0.1"

@@ -17,7 +17,7 @@ serde_yaml = "0.9"
 tokio = { version = "1.50", features = ["full"] }
 reqwest = { version = "0.13", features = ["json"] }
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
