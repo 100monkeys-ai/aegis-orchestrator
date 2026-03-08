@@ -122,7 +122,7 @@ impl ToolInvocationService {
             .smcp_session_repo
             .find_active_by_agent(agent_id)
             .await
-            .map_err(|_| SmcpSessionError::MalformedPayload)? // generic fallback error
+            .map_err(|_| SmcpSessionError::MalformedPayload("session repository lookup failed".to_string()))? // generic fallback error
             .ok_or(SmcpSessionError::SessionInactive(
                 crate::domain::smcp_session::SessionStatus::Expired,
             ))?;
@@ -131,7 +131,7 @@ impl ToolInvocationService {
         let args = self.smcp_middleware.verify_and_unwrap(&session, envelope)?;
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload)?;
+            .ok_or(SmcpSessionError::MalformedPayload("missing tool name".to_string()))?;
 
         // 3. Route tool call to the appropriate TCP server.
         // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
@@ -173,7 +173,7 @@ impl ToolInvocationService {
             crate::domain::mcp::ExecutionMode::Remote => {
                 // SMCP to JSONRPC Proxy
                 // We've unwrapped the SMCP envelope, now we build a JSON-RPC 2.0 request
-                // and dispatch it to the ToolServer's raw stido or HTTP interfaces.
+                // and dispatch it to the ToolServer's raw stdio or HTTP interfaces.
                 let _json_rpc_payload = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": tool_name,
@@ -220,7 +220,11 @@ impl ToolInvocationService {
                 self.security_context_repo
                     .find_by_name("default")
                     .await
-                    .map_err(|_| SmcpSessionError::MalformedPayload)?
+                    .map_err(|e| {
+                        SmcpSessionError::MalformedPayload(format!(
+                            "Failed to load fallback security context 'default': {e}"
+                        ))
+                    })?
                     .ok_or(SmcpSessionError::SessionInactive(
                         crate::domain::smcp_session::SessionStatus::Expired,
                     ))?
@@ -329,7 +333,13 @@ impl ToolInvocationService {
 
                         loop {
                             if attempts >= max_attempts {
-                                return Err(SmcpSessionError::SignatureVerificationFailed(format!("Inner-loop semantic judge '{}' timed out after {} seconds.", judge_agent, timeout_seconds)));
+                                return Err(SmcpSessionError::SignatureVerificationFailed(
+                                    format!(
+                                        "Inner-loop semantic judge '{}' timed out after {} seconds.",
+                                        judge_agent,
+                                        timeout_seconds
+                                    ),
+                                ));
                             }
 
                             let exec = self
@@ -367,10 +377,15 @@ impl ToolInvocationService {
                                     if !(result.score >= *min_score
                                         && result.confidence >= *min_confidence)
                                     {
-                                        return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                                             "Inner-loop tool execution rejected by semantic judge (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
-                                             result.score, min_score, result.reasoning
-                                         )));
+                                        return Err(SmcpSessionError::SignatureVerificationFailed(
+                                            format!(
+                                                "Inner-loop tool execution rejected by semantic judge \
+                                                 (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
+                                                result.score,
+                                                min_score,
+                                                result.reasoning,
+                                            ),
+                                        ));
                                     }
                                     break;
                                 }
