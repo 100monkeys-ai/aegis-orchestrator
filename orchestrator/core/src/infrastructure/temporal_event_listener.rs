@@ -370,29 +370,15 @@ impl TemporalEventListener {
                 self.event_bus.publish_workflow_event(domain_event.clone());
                 return Ok(String::new());
             }
-            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowStateEntered { execution_id, .. } => execution_id.clone(),
-            WorkflowEvent::WorkflowStateExited { execution_id, .. } => execution_id.clone(),
-            WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => {
-                execution_id.clone()
-            }
-            WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
-                execution_id.clone()
-            }
+            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowStateEntered { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowStateExited { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowIterationStarted { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowIterationCompleted { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowIterationFailed { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowExecutionFailed { execution_id, .. } => *execution_id,
+            WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
         };
 
         let execution_id_str = execution_id_obj.0.to_string();

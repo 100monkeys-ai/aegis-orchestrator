@@ -143,9 +143,7 @@ impl ToolInvocationService {
             .tool_router
             .route_tool(session.execution_id, &tool_name)
             .await
-            .map_err(|e| {
-                SmcpSessionError::MalformedPayload(format!("Routing error: {}", e))
-            })?;
+            .map_err(|e| SmcpSessionError::MalformedPayload(format!("Routing error: {}", e)))?;
 
         let server = self.tool_router.get_server(server_id).await.ok_or(
             SmcpSessionError::MalformedPayload("Server vanished after routing".to_string()),
@@ -335,13 +333,10 @@ impl ToolInvocationService {
 
                         loop {
                             if attempts >= max_attempts {
-                                return Err(SmcpSessionError::JudgeTimeout(
-                                    format!(
-                                        "Inner-loop semantic judge '{}' timed out after {} seconds.",
-                                        judge_agent,
-                                        timeout_seconds
-                                    ),
-                                ));
+                                return Err(SmcpSessionError::JudgeTimeout(format!(
+                                    "Inner-loop semantic judge '{}' timed out after {} seconds.",
+                                    judge_agent, timeout_seconds
+                                )));
                             }
 
                             let exec = self
@@ -1004,11 +999,7 @@ fn sanitize_segment(input: &str) -> String {
 
     // Prevent path traversal patterns after character substitution.
     // Treat empty or traversal-like segments as a safe default.
-    if sanitized.is_empty()
-        || sanitized == "."
-        || sanitized == ".."
-        || sanitized.contains("..")
-    {
+    if sanitized.is_empty() || sanitized == "." || sanitized == ".." || sanitized.contains("..") {
         "unversioned".to_string()
     } else {
         sanitized
