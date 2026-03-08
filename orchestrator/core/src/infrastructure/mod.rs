@@ -53,6 +53,7 @@ pub mod secrets_manager;
 pub mod security_context;
 pub mod sensor;
 pub mod smcp;
+pub mod smcp_gateway_proto;
 pub mod storage;
 pub mod temporal_client;
 pub mod temporal_event_listener;

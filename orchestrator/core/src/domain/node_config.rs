@@ -1069,8 +1069,8 @@ pub struct GrpcAuthConfig {
 /// Standalone SMCP tooling gateway endpoint configuration (ADR-053).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpGatewayConfig {
-    /// Base HTTP URL of the gateway.
-    /// Example: "http://aegis-smcp-gateway:8089"
+    /// gRPC endpoint URL of the gateway invocation service.
+    /// Example: "http://aegis-smcp-gateway:50055"
     pub url: String,
 }
 

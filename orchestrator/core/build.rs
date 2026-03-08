@@ -51,22 +51,45 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_vendor_dir = crate_dir.join("proto-vendor");
     let use_vendor = proto_vendor_dir.exists();
 
-    let (aegis_proto_path, temporal_api_base, include_dirs) = if use_vendor {
+    let (aegis_proto_path, smcp_gateway_proto_path, temporal_api_base, include_dirs) = if use_vendor
+    {
         // CI/crates.io mode: use proto-vendor/
+        let smcp_gateway_path = {
+            let namespaced = proto_vendor_dir.join("aegis/smcp_gateway.proto");
+            if namespaced.exists() {
+                namespaced
+            } else {
+                proto_vendor_dir.join("smcp_gateway.proto")
+            }
+        };
         (
             proto_vendor_dir.join("aegis/aegis_runtime.proto"),
+            smcp_gateway_path,
             proto_vendor_dir.join("temporal/api"),
             vec![proto_vendor_dir.to_string_lossy().to_string()],
         )
     } else {
+        let smcp_gateway_path = {
+            let direct = crate_root.join("aegis-proto/proto/smcp_gateway.proto");
+            if direct.exists() {
+                direct
+            } else {
+                crate_root.join("../aegis-proto/proto/smcp_gateway.proto")
+            }
+        };
         // Development mode: use git submodule
         (
             crate_root.join("aegis-proto/proto/aegis_runtime.proto"),
+            smcp_gateway_path,
             crate_root.join("proto/temporal/api"),
             vec![
                 crate_root.join("proto").to_string_lossy().to_string(),
                 crate_root
                     .join("aegis-proto/proto")
+                    .to_string_lossy()
+                    .to_string(),
+                crate_root
+                    .join("../aegis-proto/proto")
                     .to_string_lossy()
                     .to_string(),
             ],
@@ -80,6 +103,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         protos.push(aegis_proto_path.to_string_lossy().to_string());
     } else {
         return Err(format!("aegis_runtime.proto not found at {:?}", aegis_proto_path).into());
+    }
+    if smcp_gateway_proto_path.exists() {
+        protos.push(smcp_gateway_proto_path.to_string_lossy().to_string());
+    } else {
+        return Err(format!(
+            "smcp_gateway.proto not found at {:?}",
+            smcp_gateway_proto_path
+        )
+        .into());
     }
 
     let temporal_protos = &[

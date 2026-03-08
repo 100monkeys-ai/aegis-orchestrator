@@ -435,6 +435,7 @@ mod tests {
                 registry_credentials: vec![],
                 iam: None,
                 grpc_auth: None,
+                smcp_gateway: None,
             },
         };
 

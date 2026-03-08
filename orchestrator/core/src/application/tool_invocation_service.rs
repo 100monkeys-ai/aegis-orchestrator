@@ -26,6 +26,10 @@ use crate::domain::execution::ExecutionInput;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::validation::extract_json_from_text;
 use crate::infrastructure::agent_manifest_parser::AgentManifestParser;
+use crate::infrastructure::smcp_gateway_proto::gateway_invocation_service_client::GatewayInvocationServiceClient;
+use crate::infrastructure::smcp_gateway_proto::{
+    InvokeCliRequest, InvokeWorkflowRequest, ListToolsRequest,
+};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 
 pub enum ToolInvocationResult {
@@ -419,7 +423,7 @@ impl ToolInvocationService {
             Err(routing_err) => {
                 if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
                     let gateway_result = self
-                        .invoke_smcp_gateway_internal(
+                        .invoke_smcp_gateway_internal_grpc(
                             &gateway_url,
                             execution_id,
                             &tool_name,
@@ -489,7 +493,7 @@ impl ToolInvocationService {
         })?;
 
         if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
-            if let Ok(gateway_tools) = self.fetch_gateway_tools(&gateway_url).await {
+            if let Ok(gateway_tools) = self.fetch_gateway_tools_grpc(&gateway_url).await {
                 tools.extend(gateway_tools);
             }
         }
@@ -497,46 +501,35 @@ impl ToolInvocationService {
         Ok(tools)
     }
 
-    async fn fetch_gateway_tools(
+    async fn fetch_gateway_tools_grpc(
         &self,
         gateway_url: &str,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
-        let url = format!("{}/v1/tools", gateway_url.trim_end_matches('/'));
-        let client = reqwest::Client::new();
+        let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
         let response = client
-            .get(url)
-            .send()
+            .list_tools(tonic::Request::new(ListToolsRequest {}))
             .await
             .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
-        let payload = response
-            .json::<serde_json::Value>()
-            .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
-        let array = payload.as_array().ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
-                "Gateway /v1/tools response must be an array".to_string(),
-            )
-        })?;
 
         let mut converted = Vec::new();
-        for item in array {
-            let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
-                    "Gateway tool missing name".to_string(),
-                )
-            })?;
-            let description = item
-                .get("description")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let input_schema = item
-                .get("input_schema")
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!({"type":"object"}));
+        for item in response.into_inner().tools {
+            let input_schema = if item.kind == "cli" {
+                serde_json::json!({
+                    "type":"object",
+                    "properties": {
+                        "subcommand": {"type":"string"},
+                        "args": {"type":"array","items":{"type":"string"}}
+                    },
+                    "required": ["subcommand"]
+                })
+            } else {
+                serde_json::json!({"type":"object"})
+            };
             converted.push(crate::infrastructure::tool_router::ToolMetadata {
-                name: name.to_string(),
-                description,
+                name: item.name,
+                description: item.description,
                 input_schema,
             });
         }
@@ -544,39 +537,73 @@ impl ToolInvocationService {
         Ok(converted)
     }
 
-    async fn invoke_smcp_gateway_internal(
+    async fn invoke_smcp_gateway_internal_grpc(
         &self,
         gateway_url: &str,
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: &str,
         args: serde_json::Value,
     ) -> Result<serde_json::Value, SmcpSessionError> {
-        let url = format!("{}/v1/invoke/internal", gateway_url.trim_end_matches('/'));
-        let client = reqwest::Client::new();
-        let response = client
-            .post(url)
-            .json(&serde_json::json!({
-                "execution_id": execution_id.to_string(),
-                "tool_name": tool_name,
-                "args": args,
-            }))
-            .send()
+        let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
             .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
-        if !response.status().is_success() {
-            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                "Gateway returned {}",
-                response.status()
-            )));
+
+        if args.get("subcommand").is_some() {
+            let subcommand = args
+                .get("subcommand")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    SmcpSessionError::SignatureVerificationFailed(
+                        "CLI tool invocation requires 'subcommand' string".to_string(),
+                    )
+                })?
+                .to_string();
+            let cli_args = args
+                .get("args")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|item| item.as_str().map(ToOwned::to_owned))
+                        .collect::<Vec<String>>()
+                })
+                .unwrap_or_default();
+
+            let response = client
+                .invoke_cli(tonic::Request::new(InvokeCliRequest {
+                    execution_id: execution_id.to_string(),
+                    tool_name: tool_name.to_string(),
+                    subcommand,
+                    args: cli_args,
+                    workspace_path: "/workspace".to_string(),
+                }))
+                .await
+                .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+                .into_inner();
+
+            return Ok(serde_json::json!({
+                "exit_code": response.exit_code,
+                "stdout": response.stdout,
+                "stderr": response.stderr
+            }));
         }
-        let payload = response
-            .json::<serde_json::Value>()
+
+        let response = client
+            .invoke_workflow(tonic::Request::new(InvokeWorkflowRequest {
+                execution_id: execution_id.to_string(),
+                workflow_name: tool_name.to_string(),
+                input_json: args.to_string(),
+                zaru_user_token: String::new(),
+            }))
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
-        Ok(payload
-            .get("result")
-            .cloned()
-            .unwrap_or_else(|| serde_json::json!({})))
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+            .into_inner();
+
+        if response.result_json.is_empty() {
+            return Ok(serde_json::json!({}));
+        }
+
+        serde_json::from_str(&response.result_json)
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))
     }
 
     async fn invoke_aegis_agent_create_tool(
