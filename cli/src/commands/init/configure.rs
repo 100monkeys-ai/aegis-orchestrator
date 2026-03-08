@@ -766,7 +766,7 @@ impl ConfigWizard {
         let smcp_gateway_section = if components.smcp_gateway {
             r#"
   smcp_gateway:
-    url: "http://aegis-smcp-gateway:50055"
+    url: "env:SMCP_GATEWAY_URL"
 "#
         } else {
             ""
@@ -827,6 +827,11 @@ spec:
     ) -> Result<String> {
         let profiles = components.compose_profiles();
         let smcp_private_key = generate_smcp_private_key_env_value()?;
+        let smcp_gateway_url_section = if components.smcp_gateway {
+            "\n# ─── SMCP Tooling Gateway ─────────────────────────────────────────────────────\nSMCP_GATEWAY_URL=http://aegis-smcp-gateway:50055\n"
+        } else {
+            ""
+        };
 
         let api_key_line = match &components.llm {
             LlmChoice::Ollama => {
@@ -902,7 +907,7 @@ TEMPORAL_WORKER_SECRET={temporal_worker_secret}
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 AEGIS_KEEP_CONTAINER={keep_container}
 AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
-"#,
+{smcp_gateway_url_section}"#,
             profiles = profiles,
             api_key_line = api_key_line,
             additional_provider_env = additional_provider_env,
@@ -919,6 +924,7 @@ AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
                 "false"
             },
             smcp_private_key = smcp_private_key,
+            smcp_gateway_url_section = smcp_gateway_url_section,
         ))
     }
 }

@@ -129,9 +129,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .context("Configuration validation failed")?;
 
     if let Some(smcp_gateway) = &config.spec.smcp_gateway {
+        let resolved_url = resolve_env_value(&smcp_gateway.url)
+            .unwrap_or_else(|_| smcp_gateway.url.clone());
         tracing::info!(
             "Configured SMCP tooling gateway URL from node config: {}",
-            smcp_gateway.url
+            resolved_url
         );
     }
 
@@ -1047,7 +1049,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 .spec
                 .smcp_gateway
                 .as_ref()
-                .map(|gateway| gateway.url.clone()),
+                .map(|gateway| {
+                    resolve_env_value(&gateway.url)
+                        .unwrap_or_else(|_| gateway.url.clone())
+                }),
         )
         .with_workflow_authoring(
             register_workflow_use_case.clone(),

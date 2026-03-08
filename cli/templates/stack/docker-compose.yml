@@ -185,7 +185,7 @@ services:
       - SMCP_GATEWAY_DB=sqlite:///app/data/gateway.db
       - SMCP_GATEWAY_AUTH_DISABLED=true
     ports:
-      - "8089:8089"   # HTTP API
+      - "8089:8089"   # HTTP REST API + Management UI (http://localhost:8089/)
       - "50055:50055" # gRPC API
     networks:
       - aegis-network

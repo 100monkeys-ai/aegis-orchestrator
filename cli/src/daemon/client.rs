@@ -15,6 +15,15 @@ use uuid::Uuid;
 
 use aegis_orchestrator_sdk::AgentManifest;
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum WorkflowListResponse {
+    Wrapped {
+        workflows: Vec<serde_json::Value>,
+    },
+    Bare(Vec<serde_json::Value>),
+}
+
 #[derive(Debug, Clone)]
 pub struct DaemonClient {
     client: Client,
@@ -621,17 +630,17 @@ impl DaemonClient {
             anyhow::bail!("Failed to list workflows: {}", error_text);
         }
 
-        #[derive(Deserialize)]
-        struct ListResponse {
-            workflows: Vec<serde_json::Value>,
-        }
-
-        let list_response: ListResponse = response
+        let list_response: WorkflowListResponse = response
             .json()
             .await
             .context("Failed to parse list response")?;
 
-        Ok(list_response.workflows)
+        let workflows = match list_response {
+            WorkflowListResponse::Wrapped { workflows } => workflows,
+            WorkflowListResponse::Bare(workflows) => workflows,
+        };
+
+        Ok(workflows)
     }
 
     /// Describe a workflow (get YAML definition)
@@ -721,5 +730,43 @@ impl DaemonClient {
         let logs = response.text().await.context("Failed to read logs")?;
 
         Ok(logs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkflowListResponse;
+
+    #[test]
+    fn parses_wrapped_workflow_list_response() {
+        let payload = r#"{"workflows":[{"name":"alpha"}]}"#;
+        let parsed: WorkflowListResponse = serde_json::from_str(payload).expect("must parse");
+
+        match parsed {
+            WorkflowListResponse::Wrapped { workflows } => assert_eq!(workflows.len(), 1),
+            WorkflowListResponse::Bare(_) => panic!("expected wrapped workflow list"),
+        }
+    }
+
+    #[test]
+    fn parses_bare_workflow_list_response() {
+        let payload = r#"[{"name":"alpha"}]"#;
+        let parsed: WorkflowListResponse = serde_json::from_str(payload).expect("must parse");
+
+        match parsed {
+            WorkflowListResponse::Bare(workflows) => assert_eq!(workflows.len(), 1),
+            WorkflowListResponse::Wrapped { .. } => panic!("expected bare workflow list"),
+        }
+    }
+
+    #[test]
+    fn parses_empty_bare_workflow_list_response() {
+        let payload = "[]";
+        let parsed: WorkflowListResponse = serde_json::from_str(payload).expect("must parse");
+
+        match parsed {
+            WorkflowListResponse::Bare(workflows) => assert_eq!(workflows.len(), 0),
+            WorkflowListResponse::Wrapped { .. } => panic!("expected bare workflow list"),
+        }
     }
 }

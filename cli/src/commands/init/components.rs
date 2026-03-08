@@ -114,7 +114,7 @@ impl ComponentSelector {
             "SeaweedFS (distributed storage for agent volumes)",
             "IAM (Keycloak OIDC identity provider)        [needed for multi-user / Zaru]",
             "Secrets (OpenBao secrets backend)            [needed for secret manager integration]",
-            "SMCP Gateway (external tooling gateway)      [ADR-053]",
+            "SMCP Gateway (external tooling gateway)      [enables ToolWorkflows & secure external tool access]",
             "Ollama (local LLM runtime — no API key needed)",
         ];
 
