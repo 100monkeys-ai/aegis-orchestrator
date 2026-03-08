@@ -688,7 +688,7 @@ mod tests {
             final_blackboard: None,
             artifacts: None,
             agent_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
-            code_diff: Some(serde_json::json!({"summary": "updated prompt"})),
+            code_diff: Some(serde_json::json!("updated prompt")),
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
