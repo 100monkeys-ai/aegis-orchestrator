@@ -124,6 +124,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .validate()
         .context("Configuration validation failed")?;
 
+    if let Some(smcp_gateway) = &config.spec.smcp_gateway {
+        std::env::set_var("AEGIS_SMCP_GATEWAY_URL", smcp_gateway.url.clone());
+        tracing::info!(
+            "Configured SMCP tooling gateway URL from node config: {}",
+            smcp_gateway.url
+        );
+    }
+
     if config.spec.llm_providers.is_empty() {
         tracing::warn!("Started with NO LLM providers configured. Agent execution will fail!");
         println!("WARNING: No LLM providers configured. Agents will fail to generate text.");

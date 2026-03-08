@@ -162,6 +162,11 @@ pub struct NodeConfigSpec {
     /// If omitted, gRPC endpoints are unauthenticated.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_auth: Option<GrpcAuthConfig>,
+
+    /// External SMCP tooling gateway configuration (ADR-053).
+    /// If omitted, orchestrator does not forward unknown tools to the gateway.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smcp_gateway: Option<SmcpGatewayConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1061,6 +1066,14 @@ pub struct GrpcAuthConfig {
     pub exempt_methods: Vec<String>,
 }
 
+/// Standalone SMCP tooling gateway endpoint configuration (ADR-053).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SmcpGatewayConfig {
+    /// Base HTTP URL of the gateway.
+    /// Example: "http://aegis-smcp-gateway:8089"
+    pub url: String,
+}
+
 // Default value functions
 fn default_true() -> bool {
     true
@@ -1240,6 +1253,7 @@ impl Default for NodeConfigSpec {
             security_contexts: None,
             iam: None,
             grpc_auth: None,
+            smcp_gateway: None,
         }
     }
 }
@@ -1620,6 +1634,7 @@ mod tests {
                 registry_credentials: vec![],
                 iam: None,
                 grpc_auth: None,
+                smcp_gateway: None,
             },
         };
 

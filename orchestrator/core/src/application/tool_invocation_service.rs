@@ -414,13 +414,28 @@ impl ToolInvocationService {
             Err(e) => return Err(e),
         }
 
-        let server_id = self
-            .tool_router
-            .route_tool(execution_id, &tool_name)
-            .await
-            .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!("Routing error: {}", e))
-            })?;
+        let server_id = match self.tool_router.route_tool(execution_id, &tool_name).await {
+            Ok(id) => id,
+            Err(routing_err) => {
+                if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
+                    let gateway_result = self
+                        .invoke_smcp_gateway_internal(
+                            &gateway_url,
+                            execution_id,
+                            &tool_name,
+                            args.clone(),
+                        )
+                        .await;
+                    if let Ok(value) = gateway_result {
+                        return Ok(ToolInvocationResult::Direct(value));
+                    }
+                }
+                return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Routing error: {}",
+                    routing_err
+                )));
+            }
+        };
 
         let server = self.tool_router.get_server(server_id).await.ok_or(
             SmcpSessionError::SignatureVerificationFailed(
@@ -469,9 +484,95 @@ impl ToolInvocationService {
     pub async fn get_available_tools(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
-        self.tool_router.list_tools().await.map_err(|e| {
+        let mut tools = self.tool_router.list_tools().await.map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e))
-        })
+        })?;
+
+        if let Ok(gateway_url) = std::env::var("AEGIS_SMCP_GATEWAY_URL") {
+            if let Ok(gateway_tools) = self.fetch_gateway_tools(&gateway_url).await {
+                tools.extend(gateway_tools);
+            }
+        }
+
+        Ok(tools)
+    }
+
+    async fn fetch_gateway_tools(
+        &self,
+        gateway_url: &str,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+        let url = format!("{}/v1/tools", gateway_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+        let array = payload.as_array().ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "Gateway /v1/tools response must be an array".to_string(),
+            )
+        })?;
+
+        let mut converted = Vec::new();
+        for item in array {
+            let name = item.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "Gateway tool missing name".to_string(),
+                )
+            })?;
+            let description = item
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            converted.push(crate::infrastructure::tool_router::ToolMetadata {
+                name: name.to_string(),
+                description,
+                input_schema: serde_json::json!({"type": "object"}),
+            });
+        }
+
+        Ok(converted)
+    }
+
+    async fn invoke_smcp_gateway_internal(
+        &self,
+        gateway_url: &str,
+        execution_id: crate::domain::execution::ExecutionId,
+        tool_name: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, SmcpSessionError> {
+        let url = format!("{}/v1/invoke/internal", gateway_url.trim_end_matches('/'));
+        let client = reqwest::Client::new();
+        let response = client
+            .post(url)
+            .json(&serde_json::json!({
+                "execution_id": execution_id.to_string(),
+                "tool_name": tool_name,
+                "args": args,
+            }))
+            .send()
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+        if !response.status().is_success() {
+            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                "Gateway returned {}",
+                response.status()
+            )));
+        }
+        let payload = response
+            .json::<serde_json::Value>()
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+        Ok(payload
+            .get("result")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})))
     }
 
     async fn invoke_aegis_agent_create_tool(
