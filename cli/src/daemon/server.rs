@@ -18,6 +18,10 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
+/// Maximum number of retries when attempting to establish the Temporal connection.
+/// Previously this was an inline magic number (`30`) in the connection retry loop.
+const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -163,14 +167,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or(5);
 
     // Store pool separately for later volume repo initialization
-    let pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
+    let db_pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
         println!("Initializing repositories with PostgreSQL: {}", url);
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(db_max_connections)
             .connect(url)
             .await
         {
-            Ok(pool) => {
+            Ok(db_pool) => {
                 println!("Connected to PostgreSQL.");
 
                 // Check migration status
@@ -185,7 +189,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
                 // Check applied migrations
                 let applied_result = sqlx::query("SELECT version FROM _sqlx_migrations")
-                    .fetch_all(&pool)
+                    .fetch_all(&db_pool)
                     .await;
 
                 let applied_count = match applied_result {
@@ -200,7 +204,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
                 if applied_count < total_known {
                     println!("Applying pending migrations...");
-                    match MIGRATOR.run(&pool).await {
+                    match MIGRATOR.run(&db_pool).await {
                         Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
                             return Err(anyhow::anyhow!("Failed to apply migrations: {}", e));
@@ -210,7 +214,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     println!("INFO: Database is up to date.");
                 }
 
-                Some(pool)
+                Some(db_pool)
             }
             Err(e) => {
                 tracing::error!(
@@ -230,12 +234,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     let (agent_repo, workflow_repo, execution_repo, workflow_execution_repo): RepositoryTuple =
-        if let Some(pool) = pool.as_ref() {
+        if let Some(db_pool) = db_pool.as_ref() {
             (
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(pool.clone())),
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(pool.clone())),
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(pool.clone())),
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_agent::PostgresAgentRepository::new(db_pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow::PostgresWorkflowRepository::new_with_pool(db_pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_execution::PostgresExecutionRepository::new(db_pool.clone())),
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_workflow_execution::PostgresWorkflowExecutionRepository::new(db_pool.clone())),
         )
         } else {
             (
@@ -348,8 +352,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Reuse existing pool for volume repository (avoid redundant connection)
     let volume_repo: Arc<dyn aegis_orchestrator_core::domain::repository::VolumeRepository> =
-        if let Some(pool) = pool.as_ref() {
-            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(pool.clone()))
+        if let Some(db_pool) = db_pool.as_ref() {
+            Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(db_pool.clone()))
         } else {
             println!("WARNING: Volume persistence disabled (no database pool available)");
             return Err(anyhow::anyhow!(
@@ -435,8 +439,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Initializing Storage Event Persister...");
     let storage_event_repo: Arc<
         dyn aegis_orchestrator_core::domain::repository::StorageEventRepository,
-    > = if let Some(pool) = pool.as_ref() {
-        Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(pool.clone()))
+    > = if let Some(db_pool) = db_pool.as_ref() {
+        Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(db_pool.clone()))
     } else {
         println!("WARNING: Storage event persistence disabled (no database pool available)");
         Arc::new(
@@ -614,8 +618,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Spawn background task to connect
     tokio::spawn(async move {
-        let mut retries = 0;
-        let max_retries = 30; // Try for 1 minute (2s * 30) or indefinitely? User said "eventually timeout/quit trying"
+        let mut retries: i32 = 0;
 
         loop {
             match TemporalClient::new(
@@ -644,7 +647,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
                 Err(e) => {
                     retries += 1;
-                    if retries >= max_retries {
+                    if retries >= TEMPORAL_CONNECTION_MAX_RETRIES {
                         println!("Async WARNING: Failed to connect to Temporal after {} attempts. Giving up. Workflow execution will fail.", retries);
                         tracing::error!("Async: Failed to connect to Temporal: {}. Giving up.", e);
                         break;
@@ -653,7 +656,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     if retries % 5 == 0 {
                         println!(
                             "Async INFO: Still verifying Temporal connection... ({}/{})",
-                            retries, max_retries
+                            retries, TEMPORAL_CONNECTION_MAX_RETRIES
                         );
                     }
                     tracing::debug!(
@@ -850,7 +853,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(config.clone()),
     )
     .with_nfs_gateway(nfs_gateway.clone())
-    .with_runtime_registry(runtime_registry) // No Arc::new needed per signature
+    .with_runtime_registry(runtime_registry)
     .with_tool_router(tool_router.clone());
 
     if let Some(c_client) = cortex_client.clone() {
@@ -950,7 +953,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     event_bus.clone(),
                 ).await {
                     Ok(manager) => {
-                        info!("OpenBao secrets manager initialised");
+                        info!("OpenBao secrets manager initialized");
                         Arc::new(manager)
                     }
                     Err(e) => {
@@ -1645,17 +1648,23 @@ async fn stream_events_handler(
             if let Some(ended_at) = execution.ended_at {
                 match execution.status {
                     aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
-                         // Need final result? It's usually the last iteration output or not stored directly in Execution struct root except implicitly?
-                         // The ExecutionEvent::ExecutionCompleted has `final_output`.
-                         // The Execution struct doesn't seem to have `final_output` field in the previous view, just iterations.
-                         // Infer the final result from the last iteration output, falling back to an empty value.
-                        let result = execution.iterations().last().and_then(|i| i.output.clone()).unwrap_or_default();
+                         // NOTE: The Execution struct does not expose an explicit `final_output` field.
+                         // By convention, we treat the last iteration's `output` (if any) as the final result.
+                         // If no such output exists, we surface `null` and keep the semantics explicit instead of
+                         // silently defaulting to an empty string.
+                        let final_output = execution
+                            .iterations()
+                            .last()
+                            .and_then(|i| i.output.clone());
 
                         let exec_end = serde_json::json!({
                             "event_type": "ExecutionCompleted",
                             "total_iterations": execution.iterations().len(),
                             "timestamp": ended_at.to_rfc3339(),
-                            "data": { "result": result }
+                            "data": {
+                                "result": final_output,
+                                "final_output_source": "last_iteration_output"
+                            }
                         });
                         yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
                     },
