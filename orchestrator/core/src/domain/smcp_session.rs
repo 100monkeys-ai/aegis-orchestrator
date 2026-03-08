@@ -88,6 +88,8 @@ pub enum SmcpSessionError {
     MalformedPayload(String),
     /// The Ed25519 signature on the envelope did not verify against the session's stored public key.
     SignatureVerificationFailed(String),
+    /// A semantic judge agent did not respond within the allotted timeout window.
+    JudgeTimeout(String),
 }
 
 impl std::fmt::Display for SmcpSessionError {
@@ -100,6 +102,7 @@ impl std::fmt::Display for SmcpSessionError {
             Self::SignatureVerificationFailed(e) => {
                 write!(f, "Signature verification failed: {}", e)
             }
+            Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {}", msg),
         }
     }
 }
