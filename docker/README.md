@@ -105,12 +105,13 @@ docker compose ps
 
 **Solution:**
 
-The compose stack now resolves Docker socket access dynamically at container startup:
+The runtime image entrypoint now resolves Docker socket access dynamically:
 
-- Starts `aegis-runtime` as root briefly
+- Starts container entrypoint as root
 - Detects `/var/run/docker.sock` group ID at runtime
 - Adds `aegis` user to that detected group
-- Drops privileges and launches `aegis-runtime --daemon` as user `aegis`
+- Drops privileges and execs `aegis-runtime --daemon` as user `aegis`
+- Uses `tini` as PID 1 for signal forwarding and process reaping
 
 No manual `DOCKER_GID` export, compose edits, or image rebuild is required.
 

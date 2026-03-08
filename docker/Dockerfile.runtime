@@ -56,12 +56,14 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    tini \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
 # Copy the built binary from builder
 COPY --from=builder /app/target/release/aegis /usr/local/bin/aegis-runtime
+COPY docker/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
 
 # Configuration is injected at runtime via docker-compose volume mount
 # (see aegis-examples/deploy/docker-compose.yml)
@@ -77,8 +79,10 @@ EXPOSE 8088 50051
 ARG DOCKER_GID=989
 RUN groupadd -g ${DOCKER_GID} docker || true && \
     useradd -m -u 10000 -G docker aegis && \
-    chown -R aegis:aegis /app
-USER aegis
+    chown -R aegis:aegis /app && \
+    chmod +x /usr/local/bin/runtime-entrypoint.sh
 
-# Start the AEGIS daemon with gRPC enabled
-CMD ["aegis-runtime", "--daemon"]
+# Use tini for proper signal forwarding/reaping and run startup glue from
+# entrypoint, then exec runtime as unprivileged user in foreground.
+ENTRYPOINT ["tini", "--", "/usr/local/bin/runtime-entrypoint.sh"]
+CMD ["/usr/local/bin/aegis-runtime", "--daemon"]
