@@ -574,7 +574,17 @@ impl ToolInvocationService {
                     tool_name: tool_name.to_string(),
                     subcommand,
                     args: cli_args,
-                    workspace_path: "/workspace".to_string(),
+                    fsal_volume_id: self
+                        .volume_registry
+                        .find_by_execution(execution_id)
+                        .ok_or_else(|| {
+                            SmcpSessionError::SignatureVerificationFailed(format!(
+                                "No FSAL volume registered for execution {}",
+                                execution_id
+                            ))
+                        })?
+                        .volume_id
+                        .to_string(),
                 }))
                 .await
                 .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
