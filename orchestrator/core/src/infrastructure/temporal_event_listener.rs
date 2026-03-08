@@ -66,6 +66,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+const VALIDATION_FEEDBACK_FILE_PATH: &str = "validation_feedback";
+
 /// External event payload from Temporal worker
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TemporalEventPayload {
@@ -311,13 +313,17 @@ impl TemporalEventListener {
         // Special case for RefinementApplied execution event
         if payload.event_type == "RefinementApplied" {
             let execution_id = ExecutionId(uuid::Uuid::parse_str(&payload.execution_id)?);
-            let agent_id = crate::domain::agent::AgentId(uuid::Uuid::parse_str(
-                &payload
-                    .agent_id
-                    .clone()
-                    .unwrap_or_else(|| uuid::Uuid::nil().to_string()),
-            )?);
-            let iteration_number = payload.iteration_number.unwrap_or(0);
+            let agent_id_str = payload
+                .agent_id
+                .clone()
+                .ok_or_else(|| anyhow!("RefinementApplied event requires agent_id"))?;
+            let agent_id = crate::domain::agent::AgentId(
+                uuid::Uuid::parse_str(&agent_id_str)
+                    .context("Failed to parse agent_id as UUID for RefinementApplied event")?,
+            );
+            let iteration_number = payload
+                .iteration_number
+                .ok_or_else(|| anyhow!("Missing iteration_number for RefinementApplied event"))?;
 
             let diff_val = payload.code_diff.clone().unwrap_or_default();
             let diff_str = match diff_val {
@@ -326,7 +332,7 @@ impl TemporalEventListener {
             };
 
             let code_diff = crate::domain::execution::CodeDiff {
-                file_path: "validation_feedback".to_string(),
+                file_path: VALIDATION_FEEDBACK_FILE_PATH.to_string(),
                 diff: diff_str,
             };
 
@@ -381,7 +387,6 @@ impl TemporalEventListener {
             WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
                 execution_id.0.to_string()
             }
-            _ => return Err(anyhow!("Unexpected event type in response")),
         };
 
         let execution_id_obj = ExecutionId(uuid::Uuid::parse_str(&execution_id_str)?);
