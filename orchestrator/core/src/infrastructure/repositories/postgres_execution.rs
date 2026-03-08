@@ -167,13 +167,16 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
-                "pending" => ExecutionStatus::Pending,
-                "running" => ExecutionStatus::Running,
-                "completed" => ExecutionStatus::Completed,
-                "failed" => ExecutionStatus::Failed,
-                "cancelled" => ExecutionStatus::Cancelled,
-                _ => ExecutionStatus::Pending, // Default fallback
-            };
+                "pending" => Ok(ExecutionStatus::Pending),
+                "running" => Ok(ExecutionStatus::Running),
+                "completed" => Ok(ExecutionStatus::Completed),
+                "failed" => Ok(ExecutionStatus::Failed),
+                "cancelled" => Ok(ExecutionStatus::Cancelled),
+                other => Err(RepositoryError::Serialization(format!(
+                    "Unknown execution status value from database: '{}'",
+                    other
+                ))),
+            }?;
 
             let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
                 RepositoryError::Serialization(format!("Failed to deserialize input: {}", e))
@@ -190,29 +193,50 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     ))
                 })?;
 
+            let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid max_iterations value {}: expected 0-255",
+                    max_iterations
+                ))
+            })?;
+
             let hierarchy = match parent_execution_id {
                 None => ExecutionHierarchy::root(ExecutionId(id)),
                 Some(parent_id) => {
-                    // NOTE: Only `parent_execution_id` is persisted, so depth and path
-                    // are approximated here as a single-level child hierarchy. To support
-                    // full multi-level reconstruction, store `depth` and `path` in the
-                    // database or traverse ancestry recursively.
+                    // NOTE: Only `parent_execution_id` is persisted, so we cannot
+                    // reliably reconstruct full multi-level ancestry here without
+                    // additional queries. We therefore preserve the direct parent link
+                    // but treat depth/path as local to this execution.
                     ExecutionHierarchy {
                         parent_execution_id: Some(ExecutionId(parent_id)),
-                        depth: 1,
-                        path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                        depth: 0,
+                        path: vec![ExecutionId(id)],
                     }
                 }
             };
+
+            let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_uid value (expected non-negative i32): {}",
+                    container_uid
+                ))
+            })?;
+
+            let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_gid value (expected non-negative i32): {}",
+                    container_gid
+                ))
+            })?;
 
             Ok(Some(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
                 status,
                 iterations,
-                max_iterations: max_iterations as u8,
-                container_uid: container_uid as u32,
-                container_gid: container_gid as u32,
+                max_iterations: max_iterations_u8,
+                container_uid: container_uid_u32,
+                container_gid: container_gid_u32,
                 input,
                 started_at,
                 ended_at: completed_at,
@@ -265,13 +289,16 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
-                "pending" => ExecutionStatus::Pending,
-                "running" => ExecutionStatus::Running,
-                "completed" => ExecutionStatus::Completed,
-                "failed" => ExecutionStatus::Failed,
-                "cancelled" => ExecutionStatus::Cancelled,
-                _ => ExecutionStatus::Pending,
-            };
+                "pending" => Ok(ExecutionStatus::Pending),
+                "running" => Ok(ExecutionStatus::Running),
+                "completed" => Ok(ExecutionStatus::Completed),
+                "failed" => Ok(ExecutionStatus::Failed),
+                "cancelled" => Ok(ExecutionStatus::Cancelled),
+                other => Err(RepositoryError::Serialization(format!(
+                    "Unknown execution status value from database: '{}'",
+                    other
+                ))),
+            }?;
 
             let input: ExecutionInput =
                 serde_json::from_value(input_val).map_err(RepositoryError::from)?;
@@ -283,23 +310,44 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     ))
                 })?;
 
+            let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid max_iterations value {}: expected 0-255",
+                    max_iterations
+                ))
+            })?;
+
             let hierarchy = match parent_execution_id {
                 Some(parent_id) => ExecutionHierarchy {
                     parent_execution_id: Some(ExecutionId(parent_id)),
-                    depth: 1,
-                    path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                    depth: 0,
+                    path: vec![ExecutionId(id)],
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),
             };
+
+            let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_uid value (expected non-negative i32): {}",
+                    container_uid
+                ))
+            })?;
+
+            let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_gid value (expected non-negative i32): {}",
+                    container_gid
+                ))
+            })?;
 
             executions.push(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
                 status,
                 iterations,
-                max_iterations: max_iterations as u8,
-                container_uid: container_uid as u32,
-                container_gid: container_gid as u32,
+                max_iterations: max_iterations_u8,
+                container_uid: container_uid_u32,
+                container_gid: container_gid_u32,
                 input,
                 started_at,
                 ended_at: completed_at,
@@ -344,13 +392,16 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
 
             let status = match status_str.as_str() {
-                "pending" => ExecutionStatus::Pending,
-                "running" => ExecutionStatus::Running,
-                "completed" => ExecutionStatus::Completed,
-                "failed" => ExecutionStatus::Failed,
-                "cancelled" => ExecutionStatus::Cancelled,
-                _ => ExecutionStatus::Pending,
-            };
+                "pending" => Ok(ExecutionStatus::Pending),
+                "running" => Ok(ExecutionStatus::Running),
+                "completed" => Ok(ExecutionStatus::Completed),
+                "failed" => Ok(ExecutionStatus::Failed),
+                "cancelled" => Ok(ExecutionStatus::Cancelled),
+                other => Err(RepositoryError::Serialization(format!(
+                    "Unknown execution status value from database: '{}'",
+                    other
+                ))),
+            }?;
 
             let input: ExecutionInput =
                 serde_json::from_value(input_val).map_err(RepositoryError::from)?;
@@ -362,23 +413,44 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     ))
                 })?;
 
+            let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid max_iterations value {}: expected 0-255",
+                    max_iterations
+                ))
+            })?;
+
             let hierarchy = match parent_execution_id {
                 Some(parent_id) => ExecutionHierarchy {
                     parent_execution_id: Some(ExecutionId(parent_id)),
-                    depth: 1,
-                    path: vec![ExecutionId(parent_id), ExecutionId(id)],
+                    depth: 0,
+                    path: vec![ExecutionId(id)],
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),
             };
+
+            let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_uid value (expected non-negative i32): {}",
+                    container_uid
+                ))
+            })?;
+
+            let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_gid value (expected non-negative i32): {}",
+                    container_gid
+                ))
+            })?;
 
             executions.push(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
                 status,
                 iterations,
-                max_iterations: max_iterations as u8,
-                container_uid: container_uid as u32,
-                container_gid: container_gid as u32,
+                max_iterations: max_iterations_u8,
+                container_uid: container_uid_u32,
+                container_gid: container_gid_u32,
                 input,
                 started_at,
                 ended_at: completed_at,
