@@ -21,4 +21,5 @@ if [ "$#" -eq 0 ]; then
 fi
 
 # Drop root privileges and run runtime in foreground as PID 1 child under tini.
-exec su -s /bin/sh aegis -c 'exec "$@"' -- "$@"
+# With `sh -c`, first arg after `--` becomes $0, so exec must include $0.
+exec su -s /bin/sh aegis -c 'exec "$0" "$@"' -- "$@"
