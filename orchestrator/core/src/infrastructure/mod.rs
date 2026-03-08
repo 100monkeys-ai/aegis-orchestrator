@@ -29,6 +29,7 @@
 //! | [`human_input_service`] | Suspends execution pending human response | ADR-015 |
 
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server + cortex client | ADR-042 |
+//! | [`smcp_gateway_proto`] | Generated `aegis.smcp_gateway.v1` gRPC types | ADR-053 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 //! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
