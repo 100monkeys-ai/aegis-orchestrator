@@ -19,9 +19,6 @@ use axum::{
     Json, Router,
 };
 
-/// Maximum number of retries when attempting to establish the Temporal connection.
-/// Previously this was an inline magic number (`30`) in the connection retry loop.
-const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -80,11 +77,7 @@ fn default_local_host_mount_point() -> String {
         return path;
     }
 
-    let default_path = PathBuf::from("/")
-        .join("var")
-        .join("lib")
-        .join("aegis")
-        .join("local-host-volumes");
+    let default_path = PathBuf::from("/var/lib/aegis/local-host-volumes");
     default_path.to_string_lossy().into_owned()
 }
 
@@ -618,6 +611,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let temporal_address_clone = temporal_address.clone();
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
 
+    /// Maximum number of retries when attempting to establish the Temporal connection.
+    /// Previously this was an inline magic number (`30`) in the connection retry loop.
+    const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
+
     // Spawn background task to connect
     tokio::spawn(async move {
         let mut retries: i32 = 0;
@@ -959,7 +956,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         Arc::new(manager)
                     }
                     Err(e) => {
-                        return Err(anyhow::anyhow!("Failed to initialise OpenBao secrets manager: {}", e));
+                        return Err(anyhow::anyhow!("Failed to initialize OpenBao secrets manager: {}", e));
                     }
                 }
             }
@@ -1651,16 +1648,26 @@ async fn stream_events_handler(
 
             // Execution Terminal State
             if let Some(ended_at) = execution.ended_at {
+                /// Extract the final output from the last iteration of an execution.
+                ///
+                /// Returns `None` if the execution has no iterations or if the last iteration
+                /// produced no output.
+                fn final_output_from_execution(
+                    execution: &aegis_orchestrator_core::domain::execution::Execution,
+                ) -> Option<String> {
+                    execution
+                        .iterations()
+                        .last()
+                        .and_then(|i| i.output.clone())
+                }
+
                 match execution.status {
                     aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
                          // NOTE: The Execution struct does not expose an explicit `final_output` field.
                          // By convention, we treat the last iteration's `output` (if any) as the final result.
                          // If no such output exists, we surface `null` and keep the semantics explicit instead of
                          // silently defaulting to an empty string.
-                        let final_output = execution
-                            .iterations()
-                            .last()
-                            .and_then(|i| i.output.clone());
+                        let final_output = final_output_from_execution(&execution);
 
                         let exec_end = serde_json::json!({
                             "event_type": "ExecutionCompleted",
@@ -1932,7 +1939,7 @@ async fn stream_agent_events_handler(
                 if let Some(ended_at) = execution.ended_at {
                     match execution.status {
                         aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
-                            let result = execution.iterations().last().and_then(|i| i.output.clone()).unwrap_or_default();
+                            let result = execution.iterations().last().and_then(|i| i.output.clone());
                             let exec_end = serde_json::json!({
                                 "event_type": "ExecutionCompleted",
                                 "execution_id": execution.id.0,

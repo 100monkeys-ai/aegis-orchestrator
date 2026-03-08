@@ -118,7 +118,7 @@ impl ToolInvocationService {
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
         // 1. Get active session for agent
-        let session = self
+        let mut session = self
             .smcp_session_repo
             .find_active_by_agent(agent_id)
             .await
@@ -130,7 +130,7 @@ impl ToolInvocationService {
             ))?;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
-        let args = self.smcp_middleware.verify_and_unwrap(&session, envelope)?;
+        let args = self.smcp_middleware.verify_and_unwrap(&mut session, envelope)?;
         let tool_name = envelope
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload(

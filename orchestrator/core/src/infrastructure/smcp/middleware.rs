@@ -57,7 +57,7 @@ impl SmcpMiddleware {
     /// the tool server, preserving credential isolation (ADR-033).
     pub fn verify_and_unwrap(
         &self,
-        session: &SmcpSession,
+        session: &mut SmcpSession,
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
         info!("Verifying SMCP envelope for session {}", session.id);

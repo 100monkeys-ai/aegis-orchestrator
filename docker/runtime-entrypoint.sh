@@ -11,9 +11,17 @@ else
 fi
 if [ -n "$SOCK_GID" ]; then
   if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
-    groupadd -f -g "$SOCK_GID" hostdocker >/dev/null 2>&1 || true
+    if ! groupadd -f -g "$SOCK_GID" hostdocker >/dev/null 2>&1; then
+      # If group creation failed, re-check whether a group with this GID now exists.
+      if ! getent group "$SOCK_GID" >/dev/null 2>&1; then
+        echo "Failed to create group with GID $SOCK_GID for Docker socket access" >&2
+        exit 1
+      fi
+    fi
   fi
-  usermod -aG "$SOCK_GID" aegis >/dev/null 2>&1 || true
+  if ! usermod -aG "$SOCK_GID" aegis >/dev/null 2>&1; then
+    echo "Warning: failed to add user 'aegis' to group GID ${SOCK_GID}; Docker socket access may not work." >&2
+  fi
 fi
 
 if [ "$#" -eq 0 ]; then

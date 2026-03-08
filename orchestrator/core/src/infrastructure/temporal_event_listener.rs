@@ -66,6 +66,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// Canonical file name used to store validation feedback artifacts produced by refinement
+/// workflows. This is consumed by the `RefinementApplied` event handler, which expects any
+/// validation feedback generated during a refinement iteration to be written under this
+/// name within the associated artifact set or storage location.
 const VALIDATION_FEEDBACK_FILE_NAME: &str = "validation_feedback";
 
 /// External event payload from Temporal worker
@@ -294,6 +298,47 @@ impl TemporalEventListener {
         }
     }
 
+    /// Persist an execution-scoped event to the repository and publish it to the event bus.
+    ///
+    /// This helper encapsulates the two-step pattern used for all execution events:
+    /// 1. Serialise the raw payload and append it to the event log via the repository.
+    /// 2. Publish the mapped domain event to the in-process event bus for subscribers.
+    ///
+    /// # Arguments
+    ///
+    /// * `execution_id` - The execution this event belongs to.
+    /// * `temporal_sequence_number` - The Temporal sequence number for ordering.
+    /// * `event_type` - The string event type name.
+    /// * `raw_payload` - The original Temporal payload to persist as JSON.
+    /// * `iteration_number` - Optional iteration number associated with this event.
+    /// * `domain_event` - The mapped domain event to publish after persistence.
+    async fn persist_and_publish_execution_event(
+        &self,
+        execution_id: ExecutionId,
+        temporal_sequence_number: i64,
+        event_type: String,
+        raw_payload: &TemporalEventPayload,
+        iteration_number: Option<u8>,
+        domain_event: crate::domain::events::ExecutionEvent,
+    ) -> Result<()> {
+        let serialized_payload = serde_json::to_value(raw_payload)
+            .context("Failed to serialize TemporalEventPayload for persistence")?;
+
+        self.execution_repository
+            .append_event(
+                execution_id,
+                temporal_sequence_number,
+                event_type,
+                serialized_payload,
+                iteration_number,
+            )
+            .await
+            .context("Failed to persist execution event")?;
+
+        self.event_bus.publish_execution_event(domain_event);
+        Ok(())
+    }
+
     /// Process incoming event from Temporal worker
     ///
     /// # Arguments
@@ -331,7 +376,12 @@ impl TemporalEventListener {
                 .ok_or_else(|| anyhow!("Missing code_diff for RefinementApplied event"))?;
             let diff_str = match diff_val {
                 serde_json::Value::String(s) => s,
-                _ => diff_val.to_string(),
+                other => {
+                    return Err(anyhow!(
+                        "Invalid code_diff format for RefinementApplied event: expected string, got {}",
+                        other
+                    ));
+                }
             };
 
             let code_diff = crate::domain::execution::CodeDiff {
@@ -339,10 +389,9 @@ impl TemporalEventListener {
                 diff: diff_str,
             };
 
-            let applied_at = match DateTime::parse_from_rfc3339(&payload.timestamp) {
-                Ok(dt) => dt.with_timezone(&Utc),
-                Err(_) => Utc::now(),
-            };
+            let applied_at = DateTime::parse_from_rfc3339(&payload.timestamp)
+                .context("Failed to parse timestamp as RFC3339 for RefinementApplied event")?
+                .with_timezone(&Utc);
 
             let domain_event = crate::domain::events::ExecutionEvent::RefinementApplied {
                 execution_id,
@@ -352,18 +401,16 @@ impl TemporalEventListener {
                 applied_at,
             };
 
-            self.execution_repository
-                .append_event(
-                    execution_id,
-                    payload.temporal_sequence_number,
-                    payload.event_type.clone(),
-                    serde_json::to_value(&payload)?,
-                    Some(iteration_number),
-                )
-                .await
-                .context("Failed to persist execution event")?;
+            self.persist_and_publish_execution_event(
+                execution_id,
+                payload.temporal_sequence_number,
+                payload.event_type.clone(),
+                &payload,
+                Some(iteration_number),
+                domain_event,
+            )
+            .await?;
 
-            self.event_bus.publish_execution_event(domain_event);
             return Ok(payload.execution_id.clone());
         }
 
@@ -389,7 +436,12 @@ impl TemporalEventListener {
             | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
-            WorkflowEvent::WorkflowRegistered { .. } => unreachable!("handled above"),
+            WorkflowEvent::WorkflowRegistered { .. } => {
+                return Err(anyhow!(
+                    "WorkflowRegistered event unexpectedly reached execution-scoped handling; \
+                     this variant should be handled before deriving an execution_id"
+                ));
+            }
         };
 
         let execution_id_str = execution_id_obj.0.to_string();
