@@ -123,7 +123,16 @@ impl StorageProvider for OpenDalStorageProvider {
         };
 
         let size = meta.content_length();
-        let mtime = meta.last_modified().map(|t| t.timestamp()).unwrap_or(0);
+        let mtime = meta
+            .last_modified()
+            .and_then(|t| {
+                let system_time: std::time::SystemTime = t.into();
+                system_time
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|duration| duration.as_secs() as i64)
+            })
+            .unwrap_or(0);
 
         Ok(FileAttributes {
             file_type,

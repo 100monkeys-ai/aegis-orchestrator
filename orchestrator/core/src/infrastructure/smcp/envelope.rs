@@ -162,14 +162,12 @@ impl EnvelopeVerifier for SmcpEnvelope {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signer, SigningKey};
-    use rand::rngs::OsRng;
     use serde_json::json;
 
     #[test]
     fn test_smcp_envelope_verification() {
-        // Generate a test keypair
-        let mut csprng = OsRng;
-        let signing_key: SigningKey = SigningKey::generate(&mut csprng);
+        // Deterministic test keypair (avoids rand_core version coupling in tests)
+        let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
         let inner_mcp_json = json!({
@@ -208,11 +206,9 @@ mod tests {
 
     #[test]
     fn test_smcp_envelope_verification_failure() {
-        // Generate two different keypairs
-        let mut csprng = OsRng;
-        let signing_key1: SigningKey = SigningKey::generate(&mut csprng);
-
-        let signing_key2: SigningKey = SigningKey::generate(&mut csprng);
+        // Two deterministic but different keypairs
+        let signing_key1 = SigningKey::from_bytes(&[2u8; 32]);
+        let signing_key2 = SigningKey::from_bytes(&[3u8; 32]);
         let verifying_key2 = signing_key2.verifying_key();
 
         let inner_mcp_bytes = b"{\"method\": \"something\"}".to_vec();

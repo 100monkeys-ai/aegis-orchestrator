@@ -168,7 +168,6 @@ pub struct WebhookHmacState {
     pub secret_provider: Arc<dyn WebhookSecretProvider>,
 }
 
-#[async_trait]
 impl<S> axum::extract::FromRequest<S> for WebhookHmacGuard
 where
     WebhookHmacState: FromRef<S>,

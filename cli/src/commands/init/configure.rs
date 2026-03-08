@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, Password};
-use rand::rngs::OsRng;
 use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+use rsa::rand_core::OsRng;
 use rsa::RsaPrivateKey;
 use uuid::Uuid;
 

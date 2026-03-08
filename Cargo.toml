@@ -21,7 +21,7 @@ tokio = { version = "1.40", features = ["full"] }
 tokio-util = "0.7"
 
 # Web Framework
-axum = "0.7"
+axum = "0.8.8"
 tower = "0.4"
 tower-http = "0.6"
 hyper = "1.0"
@@ -40,7 +40,7 @@ bollard = "0.20"  # Docker API
 
 # Error Handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0.18"
 
 # Logging & Tracing
 tracing = "0.1"

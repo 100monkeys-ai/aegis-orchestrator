@@ -189,3 +189,298 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::events::WorkflowEvent;
+    use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+    use crate::domain::workflow::{
+        StateKind, StateName, TransitionCondition, TransitionRule, Workflow, WorkflowId,
+        WorkflowMetadata, WorkflowSpec, WorkflowState,
+    };
+    use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::{
+        InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+    };
+    use async_trait::async_trait;
+    use serde_json::json;
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone)]
+    struct StartCall {
+        workflow_name: String,
+        execution_id: ExecutionId,
+        input: HashMap<String, serde_json::Value>,
+    }
+
+    struct RecordingWorkflowEngine {
+        calls: Mutex<Vec<StartCall>>,
+        run_id: String,
+    }
+
+    impl RecordingWorkflowEngine {
+        fn new(run_id: &str) -> Self {
+            Self {
+                calls: Mutex::new(Vec::new()),
+                run_id: run_id.to_string(),
+            }
+        }
+
+        fn calls(&self) -> Vec<StartCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowEnginePort for RecordingWorkflowEngine {
+        async fn register_workflow(
+            &self,
+            _definition: &crate::application::temporal_mapper::TemporalWorkflowDefinition,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        async fn start_workflow(
+            &self,
+            workflow_name: &str,
+            execution_id: ExecutionId,
+            input: HashMap<String, serde_json::Value>,
+        ) -> Result<String> {
+            self.calls.lock().unwrap().push(StartCall {
+                workflow_name: workflow_name.to_string(),
+                execution_id,
+                input,
+            });
+            Ok(self.run_id.clone())
+        }
+    }
+
+    fn build_test_workflow(name: &str) -> Workflow {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo ready".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![TransitionRule {
+                    condition: TransitionCondition::Always,
+                    target: StateName::new("END").unwrap(),
+                    feedback: None,
+                }],
+                timeout: None,
+            },
+        );
+        states.insert(
+            StateName::new("END").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo done".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+
+        Workflow::new(
+            WorkflowMetadata {
+                name: name.to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                volumes: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn start_execution_wraps_scalar_input_seeds_blackboard_and_publishes_event() {
+        let workflow = build_test_workflow("build-and-test");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-123"));
+        let event_bus = Arc::new(EventBus::new(32));
+        let mut receiver = event_bus.subscribe();
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo.clone(),
+            execution_repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            event_bus,
+        );
+
+        let result = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!("run-ci"),
+                blackboard: Some(json!({
+                    "judges": ["lint-judge", "security-judge"],
+                    "validation_threshold": 0.85
+                })),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, "running");
+        assert_eq!(result.temporal_run_id, "temporal-run-123");
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].workflow_name, "build-and-test");
+        assert_eq!(calls[0].input.get("input"), Some(&json!("run-ci")));
+        assert_eq!(calls[0].execution_id.to_string(), result.execution_id);
+
+        let execution_id = ExecutionId::from_string(&result.execution_id).unwrap();
+        let persisted = execution_repo
+            .find_by_id(execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            persisted.blackboard.get("validation_threshold"),
+            Some(&json!(0.85))
+        );
+        assert_eq!(
+            persisted.blackboard.get("judges"),
+            Some(&json!(["lint-judge", "security-judge"]))
+        );
+
+        let event = receiver.recv().await.unwrap();
+        match event {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionStarted {
+                execution_id,
+                workflow_id,
+                ..
+            }) => {
+                assert_eq!(execution_id.to_string(), result.execution_id);
+                assert_eq!(workflow_id, workflow.id);
+            }
+            other => panic!("unexpected event type: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn start_execution_saves_before_engine_connection_check() {
+        let workflow = build_test_workflow("save-first-workflow");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({ "branch": "main" }),
+                blackboard: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Workflow engine not connected yet"));
+
+        let active = execution_repo.find_active().await.unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].workflow_id, workflow.id);
+    }
+
+    #[tokio::test]
+    async fn start_execution_resolves_workflow_by_uuid_identifier() {
+        let workflow = build_test_workflow("uuid-resolve-workflow");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-xyz"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let response = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.id.to_string(),
+                input: json!({ "target": "release" }),
+                blackboard: None,
+            })
+            .await
+            .unwrap();
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].workflow_name, "uuid-resolve-workflow");
+        assert_eq!(calls[0].input.get("target"), Some(&json!("release")));
+        assert_eq!(response.temporal_run_id, "temporal-run-xyz");
+    }
+
+    #[tokio::test]
+    async fn start_execution_returns_not_found_for_unknown_workflow() {
+        struct EmptyWorkflowRepo;
+
+        #[async_trait]
+        impl WorkflowRepository for EmptyWorkflowRepo {
+            async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+
+            async fn find_by_id(
+                &self,
+                _id: WorkflowId,
+            ) -> Result<Option<Workflow>, RepositoryError> {
+                Ok(None)
+            }
+
+            async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
+                Ok(None)
+            }
+
+            async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+                Ok(vec![])
+            }
+
+            async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
+                Ok(())
+            }
+        }
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            Arc::new(EmptyWorkflowRepo),
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(None)),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: "does-not-exist".to_string(),
+                input: json!({}),
+                blackboard: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("Workflow not found"));
+    }
+}
