@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # StandardIamService — Production JWKS-based JWT Validation (ADR-041)
+//! # KeycloakIamService — Production JWKS-based JWT Validation (ADR-041)
 //!
 //! Implements [`IdentityProvider`] by fetching and caching JWKS key sets from
 //! Keycloak realms, validating JWT signatures using RS256, and extracting custom
@@ -253,10 +253,12 @@ impl StandardIamService {
                     .extra
                     .get(&self.claims_config.zaru_tier)
                     .and_then(|v| v.as_str())
-                    .ok_or(IamError::MissingClaim { claim: "zaru_tier" })?;
+                    .ok_or(IamError::MissingClaim {
+                        claim: self.claims_config.zaru_tier.clone(),
+                    })?;
 
                 let tier = ZaruTier::from_claim(tier_value).ok_or(IamError::InvalidClaimValue {
-                    claim: "zaru_tier",
+                    claim: self.claims_config.zaru_tier.clone(),
                     value: tier_value.to_string(),
                 })?;
 
@@ -273,7 +275,7 @@ impl StandardIamService {
                     {
                         let role = AegisRole::from_claim(role_value).ok_or(
                             IamError::InvalidClaimValue {
-                                claim: "aegis_role",
+                                claim: self.claims_config.aegis_role.clone(),
                                 value: role_value.to_string(),
                             },
                         )?;
@@ -291,12 +293,12 @@ impl StandardIamService {
                         .get(&self.claims_config.aegis_role)
                         .and_then(|v| v.as_str())
                         .ok_or(IamError::MissingClaim {
-                            claim: "aegis_role",
+                            claim: self.claims_config.aegis_role.clone(),
                         })?;
 
                     let role =
                         AegisRole::from_claim(role_value).ok_or(IamError::InvalidClaimValue {
-                            claim: "aegis_role",
+                            claim: self.claims_config.aegis_role.clone(),
                             value: role_value.to_string(),
                         })?;
                     Ok(IdentityKind::Operator { aegis_role: role })
@@ -325,7 +327,9 @@ impl IdentityProvider for StandardIamService {
         // 1. Decode header to get kid + determine issuer from unvalidated claims
         let header = decode_header(raw_jwt).map_err(|e| IamError::DecodeError(e.to_string()))?;
 
-        let kid = header.kid.ok_or(IamError::MissingClaim { claim: "kid" })?;
+        let kid = header.kid.ok_or(IamError::MissingClaim {
+            claim: "kid".to_string(),
+        })?;
 
         // 2. Decode claims without validation to extract issuer for realm lookup
         let unvalidated: KeycloakClaims = {
@@ -443,7 +447,9 @@ impl IdentityProvider for StandardIamService {
                     .get(&self.claims_config.zaru_tier)
                     .and_then(|v| v.as_str())
                     .and_then(ZaruTier::from_claim)
-                    .ok_or(IamError::MissingClaim { claim: "zaru_tier" })
+                    .ok_or(IamError::MissingClaim {
+                        claim: self.claims_config.zaru_tier.clone(),
+                    })
             }
         }
     }
@@ -459,7 +465,7 @@ impl IdentityProvider for StandardIamService {
                     .and_then(|v| v.as_str())
                     .and_then(AegisRole::from_claim)
                     .ok_or(IamError::MissingClaim {
-                        claim: "aegis_role",
+                        claim: self.claims_config.aegis_role.clone(),
                     })
             }
         }
