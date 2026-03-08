@@ -96,8 +96,12 @@ pub async fn run(args: InitArgs) -> Result<()> {
     // ─── Step 4: Configure node ───────────────────────────────────────────────
     print_step(4, 7, "Configuring node");
     let wizard = ConfigWizard::new(args.yes, dir.clone(), args.advanced_override);
-    let node_config =
-        wizard.configure(&components, &stack.docker_compose, &stack.runtime_registry)?;
+    let node_config = wizard.configure(
+        &components,
+        &stack.docker_compose,
+        &stack.runtime_registry,
+        &stack.smcp_gateway_config,
+    )?;
 
     // Also write the db-init script
     let db_script_path = node_config.working_dir.join("init-multiple-dbs.sh");

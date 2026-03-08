@@ -94,6 +94,7 @@ impl ConfigWizard {
         components: &SelectedComponents,
         compose_content: &str,
         runtime_registry_content: &str,
+        smcp_gateway_config_content: &str,
     ) -> Result<NodeConfig> {
         println!();
         println!("{}", "Configure your AEGIS node:".bold());
@@ -173,6 +174,7 @@ impl ConfigWizard {
         let env_path = working_dir.join(".env");
         let compose_path = working_dir.join("docker-compose.yml");
         let runtime_registry_path = working_dir.join("runtime-registry.yaml");
+        let smcp_gateway_config_path = working_dir.join("smcp-gateway-config.yaml");
 
         // Check for existing config *before* writing anything.
         if config_path.exists() && !self.yes {
@@ -205,18 +207,21 @@ impl ConfigWizard {
             .with_context(|| format!("Failed to write {}", compose_path.display()))?;
         std::fs::write(&runtime_registry_path, runtime_registry_content)
             .with_context(|| format!("Failed to write {}", runtime_registry_path.display()))?;
+        std::fs::write(&smcp_gateway_config_path, smcp_gateway_config_content)
+            .with_context(|| format!("Failed to write {}", smcp_gateway_config_path.display()))?;
 
         println!("  {} {}", "✓".green(), config_path.display());
         println!("  {} {}", "✓".green(), env_path.display());
         println!("  {} {}", "✓".green(), compose_path.display());
         println!("  {} {}", "✓".green(), runtime_registry_path.display());
+        println!("  {} {}", "✓".green(), smcp_gateway_config_path.display());
 
         Ok(node_config)
     }
 
     fn collect_advanced_config(&self) -> Result<AdvancedConfig> {
         let defaults = AdvancedConfig {
-            node_type: "edge".to_string(),
+            node_type: "hybrid".to_string(),
             bind_address: "0.0.0.0".to_string(),
             api_port: 8088,
             log_level: "info".to_string(),

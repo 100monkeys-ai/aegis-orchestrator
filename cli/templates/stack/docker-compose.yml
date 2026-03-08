@@ -184,6 +184,9 @@ services:
       - SMCP_GATEWAY_GRPC_BIND=0.0.0.0:50055
       - SMCP_GATEWAY_DB=sqlite:///app/data/gateway.db
       - SMCP_GATEWAY_AUTH_DISABLED=true
+      # NFS host for the CliEngine — mirrors AEGIS_NFS_HOST set in .env.
+      # Linux native / WSL2 → 127.0.0.1  |  Docker Desktop → host.docker.internal
+      - SMCP_GATEWAY_NFS_HOST=${AEGIS_NFS_HOST:-127.0.0.1}
     ports:
       - "8089:8089"   # HTTP REST API + Management UI (http://localhost:8089/)
       - "50055:50055" # gRPC API
@@ -191,6 +194,7 @@ services:
       - aegis-network
     volumes:
       - smcp-gateway-data:/app/data
+      - ./smcp-gateway-config.yaml:/etc/aegis/smcp-gateway-config.yaml
     restart: unless-stopped
 
   # ============================================================================
