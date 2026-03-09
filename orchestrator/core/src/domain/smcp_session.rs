@@ -105,6 +105,8 @@ pub enum SmcpSessionError {
     SignatureVerificationFailed(String),
     /// A semantic judge agent did not respond within the allotted timeout window.
     JudgeTimeout(String),
+    /// An unexpected internal error occurred (e.g. infrastructure or service failure).
+    InternalError(String),
 }
 
 impl std::fmt::Display for SmcpSessionError {
@@ -118,6 +120,7 @@ impl std::fmt::Display for SmcpSessionError {
                 write!(f, "Signature verification failed: {}", e)
             }
             Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {}", msg),
+            Self::InternalError(msg) => write!(f, "Internal error: {}", msg),
         }
     }
 }
@@ -215,7 +218,7 @@ impl SmcpSession {
             security_context,
             status: SessionStatus::Active,
             created_at: now,
-            expires_at: now + chrono::TimeDelta::hours(SESSION_TTL_HOURS),
+            expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
         }
     }
 
