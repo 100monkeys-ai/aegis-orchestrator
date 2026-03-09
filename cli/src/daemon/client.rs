@@ -394,6 +394,37 @@ fn is_error_event(event: &serde_json::Value) -> bool {
     )
 }
 
+fn extract_iteration_error_message(event: &serde_json::Value) -> &str {
+    // Precedence:
+    // 1. event.data.error.message (when error is an object)
+    // 2. event.data.error as a string
+    // 3. event.error as a string
+    // 4. Fallback: "Unknown error"
+    if let Some(err_obj) = event
+        .get("data")
+        .and_then(|d| d.get("error"))
+        .and_then(|e| e.as_object())
+    {
+        if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
+            return msg;
+        }
+    }
+
+    if let Some(msg) = event
+        .get("data")
+        .and_then(|d| d.get("error"))
+        .and_then(|e| e.as_str())
+    {
+        return msg;
+    }
+
+    if let Some(msg) = event.get("error").and_then(|e| e.as_str()) {
+        return msg;
+    }
+
+    "Unknown error"
+}
+
 fn print_event(event: &serde_json::Value, verbose: bool) {
     use colored::Colorize;
 
@@ -454,15 +485,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         }
         "IterationFailed" => {
             let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let error = if let Some(err_obj) = event["data"]["error"].as_object() {
-                err_obj["message"]
-                    .as_str()
-                    .unwrap_or(event["data"]["error"].as_str().unwrap_or("Unknown error"))
-            } else {
-                event["data"]["error"]
-                    .as_str()
-                    .unwrap_or(event["error"].as_str().unwrap_or(""))
-            };
+            let error = extract_iteration_error_message(event);
             println!(
                 "{} {} {} {} - {}",
                 format!("[{}]", timestamp).dimmed(),
