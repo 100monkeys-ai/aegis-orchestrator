@@ -756,7 +756,62 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
+    use super::extract_iteration_error_message;
     use super::WorkflowListResponse;
+    use serde_json::json;
+
+    #[test]
+    fn test_error_object_with_message_precedence() {
+        let event = json!({
+            "data": {
+                "error": {
+                    "message": "object message",
+                    "code": "SOME_CODE"
+                }
+            },
+            "error": "top-level error"
+        });
+
+        let msg = extract_iteration_error_message(&event);
+        assert_eq!(msg, "object message");
+    }
+
+    #[test]
+    fn test_error_string_in_data_precedence() {
+        let event = json!({
+            "data": {
+                "error": "data error string"
+            },
+            "error": "top-level error"
+        });
+
+        let msg = extract_iteration_error_message(&event);
+        assert_eq!(msg, "data error string");
+    }
+
+    #[test]
+    fn test_error_string_top_level_precedence() {
+        let event = json!({
+            "error": "top-level error"
+        });
+
+        let msg = extract_iteration_error_message(&event);
+        assert_eq!(msg, "top-level error");
+    }
+
+    #[test]
+    fn test_error_fallback_unknown() {
+        let event = json!({
+            "data": {
+                "error": {
+                    "not_message": "no message field here"
+                }
+            }
+        });
+
+        let msg = extract_iteration_error_message(&event);
+        assert_eq!(msg, "Unknown error");
+    }
 
     #[test]
     fn parses_wrapped_workflow_list_response() {

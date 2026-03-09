@@ -66,10 +66,14 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use uuid::Uuid;
 
+const EVENT_TYPE_REFINEMENT_APPLIED: &str = "RefinementApplied";
+
 /// Canonical file name used to store validation feedback artifacts produced by refinement
-/// workflows. This is consumed by the `RefinementApplied` event handler, which expects any
-/// validation feedback generated during a refinement iteration to be written under this
-/// name within the associated artifact set or storage location.
+/// workflows.
+///
+/// This is consumed by the `RefinementApplied` event handler, which expects any validation
+/// feedback generated during a refinement iteration to be written under this name within the
+/// associated artifact set or storage location.
 const VALIDATION_FEEDBACK_FILE_NAME: &str = "validation_feedback";
 
 /// External event payload from Temporal worker
@@ -356,7 +360,7 @@ impl TemporalEventListener {
     /// - Missing required fields
     pub async fn handle_event(&self, payload: TemporalEventPayload) -> Result<String> {
         // Special case for RefinementApplied execution event
-        if payload.event_type == "RefinementApplied" {
+        if payload.event_type == EVENT_TYPE_REFINEMENT_APPLIED {
             let execution_id = ExecutionId(uuid::Uuid::parse_str(&payload.execution_id)?);
             let agent_id_str = payload
                 .agent_id
