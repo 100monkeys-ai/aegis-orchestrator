@@ -716,6 +716,42 @@ impl ExecutionService for StandardExecutionService {
             Vec::new()
         };
 
+        // Mount policy: all mount points must live under /workspace, and must not overlap.
+        if !volume_mounts.is_empty() {
+            let mut mount_paths = volume_mounts
+                .iter()
+                .map(|m| m.mount_point.to_string_lossy().to_string())
+                .collect::<Vec<String>>();
+            mount_paths.sort();
+
+            for path in &mount_paths {
+                if !(path == "/workspace" || path.starts_with("/workspace/")) {
+                    return Err(anyhow!(
+                        "Invalid mount path '{}': all mounts must be /workspace or /workspace/*",
+                        path
+                    ));
+                }
+            }
+
+            for i in 0..mount_paths.len() {
+                for j in (i + 1)..mount_paths.len() {
+                    let a = mount_paths[i].trim_end_matches('/');
+                    let b = mount_paths[j].trim_end_matches('/');
+                    if a == "/workspace" || b == "/workspace" {
+                        continue;
+                    }
+                    if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+                    {
+                        return Err(anyhow!(
+                            "Overlapping mount paths are not allowed: '{}' and '{}'",
+                            mount_paths[i],
+                            mount_paths[j]
+                        ));
+                    }
+                }
+            }
+        }
+
         // Register each volume with the NFS gateway BEFORE the container mounts it (ADR-036)
         // This populates the in-memory volume_registry so the NFS server can authorize requests.
         if let Some(ref gw) = self.nfs_gateway {
@@ -1192,11 +1228,11 @@ impl ExecutionService for StandardExecutionService {
             }
         };
 
-        // ADR-049 Pillar 3: Build judge proxy volume mount before runtime_config so we can
-        // use async lookups and later register the volume with the NFS gateway.
-        // Non-fatal: if the parent has no volumes yet, the judge is spawned without
+        // ADR-049 Pillar 3: Build judge proxy volume mounts from the parent execution's
+        // active NFS registry contexts so judges inherit the exact mounted volume topology.
+        // Non-fatal: if the parent has no mounted volumes yet, the judge is spawned without
         // workspace visibility rather than blocking the spawn entirely.
-        let judge_proxy_mount: Option<crate::domain::volume::VolumeMount> = {
+        let judge_proxy_mounts: Vec<crate::domain::volume::VolumeMount> = {
             let is_judge = agent
                 .manifest
                 .metadata
@@ -1205,51 +1241,62 @@ impl ExecutionService for StandardExecutionService {
                 .map(|s| s.as_str())
                 == Some("judge");
             if is_judge {
-                // Resolve the first ReadWrite volume owned by the parent execution;
-                // this is the worker's workspace that the judge needs read access to.
-                let parent_workspace_vol_id = self
-                    .volume_service
-                    .list_volumes_by_ownership(&crate::domain::volume::VolumeOwnership::execution(
-                        parent_execution_id,
-                    ))
-                    .await
-                    .ok()
-                    .and_then(|vols| vols.into_iter().next().map(|v| v.id));
+                let parent_mount_contexts = self
+                    .nfs_gateway
+                    .as_ref()
+                    .map(|gw| {
+                        gw.volume_registry()
+                            .find_all_by_execution(parent_execution_id)
+                    })
+                    .unwrap_or_default();
 
-                let proxy_backend = crate::domain::volume::VolumeBackend::Smcp {
-                    node_id: "local".to_string(),
-                    // Routing key: SmcpStorageProvider forwards reads to this volume ID.
-                    remote_volume_id: parent_workspace_vol_id
-                        .unwrap_or_else(crate::domain::volume::VolumeId::new),
-                };
-                let proxy_volume = crate::domain::volume::Volume {
-                    id: crate::domain::volume::VolumeId::new(),
-                    name: "worker-state".to_string(),
-                    tenant_id: crate::domain::volume::TenantId::default_tenant(),
-                    storage_class: crate::domain::volume::StorageClass::persistent(),
-                    status: crate::domain::volume::VolumeStatus::Available,
-                    ownership: crate::domain::volume::VolumeOwnership::Execution {
-                        execution_id: parent_execution_id,
-                    },
-                    size_limit_bytes: 1024 * 1024 * 100, // 100 MiB cap
-                    created_at: chrono::Utc::now(),
-                    attached_at: None,
-                    detached_at: None,
-                    expires_at: None,
-                    backend: proxy_backend,
-                };
-                let mount = proxy_volume.to_mount(
-                    std::path::PathBuf::from("/workspace/worker-state"),
-                    crate::domain::volume::AccessMode::ReadOnly,
-                );
+                let mut mounts = Vec::new();
+                for parent_ctx in parent_mount_contexts {
+                    let mount_path = parent_ctx.mount_point.to_string_lossy().to_string();
+                    if !(mount_path == "/workspace" || mount_path.starts_with("/workspace/")) {
+                        tracing::warn!(
+                            volume_id = %parent_ctx.volume_id,
+                            mount_path = %mount_path,
+                            "Skipping inherited judge mount: path must be /workspace or /workspace/*"
+                        );
+                        continue;
+                    }
+
+                    let proxy_backend = crate::domain::volume::VolumeBackend::Smcp {
+                        node_id: "local".to_string(),
+                        // Routing key: SmcpStorageProvider forwards reads to this volume ID.
+                        remote_volume_id: parent_ctx.volume_id,
+                    };
+                    let proxy_volume = crate::domain::volume::Volume {
+                        id: crate::domain::volume::VolumeId::new(),
+                        name: format!("inherited-{}", parent_ctx.volume_id),
+                        tenant_id: crate::domain::volume::TenantId::default_tenant(),
+                        storage_class: crate::domain::volume::StorageClass::persistent(),
+                        status: crate::domain::volume::VolumeStatus::Available,
+                        ownership: crate::domain::volume::VolumeOwnership::Execution {
+                            execution_id: parent_execution_id,
+                        },
+                        size_limit_bytes: 1024 * 1024 * 100, // 100 MiB cap
+                        created_at: chrono::Utc::now(),
+                        attached_at: None,
+                        detached_at: None,
+                        expires_at: None,
+                        backend: proxy_backend,
+                    };
+                    mounts.push(proxy_volume.to_mount(
+                        std::path::PathBuf::from(mount_path),
+                        crate::domain::volume::AccessMode::ReadOnly,
+                    ));
+                }
+
                 tracing::info!(
-                    "ADR-049: injecting read-only worker-state volume (parent={}, judge={})",
-                    parent_execution_id,
+                    "ADR-049: injecting {} read-only parent volume mount(s) into judge execution {}",
+                    mounts.len(),
                     child_execution_id
                 );
-                Some(mount)
+                mounts
             } else {
-                None
+                Vec::new()
             }
         };
 
@@ -1273,8 +1320,8 @@ impl ExecutionService for StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            // ADR-049 Pillar 3: judge_proxy_mount was computed above (async-safe).
-            volumes: judge_proxy_mount.clone().into_iter().collect(),
+            // ADR-049 Pillar 3: judge_proxy_mounts was computed above (async-safe).
+            volumes: judge_proxy_mounts.clone(),
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
@@ -1290,28 +1337,29 @@ impl ExecutionService for StandardExecutionService {
             execution_id: child_execution_id,
         };
 
-        // ADR-049 Pillar 3: Register judge proxy volume with NFS gateway so the NFS FSAL
+        // ADR-049 Pillar 3: Register judge proxy volumes with NFS gateway so the NFS FSAL
         // can authorize file-handle requests from the judge container.
-        // The proxy volume_id is keyed to child_execution_id; SmcpStorageProvider routes
-        // reads through to the parent workspace via VolumeBackend::Smcp.remote_volume_id.
-        if let (Some(ref gw), Some(ref proxy_mount)) = (&self.nfs_gateway, &judge_proxy_mount) {
-            let read_policy = crate::domain::policy::FilesystemPolicy {
-                read: vec!["/*".to_string()],
-                write: vec![],
-            };
-            gw.register_volume(
-                proxy_mount.volume_id,
-                child_execution_id,
-                1000, // container_uid
-                1000, // container_gid
-                read_policy,
-                proxy_mount.mount_point.clone(),
-            );
-            tracing::info!(
-                "ADR-049: registered read-only NFS volume {} for judge execution {}",
-                proxy_mount.volume_id,
-                child_execution_id
-            );
+        if let Some(ref gw) = self.nfs_gateway {
+            for proxy_mount in &judge_proxy_mounts {
+                let read_policy = crate::domain::policy::FilesystemPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec![],
+                };
+                gw.register_volume(
+                    proxy_mount.volume_id,
+                    child_execution_id,
+                    1000, // container_uid
+                    1000, // container_gid
+                    read_policy,
+                    proxy_mount.mount_point.clone(),
+                );
+                tracing::info!(
+                    "ADR-049: registered read-only NFS volume {} at '{}' for judge execution {}",
+                    proxy_mount.volume_id,
+                    proxy_mount.mount_point.display(),
+                    child_execution_id
+                );
+            }
         }
 
         // 6. Run Supervisor loop in background task.

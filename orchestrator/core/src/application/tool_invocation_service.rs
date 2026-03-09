@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 use anyhow::Result;
+use chrono::Utc;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::register_workflow::RegisterWorkflowUseCase;
@@ -22,13 +24,16 @@ use crate::infrastructure::tool_router::ToolRouter;
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::application::ports::ExternalWebToolPort;
+use crate::domain::events::{MCPToolEvent, ViolationType};
 use crate::domain::execution::ExecutionInput;
+use crate::domain::mcp::{MCPError, PolicyViolation, ToolInvocationId, ToolServerId};
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::validation::extract_json_from_text;
 use crate::infrastructure::agent_manifest_parser::AgentManifestParser;
+use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::smcp_gateway_proto::gateway_invocation_service_client::GatewayInvocationServiceClient;
 use crate::infrastructure::smcp_gateway_proto::{
-    InvokeCliRequest, InvokeWorkflowRequest, ListToolsRequest,
+    FsalMount, InvokeCliRequest, InvokeWorkflowRequest, ListToolsRequest,
 };
 use crate::infrastructure::workflow_parser::WorkflowParser;
 
@@ -53,6 +58,8 @@ pub struct ToolInvocationService {
     execution_service: Arc<dyn ExecutionService>,
     /// Adapter for external web tools (Path 2).
     web_tool_port: Arc<dyn ExternalWebToolPort>,
+    /// Event bus for MCP invocation and policy audit events.
+    event_bus: Arc<EventBus>,
     /// Optional workflow registration use case for built-in aegis workflow authoring tools.
     register_workflow_use_case: Option<Arc<dyn RegisterWorkflowUseCase>>,
     /// Optional validation service for semantic stage in workflow authoring tools.
@@ -75,6 +82,7 @@ impl ToolInvocationService {
         agent_lifecycle: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
         web_tool_port: Arc<dyn ExternalWebToolPort>,
+        event_bus: Arc<EventBus>,
         smcp_gateway_url: Option<String>,
     ) -> Self {
         Self {
@@ -87,6 +95,7 @@ impl ToolInvocationService {
             agent_lifecycle,
             execution_service,
             web_tool_port,
+            event_bus,
             register_workflow_use_case: None,
             validation_service: None,
             generated_manifests_root: None,
@@ -109,6 +118,145 @@ impl ToolInvocationService {
     pub fn with_generated_manifests_root(mut self, root: PathBuf) -> Self {
         self.generated_manifests_root = Some(root);
         self
+    }
+
+    fn publish_invocation_requested(
+        &self,
+        invocation_id: ToolInvocationId,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+        tool_name: &str,
+        arguments: &Value,
+    ) {
+        self.event_bus
+            .publish_mcp_event(MCPToolEvent::InvocationRequested {
+                invocation_id,
+                execution_id,
+                agent_id,
+                tool_name: tool_name.to_string(),
+                arguments: arguments.clone(),
+                requested_at: Utc::now(),
+            });
+    }
+
+    fn publish_invocation_started(
+        &self,
+        invocation_id: ToolInvocationId,
+        server_id: ToolServerId,
+        tool_name: &str,
+    ) {
+        self.event_bus
+            .publish_mcp_event(MCPToolEvent::InvocationStarted {
+                invocation_id,
+                server_id,
+                tool_name: tool_name.to_string(),
+                started_at: Utc::now(),
+            });
+    }
+
+    fn publish_invocation_completed(
+        &self,
+        invocation_id: ToolInvocationId,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+        result: &Value,
+        started: Instant,
+    ) {
+        self.event_bus
+            .publish_mcp_event(MCPToolEvent::InvocationCompleted {
+                invocation_id,
+                execution_id,
+                agent_id,
+                result: result.clone(),
+                duration_ms: started.elapsed().as_millis() as u64,
+                completed_at: Utc::now(),
+            });
+    }
+
+    fn publish_invocation_failed(
+        &self,
+        invocation_id: ToolInvocationId,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+        message: String,
+    ) {
+        self.event_bus
+            .publish_mcp_event(MCPToolEvent::InvocationFailed {
+                invocation_id,
+                execution_id,
+                agent_id,
+                error: MCPError {
+                    code: -32000,
+                    message,
+                    data: None,
+                },
+                failed_at: Utc::now(),
+            });
+    }
+
+    fn map_policy_violation(violation: &PolicyViolation) -> (ViolationType, String) {
+        match violation {
+            PolicyViolation::ToolNotAllowed {
+                tool_name,
+                allowed_tools,
+            } => (
+                ViolationType::ToolNotAllowed,
+                format!(
+                    "Tool '{}' is not allowed. Allowed: {:?}",
+                    tool_name, allowed_tools
+                ),
+            ),
+            PolicyViolation::ToolExplicitlyDenied { tool_name } => (
+                ViolationType::ToolExplicitlyDenied,
+                format!("Tool '{}' is explicitly denied", tool_name),
+            ),
+            PolicyViolation::RateLimitExceeded {
+                max_calls,
+                current_calls,
+            } => (
+                ViolationType::RateLimitExceeded,
+                format!(
+                    "Rate limit exceeded: current_calls={}, max_calls={}",
+                    current_calls, max_calls
+                ),
+            ),
+            PolicyViolation::PathOutsideBoundary {
+                path,
+                allowed_paths,
+            } => (
+                ViolationType::PathOutsideBoundary,
+                format!(
+                    "Path '{}' outside boundary {:?}",
+                    path.display(),
+                    allowed_paths
+                ),
+            ),
+            PolicyViolation::PathTraversalAttempt { path } => (
+                ViolationType::PathTraversalAttempt,
+                format!("Path traversal attempt at '{}'", path.display()),
+            ),
+            PolicyViolation::DomainNotAllowed {
+                domain,
+                allowed_domains,
+            } => (
+                ViolationType::DomainNotAllowed,
+                format!(
+                    "Domain '{}' not allowed. Allowed: {:?}",
+                    domain, allowed_domains
+                ),
+            ),
+            PolicyViolation::MissingRequiredArgument(arg) => (
+                ViolationType::MissingRequiredArgument,
+                format!("Missing required argument '{}'", arg),
+            ),
+            PolicyViolation::TimeoutExceeded {
+                tool_name,
+                max_duration,
+            } => (
+                ViolationType::TimeoutExceeded,
+                format!("Tool '{}' exceeded timeout {:?}", tool_name, max_duration),
+            ),
+        }
     }
 
     /// Invokes a tool by validating the SMCP Envelope for the agent and routing to the right server
@@ -211,6 +359,16 @@ impl ToolInvocationService {
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let invocation_id = ToolInvocationId::new();
+        let started_at = Instant::now();
+        self.publish_invocation_requested(
+            invocation_id,
+            execution_id,
+            *agent_id,
+            &tool_name,
+            &args,
+        );
+
         // 1. Determine the applicable SecurityContext.
         // If the agent is connected via SMCP (Path 1), it has an active session.
         // If the agent is running via Container Dispatch Protocol (Path 3), it does NOT
@@ -235,6 +393,22 @@ impl ToolInvocationService {
 
         // Enforce SecurityContext constraints (e.g. subcommand_allowlist for cmd.run)
         if let Err(violation) = security_context.evaluate(&tool_name, &args) {
+            let (violation_type, details) = Self::map_policy_violation(&violation);
+            self.event_bus
+                .publish_mcp_event(MCPToolEvent::PolicyViolation {
+                    execution_id,
+                    agent_id: *agent_id,
+                    tool_name: tool_name.clone(),
+                    violation_type,
+                    details: details.clone(),
+                    blocked_at: Utc::now(),
+                });
+            self.publish_invocation_failed(
+                invocation_id,
+                execution_id,
+                *agent_id,
+                format!("Policy violation: {details}"),
+            );
             return Err(SmcpSessionError::SignatureVerificationFailed(format!(
                 "Policy violation: {:?}",
                 violation
@@ -301,16 +475,43 @@ impl ToolInvocationService {
                                 ))
                             })?;
 
-                        let semantic_input = format!(
-                            "Tool Call Request:\nTool: {}\nArguments: {}",
-                            tool_name,
-                            serde_json::to_string_pretty(&args).unwrap_or_default()
-                        );
+                        let semantic_input = serde_json::to_string_pretty(&serde_json::json!({
+                            "tool": tool_name.clone(),
+                            "arguments": args.clone()
+                        }))
+                        .unwrap_or_default();
+
+                        let execution_objective = self
+                            .execution_service
+                            .get_execution(execution_id)
+                            .await
+                            .ok()
+                            .and_then(|exec| exec.input.intent)
+                            .unwrap_or_else(|| "No objective available".to_string());
+                        let available_tools = self
+                            .get_available_tools()
+                            .await
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|t| t.name)
+                            .collect::<Vec<String>>();
+                        let worker_mounts = self
+                            .volume_registry
+                            .find_all_by_execution(execution_id)
+                            .into_iter()
+                            .map(|ctx| ctx.mount_point.to_string_lossy().to_string())
+                            .collect::<Vec<String>>();
 
                         let input = ExecutionInput {
                             intent: None,
                             payload: serde_json::json!({
-                                "task": "Evaluate whether the agent's requested tool call adheres to constitutional policies and makes logical sense for the trajectory.",
+                                "task": execution_objective,
+                                "proposed_tool_call": {
+                                    "name": tool_name.clone(),
+                                    "arguments": args.clone()
+                                },
+                                "available_tools": available_tools,
+                                "worker_mounts": worker_mounts,
                                 "output": semantic_input,
                                 "criteria": criteria,
                                 "validation_context": "semantic_judge_pre_execution_inner_loop"
@@ -335,6 +536,15 @@ impl ToolInvocationService {
 
                         loop {
                             if attempts >= max_attempts {
+                                self.publish_invocation_failed(
+                                    invocation_id,
+                                    execution_id,
+                                    *agent_id,
+                                    format!(
+                                        "Inner-loop semantic judge '{}' timed out after {} seconds",
+                                        judge_agent, timeout_seconds
+                                    ),
+                                );
                                 return Err(SmcpSessionError::JudgeTimeout(format!(
                                     "Inner-loop semantic judge '{}' timed out after {} seconds.",
                                     judge_agent, timeout_seconds
@@ -376,6 +586,16 @@ impl ToolInvocationService {
                                     if !(result.score >= *min_score
                                         && result.confidence >= *min_confidence)
                                     {
+                                        self.publish_invocation_failed(
+                                            invocation_id,
+                                            execution_id,
+                                            *agent_id,
+                                            format!(
+                                                "Inner-loop tool execution rejected by semantic judge \
+                                                 (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
+                                                result.score, min_score, result.reasoning
+                                            ),
+                                        );
                                         return Err(SmcpSessionError::SignatureVerificationFailed(
                                             format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
@@ -390,6 +610,13 @@ impl ToolInvocationService {
                                 }
                                 crate::domain::execution::ExecutionStatus::Failed
                                 | crate::domain::execution::ExecutionStatus::Cancelled => {
+                                    self.publish_invocation_failed(
+                                        invocation_id,
+                                        execution_id,
+                                        *agent_id,
+                                        "Inner-loop semantic judge execution failed or was cancelled"
+                                            .to_string(),
+                                    );
                                     return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
                                 }
                                 _ => {
@@ -409,15 +636,84 @@ impl ToolInvocationService {
 
         // Built-in orchestrator authoring tools
         if tool_name == "aegis.agent.create" {
-            return self.invoke_aegis_agent_create_tool(&args).await;
+            let result = self.invoke_aegis_agent_create_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
         }
         if tool_name == "aegis.agent.list" {
-            return self.invoke_aegis_agent_list_tool().await;
+            let result = self.invoke_aegis_agent_list_tool().await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
         }
         if tool_name == "aegis.workflow.create_and_validate" {
-            return self
+            let result = self
                 .invoke_aegis_workflow_create_and_validate_tool(&args, execution_id, *agent_id)
                 .await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
         }
 
         // Try invoking built-in tools (ADR-033, ADR-040, ADR-048)
@@ -431,22 +727,64 @@ impl ToolInvocationService {
         )
         .await
         {
-            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => return Ok(result),
+            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => {
+                match &result {
+                    ToolInvocationResult::Direct(value) => self.publish_invocation_completed(
+                        invocation_id,
+                        execution_id,
+                        *agent_id,
+                        value,
+                        started_at,
+                    ),
+                    ToolInvocationResult::DispatchRequired(_) => self.publish_invocation_completed(
+                        invocation_id,
+                        execution_id,
+                        *agent_id,
+                        &serde_json::json!({"status":"dispatch_required"}),
+                        started_at,
+                    ),
+                }
+                return Ok(result);
+            }
             Ok(crate::application::tools::BuiltinToolResult::NotBuiltin) => {} // Continue to dynamic routing
-            Err(e) => return Err(e),
+            Err(e) => {
+                self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                );
+                return Err(e);
+            }
         }
 
         let server_id = match self.tool_router.route_tool(execution_id, &tool_name).await {
-            Ok(id) => id,
+            Ok(id) => {
+                self.publish_invocation_started(invocation_id, id, &tool_name);
+                id
+            }
             Err(routing_err) => {
                 if self.smcp_gateway_url.is_some() {
                     let gateway_result = self
                         .invoke_smcp_gateway_internal_grpc(execution_id, &tool_name, args.clone())
                         .await;
                     if let Ok(value) = gateway_result {
+                        self.publish_invocation_completed(
+                            invocation_id,
+                            execution_id,
+                            *agent_id,
+                            &value,
+                            started_at,
+                        );
                         return Ok(ToolInvocationResult::Direct(value));
                     }
                 }
+                self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    format!("Routing error: {}", routing_err),
+                );
                 return Err(SmcpSessionError::SignatureVerificationFailed(format!(
                     "Routing error: {}",
                     routing_err
@@ -454,11 +792,21 @@ impl ToolInvocationService {
             }
         };
 
-        let server = self.tool_router.get_server(server_id).await.ok_or(
-            SmcpSessionError::SignatureVerificationFailed(
-                "Server vanished after routing".to_string(),
-            ),
-        )?;
+        let server = match self.tool_router.get_server(server_id).await {
+            Some(server) => server,
+            None => {
+                let err = SmcpSessionError::SignatureVerificationFailed(
+                    "Server vanished after routing".to_string(),
+                );
+                self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    err.to_string(),
+                );
+                return Err(err);
+            }
+        };
 
         match server.execution_mode {
             crate::domain::mcp::ExecutionMode::Local => {
@@ -467,32 +815,41 @@ impl ToolInvocationService {
                     tool_name,
                     agent_id
                 );
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                let result = serde_json::json!({
                     "status": "success",
                     "execution_mode": "local_fsal",
                     "message": format!("Locally executed {} affecting agent volume", tool_name),
                     "args_executed": args
-                })))
+                });
+                self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &result,
+                    started_at,
+                );
+                Ok(ToolInvocationResult::Direct(result))
             }
             crate::domain::mcp::ExecutionMode::Remote => {
-                let _json_rpc_payload = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": tool_name,
-                    "params": args,
-                    "id": execution_id.to_string()
-                });
-
                 tracing::info!(
                     "Proxying remote tool via JSON-RPC: {} to server {:?}",
                     tool_name,
                     server_id
                 );
-                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                let result = serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",
                     "message": format!("Proxied {} to external MCP server {:?}", tool_name, server_id),
                     "args_proxied": args
-                })))
+                });
+                self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &result,
+                    started_at,
+                );
+                Ok(ToolInvocationResult::Direct(result))
             }
         }
     }
@@ -589,23 +946,31 @@ impl ToolInvocationService {
                 })
                 .unwrap_or_default();
 
+            let fsal_mounts = self
+                .volume_registry
+                .find_all_by_execution(execution_id)
+                .into_iter()
+                .map(|ctx| FsalMount {
+                    volume_id: ctx.volume_id.to_string(),
+                    mount_path: ctx.mount_point.to_string_lossy().to_string(),
+                    read_only: ctx.policy.write.is_empty(),
+                })
+                .collect::<Vec<FsalMount>>();
+
+            if fsal_mounts.is_empty() {
+                return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                    "No FSAL mounts registered for execution {}",
+                    execution_id
+                )));
+            }
+
             let response = client
                 .invoke_cli(tonic::Request::new(InvokeCliRequest {
                     execution_id: execution_id.to_string(),
                     tool_name: tool_name.to_string(),
                     subcommand,
                     args: cli_args,
-                    fsal_volume_id: self
-                        .volume_registry
-                        .find_by_execution(execution_id)
-                        .ok_or_else(|| {
-                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                "No FSAL volume registered for execution {}",
-                                execution_id
-                            ))
-                        })?
-                        .volume_id
-                        .to_string(),
+                    fsal_mounts,
                 }))
                 .await
                 .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
@@ -1184,6 +1549,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
             None,
         );
         let agent_id = AgentId::new();
@@ -1234,6 +1600,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
             None,
         );
         let envelope = DummyEnvelope { valid: false };
@@ -1310,6 +1677,7 @@ mod tests {
             Arc::new(TestAgentLifecycleService),
             Arc::new(TestExecutionService),
             Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
             None,
         );
 

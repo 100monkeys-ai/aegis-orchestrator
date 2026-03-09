@@ -11,12 +11,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::application::execution::ExecutionService;
 use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchId, OrchestratorMessage, ToolCall,
 };
-use crate::domain::execution::ExecutionId;
+use crate::domain::execution::{ExecutionId, TrajectoryStep};
 use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
 use crate::infrastructure::llm::registry::ProviderRegistry;
 
@@ -71,14 +72,17 @@ pub enum LlmOutput {
 struct ExecutionContext {
     agent_id: AgentId,
     model_alias: String,
+    iteration_number: u8,
     conversation: Vec<ConversationMessage>,
     iterations: usize,
     pending_dispatch_id: Option<DispatchId>,
     pending_tool_call_id: Option<String>,
+    trajectory: Vec<TrajectoryStep>,
 }
 
 pub struct InnerLoopService {
     tool_invocation_service: Arc<ToolInvocationService>,
+    execution_service: Arc<dyn ExecutionService>,
     provider_registry: Arc<ProviderRegistry>,
     active_executions: RwLock<HashMap<String, ExecutionContext>>,
 }
@@ -86,10 +90,12 @@ pub struct InnerLoopService {
 impl InnerLoopService {
     pub fn new(
         tool_invocation_service: Arc<ToolInvocationService>,
+        execution_service: Arc<dyn ExecutionService>,
         provider_registry: Arc<ProviderRegistry>,
     ) -> Self {
         Self {
             tool_invocation_service,
+            execution_service,
             provider_registry,
             active_executions: RwLock::new(HashMap::new()),
         }
@@ -103,7 +109,7 @@ impl InnerLoopService {
             AgentMessage::Generate {
                 agent_id,
                 execution_id,
-                iteration_number: _,
+                iteration_number,
                 prompt,
                 messages,
                 model_alias,
@@ -143,10 +149,12 @@ impl InnerLoopService {
                     ExecutionContext {
                         agent_id: parsed_agent_id,
                         model_alias,
+                        iteration_number,
                         conversation,
                         iterations: 0,
                         pending_dispatch_id: None,
                         pending_tool_call_id: None,
+                        trajectory: Vec::new(),
                     },
                 );
 
@@ -265,6 +273,24 @@ impl InnerLoopService {
                         conversation: ctx.conversation.clone(),
                     };
 
+                    let execution_id = ExecutionId(uuid::Uuid::parse_str(execution_id_str)?);
+                    if let Err(e) = self
+                        .execution_service
+                        .store_iteration_trajectory(
+                            execution_id,
+                            ctx.iteration_number,
+                            ctx.trajectory.clone(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            execution_id = %execution_id_str,
+                            iteration = ctx.iteration_number,
+                            error = %e,
+                            "Failed to persist inner-loop trajectory"
+                        );
+                    }
+
                     self.active_executions
                         .write()
                         .await
@@ -296,6 +322,11 @@ impl InnerLoopService {
                         .insert(execution_id_str.to_string(), ctx.clone());
 
                     for tool_call in tool_calls {
+                        let step = TrajectoryStep {
+                            tool_name: tool_call.name.clone(),
+                            arguments_json: serde_json::to_string(&tool_call.arguments)
+                                .unwrap_or_else(|_| "{}".to_string()),
+                        };
                         tracing::debug!(
                             execution_id = %execution_id_str,
                             tool = %tool_call.name,
@@ -334,6 +365,7 @@ impl InnerLoopService {
                                             execution_id_str
                                         ))?
                                 };
+                                next_ctx.trajectory.push(step);
                                 next_ctx.pending_dispatch_id = Some(dispatch_id);
                                 next_ctx.pending_tool_call_id = Some(tool_call.id.clone());
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
@@ -362,6 +394,7 @@ impl InnerLoopService {
                                             execution_id_str
                                         ))?
                                 };
+                                next_ctx.trajectory.push(step);
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,

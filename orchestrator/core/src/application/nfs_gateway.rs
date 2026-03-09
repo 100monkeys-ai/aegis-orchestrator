@@ -131,6 +131,59 @@ impl NfsVolumeRegistry {
             .cloned()
     }
 
+    /// Returns all volume contexts for an execution.
+    pub fn find_all_by_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Vec<NfsVolumeContext> {
+        self.contexts
+            .read()
+            .values()
+            .filter(|ctx| ctx.execution_id == execution_id)
+            .cloned()
+            .collect()
+    }
+
+    /// Resolve the most specific mounted volume for a requested container path.
+    /// Chooses the longest mount-point prefix match under this execution.
+    pub fn find_by_execution_and_path(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        requested_path: &str,
+    ) -> Option<NfsVolumeContext> {
+        let requested = requested_path.trim();
+        self.find_all_by_execution(execution_id)
+            .into_iter()
+            .filter(|ctx| {
+                let mount = ctx.mount_point.to_string_lossy();
+                requested == mount
+                    || requested
+                        .strip_prefix(mount.as_ref())
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+            })
+            .max_by_key(|ctx| ctx.mount_point.as_os_str().len())
+    }
+
+    /// Resolve primary workspace volume.
+    /// Prefers exact `/workspace` mount; falls back to the shortest `/workspace/...` path.
+    pub fn find_primary_workspace_by_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Option<NfsVolumeContext> {
+        let mut contexts = self.find_all_by_execution(execution_id);
+        if contexts.is_empty() {
+            return None;
+        }
+        if let Some(root) = contexts
+            .iter()
+            .find(|ctx| ctx.mount_point.to_string_lossy() == "/workspace")
+        {
+            return Some(root.clone());
+        }
+        contexts.sort_by_key(|ctx| ctx.mount_point.as_os_str().len());
+        contexts.into_iter().next()
+    }
+
     /// Get count of registered volumes
     pub fn count(&self) -> usize {
         self.contexts.read().len()

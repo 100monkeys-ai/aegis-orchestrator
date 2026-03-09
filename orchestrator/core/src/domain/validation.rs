@@ -145,6 +145,8 @@ pub struct ValidationContext {
     pub exit_code: i64,
     /// Iteration stderr (joined log lines).
     pub stderr: String,
+    /// Mounted worker paths visible to judges (canonical `/workspace...` roots).
+    pub worker_mounts: Vec<String>,
 }
 
 /// Extract the first JSON value from `text`, stripping markdown code fences.

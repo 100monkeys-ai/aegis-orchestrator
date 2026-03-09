@@ -495,6 +495,7 @@ impl GradientValidator for SemanticAgentValidator {
             payload: serde_json::json!({
                 "task": ctx.task,
                 "output": ctx.output,
+                "worker_mounts": ctx.worker_mounts.clone(),
                 "criteria": self.criteria,
                 "validation_context": "semantic_judge"
             }),
@@ -622,6 +623,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
         let input_payload = serde_json::json!({
             "task": ctx.task,
             "output": ctx.output,
+            "worker_mounts": ctx.worker_mounts.clone(),
             "criteria": self.criteria,
             "validation_context": "multi_judge"
         });

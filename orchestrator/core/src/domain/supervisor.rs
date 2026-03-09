@@ -375,6 +375,11 @@ impl Supervisor {
                     output: stdout.clone(),
                     exit_code: output.exit_code,
                     stderr: validation_stderr,
+                    worker_mounts: runtime_config
+                        .volumes
+                        .iter()
+                        .map(|m| m.mount_point.to_string_lossy().to_string())
+                        .collect(),
                 };
                 match pipeline.validate(&ctx).await {
                     Ok(pipeline_result) => {

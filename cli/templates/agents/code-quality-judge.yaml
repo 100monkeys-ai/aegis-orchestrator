@@ -45,8 +45,12 @@ spec:
       You will receive a JSON input with these fields:
         - "task": the original user request given to the coder agent
         - "output": the code that agent produced
+        - "worker_mounts": list of inherited mounted paths (for example `/workspace/datasets`)
         - "criteria": the evaluation criteria the code must satisfy
         - "validation_context": always "semantic_judge" (for context only)
+
+      If artifacts are present under paths listed in `worker_mounts`, inspect them as the source of truth
+      rather than relying only on textual output summaries.
 
       Evaluate the code across five signal categories. For each, assign a
       score from 0.0 to 1.0 and write a one-sentence message.

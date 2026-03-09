@@ -22,7 +22,10 @@ spec:
       Input typically includes:
       - user workflow objective
       - generated workflow plan and/or workflow YAML
+      - worker_mounts: list of inherited mounted paths (for example `/workspace/cache`)
       - optional criteria and validation context
+
+      If worker artifacts are available under `/workspace`, inspect them directly before scoring.
 
       Score output quality for:
       - workflow correctness

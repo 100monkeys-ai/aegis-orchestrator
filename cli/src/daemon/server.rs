@@ -1042,6 +1042,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
             ),
+            event_bus.clone(),
             config.spec.smcp_gateway.as_ref().map(|gateway| {
                 resolve_env_value(&gateway.url).unwrap_or_else(|_| gateway.url.clone())
             }),
@@ -1060,6 +1061,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let inner_loop_service = Arc::new(
         aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
             tool_invocation_service.clone(),
+            execution_service.clone(),
             llm_registry,
         ),
     );

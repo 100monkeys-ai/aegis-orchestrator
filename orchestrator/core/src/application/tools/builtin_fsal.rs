@@ -36,8 +36,13 @@ pub async fn invoke_fs_tool(
     fsal: &Arc<AegisFSAL>,
     volume_registry: &NfsVolumeRegistry,
 ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    let path_arg = args
+        .get("path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/workspace");
     let vol_ctx = volume_registry
-        .find_by_execution(execution_id)
+        .find_by_execution_and_path(execution_id, path_arg)
+        .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(format!(
                 "No volume registered for execution {}",
@@ -49,7 +54,6 @@ pub async fn invoke_fs_tool(
 
     match tool_name {
         "fs.write" => {
-            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -85,7 +89,6 @@ pub async fn invoke_fs_tool(
             })))
         }
         "fs.read" => {
-            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             let data = fsal
@@ -104,7 +107,6 @@ pub async fn invoke_fs_tool(
             })))
         }
         "fs.list" => {
-            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             let entries = fsal
@@ -139,7 +141,6 @@ pub async fn invoke_fs_tool(
             })))
         }
         "fs.create_dir" => {
-            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             fsal.create_directory(
@@ -162,7 +163,6 @@ pub async fn invoke_fs_tool(
             })))
         }
         "fs.delete" => {
-            let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
             let recursive = args
                 .get("recursive")
