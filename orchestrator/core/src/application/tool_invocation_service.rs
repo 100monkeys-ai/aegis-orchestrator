@@ -32,6 +32,8 @@ use crate::infrastructure::smcp_gateway_proto::{
 };
 use crate::infrastructure::workflow_parser::WorkflowParser;
 
+const JUDGE_POLL_INTERVAL_MS: u64 = 500;
+
 pub enum ToolInvocationResult {
     Direct(Value),
     DispatchRequired(DispatchAction),
@@ -258,8 +260,8 @@ impl ToolInvocationService {
             // judge pipeline. When the node config marks a tool with `skip_judge: true`
             // (e.g. read-only tools such as fs.read, fs.list), we bypass the judge entirely
             // to reduce latency on low-risk operations (NODE_CONFIGURATION_SPEC_V1.md).
-            let skip_tool_judge = self.tool_router.is_skip_judge(&tool_name).await;
-            if skip_tool_judge {
+            let should_skip_judge = self.tool_router.is_skip_judge(&tool_name).await;
+            if should_skip_judge {
                 tracing::debug!(
                     tool_name = %tool_name,
                     "Inner-loop semantic judge skipped (skip_judge=true in node config for this tool)"
@@ -326,7 +328,7 @@ impl ToolInvocationService {
                                 ))
                             })?;
 
-                        let poll_interval_ms = 500u64;
+                        let poll_interval_ms = JUDGE_POLL_INTERVAL_MS;
                         let timeout_ms = timeout_seconds.saturating_mul(1000);
                         let max_attempts =
                             timeout_ms.saturating_add(poll_interval_ms.saturating_sub(1)) / poll_interval_ms;
@@ -1401,5 +1403,36 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(exec_mode, "remote_jsonrpc");
+    }
+
+    #[test]
+    fn sanitize_segment_handles_empty_and_whitespace() {
+        assert_eq!(sanitize_segment(""), "unversioned");
+        assert_eq!(sanitize_segment("   "), "unversioned");
+    }
+
+    #[test]
+    fn sanitize_segment_blocks_traversal_patterns() {
+        assert_eq!(sanitize_segment("."), "unversioned");
+        assert_eq!(sanitize_segment(".."), "unversioned");
+        assert_eq!(sanitize_segment("..hidden"), "unversioned");
+        assert_eq!(sanitize_segment("hidden.."), "unversioned");
+        assert_eq!(sanitize_segment("a..b"), "unversioned");
+        assert_eq!(sanitize_segment("version..1"), "unversioned");
+    }
+
+    #[test]
+    fn sanitize_segment_replaces_special_characters() {
+        assert_eq!(sanitize_segment("foo/bar"), "foo_bar");
+        assert_eq!(sanitize_segment("foo\\bar"), "foo_bar");
+        assert_eq!(sanitize_segment("foo:bar"), "foo_bar");
+        assert_eq!(sanitize_segment("foo bar"), "foo_bar");
+        assert_eq!(sanitize_segment("name@domain.com"), "name_domain.com");
+    }
+
+    #[test]
+    fn sanitize_segment_preserves_safe_mixed_alphanumeric() {
+        assert_eq!(sanitize_segment("validName-123"), "validName-123");
+        assert_eq!(sanitize_segment("v1.2.3-beta_01"), "v1.2.3-beta_01");
     }
 }
