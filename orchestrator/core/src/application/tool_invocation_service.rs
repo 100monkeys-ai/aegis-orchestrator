@@ -235,10 +235,7 @@ impl ToolInvocationService {
 
         // Enforce SecurityContext constraints (e.g. subcommand_allowlist for cmd.run)
         if let Err(violation) = security_context.evaluate(&tool_name, &args) {
-            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                "Policy violation: {:?}",
-                violation
-            )));
+            return Err(SmcpSessionError::PolicyViolation(violation));
         }
 
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
@@ -330,7 +327,9 @@ impl ToolInvocationService {
                             })?;
 
                         let poll_interval_ms = 500u64;
-                        let max_attempts = (*timeout_seconds * 1000) / poll_interval_ms;
+                        let timeout_ms = timeout_seconds.saturating_mul(1000);
+                        let max_attempts =
+                            timeout_ms.saturating_add(poll_interval_ms.saturating_sub(1)) / poll_interval_ms;
                         let mut attempts = 0;
 
                         loop {
@@ -346,7 +345,10 @@ impl ToolInvocationService {
                                 .get_execution(exec_id)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::SignatureVerificationFailed(e.to_string())
+                                    SmcpSessionError::InternalError(format!(
+                                        "Failed to get judge execution {}: {}",
+                                        exec_id, e
+                                    ))
                                 })?;
 
                             match exec.status {

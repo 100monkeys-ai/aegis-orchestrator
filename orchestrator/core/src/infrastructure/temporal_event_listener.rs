@@ -385,6 +385,10 @@ impl TemporalEventListener {
             };
 
             let code_diff = crate::domain::execution::CodeDiff {
+                // NOTE: RefinementApplied code diffs are persisted under the canonical
+                // validation feedback artifact path. The file_path here is intentionally
+                // set to VALIDATION_FEEDBACK_FILE_NAME to indicate where in the workspace
+                // this diff content should be stored/loaded.
                 file_path: VALIDATION_FEEDBACK_FILE_NAME.to_string(),
                 diff: diff_str,
             };
@@ -418,13 +422,6 @@ impl TemporalEventListener {
         let domain_event = TemporalEventMapper::to_domain_event(&payload)
             .context("Failed to map Temporal event to domain event")?;
 
-        // Definition-time event — no execution_id exists.
-        // Publish to the event bus so subscribers are notified, then return early.
-        if let WorkflowEvent::WorkflowRegistered { .. } = &domain_event {
-            self.event_bus.publish_workflow_event(domain_event.clone());
-            return Ok(String::new());
-        }
-
         // All remaining workflow events are execution-scoped and carry an execution_id.
         let execution_id_obj = match &domain_event {
             WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
@@ -439,12 +436,10 @@ impl TemporalEventListener {
             WorkflowEvent::WorkflowRegistered { .. } => {
                 return Err(anyhow!(
                     "WorkflowRegistered event unexpectedly reached execution-scoped handling; \
-                     this variant should be handled before deriving an execution_id"
+                     this variant should be handled by TemporalEventMapper::to_domain_event"
                 ));
             }
         };
-
-        let execution_id_str = execution_id_obj.0.to_string();
 
         // Step 2: Persist event to the repository for event sourcing
         self.execution_repository
@@ -462,7 +457,7 @@ impl TemporalEventListener {
         self.event_bus.publish_workflow_event(domain_event.clone());
 
         // Step 4: Return execution ID for response
-        Ok(execution_id_str)
+        Ok(execution_id_obj.0.to_string())
     }
 }
 
