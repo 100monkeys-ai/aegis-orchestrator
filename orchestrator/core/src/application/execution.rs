@@ -488,6 +488,8 @@ impl StandardExecutionService {
         mut input: ExecutionInput,
         agent: &crate::domain::agent::Agent,
     ) -> Result<ExecutionInput> {
+        const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}\n\nUser: {{input}}\nAgent:";
+
         // Get task spec with prompt template
         let task_spec = agent
             .manifest
@@ -498,8 +500,8 @@ impl StandardExecutionService {
 
         let prompt_template = task_spec
             .prompt_template
-            .as_ref()
-            .ok_or(ExecutionError::MissingPromptTemplate)?;
+            .as_deref()
+            .unwrap_or(DEFAULT_PROMPT_TEMPLATE);
 
         // Get agent instruction
         let agent_instruction = task_spec
