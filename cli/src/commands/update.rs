@@ -102,6 +102,14 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
         println!();
         println!("{}", "[3/3] Running database migrations...".bold());
 
+        // Load the stack .env file so that `env:VAR` references in
+        // aegis-config.yaml (e.g. `url: env:AEGIS_DATABASE_URL`) resolve
+        // correctly when `aegis update` is run from outside the stack dir.
+        let env_file = dir.join(".env");
+        if env_file.exists() {
+            dotenvy::from_path(&env_file).ok();
+        }
+
         let config = NodeConfigManifest::load_or_default(config_path)?;
         let db_config = config
             .spec

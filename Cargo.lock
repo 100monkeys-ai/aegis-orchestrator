@@ -19,6 +19,7 @@ dependencies = [
  "daemonize",
  "dialoguer",
  "dirs-next",
+ "dotenvy",
  "futures",
  "indicatif",
  "jsonwebtoken",
