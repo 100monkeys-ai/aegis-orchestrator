@@ -51,7 +51,7 @@ pub enum StorageBackend {
 ///
 /// # Errors
 ///
-/// Returns an error if the backend configuration is invalid (e.g., unrecognised
+/// Returns an error if the backend configuration is invalid (e.g., unrecognized
 /// OpenDAL scheme or a `LocalHost` mount point that cannot be initialised).
 /// Callers should handle this at startup; a bad storage config is fatal.
 pub fn create_storage_provider(

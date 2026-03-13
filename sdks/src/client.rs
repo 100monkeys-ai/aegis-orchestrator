@@ -9,7 +9,7 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements client
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,16 @@ impl AegisClient {
         }
 
         let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            bail!("Failed to deploy agent: HTTP {} - {}", status, body);
+        }
+
         let deployment = response.json().await?;
 
         Ok(deployment)
@@ -66,6 +76,21 @@ impl AegisClient {
         }
 
         let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            bail!(
+                "Failed to execute task for agent {}: HTTP {} - {}",
+                agent_id,
+                status,
+                body
+            );
+        }
+
         let output = response.json().await?;
 
         Ok(output)
@@ -82,6 +107,21 @@ impl AegisClient {
         }
 
         let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            bail!(
+                "Failed to get status for agent {}: HTTP {} - {}",
+                agent_id,
+                status,
+                body
+            );
+        }
+
         let status = response.json().await?;
 
         Ok(status)
@@ -97,7 +137,8 @@ impl AegisClient {
             req = req.header("Authorization", format!("Bearer {key}"));
         }
 
-        req.send().await?;
+        let response = req.send().await?;
+        response.error_for_status()?;
 
         Ok(())
     }
@@ -129,6 +170,20 @@ impl AegisClient {
         }
 
         let response = req.send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read body>".to_string());
+            bail!(
+                "Text generation request failed with status {}: {}",
+                status,
+                body
+            );
+        }
+
         let json: serde_json::Value = response.json().await?;
 
         json["content"]
