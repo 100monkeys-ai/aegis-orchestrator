@@ -382,8 +382,7 @@ impl TemporalEventListener {
                 serde_json::Value::String(s) => s,
                 other => {
                     return Err(anyhow!(
-                        "Invalid code_diff format for RefinementApplied event: expected string, got {}",
-                        other
+                        "Invalid code_diff format for RefinementApplied event: expected string, got {other}"
                     ));
                 }
             };
@@ -496,8 +495,7 @@ mod tests {
         let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
         assert!(
             matches!(event, WorkflowEvent::WorkflowExecutionStarted { .. }),
-            "Expected WorkflowExecutionStarted, got {:?}",
-            event
+            "Expected WorkflowExecutionStarted, got {event:?}"
         );
         let WorkflowEvent::WorkflowExecutionStarted { execution_id, .. } = event else {
             return;

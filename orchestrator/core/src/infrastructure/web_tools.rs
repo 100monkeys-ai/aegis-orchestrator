@@ -36,8 +36,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                 "results": results
             }))),
             Err(e) => Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                "Web search failed: {}",
-                e
+                "Web search failed: {e}"
             ))),
         }
     }
@@ -76,8 +75,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                 })))
             }
             Err(e) => Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                "Web fetch failed: {}",
-                e
+                "Web fetch failed: {e}"
             ))),
         }
     }
@@ -97,13 +95,13 @@ async fn perform_search(url: &str) -> Result<Vec<serde_json::Value>, String> {
         .user_agent("AEGIS Orchestrator WebSearch/1.0")
         .timeout(std::time::Duration::from_secs(30))
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("DuckDuckGo request failed: {}", e))?;
+        .map_err(|e| format!("DuckDuckGo request failed: {e}"))?;
 
     if !response.status().is_success() {
         return Err(format!("DuckDuckGo returned status: {}", response.status()));
@@ -112,15 +110,15 @@ async fn perform_search(url: &str) -> Result<Vec<serde_json::Value>, String> {
     let html = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response: {}", e))?;
+        .map_err(|e| format!("Failed to read response: {e}"))?;
 
     let document = scraper::Html::parse_document(&html);
     let result_selector = scraper::Selector::parse(".result__body")
-        .map_err(|e| format!("Failed to parse result body selector: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse result body selector: {e:?}"))?;
     let title_selector = scraper::Selector::parse(".result__title a")
-        .map_err(|e| format!("Failed to parse title selector: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse title selector: {e:?}"))?;
     let snippet_selector = scraper::Selector::parse(".result__snippet")
-        .map_err(|e| format!("Failed to parse snippet selector: {:?}", e))?;
+        .map_err(|e| format!("Failed to parse snippet selector: {e:?}"))?;
 
     let mut results = Vec::new();
     for (idx, result) in document.select(&result_selector).enumerate() {
@@ -176,13 +174,13 @@ async fn perform_fetch(
             reqwest::redirect::Policy::none()
         })
         .build()
-        .map_err(|e| format!("Failed to create HTTP client: {}", e))?;
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
 
     let response = client
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(|e| format!("Request failed: {e}"))?;
 
     let status = response.status().as_u16();
     let is_html = response
@@ -195,7 +193,7 @@ async fn perform_fetch(
     let body = response
         .text()
         .await
-        .map_err(|e| format!("Failed to read response body: {}", e))?;
+        .map_err(|e| format!("Failed to read response body: {e}"))?;
 
     Ok((status, is_html, body))
 }

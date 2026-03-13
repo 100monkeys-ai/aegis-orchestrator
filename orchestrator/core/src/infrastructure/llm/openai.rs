@@ -224,14 +224,14 @@ impl LLMProvider for OpenAIAdapter {
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else {
-                LLMError::Provider(format!("HTTP {}: {}", status, error_text))
+                LLMError::Provider(format!("HTTP {status}: {error_text}"))
             });
         }
 
         let oai_response: OpenAIResponse = response
             .json()
             .await
-            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
         let choice = oai_response
             .choices
@@ -359,7 +359,7 @@ mod tests {
 
     #[test]
     fn test_tool_schema_mapping() {
-        let tools = vec![ToolSchema {
+        let tools = [ToolSchema {
             name: "fs.read".to_string(),
             description: "Read a file".to_string(),
             parameters: serde_json::json!({"type": "object", "properties": {}}),

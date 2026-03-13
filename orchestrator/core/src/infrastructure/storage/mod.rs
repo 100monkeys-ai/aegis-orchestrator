@@ -68,7 +68,7 @@ pub fn create_storage_provider(
             let scheme_name = provider.clone();
             let scheme: opendal::Scheme = provider
                 .parse()
-                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{}'", scheme_name))?;
+                .map_err(|_| anyhow::anyhow!("Invalid OpenDAL scheme: '{scheme_name}'"))?;
             let op = Operator::via_iter(scheme, options).with_context(|| {
                 format!("Failed to create OpenDAL operator for scheme '{scheme_name}'")
             })?;
@@ -203,7 +203,7 @@ mod mock {
         }
 
         async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(format!("mock-handle-{}", path).into_bytes()))
+            Ok(FileHandle(format!("mock-handle-{path}").into_bytes()))
         }
 
         async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {

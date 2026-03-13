@@ -479,8 +479,7 @@ async fn test_fsal_quota_enforcement() {
             assert_eq!(available_bytes, 0); // Quota already exceeded (5120 > 1024)
         }
         other => {
-            assert!(false, "Expected QuotaExceeded error, got: {:?}", other);
-            return;
+            panic!("Expected QuotaExceeded error, got: {other:?}");
         }
     }
 

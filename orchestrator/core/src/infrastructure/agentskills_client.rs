@@ -105,7 +105,7 @@ impl AgentSkillsClient {
             let skill = self
                 .fetch_skill(&skill_id)
                 .await
-                .with_context(|| format!("Failed to fetch skill: {}", skill_id))?;
+                .with_context(|| format!("Failed to fetch skill: {skill_id}"))?;
             skills.push(skill);
         }
 
@@ -134,8 +134,7 @@ impl AgentSkillsClient {
         let parts: Vec<&str> = skill_id.split(':').collect();
         if parts.len() != 2 {
             return Err(anyhow!(
-                "Invalid skill ID format: {}. Expected 'namespace:skill-name'",
-                skill_id
+                "Invalid skill ID format: {skill_id}. Expected 'namespace:skill-name'"
             ));
         }
         let (namespace, name) = (parts[0], parts[1]);
@@ -176,7 +175,7 @@ impl AgentSkillsClient {
         }
 
         let content = fs::read_to_string(&cache_path)
-            .with_context(|| format!("Failed to read cached skill: {:?}", cache_path))?;
+            .with_context(|| format!("Failed to read cached skill: {cache_path:?}"))?;
 
         let skill: SkillDefinition =
             serde_json::from_str(&content).context("Failed to parse cached skill")?;
@@ -194,7 +193,7 @@ impl AgentSkillsClient {
         let content = serde_json::to_string_pretty(skill).context("Failed to serialize skill")?;
 
         fs::write(&cache_path, content)
-            .with_context(|| format!("Failed to write cache file: {:?}", cache_path))?;
+            .with_context(|| format!("Failed to write cache file: {cache_path:?}"))?;
 
         Ok(())
     }
@@ -203,7 +202,7 @@ impl AgentSkillsClient {
     fn cache_path(&self, skill_id: &str) -> PathBuf {
         // Replace ':' with '_' for filesystem safety
         let safe_id = skill_id.replace(':', "_");
-        self.cache_dir.join(format!("{}.json", safe_id))
+        self.cache_dir.join(format!("{safe_id}.json"))
     }
 
     /// Clear entire cache
@@ -219,7 +218,7 @@ impl AgentSkillsClient {
         let cache_path = self.cache_path(skill_id);
         if cache_path.exists() {
             fs::remove_file(&cache_path)
-                .with_context(|| format!("Failed to remove cache file: {:?}", cache_path))?;
+                .with_context(|| format!("Failed to remove cache file: {cache_path:?}"))?;
         }
         Ok(())
     }

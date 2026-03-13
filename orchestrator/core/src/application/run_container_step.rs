@@ -316,8 +316,7 @@ impl RunParallelContainerStepsUseCase {
             }
             // All failed with non-zero exit codes (Ok results with exit_code != 0).
             return Err(ContainerStepError::DockerError(format!(
-                "ParallelContainerRun strategy {:?} not met: {}/{} steps succeeded",
-                completion, succeeded, step_count
+                "ParallelContainerRun strategy {completion:?} not met: {succeeded}/{step_count} steps succeeded"
             )));
         }
 

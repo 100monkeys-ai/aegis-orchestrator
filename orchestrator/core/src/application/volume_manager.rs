@@ -205,7 +205,7 @@ impl VolumeService for StandardVolumeService {
 
         // Construct storage-relative path: /aegis/volumes/{tenant_id}/{volume_id}
         let volume_id = VolumeId::new();
-        let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
+        let remote_path = format!("/aegis/volumes/{tenant_id}/{volume_id}");
         let backend = match self.storage_mode.as_str() {
             "seaweedfs" => VolumeBackend::SeaweedFS {
                 filer_endpoint: self.filer_endpoint.clone(),
@@ -223,8 +223,7 @@ impl VolumeService for StandardVolumeService {
             },
             other => {
                 return Err(anyhow::anyhow!(
-                    "Unsupported storage mode for standard volume creation: {}",
-                    other
+                    "Unsupported storage mode for standard volume creation: {other}"
                 ));
             }
         };
@@ -299,7 +298,7 @@ impl VolumeService for StandardVolumeService {
         self.repository
             .find_by_id(id)
             .await?
-            .ok_or_else(|| anyhow::anyhow!("Volume {} not found", id))
+            .ok_or_else(|| anyhow::anyhow!("Volume {id} not found"))
     }
 
     async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>> {
@@ -360,7 +359,7 @@ impl VolumeService for StandardVolumeService {
                 volume_id,
                 instance_id: instance_id.clone(),
                 mount_point: mount_point.to_string_lossy().to_string(),
-                access_mode: format!("{:?}", access_mode),
+                access_mode: format!("{access_mode:?}"),
                 attached_at: Utc::now(),
             });
 
@@ -707,8 +706,7 @@ impl VolumeService for StandardVolumeService {
                 }
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Invalid volume_type '{}'. Expected 'seaweedfs', 'opendal', 'hostPath', 'smcp'",
-                        other
+                        "Invalid volume_type '{other}'. Expected 'seaweedfs', 'opendal', 'hostPath', 'smcp'"
                     ));
                 }
             };
@@ -744,7 +742,7 @@ fn parse_size_string(size: &str) -> Result<u64> {
     let number: u64 = number_part
         .trim()
         .parse()
-        .context(format!("Invalid number in size '{}'", size))?;
+        .context(format!("Invalid number in size '{size}'"))?;
 
     let multiplier: u64 = match unit_part.trim().to_lowercase().as_str() {
         "ki" => 1024,
@@ -758,8 +756,7 @@ fn parse_size_string(size: &str) -> Result<u64> {
         "" => 1, // No unit = bytes
         unknown => {
             return Err(anyhow::anyhow!(
-                "Unknown size unit '{}'. Supported: Ki, Mi, Gi, Ti (binary) or K, M, G, T (decimal)",
-                unknown
+                "Unknown size unit '{unknown}'. Supported: Ki, Mi, Gi, Ti (binary) or K, M, G, T (decimal)"
             ));
         }
     };
@@ -895,7 +892,7 @@ mod tests {
 
         // Verify storage provider calls
         let directories = storage_provider.directories.lock().await;
-        let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, volume_id);
+        let remote_path = format!("/aegis/volumes/{tenant_id}/{volume_id}");
         assert!(directories.contains_key(&remote_path));
     }
 

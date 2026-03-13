@@ -77,12 +77,12 @@ impl ExamplesLoader {
 
         hello_world_manifest
             .validate()
-            .map_err(|e| anyhow::anyhow!("hello-world manifest validation failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("hello-world manifest validation failed: {e}"))?;
         code_quality_judge_manifest
             .validate()
-            .map_err(|e| anyhow::anyhow!("code-quality-judge manifest validation failed: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("code-quality-judge manifest validation failed: {e}"))?;
         tool_call_policy_judge_manifest.validate().map_err(|e| {
-            anyhow::anyhow!("tool-call-policy-judge manifest validation failed: {}", e)
+            anyhow::anyhow!("tool-call-policy-judge manifest validation failed: {e}")
         })?;
 
         let client = DaemonClient::new(&self.host, self.port)?;
@@ -113,11 +113,7 @@ impl ExamplesLoader {
         println!("  Run a task to test it:");
         println!(
             "    {}",
-            format!(
-                "aegis task execute --agent {} 'Hello, AEGIS!'",
-                hello_world_agent_id
-            )
-            .cyan()
+            format!("aegis task execute --agent {hello_world_agent_id} 'Hello, AEGIS!'").cyan()
         );
 
         Ok(())

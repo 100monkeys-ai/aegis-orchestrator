@@ -250,7 +250,7 @@ impl ProviderRegistry {
         let (model_name, provider) = self
             .alias_map
             .get(alias)
-            .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
+            .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{alias}' not found")))?;
 
         info!("LLM inference: alias='{}', model='{}'", alias, model_name);
 
@@ -309,7 +309,7 @@ impl ProviderRegistry {
         let (model_name, provider) = self
             .alias_map
             .get(alias)
-            .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{}' not found", alias)))?;
+            .ok_or_else(|| LLMError::ModelNotFound(format!("Model alias '{alias}' not found")))?;
 
         info!(
             "LLM text generation: alias='{}', model='{}'",
@@ -379,6 +379,38 @@ impl ProviderRegistry {
     }
 }
 
+// Implement domain LLMProvider trait for infrastructure ProviderRegistry
+// This allows the infrastructure to be used through domain interfaces
+#[async_trait]
+impl LLMProvider for ProviderRegistry {
+    async fn generate(
+        &self,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<GenerationResponse, LLMError> {
+        self.generate("default", prompt, options).await
+    }
+
+    async fn generate_chat(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[ToolSchema],
+        options: &GenerationOptions,
+    ) -> Result<ChatResponse, LLMError> {
+        self.generate_chat("default", messages, tools, options)
+            .await
+    }
+
+    async fn health_check(&self) -> Result<(), LLMError> {
+        let (_, provider) = self
+            .alias_map
+            .get("default")
+            .ok_or_else(|| LLMError::Provider("Default model alias not configured".into()))?;
+
+        provider.health_check().await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,37 +474,5 @@ mod tests {
         let registry = ProviderRegistry::from_config(&config).unwrap();
         assert!(registry.has_alias("default"));
         assert_eq!(registry.available_aliases().len(), 1);
-    }
-}
-
-// Implement domain LLMProvider trait for infrastructure ProviderRegistry
-// This allows the infrastructure to be used through domain interfaces
-#[async_trait]
-impl LLMProvider for ProviderRegistry {
-    async fn generate(
-        &self,
-        prompt: &str,
-        options: &GenerationOptions,
-    ) -> Result<GenerationResponse, LLMError> {
-        self.generate("default", prompt, options).await
-    }
-
-    async fn generate_chat(
-        &self,
-        messages: &[ChatMessage],
-        tools: &[ToolSchema],
-        options: &GenerationOptions,
-    ) -> Result<ChatResponse, LLMError> {
-        self.generate_chat("default", messages, tools, options)
-            .await
-    }
-
-    async fn health_check(&self) -> Result<(), LLMError> {
-        let (_, provider) = self
-            .alias_map
-            .get("default")
-            .ok_or_else(|| LLMError::Provider("Default model alias not configured".into()))?;
-
-        provider.health_check().await
     }
 }

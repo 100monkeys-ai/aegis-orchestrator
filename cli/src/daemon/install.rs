@@ -166,7 +166,7 @@ async fn install_launchd(binary_path: Option<PathBuf>, _user: Option<String>) ->
     };
 
     if !binary.exists() {
-        anyhow::bail!("Binary not found: {:?}", binary);
+        anyhow::bail!("Binary not found: {binary:?}");
     }
 
     // Generate plist file
@@ -176,11 +176,11 @@ async fn install_launchd(binary_path: Option<PathBuf>, _user: Option<String>) ->
     let plist_path = "/Library/LaunchDaemons/io.aegis.daemon.plist";
 
     fs::write(plist_path, plist_content)
-        .with_context(|| format!("Failed to write plist file: {}", plist_path))?;
+        .with_context(|| format!("Failed to write plist file: {plist_path}"))?;
 
     println!(
         "{}",
-        format!("✓ LaunchDaemon plist created: {}", plist_path).green()
+        format!("✓ LaunchDaemon plist created: {plist_path}").green()
     );
 
     // Load the LaunchDaemon
@@ -192,7 +192,7 @@ async fn install_launchd(binary_path: Option<PathBuf>, _user: Option<String>) ->
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Failed to load LaunchDaemon: {}", stderr);
+        anyhow::bail!("Failed to load LaunchDaemon: {stderr}");
     }
 
     println!("{}", "✓ LaunchDaemon loaded".green());
@@ -228,10 +228,10 @@ async fn uninstall_launchd() -> Result<()> {
     // Remove plist file
     if std::path::Path::new(plist_path).exists() {
         fs::remove_file(plist_path)
-            .with_context(|| format!("Failed to remove plist file: {}", plist_path))?;
+            .with_context(|| format!("Failed to remove plist file: {plist_path}"))?;
         println!(
             "{}",
-            format!("✓ LaunchDaemon plist removed: {}", plist_path).green()
+            format!("✓ LaunchDaemon plist removed: {plist_path}").green()
         );
     }
 

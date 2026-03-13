@@ -215,7 +215,7 @@ impl SecretStore for OpenBaoSecretStore {
         // use raw reqwest (same pattern already used for lease management).
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
-        let url = format!("{}v1/{}/creds/{}", address, engine_path, role);
+        let url = format!("{address}v1/{engine_path}/creds/{role}");
         let http_resp = reqwest::Client::new()
             .get(&url)
             .header("X-Vault-Token", &token)
@@ -223,8 +223,7 @@ impl SecretStore for OpenBaoSecretStore {
             .await
             .map_err(|e| {
                 SecretsError::DynamicSecretError(format!(
-                    "HTTP GET {}/{}/creds/{} failed: {}",
-                    address, engine_path, role, e
+                    "HTTP GET {address}/{engine_path}/creds/{role} failed: {e}"
                 ))
             })?;
 
@@ -238,7 +237,7 @@ impl SecretStore for OpenBaoSecretStore {
         }
 
         let resp_json: serde_json::Value = http_resp.json().await.map_err(|e| {
-            SecretsError::DynamicSecretError(format!("Dynamic secret response parse failed: {}", e))
+            SecretsError::DynamicSecretError(format!("Dynamic secret response parse failed: {e}"))
         })?;
 
         let lease_id = resp_json["lease_id"]
@@ -275,7 +274,7 @@ impl SecretStore for OpenBaoSecretStore {
         let client = self.client.read().await;
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
-        let url = format!("{}v1/sys/leases/renew", address);
+        let url = format!("{address}v1/sys/leases/renew");
         let body = serde_json::json!({
             "lease_id": lease_id,
             "increment": format!("{}s", increment.as_secs()),
@@ -287,7 +286,7 @@ impl SecretStore for OpenBaoSecretStore {
             .send()
             .await
             .map_err(|e| {
-                SecretsError::DynamicSecretError(format!("Lease renewal HTTP failed: {}", e))
+                SecretsError::DynamicSecretError(format!("Lease renewal HTTP failed: {e}"))
             })?;
         if !http_resp.status().is_success() {
             return Err(SecretsError::DynamicSecretError(format!(
@@ -297,7 +296,7 @@ impl SecretStore for OpenBaoSecretStore {
         }
         // The response contains lease_duration in the top-level JSON
         let resp_json: serde_json::Value = http_resp.json().await.map_err(|e| {
-            SecretsError::DynamicSecretError(format!("Lease renewal response parse failed: {}", e))
+            SecretsError::DynamicSecretError(format!("Lease renewal response parse failed: {e}"))
         })?;
         let duration_secs = resp_json["lease_duration"]
             .as_u64()
@@ -311,7 +310,7 @@ impl SecretStore for OpenBaoSecretStore {
         let client = self.client.read().await;
         let address = client.settings().address.clone();
         let token = client.settings().token.clone();
-        let url = format!("{}v1/sys/leases/revoke", address);
+        let url = format!("{address}v1/sys/leases/revoke");
         let body = serde_json::json!({ "lease_id": lease_id });
         let http_resp = reqwest::Client::new()
             .put(&url)
@@ -320,7 +319,7 @@ impl SecretStore for OpenBaoSecretStore {
             .send()
             .await
             .map_err(|e| {
-                SecretsError::DynamicSecretError(format!("Lease revocation HTTP failed: {}", e))
+                SecretsError::DynamicSecretError(format!("Lease revocation HTTP failed: {e}"))
             })?;
         if !http_resp.status().is_success() {
             return Err(SecretsError::DynamicSecretError(format!(
@@ -336,7 +335,7 @@ impl SecretStore for OpenBaoSecretStore {
         let encoded_data = base64::engine::general_purpose::STANDARD.encode(data);
         let resp = vaultrs::transit::data::sign(&*client, "transit", key_name, &encoded_data, None)
             .await
-            .map_err(|e| SecretsError::TransitError(format!("Sign failed: {}", e)))?;
+            .map_err(|e| SecretsError::TransitError(format!("Sign failed: {e}")))?;
         Ok(resp.signature)
     }
 
@@ -359,7 +358,7 @@ impl SecretStore for OpenBaoSecretStore {
             Some(&mut opts),
         )
         .await
-        .map_err(|e| SecretsError::TransitError(format!("Verify failed: {}", e)))?;
+        .map_err(|e| SecretsError::TransitError(format!("Verify failed: {e}")))?;
         Ok(resp.valid)
     }
 
@@ -373,7 +372,7 @@ impl SecretStore for OpenBaoSecretStore {
         let resp =
             vaultrs::transit::data::encrypt(&*client, "transit", key_name, &encoded_data, None)
                 .await
-                .map_err(|e| SecretsError::TransitError(format!("Encrypt failed: {}", e)))?;
+                .map_err(|e| SecretsError::TransitError(format!("Encrypt failed: {e}")))?;
         Ok(resp.ciphertext)
     }
 
@@ -385,10 +384,10 @@ impl SecretStore for OpenBaoSecretStore {
         let client = self.client.read().await;
         let resp = vaultrs::transit::data::decrypt(&*client, "transit", key_name, ciphertext, None)
             .await
-            .map_err(|e| SecretsError::TransitError(format!("Decrypt failed: {}", e)))?;
+            .map_err(|e| SecretsError::TransitError(format!("Decrypt failed: {e}")))?;
         base64::engine::general_purpose::STANDARD
             .decode(&resp.plaintext)
-            .map_err(|e| SecretsError::TransitError(format!("Base64 decode failed: {}", e)))
+            .map_err(|e| SecretsError::TransitError(format!("Base64 decode failed: {e}")))
     }
 }
 
@@ -412,7 +411,7 @@ impl MockSecretStore {
     }
 
     fn kv_key(engine: &str, path: &str) -> String {
-        format!("{}/{}", engine, path)
+        format!("{engine}/{path}")
     }
 }
 
@@ -434,7 +433,7 @@ impl SecretStore for MockSecretStore {
             .get(&Self::kv_key(engine, path))
             .cloned()
             .ok_or_else(|| SecretsError::SecretNotFound {
-                path: format!("{}/{}", engine, path),
+                path: format!("{engine}/{path}"),
             })
     }
 
@@ -455,11 +454,11 @@ impl SecretStore for MockSecretStore {
         role: &str,
     ) -> Result<DomainDynamicSecret, SecretsError> {
         Ok(DomainDynamicSecret {
-            lease_id: format!("{}/creds/{}/lease-mock-001", engine, role),
+            lease_id: format!("{engine}/creds/{role}/lease-mock-001"),
             values: HashMap::from([
                 (
                     "username".to_string(),
-                    SensitiveString::new(format!("v-mock-{}-abc123", role)),
+                    SensitiveString::new(format!("v-mock-{role}-abc123")),
                 ),
                 (
                     "password".to_string(),
@@ -487,7 +486,7 @@ impl SecretStore for MockSecretStore {
     async fn transit_sign(&self, key_name: &str, data: &[u8]) -> Result<String, SecretsError> {
         // Deterministic mock signature: "secret:v1:<key_name>:<base64(data)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(data);
-        Ok(format!("secret:v1:{}:{}", key_name, encoded))
+        Ok(format!("secret:v1:{key_name}:{encoded}"))
     }
 
     async fn transit_verify(
@@ -507,7 +506,7 @@ impl SecretStore for MockSecretStore {
     ) -> Result<String, SecretsError> {
         // Deterministic mock ciphertext: "secret:v1:<key_name>:<base64(plaintext)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
-        Ok(format!("secret:v1:{}:{}", key_name, encoded))
+        Ok(format!("secret:v1:{key_name}:{encoded}"))
     }
 
     async fn transit_decrypt(
@@ -515,16 +514,15 @@ impl SecretStore for MockSecretStore {
         key_name: &str,
         ciphertext: &str,
     ) -> Result<Vec<u8>, SecretsError> {
-        let prefix = format!("secret:v1:{}:", key_name);
+        let prefix = format!("secret:v1:{key_name}:");
         let encoded = ciphertext.strip_prefix(&prefix).ok_or_else(|| {
             SecretsError::TransitError(format!(
-                "Invalid mock ciphertext format (expected prefix '{}')",
-                prefix
+                "Invalid mock ciphertext format (expected prefix '{prefix}')"
             ))
         })?;
         base64::engine::general_purpose::STANDARD
             .decode(encoded)
-            .map_err(|e| SecretsError::TransitError(format!("Base64 decode failed: {}", e)))
+            .map_err(|e| SecretsError::TransitError(format!("Base64 decode failed: {e}")))
     }
 }
 
@@ -585,7 +583,7 @@ impl SecretsManager {
     }
 
     fn cache_key(engine: &str, path: &str) -> String {
-        format!("{}/{}", engine, path)
+        format!("{engine}/{path}")
     }
 
     /// Read a secret from the KV engine, served from cache when fresh.
@@ -651,7 +649,7 @@ impl SecretsManager {
         secret
             .remove(field)
             .ok_or_else(|| SecretsError::SecretNotFound {
-                path: format!("{}/{}#{}", engine, path, field),
+                path: format!("{engine}/{path}#{field}"),
             })
     }
 
@@ -718,7 +716,7 @@ impl SecretsManager {
                 self.event_bus
                     .publish_secret_event(SecretEvent::SecretAccessDenied {
                         engine: Some(engine.to_string()),
-                        path: Some(format!("creds/{}", role)),
+                        path: Some(format!("creds/{role}")),
                         reason: e.to_string(),
                         access_context: context.clone(),
                         denied_at: Utc::now(),
@@ -829,8 +827,7 @@ impl SecretsManager {
 
                 let (engine, path) = kv_path.split_once('/').ok_or_else(|| {
                     SecretsError::InvalidPath(format!(
-                        "OpenBao credential key must contain at least engine/path: '{}'",
-                        raw
+                        "OpenBao credential key must contain at least engine/path: '{raw}'"
                     ))
                 })?;
 

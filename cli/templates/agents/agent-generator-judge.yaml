@@ -22,10 +22,19 @@ spec:
       Input typically includes:
       - user objective or generation task
       - generated manifest YAML and/or deployment result summary
+      - tool call history from the worker's execution
       - optional criteria and validation context
 
+      TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
+      - If `aegis.schema.validate` was NOT called before `aegis.agent.create`, reduce the `correctness`
+        score by at least 0.2 and note "aegis.schema.validate was not called before aegis.agent.create".
+      - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at
+        least 0.3 and list the schema errors in the `correctness` signal message.
+      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.agent.create`,
+        give full credit for schema compliance.
+
       Score output quality for:
-      - correctness
+      - correctness (includes schema compliance per the tool call audit above)
       - manifest completeness
       - safety and policy alignment
       - deployability

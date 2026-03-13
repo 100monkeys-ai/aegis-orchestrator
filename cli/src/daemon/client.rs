@@ -36,9 +36,9 @@ impl DaemonClient {
             .context("Failed to create HTTP client")?;
 
         let base_url = if host.starts_with("http://") || host.starts_with("https://") {
-            format!("{}:{}", host, port)
+            format!("{host}:{port}")
         } else {
-            format!("http://{}:{}", host, port)
+            format!("http://{host}:{port}")
         };
 
         Ok(Self { client, base_url })
@@ -60,7 +60,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to deploy agent: {}", error_text);
+            anyhow::bail!("Failed to deploy agent: {error_text}");
         }
 
         #[derive(Deserialize)]
@@ -92,7 +92,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to execute agent: {}", error_text);
+            anyhow::bail!("Failed to execute agent: {error_text}");
         }
 
         #[derive(Deserialize)]
@@ -118,7 +118,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get execution: {}", error_text);
+            anyhow::bail!("Failed to get execution: {error_text}");
         }
 
         response
@@ -140,7 +140,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to cancel execution: {}", error_text);
+            anyhow::bail!("Failed to cancel execution: {error_text}");
         }
 
         Ok(())
@@ -153,7 +153,7 @@ impl DaemonClient {
     ) -> Result<Vec<ExecutionInfo>> {
         let mut url = format!("{}/v1/executions?limit={}", self.base_url, limit);
         if let Some(aid) = agent_id {
-            url.push_str(&format!("&agent_id={}", aid));
+            url.push_str(&format!("&agent_id={aid}"));
         }
 
         let response = self
@@ -165,7 +165,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to list executions: {}", error_text);
+            anyhow::bail!("Failed to list executions: {error_text}");
         }
 
         response
@@ -197,7 +197,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to stream logs: {}", error_text);
+            anyhow::bail!("Failed to stream logs: {error_text}");
         }
 
         let mut stream = response.bytes_stream();
@@ -244,7 +244,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to stream agent logs: {}", error_text);
+            anyhow::bail!("Failed to stream agent logs: {error_text}");
         }
 
         let mut stream = response.bytes_stream();
@@ -279,7 +279,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to delete execution: {}", error_text);
+            anyhow::bail!("Failed to delete execution: {error_text}");
         }
 
         Ok(())
@@ -295,7 +295,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to list agents: {}", error_text);
+            anyhow::bail!("Failed to list agents: {error_text}");
         }
 
         response
@@ -314,7 +314,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get agent: {}", error_text);
+            anyhow::bail!("Failed to get agent: {error_text}");
         }
 
         response
@@ -333,7 +333,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to delete agent: {}", error_text);
+            anyhow::bail!("Failed to delete agent: {error_text}");
         }
 
         Ok(())
@@ -352,7 +352,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to lookup agent: {}", error_text);
+            anyhow::bail!("Failed to lookup agent: {error_text}");
         }
 
         #[derive(Deserialize)]
@@ -435,7 +435,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         "ExecutionStarted" => {
             println!(
                 "{} {}",
-                format!("[{}]", timestamp).dimmed(),
+                format!("[{timestamp}]").dimmed(),
                 "Execution started".bold()
             );
         }
@@ -446,7 +446,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
                 let action = event["action"].as_str().unwrap_or("");
                 println!(
                     "{} {} {} - {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "Iteration".yellow(),
                     iteration,
                     action
@@ -454,7 +454,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             } else {
                 println!(
                     "{} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "Iteration".yellow(),
                     iteration
                 );
@@ -467,7 +467,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             if verbose {
                 println!(
                     "{} {} {} {}\n{}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "Iteration".yellow(),
                     iteration,
                     "completed".green(),
@@ -476,7 +476,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             } else {
                 println!(
                     "{} {} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "Iteration".yellow(),
                     iteration,
                     "completed".green()
@@ -488,7 +488,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             let error = extract_iteration_error_message(event);
             println!(
                 "{} {} {} {} - {}",
-                format!("[{}]", timestamp).dimmed(),
+                format!("[{timestamp}]").dimmed(),
                 "Iteration".yellow(),
                 iteration,
                 "failed".red(),
@@ -514,20 +514,20 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
 
                 println!(
                     "{} {} [{}]",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "LLM Interaction".purple().bold(),
                     model
                 );
                 println!("{}", "PROMPT:".dimmed());
-                println!("{}", prompt);
+                println!("{prompt}");
                 println!("{}", "RESPONSE:".dimmed());
-                println!("{}", response);
+                println!("{response}");
                 println!("{}", "-".repeat(40).dimmed());
             } else {
                 // Show model interaction indicator without response content
                 println!(
                     "{} {} [{}]",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "LLM".purple(),
                     model
                 );
@@ -537,14 +537,14 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             if verbose {
                 println!(
                     "{} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     event_type.cyan(),
                     serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
                 );
             } else {
                 println!(
                     "{} {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     "Execution completed".green().bold()
                 );
             }
@@ -552,7 +552,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
         "ExecutionFailed" => {
             println!(
                 "{} {} {}",
-                format!("[{}]", timestamp).dimmed(),
+                format!("[{timestamp}]").dimmed(),
                 "Execution failed".red().bold(),
                 event["data"]["error"]
                     .as_str()
@@ -564,7 +564,7 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
             if event_type != "Unknown" {
                 println!(
                     "{} {} {}",
-                    format!("[{}]", timestamp).dimmed(),
+                    format!("[{timestamp}]").dimmed(),
                     event_type.cyan(),
                     serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
                 );
@@ -598,7 +598,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to deploy workflow: {}", error_text);
+            anyhow::bail!("Failed to deploy workflow: {error_text}");
         }
 
         Ok(())
@@ -621,7 +621,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to run workflow: {}", error_text);
+            anyhow::bail!("Failed to run workflow: {error_text}");
         }
 
         #[derive(Deserialize)]
@@ -648,7 +648,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to list workflows: {}", error_text);
+            anyhow::bail!("Failed to list workflows: {error_text}");
         }
 
         let list_response: WorkflowListResponse = response
@@ -675,7 +675,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to describe workflow: {}", error_text);
+            anyhow::bail!("Failed to describe workflow: {error_text}");
         }
 
         let workflow_yaml = response
@@ -697,7 +697,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to delete workflow: {}", error_text);
+            anyhow::bail!("Failed to delete workflow: {error_text}");
         }
 
         Ok(())
@@ -717,7 +717,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to stream logs: {}", error_text);
+            anyhow::bail!("Failed to stream logs: {error_text}");
         }
 
         let mut stream = response.bytes_stream();
@@ -725,7 +725,7 @@ impl DaemonClient {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("Failed to read log chunk")?;
             let text = String::from_utf8_lossy(&chunk);
-            print!("{}", text);
+            print!("{text}");
         }
 
         Ok(())
@@ -745,7 +745,7 @@ impl DaemonClient {
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get logs: {}", error_text);
+            anyhow::bail!("Failed to get logs: {error_text}");
         }
 
         let logs = response.text().await.context("Failed to read logs")?;

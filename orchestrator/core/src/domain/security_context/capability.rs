@@ -112,7 +112,7 @@ impl Capability {
                 if let Some(ref allowlist) = self.command_allowlist {
                     if !allowlist.contains(&cmd_base.to_string()) {
                         return Err(PolicyViolation::ToolNotAllowed {
-                            tool_name: format!("cmd.run (command: {})", cmd),
+                            tool_name: format!("cmd.run (command: {cmd})"),
                             allowed_tools: allowlist.clone(),
                         });
                     }
@@ -123,13 +123,13 @@ impl Capability {
                         let subcommand = cmd_parts[1];
                         if !sub_allowlist.contains(&subcommand.to_string()) {
                             return Err(PolicyViolation::ToolNotAllowed {
-                                tool_name: format!("cmd.run (subcommand: {})", subcommand),
+                                tool_name: format!("cmd.run (subcommand: {subcommand})"),
                                 allowed_tools: sub_allowlist.clone(),
                             });
                         }
                     } else if !sub_allowlist.is_empty() {
                         return Err(PolicyViolation::ToolNotAllowed {
-                            tool_name: format!("cmd.run (missing subcommand: {})", cmd),
+                            tool_name: format!("cmd.run (missing subcommand: {cmd})"),
                             allowed_tools: sub_allowlist.clone(),
                         });
                     }

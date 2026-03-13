@@ -178,8 +178,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ContainerStepError::ImagePullFailed {
                                 image: config.image.clone(),
                                 error: format!(
-                                "environment variable '{}' (from registry_credentials) is not set",
-                                var_name
+                                "environment variable '{var_name}' (from registry_credentials) is not set"
                             ),
                             }
                         })?;
@@ -196,9 +195,8 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ContainerStepError::ImagePullFailed {
                                 image: config.image.clone(),
                                 error: format!(
-                                    "env var '{}' must be in format 'username:password' or \
-                                     'username:password@serveraddress'",
-                                    var_name
+                                    "env var '{var_name}' must be in format 'username:password' or \
+                                     'username:password@serveraddress'"
                                 ),
                             }
                         })?;
@@ -221,9 +219,8 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                             ContainerStepError::ImagePullFailed {
                                 image: config.image.clone(),
                                 error: format!(
-                                    "secret registry_credentials '{}' must be in format \
-                                     'secret:engine/path'",
-                                    s
+                                    "secret registry_credentials '{s}' must be in format \
+                                     'secret:engine/path'"
                                 ),
                             }
                         })?;
@@ -236,8 +233,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                         .map_err(|e| ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
                             error: format!(
-                                "failed to read registry credentials from OpenBao at '{}': {}",
-                                secret_ref_path, e
+                                "failed to read registry credentials from OpenBao at '{secret_ref_path}': {e}"
                             ),
                         })?;
 
@@ -245,8 +241,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                         ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
                             error: format!(
-                                "OpenBao secret at '{}' is missing required field 'username'",
-                                secret_ref_path
+                                "OpenBao secret at '{secret_ref_path}' is missing required field 'username'"
                             ),
                         }
                     })?;
@@ -255,8 +250,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                         ContainerStepError::ImagePullFailed {
                             image: config.image.clone(),
                             error: format!(
-                                "OpenBao secret at '{}' is missing required field 'password'",
-                                secret_ref_path
+                                "OpenBao secret at '{secret_ref_path}' is missing required field 'password'"
                             ),
                         }
                     })?;
@@ -278,9 +272,8 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             Some(s) => Err(ContainerStepError::ImagePullFailed {
                 image: config.image.clone(),
                 error: format!(
-                    "unrecognised registry_credentials format '{}'; \
-                             expected 'env:VAR_NAME' or 'secret:engine/path'",
-                    s
+                    "unrecognised registry_credentials format '{s}'; \
+                             expected 'env:VAR_NAME' or 'secret:engine/path'"
                 ),
             }),
         };
@@ -403,11 +396,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         // ─── 4. Build env vars ────────────────────────────────────────────────
         // Intentionally does NOT inject AEGIS_ORCHESTRATOR_URL or any bootstrap
         // env vars — this is a deterministic CI/CD step, not an agent iteration.
-        let env_strings: Vec<String> = config
-            .env
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let env_strings: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // ─── 5. Resolve command ───────────────────────────────────────────────
         // Shell wrapping (sh -c) is applied upstream in RunContainerStepUseCase
@@ -448,10 +437,10 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                 if e.to_string().to_lowercase().contains("mount") {
                     ContainerStepError::VolumeMountFailed {
                         volume: "unknown".to_string(),
-                        error: format!("create_container: {}", e),
+                        error: format!("create_container: {e}"),
                     }
                 } else {
-                    ContainerStepError::DockerError(format!("create_container: {}", e))
+                    ContainerStepError::DockerError(format!("create_container: {e}"))
                 }
             });
 
@@ -479,7 +468,7 @@ impl ContainerStepRunner for DockerContainerStepRunner {
                     ..Default::default()
                 }),
             ));
-            let error = ContainerStepError::DockerError(format!("start_container: {}", e));
+            let error = ContainerStepError::DockerError(format!("start_container: {e}"));
             self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
             return Err(error);
         }
@@ -654,7 +643,7 @@ async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutpu
             }
             Ok(_) => {}
             Err(e) => {
-                return Err(CaptureError::Docker(format!("logs stream error: {}", e)));
+                return Err(CaptureError::Docker(format!("logs stream error: {e}")));
             }
         }
     }
@@ -669,7 +658,7 @@ async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutpu
         match result {
             Ok(body) => body.status_code as i32,
             Err(e) => {
-                return Err(CaptureError::Docker(format!("wait_container error: {}", e)));
+                return Err(CaptureError::Docker(format!("wait_container error: {e}")));
             }
         }
     } else {

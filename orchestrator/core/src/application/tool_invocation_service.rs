@@ -24,6 +24,7 @@ use crate::infrastructure::tool_router::ToolRouter;
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::application::ports::ExternalWebToolPort;
+use crate::application::schema_registry::SchemaRegistry;
 use crate::domain::events::{MCPToolEvent, ViolationType};
 use crate::domain::execution::ExecutionInput;
 use crate::domain::mcp::{MCPError, PolicyViolation, ToolInvocationId, ToolServerId};
@@ -70,6 +71,8 @@ pub struct ToolInvocationService {
     generated_manifests_root: Option<PathBuf>,
     /// Optional ADR-053 SMCP gateway URL from node config.
     smcp_gateway_url: Option<String>,
+    /// Schema registry for builtin schema.get / schema.validate tools.
+    schema_registry: Arc<SchemaRegistry>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -102,6 +105,7 @@ impl ToolInvocationService {
             validation_service: None,
             generated_manifests_root: None,
             smcp_gateway_url,
+            schema_registry: Arc::new(SchemaRegistry::build()),
         }
     }
 
@@ -203,14 +207,11 @@ impl ToolInvocationService {
                 allowed_tools,
             } => (
                 ViolationType::ToolNotAllowed,
-                format!(
-                    "Tool '{}' is not allowed. Allowed: {:?}",
-                    tool_name, allowed_tools
-                ),
+                format!("Tool '{tool_name}' is not allowed. Allowed: {allowed_tools:?}"),
             ),
             PolicyViolation::ToolExplicitlyDenied { tool_name } => (
                 ViolationType::ToolExplicitlyDenied,
-                format!("Tool '{}' is explicitly denied", tool_name),
+                format!("Tool '{tool_name}' is explicitly denied"),
             ),
             PolicyViolation::RateLimitExceeded {
                 max_calls,
@@ -218,8 +219,7 @@ impl ToolInvocationService {
             } => (
                 ViolationType::RateLimitExceeded,
                 format!(
-                    "Rate limit exceeded: current_calls={}, max_calls={}",
-                    current_calls, max_calls
+                    "Rate limit exceeded: current_calls={current_calls}, max_calls={max_calls}"
                 ),
             ),
             PolicyViolation::PathOutsideBoundary {
@@ -242,21 +242,18 @@ impl ToolInvocationService {
                 allowed_domains,
             } => (
                 ViolationType::DomainNotAllowed,
-                format!(
-                    "Domain '{}' not allowed. Allowed: {:?}",
-                    domain, allowed_domains
-                ),
+                format!("Domain '{domain}' not allowed. Allowed: {allowed_domains:?}"),
             ),
             PolicyViolation::MissingRequiredArgument(arg) => (
                 ViolationType::MissingRequiredArgument,
-                format!("Missing required argument '{}'", arg),
+                format!("Missing required argument '{arg}'"),
             ),
             PolicyViolation::TimeoutExceeded {
                 tool_name,
                 max_duration,
             } => (
                 ViolationType::TimeoutExceeded,
-                format!("Tool '{}' exceeded timeout {:?}", tool_name, max_duration),
+                format!("Tool '{tool_name}' exceeded timeout {max_duration:?}"),
             ),
         }
     }
@@ -295,7 +292,7 @@ impl ToolInvocationService {
             .tool_router
             .route_tool(session.execution_id, &tool_name)
             .await
-            .map_err(|e| SmcpSessionError::MalformedPayload(format!("Routing error: {}", e)))?;
+            .map_err(|e| SmcpSessionError::MalformedPayload(format!("Routing error: {e}")))?;
 
         let server = self.tool_router.get_server(server_id).await.ok_or(
             SmcpSessionError::MalformedPayload("Server vanished after routing".to_string()),
@@ -424,8 +421,7 @@ impl ToolInvocationService {
             .await
             .map_err(|e| {
                 SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Failed to retrieve agent: {}",
-                    e
+                    "Failed to retrieve agent: {e}"
                 ))
             })?;
 
@@ -463,14 +459,12 @@ impl ToolInvocationService {
                             .await
                             .map_err(|e| {
                                 SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Failed to lookup judge: {}",
-                                    e
+                                    "Failed to lookup judge: {e}"
                                 ))
                             })?
                             .ok_or_else(|| {
                                 SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Judge agent '{}' not found",
-                                    judge_agent
+                                    "Judge agent '{judge_agent}' not found"
                                 ))
                             })?;
 
@@ -524,8 +518,7 @@ impl ToolInvocationService {
                             .await
                             .map_err(|e| {
                                 SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Failed to spawn judge child execution: {}",
-                                    e
+                                    "Failed to spawn judge child execution: {e}"
                                 ))
                             })?;
 
@@ -543,13 +536,11 @@ impl ToolInvocationService {
                                     execution_id,
                                     *agent_id,
                                     format!(
-                                        "Inner-loop semantic judge '{}' timed out after {} seconds",
-                                        judge_agent, timeout_seconds
+                                        "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds"
                                     ),
                                 );
                                 return Err(SmcpSessionError::JudgeTimeout(format!(
-                                    "Inner-loop semantic judge '{}' timed out after {} seconds.",
-                                    judge_agent, timeout_seconds
+                                    "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds."
                                 )));
                             }
 
@@ -559,8 +550,7 @@ impl ToolInvocationService {
                                 .await
                                 .map_err(|e| {
                                     SmcpSessionError::InternalError(format!(
-                                        "Failed to get judge execution {}: {}",
-                                        exec_id, e
+                                        "Failed to get judge execution {exec_id}: {e}"
                                     ))
                                 })?;
 
@@ -583,8 +573,7 @@ impl ToolInvocationService {
                                     let result: crate::domain::validation::GradientResult =
                                         serde_json::from_str(&json_str).map_err(|e| {
                                             SmcpSessionError::SignatureVerificationFailed(format!(
-                                                "Failed to parse judge output: {}",
-                                                e
+                                                "Failed to parse judge output: {e}"
                                             ))
                                         })?;
 
@@ -729,6 +718,7 @@ impl ToolInvocationService {
             &self.fsal,
             &self.volume_registry,
             &self.web_tool_port,
+            &self.schema_registry,
         )
         .await
         {
@@ -788,11 +778,10 @@ impl ToolInvocationService {
                     invocation_id,
                     execution_id,
                     *agent_id,
-                    format!("Routing error: {}", routing_err),
+                    format!("Routing error: {routing_err}"),
                 );
                 return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Routing error: {}",
-                    routing_err
+                    "Routing error: {routing_err}"
                 )));
             }
         };
@@ -864,7 +853,7 @@ impl ToolInvocationService {
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
         let mut tools = self.tool_router.list_tools().await.map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {e}"))
         })?;
 
         if self.smcp_gateway_url.is_some() {
@@ -964,8 +953,7 @@ impl ToolInvocationService {
 
             if fsal_mounts.is_empty() {
                 return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                    "No FSAL mounts registered for execution {}",
-                    execution_id
+                    "No FSAL mounts registered for execution {execution_id}"
                 )));
             }
 
@@ -1048,8 +1036,7 @@ impl ToolInvocationService {
                     )
                     .map_err(|e| {
                         SmcpSessionError::SignatureVerificationFailed(format!(
-                            "Agent deployed but failed to persist manifest: {}",
-                            e
+                            "Agent deployed but failed to persist manifest: {e}"
                         ))
                     })?;
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -1076,7 +1063,7 @@ impl ToolInvocationService {
 
     async fn invoke_aegis_agent_list_tool(&self) -> Result<ToolInvocationResult, SmcpSessionError> {
         let agents = self.agent_lifecycle.list_agents().await.map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list agents: {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
         })?;
 
         let entries: Vec<serde_json::Value> = agents
@@ -1199,14 +1186,12 @@ impl ToolInvocationService {
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "Failed to lookup judge agent '{}': {}",
-                        judge_name, e
+                        "Failed to lookup judge agent '{judge_name}': {e}"
                     ))
                 })?
                 .ok_or_else(|| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "Judge agent '{}' not found",
-                        judge_name
+                        "Judge agent '{judge_name}' not found"
                     ))
                 })?;
             judges.push((judge_id, 1.0));
@@ -1216,8 +1201,7 @@ impl ToolInvocationService {
             "Evaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness.".to_string()
         } else {
             format!(
-                "Task Context:\n{}\n\nEvaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness.",
-                task_context
+                "Task Context:\n{task_context}\n\nEvaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness."
             )
         };
 
@@ -1252,8 +1236,7 @@ impl ToolInvocationService {
             .await
             .map_err(|e| {
                 SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Workflow semantic validation failed: {}",
-                    e
+                    "Workflow semantic validation failed: {e}"
                 ))
             })?;
 
@@ -1292,8 +1275,7 @@ impl ToolInvocationService {
                     )
                     .map_err(|e| {
                         SmcpSessionError::SignatureVerificationFailed(format!(
-                            "Workflow deployed but failed to persist manifest: {}",
-                            e
+                            "Workflow deployed but failed to persist manifest: {e}"
                         ))
                     })?;
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -1346,7 +1328,7 @@ impl ToolInvocationService {
         let target_dir = root.join(kind).join(safe_name);
         std::fs::create_dir_all(&target_dir)?;
 
-        let file_path = target_dir.join(format!("{}.yaml", safe_version));
+        let file_path = target_dir.join(format!("{safe_version}.yaml"));
         std::fs::write(&file_path, manifest_yaml)?;
         Ok(Some(path_to_string(&file_path)))
     }

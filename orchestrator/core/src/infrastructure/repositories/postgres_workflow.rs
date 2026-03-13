@@ -69,7 +69,7 @@ impl PostgresWorkflowRepository {
         let result = hasher.finalize();
         let mut hex_string = String::new();
         for byte in result {
-            let _ = write!(hex_string, "{:02x}", byte);
+            let _ = write!(hex_string, "{byte:02x}");
         }
         hex_string
     }
@@ -90,13 +90,10 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 workflow,
             )
             .map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to map temporal definition: {}", e))
+                RepositoryError::Serialization(format!("Failed to map temporal definition: {e}"))
             })?;
         let temporal_def_json = serde_json::to_value(temporal_def).map_err(|e| {
-            RepositoryError::Serialization(format!(
-                "Failed to serialize temporal definition: {}",
-                e
-            ))
+            RepositoryError::Serialization(format!("Failed to serialize temporal definition: {e}"))
         })?;
 
         // Version
@@ -129,7 +126,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(&temporal_def_json)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflows: {}", e)))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflows: {e}")))?;
 
         // Also save to shared workflow_definitions table for TypeScript worker
         let def_hash = Self::compute_hash(&temporal_def_json);
@@ -151,7 +148,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(def_hash)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflow_definitions: {}", e)))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save to workflow_definitions: {e}")))?;
 
         Ok(())
     }

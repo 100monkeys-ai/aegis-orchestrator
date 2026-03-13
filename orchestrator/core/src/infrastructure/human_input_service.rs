@@ -158,7 +158,7 @@ impl HumanInputService {
             let _ = request.response_tx.send(status);
             Ok(())
         } else {
-            anyhow::bail!("Request {} not found or already completed", request_id)
+            anyhow::bail!("Request {request_id} not found or already completed")
         }
     }
 
@@ -189,7 +189,7 @@ impl HumanInputService {
             let _ = request.response_tx.send(status);
             Ok(())
         } else {
-            anyhow::bail!("Request {} not found or already completed", request_id)
+            anyhow::bail!("Request {request_id} not found or already completed")
         }
     }
 
@@ -235,7 +235,7 @@ impl HumanInputService {
             });
             Ok(())
         } else {
-            anyhow::bail!("Request {} not found", request_id)
+            anyhow::bail!("Request {request_id} not found")
         }
     }
 }
@@ -293,8 +293,7 @@ mod tests {
 
         assert!(
             matches!(result, HumanInputStatus::Approved { .. }),
-            "Expected approval result, got {:?}",
-            result
+            "Expected approval result, got {result:?}"
         );
         let HumanInputStatus::Approved {
             feedback,
@@ -339,8 +338,7 @@ mod tests {
 
         assert!(
             matches!(result, HumanInputStatus::Rejected { .. }),
-            "Expected rejection result, got {:?}",
-            result
+            "Expected rejection result, got {result:?}"
         );
         let HumanInputStatus::Rejected {
             reason,
@@ -367,8 +365,7 @@ mod tests {
 
         assert!(
             matches!(result, HumanInputStatus::TimedOut { .. }),
-            "Expected timeout result, got {:?}",
-            result
+            "Expected timeout result, got {result:?}"
         );
     }
 

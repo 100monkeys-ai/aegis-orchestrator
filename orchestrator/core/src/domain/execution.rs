@@ -93,8 +93,7 @@ impl ExecutionHierarchy {
 
         if new_depth > MAX_RECURSIVE_DEPTH {
             return Err(format!(
-                "Maximum recursive depth ({}) exceeded. Cannot create child execution.",
-                MAX_RECURSIVE_DEPTH
+                "Maximum recursive depth ({MAX_RECURSIVE_DEPTH}) exceeded. Cannot create child execution."
             ));
         }
 
@@ -512,7 +511,7 @@ mod tests {
     #[test]
     fn test_execution_id_display() {
         let id = ExecutionId::new();
-        let s = format!("{}", id);
+        let s = format!("{id}");
         assert_eq!(s, id.0.to_string());
     }
 

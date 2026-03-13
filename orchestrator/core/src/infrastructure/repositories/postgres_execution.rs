@@ -130,7 +130,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(parent_execution_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {}", e)))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
 
         Ok(())
     }
@@ -173,13 +173,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 "failed" => Ok(ExecutionStatus::Failed),
                 "cancelled" => Ok(ExecutionStatus::Cancelled),
                 other => Err(RepositoryError::Serialization(format!(
-                    "Unknown execution status value from database: '{}'",
-                    other
+                    "Unknown execution status value from database: '{other}'"
                 ))),
             }?;
 
             let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize input: {}", e))
+                RepositoryError::Serialization(format!("Failed to deserialize input: {e}"))
             })?;
 
             // There is a weird issue where iterations might be stored as property of Execution,
@@ -187,16 +186,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
             // The `iterations` column is JSONB array.
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
-                    RepositoryError::Serialization(format!(
-                        "Failed to deserialize iterations: {}",
-                        e
-                    ))
+                    RepositoryError::Serialization(format!("Failed to deserialize iterations: {e}"))
                 })?;
 
             let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid max_iterations value {}: expected 0-255",
-                    max_iterations
+                    "Invalid max_iterations value {max_iterations}: expected 0-255"
                 ))
             })?;
 
@@ -220,15 +215,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
             let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_uid value (expected non-negative i32): {}",
-                    container_uid
+                    "Invalid container_uid value (expected non-negative i32): {container_uid}"
                 ))
             })?;
 
             let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_gid value (expected non-negative i32): {}",
-                    container_gid
+                    "Invalid container_gid value (expected non-negative i32): {container_gid}"
                 ))
             })?;
 
@@ -298,29 +291,23 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 "failed" => Ok(ExecutionStatus::Failed),
                 "cancelled" => Ok(ExecutionStatus::Cancelled),
                 other => Err(RepositoryError::Serialization(format!(
-                    "Unknown execution status value from database: '{}'",
-                    other
+                    "Unknown execution status value from database: '{other}'"
                 ))),
             }?;
 
             let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
                 RepositoryError::Serialization(format!(
-                    "Failed to deserialize execution input: {}",
-                    e
+                    "Failed to deserialize execution input: {e}"
                 ))
             })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
-                    RepositoryError::Serialization(format!(
-                        "Failed to deserialize iterations: {}",
-                        e
-                    ))
+                    RepositoryError::Serialization(format!("Failed to deserialize iterations: {e}"))
                 })?;
 
             let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid max_iterations value {}: expected 0-255",
-                    max_iterations
+                    "Invalid max_iterations value {max_iterations}: expected 0-255"
                 ))
             })?;
 
@@ -335,15 +322,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
             let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_uid value (expected non-negative i32): {}",
-                    container_uid
+                    "Invalid container_uid value (expected non-negative i32): {container_uid}"
                 ))
             })?;
 
             let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_gid value (expected non-negative i32): {}",
-                    container_gid
+                    "Invalid container_gid value (expected non-negative i32): {container_gid}"
                 ))
             })?;
 
@@ -405,29 +390,23 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 "failed" => Ok(ExecutionStatus::Failed),
                 "cancelled" => Ok(ExecutionStatus::Cancelled),
                 other => Err(RepositoryError::Serialization(format!(
-                    "Unknown execution status value from database: '{}'",
-                    other
+                    "Unknown execution status value from database: '{other}'"
                 ))),
             }?;
 
             let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
                 RepositoryError::Serialization(format!(
-                    "Failed to deserialize execution input: {}",
-                    e
+                    "Failed to deserialize execution input: {e}"
                 ))
             })?;
             let iterations: Vec<Iteration> =
                 serde_json::from_value(iterations_val).map_err(|e| {
-                    RepositoryError::Serialization(format!(
-                        "Failed to deserialize iterations: {}",
-                        e
-                    ))
+                    RepositoryError::Serialization(format!("Failed to deserialize iterations: {e}"))
                 })?;
 
             let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid max_iterations value {}: expected 0-255",
-                    max_iterations
+                    "Invalid max_iterations value {max_iterations}: expected 0-255"
                 ))
             })?;
 
@@ -442,15 +421,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
             let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_uid value (expected non-negative i32): {}",
-                    container_uid
+                    "Invalid container_uid value (expected non-negative i32): {container_uid}"
                 ))
             })?;
 
             let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
                 RepositoryError::Serialization(format!(
-                    "Invalid container_gid value (expected non-negative i32): {}",
-                    container_gid
+                    "Invalid container_gid value (expected non-negative i32): {container_gid}"
                 ))
             })?;
 

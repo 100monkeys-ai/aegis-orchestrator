@@ -91,7 +91,7 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
         Ok(DaemonStatus::Running { pid, .. }) => {
             println!(
                 "{}",
-                format!("✓ Daemon already running (PID: {})", pid).green()
+                format!("✓ Daemon already running (PID: {pid})").green()
             );
             println!("Use 'aegis daemon stop' to stop it first.");
             return Ok(());
@@ -165,12 +165,12 @@ async fn stop(force: bool, timeout: u64, host: &str, port: u16) -> Result<()> {
             return Ok(());
         }
         Ok(DaemonStatus::Running { pid, .. }) | Ok(DaemonStatus::Unhealthy { pid, .. }) => {
-            println!("Stopping daemon (PID: {})...", pid);
+            println!("Stopping daemon (PID: {pid})...");
             stop_daemon(force, timeout).await?;
             println!("{}", "✓ Daemon stopped".green());
         }
         Err(e) => {
-            println!("{}", format!("✗ Failed to check daemon: {}", e).red());
+            println!("{}", format!("✗ Failed to check daemon: {e}").red());
             return Err(e);
         }
     }
@@ -182,7 +182,7 @@ async fn status(host: &str, port: u16) -> Result<()> {
     match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, uptime }) => {
             println!("{}", "✓ Daemon is running".green());
-            println!("  PID: {}", pid);
+            println!("  PID: {pid}");
             if let Some(uptime) = uptime {
                 println!("  Uptime: {}", format_duration(uptime));
             }
@@ -191,12 +191,12 @@ async fn status(host: &str, port: u16) -> Result<()> {
             println!("{}", "✗ Daemon is not running".red());
         }
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
-            println!("{}", format!("⚠ Daemon unhealthy (PID: {})", pid).yellow());
-            println!("  Process exists but HTTP API check failed: {}", error);
+            println!("{}", format!("⚠ Daemon unhealthy (PID: {pid})").yellow());
+            println!("  Process exists but HTTP API check failed: {error}");
             println!("  Check logs at /tmp/aegis.out and /tmp/aegis.err");
         }
         Err(e) => {
-            println!("{}", format!("✗ Failed to check status: {}", e).red());
+            println!("{}", format!("✗ Failed to check status: {e}").red());
             return Err(e);
         }
     }
@@ -234,10 +234,10 @@ fn format_duration(secs: u64) -> String {
     let minutes = (secs % 3600) / 60;
 
     if days > 0 {
-        format!("{}d {}h {}m", days, hours, minutes)
+        format!("{days}d {hours}h {minutes}m")
     } else if hours > 0 {
-        format!("{}h {}m", hours, minutes)
+        format!("{hours}h {minutes}m")
     } else {
-        format!("{}m", minutes)
+        format!("{minutes}m")
     }
 }

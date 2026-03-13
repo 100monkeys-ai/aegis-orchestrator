@@ -33,24 +33,24 @@ impl PostgresStorageEventRepository {
     fn deserialize_row(row: &sqlx::postgres::PgRow) -> Result<StorageEvent, RepositoryError> {
         let event_type: String = row
             .try_get("event_type")
-            .map_err(|e| RepositoryError::Database(format!("Missing event_type: {}", e)))?;
+            .map_err(|e| RepositoryError::Database(format!("Missing event_type: {e}")))?;
         let execution_id = ExecutionId(
             row.try_get::<Uuid, _>("execution_id")
-                .map_err(|e| RepositoryError::Database(format!("Missing execution_id: {}", e)))?,
+                .map_err(|e| RepositoryError::Database(format!("Missing execution_id: {e}")))?,
         );
         let volume_id = VolumeId(
             row.try_get::<Uuid, _>("volume_id")
-                .map_err(|e| RepositoryError::Database(format!("Missing volume_id: {}", e)))?,
+                .map_err(|e| RepositoryError::Database(format!("Missing volume_id: {e}")))?,
         );
         let path: String = row
             .try_get("path")
-            .map_err(|e| RepositoryError::Database(format!("Missing path: {}", e)))?;
+            .map_err(|e| RepositoryError::Database(format!("Missing path: {e}")))?;
         let details: serde_json::Value = row
             .try_get("operation_details")
-            .map_err(|e| RepositoryError::Database(format!("Missing operation_details: {}", e)))?;
+            .map_err(|e| RepositoryError::Database(format!("Missing operation_details: {e}")))?;
         let timestamp: DateTime<Utc> = row
             .try_get("timestamp")
-            .map_err(|e| RepositoryError::Database(format!("Missing timestamp: {}", e)))?;
+            .map_err(|e| RepositoryError::Database(format!("Missing timestamp: {e}")))?;
 
         // Parse timestamp from details (fallback to row timestamp if missing)
         let parse_timestamp = |key: &str| -> DateTime<Utc> {
@@ -198,8 +198,7 @@ impl PostgresStorageEventRepository {
             _ => {
                 warn!("Unknown storage event type: {}", event_type);
                 Err(RepositoryError::Database(format!(
-                    "Unknown event type: {}",
-                    event_type
+                    "Unknown event type: {event_type}"
                 )))
             }
         }

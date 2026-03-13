@@ -127,7 +127,7 @@ impl StandardRuntimeRegistry {
             .map_err(|e| RegistryError::FileNotFound(format!("{}:{}", path.display(), e)))?;
 
         let manifest: RegistryManifest = serde_yaml::from_str(&content)
-            .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {}", e)))?;
+            .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {e}")))?;
 
         Ok(Self {
             spec: manifest.spec,
@@ -141,7 +141,7 @@ impl StandardRuntimeRegistry {
     /// Returns [`RegistryError::ParseError`] if the YAML is malformed.
     pub fn from_yaml_str(content: &str) -> Result<Self, RegistryError> {
         let manifest: RegistryManifest = serde_yaml::from_str(content)
-            .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {}", e)))?;
+            .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {e}")))?;
 
         Ok(Self {
             spec: manifest.spec,
@@ -285,11 +285,7 @@ spec:
             Err(RegistryError::UnsupportedLanguage { language, .. }) => {
                 assert_eq!(language, "ruby");
             }
-            other => assert!(
-                false,
-                "Expected UnsupportedLanguage error, got: {:?}",
-                other
-            ),
+            other => panic!("Expected UnsupportedLanguage error, got: {other:?}"),
         }
     }
 
@@ -318,7 +314,7 @@ spec:
                 assert_eq!(language, "python");
                 assert_eq!(version, "3.9");
             }
-            other => assert!(false, "Expected UnsupportedVersion error, got: {:?}", other),
+            other => panic!("Expected UnsupportedVersion error, got: {other:?}"),
         }
     }
 

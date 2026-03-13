@@ -1352,9 +1352,8 @@ impl NodeConfigManifest {
         // 1. Explicit CLI path (Fail if missing/invalid)
         if let Some(path) = cli_path {
             tracing::info!("Loading configuration from explicit path: {:?}", path);
-            let mut config = Self::from_yaml_file(&path).map_err(|e| {
-                anyhow::anyhow!("Failed to search/load config at {:?}: {}", path, e)
-            })?;
+            let mut config = Self::from_yaml_file(&path)
+                .map_err(|e| anyhow::anyhow!("Failed to search/load config at {path:?}: {e}"))?;
             config.apply_env_overrides();
             return Ok(config);
         }
@@ -1504,10 +1503,7 @@ impl NodeConfigManifest {
                 .iter()
                 .any(|p| &p.name == default_provider)
             {
-                anyhow::bail!(
-                    "Default provider '{}' not found in llm_providers",
-                    default_provider
-                );
+                anyhow::bail!("Default provider '{default_provider}' not found in llm_providers");
             }
         }
 
@@ -1518,10 +1514,7 @@ impl NodeConfigManifest {
                 .iter()
                 .any(|p| &p.name == fallback_provider)
             {
-                anyhow::bail!(
-                    "Fallback provider '{}' not found in llm_providers",
-                    fallback_provider
-                );
+                anyhow::bail!("Fallback provider '{fallback_provider}' not found in llm_providers");
             }
         }
 
@@ -1547,9 +1540,7 @@ pub fn resolve_env_value(raw: &str) -> anyhow::Result<String> {
     if let Some(var_name) = raw.strip_prefix("env:") {
         std::env::var(var_name).map_err(|_| {
             anyhow::anyhow!(
-                "Environment variable '{}' not set (referenced via 'env:{}' in config)",
-                var_name,
-                var_name,
+                "Environment variable '{var_name}' not set (referenced via 'env:{var_name}' in config)",
             )
         })
     } else {
@@ -1562,6 +1553,14 @@ pub fn resolve_env_value(raw: &str) -> anyhow::Result<String> {
 /// Returns `None` if the input is `None` or if the env var is not set.
 pub fn resolve_env_value_optional(raw: &Option<String>) -> Option<String> {
     raw.as_ref().and_then(|v| resolve_env_value(v).ok())
+}
+
+fn default_bootstrap_script() -> String {
+    "assets/bootstrap.py".to_string()
+}
+
+fn default_isolation_mode() -> String {
+    "inherit".to_string()
 }
 
 #[cfg(test)]
@@ -1687,12 +1686,4 @@ mod tests {
         });
         assert!(manifest.validate().is_err());
     }
-}
-
-fn default_bootstrap_script() -> String {
-    "assets/bootstrap.py".to_string()
-}
-
-fn default_isolation_mode() -> String {
-    "inherit".to_string()
 }

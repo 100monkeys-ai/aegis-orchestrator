@@ -499,8 +499,7 @@ mod tests {
                 received,
                 DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed { .. })
             ),
-            "Expected AgentDeployed event, got {:?}",
-            received
+            "Expected AgentDeployed event, got {received:?}"
         );
         let DomainEvent::AgentLifecycle(AgentLifecycleEvent::AgentDeployed {
             agent_id: id, ..
@@ -537,8 +536,7 @@ mod tests {
         let received = receiver.recv().await.unwrap();
         assert!(
             matches!(received, ExecutionEvent::ExecutionStarted { .. }),
-            "Expected ExecutionStarted event, got {:?}",
-            received
+            "Expected ExecutionStarted event, got {received:?}"
         );
         let ExecutionEvent::ExecutionStarted {
             execution_id: id, ..

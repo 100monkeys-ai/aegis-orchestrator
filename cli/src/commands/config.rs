@@ -91,13 +91,13 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("{}", "Metadata:".bold());
     println!("  Name: {}", config.metadata.name);
     if let Some(version) = &config.metadata.version {
-        println!("  Version: {}", version);
+        println!("  Version: {version}");
     }
     if let Some(labels) = &config.metadata.labels {
         if !labels.is_empty() {
             println!("  Labels:");
             for (key, value) in labels {
-                println!("    {}: {}", key, value);
+                println!("    {key}: {value}");
             }
         }
     }
@@ -108,7 +108,7 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     println!("  ID: {}", config.spec.node.id);
     println!("  Type: {:?}", config.spec.node.node_type);
     if let Some(region) = &config.spec.node.region {
-        println!("  Region: {}", region);
+        println!("  Region: {region}");
     }
     if !config.spec.node.tags.is_empty() {
         println!("  Tags: {}", config.spec.node.tags.join(", "));
@@ -140,7 +140,7 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
             .unwrap_or("(none)")
     );
     if let Some(fallback) = &config.spec.llm_selection.fallback_provider {
-        println!("  Fallback provider: {}", fallback);
+        println!("  Fallback provider: {fallback}");
     }
     println!();
 
@@ -170,7 +170,7 @@ async fn generate(output: PathBuf, with_examples: bool) -> Result<()> {
     };
 
     std::fs::write(&output, sample)
-        .with_context(|| format!("Failed to write config to {:?}", output))?;
+        .with_context(|| format!("Failed to write config to {output:?}"))?;
 
     println!(
         "{}",

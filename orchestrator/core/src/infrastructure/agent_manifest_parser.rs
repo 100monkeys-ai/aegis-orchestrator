@@ -50,7 +50,7 @@ impl AgentManifestParser {
         // Validate the parsed manifest
         manifest
             .validate()
-            .map_err(|e| anyhow!("Manifest validation failed: {}", e))?;
+            .map_err(|e| anyhow!("Manifest validation failed: {e}"))?;
 
         Ok(manifest)
     }

@@ -81,7 +81,7 @@ pub async fn validate_grpc_request<T>(
         .await
         .map_err(|e| {
             warn!(method, error = %e, "gRPC JWT validation failed");
-            Status::unauthenticated(format!("Token validation failed: {}", e))
+            Status::unauthenticated(format!("Token validation failed: {e}"))
         })?;
 
     Ok(Some(validated.identity))

@@ -116,7 +116,7 @@ impl CredentialRef {
     pub fn from_secret_store(path: &str) -> Self {
         Self {
             store_type: CredentialStoreType::SecretStore,
-            key: format!("secret:{}", path),
+            key: format!("secret:{path}"),
         }
     }
 }
@@ -202,7 +202,7 @@ impl std::fmt::Display for DomainError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::InvalidStateTransition { from, to } => {
-                write!(f, "Invalid state transition from {} to {}", from, to)
+                write!(f, "Invalid state transition from {from} to {to}")
             }
         }
     }

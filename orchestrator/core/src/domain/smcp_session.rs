@@ -112,15 +112,15 @@ pub enum SmcpSessionError {
 impl std::fmt::Display for SmcpSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SessionInactive(status) => write!(f, "Session is inactive: {:?}", status),
+            Self::SessionInactive(status) => write!(f, "Session is inactive: {status:?}"),
             Self::SessionExpired => write!(f, "Session has expired"),
-            Self::PolicyViolation(v) => write!(f, "Policy violation: {:?}", v),
-            Self::MalformedPayload(msg) => write!(f, "Malformed MCP payload: {}", msg),
+            Self::PolicyViolation(v) => write!(f, "Policy violation: {v:?}"),
+            Self::MalformedPayload(msg) => write!(f, "Malformed MCP payload: {msg}"),
             Self::SignatureVerificationFailed(e) => {
-                write!(f, "Signature verification failed: {}", e)
+                write!(f, "Signature verification failed: {e}")
             }
-            Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {}", msg),
-            Self::InternalError(msg) => write!(f, "Internal error: {}", msg),
+            Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {msg}"),
+            Self::InternalError(msg) => write!(f, "Internal error: {msg}"),
         }
     }
 }

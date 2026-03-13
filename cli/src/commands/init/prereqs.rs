@@ -178,13 +178,13 @@ fn try_install(binary: &str) -> Result<()> {
 fn install_macos(binary: &str) -> Result<()> {
     let pkg = match binary {
         "docker" => "docker",
-        other => bail!("No brew formula known for '{}'", other),
+        other => bail!("No brew formula known for '{other}'"),
     };
     let status = std::process::Command::new("brew")
         .args(["install", "--cask", pkg])
         .status()?;
     if !status.success() {
-        bail!("brew install --cask {} exited with status {}", pkg, status);
+        bail!("brew install --cask {pkg} exited with status {status}");
     }
     Ok(())
 }

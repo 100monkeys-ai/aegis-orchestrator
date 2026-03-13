@@ -35,8 +35,7 @@ impl SmcpStorageProvider {
             Ok((volume_id, internal_path))
         } else {
             Err(StorageError::InvalidPath(format!(
-                "Invalid SMCP path struct: {}",
-                path
+                "Invalid SMCP path struct: {path}"
             )))
         }
     }

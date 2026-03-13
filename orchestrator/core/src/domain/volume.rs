@@ -176,9 +176,9 @@ mod duration_serialization {
         let hours = duration.num_hours();
         let remaining_minutes = duration.num_minutes() % 60;
         let duration_str = if remaining_minutes == 0 {
-            format!("PT{}H", hours)
+            format!("PT{hours}H")
         } else {
-            format!("PT{}H{}M", hours, remaining_minutes)
+            format!("PT{hours}H{remaining_minutes}M")
         };
         serializer.serialize_str(&duration_str)
     }
@@ -194,7 +194,7 @@ mod duration_serialization {
     fn parse_iso8601_duration(s: &str) -> Result<Duration, String> {
         // Simple ISO 8601 duration parser (supports PTnHnM format)
         if !s.starts_with("PT") {
-            return Err(format!("Invalid ISO 8601 duration: {}", s));
+            return Err(format!("Invalid ISO 8601 duration: {s}"));
         }
 
         let rest = &s[2..];
@@ -211,21 +211,21 @@ mod duration_serialization {
                 if !min_part.is_empty() {
                     minutes = min_part
                         .parse()
-                        .map_err(|_| format!("Invalid minutes: {}", min_part))?;
+                        .map_err(|_| format!("Invalid minutes: {min_part}"))?;
                 }
             }
         } else if rest.ends_with('H') {
             hours = rest
                 .trim_end_matches('H')
                 .parse()
-                .map_err(|_| format!("Invalid hours: {}", rest))?;
+                .map_err(|_| format!("Invalid hours: {rest}"))?;
         } else if rest.ends_with('M') {
             minutes = rest
                 .trim_end_matches('M')
                 .parse()
-                .map_err(|_| format!("Invalid minutes: {}", rest))?;
+                .map_err(|_| format!("Invalid minutes: {rest}"))?;
         } else {
-            return Err(format!("Invalid duration format: {}", s));
+            return Err(format!("Invalid duration format: {s}"));
         }
 
         Ok(Duration::hours(hours) + Duration::minutes(minutes))
@@ -282,7 +282,7 @@ impl FilerEndpoint {
 
         let port = parsed.port().unwrap_or(8888);
 
-        Ok(format!("{}:{}", host, port))
+        Ok(format!("{host}:{port}"))
     }
 }
 

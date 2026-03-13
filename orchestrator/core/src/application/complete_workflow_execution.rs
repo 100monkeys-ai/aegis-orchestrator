@@ -137,7 +137,7 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
             CompletionStatus::Cancelled => ExecutionStatus::Cancelled,
         };
 
-        let final_status_str = format!("{:?}", final_status).to_lowercase();
+        let final_status_str = format!("{final_status:?}").to_lowercase();
         execution.status = final_status;
 
         // Step 4: Merge final blackboard state if provided
@@ -369,6 +369,6 @@ mod tests {
 
         assert!(err
             .to_string()
-            .contains(&format!("Workflow execution not found: {}", missing)));
+            .contains(&format!("Workflow execution not found: {missing}")));
     }
 }

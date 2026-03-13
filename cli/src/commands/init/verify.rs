@@ -47,7 +47,7 @@ impl HealthChecker {
                 .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
         );
         spinner.enable_steady_tick(Duration::from_millis(80));
-        spinner.set_message(format!("Polling {}...", url));
+        spinner.set_message(format!("Polling {url}..."));
 
         let start = Instant::now();
         let client = reqwest::Client::builder()
@@ -66,7 +66,7 @@ impl HealthChecker {
                     spinner.set_message(format!("HTTP {} — retrying...", resp.status()));
                 }
                 Err(e) => {
-                    spinner.set_message(format!("Not reachable yet ({}) — retrying...", e));
+                    spinner.set_message(format!("Not reachable yet ({e}) — retrying..."));
                 }
             }
 

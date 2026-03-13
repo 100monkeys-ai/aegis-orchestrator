@@ -156,8 +156,7 @@ impl DockerImageManager for StandardDockerImageManager {
         if !should_pull {
             if !image_exists && matches!(policy, ImagePullPolicy::Never) {
                 return Err(RuntimeError::SpawnFailed(format!(
-                    "Image {} not found locally and image_pull_policy is Never",
-                    image
+                    "Image {image} not found locally and image_pull_policy is Never"
                 )));
             }
             return Ok(PullSource::Cached);
@@ -198,15 +197,14 @@ impl DockerImageManager for StandardDockerImageManager {
         while let Some(result) = stream.next().await {
             if let Err(e) = result {
                 let error_msg = format!(
-                    "Failed to pull image {}: {}\n\n\
+                    "Failed to pull image {image}: {e}\n\n\
                      Common causes:\n\
                      - Docker daemon not responding (connection issue)\n\
                      - No internet connectivity to Docker Hub\n\
                      - Image name is incorrect or doesn't exist\n\
                      - Corporate proxy/firewall blocking Docker Hub\n\
                      - Registry authentication required\n\n\
-                     Try manually: docker pull {}",
-                    image, e, image
+                     Try manually: docker pull {image}"
                 );
                 return Err(RuntimeError::SpawnFailed(error_msg));
             }

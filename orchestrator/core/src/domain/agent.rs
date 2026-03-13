@@ -39,11 +39,12 @@
 //! See AGENTS.md §Agent Domain ubiquitous language.
 
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// Image pull policy strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "PascalCase")]
 pub enum ImagePullPolicy {
     /// Always pull from registry, even if cached locally
@@ -97,7 +98,7 @@ pub struct Agent {
 
 /// Kubernetes-style Agent Manifest (v1.0)
 /// Follows spec: MANIFEST_SPEC_V1.md
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentManifest {
     /// API version (e.g., "100monkeys.ai/v1")
@@ -115,7 +116,7 @@ pub struct AgentManifest {
 }
 
 /// Kubernetes-style metadata
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ManifestMetadata {
     /// Unique agent name (DNS label format)
     pub name: String,
@@ -137,7 +138,7 @@ pub struct ManifestMetadata {
 }
 
 /// Agent specification (the main configuration)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AgentSpec {
     /// Runtime configuration
     pub runtime: RuntimeConfig,
@@ -186,7 +187,7 @@ pub struct AgentSpec {
 /// - **CustomRuntime**: image (user-supplied fully-qualified container image)
 ///
 /// Validation ensures exactly one mode is specified (not both).
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct RuntimeConfig {
     /// Programming language (python, javascript, typescript, rust, go)
     /// Mutually exclusive with `image` field.
@@ -206,14 +207,17 @@ pub struct RuntimeConfig {
 
     /// Image pull policy (Always, IfNotPresent, Never)
     /// Controls whether the runtime image is pulled from registry.
+    #[serde(default = "default_image_pull_policy")]
     pub image_pull_policy: ImagePullPolicy,
 
     /// Optional isolation mode (inherit, firecracker, docker, process)
+    #[serde(default = "default_isolation")]
     pub isolation: String,
 
     /// LLM model alias for this agent's primary LLM calls.
     /// Maps to a concrete provider + model in `aegis-config.yaml`.
     /// Standard aliases: `default`, `fast`, `smart`, `cheap`, `local`.
+    #[serde(default = "default_model_alias")]
     pub model: String,
 }
 
@@ -280,57 +284,8 @@ pub enum RuntimeType {
     Custom,
 }
 
-// For backward compatibility and deserialization, convert legacy format
-impl<'de> Deserialize<'de> for RuntimeConfig {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        struct RuntimeConfigHelper {
-            #[serde(default)]
-            language: Option<String>,
-            #[serde(default)]
-            version: Option<String>,
-            #[serde(default)]
-            image: Option<String>,
-            #[serde(default)]
-            image_pull_policy: Option<String>,
-            #[serde(default)]
-            isolation: Option<String>,
-            #[serde(default)]
-            model: Option<String>,
-        }
-
-        let helper = RuntimeConfigHelper::deserialize(deserializer)?;
-
-        // Parse image_pull_policy
-        let image_pull_policy = match helper.image_pull_policy.as_deref() {
-            Some("Always") => ImagePullPolicy::Always,
-            Some("IfNotPresent") => ImagePullPolicy::IfNotPresent,
-            Some("Never") => ImagePullPolicy::Never,
-            Some(invalid) => {
-                return Err(serde::de::Error::custom(format!(
-                    "invalid image_pull_policy: {} (must be Always, IfNotPresent, or Never)",
-                    invalid
-                )))
-            }
-            None => default_image_pull_policy(),
-        };
-
-        Ok(RuntimeConfig {
-            language: helper.language,
-            version: helper.version,
-            image: helper.image,
-            image_pull_policy,
-            isolation: helper.isolation.unwrap_or_else(default_isolation),
-            model: helper.model.unwrap_or_else(default_model_alias),
-        })
-    }
-}
-
 /// Volume specification in agent manifest
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct VolumeSpec {
     /// Volume name (used as identifier)
     pub name: String,
@@ -365,7 +320,7 @@ pub struct VolumeSpec {
     pub ttl_hours: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ScheduleConfig {
     Cron {
@@ -382,7 +337,7 @@ pub enum ScheduleConfig {
     Manual,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct TaskConfig {
     #[serde(default)]
     pub agentskills: Vec<String>,
@@ -394,7 +349,7 @@ pub struct TaskConfig {
     pub input_data: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ContextItem {
     Text {
@@ -415,7 +370,7 @@ pub enum ContextItem {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ExecutionStrategy {
     #[serde(default)]
     pub mode: ExecutionMode,
@@ -447,7 +402,7 @@ impl Default for ExecutionStrategy {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 #[serde(rename_all = "kebab-case")]
 pub enum ExecutionMode {
     #[default]
@@ -479,7 +434,7 @@ pub enum ExecutionMode {
 ///         criteria: "Output must be idiomatic Rust with no unsafe blocks"
 ///         min_score: 0.8
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ValidatorSpec {
     /// Passes when the agent's last exit code matches `expected` (default 0).
@@ -531,6 +486,7 @@ pub enum ValidatorSpec {
         judges: Vec<String>,
         /// Consensus strategy used to combine individual judge scores.
         #[serde(default = "default_consensus_strategy")]
+        #[schemars(skip)]
         consensus: crate::domain::workflow::ConsensusStrategy,
         /// Minimum number of judges that must complete for a valid result.
         #[serde(default = "default_one")]
@@ -571,12 +527,12 @@ fn default_consensus_strategy() -> crate::domain::workflow::ConsensusStrategy {
     crate::domain::workflow::ConsensusStrategy::WeightedAverage
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct DeliveryConfig {
     pub destinations: Vec<DeliveryDestination>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct DeliveryDestination {
     pub name: String,
     pub condition: DeliveryCondition,
@@ -586,7 +542,7 @@ pub struct DeliveryDestination {
     pub config: DeliveryType,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryCondition {
     OnSuccess,
@@ -594,7 +550,7 @@ pub enum DeliveryCondition {
     Always,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct TransformConfig {
     pub script: String,
     #[serde(default)]
@@ -603,7 +559,7 @@ pub struct TransformConfig {
     pub timeout_seconds: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum DeliveryType {
     Email { email: EmailConfig },
@@ -612,7 +568,7 @@ pub enum DeliveryType {
     Sms { sms: SmsConfig },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct EmailConfig {
     pub to: String,
     pub subject: String,
@@ -621,7 +577,7 @@ pub struct EmailConfig {
     pub attachments: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct WebhookConfig {
     pub url: String,
     #[serde(default = "default_post")]
@@ -631,7 +587,7 @@ pub struct WebhookConfig {
     pub body: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct RestConfig {
     pub url: String,
     pub method: String,
@@ -640,14 +596,14 @@ pub struct RestConfig {
     pub body: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct SmsConfig {
     pub to: String,
     pub message: String,
 }
 
 /// Security configuration (renamed from PermissionsConfig to match spec)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct SecurityConfig {
     #[serde(default)]
     pub network: NetworkPolicy,
@@ -658,7 +614,7 @@ pub struct SecurityConfig {
 }
 
 /// Network access policy
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 pub struct NetworkPolicy {
     /// Policy mode: "allow" (allowlist) | "deny" (denylist) | "none"
     #[serde(default = "default_network_mode")]
@@ -674,7 +630,7 @@ pub struct NetworkPolicy {
 }
 
 /// Filesystem access policy
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default, JsonSchema)]
 pub struct FilesystemPolicy {
     /// Readable paths
     #[serde(default)]
@@ -690,7 +646,7 @@ pub struct FilesystemPolicy {
 }
 
 /// Resource limits
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ResourceLimits {
     /// CPU quota in millicores (1000 = 1 CPU core)
     #[serde(default = "default_cpu")]
@@ -778,7 +734,7 @@ impl ResourceLimits {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct AdvancedConfig {
     #[serde(default)]
     pub warm_pool_size: u32,
@@ -795,7 +751,7 @@ pub struct AdvancedConfig {
     pub bootstrap_path: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct HealthCheckConfig {
     pub path: String,
     pub interval_seconds: u64,
@@ -954,7 +910,7 @@ impl AgentManifest {
     /// Returns None for custom runtimes (use image field instead)
     pub fn runtime_string(&self) -> Option<String> {
         match (&self.spec.runtime.language, &self.spec.runtime.version) {
-            (Some(lang), Some(ver)) => Some(format!("{}:{}", lang, ver)),
+            (Some(lang), Some(ver)) => Some(format!("{lang}:{ver}")),
             _ => None,
         }
     }

@@ -111,11 +111,7 @@ pub async fn handle_command(
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
             println!(
                 "{}",
-                format!(
-                    "⚠ Daemon is running (PID: {}) but unhealthy: {}",
-                    pid, error
-                )
-                .yellow()
+                format!("⚠ Daemon is running (PID: {pid}) but unhealthy: {error}").yellow()
             );
             println!("Run 'aegis daemon status' for more info.");
             return Ok(());
@@ -158,7 +154,7 @@ async fn show_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
 
     // Export as YAML to stdout
     let yaml = serde_yaml::to_string(&manifest).context("Failed to serialize manifest to YAML")?;
-    println!("{}", yaml);
+    println!("{yaml}");
 
     Ok(())
 }
@@ -189,7 +185,7 @@ async fn list_agents(client: DaemonClient) -> Result<()> {
 
 async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
     client.delete_agent(agent_id).await?;
-    println!("{}", format!("✓ Agent {} removed", agent_id).green());
+    println!("{}", format!("✓ Agent {agent_id} removed").green());
     Ok(())
 }
 
@@ -201,7 +197,7 @@ async fn deploy_agent(
 ) -> Result<()> {
     let manifest_content = tokio::fs::read_to_string(&manifest)
         .await
-        .with_context(|| format!("Failed to read manifest: {:?}", manifest))?;
+        .with_context(|| format!("Failed to read manifest: {manifest:?}"))?;
 
     // Parse with SDK types (now using core domain re-exports)
     let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
@@ -210,7 +206,7 @@ async fn deploy_agent(
     // Use domain validation (comprehensive checks including DNS labels, timeouts, etc.)
     agent_manifest
         .validate()
-        .map_err(|e| anyhow::anyhow!("Manifest validation failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Manifest validation failed: {e}"))?;
 
     if validate_only {
         println!(
@@ -243,7 +239,7 @@ async fn deploy_agent(
 
     let agent_id = client.deploy_agent(agent_manifest, force).await?;
 
-    println!("{}", format!("✓ Agent deployed: {}", agent_id).green());
+    println!("{}", format!("✓ Agent deployed: {agent_id}").green());
 
     Ok(())
 }
@@ -262,19 +258,19 @@ async fn logs_agent(
         // Look up by name
         println!(
             "{}",
-            format!("Looking up agent '{}'...", agent_id_str).dimmed()
+            format!("Looking up agent '{agent_id_str}'...").dimmed()
         );
         match client.lookup_agent(&agent_id_str).await? {
             Some(id) => id,
             None => {
-                anyhow::bail!("Agent '{}' not found", agent_id_str);
+                anyhow::bail!("Agent '{agent_id_str}' not found");
             }
         }
     };
 
     println!(
         "{}",
-        format!("Streaming logs for agent {}...", agent_id).dimmed()
+        format!("Streaming logs for agent {agent_id}...").dimmed()
     );
     client
         .stream_agent_logs(agent_id, follow, errors_only, verbose)
@@ -310,11 +306,7 @@ async fn generate_agent(
 
     println!(
         "{}",
-        format!(
-            "Generating agent via '{}' (id: {})...",
-            AGENT_GENERATOR_NAME, generator_id
-        )
-        .cyan()
+        format!("Generating agent via '{AGENT_GENERATOR_NAME}' (id: {generator_id})...").cyan()
     );
 
     let execution_id = client
@@ -324,7 +316,7 @@ async fn generate_agent(
 
     println!(
         "{}",
-        format!("✓ Agent generation execution started: {}", execution_id).green()
+        format!("✓ Agent generation execution started: {execution_id}").green()
     );
 
     if follow {
@@ -392,18 +384,14 @@ async fn ensure_generator_agent_deployed(
 
     println!(
         "{}",
-        format!(
-            "Generator agent '{}' not found. Deploying template...",
-            name
-        )
-        .yellow()
+        format!("Generator agent '{name}' not found. Deploying template...").yellow()
     );
 
     let manifest: aegis_orchestrator_sdk::AgentManifest =
         serde_yaml::from_str(template_yaml).context("Failed to parse generator template YAML")?;
     manifest
         .validate()
-        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {e}"))?;
 
     client
         .deploy_agent(manifest, false)
@@ -431,8 +419,5 @@ async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    anyhow::bail!(
-        "Timed out waiting for generation execution {} to finish",
-        execution_id
-    );
+    anyhow::bail!("Timed out waiting for generation execution {execution_id} to finish");
 }

@@ -343,11 +343,11 @@ impl GradientValidator for OutputGradientValidator {
                         return Ok(GradientResult {
                             score: 0.0,
                             confidence: 1.0,
-                            reasoning: format!("Output is not valid JSON: {}", e),
+                            reasoning: format!("Output is not valid JSON: {e}"),
                             signals: vec![ValidationSignal {
                                 category: "format".to_string(),
                                 score: 0.0,
-                                message: format!("JSON parse error: {}", e),
+                                message: format!("JSON parse error: {e}"),
                             }],
                             metadata: HashMap::new(),
                         });
@@ -360,11 +360,11 @@ impl GradientValidator for OutputGradientValidator {
                     return Ok(GradientResult {
                         score: 0.0,
                         confidence: 1.0,
-                        reasoning: format!("Output is not valid YAML: {}", e),
+                        reasoning: format!("Output is not valid YAML: {e}"),
                         signals: vec![ValidationSignal {
                             category: "format".to_string(),
                             score: 0.0,
-                            message: format!("YAML parse error: {}", e),
+                            message: format!("YAML parse error: {e}"),
                         }],
                         metadata: HashMap::new(),
                     });
@@ -376,7 +376,7 @@ impl GradientValidator for OutputGradientValidator {
         // Step 2: JSON Schema validation
         if let (Some(ref schema), Some(ref value)) = (&self.schema, &parsed_value) {
             let compiled = jsonschema::validator_for(schema)
-                .map_err(|e| anyhow::anyhow!("Invalid JSON schema in manifest: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid JSON schema in manifest: {e}"))?;
             if !compiled.is_valid(value) {
                 let errors: Vec<String> =
                     compiled.iter_errors(value).map(|e| e.to_string()).collect();
@@ -400,16 +400,16 @@ impl GradientValidator for OutputGradientValidator {
         // Step 3: Regex match
         if let Some(ref pattern) = self.regex_pattern {
             let re = regex::Regex::new(pattern)
-                .map_err(|e| anyhow::anyhow!("Invalid regex in manifest: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Invalid regex in manifest: {e}"))?;
             if !re.is_match(&ctx.output) {
                 return Ok(GradientResult {
                     score: 0.0,
                     confidence: 1.0,
-                    reasoning: format!("Output does not match required pattern: {}", pattern),
+                    reasoning: format!("Output does not match required pattern: {pattern}"),
                     signals: vec![ValidationSignal {
                         category: "regex".to_string(),
                         score: 0.0,
-                        message: format!("Pattern '{}' not matched in output", pattern),
+                        message: format!("Pattern '{pattern}' not matched in output"),
                     }],
                     metadata: HashMap::new(),
                 });

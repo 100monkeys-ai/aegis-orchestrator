@@ -185,8 +185,7 @@ fn repair_permissions_for_removal(dir: &Path) -> Result<()> {
             s.code().unwrap_or(-1)
         )),
         Err(e) => Err(anyhow::anyhow!(
-            "Failed to run docker permission repair: {}",
-            e
+            "Failed to run docker permission repair: {e}"
         )),
     }
 }

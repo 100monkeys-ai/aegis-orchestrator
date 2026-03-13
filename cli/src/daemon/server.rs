@@ -163,7 +163,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Store pool separately for later volume repo initialization
     let db_pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
-        println!("Initializing repositories with PostgreSQL: {}", url);
+        println!("Initializing repositories with PostgreSQL: {url}");
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(db_max_connections)
             .connect(url)
@@ -192,17 +192,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     Err(_) => 0,
                 };
 
-                println!(
-                    "INFO: Database has {}/{} applied migrations.",
-                    applied_count, total_known
-                );
+                println!("INFO: Database has {applied_count}/{total_known} applied migrations.");
 
                 if applied_count < total_known {
                     println!("Applying pending migrations...");
                     match MIGRATOR.run(&db_pool).await {
                         Ok(_) => println!("SUCCESS: Database migrations applied."),
                         Err(e) => {
-                            return Err(anyhow::anyhow!("Failed to apply migrations: {}", e));
+                            return Err(anyhow::anyhow!("Failed to apply migrations: {e}"));
                         }
                     }
                 } else {
@@ -216,10 +213,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     "Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
                     e
                 );
-                println!(
-                    "ERROR: Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
-                    e
-                );
+                println!("ERROR: Failed to connect to PostgreSQL: {e}. Falling back to InMemory.");
                 None
             }
         }
@@ -391,7 +385,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     },
                 )?
             }
-            other => return Err(anyhow::anyhow!("Unsupported storage backend: {}", other)),
+            other => return Err(anyhow::anyhow!("Unsupported storage backend: {other}")),
         };
 
     let volume_service = Arc::new(
@@ -486,14 +480,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             e
         );
         // Log to stderr to ensure visibility
-        eprintln!("FATAL: NFS Server Gateway failed: {}", e);
+        eprintln!("FATAL: NFS Server Gateway failed: {e}");
         // Allow shutdown of daemon via signal
         std::process::exit(1);
     }
-    println!(
-        "✓ NFS Server Gateway started on port {} (ADR-036)",
-        nfs_bind_port
-    );
+    println!("✓ NFS Server Gateway started on port {nfs_bind_port} (ADR-036)");
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
 
@@ -501,19 +492,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let registry_path = &config.spec.runtime.runtime_registry_path;
     let runtime_registry = match StandardRuntimeRegistry::from_file(registry_path) {
         Ok(registry) => {
-            println!(
-                "✓ StandardRuntime registry loaded from '{}' (ADR-043)",
-                registry_path
-            );
+            println!("✓ StandardRuntime registry loaded from '{registry_path}' (ADR-043)");
             Arc::new(registry)
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
-                "Failed to load StandardRuntime registry from '{}': {}. \
+                "Failed to load StandardRuntime registry from '{registry_path}': {e}. \
                  Ensure runtime-registry.yaml exists at the configured path \
-                 (spec.runtime.runtime_registry_path in aegis-config.yaml).",
-                registry_path,
-                e
+                 (spec.runtime.runtime_registry_path in aegis-config.yaml)."
             ));
         }
     };
@@ -588,10 +574,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
-    println!(
-        "Initializing Temporal Client (Address: {})...",
-        temporal_address
-    );
+    println!("Initializing Temporal Client (Address: {temporal_address})...");
 
     // Create shared containers for the concrete Temporal client and the workflow engine port.
     let temporal_client_container: Arc<
@@ -647,15 +630,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 Err(e) => {
                     retries += 1;
                     if retries >= TEMPORAL_CONNECTION_MAX_RETRIES {
-                        println!("Async WARNING: Failed to connect to Temporal after {} attempts. Giving up. Workflow execution will fail.", retries);
+                        println!("Async WARNING: Failed to connect to Temporal after {retries} attempts. Giving up. Workflow execution will fail.");
                         tracing::error!("Async: Failed to connect to Temporal: {}. Giving up.", e);
                         break;
                     }
 
                     if retries % 5 == 0 {
                         println!(
-                            "Async INFO: Still verifying Temporal connection... ({}/{})",
-                            retries, TEMPORAL_CONNECTION_MAX_RETRIES
+                            "Async INFO: Still verifying Temporal connection... ({retries}/{TEMPORAL_CONNECTION_MAX_RETRIES})"
                         );
                     }
                     tracing::debug!(
@@ -730,6 +712,47 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 capabilities: vec![
                     aegis_orchestrator_core::domain::node_config::CapabilityConfig {
                         name: "fs.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.schema.get")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.schema.get".to_string(),
+                description:
+                    "Returns the canonical JSON Schema for a manifest kind (agent or workflow)."
+                        .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.schema.get".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.schema.validate")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.schema.validate".to_string(),
+                description: "Validates a manifest YAML string against its canonical JSON Schema."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.schema.validate".to_string(),
                         skip_judge: true,
                     },
                 ],
@@ -926,8 +949,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
         .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to initialize SMCP token issuer from AEGIS_SMCP_PRIVATE_KEY: {}",
-                e
+                "Failed to initialize SMCP token issuer from AEGIS_SMCP_PRIVATE_KEY: {e}"
             )
         })?,
     );
@@ -956,7 +978,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         Arc::new(manager)
                     }
                     Err(e) => {
-                        return Err(anyhow::anyhow!("Failed to initialize OpenBao secrets manager: {}", e));
+                        return Err(anyhow::anyhow!("Failed to initialize OpenBao secrets manager: {e}"));
                     }
                 }
             }
@@ -1110,10 +1132,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         50051
     };
 
-    let grpc_addr_str = format!("{}:{}", bind_addr, grpc_port);
+    let grpc_addr_str = format!("{bind_addr}:{grpc_port}");
     let grpc_addr: std::net::SocketAddr = grpc_addr_str
         .parse()
-        .with_context(|| format!("Failed to parse gRPC address: {}", grpc_addr_str))?;
+        .with_context(|| format!("Failed to parse gRPC address: {grpc_addr_str}"))?;
 
     // Tool routing services moved above AppState!
 
@@ -1154,7 +1176,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
-        println!("Starting gRPC server on {}", grpc_addr);
+        println!("Starting gRPC server on {grpc_addr}");
         if let Err(e) = aegis_orchestrator_core::presentation::grpc::server::start_grpc_server(
             grpc_addr,
             exec_service_clone,
@@ -1167,18 +1189,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .await
         {
             tracing::error!("gRPC server failed: {}", e);
-            eprintln!("gRPC server failed: {}", e);
+            eprintln!("gRPC server failed: {e}");
         }
     });
 
-    let addr = format!("{}:{}", bind_addr, final_port);
-    println!("Binding to {}...", addr);
+    let addr = format!("{bind_addr}:{final_port}");
+    println!("Binding to {addr}...");
     let listener = TcpListener::bind(&addr)
         .await
-        .with_context(|| format!("Failed to bind to {}", addr))?;
+        .with_context(|| format!("Failed to bind to {addr}"))?;
 
     info!("Daemon listening on {}", addr);
-    println!("Daemon listening on {}", addr);
+    println!("Daemon listening on {addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -2359,12 +2381,12 @@ async fn get_workflow_handler(
             Ok(yaml) => (StatusCode::OK, yaml),
             Err(e) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize workflow: {}", e),
+                format!("Failed to serialize workflow: {e}"),
             ),
         },
         _ => (
             StatusCode::NOT_FOUND,
-            format!("Workflow '{}' not found", name),
+            format!("Workflow '{name}' not found"),
         ),
     }
 }
@@ -2568,7 +2590,7 @@ async fn stream_workflow_logs_handler(
 
                 let event_type = event.event_type(); // Enum
 
-                let _ = writeln!(output, "[{}] {:?}", timestamp, event_type);
+                let _ = writeln!(output, "[{timestamp}] {event_type:?}");
 
                 // Event type is currently sufficient for a concise log view.
             }
@@ -2576,7 +2598,7 @@ async fn stream_workflow_logs_handler(
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get workflow logs: {}", e),
+            format!("Failed to get workflow logs: {e}"),
         ),
     }
 }

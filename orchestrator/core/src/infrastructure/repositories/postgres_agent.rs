@@ -81,7 +81,7 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(agent.updated_at)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save agent: {}", e)))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save agent: {e}")))?;
 
         Ok(())
     }
@@ -116,7 +116,7 @@ impl AgentRepository for PostgresAgentRepository {
             };
 
             let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
             })?;
 
             Ok(Some(Agent {
@@ -162,7 +162,7 @@ impl AgentRepository for PostgresAgentRepository {
             };
 
             let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
             })?;
 
             Ok(Some(Agent {
@@ -208,7 +208,7 @@ impl AgentRepository for PostgresAgentRepository {
             };
 
             let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
-                RepositoryError::Serialization(format!("Failed to deserialize manifest: {}", e))
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
             })?;
 
             agents.push(Agent {

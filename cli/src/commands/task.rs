@@ -104,7 +104,7 @@ pub async fn handle_command(command: TaskCommand, host: &str, port: u16) -> Resu
     if let Ok(DaemonStatus::Unhealthy { pid, error }) = &daemon_status {
         println!(
             "{}",
-            format!("⚠ Daemon found (PID: {}) but unhealthy: {}", pid, error).yellow()
+            format!("⚠ Daemon found (PID: {pid}) but unhealthy: {error}").yellow()
         );
     }
 
@@ -166,7 +166,7 @@ async fn execute_daemon(
             if tokio::fs::try_exists(&manifest_path).await.unwrap_or(false) {
                 let manifest_content = tokio::fs::read_to_string(&manifest_path)
                     .await
-                    .with_context(|| format!("Failed to read manifest: {:?}", manifest_path))?;
+                    .with_context(|| format!("Failed to read manifest: {manifest_path:?}"))?;
 
                 let agent_manifest: aegis_orchestrator_sdk::AgentManifest =
                     serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
@@ -176,11 +176,11 @@ async fn execute_daemon(
                     Ok(id) => id,
                     Err(e) => {
                         // Simplify error for user
-                        anyhow::bail!("Failed to deploy manifest: {}", e);
+                        anyhow::bail!("Failed to deploy manifest: {e}");
                     }
                 }
             } else {
-                anyhow::bail!("Agent '{}' not found and not a valid manifest path.", agent);
+                anyhow::bail!("Agent '{agent}' not found and not a valid manifest path.");
             }
         }
     };
@@ -188,14 +188,11 @@ async fn execute_daemon(
     // Parse input
     let input_data = parse_input(input).await?;
 
-    println!("Executing agent {}...", agent_id);
+    println!("Executing agent {agent_id}...");
 
     let execution_id = client.execute_agent(agent_id, input_data).await?;
 
-    println!(
-        "{}",
-        format!("✓ Execution started: {}", execution_id).green()
-    );
+    println!("{}", format!("✓ Execution started: {execution_id}").green());
 
     if follow {
         logs_daemon(execution_id, true, false, false, client).await?;
@@ -210,14 +207,14 @@ async fn execute_daemon(
 async fn status_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
     let execution = client.get_execution(execution_id).await?;
 
-    println!("Execution {}", execution_id);
+    println!("Execution {execution_id}");
     println!("  Status: {}", format_status(&execution.status));
     println!("  Agent: {}", execution.agent_id);
     if let Some(started) = execution.started_at {
-        println!("  Started: {}", started);
+        println!("  Started: {started}");
     }
     if let Some(ended) = execution.ended_at {
-        println!("  Ended: {}", ended);
+        println!("  Ended: {ended}");
     }
 
     Ok(())
@@ -240,7 +237,7 @@ async fn cancel_daemon(execution_id: Uuid, _force: bool, client: DaemonClient) -
     client.cancel_execution(execution_id).await?;
     println!(
         "{}",
-        format!("✓ Execution {} cancelled", execution_id).green()
+        format!("✓ Execution {execution_id} cancelled").green()
     );
     Ok(())
 }
@@ -274,7 +271,7 @@ async fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
             let path = &s[1..];
             let content = tokio::fs::read_to_string(path)
                 .await
-                .with_context(|| format!("Failed to read input file: {}", path))?;
+                .with_context(|| format!("Failed to read input file: {path}"))?;
             serde_json::from_str(&content).context("Failed to parse input JSON")
         }
         Some(s) => {
@@ -309,7 +306,7 @@ async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient
         tokio::time::sleep(POLL_INTERVAL).await;
     }
 
-    anyhow::bail!("Timed out waiting for execution {} to finish", execution_id);
+    anyhow::bail!("Timed out waiting for execution {execution_id} to finish");
 }
 
 fn format_status(status: &str) -> colored::ColoredString {
@@ -324,9 +321,6 @@ fn format_status(status: &str) -> colored::ColoredString {
 
 async fn remove_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
     client.delete_execution(execution_id).await?;
-    println!(
-        "{}",
-        format!("✓ Execution {} removed", execution_id).green()
-    );
+    println!("{}", format!("✓ Execution {execution_id} removed").green());
     Ok(())
 }

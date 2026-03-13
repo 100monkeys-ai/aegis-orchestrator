@@ -359,10 +359,10 @@ impl IdentityProvider for StandardIamService {
             self.event_bus
                 .publish_iam_event(IamEvent::TokenValidationFailed {
                     realm_slug: Some(realm.realm_slug.clone()),
-                    reason: format!("No matching JWK for kid: {}", kid),
+                    reason: format!("No matching JWK for kid: {kid}"),
                     attempted_at: Utc::now(),
                 });
-            IamError::SignatureInvalid(format!("No matching JWK for kid: {}", kid))
+            IamError::SignatureInvalid(format!("No matching JWK for kid: {kid}"))
         })?;
 
         // 6. Build decoding key from JWK RSA components

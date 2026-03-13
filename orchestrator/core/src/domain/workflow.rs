@@ -27,6 +27,7 @@
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use chrono::{DateTime, Utc};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -395,7 +396,7 @@ impl WorkflowMetadata {
 ///
 /// Workflows may declare named volumes in `spec.volumes`; these are referenced
 /// by `ContainerVolumeMount.name` inside `ContainerRun` and `ParallelContainerRun` states.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowStorageClass {
     /// Ephemeral volume — auto-cleaned after workflow execution ends
@@ -410,7 +411,7 @@ pub enum WorkflowStorageClass {
 /// Volumes declared here are matched by name in `ContainerVolumeMount` entries.
 /// Volume provisioning itself is handled by the Storage Gateway Context (ADR-036/ADR-032);
 /// this declaration is the intent layer consumed by the manifest parser and Temporal mapper.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowVolumeSpec {
     /// Logical name referenced by `ContainerVolumeMount.name`
     pub name: String,
@@ -471,7 +472,7 @@ pub struct WorkflowState {
 /// Binds a workflow-level volume into a CI/CD container at a specific path.
 /// Volumes are always accessed via the NFS Server Gateway (ADR-036) — never
 /// via direct bind mounts.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerVolumeMount {
     /// Volume name (references a workflow-level or execution-level volume)
     pub name: String,
@@ -485,7 +486,7 @@ pub struct ContainerVolumeMount {
 }
 
 /// Resource limits for a ContainerRun step
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerResources {
     /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
     #[serde(default)]
@@ -498,11 +499,12 @@ pub struct ContainerResources {
     /// Hard wall-clock timeout for the entire container execution
     #[serde(default)]
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
     pub timeout: Option<Duration>,
 }
 
 /// Retry configuration for a ContainerRun step
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RetryConfig {
     /// Maximum number of additional attempts after the first (0 = no retries)
     #[serde(default)]
@@ -514,7 +516,7 @@ pub struct RetryConfig {
 }
 
 /// Configuration for a single step in ParallelContainerRun
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ContainerRunConfig {
     /// Unique label for this step; used as the blackboard key for its output
     pub name: String,
@@ -551,7 +553,7 @@ pub struct ContainerRunConfig {
 }
 
 /// Aggregation strategy for a ParallelContainerRun state
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ParallelCompletionStrategy {
     /// All steps must exit with code 0 — any non-zero exit causes the state to fail
@@ -693,7 +695,7 @@ pub enum StateKind {
 }
 
 /// Isolation mode for agent execution
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IsolationMode {
     /// Inherit from node configuration
@@ -789,7 +791,7 @@ fn default_min_judges() -> usize {
 }
 
 /// Weights for combining agreement and self-confidence in consensus
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConfidenceWeighting {
     /// Weight for agreement among judges (default: 0.7)
     #[serde(default = "default_agreement_factor")]
@@ -844,7 +846,7 @@ fn default_self_confidence_factor() -> f64 {
 }
 
 /// Consensus strategy for aggregating parallel agent results
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ConsensusStrategy {
     /// Weighted average of scores
@@ -1238,10 +1240,9 @@ mod tests {
         let json = serde_json::to_string(&condition).unwrap();
         assert!(
             json.contains("score_and_confidence_above"),
-            "wrong tag: {}",
-            json
+            "wrong tag: {json}"
         );
-        assert!(json.contains("0.85"), "threshold missing: {}", json);
+        assert!(json.contains("0.85"), "threshold missing: {json}");
 
         let round_tripped: TransitionCondition = serde_json::from_str(&json).unwrap();
         assert!(

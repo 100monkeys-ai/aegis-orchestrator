@@ -81,7 +81,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         .bind(volume.expires_at)
         .execute(&self.pool)
         .await
-        .map_err(|e| RepositoryError::Database(format!("Failed to save volume: {}", e)))?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to save volume: {e}")))?;
 
         Ok(())
     }
@@ -204,10 +204,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!(
-                "Volume {} not found",
-                id
-            )));
+            return Err(RepositoryError::NotFound(format!("Volume {id} not found")));
         }
 
         Ok(())
@@ -230,19 +227,19 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
     let expires_at: Option<DateTime<Utc>> = row.get("expires_at");
 
     let storage_class: StorageClass = serde_json::from_value(storage_class).map_err(|e| {
-        RepositoryError::Serialization(format!("Failed to deserialize storage_class: {}", e))
+        RepositoryError::Serialization(format!("Failed to deserialize storage_class: {e}"))
     })?;
 
     let backend: VolumeBackend = serde_json::from_value(backend).map_err(|e| {
-        RepositoryError::Serialization(format!("Failed to deserialize backend: {}", e))
+        RepositoryError::Serialization(format!("Failed to deserialize backend: {e}"))
     })?;
 
     let status: VolumeStatus = serde_json::from_value(status).map_err(|e| {
-        RepositoryError::Serialization(format!("Failed to deserialize status: {}", e))
+        RepositoryError::Serialization(format!("Failed to deserialize status: {e}"))
     })?;
 
     let ownership: VolumeOwnership = serde_json::from_value(ownership).map_err(|e| {
-        RepositoryError::Serialization(format!("Failed to deserialize ownership: {}", e))
+        RepositoryError::Serialization(format!("Failed to deserialize ownership: {e}"))
     })?;
 
     Ok(Volume {

@@ -205,12 +205,7 @@ async fn test_validation_event_streaming() {
         ..
     }) = event1
     else {
-        assert!(
-            false,
-            "Expected GradientValidationPerformed, got {:?}",
-            event1
-        );
-        return;
+        panic!("Expected GradientValidationPerformed, got {event1:?}");
     };
     assert_eq!(eid, execution_id);
     assert_eq!(score, 0.95);
@@ -227,8 +222,7 @@ async fn test_validation_event_streaming() {
         ..
     }) = event2
     else {
-        assert!(false, "Expected MultiJudgeConsensus, got {:?}", event2);
-        return;
+        panic!("Expected MultiJudgeConsensus, got {event2:?}");
     };
     assert_eq!(eid, execution_id);
     // Consensus of one judge with 0.95 and high confidence should be close to 0.95

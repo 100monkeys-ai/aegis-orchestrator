@@ -94,7 +94,7 @@ impl TemporalClient {
         let addr = if address.contains("://") {
             address.to_string()
         } else {
-            format!("http://{}", address)
+            format!("http://{address}")
         };
 
         let endpoint = Channel::from_shared(addr.clone())
@@ -307,11 +307,7 @@ impl TemporalClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "(no body)".to_string());
-            anyhow::bail!(
-                "Failed to register workflow with Temporal worker: {} - {}",
-                status,
-                body
-            );
+            anyhow::bail!("Failed to register workflow with Temporal worker: {status} - {body}");
         }
 
         Ok(())

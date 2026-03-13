@@ -89,7 +89,7 @@ impl ContextLoader {
             let content = self
                 .load_attachment(attachment)
                 .await
-                .with_context(|| format!("Failed to load attachment: {:?}", attachment))?;
+                .with_context(|| format!("Failed to load attachment: {attachment:?}"))?;
 
             total_size += content.len();
             if total_size > self.max_size {
@@ -103,9 +103,9 @@ impl ContextLoader {
             // Format with description if available
             let description = self.get_description(attachment);
             let formatted = if let Some(desc) = description {
-                format!("# {}\n\n{}\n\n---\n\n", desc, content)
+                format!("# {desc}\n\n{content}\n\n---\n\n")
             } else {
-                format!("{}\n\n---\n\n", content)
+                format!("{content}\n\n---\n\n")
             };
 
             parts.push(formatted);
@@ -127,11 +127,11 @@ impl ContextLoader {
     /// Load content from a local file
     fn load_file(&self, path: &Path) -> Result<String> {
         if !path.exists() {
-            return Err(anyhow!("File not found: {:?}", path));
+            return Err(anyhow!("File not found: {path:?}"));
         }
 
-        let metadata = fs::metadata(path)
-            .with_context(|| format!("Failed to get file metadata: {:?}", path))?;
+        let metadata =
+            fs::metadata(path).with_context(|| format!("Failed to get file metadata: {path:?}"))?;
 
         if metadata.len() > self.max_file_size as u64 {
             return Err(anyhow!(
@@ -142,13 +142,13 @@ impl ContextLoader {
             ));
         }
 
-        fs::read_to_string(path).with_context(|| format!("Failed to read file: {:?}", path))
+        fs::read_to_string(path).with_context(|| format!("Failed to read file: {path:?}"))
     }
 
     /// Load and concatenate all files in a directory
     fn load_directory(&self, path: &Path) -> Result<String> {
         if !path.exists() || !path.is_dir() {
-            return Err(anyhow!("Directory not found: {:?}", path));
+            return Err(anyhow!("Directory not found: {path:?}"));
         }
 
         let mut files = Vec::new();
@@ -165,16 +165,16 @@ impl ContextLoader {
                     continue;
                 }
 
-                let content = self.load_file(file_path).with_context(|| {
-                    format!("Failed to load file in directory: {:?}", file_path)
-                })?;
+                let content = self
+                    .load_file(file_path)
+                    .with_context(|| format!("Failed to load file in directory: {file_path:?}"))?;
 
                 let relative_path = file_path
                     .strip_prefix(path)
                     .unwrap_or(file_path)
                     .to_string_lossy();
 
-                files.push(format!("## File: {}\n\n{}\n\n", relative_path, content));
+                files.push(format!("## File: {relative_path}\n\n{content}\n\n"));
             }
         }
 
@@ -193,7 +193,7 @@ impl ContextLoader {
             .header("User-Agent", "AEGIS/1.0")
             .send()
             .await
-            .with_context(|| format!("Failed to fetch URL: {}", url))?;
+            .with_context(|| format!("Failed to fetch URL: {url}"))?;
 
         if !response.status().is_success() {
             return Err(anyhow!("HTTP {} fetching URL: {}", response.status(), url));
@@ -214,7 +214,7 @@ impl ContextLoader {
         let text = response
             .text()
             .await
-            .with_context(|| format!("Failed to read URL content: {}", url))?;
+            .with_context(|| format!("Failed to read URL content: {url}"))?;
 
         if text.len() > self.max_file_size {
             return Err(anyhow!(
@@ -254,7 +254,7 @@ impl ContextLoader {
         ];
 
         if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            let ext_with_dot = format!(".{}", ext);
+            let ext_with_dot = format!(".{ext}");
             if skip_extensions.contains(&ext_with_dot.as_str()) {
                 return true;
             }
@@ -360,11 +360,10 @@ mod tests {
         let result = tokio_test::block_on(loader.load_attachments(&attachments));
         assert!(result.is_err(), "Expected an error but got Ok");
         let err = result.unwrap_err();
-        let err_msg = format!("{:?}", err); // Use Debug format to see the full chain
+        let err_msg = format!("{err:?}"); // Use Debug format to see the full chain
         assert!(
             err_msg.contains("exceeds"),
-            "Error message should contain 'exceeds', got: {}",
-            err_msg
+            "Error message should contain 'exceeds', got: {err_msg}"
         );
     }
 

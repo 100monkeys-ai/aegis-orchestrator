@@ -170,14 +170,14 @@ impl LLMProvider for OllamaAdapter {
             return Err(if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else {
-                LLMError::Provider(format!("HTTP {}: {}", status, error_text))
+                LLMError::Provider(format!("HTTP {status}: {error_text}"))
             });
         }
 
         let cr: OllamaChatResponse = response
             .json()
             .await
-            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
         if !cr.message.tool_calls.is_empty() {
             let tool_calls = cr
@@ -186,7 +186,7 @@ impl LLMProvider for OllamaAdapter {
                 .into_iter()
                 .enumerate()
                 .map(|(i, tc)| ChatToolCall {
-                    id: format!("ollama-call-{}", i),
+                    id: format!("ollama-call-{i}"),
                     name: tc.function.name.replace('_', "."), // Reverse outbound sanitization
                     arguments: tc.function.arguments,
                 })
@@ -272,7 +272,7 @@ mod tests {
         });
         let cr: OllamaChatResponse = serde_json::from_value(json).unwrap();
         assert_eq!(cr.message.content, "Hello!");
-        assert_eq!(cr.done, true);
+        assert!(cr.done);
         assert!(cr.message.tool_calls.is_empty());
     }
 

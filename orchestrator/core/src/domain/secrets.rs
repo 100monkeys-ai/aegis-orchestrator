@@ -294,8 +294,8 @@ mod tests {
     #[test]
     fn sensitive_string_redacts_in_debug() {
         let s = SensitiveString::new("super-secret-api-key");
-        assert_eq!(format!("{:?}", s), "[REDACTED]");
-        assert_eq!(format!("{}", s), "[REDACTED]");
+        assert_eq!(format!("{s:?}"), "[REDACTED]");
+        assert_eq!(format!("{s}"), "[REDACTED]");
     }
 
     #[test]
@@ -325,7 +325,7 @@ mod tests {
     fn secret_path_full_path() {
         let path = SecretPath::new("aegis-system", "kv", "mcp-tools/gmail");
         assert_eq!(path.full_path(), "aegis-system/kv/mcp-tools/gmail");
-        assert_eq!(format!("{}", path), "aegis-system/kv/mcp-tools/gmail");
+        assert_eq!(format!("{path}"), "aegis-system/kv/mcp-tools/gmail");
     }
 
     // ── DomainDynamicSecret ──────────────────────────────────────────────────

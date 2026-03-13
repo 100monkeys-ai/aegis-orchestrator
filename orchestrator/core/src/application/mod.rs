@@ -39,6 +39,7 @@ pub mod agent;
 pub mod attestation_service;
 pub mod execution;
 pub mod lifecycle;
+pub mod schema_registry;
 pub mod tool_invocation_service;
 pub mod tools;
 pub mod validation_service;

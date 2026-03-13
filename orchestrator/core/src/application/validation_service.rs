@@ -119,7 +119,7 @@ impl ValidationService {
         if let Some(ref weighting) = config.confidence_weighting {
             weighting
                 .validate()
-                .map_err(|e| anyhow!("Invalid confidence weighting: {}", e))?;
+                .map_err(|e| anyhow!("Invalid confidence weighting: {e}"))?;
         }
 
         let mut futures = Vec::new();
@@ -227,8 +227,7 @@ impl ValidationService {
         loop {
             if attempts >= max_attempts {
                 return Err(anyhow!(
-                    "Judge execution timed out after {} seconds",
-                    timeout_seconds
+                    "Judge execution timed out after {timeout_seconds} seconds"
                 ));
             }
 
@@ -248,7 +247,7 @@ impl ValidationService {
                     let json_str = Self::extract_json(output_str).unwrap_or(output_str.clone());
 
                     let result: GradientResult = serde_json::from_str(&json_str)
-                        .context(format!("Failed to parse judge output: {}", json_str))?;
+                        .context(format!("Failed to parse judge output: {json_str}"))?;
 
                     return Ok((judge_id, result));
                 }
@@ -531,9 +530,8 @@ impl GradientValidator for SemanticAgentValidator {
                         .ok_or_else(|| anyhow!("Judge completed but has no output"))?;
                     let json_str =
                         extract_json_from_text(output_str).unwrap_or_else(|| output_str.clone());
-                    let result: GradientResult = serde_json::from_str(&json_str).context(
-                        format!("Failed to parse semantic judge output: {}", json_str),
-                    )?;
+                    let result: GradientResult = serde_json::from_str(&json_str)
+                        .context(format!("Failed to parse semantic judge output: {json_str}"))?;
                     return Ok(result);
                 }
                 ExecutionStatus::Failed | ExecutionStatus::Cancelled => {
@@ -615,7 +613,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                 .agent_lifecycle_service
                 .lookup_agent(name)
                 .await?
-                .ok_or_else(|| anyhow!("Judge agent '{}' not found", name))?;
+                .ok_or_else(|| anyhow!("Judge agent '{name}' not found"))?;
             judge_ids.push((id, 1.0)); // Equal weight by default.
         }
 
@@ -653,8 +651,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                 loop {
                     if attempts >= max_attempts {
                         return Err::<(AgentId, GradientResult, f64), _>(anyhow!(
-                            "Judge timed out after {} seconds",
-                            timeout
+                            "Judge timed out after {timeout} seconds"
                         ));
                     }
                     let exec = svc.get_execution(exec_id).await?;
@@ -672,7 +669,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                                 crate::domain::validation::extract_json_from_text(output_str)
                                     .unwrap_or_else(|| output_str.clone());
                             let result: GradientResult = serde_json::from_str(&json_str)
-                                .context(format!("Failed to parse judge output: {}", json_str))?;
+                                .context(format!("Failed to parse judge output: {json_str}"))?;
                             return Ok((jid, result, w));
                         }
                         ExecutionStatus::Failed | ExecutionStatus::Cancelled => {

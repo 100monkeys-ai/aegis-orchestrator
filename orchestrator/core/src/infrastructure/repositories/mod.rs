@@ -140,7 +140,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
                 updated.update_manifest(manifest);
                 self.save(&updated)
                     .await
-                    .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
+                    .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
                 return Ok(updated.id);
             }
 
@@ -149,7 +149,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
             updated.update_manifest(manifest);
             self.save(&updated)
                 .await
-                .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
             return Ok(updated.id);
         }
 
@@ -157,14 +157,14 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         let id = agent.id;
         self.save(&agent)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to save agent: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
         Ok(id)
     }
 
     async fn get_agent(&self, id: AgentId) -> anyhow::Result<Agent> {
         self.find_by_id(id)
             .await
-            .map_err(|e| anyhow::anyhow!("Repository error: {}", e))?
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))
     }
 
@@ -173,26 +173,26 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         agent.update_manifest(manifest);
         self.save(&agent)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to update agent: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to update agent: {e}"))
     }
 
     async fn delete_agent(&self, id: AgentId) -> anyhow::Result<()> {
         self.delete(id)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to delete agent: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to delete agent: {e}"))
     }
 
     async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
         self.list_all()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list agents: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
     }
 
     async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
         let agent = self
             .find_by_name(name)
             .await
-            .map_err(|e| anyhow::anyhow!("Repository error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
     }
 }

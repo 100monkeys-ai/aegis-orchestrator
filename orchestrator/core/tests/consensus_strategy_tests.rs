@@ -210,7 +210,7 @@ fn test_consensus_strategy_serialization() {
         let json = serde_json::to_string(&strategy).expect("Should serialize");
         let deserialized: ConsensusStrategy =
             serde_json::from_str(&json).expect("Should deserialize");
-        assert_eq!(format!("{:?}", strategy), format!("{:?}", deserialized));
+        assert_eq!(format!("{strategy:?}"), format!("{:?}", deserialized));
     }
 }
 

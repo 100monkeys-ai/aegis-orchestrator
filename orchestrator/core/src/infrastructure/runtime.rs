@@ -111,7 +111,7 @@ impl DockerRuntime {
             // Relative path - resolve from current directory
             std::env::current_dir()
                 .map_err(|e| {
-                    RuntimeError::SpawnFailed(format!("Failed to get current directory: {}", e))
+                    RuntimeError::SpawnFailed(format!("Failed to get current directory: {e}"))
                 })?
                 .join(&bootstrap_script)
         };
@@ -141,16 +141,15 @@ impl DockerRuntime {
 
             result.map_err(|e| {
                 RuntimeError::SpawnFailed(format!(
-                    "Failed to connect to Docker at {}: {}\n\n\
-                 Ensure Docker is running and the socket path is correct.",
-                    path, e
+                    "Failed to connect to Docker at {path}: {e}\n\n\
+                 Ensure Docker is running and the socket path is correct."
                 ))
             })?
         } else {
             // Auto-detect Docker connection
             Docker::connect_with_local_defaults()
                 .map_err(|e| RuntimeError::SpawnFailed(format!(
-                    "Failed to connect to Docker: {}\n\n\
+                    "Failed to connect to Docker: {e}\n\n\
                      Common causes:\n\
                      - Docker daemon not running (check: docker ps)\n\
                      - Permission denied accessing Docker socket\n\
@@ -159,8 +158,7 @@ impl DockerRuntime {
                      Try:\n\
                      - Start Docker: systemctl start docker (Linux) or Docker Desktop (Windows/Mac)\n\
                      - Check permissions: ls -la /var/run/docker.sock\n\
-                     - Add user to docker group: sudo usermod -aG docker $USER",
-                    e
+                     - Add user to docker group: sudo usermod -aG docker $USER"
                 )))?
         };
         // Clone docker before moving it into Self (image_manager needs its own handle).
@@ -196,7 +194,7 @@ impl DockerRuntime {
                 filters: Some(filters),
             }))
             .await
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Image prune failed: {}", e)))?;
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Image prune failed: {e}")))?;
         Ok(())
     }
 
@@ -204,13 +202,12 @@ impl DockerRuntime {
     pub async fn healthcheck(&self) -> Result<(), RuntimeError> {
         self.docker.ping().await.map_err(|e| {
             RuntimeError::SpawnFailed(format!(
-                "Cannot connect to Docker daemon: {}\n\n\
+                "Cannot connect to Docker daemon: {e}\n\n\
                  Docker healthcheck failed. Ensure Docker is running:\n\
                  - On Windows: Start Docker Desktop\n\
                  - On Linux: sudo systemctl start docker\n\
                  - On macOS: Start Docker Desktop\n\n\
-                 Verify with: docker ps",
-                e
+                 Verify with: docker ps"
             ))
         })?;
         Ok(())
@@ -462,11 +459,8 @@ impl AgentRuntime for DockerRuntime {
         };
 
         // Convert map to "KEY=VALUE" strings
-        let mut env_vars: Vec<String> = config
-            .env
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect();
+        let mut env_vars: Vec<String> =
+            config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
 
         // Add orchestrator URL for agent bootstrap script to call LLM proxy
         env_vars.push(format!("AEGIS_ORCHESTRATOR_URL={}", self.orchestrator_url));
@@ -513,7 +507,7 @@ impl AgentRuntime for DockerRuntime {
         self.docker
             .start_container(&id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to start container: {}", e)))?;
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to start container: {e}")))?;
 
         info!("Spawned agent container: {}", id);
 
@@ -638,7 +632,7 @@ impl AgentRuntime for DockerRuntime {
         // Get exit code from exec
         let exec_inspect =
             self.docker.inspect_exec(&exec.id).await.map_err(|e| {
-                RuntimeError::ExecutionFailed(format!("Failed to inspect exec: {}", e))
+                RuntimeError::ExecutionFailed(format!("Failed to inspect exec: {e}"))
             })?;
 
         let exit_code = exec_inspect.exit_code.unwrap_or(0);
@@ -664,7 +658,7 @@ impl AgentRuntime for DockerRuntime {
             let error_msg = if !stderr_logs.is_empty() {
                 stderr_logs.join("\n")
             } else {
-                format!("Bootstrap script exited with code {}", exit_code)
+                format!("Bootstrap script exited with code {exit_code}")
             };
             Err(RuntimeError::ExecutionFailed(error_msg))
         } else {
@@ -726,7 +720,7 @@ impl AgentRuntime for DockerRuntime {
 
         Ok(InstanceStatus {
             id: id.clone(),
-            state: format!("{:?}", state),
+            state: format!("{state:?}"),
             uptime_seconds: uptime,
             memory_usage_mb: mem,
             cpu_usage_percent: cpu,
@@ -755,7 +749,7 @@ impl DockerRuntime {
             .create_exec(container_id, check_exists)
             .await
             .map_err(|e| {
-                RuntimeError::SpawnFailed(format!("Failed to check for bootstrap script: {}", e))
+                RuntimeError::SpawnFailed(format!("Failed to check for bootstrap script: {e}"))
             })?;
 
         let start_opts = StartExecOptions {
@@ -775,7 +769,7 @@ impl DockerRuntime {
             .inspect_exec(&check_exec.id)
             .await
             .map_err(|e| {
-                RuntimeError::SpawnFailed(format!("Failed to inspect bootstrap check: {}", e))
+                RuntimeError::SpawnFailed(format!("Failed to inspect bootstrap check: {e}"))
             })?;
 
         let exit_code = check_inspect.exit_code.unwrap_or(1);
@@ -807,18 +801,18 @@ impl DockerRuntime {
         let mut header = tar::Header::new_gnu();
         header
             .set_path("aegis-bootstrap")
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to set tar path: {}", e)))?;
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to set tar path: {e}")))?;
         header.set_size(bootstrap_content.len() as u64);
         header.set_mode(0o755); // Make executable
         header.set_cksum();
 
         tar_builder
             .append(&header, bootstrap_content.as_slice())
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to create tar: {}", e)))?;
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to create tar: {e}")))?;
 
         let tar_data = tar_builder
             .into_inner()
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to finalize tar: {}", e)))?;
+            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to finalize tar: {e}")))?;
 
         // Upload to container at /usr/local/bin/
         let options = UploadToContainerOptions {
@@ -835,8 +829,7 @@ impl DockerRuntime {
             .await
             .map_err(|e| {
                 RuntimeError::SpawnFailed(format!(
-                    "Failed to copy bootstrap script to container: {}",
-                    e
+                    "Failed to copy bootstrap script to container: {e}"
                 ))
             })?;
 

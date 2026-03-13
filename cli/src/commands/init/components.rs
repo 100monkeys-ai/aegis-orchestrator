@@ -190,7 +190,7 @@ impl ComponentSelector {
         println!();
         println!("{}", "Selected components:".bold());
         for line in summary_lines {
-            println!("{}", line);
+            println!("{line}");
         }
 
         Ok(SelectedComponents {

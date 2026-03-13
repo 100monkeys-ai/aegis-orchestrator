@@ -1044,8 +1044,7 @@ mod tests {
         let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(deserialized, StorageEvent::FileOpened { .. }),
-            "Expected FileOpened variant, got: {:?}",
-            deserialized
+            "Expected FileOpened variant, got: {deserialized:?}"
         );
         let StorageEvent::FileOpened {
             path, open_mode, ..
@@ -1085,8 +1084,7 @@ mod tests {
         let deserialized: ExecutionEvent = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(deserialized, ExecutionEvent::ExecutionStarted { .. }),
-            "Expected ExecutionStarted variant, got: {:?}",
-            deserialized
+            "Expected ExecutionStarted variant, got: {deserialized:?}"
         );
         let ExecutionEvent::ExecutionStarted { execution_id, .. } = deserialized else {
             return;
@@ -1143,8 +1141,7 @@ mod tests {
                 deserialized,
                 ValidationEvent::GradientValidationPerformed { .. }
             ),
-            "Expected GradientValidationPerformed variant, got: {:?}",
-            deserialized
+            "Expected GradientValidationPerformed variant, got: {deserialized:?}"
         );
         let ValidationEvent::GradientValidationPerformed {
             score, confidence, ..
@@ -1212,8 +1209,7 @@ mod tests {
         let deserialized: PolicyEvent = serde_json::from_str(&json).unwrap();
         assert!(
             matches!(deserialized, PolicyEvent::PolicyViolationBlocked { .. }),
-            "Expected PolicyViolationBlocked variant, got: {:?}",
-            deserialized
+            "Expected PolicyViolationBlocked variant, got: {deserialized:?}"
         );
         let PolicyEvent::PolicyViolationBlocked { violation_type, .. } = deserialized else {
             return;

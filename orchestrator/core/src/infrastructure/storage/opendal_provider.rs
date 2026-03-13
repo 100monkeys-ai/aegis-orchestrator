@@ -45,7 +45,7 @@ impl From<opendal::Error> for StorageError {
 impl StorageProvider for OpenDalStorageProvider {
     async fn create_directory(&self, path: &str) -> Result<(), StorageError> {
         let path = if !path.ends_with('/') {
-            format!("{}/", path)
+            format!("{path}/")
         } else {
             path.to_string()
         };

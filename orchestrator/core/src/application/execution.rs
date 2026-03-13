@@ -544,15 +544,14 @@ impl ExecutionService for StandardExecutionService {
         // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
         if let Some(router) = &self.tool_router {
             let available_tools = router.list_tools().await.map_err(|e| {
-                ExecutionError::InvalidExecutionInput(format!("Failed to query tool router: {}", e))
+                ExecutionError::InvalidExecutionInput(format!("Failed to query tool router: {e}"))
             })?;
 
             let requested_tools = agent.manifest.spec.tools.clone();
             for req_tool in requested_tools {
                 if !available_tools.iter().any(|t| t.name == req_tool) {
                     return Err(ExecutionError::InvalidExecutionInput(format!(
-                        "Agent requested tool '{}' but it is not available in the current node configuration.",
-                        req_tool
+                        "Agent requested tool '{req_tool}' but it is not available in the current node configuration."
                     )).into());
                 }
             }
@@ -619,7 +618,7 @@ impl ExecutionService for StandardExecutionService {
                     .as_ref()
                     .map(|n| n.port)
                     .unwrap_or(8088);
-                format!("http://host.docker.internal:{}", port)
+                format!("http://host.docker.internal:{port}")
             });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
 
@@ -727,8 +726,7 @@ impl ExecutionService for StandardExecutionService {
             for path in &mount_paths {
                 if !(path == "/workspace" || path.starts_with("/workspace/")) {
                     return Err(anyhow!(
-                        "Invalid mount path '{}': all mounts must be /workspace or /workspace/*",
-                        path
+                        "Invalid mount path '{path}': all mounts must be /workspace or /workspace/*"
                     ));
                 }
             }
@@ -831,20 +829,15 @@ impl ExecutionService for StandardExecutionService {
                         Err(e) => {
                             tracing::error!("StandardRuntime validation failed: {}", e);
                             return Err(anyhow!(
-                                "Unsupported Standard Runtime: {} {}. {}",
-                                language,
-                                version,
-                                e
+                                "Unsupported Standard Runtime: {language} {version}. {e}"
                             ));
                         }
                     }
                 } else {
                     return Err(anyhow!(
                         "StandardRuntime registry not configured; cannot resolve image for \
-                         language='{}' version='{}'. Call `.with_runtime_registry()` when \
-                         building StandardExecutionService (ADR-043).",
-                        language,
-                        version
+                         language='{language}' version='{version}'. Call `.with_runtime_registry()` when \
+                         building StandardExecutionService (ADR-043)."
                     ));
                 }
             },
@@ -943,10 +936,7 @@ impl ExecutionService for StandardExecutionService {
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
                     // Execution timed out — emit specific timeout event
                     if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
-                        exec.fail(format!(
-                            "Execution timed out after {} seconds",
-                            timeout_secs
-                        ));
+                        exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
 
@@ -1049,7 +1039,7 @@ impl ExecutionService for StandardExecutionService {
             match receiver.recv().await {
                 Ok(event) => Some((Ok(event), receiver)),
                 Err(EventBusError::Closed) => None,
-                Err(e) => Some((Err(anyhow!("Event bus error: {}", e)), receiver)),
+                Err(e) => Some((Err(anyhow!("Event bus error: {e}")), receiver)),
             }
         });
 
@@ -1088,7 +1078,7 @@ impl ExecutionService for StandardExecutionService {
             .repository
             .find_by_id(parent_execution_id)
             .await?
-            .ok_or_else(|| anyhow!("Parent execution {} not found", parent_execution_id))?;
+            .ok_or_else(|| anyhow!("Parent execution {parent_execution_id} not found"))?;
 
         if !parent.can_spawn_child() {
             return Err(anyhow!(
@@ -1119,7 +1109,7 @@ impl ExecutionService for StandardExecutionService {
             max_retries,
             &parent,
         )
-        .map_err(|e| anyhow!("Failed to create child execution: {}", e))?;
+        .map_err(|e| anyhow!("Failed to create child execution: {e}"))?;
         let child_execution_id = child_execution.id;
         child_execution.start();
         self.repository.save(&child_execution).await?;
@@ -1162,7 +1152,7 @@ impl ExecutionService for StandardExecutionService {
                     .as_ref()
                     .map(|n| n.port)
                     .unwrap_or(8088);
-                format!("http://host.docker.internal:{}", port)
+                format!("http://host.docker.internal:{port}")
             });
         env.insert("AEGIS_ORCHESTRATOR_URL".to_string(), orchestrator_url);
         let llm_timeout_seconds = agent
@@ -1214,12 +1204,7 @@ impl ExecutionService for StandardExecutionService {
             let version = agent.manifest.spec.runtime.version.as_deref().unwrap_or("");
             if let Some(ref reg) = self.runtime_registry {
                 reg.resolve(language, version).map_err(|e| {
-                    anyhow!(
-                        "Unsupported Standard Runtime for judge: {} {}. {}",
-                        language,
-                        version,
-                        e
-                    )
+                    anyhow!("Unsupported Standard Runtime for judge: {language} {version}. {e}")
                 })?
             } else {
                 return Err(anyhow!(
@@ -1436,10 +1421,7 @@ impl ExecutionService for StandardExecutionService {
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
                     if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
-                        exec.fail(format!(
-                            "Execution timed out after {} seconds",
-                            timeout_secs
-                        ));
+                        exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
                         let _ = repository.save(&exec).await;
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {

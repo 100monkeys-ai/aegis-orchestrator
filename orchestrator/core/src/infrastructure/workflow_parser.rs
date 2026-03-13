@@ -51,6 +51,7 @@
 //! ```
 
 use crate::domain::workflow::*;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -64,7 +65,7 @@ use std::path::Path;
 ///
 /// This struct matches the YAML schema exactly. It is then converted
 /// to the domain Workflow object with validation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowManifest {
     pub api_version: String,
@@ -73,7 +74,7 @@ pub struct WorkflowManifest {
     pub spec: WorkflowSpecYaml,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowMetadataYaml {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +87,7 @@ pub struct WorkflowMetadataYaml {
     pub annotations: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowSpecYaml {
     pub initial_state: String,
     #[serde(default)]
@@ -97,17 +98,18 @@ pub struct WorkflowSpecYaml {
     pub volumes: Vec<crate::domain::workflow::WorkflowVolumeSpec>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowStateYaml {
     #[serde(flatten)]
     pub kind: StateKindYaml,
     pub transitions: Vec<TransitionRuleYaml>,
     #[serde(default)]
     #[serde(with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
     pub timeout: Option<std::time::Duration>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind")]
 pub enum StateKindYaml {
     Agent {
@@ -174,7 +176,7 @@ pub enum StateKindYaml {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ParallelAgentConfigYaml {
     pub agent: String,
     pub input: String,
@@ -198,7 +200,7 @@ fn default_poll_interval() -> u64 {
     500
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ConsensusConfigYaml {
     pub strategy: ConsensusStrategy,
     #[serde(default)]
@@ -218,7 +220,7 @@ fn default_min_judges() -> Option<usize> {
 }
 
 /// YAML representation of a judge agent configuration (ADR-016 / ADR-017)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct JudgeConfigYaml {
     pub agent_id: String,
     #[serde(default)]
@@ -227,7 +229,7 @@ pub struct JudgeConfigYaml {
     pub weight: f64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TransitionRuleYaml {
     #[serde(flatten)]
     pub condition: TransitionConditionYaml,
@@ -236,7 +238,7 @@ pub struct TransitionRuleYaml {
     pub feedback: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "condition", rename_all = "snake_case")]
 pub enum TransitionConditionYaml {
     Always,
@@ -327,7 +329,7 @@ impl WorkflowParser {
 
         // Validate and convert metadata
         WorkflowMetadata::validate_name(&manifest.metadata.name).map_err(|e| {
-            WorkflowParseError::ValidationError(format!("Invalid workflow name: {}", e))
+            WorkflowParseError::ValidationError(format!("Invalid workflow name: {e}"))
         })?;
 
         let metadata = WorkflowMetadata {
@@ -970,7 +972,7 @@ spec:
                 assert_eq!(r.backoff.as_deref(), Some("5s"));
                 assert!(!shell);
             }
-            other => assert!(false, "expected ContainerRun, got {:?}", other),
+            other => panic!("expected ContainerRun, got {other:?}"),
         }
     }
 
@@ -1015,7 +1017,7 @@ spec:
                     crate::domain::workflow::ParallelCompletionStrategy::AllSucceed
                 );
             }
-            other => assert!(false, "expected ParallelContainerRun, got {:?}", other),
+            other => panic!("expected ParallelContainerRun, got {other:?}"),
         }
     }
 
@@ -1080,7 +1082,7 @@ spec:
                 assert_eq!(i1, i2);
                 assert_eq!(v1.len(), v2.len());
             }
-            _ => assert!(false, "both states should be ContainerRun after round-trip"),
+            _ => panic!("both states should be ContainerRun after round-trip"),
         }
     }
 

@@ -383,8 +383,7 @@ impl StimulusService for StandardStimulusService {
                     .publish_stimulus_event(StimulusEvent::StimulusRejected {
                         stimulus_id: stimulus.id,
                         reason: format!(
-                            "low_confidence: {:.2} (threshold: {:.2})",
-                            confidence, threshold
+                            "low_confidence: {confidence:.2} (threshold: {threshold:.2})"
                         ),
                         rejected_at: Utc::now(),
                     });

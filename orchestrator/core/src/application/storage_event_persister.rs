@@ -184,8 +184,7 @@ mod tests {
         // Assert: Event was persisted
         assert!(
             matches!(event, StorageEvent::FileOpened { .. }),
-            "Test setup error: expected FileOpened event, got {:?}",
-            event
+            "Test setup error: expected FileOpened event, got {event:?}"
         );
         let StorageEvent::FileOpened { volume_id, .. } = &event else {
             return;

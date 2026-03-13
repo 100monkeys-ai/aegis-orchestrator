@@ -102,16 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if aegis_proto_path.exists() {
         protos.push(aegis_proto_path.to_string_lossy().to_string());
     } else {
-        return Err(format!("aegis_runtime.proto not found at {:?}", aegis_proto_path).into());
+        return Err(format!("aegis_runtime.proto not found at {aegis_proto_path:?}").into());
     }
     if smcp_gateway_proto_path.exists() {
         protos.push(smcp_gateway_proto_path.to_string_lossy().to_string());
     } else {
-        return Err(format!(
-            "smcp_gateway.proto not found at {:?}",
-            smcp_gateway_proto_path
-        )
-        .into());
+        return Err(format!("smcp_gateway.proto not found at {smcp_gateway_proto_path:?}").into());
     }
 
     let temporal_protos = &[

@@ -101,14 +101,11 @@ impl EnvelopeVerifier for SmcpEnvelope {
         })?;
 
         let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Invalid public key: {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Invalid public key: {e}"))
         })?;
 
         let decoded_sig = STANDARD.decode(&self.signature).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!(
-                "Invalid base64 signature: {}",
-                e
-            ))
+            SmcpSessionError::SignatureVerificationFailed(format!("Invalid base64 signature: {e}"))
         })?;
 
         let sig_bytes: [u8; 64] = decoded_sig.try_into().map_err(|_| {
@@ -123,8 +120,7 @@ impl EnvelopeVerifier for SmcpEnvelope {
             .verify(&self.inner_mcp, &signature)
             .map_err(|e| {
                 SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Signature verification failed: {}",
-                    e
+                    "Signature verification failed: {e}"
                 ))
             })
     }

@@ -55,7 +55,7 @@ impl StorageProvider for LocalHostStorageProvider {
             return Err(StorageError::AlreadyExists(path.to_string()));
         }
         std::fs::create_dir_all(&fs_path)
-            .map_err(|e| StorageError::IoError(format!("Create dir failed: {}", e)))?;
+            .map_err(|e| StorageError::IoError(format!("Create dir failed: {e}")))?;
         Ok(())
     }
 
@@ -65,7 +65,7 @@ impl StorageProvider for LocalHostStorageProvider {
             return Err(StorageError::NotFound(path.to_string()));
         }
         std::fs::remove_dir_all(&fs_path)
-            .map_err(|e| StorageError::IoError(format!("Delete dir failed: {}", e)))?;
+            .map_err(|e| StorageError::IoError(format!("Delete dir failed: {e}")))?;
         Ok(())
     }
 
@@ -94,24 +94,24 @@ impl StorageProvider for LocalHostStorageProvider {
         match mode {
             OpenMode::ReadOnly => {
                 std::fs::metadata(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+                    .map_err(|e| StorageError::FileNotFound(format!("{path}: {e}")))?;
             }
             OpenMode::WriteOnly => {
                 File::options()
                     .write(true)
                     .open(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+                    .map_err(|e| StorageError::FileNotFound(format!("{path}: {e}")))?;
             }
             OpenMode::ReadWrite => {
                 File::options()
                     .read(true)
                     .write(true)
                     .open(&fs_path)
-                    .map_err(|e| StorageError::FileNotFound(format!("{}: {}", path, e)))?;
+                    .map_err(|e| StorageError::FileNotFound(format!("{path}: {e}")))?;
             }
             OpenMode::Create => {
                 File::create(&fs_path)
-                    .map_err(|e| StorageError::IoError(format!("Create failed {}: {}", path, e)))?;
+                    .map_err(|e| StorageError::IoError(format!("Create failed {path}: {e}")))?;
             }
         };
 

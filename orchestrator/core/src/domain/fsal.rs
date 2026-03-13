@@ -230,7 +230,7 @@ impl AegisFSAL {
                 // Recursive glob pattern (/workspace/** matches /workspace and all nested)
                 let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
                 path.starts_with(prefix)
-                    && (path == prefix || path.starts_with(&format!("{}/", prefix)))
+                    && (path == prefix || path.starts_with(&format!("{prefix}/")))
             } else if pattern.ends_with("/*") {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
@@ -243,8 +243,7 @@ impl AegisFSAL {
 
         if !allowed {
             return Err(FsalError::PolicyViolation(format!(
-                "Read not allowed for path: {}",
-                path
+                "Read not allowed for path: {path}"
             )));
         }
 
@@ -260,7 +259,7 @@ impl AegisFSAL {
                 // Recursive glob pattern (/workspace/** matches /workspace and all nested)
                 let prefix = &pattern[..pattern.len() - 3]; // Remove "/**"
                 path.starts_with(prefix)
-                    && (path == prefix || path.starts_with(&format!("{}/", prefix)))
+                    && (path == prefix || path.starts_with(&format!("{prefix}/")))
             } else if pattern.ends_with("/*") {
                 // Single-level glob pattern (/workspace/* matches /workspace/file but not /workspace/dir/file)
                 let prefix = &pattern[..pattern.len() - 2];
@@ -273,8 +272,7 @@ impl AegisFSAL {
 
         if !allowed {
             return Err(FsalError::PolicyViolation(format!(
-                "Write not allowed for path: {}",
-                path
+                "Write not allowed for path: {path}"
             )));
         }
 
@@ -295,7 +293,7 @@ impl AegisFSAL {
 
         // 2. Build child path
         let child_path = if parent_path == "/" || parent_path.is_empty() {
-            format!("/{}", name)
+            format!("/{name}")
         } else {
             format!("{}/{}", parent_path.trim_end_matches('/'), name)
         };

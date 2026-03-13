@@ -58,7 +58,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         return Ok(Duration::from_secs(hours * 3600));
     }
 
-    Err(format!("Invalid duration format: {}", s))
+    Err(format!("Invalid duration format: {s}"))
 }
 
 /// Global default execution timeout when the manifest specifies none.
@@ -244,7 +244,7 @@ impl Supervisor {
                     id
                 }
                 Err(e) => {
-                    let error_msg = format!("Failed to spawn instance: {}", e);
+                    let error_msg = format!("Failed to spawn instance: {e}");
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
 
@@ -319,7 +319,7 @@ impl Supervisor {
             let output = match execution_result {
                 Ok(out) => out,
                 Err(e) => {
-                    let error_msg = format!("Execution failed: {}", e);
+                    let error_msg = format!("Execution failed: {e}");
                     warn!("{}", error_msg);
                     observer.on_iteration_fail(attempts as u8, &error_msg).await;
 
@@ -497,7 +497,7 @@ mod tests {
         fn with_spawn_success(self, count: usize) -> Self {
             let mut results = Vec::new();
             for i in 0..count {
-                results.push(Ok(InstanceId::new(format!("instance-{}", i))));
+                results.push(Ok(InstanceId::new(format!("instance-{i}"))));
             }
             Self {
                 spawn_results: Arc::new(Mutex::new(results)),

@@ -48,12 +48,12 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
         .build()?;
 
     let base_url = if host.starts_with("http://") || host.starts_with("https://") {
-        format!("{}:{}", host, port)
+        format!("{host}:{port}")
     } else {
-        format!("http://{}:{}", host, port)
+        format!("http://{host}:{port}")
     };
 
-    let health_url = format!("{}/health", base_url);
+    let health_url = format!("{base_url}/health");
 
     // We check the PID file primarily to return the PID in the Running status if available locally.
     // If not available (remote), we return 0 or another indicator.
@@ -234,13 +234,13 @@ fn process_exists(_pid: u32) -> bool {
 #[cfg(unix)]
 fn send_signal(pid: u32, signal: i32) -> Result<()> {
     let pid_i32 = i32::try_from(pid)
-        .map_err(|_| anyhow::anyhow!("PID {} overflows i32; cannot send signal", pid))?;
+        .map_err(|_| anyhow::anyhow!("PID {pid} overflows i32; cannot send signal"))?;
     // SAFETY: `libc::kill` is safe when `pid_i32` is a valid process ID (which
     // we have just verified fits in `i32`) and `signal` is a valid signal
     // number supplied by the caller from named `libc::SIG*` constants.
     let rc = unsafe { libc::kill(pid_i32, signal) };
     if rc != 0 {
-        anyhow::bail!("Failed to send signal {} to process {}", signal, pid);
+        anyhow::bail!("Failed to send signal {signal} to process {pid}");
     }
     Ok(())
 }
@@ -250,10 +250,10 @@ pub fn write_pid_file(pid: u32) -> Result<()> {
     let pid_file = get_pid_file_path();
     if let Some(parent) = pid_file.parent() {
         std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create PID directory: {:?}", parent))?;
+            .with_context(|| format!("Failed to create PID directory: {parent:?}"))?;
     }
     std::fs::write(&pid_file, pid.to_string())
-        .with_context(|| format!("Failed to write PID file: {:?}", pid_file))?;
+        .with_context(|| format!("Failed to write PID file: {pid_file:?}"))?;
     info!("Wrote PID file: {:?}", pid_file);
     Ok(())
 }
@@ -263,7 +263,7 @@ pub fn remove_pid_file() -> Result<()> {
     let pid_file = get_pid_file_path();
     if pid_file.exists() {
         std::fs::remove_file(&pid_file)
-            .with_context(|| format!("Failed to remove PID file: {:?}", pid_file))?;
+            .with_context(|| format!("Failed to remove PID file: {pid_file:?}"))?;
         info!("Removed PID file: {:?}", pid_file);
     }
     Ok(())

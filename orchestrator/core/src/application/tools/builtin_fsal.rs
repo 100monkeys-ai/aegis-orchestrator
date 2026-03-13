@@ -24,7 +24,7 @@ fn to_volume_relative(mount_point: &Path, path: &str) -> String {
         if stripped.starts_with('/') {
             return stripped.to_string();
         }
-        return format!("/{}", stripped);
+        return format!("/{stripped}");
     }
     path.to_string()
 }
@@ -45,8 +45,7 @@ pub async fn invoke_fs_tool(
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(format!(
-                "No volume registered for execution {}",
-                execution_id
+                "No volume registered for execution {execution_id}"
             ))
         })?;
 
@@ -67,8 +66,7 @@ pub async fn invoke_fs_tool(
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "FSAL create_file error: {}",
-                        e
+                        "FSAL create_file error: {e}"
                     ))
                 })?;
 
@@ -76,10 +74,7 @@ pub async fn invoke_fs_tool(
                 .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
-                        "FSAL write error: {}",
-                        e
-                    ))
+                    SmcpSessionError::SignatureVerificationFailed(format!("FSAL write error: {e}"))
                 })?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -95,7 +90,7 @@ pub async fn invoke_fs_tool(
                 .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!("FSAL read error: {}", e))
+                    SmcpSessionError::SignatureVerificationFailed(format!("FSAL read error: {e}"))
                 })?;
 
             let content = String::from_utf8_lossy(&data).to_string();
@@ -119,8 +114,7 @@ pub async fn invoke_fs_tool(
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "FSAL readdir error: {}",
-                        e
+                        "FSAL readdir error: {e}"
                     ))
                 })?;
 
@@ -151,10 +145,7 @@ pub async fn invoke_fs_tool(
             )
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
-                    "FSAL create_dir error: {}",
-                    e
-                ))
+                SmcpSessionError::SignatureVerificationFailed(format!("FSAL create_dir error: {e}"))
             })?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -179,8 +170,7 @@ pub async fn invoke_fs_tool(
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "FSAL delete_directory error: {}",
-                        e
+                        "FSAL delete_directory error: {e}"
                     ))
                 })?;
             } else {
@@ -193,8 +183,7 @@ pub async fn invoke_fs_tool(
                 .await
                 .map_err(|e| {
                     SmcpSessionError::SignatureVerificationFailed(format!(
-                        "FSAL delete_file error: {}",
-                        e
+                        "FSAL delete_file error: {e}"
                     ))
                 })?;
             }
@@ -209,8 +198,7 @@ pub async fn invoke_fs_tool(
         "fs.grep" => invoke_grep(args, execution_id, fsal, vol_ctx).await,
         "fs.glob" => invoke_glob(args, execution_id, fsal, vol_ctx).await,
         _ => Err(SmcpSessionError::SignatureVerificationFailed(format!(
-            "Unknown fs tool: {}",
-            tool_name
+            "Unknown fs tool: {tool_name}"
         ))),
     }
 }
@@ -239,7 +227,7 @@ async fn invoke_edit(
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (read): {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (read): {e}"))
         })?;
 
     let content = String::from_utf8_lossy(&data).to_string();
@@ -265,7 +253,7 @@ async fn invoke_edit(
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (write): {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (write): {e}"))
         })?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -289,7 +277,7 @@ async fn invoke_multi_edit(
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {}", e))
+            SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {e}"))
         })?;
 
     let mut content = String::from_utf8(data).map_err(|_| {
@@ -324,14 +312,12 @@ async fn invoke_multi_edit(
                 success_count += 1;
             } else {
                 return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Target content '{}' exists multiple times in file. Be more specific.",
-                    target
+                    "Target content '{target}' exists multiple times in file. Be more specific."
                 )));
             }
         } else {
             return Err(SmcpSessionError::SignatureVerificationFailed(format!(
-                "Target content '{}' not found in file.",
-                target
+                "Target content '{target}' not found in file."
             )));
         }
     }
@@ -351,8 +337,7 @@ async fn invoke_multi_edit(
         .await
         .map_err(|e| {
             SmcpSessionError::SignatureVerificationFailed(format!(
-                "Multi-edit error (truncate): {}",
-                e
+                "Multi-edit error (truncate): {e}"
             ))
         })?;
 
@@ -360,10 +345,7 @@ async fn invoke_multi_edit(
         .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!(
-                "Multi-edit error (write): {}",
-                e
-            ))
+            SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (write): {e}"))
         })?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -385,7 +367,7 @@ async fn invoke_grep(
 
     // Parse regex
     let regex = regex::Regex::new(pattern_str).map_err(|e| {
-        SmcpSessionError::SignatureVerificationFailed(format!("Invalid regex pattern: {}", e))
+        SmcpSessionError::SignatureVerificationFailed(format!("Invalid regex pattern: {e}"))
     })?;
 
     // We will do a recursive walk using AegisFSAL
@@ -469,8 +451,8 @@ async fn invoke_glob(
         .replace(".", "\\.")
         .replace("*", ".*")
         .replace("?", ".");
-    let regex = regex::Regex::new(&format!("^{}$", regex_pattern)).map_err(|e| {
-        SmcpSessionError::SignatureVerificationFailed(format!("Invalid glob pattern: {}", e))
+    let regex = regex::Regex::new(&format!("^{regex_pattern}$")).map_err(|e| {
+        SmcpSessionError::SignatureVerificationFailed(format!("Invalid glob pattern: {e}"))
     })?;
 
     let mut matches = Vec::new();

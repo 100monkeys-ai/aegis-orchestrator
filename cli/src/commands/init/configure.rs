@@ -640,11 +640,6 @@ impl ConfigWizard {
     max_retries: 3
     retry_delay_ms: 1000
 "#,
-            base_provider_section = base_provider_section,
-            extra_lmstudio_section = extra_lmstudio_section,
-            extra_anthropic_section = extra_anthropic_section,
-            extra_gemini_section = extra_gemini_section,
-            default_provider = default_provider,
         );
 
         let database_section = r#"
@@ -721,6 +716,18 @@ impl ConfigWizard {
       description: "Fetches content from a URL, optionally converting HTML to Markdown."
       capabilities:
         - name: "web.fetch"
+          skip_judge: true
+    - name: "aegis.schema.get"
+      enabled: true
+      description: "Returns the canonical JSON Schema for a manifest kind (agent or workflow)."
+      capabilities:
+        - name: "aegis.schema.get"
+          skip_judge: true
+    - name: "aegis.schema.validate"
+      enabled: true
+      description: "Validates a manifest YAML string against its canonical JSON Schema."
+      capabilities:
+        - name: "aegis.schema.validate"
           skip_judge: true
     - name: "aegis.agent.create"
       enabled: true

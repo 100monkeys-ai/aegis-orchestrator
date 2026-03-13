@@ -169,8 +169,7 @@ impl RuntimeConfig {
                 "Process isolation is not yet implemented. Use 'docker' or 'inherit'.".to_string(),
             )),
             other => Err(RuntimeError::SpawnFailed(format!(
-                "Unknown isolation mode '{}'. Supported: docker, inherit",
-                other
+                "Unknown isolation mode '{other}'. Supported: docker, inherit"
             ))),
         }
     }

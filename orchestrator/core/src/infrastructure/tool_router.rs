@@ -163,7 +163,7 @@ impl ToolRouter {
             .await
             .map_err(|e| RoutingError::AgentNotAuthorized {
                 tool_name: tool_name.to_string(),
-                reason: format!("Could not load agent's tool authorization: {}", e),
+                reason: format!("Could not load agent's tool authorization: {e}"),
             })?;
 
         // Step 2: Verify the agent is authorized to use this specific tool.
@@ -180,8 +180,7 @@ impl ToolRouter {
                 return Err(RoutingError::AgentNotAuthorized {
                     tool_name: tool_name.to_string(),
                     reason: format!(
-                        "Tool not in agent's authorized set. Authorized: {:?}",
-                        available
+                        "Tool not in agent's authorized set. Authorized: {available:?}"
                     ),
                 });
             }
@@ -445,6 +444,30 @@ impl ToolRouter {
                             }
                         },
                         "required": ["url"]
+                    }),
+                    "aegis.schema.get" => json!({
+                        "type": "object",
+                        "properties": {
+                            "key": {
+                                "type": "string",
+                                "description": "Schema key to retrieve. Supported: \"agent/manifest/v1\", \"workflow/manifest/v1\""
+                            }
+                        },
+                        "required": ["key"]
+                    }),
+                    "aegis.schema.validate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "kind": {
+                                "type": "string",
+                                "description": "Manifest kind to validate against. Supported: \"agent\", \"workflow\""
+                            },
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full manifest YAML text to validate against the canonical schema."
+                            }
+                        },
+                        "required": ["kind", "manifest_yaml"]
                     }),
                     "aegis.agent.create" => json!({
                         "type": "object",
@@ -927,8 +950,7 @@ mod tests {
         let err = result.unwrap_err();
         assert!(
             matches!(err, RoutingError::AgentNotAuthorized { .. }),
-            "Expected AgentNotAuthorized, got {:?}",
-            err
+            "Expected AgentNotAuthorized, got {err:?}"
         );
         if let RoutingError::AgentNotAuthorized { tool_name, .. } = err {
             assert_eq!(tool_name, "gmail.send");

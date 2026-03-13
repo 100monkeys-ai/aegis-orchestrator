@@ -112,8 +112,7 @@ impl WorkflowRegistry {
     pub fn set_confidence_threshold(&mut self, threshold: f64) -> Result<()> {
         if !(0.0..=1.0).contains(&threshold) {
             return Err(anyhow!(
-                "confidence_threshold must be in [0.0, 1.0], got {}",
-                threshold
+                "confidence_threshold must be in [0.0, 1.0], got {threshold}"
             ));
         }
         self.confidence_threshold = threshold;
@@ -160,10 +159,10 @@ impl WorkflowRegistry {
             return Err(anyhow!("Route key must not be empty"));
         }
         if lowered.contains('/') {
-            return Err(anyhow!("Route key '{}' must not contain '/'", key));
+            return Err(anyhow!("Route key '{key}' must not contain '/'"));
         }
         if lowered.contains(char::is_whitespace) {
-            return Err(anyhow!("Route key '{}' must not contain whitespace", key));
+            return Err(anyhow!("Route key '{key}' must not contain whitespace"));
         }
         Ok(lowered)
     }

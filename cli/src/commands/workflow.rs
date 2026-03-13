@@ -199,10 +199,10 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
     println!("Workflow Details:");
     println!("  Name:        {}", workflow.metadata.name);
     if let Some(version) = &workflow.metadata.version {
-        println!("  Version:     {}", version);
+        println!("  Version:     {version}");
     }
     if let Some(description) = &workflow.metadata.description {
-        println!("  Description: {}", description);
+        println!("  Description: {description}");
     }
     println!("  States:      {}", workflow.spec.states.len());
     println!("  Initial:     {}", workflow.spec.initial_state.as_str());
@@ -214,7 +214,7 @@ async fn validate_workflow(file: PathBuf) -> Result<()> {
         .values()
         .filter(|s| s.transitions.is_empty())
         .count();
-    println!("  Terminal:    {} state(s)", terminal_count);
+    println!("  Terminal:    {terminal_count} state(s)");
 
     Ok(())
 }
@@ -228,11 +228,7 @@ async fn deploy_workflow(file: PathBuf, host: &str, port: u16) -> Result<()> {
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
             println!(
                 "{}",
-                format!(
-                    "⚠ Daemon is running (PID: {}) but unhealthy: {}",
-                    pid, error
-                )
-                .yellow()
+                format!("⚠ Daemon is running (PID: {pid}) but unhealthy: {error}").yellow()
             );
             println!("Run 'aegis daemon status' for more info.");
             return Ok(());
@@ -267,8 +263,8 @@ async fn deploy_workflow(file: PathBuf, host: &str, port: u16) -> Result<()> {
 
     println!("{}", "✓ Workflow deployed successfully!".green().bold());
     println!();
-    println!("  Name: {}", workflow_name);
-    println!("  Run:  aegis workflow run {}", workflow_name);
+    println!("  Name: {workflow_name}");
+    println!("  Run:  aegis workflow run {workflow_name}");
 
     Ok(())
 }
@@ -312,10 +308,7 @@ async fn run_workflow(
     for param in params {
         let parts: Vec<&str> = param.splitn(2, '=').collect();
         if parts.len() != 2 {
-            anyhow::bail!(
-                "Invalid parameter format: '{}'. Expected 'key=value'",
-                param
-            );
+            anyhow::bail!("Invalid parameter format: '{param}'. Expected 'key=value'");
         }
         let key = parts[0].to_string();
         let value = parts[1].to_string();
@@ -327,11 +320,11 @@ async fn run_workflow(
     }
 
     println!("{}", "🚀 Starting workflow execution...".cyan());
-    println!("   Workflow: {}", name);
+    println!("   Workflow: {name}");
     if !input_params.is_empty() {
         println!("   Parameters:");
         for (key, value) in &input_params {
-            println!("     {}: {}", key, value);
+            println!("     {key}: {value}");
         }
     }
     println!();
@@ -345,8 +338,8 @@ async fn run_workflow(
 
     println!("{}", "✓ Workflow execution started!".green().bold());
     println!();
-    println!("  Execution ID: {}", execution_id);
-    println!("  View logs:    aegis workflow logs {}", execution_id);
+    println!("  Execution ID: {execution_id}");
+    println!("  View logs:    aegis workflow logs {execution_id}");
     println!();
 
     if follow {
@@ -374,11 +367,7 @@ async fn generate_workflow(
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
             println!(
                 "{}",
-                format!(
-                    "⚠ Daemon is running (PID: {}) but unhealthy: {}",
-                    pid, error
-                )
-                .yellow()
+                format!("⚠ Daemon is running (PID: {pid}) but unhealthy: {error}").yellow()
             );
             println!("Run 'aegis daemon status' for more info.");
             return Ok(());
@@ -437,8 +426,7 @@ async fn generate_workflow(
     println!(
         "{}",
         format!(
-            "Generating workflow via built-in workflow '{}'...",
-            WORKFLOW_GENERATOR_WORKFLOW_NAME
+            "Generating workflow via built-in workflow '{WORKFLOW_GENERATOR_WORKFLOW_NAME}'..."
         )
         .cyan()
     );
@@ -455,15 +443,14 @@ async fn generate_workflow(
 
     println!(
         "{}",
-        format!("✓ Workflow generation execution started: {}", execution_id).green()
+        format!("✓ Workflow generation execution started: {execution_id}").green()
     );
 
     if follow {
         client.stream_workflow_logs(execution_id).await?;
     } else {
         println!(
-            "Follow generator workflow logs with:\n  aegis workflow logs {} --follow",
-            execution_id
+            "Follow generator workflow logs with:\n  aegis workflow logs {execution_id} --follow"
         );
     }
 
@@ -544,18 +531,14 @@ async fn ensure_generator_agent_deployed(
 
     println!(
         "{}",
-        format!(
-            "Generator agent '{}' not found. Deploying template...",
-            name
-        )
-        .yellow()
+        format!("Generator agent '{name}' not found. Deploying template...").yellow()
     );
 
     let manifest: aegis_orchestrator_sdk::AgentManifest =
         serde_yaml::from_str(template_yaml).context("Failed to parse generator template YAML")?;
     manifest
         .validate()
-        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {}", e))?;
+        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {e}"))?;
 
     client
         .deploy_agent(manifest, false)
@@ -574,11 +557,7 @@ async fn ensure_generator_workflow_deployed(
 
     println!(
         "{}",
-        format!(
-            "Generator workflow '{}' not found. Deploying template...",
-            name
-        )
-        .yellow()
+        format!("Generator workflow '{name}' not found. Deploying template...").yellow()
     );
 
     // Validate template before deployment.
@@ -664,15 +643,15 @@ async fn list_workflows(long: bool, labels: Vec<String>, host: &str, port: u16) 
             .unwrap_or("unknown");
 
         if long {
-            println!("{}", format!("• {}", name).green().bold());
+            println!("{}", format!("• {name}").green().bold());
             if let Some(version) = workflow.get("version").and_then(|v| v.as_str()) {
-                println!("  Version:     {}", version);
+                println!("  Version:     {version}");
             }
             if let Some(desc) = workflow.get("description").and_then(|d| d.as_str()) {
-                println!("  Description: {}", desc);
+                println!("  Description: {desc}");
             }
             if let Some(states) = workflow.get("state_count").and_then(|s| s.as_u64()) {
-                println!("  States:      {}", states);
+                println!("  States:      {states}");
             }
             println!();
         } else {
@@ -712,20 +691,17 @@ async fn describe_workflow(
 
     match output_format.as_str() {
         "yaml" => {
-            println!("{}", workflow_yaml);
+            println!("{workflow_yaml}");
         }
         "json" => {
             let parsed: serde_yaml::Value =
                 serde_yaml::from_str(&workflow_yaml).context("Failed to parse workflow YAML")?;
             let json =
                 serde_json::to_string_pretty(&parsed).context("Failed to convert to JSON")?;
-            println!("{}", json);
+            println!("{json}");
         }
         _ => {
-            anyhow::bail!(
-                "Invalid output format: '{}'. Use 'yaml' or 'json'",
-                output_format
-            );
+            anyhow::bail!("Invalid output format: '{output_format}'. Use 'yaml' or 'json'");
         }
     }
 
@@ -755,7 +731,7 @@ async fn stream_workflow_logs(
     }
 
     println!("{}", "📡 Streaming workflow logs...".cyan());
-    println!("   Execution ID: {}", execution_id);
+    println!("   Execution ID: {execution_id}");
     if transitions_only {
         println!("   Filter:       State transitions only");
     }
@@ -774,7 +750,7 @@ async fn stream_workflow_logs(
             .get_workflow_logs(execution_id)
             .await
             .context("Failed to get logs")?;
-        println!("{}", logs);
+        println!("{logs}");
     }
 
     Ok(())
@@ -809,7 +785,7 @@ async fn delete_workflow(
             use std::io::{self, Write};
             print!(
                 "{}",
-                format!("Delete workflow '{}' (y/N)? ", name_for_prompt).yellow()
+                format!("Delete workflow '{name_for_prompt}' (y/N)? ").yellow()
             );
             io::stdout().flush()?;
             let mut response = String::new();

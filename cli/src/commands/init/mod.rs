@@ -169,7 +169,7 @@ fn print_banner() {
 fn print_step(n: u8, total: u8, label: &str) {
     println!(
         "\n{} {}",
-        format!("[{}/{}]", n, total).bold().cyan(),
+        format!("[{n}/{total}]").bold().cyan(),
         label.bold()
     );
 }

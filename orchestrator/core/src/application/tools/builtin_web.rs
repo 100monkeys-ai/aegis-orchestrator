@@ -55,8 +55,7 @@ pub async fn invoke_web_tool(
                 .await
         }
         _ => Err(SmcpSessionError::SignatureVerificationFailed(format!(
-            "Unknown web tool: {}",
-            tool_name
+            "Unknown web tool: {tool_name}"
         ))),
     }
 }

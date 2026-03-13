@@ -105,7 +105,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
 
         // Step 1: Parse YAML → Workflow domain aggregate
         let workflow = WorkflowParser::parse_yaml(yaml_manifest)
-            .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {e}"))?;
 
         let workflow_id = workflow.id.to_string();
         let workflow_name = workflow.metadata.name.clone();

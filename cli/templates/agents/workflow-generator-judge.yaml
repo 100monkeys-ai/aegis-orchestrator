@@ -22,10 +22,19 @@ spec:
       Input typically includes:
       - user workflow objective
       - generated workflow plan and/or workflow YAML
+      - tool call history from the worker's execution
       - worker_mounts: list of inherited mounted paths (for example `/workspace/cache`)
       - optional criteria and validation context
 
       If worker artifacts are available under `/workspace`, inspect them directly before scoring.
+
+      TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
+      - If `aegis.schema.validate` was NOT called before `aegis.workflow.create_and_validate`, reduce
+        the `correctness` score by at least 0.2 and note "aegis.schema.validate was not called before aegis.workflow.create_and_validate".
+      - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at
+        least 0.3 and list the schema errors in the `correctness` signal message.
+      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.workflow.create_and_validate`,
+        give full credit for schema compliance.
 
       Score output quality for:
       - workflow correctness

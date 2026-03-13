@@ -328,9 +328,9 @@ impl NFSFileSystem for AegisFsalAdapter {
             // Navigate down to depth 3: /aegis/volumes/{tenant_id}
             if path_parts.len() < 3 {
                 let synthetic_path = if parent_path == "/" {
-                    format!("/{}", name)
+                    format!("/{name}")
                 } else {
-                    format!("{}/{}", parent_path, name)
+                    format!("{parent_path}/{name}")
                 };
 
                 let dummy_exec = crate::domain::execution::ExecutionId(uuid::Uuid::nil());
@@ -393,9 +393,9 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Build child path relative to volume root
         let child_path = if parent_path == "/" {
-            format!("/{}", name)
+            format!("/{name}")
         } else {
-            format!("{}/{}", parent_path, name)
+            format!("{parent_path}/{name}")
         };
 
         // Encode child handle with path
@@ -712,9 +712,9 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Build file path
         let file_path = if parent_path == "/" {
-            format!("/{}", name)
+            format!("/{name}")
         } else {
-            format!("{}/{}", parent_path, name)
+            format!("{parent_path}/{name}")
         };
 
         // Create file via FSAL
@@ -776,9 +776,9 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Build directory path
         let dir_path = if parent_path == "/" {
-            format!("/{}", name)
+            format!("/{name}")
         } else {
-            format!("{}/{}", parent_path, name)
+            format!("{parent_path}/{name}")
         };
 
         // Create directory via FSAL
@@ -830,9 +830,9 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Build file path
         let file_path = if parent_path == "/" {
-            format!("/{}", name)
+            format!("/{name}")
         } else {
-            format!("{}/{}", parent_path, name)
+            format!("{parent_path}/{name}")
         };
 
         // Try to delete as file first, then as directory if file deletion fails
@@ -895,14 +895,14 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Build full paths
         let from_path = if from_parent_path == "/" {
-            format!("/{}", from_name)
+            format!("/{from_name}")
         } else {
-            format!("{}/{}", from_parent_path, from_name)
+            format!("{from_parent_path}/{from_name}")
         };
         let to_path = if to_parent_path == "/" {
-            format!("/{}", to_name)
+            format!("/{to_name}")
         } else {
-            format!("{}/{}", to_parent_path, to_name)
+            format!("{to_parent_path}/{to_name}")
         };
 
         // Rename via FSAL

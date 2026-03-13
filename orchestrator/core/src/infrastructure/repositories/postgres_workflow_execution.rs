@@ -133,7 +133,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| {
-            RepositoryError::Database(format!("Failed to save workflow execution: {}", e))
+            RepositoryError::Database(format!("Failed to save workflow execution: {e}"))
         })?;
 
         Ok(())
@@ -302,9 +302,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(iteration_val)
         .execute(&self.pool)
         .await
-        .map_err(|e| {
-            RepositoryError::Database(format!("Failed to append execution event: {}", e))
-        })?;
+        .map_err(|e| RepositoryError::Database(format!("Failed to append execution event: {e}")))?;
 
         // Also update iteration_count if this is an iteration event
         if iteration_number.is_some() {
@@ -320,7 +318,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             .execute(&self.pool)
             .await
             .map_err(|e| {
-                RepositoryError::Database(format!("Failed to update iteration_count: {}", e))
+                RepositoryError::Database(format!("Failed to update iteration_count: {e}"))
             })?;
         }
 

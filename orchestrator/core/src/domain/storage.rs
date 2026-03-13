@@ -466,7 +466,7 @@ mod tests {
         }
 
         async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(format!("test-handle-{}", path).into_bytes()))
+            Ok(FileHandle(format!("test-handle-{path}").into_bytes()))
         }
 
         async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {

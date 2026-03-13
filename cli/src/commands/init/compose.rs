@@ -74,7 +74,7 @@ impl ComposeRunner {
                 eprintln!("{}", "  (no container logs captured)".dimmed());
             } else {
                 for line in logs.lines() {
-                    eprintln!("  {}", line);
+                    eprintln!("  {line}");
                 }
             }
             eprintln!(
@@ -136,10 +136,7 @@ impl ComposeRunner {
             }
 
             if Instant::now() >= deadline {
-                bail!(
-                    "Timed out waiting for Ollama model '{}' to become available",
-                    model
-                );
+                bail!("Timed out waiting for Ollama model '{model}' to become available");
             }
             thread::sleep(Duration::from_secs(2));
         }
@@ -187,7 +184,7 @@ impl ComposeRunner {
             Ok(o) => {
                 let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
                 let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
-                format!("{}{}", stdout, stderr)
+                format!("{stdout}{stderr}")
             }
             Err(_) => String::new(),
         }

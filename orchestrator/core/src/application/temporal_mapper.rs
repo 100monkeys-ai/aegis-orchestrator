@@ -736,7 +736,7 @@ impl TemporalWorkflowMapper {
                     handlebars
                         .render_template(input, &serde_json::json!({}))
                         .with_context(|| {
-                            format!("Invalid template in state {}: {}", state_name, input)
+                            format!("Invalid template in state {state_name}: {input}")
                         })?;
                 }
                 StateKind::System { env, .. } => {
@@ -744,10 +744,7 @@ impl TemporalWorkflowMapper {
                         handlebars
                             .render_template(value, &serde_json::json!({}))
                             .with_context(|| {
-                                format!(
-                                    "Invalid template in state {} env {}: {}",
-                                    state_name, key, value
-                                )
+                                format!("Invalid template in state {state_name} env {key}: {value}")
                             })?;
                     }
                 }
@@ -769,8 +766,7 @@ impl TemporalWorkflowMapper {
                             .render_template(value, &serde_json::json!({}))
                             .with_context(|| {
                                 format!(
-                                    "Invalid template in ContainerRun state {} env {}: {}",
-                                    state_name, key, value
+                                    "Invalid template in ContainerRun state {state_name} env {key}: {value}"
                                 )
                             })?;
                     }

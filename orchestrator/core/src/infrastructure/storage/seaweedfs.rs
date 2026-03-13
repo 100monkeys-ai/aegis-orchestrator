@@ -106,10 +106,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 let error_msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
                 Err(StorageError::Unknown(format!(
-                    "Failed to create directory {}: {}",
-                    path, error_msg
+                    "Failed to create directory {path}: {error_msg}"
                 )))
             }
         }
@@ -139,10 +138,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 let error_msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
                 Err(StorageError::Unknown(format!(
-                    "Failed to delete directory {}: {}",
-                    path, error_msg
+                    "Failed to delete directory {path}: {error_msg}"
                 )))
             }
         }
@@ -171,10 +169,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 let error_msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
                 Err(StorageError::Unknown(format!(
-                    "Failed to set quota for {}: {}",
-                    path, error_msg
+                    "Failed to set quota for {path}: {error_msg}"
                 )))
             }
         }
@@ -211,10 +208,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 let error_msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
                 Err(StorageError::Unknown(format!(
-                    "Failed to get usage for {}: {}",
-                    path, error_msg
+                    "Failed to get usage for {path}: {error_msg}"
                 )))
             }
         }
@@ -273,10 +269,9 @@ impl StorageProvider for SeaweedFSAdapter {
                 let error_msg = response
                     .text()
                     .await
-                    .unwrap_or_else(|_| format!("HTTP {}", status));
+                    .unwrap_or_else(|_| format!("HTTP {status}"));
                 Err(StorageError::Unknown(format!(
-                    "Failed to list directories in {}: {}",
-                    path, error_msg
+                    "Failed to list directories in {path}: {error_msg}"
                 )))
             }
         }
@@ -333,8 +328,7 @@ impl StorageProvider for SeaweedFSAdapter {
             }
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path)),
             status => Err(StorageError::Unknown(format!(
-                "Failed to read file {}: HTTP {}",
-                path, status
+                "Failed to read file {path}: HTTP {status}"
             ))),
         }
     }
@@ -438,8 +432,7 @@ impl StorageProvider for SeaweedFSAdapter {
             }
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
             status => Err(StorageError::Unknown(format!(
-                "Failed to stat {}: HTTP {}",
-                path, status
+                "Failed to stat {path}: HTTP {status}"
             ))),
         }
     }
@@ -473,8 +466,7 @@ impl StorageProvider for SeaweedFSAdapter {
             }
             StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
             status => Err(StorageError::Unknown(format!(
-                "Failed to readdir {}: HTTP {}",
-                path, status
+                "Failed to readdir {path}: HTTP {status}"
             ))),
         }
     }
@@ -506,8 +498,7 @@ impl StorageProvider for SeaweedFSAdapter {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
             StatusCode::NOT_FOUND => Err(StorageError::FileNotFound(path.to_string())),
             status => Err(StorageError::Unknown(format!(
-                "Failed to delete file {}: HTTP {}",
-                path, status
+                "Failed to delete file {path}: HTTP {status}"
             ))),
         }
     }
@@ -530,8 +521,7 @@ impl StorageProvider for SeaweedFSAdapter {
 
         if !read_response.status().is_success() {
             return Err(StorageError::Unknown(format!(
-                "Failed to read source file {}",
-                from
+                "Failed to read source file {from}"
             )));
         }
 
@@ -543,8 +533,7 @@ impl StorageProvider for SeaweedFSAdapter {
 
         if !write_response.status().is_success() {
             return Err(StorageError::Unknown(format!(
-                "Failed to write destination file {}",
-                to
+                "Failed to write destination file {to}"
             )));
         }
 
@@ -555,8 +544,7 @@ impl StorageProvider for SeaweedFSAdapter {
             // Rename semantics: if delete fails, both files exist - this is an error
             // Don't leave orphaned files; fail the rename operation
             return Err(StorageError::Unknown(format!(
-                "Rename from {} to {} failed on cleanup: source file still exists",
-                from, to
+                "Rename from {from} to {to} failed on cleanup: source file still exists"
             )));
         }
 

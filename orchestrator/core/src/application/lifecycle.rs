@@ -102,7 +102,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         self.repository
             .list_all()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list agents: {}", e))
+            .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
     }
 
     async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
@@ -110,7 +110,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .repository
             .find_by_name(name)
             .await
-            .map_err(|e| anyhow::anyhow!("Repository error: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
     }
 }

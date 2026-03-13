@@ -146,7 +146,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
                     applied_count
                 );
             } else {
-                println!("  Applying {} pending migration(s)...", pending);
+                println!("  Applying {pending} pending migration(s)...");
                 MIGRATOR
                     .run(&pool)
                     .await

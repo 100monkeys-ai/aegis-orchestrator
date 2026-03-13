@@ -172,12 +172,12 @@ impl InnerLoopService {
                 let mut ctx = {
                     let mut lock = self.active_executions.write().await;
                     lock.remove(&execution_id).ok_or_else(|| {
-                        anyhow::anyhow!("Unknown or expired execution_id: {}", execution_id)
+                        anyhow::anyhow!("Unknown or expired execution_id: {execution_id}")
                     })?
                 };
 
                 if Some(dispatch_id) != ctx.pending_dispatch_id {
-                    anyhow::bail!("Mismatched dispatch_id for execution_id: {}", execution_id);
+                    anyhow::bail!("Mismatched dispatch_id for execution_id: {execution_id}");
                 }
 
                 let tool_call_id = ctx.pending_tool_call_id.clone().unwrap_or_default();
@@ -213,7 +213,7 @@ impl InnerLoopService {
             let mut ctx = {
                 let lock = self.active_executions.read().await;
                 lock.get(execution_id_str).cloned().ok_or_else(|| {
-                    anyhow::anyhow!("Execution context not found for {}", execution_id_str)
+                    anyhow::anyhow!("Execution context not found for {execution_id_str}")
                 })?
             };
 
@@ -222,10 +222,7 @@ impl InnerLoopService {
                     .write()
                     .await
                     .remove(execution_id_str);
-                anyhow::bail!(
-                    "Inner loop exceeded max iterations ({})",
-                    MAX_INNER_LOOP_ITERATIONS
-                );
+                anyhow::bail!("Inner loop exceeded max iterations ({MAX_INNER_LOOP_ITERATIONS})");
             }
 
             let available_tools = self
@@ -361,8 +358,7 @@ impl InnerLoopService {
                                     lock.get(execution_id_str)
                                         .cloned()
                                         .ok_or_else(|| anyhow::anyhow!(
-                                            "execution context for '{}' not found in active_executions",
-                                            execution_id_str
+                                            "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
                                 next_ctx.trajectory.push(step);
@@ -390,8 +386,7 @@ impl InnerLoopService {
                                     lock.get(execution_id_str)
                                         .cloned()
                                         .ok_or_else(|| anyhow::anyhow!(
-                                            "execution context for '{}' not found in active_executions",
-                                            execution_id_str
+                                            "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
                                 next_ctx.trajectory.push(step);
@@ -450,14 +445,13 @@ impl InnerLoopService {
                                     error = %e,
                                     "Tool returned recoverable error — feeding back to LLM"
                                 );
-                                let tool_result = format!("Tool execution error: {}", e);
+                                let tool_result = format!("Tool execution error: {e}");
                                 let mut next_ctx = {
                                     let lock = self.active_executions.read().await;
                                     lock.get(execution_id_str)
                                         .cloned()
                                         .ok_or_else(|| anyhow::anyhow!(
-                                            "execution context for '{}' not found in active_executions",
-                                            execution_id_str
+                                            "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
                                 next_ctx.conversation.push(ConversationMessage {
@@ -534,7 +528,7 @@ impl InnerLoopService {
                     .collect();
                 Ok(LlmOutput::ToolCalls(tool_calls))
             }
-            Err(e) => Err(anyhow::anyhow!("LLM call failed: {}", e)),
+            Err(e) => Err(anyhow::anyhow!("LLM call failed: {e}")),
         }
     }
 }

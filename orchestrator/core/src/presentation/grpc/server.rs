@@ -114,14 +114,14 @@ impl AegisRuntime for AegisRuntimeService {
 
         // Parse agent_id
         let agent_id = AgentId::from_string(&req.agent_id)
-            .map_err(|e| Status::invalid_argument(format!("Invalid agent_id: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid agent_id: {e}")))?;
 
         // Create execution input
         let payload = if req.context_json.is_empty() {
             serde_json::Value::Null
         } else {
             serde_json::from_str(&req.context_json)
-                .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {}", e)))?
+                .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {e}")))?
         };
 
         // Let ExecutionService render the agent's prompt_template
@@ -166,7 +166,7 @@ impl AegisRuntime for AegisRuntimeService {
                                     event: Some(execution_event::Event::ExecutionFailed(
                                         ExecutionFailed {
                                             execution_id: uuid::Uuid::new_v4().to_string(),
-                                            reason: format!("Invalid parent_execution_id: {}", e),
+                                            reason: format!("Invalid parent_execution_id: {e}"),
                                             total_iterations: 0,
                                             failed_at: Utc::now().to_rfc3339(),
                                         },
@@ -229,7 +229,7 @@ impl AegisRuntime for AegisRuntimeService {
                                     event: Some(execution_event::Event::ExecutionFailed(
                                         ExecutionFailed {
                                             execution_id: execution_id.to_string(),
-                                            reason: format!("Failed to stream execution: {}", e),
+                                            reason: format!("Failed to stream execution: {e}"),
                                             total_iterations: 0,
                                             failed_at: Utc::now().to_rfc3339(),
                                         },
@@ -244,7 +244,7 @@ impl AegisRuntime for AegisRuntimeService {
                         .send(Ok(ExecutionEvent {
                             event: Some(execution_event::Event::ExecutionFailed(ExecutionFailed {
                                 execution_id: uuid::Uuid::new_v4().to_string(),
-                                reason: format!("Failed to start execution: {}", e),
+                                reason: format!("Failed to start execution: {e}"),
                                 total_iterations: 0,
                                 failed_at: Utc::now().to_rfc3339(),
                             })),
@@ -294,7 +294,7 @@ impl AegisRuntime for AegisRuntimeService {
                     duration_ms,
                 }))
             }
-            Ok(Err(e)) => Err(Status::internal(format!("Command execution failed: {}", e))),
+            Ok(Err(e)) => Err(Status::internal(format!("Command execution failed: {e}"))),
             Err(_) => Err(Status::deadline_exceeded("Command execution timed out")),
         }
     }
@@ -315,17 +315,17 @@ impl AegisRuntime for AegisRuntimeService {
                     .map(|id| (id, if j.weight > 0.0 { j.weight as f64 } else { 1.0 }))
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {e}")))?;
 
         // Parse context_json once; extract execution_id/agent_id for proper child-execution linking
-        let context_value: Option<serde_json::Value> =
-            if req.context_json.is_empty() {
-                None
-            } else {
-                Some(serde_json::from_str(&req.context_json).map_err(|e| {
-                    Status::invalid_argument(format!("Invalid context_json: {}", e))
-                })?)
-            };
+        let context_value: Option<serde_json::Value> = if req.context_json.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::from_str(&req.context_json)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {e}")))?,
+            )
+        };
 
         let exec_id = context_value
             .as_ref()
@@ -405,7 +405,7 @@ impl AegisRuntime for AegisRuntimeService {
                     individual_results,
                 }))
             }
-            Err(e) => Err(Status::internal(format!("Validation failed: {}", e))),
+            Err(e) => Err(Status::internal(format!("Validation failed: {e}"))),
         }
     }
 
@@ -486,7 +486,7 @@ impl AegisRuntime for AegisRuntimeService {
             Ok(res) => Ok(Response::new(AttestAgentResponse {
                 security_token: res.security_token,
             })),
-            Err(e) => Err(Status::internal(format!("Attestation failed: {}", e))),
+            Err(e) => Err(Status::internal(format!("Attestation failed: {e}"))),
         }
     }
 
@@ -535,7 +535,7 @@ impl AegisRuntime for AegisRuntimeService {
             .ok_or_else(|| Status::unauthenticated("Token missing agent_id claim"))?;
 
         let agent_id = crate::domain::agent::AgentId::from_string(agent_id_str)
-            .map_err(|e| Status::internal(format!("Invalid agent_id in token: {}", e)))?;
+            .map_err(|e| Status::internal(format!("Invalid agent_id in token: {e}")))?;
 
         match tool_invocation_service
             .invoke_tool(&agent_id, &envelope)
@@ -543,13 +543,12 @@ impl AegisRuntime for AegisRuntimeService {
         {
             Ok(result) => {
                 let bytes = serde_json::to_vec(&result).map_err(|e| {
-                    Status::internal(format!("Failed to serialize tool result: {}", e))
+                    Status::internal(format!("Failed to serialize tool result: {e}"))
                 })?;
                 Ok(Response::new(InvokeToolResponse { result_json: bytes }))
             }
             Err(e) => Err(Status::permission_denied(format!(
-                "Tool invocation rejected: {}",
-                e
+                "Tool invocation rejected: {e}"
             ))),
         }
     }
@@ -593,10 +592,10 @@ impl AegisRuntime for AegisRuntimeService {
         use std::collections::HashMap;
 
         let execution_id = ExecutionId::from_string(&req.execution_id)
-            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {e}")))?;
 
         let state_name = StateName::new(req.state_name.clone())
-            .map_err(|e| Status::invalid_argument(format!("Invalid state_name: {}", e)))?;
+            .map_err(|e| Status::invalid_argument(format!("Invalid state_name: {e}")))?;
 
         let image_pull_policy = match req.image_pull_policy.to_lowercase().as_str() {
             "always" => ImagePullPolicy::Always,
@@ -680,22 +679,21 @@ impl AegisRuntime for AegisRuntimeService {
                 use crate::domain::runtime::ContainerStepError;
                 let status = match &e {
                     ContainerStepError::ImagePullFailed { image, error } => {
-                        Status::unavailable(format!("Image pull failed for '{}': {}", image, error))
+                        Status::unavailable(format!("Image pull failed for '{image}': {error}"))
                     }
                     ContainerStepError::TimeoutExpired { timeout_secs } => {
                         Status::deadline_exceeded(format!(
-                            "Container step timed out after {}s",
-                            timeout_secs
+                            "Container step timed out after {timeout_secs}s"
                         ))
                     }
                     ContainerStepError::VolumeMountFailed { volume, error } => {
-                        Status::internal(format!("Volume mount failed for '{}': {}", volume, error))
+                        Status::internal(format!("Volume mount failed for '{volume}': {error}"))
                     }
                     ContainerStepError::ResourceExhausted { detail } => {
-                        Status::resource_exhausted(format!("Resource exhausted: {}", detail))
+                        Status::resource_exhausted(format!("Resource exhausted: {detail}"))
                     }
                     ContainerStepError::DockerError(msg) => {
-                        Status::internal(format!("Docker error: {}", msg))
+                        Status::internal(format!("Docker error: {msg}"))
                     }
                 };
                 Err(status)

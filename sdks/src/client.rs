@@ -46,7 +46,7 @@ impl AegisClient {
         let mut req = self.client.post(&url).json(manifest);
 
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         let response = req.send().await?;
@@ -62,7 +62,7 @@ impl AegisClient {
         let mut req = self.client.post(&url).json(&input);
 
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         let response = req.send().await?;
@@ -78,7 +78,7 @@ impl AegisClient {
         let mut req = self.client.get(&url);
 
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         let response = req.send().await?;
@@ -94,7 +94,7 @@ impl AegisClient {
         let mut req = self.client.delete(&url);
 
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         req.send().await?;
@@ -125,7 +125,7 @@ impl AegisClient {
         let mut req = self.client.post(&url).json(&payload);
 
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {}", key));
+            req = req.header("Authorization", format!("Bearer {key}"));
         }
 
         let response = req.send().await?;

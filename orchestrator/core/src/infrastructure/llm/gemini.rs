@@ -300,14 +300,14 @@ impl LLMProvider for GeminiAdapter {
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
             } else {
-                LLMError::Provider(format!("HTTP {}: {}", status, error_text))
+                LLMError::Provider(format!("HTTP {status}: {error_text}"))
             });
         }
 
         let gr: GeminiGenerateContentResponse = response
             .json()
             .await
-            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {}", e)))?;
+            .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
         let candidate = gr
             .candidates
