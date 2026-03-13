@@ -1661,8 +1661,11 @@ mod tests {
         let aegis_dir = tmp.path().join(".aegis");
         fs::create_dir_all(&aegis_dir).expect("create .aegis dir");
         let config_file = aegis_dir.join("aegis-config.yaml");
-        fs::write(&config_file, "apiVersion: 100monkeys.ai/v1\nkind: NodeConfig\n")
-            .expect("write config");
+        fs::write(
+            &config_file,
+            "apiVersion: 100monkeys.ai/v1\nkind: NodeConfig\n",
+        )
+        .expect("write config");
 
         // Override HOME so discover_config() searches our temp dir.
         std::env::remove_var("AEGIS_CONFIG_PATH");
