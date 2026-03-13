@@ -1313,32 +1313,32 @@ impl NodeConfigManifest {
             }
         }
 
-        // 3. Working directory
+        // 2. Working directory
         let cwd = PathBuf::from("./aegis-config.yaml");
         if cwd.exists() {
             return Some(cwd);
         }
 
-        // 4. User home
+        // 3. User home (~/.aegis/aegis-config.yaml — matches what `aegis init` writes)
         if let Some(home) = dirs::home_dir() {
-            let user_config = home.join(".aegis").join("config.yaml");
+            let user_config = home.join(".aegis").join("aegis-config.yaml");
             if user_config.exists() {
                 return Some(user_config);
             }
         }
 
-        // 5. System config
+        // 4. System config
         #[cfg(unix)]
         let system_config = PathBuf::from("/")
             .join("etc")
             .join("aegis")
-            .join("config.yaml");
+            .join("aegis-config.yaml");
         #[cfg(windows)]
         let system_config = std::env::var_os("ProgramData")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir)
             .join("Aegis")
-            .join("config.yaml");
+            .join("aegis-config.yaml");
 
         if system_config.exists() {
             return Some(system_config);
@@ -1646,6 +1646,42 @@ mod tests {
         assert_eq!(parsed.spec.node.id, "550e8400-e29b-41d4-a716-446655440000");
         assert_eq!(parsed.spec.llm_providers.len(), 1);
         assert_eq!(parsed.spec.llm_providers[0].name, "ollama");
+    }
+
+    #[test]
+    fn test_discover_config_home_dir() {
+        // Regression test: discover_config() must find `aegis-config.yaml` (with
+        // the `aegis-` prefix) in ~/.aegis/, matching what `aegis init` writes.
+        // Before this fix the home-dir lookup used `config.yaml` (no prefix),
+        // causing `aegis update` to silently fall back to empty defaults and then
+        // fail with "spec.database not configured".
+        use std::fs;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let aegis_dir = tmp.path().join(".aegis");
+        fs::create_dir_all(&aegis_dir).expect("create .aegis dir");
+        let config_file = aegis_dir.join("aegis-config.yaml");
+        fs::write(&config_file, "apiVersion: 100monkeys.ai/v1\nkind: NodeConfig\n")
+            .expect("write config");
+
+        // Override HOME so discover_config() searches our temp dir.
+        std::env::remove_var("AEGIS_CONFIG_PATH");
+        let old_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", tmp.path());
+
+        let discovered = NodeConfigManifest::discover_config();
+
+        // Restore HOME before any assertions that might panic.
+        match old_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            discovered.as_deref(),
+            Some(config_file.as_path()),
+            "discover_config() should find ~/.aegis/aegis-config.yaml (the file aegis init writes)",
+        );
     }
 
     #[test]
