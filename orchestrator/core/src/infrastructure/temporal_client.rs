@@ -148,12 +148,11 @@ impl TemporalClient {
         let payload = Payload {
             metadata,
             data: json_bytes,
-            // external_payloads was added in recent temporal api versions?
-            // If prost generated it, we must provide it.
-            // Check if it exists in the downloaded proto.
-            // Assuming strict error means it exists.
-            // It is likely repeated?
-            // Let's assume Vec::new().
+            // Any additional fields generated from the Temporal proto definition
+            // (for example, `external_payloads` in newer API versions) are left at
+            // their default values via `..Default::default()`. This matches the
+            // expected encoding for a single JSON payload; see the Temporal
+            // Payloads documentation for details.
             ..Default::default()
         };
 
