@@ -511,6 +511,26 @@ impl ToolRouter {
                         },
                         "required": ["name"]
                     }),
+                    "aegis.agent.delete" => json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "UUID of the agent to remove."
+                            }
+                        },
+                        "required": ["agent_id"]
+                    }),
+                    "aegis.agent.generate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "Natural-language intent for the agent to create."
+                            }
+                        },
+                        "required": ["input"]
+                    }),
                     "aegis.workflow.list" => json!({
                         "type": "object",
                         "properties": {}
@@ -538,6 +558,106 @@ impl ToolRouter {
                             }
                         },
                         "required": ["name"]
+                    }),
+                    "aegis.workflow.delete" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the workflow to delete."
+                            }
+                        },
+                        "required": ["name"]
+                    }),
+                    "aegis.workflow.run" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the workflow to execute."
+                            },
+                            "input": {
+                                "type": "object",
+                                "description": "Workflow input parameters."
+                            }
+                        },
+                        "required": ["name"]
+                    }),
+                    "aegis.workflow.generate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "input": {
+                                "type": "string",
+                                "description": "Natural-language workflow objective."
+                            }
+                        },
+                        "required": ["input"]
+                    }),
+                    "aegis.task.execute" => json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "UUID or Name of the agent to execute."
+                            },
+                            "input": {
+                                "type": "object",
+                                "description": "Input data for the task."
+                            }
+                        },
+                        "required": ["agent_id"]
+                    }),
+                    "aegis.task.status" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution to check."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.task.list" => json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "Optional UUID to filter by agent."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results.",
+                                "default": 20
+                            }
+                        }
+                    }),
+                    "aegis.task.cancel" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution to cancel."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.task.remove" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution to remove."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.system.info" => json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                    "aegis.system.config" => json!({
+                        "type": "object",
+                        "properties": {}
                     }),
                     "aegis.workflow.create" => json!({
                         "type": "object",

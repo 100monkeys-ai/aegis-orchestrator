@@ -1098,6 +1098,29 @@ impl WorkflowExecution {
 }
 
 // ============================================================================
+// Audit Trail Records
+// ============================================================================
+
+/// A single persisted event from a workflow execution — part of the
+/// append-only audit trail written by `WorkflowExecutionRepository::append_event`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowExecutionEventRecord {
+    /// Monotonically increasing sequence number within this execution.
+    pub sequence: i64,
+    /// Discriminant string matching the `WorkflowEvent` variant name
+    /// (e.g. `"WorkflowStateEntered"`, `"WorkflowIterationCompleted"`).
+    pub event_type: String,
+    /// State name if the event is state-scoped (e.g. `WorkflowStateEntered`).
+    pub state_name: Option<String>,
+    /// Iteration number if the event is iteration-scoped.
+    pub iteration_number: Option<u8>,
+    /// Full event payload (serialised `WorkflowEvent` variant).
+    pub payload: serde_json::Value,
+    /// Wall-clock time the event was recorded.
+    pub recorded_at: chrono::DateTime<chrono::Utc>,
+}
+
+// ============================================================================
 // Domain Errors
 // ============================================================================
 

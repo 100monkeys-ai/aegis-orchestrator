@@ -203,6 +203,19 @@ impl EventBus {
         }
     }
 
+    /// Subscribe to `WorkflowEvent`s scoped to a specific workflow execution.
+    ///
+    /// The receiver will only yield events whose `execution_id` matches `id`.
+    pub fn subscribe_workflow_execution(
+        &self,
+        id: crate::domain::execution::ExecutionId,
+    ) -> WorkflowEventReceiver {
+        WorkflowEventReceiver {
+            receiver: self.sender.subscribe(),
+            execution_id: id,
+        }
+    }
+
     /// Subscribe and filter for specific agent ID
     pub fn subscribe_agent(&self, agent_id: crate::domain::agent::AgentId) -> AgentEventReceiver {
         let receiver = self.sender.subscribe();
@@ -323,6 +336,54 @@ impl ExecutionEventReceiver {
                     execution_id == &self.execution_id
                 }
             },
+        }
+    }
+}
+
+/// Filtered receiver for workflow-execution–scoped domain events.
+pub struct WorkflowEventReceiver {
+    receiver: broadcast::Receiver<DomainEvent>,
+    execution_id: crate::domain::execution::ExecutionId,
+}
+
+impl WorkflowEventReceiver {
+    /// Receive the next `WorkflowEvent` for the specified execution ID.
+    /// Filters out events from other executions and non-workflow events.
+    pub async fn recv(&mut self) -> Result<crate::domain::events::WorkflowEvent, EventBusError> {
+        loop {
+            match self.receiver.recv().await {
+                Ok(DomainEvent::Workflow(ev)) => {
+                    if self.matches_execution(&ev) {
+                        return Ok(ev);
+                    }
+                }
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    warn!("WorkflowEventReceiver lagged by {} events", n);
+                    continue;
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return Err(EventBusError::Closed);
+                }
+            }
+        }
+    }
+
+    fn matches_execution(&self, event: &crate::domain::events::WorkflowEvent) -> bool {
+        use crate::domain::events::WorkflowEvent;
+        match event {
+            WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
+            | WorkflowEvent::WorkflowStateEntered { execution_id, .. }
+            | WorkflowEvent::WorkflowStateExited { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationStarted { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationCompleted { execution_id, .. }
+            | WorkflowEvent::WorkflowIterationFailed { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
+            | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => {
+                *execution_id == self.execution_id
+            }
+            _ => false,
         }
     }
 }

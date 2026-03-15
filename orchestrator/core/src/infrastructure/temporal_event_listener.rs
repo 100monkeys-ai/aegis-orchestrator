@@ -628,6 +628,16 @@ mod tests {
         ) -> Result<(), RepositoryError> {
             Err(RepositoryError::Database("append failed".to_string()))
         }
+
+        async fn find_events_by_execution(
+            &self,
+            _id: ExecutionId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError>
+        {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]

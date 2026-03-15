@@ -629,6 +629,95 @@ impl ToolPolicy {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool Input Contract (BC-4/BC-12, ADR-055)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Domain value object encoding the **required-argument contract** for every
+/// known built-in and management tool exposed via the SMCP tool path (ADR-055).
+///
+/// # Why this lives in the domain layer
+///
+/// Which parameters a tool *requires* is a fact about the tool's interface —
+/// it is domain knowledge, not orchestration logic.  Placing it here keeps the
+/// Application Layer (`ToolInvocationService`) free of per-tool business rules
+/// and makes the contracts discoverable, testable, and evolvable independently
+/// of routing or execution plumbing.
+///
+/// # Usage
+///
+/// ```rust,ignore
+/// ToolInputContract::validate("aegis.agent.create", &args)
+///     .map_err(|msg| SmcpSessionError::InvalidArguments(msg))?;
+/// ```
+pub struct ToolInputContract;
+
+impl ToolInputContract {
+    /// Returns the required parameter names for `tool_name`, or an empty slice
+    /// for tools with no required parameters or unknown tool names.
+    ///
+    /// Unknown names return `&[]` — the call is passed through; the router
+    /// will reject truly unrecognised tools with an appropriate routing error.
+    pub fn required_fields(tool_name: &str) -> &'static [&'static str] {
+        match tool_name {
+            "aegis.execute" => &["prompt"],
+            "aegis.agent.create" | "aegis.agent.update" => &["manifest_yaml"],
+            "aegis.agent.export" => &["name"],
+            "aegis.agent.delete" | "aegis.task.execute" => &["agent_id"],
+            "aegis.agent.generate" | "aegis.workflow.generate" => &["input"],
+            "aegis.workflow.create" | "aegis.workflow.update" => &["manifest_yaml"],
+            "aegis.workflow.export" | "aegis.workflow.delete" | "aegis.workflow.run" => &["name"],
+            "aegis.workflow.logs" => &["execution_id"],
+            "aegis.task.status" | "aegis.task.cancel" | "aegis.task.remove" => &["execution_id"],
+            "aegis.schema.get" => &["key"],
+            "aegis.schema.validate" => &["kind", "manifest_yaml"],
+            "cmd.run" => &["command"],
+            "fs.read" | "fs.list" | "fs.create_dir" | "fs.delete" => &["path"],
+            "fs.write" => &["path", "content"],
+            "fs.edit" => &["path", "target_content", "replacement_content"],
+            "fs.multi_edit" => &["path", "edits"],
+            "fs.grep" | "fs.glob" => &["pattern", "path"],
+            "web.search" => &["query"],
+            "web.fetch" => &["url"],
+            _ => &[],
+        }
+    }
+
+    /// Validates that `args` satisfies the input contract for `tool_name`.
+    ///
+    /// Returns `Ok(())` when all required fields are present and non-null.
+    /// Returns `Err(message)` with a human-readable description of the first
+    /// missing or null field; the caller maps this to the appropriate error type.
+    ///
+    /// An additional semantic check is applied to `cmd.run`: the `command`
+    /// value must be a non-empty, non-whitespace-only string so that the
+    /// Dispatch Protocol never spawns a shell with a blank command.
+    pub fn validate(tool_name: &str, args: &Value) -> Result<(), String> {
+        for field in Self::required_fields(tool_name) {
+            let present = args.get(*field).map(|v| !v.is_null()).unwrap_or(false);
+            if !present {
+                return Err(format!(
+                    "required field '{field}' is missing or null for tool '{tool_name}'"
+                ));
+            }
+        }
+
+        // Semantic constraint: a whitespace-only command produces a no-op or
+        // provokes confusing shell errors; reject it before dispatch.
+        if tool_name == "cmd.run"
+            && args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true)
+        {
+            return Err("'command' must be a non-empty string for 'cmd.run'".to_string());
+        }
+
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

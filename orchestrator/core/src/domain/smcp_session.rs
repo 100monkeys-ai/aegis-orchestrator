@@ -107,6 +107,13 @@ pub enum SmcpSessionError {
     JudgeTimeout(String),
     /// An unexpected internal error occurred (e.g. infrastructure or service failure).
     InternalError(String),
+    /// Tool call arguments failed required-field validation against the tool's input schema.
+    ///
+    /// Returned by [`crate::application::tool_invocation_service::ToolInvocationService`] before
+    /// dispatch when a known tool is called without all of its required parameters present or
+    /// when a parameter value is semantically invalid (e.g. `cmd.run` with an empty `command`).
+    /// Maps to MCP JSON-RPC error code `-32602` (Invalid params).
+    InvalidArguments(String),
 }
 
 impl std::fmt::Display for SmcpSessionError {
@@ -121,6 +128,7 @@ impl std::fmt::Display for SmcpSessionError {
             }
             Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {msg}"),
             Self::InternalError(msg) => write!(f, "Internal error: {msg}"),
+            Self::InvalidArguments(msg) => write!(f, "Invalid tool arguments: {msg}"),
         }
     }
 }

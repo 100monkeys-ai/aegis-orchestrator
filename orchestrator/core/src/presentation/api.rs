@@ -32,12 +32,15 @@ use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
+use crate::domain::repository::WorkflowExecutionRepository;
+use crate::domain::smcp_session::SmcpSessionError;
+use crate::infrastructure::event_bus::EventBus;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
 use crate::presentation::webhook_guard::{
     EnvWebhookSecretProvider, WebhookHmacState, WebhookSecretProvider,
 };
 use axum::{
-    extract::{FromRef, Path, State},
+    extract::{FromRef, Path, Query, State},
     response::{IntoResponse, Sse},
     routing::{get, post},
     Json, Router,
@@ -59,6 +62,10 @@ pub struct AppState {
     pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
     /// SMCP tool invocation service (ADR-033). Optional until wired.
     pub tool_invocation_service: Option<Arc<ToolInvocationService>>,
+    /// Workflow execution repository for event-log snapshots (BC-3). Optional until wired.
+    pub workflow_execution_repo: Option<Arc<dyn WorkflowExecutionRepository>>,
+    /// Event bus for workflow SSE streaming (ADR-030). Optional until wired.
+    pub event_bus: Option<Arc<EventBus>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -81,6 +88,8 @@ pub fn app(
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
         tool_invocation_service: None,
+        workflow_execution_repo: None,
+        event_bus: None,
     });
 
     Router::new()
@@ -98,6 +107,14 @@ pub fn app(
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))
         .route("/v1/webhooks/:source", post(webhook_handler))
+        .route(
+            "/v1/workflows/executions/:id/logs",
+            get(get_workflow_execution_logs),
+        )
+        .route(
+            "/v1/workflows/executions/:id/logs/stream",
+            get(stream_workflow_execution_logs),
+        )
         .with_state(state)
 }
 
@@ -116,6 +133,8 @@ pub fn app_with_inner_loop(
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
         tool_invocation_service: None,
+        workflow_execution_repo: None,
+        event_bus: None,
     });
 
     Router::new()
@@ -131,6 +150,14 @@ pub fn app_with_inner_loop(
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))
         .route("/v1/webhooks/:source", post(webhook_handler))
+        .route(
+            "/v1/workflows/executions/:id/logs",
+            get(get_workflow_execution_logs),
+        )
+        .route(
+            "/v1/workflows/executions/:id/logs/stream",
+            get(stream_workflow_execution_logs),
+        )
         .with_state(state)
 }
 
@@ -204,6 +231,153 @@ async fn stream_execution(
             )
         }
     };
+
+    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+}
+
+// ============================================================================
+// Workflow Execution Log Endpoints
+// ============================================================================
+
+#[derive(serde::Deserialize, Default)]
+struct WorkflowLogsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// `GET /v1/workflows/executions/:id/logs` — return the persisted event log
+/// for a workflow execution as a JSON snapshot.
+///
+/// Returns 404 (bad UUID), 501 (repo not wired), or 200 with the event list.
+async fn get_workflow_execution_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<WorkflowLogsQuery>,
+) -> impl IntoResponse {
+    let execution_id = match uuid::Uuid::parse_str(&id) {
+        Ok(uid) => crate::domain::execution::ExecutionId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid execution ID"})),
+            )
+                .into_response();
+        }
+    };
+
+    let repo = match &state.workflow_execution_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::NOT_IMPLEMENTED,
+                Json(serde_json::json!({
+                    "error": "Workflow execution repository not configured",
+                    "execution_id": id,
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = params.limit.unwrap_or(100);
+    let offset = params.offset.unwrap_or(0);
+
+    match repo
+        .find_events_by_execution(execution_id, limit, offset)
+        .await
+    {
+        Ok(events) => {
+            let count = events.len();
+            (
+                axum::http::StatusCode::OK,
+                Json(serde_json::json!({
+                    "execution_id": id,
+                    "events": events,
+                    "count": count,
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/workflows/executions/:id/logs/stream` — SSE stream of workflow
+/// execution events for the given execution.
+///
+/// Subscribes to the `EventBus` for the given execution and streams
+/// `WorkflowEvent`s until a terminal event (Completed / Failed / Cancelled)
+/// is received or the client disconnects.
+async fn stream_workflow_execution_logs(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let execution_id = match uuid::Uuid::parse_str(&id) {
+        Ok(uid) => crate::domain::execution::ExecutionId(uid),
+        Err(_) => {
+            let stream: Pin<
+                Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>,
+            > = Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+                    .map(Ok::<_, axum::Error>),
+            );
+            return Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default());
+        }
+    };
+
+    let event_bus = match &state.event_bus {
+        Some(eb) => eb.clone(),
+        None => {
+            let stream: Pin<
+                Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>,
+            > = Box::pin(
+                tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
+                    .map(Ok::<_, axum::Error>),
+            );
+            return Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default());
+        }
+    };
+
+    let (tx, rx) = tokio::sync::mpsc::channel(32);
+
+    tokio::spawn(async move {
+        let mut receiver = event_bus.subscribe_workflow_execution(execution_id);
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let is_terminal = matches!(
+                        event,
+                        crate::domain::events::WorkflowEvent::WorkflowExecutionCompleted { .. }
+                            | crate::domain::events::WorkflowEvent::WorkflowExecutionFailed { .. }
+                            | crate::domain::events::WorkflowEvent::WorkflowExecutionCancelled { .. }
+                    );
+                    let data = serde_json::to_string(&event).unwrap_or_default();
+                    if tx
+                        .send(axum::response::sse::Event::default().data(data))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if is_terminal {
+                        break;
+                    }
+                }
+                Err(crate::infrastructure::event_bus::EventBusError::Closed) => break,
+                Err(_) => continue,
+            }
+        }
+    });
+
+    let stream: Pin<
+        Box<dyn Stream<Item = Result<axum::response::sse::Event, axum::Error>> + Send>,
+    > = Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, axum::Error>));
 
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
@@ -394,11 +568,41 @@ async fn smcp_tool_invoke(
 
     match tool_svc.invoke_tool(&agent_id, &envelope).await {
         Ok(res) => (axum::http::StatusCode::OK, Json(res)).into_response(),
-        Err(e) => (
-            axum::http::StatusCode::BAD_REQUEST,
-            Json(json!({ "error": e.to_string() })),
-        )
-            .into_response(),
+        Err(e) => {
+            // Map domain errors to HTTP status + MCP JSON-RPC error codes (ADR-055).
+            // Callers receive a standard `{"jsonrpc":"2.0","error":{"code":N,"message":"..."}}` body
+            // so MCP clients can handle them uniformly regardless of transport.
+            let (http_status, rpc_code) = match &e {
+                SmcpSessionError::SessionExpired
+                | SmcpSessionError::SignatureVerificationFailed(_) => {
+                    (axum::http::StatusCode::UNAUTHORIZED, -32000_i32)
+                }
+                SmcpSessionError::PolicyViolation(_) | SmcpSessionError::SessionInactive(_) => {
+                    (axum::http::StatusCode::FORBIDDEN, -32000_i32)
+                }
+                SmcpSessionError::MalformedPayload(_) => {
+                    (axum::http::StatusCode::BAD_REQUEST, -32600_i32)
+                }
+                SmcpSessionError::InvalidArguments(_) => {
+                    (axum::http::StatusCode::UNPROCESSABLE_ENTITY, -32602_i32)
+                }
+                SmcpSessionError::JudgeTimeout(_) | SmcpSessionError::InternalError(_) => {
+                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, -32603_i32)
+                }
+            };
+            (
+                http_status,
+                Json(json!({
+                    "jsonrpc": "2.0",
+                    "error": {
+                        "code": rpc_code,
+                        "message": e.to_string(),
+                        "data": null
+                    }
+                })),
+            )
+                .into_response()
+        }
     }
 }
 

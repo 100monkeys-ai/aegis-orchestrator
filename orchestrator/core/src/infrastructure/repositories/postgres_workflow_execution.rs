@@ -324,4 +324,49 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
 
         Ok(())
     }
+
+    async fn find_events_by_execution(
+        &self,
+        id: ExecutionId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT temporal_sequence_number, event_type, event_payload,
+                   iteration_number, created_at
+            FROM execution_events
+            WHERE execution_id = $1
+            ORDER BY temporal_sequence_number ASC
+            LIMIT $2 OFFSET $3
+            "#,
+        )
+        .bind(id.0)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to query execution events: {e}")))?;
+
+        let records = rows
+            .into_iter()
+            .map(|row| {
+                let sequence: i64 = row.get("temporal_sequence_number");
+                let event_type: String = row.get("event_type");
+                let payload: serde_json::Value = row.get("event_payload");
+                let iteration_number: Option<i16> = row.get("iteration_number");
+                let recorded_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+                crate::domain::workflow::WorkflowExecutionEventRecord {
+                    sequence,
+                    event_type,
+                    state_name: None,
+                    iteration_number: iteration_number.map(|n| n as u8),
+                    payload,
+                    recorded_at,
+                }
+            })
+            .collect();
+
+        Ok(records)
+    }
 }

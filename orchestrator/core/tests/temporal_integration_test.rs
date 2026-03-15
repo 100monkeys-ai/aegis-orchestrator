@@ -72,6 +72,17 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
+    async fn find_events_by_execution(
+        &self,
+        _id: ExecutionId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<aegis_orchestrator_core::domain::workflow::WorkflowExecutionEventRecord>,
+        RepositoryError,
+    > {
+        Ok(vec![])
+    }
 }
 
 #[tokio::test]

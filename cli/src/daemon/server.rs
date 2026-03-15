@@ -114,8 +114,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Load configuration
     println!("Loading configuration...");
-    let config =
-        NodeConfigManifest::load_or_default(config_path).context("Failed to load configuration")?;
+    let config = NodeConfigManifest::load_or_default(config_path.clone())
+        .context("Failed to load configuration")?;
 
     config
         .validate()
@@ -1074,7 +1074,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             validation_service.clone(),
         )
         .with_workflow_repository(workflow_repo.clone())
-        .with_generated_manifests_root(generated_artifacts_root.clone()),
+        .with_workflow_execution_repo(workflow_execution_repo.clone())
+        .with_workflow_execution(start_workflow_execution_use_case.clone())
+        .with_generated_manifests_root(generated_artifacts_root.clone())
+        .with_node_config_path(config_path.clone()),
     );
     println!(
         "Generated manifests will be written to: {}",

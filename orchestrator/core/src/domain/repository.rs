@@ -144,6 +144,18 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         payload: serde_json::Value,
         iteration_number: Option<u8>,
     ) -> Result<(), RepositoryError>;
+
+    /// Retrieve the persisted audit-trail events for a workflow execution in
+    /// sequence order, with pagination support.
+    ///
+    /// Returns an empty `Vec` if no events have been persisted yet (e.g. the
+    /// in-memory stub implementation).
+    async fn find_events_by_execution(
+        &self,
+        id: ExecutionId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError>;
 }
 
 /// Repository interface for Volume aggregates

@@ -380,6 +380,15 @@ impl crate::domain::repository::WorkflowExecutionRepository
         // No-op for in memory for now
         Ok(())
     }
+
+    async fn find_events_by_execution(
+        &self,
+        _id: ExecutionId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError> {
+        Ok(vec![])
+    }
 }
 
 // ============================================================================
