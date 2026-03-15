@@ -110,8 +110,8 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
 
 pub fn resolve_templates_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
     let base_dir = config_path
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
+        .and_then(|config| config.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| dirs_next::home_dir().map(|home| home.join(".aegis")))
         .unwrap_or_else(|| std::path::PathBuf::from(".aegis"));
     base_dir.join("templates")
 }

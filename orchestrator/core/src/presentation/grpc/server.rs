@@ -21,6 +21,10 @@ use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionInput;
+
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 500;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 
 // Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
@@ -313,7 +317,9 @@ impl AegisRuntime for AegisRuntimeService {
         }
 
         // Execute with timeout
-        let timeout = std::time::Duration::from_secs(req.timeout_seconds.unwrap_or(300) as u64);
+        let timeout = std::time::Duration::from_secs(
+            req.timeout_seconds.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS as i32) as u64,
+        );
 
         match tokio::time::timeout(timeout, cmd.output()).await {
             Ok(Ok(output)) => {
@@ -412,8 +418,8 @@ impl AegisRuntime for AegisRuntimeService {
                 validation_req,
                 judge_configs,
                 consensus_config,
-                60,  // 60 second timeout
-                500, // 500ms poll interval
+                DEFAULT_VALIDATION_TIMEOUT_SECS,       // 60 second timeout
+                DEFAULT_VALIDATION_POLL_INTERVAL_MS,   // 500ms poll interval
             )
             .await
         {
