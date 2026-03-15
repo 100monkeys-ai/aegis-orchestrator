@@ -135,8 +135,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             INSERT INTO workflow_definitions (workflow_id, name, definition, definition_hash, registered_at)
             VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (workflow_id) DO UPDATE SET
-                name = EXCLUDED.name,
+            ON CONFLICT (name) DO UPDATE SET
+                workflow_id = EXCLUDED.workflow_id,
                 definition = EXCLUDED.definition,
                 definition_hash = EXCLUDED.definition_hash,
                 registered_at = NOW()

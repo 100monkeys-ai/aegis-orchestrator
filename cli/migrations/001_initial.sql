@@ -85,6 +85,9 @@ CREATE TABLE workflow_executions (
     -- Results
     final_output JSONB,
     error_message TEXT,
+
+    -- Iteration tracking (updated by TemporalEventListener on iteration events)
+    iteration_count SMALLINT DEFAULT 0,
     
     -- Timestamps
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -105,6 +108,37 @@ CREATE INDEX idx_workflow_executions_current_state ON workflow_executions(curren
 
 -- Composite index for common queries
 CREATE INDEX idx_workflow_executions_workflow_temporal ON workflow_executions(workflow_id, temporal_workflow_id);
+
+-- -----------------------------------------------------------------------------
+-- Execution Events Table
+-- Append-only audit log of Temporal events for each workflow execution
+-- Used by TemporalEventListener to record iteration progress and state transitions
+-- -----------------------------------------------------------------------------
+CREATE TABLE execution_events (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    execution_id UUID NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+
+    -- Temporal sequence number for ordering (monotonically increasing per execution)
+    temporal_sequence_number BIGINT NOT NULL,
+
+    -- Event classification
+    event_type TEXT NOT NULL,
+    event_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+
+    -- Optional iteration reference (NULL for non-iteration events)
+    iteration_number SMALLINT,
+
+    -- Timestamp
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- Idempotency: each sequence number is unique per execution
+    CONSTRAINT execution_events_unique_sequence UNIQUE (execution_id, temporal_sequence_number)
+);
+
+CREATE INDEX idx_execution_events_execution_id ON execution_events(execution_id);
+CREATE INDEX idx_execution_events_sequence ON execution_events(execution_id, temporal_sequence_number ASC);
+
+COMMENT ON TABLE execution_events IS 'Append-only Temporal event log per workflow execution; drives iteration_count and state history';
 
 -- -----------------------------------------------------------------------------
 -- Agents Table
