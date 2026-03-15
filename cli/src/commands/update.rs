@@ -45,6 +45,10 @@ pub struct UpdateCommand {
     #[arg(long)]
     pub skip_migrations: bool,
 
+    /// Skip re-deploying built-in agents and workflows
+    #[arg(long)]
+    pub skip_builtins: bool,
+
     /// Preview what would happen without making any changes
     #[arg(long)]
     pub dry_run: bool,
@@ -70,7 +74,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
     // ─── Step 1: Pull latest images ───────────────────────────────────────────
     if !cmd.skip_pull {
         println!();
-        println!("{}", "[1/3] Pulling latest images...".bold());
+        println!("{}", "[1/4] Pulling latest images...".bold());
         if cmd.dry_run {
             println!("  {} would run: docker compose pull", "→".dimmed());
         } else {
@@ -79,13 +83,13 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
         }
     } else {
         println!();
-        println!("{}", "[1/3] Pulling latest images... skipped".dimmed());
+        println!("{}", "[1/4] Pulling latest images... skipped".dimmed());
     }
 
     // ─── Step 2: Restart services ─────────────────────────────────────────────
     if !cmd.skip_restart {
         println!();
-        println!("{}", "[2/3] Restarting services with new images...".bold());
+        println!("{}", "[2/4] Restarting services with new images...".bold());
         if cmd.dry_run {
             println!("  {} would run: docker compose up -d --wait", "→".dimmed());
         } else {
@@ -94,13 +98,13 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
         }
     } else {
         println!();
-        println!("{}", "[2/3] Restarting services... skipped".dimmed());
+        println!("{}", "[2/4] Restarting services... skipped".dimmed());
     }
 
     // ─── Step 3: DB migrations ────────────────────────────────────────────────
     if !cmd.skip_migrations {
         println!();
-        println!("{}", "[3/3] Running database migrations...".bold());
+        println!("{}", "[3/4] Running database migrations...".bold());
 
         // Load the stack .env file so that `env:VAR` references in
         // aegis-config.yaml (e.g. `url: env:AEGIS_DATABASE_URL`) resolve
@@ -110,7 +114,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
             dotenvy::from_path(&env_file).ok();
         }
 
-        let config = NodeConfigManifest::load_or_default(config_path)?;
+        let config = NodeConfigManifest::load_or_default(config_path.clone())?;
         let db_config = config
             .spec
             .database
@@ -164,7 +168,47 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
         }
     } else {
         println!();
-        println!("{}", "[3/3] Database migrations... skipped".dimmed());
+        println!("{}", "[3/4] Database migrations... skipped".dimmed());
+    }
+
+    // ─── Step 4: Built-in templates ───────────────────────────────────────────
+    if !cmd.skip_builtins {
+        println!();
+        println!("{}", "[4/4] Re-deploying built-in templates...".bold());
+
+        // Load the stack .env file so that `env:VAR` references in
+        // aegis-config.yaml resolve correctly.
+        let env_file = dir.join(".env");
+        if env_file.exists() {
+            dotenvy::from_path(&env_file).ok();
+        }
+
+        let config = NodeConfigManifest::load_or_default(config_path.clone())?;
+        let host = config
+            .spec
+            .network
+            .as_ref()
+            .map(|n| n.bind_address.clone())
+            .unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = config.spec.network.as_ref().map(|n| n.port).unwrap_or(8088);
+
+        if cmd.dry_run {
+            println!(
+                "  {} would connect to daemon and re-deploy all built-in agents and workflows",
+                "→".dimmed()
+            );
+        } else {
+            let client = crate::daemon::DaemonClient::new(&host, port)?;
+            // Force re-deployment of built-ins to ensure they are updated
+            super::builtins::deploy_all_builtins(&client, true).await?;
+            println!("  {} All built-in templates updated", "✓".green());
+        }
+    } else {
+        println!();
+        println!(
+            "{}",
+            "[4/4] Re-deploying built-in templates... skipped".dimmed()
+        );
     }
 
     // ─── Done ─────────────────────────────────────────────────────────────────

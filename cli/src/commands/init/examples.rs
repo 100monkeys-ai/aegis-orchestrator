@@ -15,13 +15,8 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer::Confirm;
 
+use crate::commands::builtins;
 use crate::daemon::DaemonClient;
-
-const HELLO_WORLD_TEMPLATE: &str = include_str!("../../../templates/agents/hello-world-agent.yaml");
-const CODE_QUALITY_JUDGE_TEMPLATE: &str =
-    include_str!("../../../templates/agents/code-quality-judge.yaml");
-const TOOL_CALL_POLICY_JUDGE_TEMPLATE: &str =
-    include_str!("../../../templates/agents/tool-call-policy-judge.yaml");
 
 /// Offers to deploy the `hello-world` example and companion judge agents.
 pub struct ExamplesLoader {
@@ -66,13 +61,13 @@ impl ExamplesLoader {
         );
 
         let hello_world_manifest: aegis_orchestrator_sdk::AgentManifest =
-            serde_yaml::from_str(HELLO_WORLD_TEMPLATE)
+            serde_yaml::from_str(builtins::HELLO_WORLD_TEMPLATE)
                 .context("Failed to parse hello-world agent.yaml")?;
         let code_quality_judge_manifest: aegis_orchestrator_sdk::AgentManifest =
-            serde_yaml::from_str(CODE_QUALITY_JUDGE_TEMPLATE)
+            serde_yaml::from_str(builtins::CODE_QUALITY_JUDGE_TEMPLATE)
                 .context("Failed to parse code-quality-judge.yaml")?;
         let tool_call_policy_judge_manifest: aegis_orchestrator_sdk::AgentManifest =
-            serde_yaml::from_str(TOOL_CALL_POLICY_JUDGE_TEMPLATE)
+            serde_yaml::from_str(builtins::TOOL_CALL_POLICY_JUDGE_TEMPLATE)
                 .context("Failed to parse tool-call-policy-judge.yaml")?;
 
         hello_world_manifest

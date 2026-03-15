@@ -13,21 +13,14 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 use uuid::Uuid;
 
+use crate::commands::builtins;
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
 
-const AGENT_GENERATOR_NAME: &str = "agent-creator-agent";
-const AGENT_GENERATOR_TEMPLATE: &str =
-    include_str!("../../templates/agents/agent-creator-agent.yaml");
-const AGENT_GENERATOR_JUDGE_NAME: &str = "agent-generator-judge";
-const AGENT_GENERATOR_JUDGE_TEMPLATE: &str =
-    include_str!("../../templates/agents/agent-generator-judge.yaml");
-const WORKFLOW_GENERATOR_JUDGE_NAME: &str = "workflow-generator-judge";
-const WORKFLOW_GENERATOR_JUDGE_TEMPLATE: &str =
-    include_str!("../../templates/agents/workflow-generator-judge.yaml");
+const AGENT_GENERATOR_NAME: &str = builtins::AGENT_GENERATOR_AGENT_NAME;
 
 #[derive(Subcommand)]
 pub enum AgentCommand {
@@ -285,30 +278,21 @@ async fn generate_agent(
     client: DaemonClient,
     config_path: Option<&PathBuf>,
 ) -> Result<()> {
-    let templates_root = resolve_templates_root(config_path);
-    sync_generator_templates_to_disk(&templates_root)?;
+    let templates_root = builtins::resolve_templates_root(config_path);
+    builtins::sync_generator_templates_to_disk(&templates_root)?;
 
-    let _agent_judge_id = ensure_generator_agent_deployed(
-        &client,
-        AGENT_GENERATOR_JUDGE_NAME,
-        AGENT_GENERATOR_JUDGE_TEMPLATE,
-    )
-    .await?;
-    let _workflow_judge_id = ensure_generator_agent_deployed(
-        &client,
-        WORKFLOW_GENERATOR_JUDGE_NAME,
-        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
-    )
-    .await?;
-    let generator_id =
-        ensure_generator_agent_deployed(&client, AGENT_GENERATOR_NAME, AGENT_GENERATOR_TEMPLATE)
-            .await?;
+    // Ensure built-ins are deployed (but don't force overwrite unless it's an update)
+    builtins::deploy_all_builtins(&client, false).await?;
+
+    let generator_id = client
+        .lookup_agent(AGENT_GENERATOR_NAME)
+        .await?
+        .context("Generator agent not found even after deployment attempt")?;
 
     println!(
         "{}",
         format!("Generating agent via '{AGENT_GENERATOR_NAME}' (id: {generator_id})...").cyan()
     );
-
     let execution_id = client
         .execute_agent(generator_id, serde_json::Value::String(input))
         .await
@@ -326,77 +310,6 @@ async fn generate_agent(
     }
 
     Ok(())
-}
-
-fn resolve_templates_root(config_path: Option<&PathBuf>) -> PathBuf {
-    let base_dir = config_path
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
-        .unwrap_or_else(|| PathBuf::from(".aegis"));
-    base_dir.join("templates")
-}
-
-fn sync_generator_templates_to_disk(templates_root: &Path) -> Result<()> {
-    persist_template(
-        templates_root,
-        "agents",
-        "agent-creator-agent.yaml",
-        AGENT_GENERATOR_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "agent-generator-judge.yaml",
-        AGENT_GENERATOR_JUDGE_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "workflow-generator-judge.yaml",
-        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
-    )?;
-    Ok(())
-}
-
-fn persist_template(
-    templates_root: &Path,
-    category: &str,
-    file_name: &str,
-    content: &str,
-) -> Result<()> {
-    let dir = templates_root.join(category);
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("Failed to create template directory {}", dir.display()))?;
-    let file_path = dir.join(file_name);
-    std::fs::write(&file_path, content)
-        .with_context(|| format!("Failed to write bundled template {}", file_path.display()))?;
-    Ok(())
-}
-
-async fn ensure_generator_agent_deployed(
-    client: &DaemonClient,
-    name: &str,
-    template_yaml: &str,
-) -> Result<Uuid> {
-    if let Some(id) = client.lookup_agent(name).await? {
-        return Ok(id);
-    }
-
-    println!(
-        "{}",
-        format!("Generator agent '{name}' not found. Deploying template...").yellow()
-    );
-
-    let manifest: aegis_orchestrator_sdk::AgentManifest =
-        serde_yaml::from_str(template_yaml).context("Failed to parse generator template YAML")?;
-    manifest
-        .validate()
-        .map_err(|e| anyhow::anyhow!("Generator template validation failed: {e}"))?;
-
-    client
-        .deploy_agent(manifest, false)
-        .await
-        .context("Failed to deploy generator template")
 }
 
 async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {

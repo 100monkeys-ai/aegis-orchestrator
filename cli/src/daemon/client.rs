@@ -587,9 +587,25 @@ impl DaemonClient {
 
     /// Deploy a workflow from YAML content.
     pub async fn deploy_workflow_manifest(&self, workflow_yaml: &str) -> Result<()> {
+        self.deploy_workflow_manifest_with_force(workflow_yaml, false)
+            .await
+    }
+
+    /// Deploy a workflow from YAML content with optional force overwrite.
+    pub async fn deploy_workflow_manifest_with_force(
+        &self,
+        workflow_yaml: &str,
+        force: bool,
+    ) -> Result<()> {
+        let url = if force {
+            format!("{}/v1/workflows?force=true", self.base_url)
+        } else {
+            format!("{}/v1/workflows", self.base_url)
+        };
+
         let response = self
             .client
-            .post(format!("{}/v1/workflows", self.base_url))
+            .post(url)
             .header("Content-Type", "application/x-yaml")
             .body(workflow_yaml.to_string())
             .send()
