@@ -30,7 +30,7 @@ This crate is not intended for direct use by agent authors — use [`aegis-orche
 
 ```toml
 [dependencies]
-aegis-orchestrator-core = "0.10.0-pre-alpha"
+aegis-orchestrator-core = "0.11.0-pre-alpha"
 ```
 
 ```rust

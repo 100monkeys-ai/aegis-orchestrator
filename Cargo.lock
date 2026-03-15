@@ -4,7 +4,7 @@ version = 3
 
 [[package]]
 name = "aegis-orchestrator"
-version = "0.10.0-pre-alpha"
+version = "0.11.0-pre-alpha"
 dependencies = [
  "aegis-orchestrator-core",
  "aegis-orchestrator-sdk",
@@ -42,7 +42,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-core"
-version = "0.10.0-pre-alpha"
+version = "0.11.0-pre-alpha"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-sdk"
-version = "0.10.0-pre-alpha"
+version = "0.11.0-pre-alpha"
 dependencies = [
  "aegis-orchestrator-core",
  "anyhow",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "aegis-orchestrator-swarm"
-version = "0.10.0-pre-alpha"
+version = "0.11.0-pre-alpha"
 dependencies = [
  "aegis-orchestrator-core",
  "anyhow",

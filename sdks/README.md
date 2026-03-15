@@ -17,7 +17,7 @@ Rust SDK for building and deploying agents on the [100monkeys.ai AEGIS](https://
 
 ```toml
 [dependencies]
-aegis-orchestrator-sdk = "0.10.0-pre-alpha"
+aegis-orchestrator-sdk = "0.11.0-pre-alpha"
 tokio = { version = "1", features = ["full"] }
 ```
 
