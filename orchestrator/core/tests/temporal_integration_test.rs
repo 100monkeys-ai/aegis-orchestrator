@@ -117,6 +117,10 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     }
 }
 
+// NOTE: This is a full Temporal integration test that may require external services
+// (e.g., a running Temporal server) and can be slow or environment-dependent.
+// It is therefore marked `#[ignore]` and must be run explicitly, for example with:
+// `cargo test --test temporal_integration_test -- --ignored`.
 #[tokio::test]
 #[ignore]
 async fn test_register_and_start_temporal_workflow() {
@@ -154,16 +158,16 @@ states:
         .register_workflow(workflow_yaml, false)
         .await;
 
-    if let Ok(reg) = register_result {
-        let req = StartWorkflowExecutionRequest {
-            workflow_id: reg.workflow_id.clone(),
-            input: serde_json::json!({"message": "hello testing"}),
-            blackboard: None,
-        };
+    let reg = register_result.expect("Failed to register workflow in temporal integration test");
+    let req = StartWorkflowExecutionRequest {
+        workflow_id: reg.workflow_id.clone(),
+        input: serde_json::json!({"message": "hello testing"}),
+        blackboard: None,
+    };
 
-        let start_result = start_use_case.start_execution(req).await;
-        if let Ok(exec) = start_result {
-            assert_eq!(exec.workflow_id, reg.workflow_id);
-        }
-    }
+    let start_result = start_use_case.start_execution(req).await;
+    let exec =
+        start_result.expect("Failed to start workflow execution in temporal integration test");
+    assert_eq!(exec.workflow_id, reg.workflow_id);
 }
+

@@ -25,7 +25,7 @@
 //! - **Version Management**: Multiple versions of the same workflow
 //! - **Content Hashing**: SHA-256 based deduplication
 //! - **Multi-Format Storage**: YAML source + JSON definition + Temporal mapping
-//! - **Immutable Definitions**: Workflows are append-only (new versions created)
+//! - **Definition Storage**: Workflows can be versioned and updated as needed
 //!
 //! # Usage
 //!
@@ -108,11 +108,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             INSERT INTO workflows (id, name, version, description, yaml_source, domain_json, temporal_def_json, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            ON CONFLICT (name) DO UPDATE SET
+            ON CONFLICT (name, version) DO UPDATE SET
                 version = EXCLUDED.version,
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
-                domain_json = EXCLUDED.domain_json || jsonb_build_object('id', workflows.id::text),
+                domain_json = EXCLUDED.domain_json,
                 temporal_def_json = EXCLUDED.temporal_def_json,
                 updated_at = NOW()
             "#
@@ -133,9 +133,9 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflow_definitions (workflow_id, name, definition, definition_hash, registered_at)
-            VALUES ($1, $2, $3, $4, NOW())
-            ON CONFLICT (name) DO UPDATE SET
+            INSERT INTO workflow_definitions (workflow_id, name, version, definition, definition_hash, registered_at)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            ON CONFLICT (name, version) DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
                 definition = EXCLUDED.definition,
                 definition_hash = EXCLUDED.definition_hash,
@@ -144,6 +144,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         )
         .bind(workflow.id.0)
         .bind(&workflow.metadata.name)
+        .bind(&version)
         .bind(&temporal_def_json)
         .bind(def_hash)
         .execute(&self.pool)
@@ -228,6 +229,17 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     }
 
     async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            DELETE FROM workflow_definitions
+            WHERE workflow_id = $1
+            "#,
+        )
+        .bind(id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
         sqlx::query(
             r#"
             DELETE FROM workflows

@@ -19,6 +19,19 @@ use axum::{
     Json, Router,
 };
 
+/// Extract the final output from the last iteration of an execution.
+///
+/// Returns `None` if the execution has no iterations or if the last iteration
+/// produced no output.
+fn final_output_from_execution(
+    execution: &aegis_orchestrator_core::domain::execution::Execution,
+) -> Option<String> {
+    execution
+        .iterations()
+        .last()
+        .and_then(|i| i.output.clone())
+}
+
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -595,7 +608,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
 
     /// Maximum number of retries when attempting to establish the Temporal connection.
-    /// Previously this was an inline magic number (`30`) in the connection retry loop.
+    ///
+    /// With the current 2-second backoff between attempts, `30` retries corresponds to
+    /// roughly one minute of retrying before giving up. This value is intended to balance
+    /// resilience to short-lived outages during startup against delaying server readiness
+    /// for too long in the face of persistent misconfiguration or a down Temporal cluster.
+    ///
+    /// If this maximum is reached, the daemon stops retrying, logs a warning and an error,
+    /// and continues running without an active Temporal client. As a result, any workflow
+    /// execution that depends on Temporal will fail until the process is restarted or the
+    /// connection is re-established by other means.
     const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
 
     // Spawn background task to connect
@@ -1681,18 +1703,6 @@ async fn stream_events_handler(
 
             // Execution Terminal State
             if let Some(ended_at) = execution.ended_at {
-                /// Extract the final output from the last iteration of an execution.
-                ///
-                /// Returns `None` if the execution has no iterations or if the last iteration
-                /// produced no output.
-                fn final_output_from_execution(
-                    execution: &aegis_orchestrator_core::domain::execution::Execution,
-                ) -> Option<String> {
-                    execution
-                        .iterations()
-                        .last()
-                        .and_then(|i| i.output.clone())
-                }
 
                 match execution.status {
                     aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
@@ -2120,6 +2130,11 @@ struct ListExecutionsQuery {
     limit: Option<usize>,
 }
 
+/// Maximum number of executions that can be returned by a single
+/// `list_executions` request. This upper bound protects the daemon from
+/// excessive memory usage and response sizes when clients request very
+/// large pages. If a client supplies a `limit` greater than this value,
+/// the requested limit is clamped down to `MAX_EXECUTION_LIST_LIMIT`.
 const MAX_EXECUTION_LIST_LIMIT: usize = 1000;
 
 async fn list_executions_handler(
