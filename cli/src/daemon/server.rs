@@ -1270,13 +1270,20 @@ async fn shutdown_signal() {
 
 /// POST /v1/workflows/temporal/register - Register a workflow with Temporal
 /// Phase 2: Uses StandardRegisterWorkflowUseCase with Temporal
+#[derive(serde::Deserialize, Default)]
+struct RegisterWorkflowQuery {
+    #[serde(default)]
+    force: bool,
+}
+
 async fn register_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
+    axum::extract::Query(query): axum::extract::Query<RegisterWorkflowQuery>,
     body: String,
 ) -> impl IntoResponse {
     match state
         .register_workflow_use_case
-        .register_workflow(&body, false)
+        .register_workflow(&body, query.force)
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
