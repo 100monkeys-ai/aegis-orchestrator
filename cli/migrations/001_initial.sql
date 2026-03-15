@@ -184,6 +184,9 @@ CREATE TABLE executions (
     container_uid INTEGER NOT NULL DEFAULT 1000,
     container_gid INTEGER NOT NULL DEFAULT 1000,
     
+    -- Execution hierarchy (ADR-039)
+    parent_execution_id UUID REFERENCES executions(id) ON DELETE SET NULL,
+
     -- Timestamps
     started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     completed_at TIMESTAMPTZ,
@@ -198,6 +201,8 @@ CREATE INDEX idx_executions_agent_id ON executions(agent_id);
 CREATE INDEX idx_executions_workflow_execution_id ON executions(workflow_execution_id);
 CREATE INDEX idx_executions_status ON executions(status);
 CREATE INDEX idx_executions_started_at ON executions(started_at DESC);
+CREATE INDEX idx_executions_parent_execution_id ON executions(parent_execution_id)
+    WHERE parent_execution_id IS NOT NULL;
 
 -- =============================================================================
 -- Temporal Worker Schema
@@ -279,6 +284,7 @@ COMMENT ON COLUMN workflows.domain_json IS 'Serialized Rust Workflow domain obje
 COMMENT ON COLUMN workflows.temporal_def_json IS 'Generated Temporal workflow definition sent to workers';
 COMMENT ON COLUMN workflow_executions.temporal_workflow_id IS 'Temporal workflow ID for querying Temporal Server';
 COMMENT ON COLUMN workflow_executions.temporal_run_id IS 'Temporal run ID for specific execution instance';
+COMMENT ON COLUMN executions.parent_execution_id IS 'Parent execution ID for child executions (NULL for root executions). Supports ADR-039 recursive execution hierarchy.';
 
 -- =============================================================================
 -- Sample Data (for development)
