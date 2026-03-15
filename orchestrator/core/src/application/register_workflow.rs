@@ -36,6 +36,7 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for register workflow
 
+use crate::application::agent::AgentLifecycleService;
 use crate::application::ports::WorkflowEnginePort;
 use crate::domain::repository::WorkflowRepository;
 use crate::infrastructure::event_bus::EventBus;
@@ -87,6 +88,9 @@ pub struct StandardRegisterWorkflowUseCase {
     workflow_repository: Arc<dyn WorkflowRepository>,
     workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
     event_bus: Arc<EventBus>,
+    /// Agent lifecycle service used to resolve agent name references to UUIDs at
+    /// workflow deploy time, ensuring execution-time failures are surfaced early.
+    agent_service: Arc<dyn AgentLifecycleService>,
 }
 
 impl StandardRegisterWorkflowUseCase {
@@ -94,11 +98,13 @@ impl StandardRegisterWorkflowUseCase {
         workflow_repository: Arc<dyn WorkflowRepository>,
         workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
         event_bus: Arc<EventBus>,
+        agent_service: Arc<dyn AgentLifecycleService>,
     ) -> Self {
         Self {
             workflow_repository,
             workflow_engine,
             event_bus,
+            agent_service,
         }
     }
 }
@@ -140,11 +146,38 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         }
 
         // Step 2: Map to Temporal definition via anti-corruption layer
-        let temporal_definition =
+        let mut temporal_definition =
             crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
                 &workflow,
             )
             .context("Failed to map workflow to Temporal definition")?;
+
+        // Step 2b: Resolve agent name references → UUIDs in all Agent states.
+        // Workflow YAML references agents by human-readable name (e.g. `agent: coder`);
+        // the Temporal worker and gRPC ExecuteAgent handler require a UUID. Resolving
+        // at deploy time gives a clear error message rather than a silent runtime failure.
+        for (state_name, state) in temporal_definition.states.iter_mut() {
+            if state.kind == "Agent" {
+                if let Some(ref name) = state.agent.clone() {
+                    if uuid::Uuid::parse_str(name).is_err() {
+                        let agent_id = self
+                            .agent_service
+                            .lookup_agent(name)
+                            .await
+                            .with_context(|| {
+                                format!("Failed to resolve agent '{name}' in state '{state_name}'")
+                            })?
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Agent '{name}' referenced in state '{state_name}' not found; \
+                                     deploy the agent before registering this workflow"
+                                )
+                            })?;
+                        state.agent = Some(agent_id.0.to_string());
+                    }
+                }
+            }
+        }
 
         // Step 3: Register with Temporal via HTTP to TypeScript worker
         let engine = {
@@ -187,7 +220,9 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::agent::AgentLifecycleService;
     use crate::application::temporal_mapper::TemporalWorkflowDefinition;
+    use crate::domain::agent::{Agent, AgentId, AgentManifest};
     use crate::domain::events::WorkflowEvent;
     use crate::domain::repository::{RepositoryError, WorkflowRepository};
     use crate::domain::workflow::{Workflow, WorkflowId};
@@ -196,6 +231,45 @@ mod tests {
     use async_trait::async_trait;
     use serde_json::json;
     use std::sync::Mutex;
+
+    /// Test fixture: resolves any agent name to a deterministic UUID.
+    /// Returns `None` only when `name == "nonexistent-agent"` (for error-path tests).
+    struct MockAgentService;
+
+    #[async_trait]
+    impl AgentLifecycleService for MockAgentService {
+        async fn deploy_agent(
+            &self,
+            _manifest: AgentManifest,
+            _force: bool,
+        ) -> anyhow::Result<AgentId> {
+            unimplemented!()
+        }
+        async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
+            unimplemented!()
+        }
+        async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
+            unimplemented!()
+        }
+        async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
+            if name == "nonexistent-agent" {
+                return Ok(None);
+            }
+            Ok(Some(AgentId(
+                uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+            )))
+        }
+    }
+
+    fn mock_agent_service() -> Arc<dyn AgentLifecycleService> {
+        Arc::new(MockAgentService)
+    }
 
     const VALID_WORKFLOW_YAML: &str = r#"
 apiVersion: 100monkeys.ai/v1
@@ -306,6 +380,7 @@ spec:
             repo.clone(),
             Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
             event_bus,
+            mock_agent_service(),
         );
 
         let response = service
@@ -344,6 +419,7 @@ spec:
             Arc::new(InMemoryWorkflowRepository::new()),
             Arc::new(tokio::sync::RwLock::new(None)),
             Arc::new(EventBus::new(8)),
+            mock_agent_service(),
         );
 
         let err = service
@@ -363,6 +439,7 @@ spec:
                 Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
             ))),
             Arc::new(EventBus::new(8)),
+            mock_agent_service(),
         );
 
         let err = service
@@ -381,6 +458,7 @@ spec:
                 Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
             ))),
             Arc::new(EventBus::new(8)),
+            mock_agent_service(),
         );
 
         let err = service
@@ -401,6 +479,7 @@ spec:
                 Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
             ))),
             Arc::new(EventBus::new(8)),
+            mock_agent_service(),
         );
 
         let _ = service
@@ -424,6 +503,7 @@ spec:
                 Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
             ))),
             event_bus,
+            mock_agent_service(),
         );
 
         let _ = service
@@ -440,6 +520,7 @@ spec:
             Arc::new(InMemoryWorkflowRepository::new()),
             Arc::new(tokio::sync::RwLock::new(None)),
             Arc::new(EventBus::new(8)),
+            mock_agent_service(),
         );
         let err = service
             .register_workflow(&invalid, false)
@@ -462,6 +543,7 @@ spec:
                 engine.clone() as Arc<dyn WorkflowEnginePort>
             ))),
             event_bus,
+            mock_agent_service(),
         );
 
         // First registration
@@ -484,5 +566,50 @@ spec:
             .await
             .unwrap();
         assert_eq!(response.status, "registered");
+    }
+
+    /// Workflow YAML that references a non-existent agent; should fail during step 2b.
+    const WORKFLOW_YAML_UNKNOWN_AGENT: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: test-unknown-agent
+  version: "1.0.0"
+  description: "Workflow with an unknown agent"
+spec:
+  initial_state: step1
+  states:
+    step1:
+      kind: Agent
+      agent: nonexistent-agent
+      input: "test input"
+      transitions:
+        - condition: always
+          target: done
+    done:
+      kind: System
+      command: echo done
+      transitions: []
+"#;
+
+    #[tokio::test]
+    async fn register_workflow_fails_when_agent_not_found() {
+        let service = StandardRegisterWorkflowUseCase::new(
+            Arc::new(InMemoryWorkflowRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
+            ))),
+            Arc::new(EventBus::new(8)),
+            mock_agent_service(),
+        );
+
+        let err = service
+            .register_workflow(WORKFLOW_YAML_UNKNOWN_AGENT, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent-agent"),
+            "error should mention the unknown agent name, got: {err}"
+        );
     }
 }

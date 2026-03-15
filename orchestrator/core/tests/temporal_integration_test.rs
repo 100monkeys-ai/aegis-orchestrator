@@ -9,6 +9,7 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements temporal integration test
 
+use aegis_orchestrator_core::application::agent::AgentLifecycleService;
 use aegis_orchestrator_core::application::register_workflow::{
     RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase,
 };
@@ -16,6 +17,7 @@ use aegis_orchestrator_core::application::start_workflow_execution::{
     StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
     StartWorkflowExecutionUseCase,
 };
+use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest};
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::repository::{
     RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
@@ -25,6 +27,36 @@ use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+struct MockAgentServiceInt;
+
+#[async_trait]
+impl AgentLifecycleService for MockAgentServiceInt {
+    async fn deploy_agent(
+        &self,
+        _manifest: AgentManifest,
+        _force: bool,
+    ) -> anyhow::Result<AgentId> {
+        unimplemented!()
+    }
+    async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
+        unimplemented!()
+    }
+    async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
+        unimplemented!()
+    }
+    async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
+        unimplemented!()
+    }
+    async fn lookup_agent(&self, _name: &str) -> anyhow::Result<Option<AgentId>> {
+        Ok(Some(AgentId(
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        )))
+    }
+}
 
 // Mock Repositories to ensure the tests compile perfectly without relying on Postgres bindings that may not be exported here.
 struct MockWorkflowRepo;
@@ -97,6 +129,7 @@ async fn test_register_and_start_temporal_workflow() {
         workflow_repo.clone(),
         temporal_container.clone(),
         event_bus.clone(),
+        Arc::new(MockAgentServiceInt),
     );
 
     let start_use_case = StandardStartWorkflowExecutionUseCase::new(

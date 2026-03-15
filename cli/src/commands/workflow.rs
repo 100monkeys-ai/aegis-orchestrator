@@ -101,6 +101,10 @@ pub enum WorkflowCommand {
         /// Show state transitions only
         #[arg(long)]
         transitions: bool,
+
+        /// Show verbose output (execution metadata, resolved agent IDs, etc.)
+        #[arg(long, short = 'v')]
+        verbose: bool,
     },
 
     /// Delete a workflow from registry
@@ -149,7 +153,8 @@ pub async fn handle_command(
             execution_id,
             follow,
             transitions,
-        } => stream_workflow_logs(execution_id, follow, transitions, host, port).await,
+            verbose,
+        } => stream_workflow_logs(execution_id, follow, transitions, verbose, host, port).await,
         WorkflowCommand::Delete { name, yes } => delete_workflow(name, yes, host, port).await,
         WorkflowCommand::Generate { input, follow } => {
             generate_workflow(input, follow, host, port, config_path.as_ref()).await
@@ -545,6 +550,7 @@ async fn stream_workflow_logs(
     execution_id: Uuid,
     follow: bool,
     transitions_only: bool,
+    verbose: bool,
     host: &str,
     port: u16,
 ) -> Result<()> {
@@ -566,6 +572,9 @@ async fn stream_workflow_logs(
     println!("   Execution ID: {execution_id}");
     if transitions_only {
         println!("   Filter:       State transitions only");
+    }
+    if verbose {
+        println!("   Mode:         Verbose");
     }
     println!();
 

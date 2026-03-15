@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
+use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::application::run_container_step::RunContainerStepUseCase;
 use crate::application::stimulus::StimulusService;
@@ -42,6 +43,8 @@ pub struct AegisRuntimeService {
     stimulus_service: Option<Arc<dyn StimulusService>>,
     /// BC-3: Container step runner use case (ADR-050). Optional until wired.
     run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
+    /// BC-1: Agent lifecycle service for resolving agent name → UUID at execution time (Phase 1b).
+    agent_service: Option<Arc<dyn AgentLifecycleService>>,
 }
 
 impl AegisRuntimeService {
@@ -57,6 +60,7 @@ impl AegisRuntimeService {
             cortex_client: None,
             stimulus_service: None,
             run_container_step_use_case: None,
+            agent_service: None,
         }
     }
 
@@ -94,6 +98,12 @@ impl AegisRuntimeService {
         self
     }
 
+    /// Set the agent lifecycle service for name-to-UUID resolution at execution time (Phase 1b).
+    pub fn with_agent_service(mut self, svc: Arc<dyn AgentLifecycleService>) -> Self {
+        self.agent_service = Some(svc);
+        self
+    }
+
     /// Create a gRPC server instance
     pub fn into_server(self) -> AegisRuntimeServer<Self> {
         AegisRuntimeServer::new(self)
@@ -112,9 +122,31 @@ impl AegisRuntime for AegisRuntimeService {
     ) -> Result<Response<Self::ExecuteAgentStream>, Status> {
         let req = request.into_inner();
 
-        // Parse agent_id
-        let agent_id = AgentId::from_string(&req.agent_id)
-            .map_err(|e| Status::invalid_argument(format!("Invalid agent_id: {e}")))?;
+        // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
+        let agent_id = if let Ok(id) = AgentId::from_string(&req.agent_id) {
+            id
+        } else if let Some(ref svc) = self.agent_service {
+            match svc.lookup_agent(&req.agent_id).await {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return Err(Status::not_found(format!(
+                        "Agent '{}' not found; deploy it with `aegis agent deploy` first",
+                        req.agent_id
+                    )))
+                }
+                Err(e) => {
+                    return Err(Status::internal(format!(
+                        "Failed to resolve agent '{}': {e}",
+                        req.agent_id
+                    )))
+                }
+            }
+        } else {
+            return Err(Status::invalid_argument(format!(
+                "Invalid agent_id '{}': not a UUID and agent name resolution is unavailable",
+                req.agent_id
+            )));
+        };
 
         // Create execution input
         let payload = if req.context_json.is_empty() {
@@ -860,6 +892,7 @@ fn convert_domain_event_to_proto(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_grpc_server(
     addr: std::net::SocketAddr,
     execution_service: Arc<dyn ExecutionService>,
@@ -872,6 +905,7 @@ pub async fn start_grpc_server(
     >,
     cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
     run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
+    agent_service: Arc<dyn AgentLifecycleService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut service = AegisRuntimeService::new(execution_service, validation_service);
 
@@ -886,6 +920,8 @@ pub async fn start_grpc_server(
     if let Some(uc) = run_container_step_use_case {
         service = service.with_container_step_runner(uc);
     }
+
+    service = service.with_agent_service(agent_service);
 
     let server = service.into_server();
 

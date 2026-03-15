@@ -908,6 +908,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_repo.clone(),
         workflow_engine_container.clone(),
         event_bus.clone(),
+        agent_service.clone(),
     ));
 
     let start_workflow_execution_use_case = Arc::new(StandardStartWorkflowExecutionUseCase::new(
@@ -1093,7 +1094,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     let app_state = AppState {
-        agent_service,
+        agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
@@ -1177,6 +1178,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
+    let agent_service_for_grpc: Arc<dyn AgentLifecycleService> = agent_service.clone();
 
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -1189,6 +1191,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Some(tool_invocation_service),
             cortex_client,
             Some(run_container_step_use_case),
+            agent_service_for_grpc,
         )
         .await
         {
