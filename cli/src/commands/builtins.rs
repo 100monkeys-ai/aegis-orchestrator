@@ -195,8 +195,14 @@ async fn deploy_builtin_agent(
     template_yaml: &str,
     force: bool,
 ) -> Result<Uuid> {
+    let manifest: aegis_orchestrator_sdk::AgentManifest =
+        serde_yaml::from_str(template_yaml).context("Failed to parse built-in template YAML")?;
+    manifest
+        .validate()
+        .map_err(|e| anyhow::anyhow!("Built-in template validation failed: {e}"))?;
+
     if !force {
-        if let Some(id) = client.lookup_agent(name).await? {
+        if let Some(id) = client.lookup_agent(&manifest.metadata.name).await? {
             return Ok(id);
         }
     }
@@ -206,12 +212,6 @@ async fn deploy_builtin_agent(
         "→".dimmed(),
         name.cyan()
     );
-
-    let manifest: aegis_orchestrator_sdk::AgentManifest =
-        serde_yaml::from_str(template_yaml).context("Failed to parse built-in template YAML")?;
-    manifest
-        .validate()
-        .map_err(|e| anyhow::anyhow!("Built-in template validation failed: {e}"))?;
 
     client
         .deploy_agent(manifest, force)
