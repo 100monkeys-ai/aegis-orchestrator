@@ -112,7 +112,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 version = EXCLUDED.version,
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
-                domain_json = EXCLUDED.domain_json,
+                domain_json = EXCLUDED.domain_json || jsonb_build_object('id', workflows.id::text),
                 temporal_def_json = EXCLUDED.temporal_def_json,
                 updated_at = NOW()
             "#
