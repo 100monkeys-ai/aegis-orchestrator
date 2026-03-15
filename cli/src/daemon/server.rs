@@ -820,6 +820,461 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    // fs extended tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "fs.create_dir")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.create_dir".to_string(),
+                description: "Creates a new directory along with any necessary parent directories."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.create_dir".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.delete") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.delete".to_string(),
+                description: "Deletes a file or directory.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.delete".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.edit") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.edit".to_string(),
+                description: "Performs an exact string replacement in a file.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.edit".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "fs.multi_edit")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.multi_edit".to_string(),
+                description: "Performs multiple sequential string replacements in a file."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.multi_edit".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.grep") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.grep".to_string(),
+                description:
+                    "Recursively searches for a regex pattern within files in a given directory."
+                        .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.grep".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers.iter().any(|d| d.name == "fs.glob") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "fs.glob".to_string(),
+                description: "Recursively matches files against a glob pattern.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "fs.glob".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    // web tools
+    if !builtin_dispatchers.iter().any(|d| d.name == "web.search") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "web.search".to_string(),
+                description: "Performs an internet search query.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "web.search".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers.iter().any(|d| d.name == "web.fetch") {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "web.fetch".to_string(),
+                description: "Fetches content from a URL, optionally converting HTML to Markdown."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "web.fetch".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    // aegis.agent extended tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.update")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.update".to_string(),
+                description: "Updates an existing Agent manifest in the registry.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.update".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.export")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.export".to_string(),
+                description: "Exports an Agent manifest by name.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.export".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.delete")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.delete".to_string(),
+                description: "Removes a deployed agent from the registry by UUID.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.delete".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.generate")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.generate".to_string(),
+                description: "Generates an Agent manifest from a natural-language intent."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.generate".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+
+    // aegis.workflow extended tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.list")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.list".to_string(),
+                description: "Lists currently registered workflows and metadata.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.update")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.update".to_string(),
+                description: "Updates an existing Workflow manifest in the registry.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.update".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.export")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.export".to_string(),
+                description: "Exports a Workflow manifest by name.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.export".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.delete")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.delete".to_string(),
+                description: "Removes a registered workflow from the registry by name.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.delete".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.run")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.run".to_string(),
+                description:
+                    "Executes a registered workflow by name with optional input parameters."
+                        .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.run".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.generate")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.generate".to_string(),
+                description: "Generates a Workflow manifest from a natural-language objective."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.generate".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+
+    // aegis.task tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.execute")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.execute".to_string(),
+                description: "Starts a new agent execution (task) by agent UUID or name."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.execute".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.status")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.status".to_string(),
+                description: "Returns the current status and output of an execution by UUID."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.status".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.list")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.list".to_string(),
+                description: "Lists recent executions, optionally filtered by agent.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.cancel")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.cancel".to_string(),
+                description: "Cancels an active agent execution by UUID.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.cancel".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.remove")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.remove".to_string(),
+                description: "Removes a completed or failed execution record by UUID.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.remove".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+
+    // aegis.system tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.system.info")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.system.info".to_string(),
+                description: "Returns system version, status, and capabilities.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.system.info".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.system.config")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.system.config".to_string(),
+                description: "Returns the current node configuration.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.system.config".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
     let tool_router = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
             tool_registry.clone(),

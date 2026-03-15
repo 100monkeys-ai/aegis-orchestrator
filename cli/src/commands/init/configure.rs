@@ -745,6 +745,98 @@ impl ConfigWizard {
       description: "Performs strict deterministic + semantic workflow validation and registers the workflow on pass."
       capabilities:
         - name: "aegis.workflow.create"
+    - name: "aegis.agent.update"
+      enabled: true
+      description: "Updates an existing Agent manifest in the registry."
+      capabilities:
+        - name: "aegis.agent.update"
+    - name: "aegis.agent.export"
+      enabled: true
+      description: "Exports an Agent manifest by name."
+      capabilities:
+        - name: "aegis.agent.export"
+          skip_judge: true
+    - name: "aegis.agent.delete"
+      enabled: true
+      description: "Removes a deployed agent from the registry by UUID."
+      capabilities:
+        - name: "aegis.agent.delete"
+    - name: "aegis.agent.generate"
+      enabled: true
+      description: "Generates an Agent manifest from a natural-language intent."
+      capabilities:
+        - name: "aegis.agent.generate"
+    - name: "aegis.workflow.list"
+      enabled: true
+      description: "Lists currently registered workflows and metadata."
+      capabilities:
+        - name: "aegis.workflow.list"
+          skip_judge: true
+    - name: "aegis.workflow.update"
+      enabled: true
+      description: "Updates an existing Workflow manifest in the registry."
+      capabilities:
+        - name: "aegis.workflow.update"
+    - name: "aegis.workflow.export"
+      enabled: true
+      description: "Exports a Workflow manifest by name."
+      capabilities:
+        - name: "aegis.workflow.export"
+          skip_judge: true
+    - name: "aegis.workflow.delete"
+      enabled: true
+      description: "Removes a registered workflow from the registry by name."
+      capabilities:
+        - name: "aegis.workflow.delete"
+    - name: "aegis.workflow.run"
+      enabled: true
+      description: "Executes a registered workflow by name with optional input parameters."
+      capabilities:
+        - name: "aegis.workflow.run"
+    - name: "aegis.workflow.generate"
+      enabled: true
+      description: "Generates a Workflow manifest from a natural-language objective."
+      capabilities:
+        - name: "aegis.workflow.generate"
+    - name: "aegis.task.execute"
+      enabled: true
+      description: "Starts a new agent execution (task) by agent UUID or name."
+      capabilities:
+        - name: "aegis.task.execute"
+    - name: "aegis.task.status"
+      enabled: true
+      description: "Returns the current status and output of an execution by UUID."
+      capabilities:
+        - name: "aegis.task.status"
+          skip_judge: true
+    - name: "aegis.task.list"
+      enabled: true
+      description: "Lists recent executions, optionally filtered by agent."
+      capabilities:
+        - name: "aegis.task.list"
+          skip_judge: true
+    - name: "aegis.task.cancel"
+      enabled: true
+      description: "Cancels an active agent execution by UUID."
+      capabilities:
+        - name: "aegis.task.cancel"
+    - name: "aegis.task.remove"
+      enabled: true
+      description: "Removes a completed or failed execution record by UUID."
+      capabilities:
+        - name: "aegis.task.remove"
+    - name: "aegis.system.info"
+      enabled: true
+      description: "Returns system version, status, and capabilities."
+      capabilities:
+        - name: "aegis.system.info"
+          skip_judge: true
+    - name: "aegis.system.config"
+      enabled: true
+      description: "Returns the current node configuration."
+      capabilities:
+        - name: "aegis.system.config"
+          skip_judge: true
 "#;
 
         let temporal_section = if components.temporal {
