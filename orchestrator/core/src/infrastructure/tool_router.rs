@@ -487,12 +487,68 @@ impl ToolRouter {
                         "type": "object",
                         "properties": {}
                     }),
-                    "aegis.workflow.create_and_validate" => json!({
+                    "aegis.agent.update" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Agent manifest YAML to update an existing agent."
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing version if it already exists."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
+                    "aegis.agent.export" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the agent to export."
+                            }
+                        },
+                        "required": ["name"]
+                    }),
+                    "aegis.workflow.list" => json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                    "aegis.workflow.update" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Workflow manifest YAML to update an existing workflow."
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing version if it already exists."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
+                    }),
+                    "aegis.workflow.export" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Name of the workflow to export."
+                            }
+                        },
+                        "required": ["name"]
+                    }),
+                    "aegis.workflow.create" => json!({
                         "type": "object",
                         "properties": {
                             "manifest_yaml": {
                                 "type": "string",
                                 "description": "Full Workflow manifest YAML to parse, validate, semantically judge, and register."
+                            },
+                            "force": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing version if it already exists."
                             },
                             "task_context": {
                                 "type": "string",
@@ -1010,11 +1066,11 @@ mod tests {
                 }],
             },
             BuiltinDispatcherConfig {
-                name: "aegis.workflow.create_and_validate".to_string(),
+                name: "aegis.workflow.create".to_string(),
                 description: "Create, validate, and register workflows".to_string(),
                 enabled: true,
                 capabilities: vec![CapabilityConfig {
-                    name: "aegis.workflow.create_and_validate".to_string(),
+                    name: "aegis.workflow.create".to_string(),
                     skip_judge: false,
                 }],
             },
@@ -1032,18 +1088,16 @@ mod tests {
             "manifest_yaml must be required for aegis.agent.create"
         );
 
-        let workflow_tool = tools
-            .iter()
-            .find(|t| t.name == "aegis.workflow.create_and_validate");
+        let workflow_tool = tools.iter().find(|t| t.name == "aegis.workflow.create");
         assert!(
             workflow_tool.is_some(),
-            "expected aegis.workflow.create_and_validate tool"
+            "expected aegis.workflow.create tool"
         );
         let workflow_schema = &workflow_tool.unwrap().input_schema;
         assert_eq!(
             workflow_schema["required"][0].as_str(),
             Some("manifest_yaml"),
-            "manifest_yaml must be required for aegis.workflow.create_and_validate"
+            "manifest_yaml must be required for aegis.workflow.create"
         );
         assert!(
             workflow_schema["properties"]["judge_agents"].is_object(),

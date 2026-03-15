@@ -19,10 +19,12 @@ spec:
     instruction: |
       You are a workflow planning specialist.
 
-      First, call `aegis.agent.list` to inspect currently deployed agents.
+      First, call `aegis.agent.list` and `aegis.workflow.list` to inspect currently deployed agents and registered workflows.
       Then analyze the user workflow request step-by-step. For each required workflow step:
       - map it to an existing deployed agent when possible
       - only mark it as missing when no suitable deployed agent exists
+
+      If the user is requesting an update to an existing workflow, identify the existing workflow name from the list.
 
       Produce a concise JSON plan with:
       - required_agents: array of agent names/capabilities needed for the workflow
@@ -55,6 +57,7 @@ spec:
 
   tools:
     - aegis.agent.list
+    - aegis.workflow.list
 
   security:
     network:

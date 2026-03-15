@@ -26,12 +26,14 @@ spec:
       - optional criteria and validation context
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
-      - If `aegis.schema.validate` was NOT called before `aegis.agent.create`, reduce the `correctness`
-        score by at least 0.2 and note "aegis.schema.validate was not called before aegis.agent.create".
+      - If `aegis.schema.validate` was NOT called before `aegis.agent.create` or `aegis.agent.update`, reduce the `correctness`
+        score by at least 0.2 and note "aegis.schema.validate was not called before agent deployment".
       - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at
         least 0.3 and list the schema errors in the `correctness` signal message.
-      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.agent.create`,
+      - If updating an existing agent, ensure `aegis.agent.export` was called to retrieve current state.
+      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.agent.create` / `update`,
         give full credit for schema compliance.
+      - Ensure `force: true` was only used if requested, otherwise version increments are expected.
 
       Score output quality for:
       - correctness (includes schema compliance per the tool call audit above)

@@ -740,11 +740,11 @@ impl ConfigWizard {
       capabilities:
         - name: "aegis.agent.list"
           skip_judge: true
-    - name: "aegis.workflow.create_and_validate"
+    - name: "aegis.workflow.create"
       enabled: true
       description: "Performs strict deterministic + semantic workflow validation and registers the workflow on pass."
       capabilities:
-        - name: "aegis.workflow.create_and_validate"
+        - name: "aegis.workflow.create"
 "#;
 
         let temporal_section = if components.temporal {

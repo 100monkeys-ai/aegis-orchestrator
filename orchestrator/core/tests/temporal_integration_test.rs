@@ -106,7 +106,9 @@ states:
     next: [end]
 "#;
 
-    let register_result = register_use_case.register_workflow(workflow_yaml).await;
+    let register_result = register_use_case
+        .register_workflow(workflow_yaml, false)
+        .await;
 
     if let Ok(reg) = register_result {
         let req = StartWorkflowExecutionRequest {

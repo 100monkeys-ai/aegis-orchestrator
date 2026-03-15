@@ -74,7 +74,12 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
     /// - Validation errors: Workflow invariants violated
     /// - Registration errors: Temporal server unavailable
     /// - Persistence errors: Database save failed
-    async fn register_workflow(&self, yaml_manifest: &str) -> Result<RegisteredWorkflow>;
+    /// - Version error: Workflow same name + version already exists and `force = false`
+    async fn register_workflow(
+        &self,
+        yaml_manifest: &str,
+        force: bool,
+    ) -> Result<RegisteredWorkflow>;
 }
 
 /// Standard implementation of RegisterWorkflowUseCase
@@ -100,8 +105,12 @@ impl StandardRegisterWorkflowUseCase {
 
 #[async_trait]
 impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
-    async fn register_workflow(&self, yaml_manifest: &str) -> Result<RegisteredWorkflow> {
-        info!("Registering workflow from manifest");
+    async fn register_workflow(
+        &self,
+        yaml_manifest: &str,
+        force: bool,
+    ) -> Result<RegisteredWorkflow> {
+        info!("Registering workflow from manifest (force={force})");
 
         // Step 1: Parse YAML → Workflow domain aggregate
         let workflow = WorkflowParser::parse_yaml(yaml_manifest)
@@ -114,6 +123,21 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .version
             .clone()
             .unwrap_or_else(|| "0.1.0".to_string());
+
+        // Step 1b: Check for existing version if force=false
+        if !force {
+            if let Some(existing) = self
+                .workflow_repository
+                .find_by_name(&workflow_name)
+                .await?
+            {
+                if existing.metadata.version == workflow.metadata.version {
+                    anyhow::bail!(
+                        "Workflow '{workflow_name}' with version '{workflow_version}' already exists. Create a new version or use 'force' to overwrite."
+                    );
+                }
+            }
+        }
 
         // Step 2: Map to Temporal definition via anti-corruption layer
         let temporal_definition =
@@ -285,7 +309,7 @@ spec:
         );
 
         let response = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap();
         assert_eq!(response.name, "registration-test-workflow");
@@ -323,7 +347,7 @@ spec:
         );
 
         let err = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
         assert!(err
@@ -342,7 +366,7 @@ spec:
         );
 
         let err = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
         let msg = err.to_string();
@@ -360,7 +384,7 @@ spec:
         );
 
         let err = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
         assert!(err
@@ -380,7 +404,7 @@ spec:
         );
 
         let _ = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
         let stored = repo
@@ -403,7 +427,7 @@ spec:
         );
 
         let _ = service
-            .register_workflow(VALID_WORKFLOW_YAML)
+            .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
         assert!(matches!(events.try_recv(), Err(EventBusError::Empty)));
@@ -417,9 +441,48 @@ spec:
             Arc::new(tokio::sync::RwLock::new(None)),
             Arc::new(EventBus::new(8)),
         );
-        let err = service.register_workflow(&invalid).await.unwrap_err();
+        let err = service
+            .register_workflow(&invalid, false)
+            .await
+            .unwrap_err();
         assert!(err
             .to_string()
             .contains("Failed to parse workflow YAML manifest"));
+    }
+
+    #[tokio::test]
+    async fn register_workflow_fails_for_duplicate_version_without_force() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let event_bus = Arc::new(EventBus::new(8));
+
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                engine.clone() as Arc<dyn WorkflowEnginePort>
+            ))),
+            event_bus,
+        );
+
+        // First registration
+        service
+            .register_workflow(VALID_WORKFLOW_YAML, false)
+            .await
+            .unwrap();
+
+        // Second registration with same version, no force
+        let err = service
+            .register_workflow(VALID_WORKFLOW_YAML, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+        assert!(err.to_string().contains("use 'force' to overwrite"));
+
+        // Third registration with same version, WITH force
+        let response = service
+            .register_workflow(VALID_WORKFLOW_YAML, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status, "registered");
     }
 }

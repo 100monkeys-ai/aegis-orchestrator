@@ -57,7 +57,7 @@ impl AegisClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            bail!("Failed to deploy agent: HTTP {} - {}", status, body);
+            bail!("Failed to deploy agent: HTTP {status} - {body}");
         }
 
         let deployment = response.json().await?;
@@ -83,12 +83,7 @@ impl AegisClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            bail!(
-                "Failed to execute task for agent {}: HTTP {} - {}",
-                agent_id,
-                status,
-                body
-            );
+            bail!("Failed to execute task for agent {agent_id}: HTTP {status} - {body}");
         }
 
         let output = response.json().await?;
@@ -114,12 +109,7 @@ impl AegisClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            bail!(
-                "Failed to get status for agent {}: HTTP {} - {}",
-                agent_id,
-                status,
-                body
-            );
+            bail!("Failed to get status for agent {agent_id}: HTTP {status} - {body}");
         }
 
         let status = response.json().await?;
@@ -177,11 +167,7 @@ impl AegisClient {
                 .text()
                 .await
                 .unwrap_or_else(|_| "<failed to read body>".to_string());
-            bail!(
-                "Text generation request failed with status {}: {}",
-                status,
-                body
-            );
+            bail!("Text generation request failed with status {status}: {body}");
         }
 
         let json: serde_json::Value = response.json().await?;

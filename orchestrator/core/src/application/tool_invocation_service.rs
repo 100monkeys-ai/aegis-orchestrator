@@ -67,6 +67,8 @@ pub struct ToolInvocationService {
     register_workflow_use_case: Option<Arc<dyn RegisterWorkflowUseCase>>,
     /// Optional validation service for semantic stage in workflow authoring tools.
     validation_service: Option<Arc<ValidationService>>,
+    /// Optional workflow repository for managing workflows.
+    workflow_repository: Option<Arc<dyn crate::domain::repository::WorkflowRepository>>,
     /// Optional root directory for persisting generated manifests on disk.
     generated_manifests_root: Option<PathBuf>,
     /// Optional ADR-053 SMCP gateway URL from node config.
@@ -103,6 +105,7 @@ impl ToolInvocationService {
             event_bus,
             register_workflow_use_case: None,
             validation_service: None,
+            workflow_repository: None,
             generated_manifests_root: None,
             smcp_gateway_url,
             schema_registry: Arc::new(SchemaRegistry::build()),
@@ -117,6 +120,14 @@ impl ToolInvocationService {
     ) -> Self {
         self.register_workflow_use_case = Some(register_workflow_use_case);
         self.validation_service = Some(validation_service);
+        self
+    }
+
+    pub fn with_workflow_repository(
+        mut self,
+        workflow_repository: Arc<dyn crate::domain::repository::WorkflowRepository>,
+    ) -> Self {
+        self.workflow_repository = Some(workflow_repository);
         self
     }
 
@@ -655,6 +666,58 @@ impl ToolInvocationService {
             }
             return result;
         }
+        if tool_name == "aegis.agent.update" {
+            let result = self.invoke_aegis_agent_update_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.agent.export" {
+            let result = self.invoke_aegis_agent_export_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
         if tool_name == "aegis.agent.list" {
             let result = self.invoke_aegis_agent_list_tool().await;
             match &result {
@@ -681,9 +744,89 @@ impl ToolInvocationService {
             }
             return result;
         }
-        if tool_name == "aegis.workflow.create_and_validate" {
+        if tool_name == "aegis.workflow.list" {
+            let result = self.invoke_aegis_workflow_list_tool().await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.export" {
+            let result = self.invoke_aegis_workflow_export_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.update" {
             let result = self
-                .invoke_aegis_workflow_create_and_validate_tool(&args, execution_id, *agent_id)
+                .invoke_aegis_workflow_update_tool(&args, execution_id, *agent_id)
+                .await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.create" {
+            let result = self
+                .invoke_aegis_workflow_create_tool(&args, execution_id, *agent_id)
                 .await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
@@ -1086,7 +1229,321 @@ impl ToolInvocationService {
         })))
     }
 
-    async fn invoke_aegis_workflow_create_and_validate_tool(
+    async fn invoke_aegis_agent_update_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.agent.update requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": false,
+                    "updated": false,
+                    "error": format!("Manifest parsing failed: {}", e)
+                })));
+            }
+        };
+
+        if let Err(e) = manifest.validate() {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": false,
+                "updated": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "error": format!("Schema validation failed: {}", e)
+            })));
+        }
+
+        let existing_agent = match self
+            .agent_lifecycle
+            .lookup_agent(&manifest.metadata.name)
+            .await
+        {
+            Ok(Some(id)) => self.agent_lifecycle.get_agent(id).await.ok(),
+            _ => None,
+        };
+
+        let agent_id = match &existing_agent {
+            Some(a) => a.id,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": true,
+                    "updated": false,
+                    "name": manifest.metadata.name,
+                    "error": "Agent not found"
+                })));
+            }
+        };
+
+        // Version check if force=false
+        if !force {
+            if let Some(existing) = existing_agent {
+                if existing.manifest.metadata.version == manifest.metadata.version {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.update",
+                        "validated": true,
+                        "updated": false,
+                        "name": manifest.metadata.name,
+                        "version": manifest.metadata.version,
+                        "error": format!("Agent '{}' with version '{}' already exists. Create a new version or use 'force' to overwrite.", manifest.metadata.name, manifest.metadata.version)
+                    })));
+                }
+            }
+        }
+
+        match self
+            .agent_lifecycle
+            .update_agent(agent_id, manifest.clone())
+            .await
+        {
+            Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": true,
+                "updated": true,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "agent_id": agent_id.0.to_string(),
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": true,
+                "updated": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [format!("Agent update failed: {}", e)]
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_agent_export_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.agent.export requires 'name' string".to_string(),
+            )
+        })?;
+
+        let agent_id = match self.agent_lifecycle.lookup_agent(name).await {
+            Ok(Some(id)) => id,
+            _ => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    crate::domain::agent::AgentId(uuid)
+                } else {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.export",
+                        "error": "Agent not found or invalid UUID"
+                    })));
+                }
+            }
+        };
+
+        match self.agent_lifecycle.get_agent(agent_id).await {
+            Ok(agent) => {
+                let yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.export",
+                    "name": agent.name,
+                    "manifest_yaml": yaml
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.export",
+                "error": format!("Failed to get agent: {}", e)
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_workflow_list_tool(
+        &self,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let repo = match &self.workflow_repository {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.list",
+                    "error": "Workflow repository not configured"
+                })));
+            }
+        };
+
+        let workflows = repo.list_all().await.map_err(|e| {
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list workflows: {e}"))
+        })?;
+
+        let entries: Vec<serde_json::Value> = workflows
+            .iter()
+            .map(|w| {
+                serde_json::json!({
+                    "id": w.id.0.to_string(),
+                    "name": w.metadata.name,
+                    "version": w.metadata.version.clone().unwrap_or_default(),
+                    "initial_state": w.spec.initial_state,
+                })
+            })
+            .collect();
+
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.workflow.list",
+            "count": entries.len(),
+            "workflows": entries
+        })))
+    }
+
+    async fn invoke_aegis_workflow_export_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.workflow.export requires 'name' string".to_string(),
+            )
+        })?;
+
+        let repo = match &self.workflow_repository {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.export",
+                    "error": "Workflow repository not configured"
+                })));
+            }
+        };
+
+        let workflow = match repo.find_by_name(name).await {
+            Ok(Some(w)) => w,
+            _ => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    match repo
+                        .find_by_id(crate::domain::workflow::WorkflowId(uuid))
+                        .await
+                    {
+                        Ok(Some(w)) => w,
+                        _ => {
+                            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                                "tool": "aegis.workflow.export",
+                                "error": "Workflow not found"
+                            })))
+                        }
+                    }
+                } else {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.export",
+                        "error": "Workflow not found or invalid UUID"
+                    })));
+                }
+            }
+        };
+
+        let yaml = serde_yaml::to_string(&workflow).unwrap_or_default();
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.workflow.export",
+            "name": workflow.metadata.name,
+            "manifest_yaml": yaml
+        })))
+    }
+
+    async fn invoke_aegis_workflow_update_tool(
+        &self,
+        args: &Value,
+        _execution_id: crate::domain::execution::ExecutionId,
+        _agent_id: AgentId,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.workflow.update requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
+            Ok(w) => w,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.update",
+                    "updated": false,
+                    "error": format!("Workflow parser validation failed: {}", e),
+                })));
+            }
+        };
+
+        if let Err(e) = WorkflowValidator::check_for_cycles(&workflow) {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.update",
+                "updated": false,
+                "error": format!("Workflow cycle validation failed: {}", e),
+            })));
+        }
+
+        let repo = match &self.workflow_repository {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.update",
+                    "error": "Workflow repository not configured"
+                })));
+            }
+        };
+
+        let _existing = match repo.find_by_name(&workflow.metadata.name).await {
+            Ok(Some(w)) => w,
+            _ => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.update",
+                    "updated": false,
+                    "error": "Workflow not found"
+                })));
+            }
+        };
+
+        let register_workflow_use_case = match &self.register_workflow_use_case {
+            Some(uc) => uc,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.update",
+                    "error": "Workflow registration use case not configured"
+                })));
+            }
+        };
+
+        match register_workflow_use_case
+            .register_workflow(manifest_yaml, force)
+            .await
+        {
+            Ok(meta) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.update",
+                "updated": true,
+                "name": meta.name,
+                "workflow_id": meta.workflow_id
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.update",
+                "updated": false,
+                "error": format!("Workflow update failed: {}", e)
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_workflow_create_tool(
         &self,
         args: &Value,
         execution_id: crate::domain::execution::ExecutionId,
@@ -1097,8 +1554,7 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 SmcpSessionError::SignatureVerificationFailed(
-                    "aegis.workflow.create_and_validate requires 'manifest_yaml' string"
-                        .to_string(),
+                    "aegis.workflow.create requires 'manifest_yaml' string".to_string(),
                 )
             })?;
 
@@ -1117,11 +1573,13 @@ impl ToolInvocationService {
             .and_then(|v| v.as_f64())
             .unwrap_or(0.7);
 
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
         let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
             Ok(w) => w,
             Err(e) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                    "tool": "aegis.workflow.create_and_validate",
+                    "tool": "aegis.workflow.create",
                     "deterministic_validation": {
                         "passed": false,
                         "error": format!("Workflow parser validation failed: {}", e),
@@ -1134,7 +1592,7 @@ impl ToolInvocationService {
 
         if let Err(e) = WorkflowValidator::check_for_cycles(&workflow) {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.create_and_validate",
+                "tool": "aegis.workflow.create",
                 "deterministic_validation": {
                     "passed": false,
                     "error": format!("Workflow cycle validation failed: {}", e),
@@ -1168,7 +1626,7 @@ impl ToolInvocationService {
 
         if judge_names.is_empty() {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.create_and_validate",
+                "tool": "aegis.workflow.create",
                 "deterministic_validation": {"passed": true},
                 "semantic_validation": {
                     "passed": false,
@@ -1209,7 +1667,7 @@ impl ToolInvocationService {
             content: manifest_yaml.to_string(),
             criteria,
             context: Some(serde_json::json!({
-                "validation_context": "workflow_create_and_validate",
+                "validation_context": "workflow_create",
                 "workflow_name": workflow.metadata.name,
                 "state_count": workflow.spec.states.len(),
             })),
@@ -1245,7 +1703,7 @@ impl ToolInvocationService {
 
         if !semantic_passed {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.create_and_validate",
+                "tool": "aegis.workflow.create",
                 "deterministic_validation": {"passed": true},
                 "semantic_validation": {
                     "passed": false,
@@ -1262,7 +1720,7 @@ impl ToolInvocationService {
         }
 
         match register_workflow_use_case
-            .register_workflow(manifest_yaml)
+            .register_workflow(manifest_yaml, force)
             .await
         {
             Ok(registered) => {
@@ -1279,7 +1737,7 @@ impl ToolInvocationService {
                         ))
                     })?;
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
-                    "tool": "aegis.workflow.create_and_validate",
+                    "tool": "aegis.workflow.create",
                     "deterministic_validation": {"passed": true},
                     "semantic_validation": {
                         "passed": true,
@@ -1298,7 +1756,7 @@ impl ToolInvocationService {
                 })))
             }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.create_and_validate",
+                "tool": "aegis.workflow.create",
                 "deterministic_validation": {"passed": true},
                 "semantic_validation": {
                     "passed": true,

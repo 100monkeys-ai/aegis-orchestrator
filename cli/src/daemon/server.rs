@@ -801,18 +801,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     if !builtin_dispatchers
         .iter()
-        .any(|d| d.name == "aegis.workflow.create_and_validate")
+        .any(|d| d.name == "aegis.workflow.create")
     {
         builtin_dispatchers.push(
             aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
-                name: "aegis.workflow.create_and_validate".to_string(),
+                name: "aegis.workflow.create".to_string(),
                 description:
                     "Performs strict deterministic and semantic workflow validation, then registers on pass."
                         .to_string(),
                 enabled: true,
                 capabilities: vec![
                     aegis_orchestrator_core::domain::node_config::CapabilityConfig {
-                        name: "aegis.workflow.create_and_validate".to_string(),
+                        name: "aegis.workflow.create".to_string(),
                         skip_judge: false,
                     },
                 ],
@@ -1073,6 +1073,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             register_workflow_use_case.clone(),
             validation_service.clone(),
         )
+        .with_workflow_repository(workflow_repo.clone())
         .with_generated_manifests_root(generated_artifacts_root.clone()),
     );
     println!(
@@ -1272,7 +1273,7 @@ async fn register_temporal_workflow_handler(
 ) -> impl IntoResponse {
     match state
         .register_workflow_use_case
-        .register_workflow(&body)
+        .register_workflow(&body, false)
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
