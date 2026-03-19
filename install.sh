@@ -135,7 +135,7 @@ elif [[ "$PLATFORM" == "linux" ]]; then
     fi
     info "Installing Docker Engine..."
     sudo apt-get update -qq
-    sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg lsb-release
+    sudo apt-get install -y --no-install-recommends gnupg lsb-release
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
         | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -191,7 +191,12 @@ if [[ "$CURRENT_AEGIS_VERSION" == "$AEGIS_VERSION" ]]; then
     success "aegis $AEGIS_VERSION already installed. Skipping cargo install."
 else
     info "Installing aegis-orchestrator CLI via cargo (version: $AEGIS_VERSION)..."
-    cargo install aegis-orchestrator --version "$AEGIS_VERSION"
+    if ! cargo install aegis-orchestrator --version "$AEGIS_VERSION"; then
+        info "Failed to install aegis-orchestrator version $AEGIS_VERSION. Attempting to install latest version instead..."
+        if ! cargo install aegis-orchestrator; then
+            die "Unable to install aegis-orchestrator. Both version $AEGIS_VERSION and latest version failed. Please check your network connection and cargo configuration."
+        fi
+    fi
     success "aegis installed: $(aegis --version)"
 fi
 
@@ -206,7 +211,7 @@ fi
 # which shell the user opens next.
 _add_cargo_to_rc() {
     local rc="$1"
-    if [[ -f "$rc" ]] && ! grep -q 'cargo/bin' "$rc" 2>/dev/null; then
+    if [[ -f "$rc" ]] && ! grep -q '# Added by AEGIS installer' "$rc" 2>/dev/null; then
         echo '' >> "$rc"
         echo '# Added by AEGIS installer' >> "$rc"
         echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> "$rc"
