@@ -40,7 +40,10 @@ dashmap = "6"
 bollard.workspace = true
 sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
 tracing.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 axum.workspace = true
+tower.workspace = true
 tokio-stream = "0.1.18"
 tokio-util = "0.7"
 tower-http.workspace = true

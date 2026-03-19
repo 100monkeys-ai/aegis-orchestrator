@@ -75,7 +75,11 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
 
         // No existing agent with this name — create a fresh one
         let agent = Agent::new(manifest);
+        let agent_name = agent.manifest.metadata.name.clone();
         self.repository.save(&agent).await?;
+
+        metrics::counter!("agent_deploy_total", "name" => agent_name).increment(1);
+
         Ok(agent.id)
     }
 
@@ -95,6 +99,9 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
 
     async fn delete_agent(&self, id: AgentId) -> Result<()> {
         self.repository.delete(id).await?;
+
+        metrics::counter!("agent_delete_total", "id" => id.0.to_string()).increment(1);
+
         Ok(())
     }
 

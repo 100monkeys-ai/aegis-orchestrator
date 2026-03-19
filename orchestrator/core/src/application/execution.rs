@@ -291,6 +291,10 @@ struct ExecutionMonitor {
 impl SupervisorObserver for ExecutionMonitor {
     async fn on_iteration_start(&self, iteration: u8, action: &str) {
         let now = Utc::now();
+
+        metrics::counter!("execution_iteration_total", "agent_id" => self.agent_id.0.to_string())
+            .increment(1);
+
         // Update DB
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
             {
@@ -582,6 +586,11 @@ impl ExecutionService for StandardExecutionService {
                 agent_id,
                 started_at: Utc::now(),
             });
+
+        metrics::counter!("execution_start_total", "agent_id" => agent_id.0.to_string())
+            .increment(1);
+        metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
+            .increment(1.0);
 
         // 4. Spawn Runtime
         let mut env = agent.manifest.spec.env.clone();
@@ -900,6 +909,7 @@ impl ExecutionService for StandardExecutionService {
             .insert(execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
         let cortex_client = self.cortex_client.clone();
+        let start_time = Utc::now();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -912,6 +922,13 @@ impl ExecutionService for StandardExecutionService {
                     validation_pipeline,
                 )
                 .await;
+
+            let duration = Utc::now() - start_time;
+            let duration_seconds = duration.num_milliseconds() as f64 / 1000.0;
+            metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
+                .decrement(1.0);
+            metrics::histogram!("execution_duration_seconds", "agent_id" => agent_id.0.to_string())
+                .record(duration_seconds);
 
             // Clean up the token from the map now that the execution is done
             tokens_map.remove(&execution_id);
@@ -1122,6 +1139,11 @@ impl ExecutionService for StandardExecutionService {
                 agent_id,
                 started_at: Utc::now(),
             });
+
+        metrics::counter!("execution_start_total", "agent_id" => agent_id.0.to_string())
+            .increment(1);
+        metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
+            .increment(1.0);
 
         // 5. Build runtime config.
         let mut env = agent.manifest.spec.env.clone();

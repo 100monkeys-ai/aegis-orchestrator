@@ -131,6 +131,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .validate()
         .context("Configuration validation failed")?;
 
+    // Initialize metrics if enabled (ADR-058 Step 2)
+    if config
+        .spec
+        .observability
+        .as_ref()
+        .and_then(|o| o.metrics.as_ref())
+        .map(|m| m.enabled)
+        .unwrap_or(false)
+    {
+        let metrics_cfg = config
+            .spec
+            .observability
+            .as_ref()
+            .unwrap()
+            .metrics
+            .as_ref()
+            .unwrap();
+        let region = config.spec.node.region.as_deref();
+        let version = env!("CARGO_PKG_VERSION");
+
+        aegis_orchestrator_core::infrastructure::telemetry::init_metrics(
+            metrics_cfg.port,
+            &config.spec.node.id,
+            &config.metadata.name,
+            region,
+            version,
+        )
+        .context("Failed to initialize metrics")?;
+        println!(
+            "✓ Metrics exporter initialized on port {}",
+            metrics_cfg.port
+        );
+    }
+
     if let Some(smcp_gateway) = &config.spec.smcp_gateway {
         let resolved_url =
             resolve_env_value(&smcp_gateway.url).unwrap_or_else(|_| smcp_gateway.url.clone());

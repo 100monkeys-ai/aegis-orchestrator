@@ -467,7 +467,7 @@ pub struct LoggingConfig {
     pub file: Option<String>,
 
     /// OTLP collector endpoint.
-    /// E.g. "http://localhost:4317" or "https://otlp.datadoghq.com"
+    /// E.g. "http://localhost:4317" or "<https://otlp.datadoghq.com>"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub otlp_endpoint: Option<String>,
 
@@ -1227,7 +1227,7 @@ fn default_log_format() -> String {
 }
 
 fn default_metrics_port() -> u16 {
-    9090
+    9091
 }
 
 fn default_metrics_path() -> String {

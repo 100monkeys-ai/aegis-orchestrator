@@ -35,12 +35,14 @@ use crate::domain::execution::ExecutionInput;
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::smcp_session::SmcpSessionError;
 use crate::infrastructure::event_bus::EventBus;
+use crate::presentation::metrics_middleware::metrics_middleware;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
 use crate::presentation::webhook_guard::{
     EnvWebhookSecretProvider, WebhookHmacState, WebhookSecretProvider,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
+    middleware,
     response::{IntoResponse, Sse},
     routing::{get, post},
     Json, Router,
@@ -115,6 +117,7 @@ pub fn app(
             "/v1/workflows/executions/:id/logs/stream",
             get(stream_workflow_execution_logs),
         )
+        .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
 }
 
@@ -158,6 +161,7 @@ pub fn app_with_inner_loop(
             "/v1/workflows/executions/:id/logs/stream",
             get(stream_workflow_execution_logs),
         )
+        .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
 }
 

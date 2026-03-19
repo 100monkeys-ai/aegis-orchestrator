@@ -56,6 +56,7 @@ pub mod sensor;
 pub mod smcp;
 pub mod smcp_gateway_proto;
 pub mod storage;
+pub mod telemetry;
 pub mod temporal_client;
 pub mod temporal_event_listener;
 pub mod temporal_proto;

@@ -253,6 +253,8 @@ spec:
     metrics:
       # Enable Prometheus metrics endpoint (/metrics)
       enabled: true
+      port: 9091
+      path: "/metrics"
     
     tracing:
       # Enable distributed tracing

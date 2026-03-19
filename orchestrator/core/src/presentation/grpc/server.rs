@@ -26,6 +26,7 @@ const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 500;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
+use crate::presentation::metrics_middleware::GrpcMetricsLayer;
 
 // Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
 // so that both the server and the CortexGrpcClient client share the same Rust types.
@@ -935,6 +936,7 @@ pub async fn start_grpc_server(
     tracing::info!("Starting AEGIS gRPC server on {}", addr);
 
     tonic::transport::Server::builder()
+        .layer(GrpcMetricsLayer)
         .add_service(server)
         .serve(addr)
         .await?;

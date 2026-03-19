@@ -54,6 +54,8 @@ dotenvy = "0.15"
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
 opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
