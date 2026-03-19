@@ -156,6 +156,13 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError>;
+
+    /// List workflow executions paginated (newest first)
+    async fn list_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
 }
 
 /// Repository interface for Volume aggregates

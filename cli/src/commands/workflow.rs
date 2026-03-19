@@ -128,6 +128,30 @@ pub enum WorkflowCommand {
         #[arg(short, long)]
         follow: bool,
     },
+
+    /// Manage workflow executions
+    Executions {
+        #[command(subcommand)]
+        command: ExecutionsCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ExecutionsCommand {
+    /// List recent workflow executions
+    List {
+        /// Maximum number of results to return
+        #[arg(long, default_value = "20")]
+        limit: usize,
+
+        /// Filter by workflow UUID
+        #[arg(long, value_name = "UUID")]
+        workflow_id: Option<Uuid>,
+
+        /// Show detailed information (current state, timestamps)
+        #[arg(long, short = 'l')]
+        long: bool,
+    },
 }
 
 pub async fn handle_command(
@@ -159,6 +183,23 @@ pub async fn handle_command(
         WorkflowCommand::Generate { input, follow } => {
             generate_workflow(input, follow, host, port, config_path.as_ref()).await
         }
+        WorkflowCommand::Executions { command } => {
+            handle_executions_command(command, host, port).await
+        }
+    }
+}
+
+async fn handle_executions_command(
+    command: ExecutionsCommand,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    match command {
+        ExecutionsCommand::List {
+            limit,
+            workflow_id,
+            long,
+        } => list_workflow_executions(limit, workflow_id, long, host, port).await,
     }
 }
 
@@ -493,6 +534,85 @@ async fn list_workflows(long: bool, labels: Vec<String>, host: &str, port: u16) 
             println!();
         } else {
             println!("• {}", name.green());
+        }
+    }
+
+    Ok(())
+}
+
+/// List recent workflow executions
+async fn list_workflow_executions(
+    limit: usize,
+    workflow_id: Option<Uuid>,
+    long: bool,
+    host: &str,
+    port: u16,
+) -> Result<()> {
+    let daemon_status = check_daemon_running(host, port).await;
+    match daemon_status {
+        Ok(DaemonStatus::Running { .. }) => {}
+        _ => {
+            println!(
+                "{}",
+                "Listing workflow executions requires the daemon to be running.".red()
+            );
+            println!("Run 'aegis daemon start' to start the daemon.");
+            return Ok(());
+        }
+    }
+
+    let client = DaemonClient::new(host, port)?;
+    let executions = client
+        .list_workflow_executions(limit, workflow_id)
+        .await
+        .context("Failed to list workflow executions")?;
+
+    if executions.is_empty() {
+        println!("{}", "No workflow executions found.".yellow());
+        println!();
+        println!("Run a workflow with:");
+        println!("  aegis workflow run <name>");
+        return Ok(());
+    }
+
+    println!("{}", "📋 Workflow Executions".cyan().bold());
+    println!();
+
+    for execution in executions {
+        let execution_id = execution
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let status = execution
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let status_display = match status {
+            "running" => status.green(),
+            "completed" => status.cyan(),
+            "failed" => status.red(),
+            "cancelled" => status.yellow(),
+            _ => status.normal(),
+        };
+
+        if long {
+            println!("{}", format!("• {execution_id}").bold());
+            if let Some(wid) = execution.get("workflow_id").and_then(|v| v.as_str()) {
+                println!("  Workflow:     {wid}");
+            }
+            println!("  Status:       {status_display}");
+            if let Some(state) = execution.get("current_state").and_then(|v| v.as_str()) {
+                println!("  State:        {state}");
+            }
+            if let Some(started) = execution.get("started_at").and_then(|v| v.as_str()) {
+                println!("  Started:      {started}");
+            }
+            if let Some(updated) = execution.get("last_transition_at").and_then(|v| v.as_str()) {
+                println!("  Last updated: {updated}");
+            }
+            println!();
+        } else {
+            println!("• {}  [{}]", execution_id.green(), status_display);
         }
     }
 

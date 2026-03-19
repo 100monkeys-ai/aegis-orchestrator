@@ -638,6 +638,14 @@ mod tests {
         {
             Ok(vec![])
         }
+
+        async fn list_paginated(
+            &self,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
+        }
     }
 
     #[tokio::test]

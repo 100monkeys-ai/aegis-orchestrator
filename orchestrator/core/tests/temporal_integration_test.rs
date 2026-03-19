@@ -115,6 +115,13 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     > {
         Ok(vec![])
     }
+    async fn list_paginated(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
 }
 
 // NOTE: This is a full Temporal integration test that may require external services
@@ -170,4 +177,3 @@ states:
         start_result.expect("Failed to start workflow execution in temporal integration test");
     assert_eq!(exec.workflow_id, reg.workflow_id);
 }
-

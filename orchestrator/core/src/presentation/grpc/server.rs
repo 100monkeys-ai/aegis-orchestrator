@@ -318,7 +318,8 @@ impl AegisRuntime for AegisRuntimeService {
 
         // Execute with timeout
         let timeout = std::time::Duration::from_secs(
-            req.timeout_seconds.unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS as i32) as u64,
+            req.timeout_seconds
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS as u32) as u64,
         );
 
         match tokio::time::timeout(timeout, cmd.output()).await {
@@ -418,8 +419,8 @@ impl AegisRuntime for AegisRuntimeService {
                 validation_req,
                 judge_configs,
                 consensus_config,
-                DEFAULT_VALIDATION_TIMEOUT_SECS,       // 60 second timeout
-                DEFAULT_VALIDATION_POLL_INTERVAL_MS,   // 500ms poll interval
+                DEFAULT_VALIDATION_TIMEOUT_SECS, // 60 second timeout
+                DEFAULT_VALIDATION_POLL_INTERVAL_MS, // 500ms poll interval
             )
             .await
         {

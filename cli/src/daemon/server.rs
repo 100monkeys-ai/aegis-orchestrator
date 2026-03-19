@@ -26,10 +26,7 @@ use axum::{
 fn final_output_from_execution(
     execution: &aegis_orchestrator_core::domain::execution::Execution,
 ) -> Option<String> {
-    execution
-        .iterations()
-        .last()
-        .and_then(|i| i.output.clone())
+    execution.iterations().last().and_then(|i| i.output.clone())
 }
 
 use std::sync::Arc;
@@ -1580,6 +1577,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         register_workflow_use_case,
         start_workflow_execution_use_case,
         workflow_repo: workflow_repo.clone(),
+        workflow_execution_repo: workflow_execution_repo.clone(),
         temporal_client_container: temporal_client_container.clone(),
         tool_invocation_service: tool_invocation_service.clone(),
         attestation_service: attestation_service.clone(),
@@ -1928,6 +1926,10 @@ fn create_router(app_state: Arc<AppState>) -> Router {
             post(execute_temporal_workflow_handler),
         )
         .route(
+            "/v1/workflows/executions",
+            get(list_workflow_executions_handler),
+        )
+        .route(
             "/v1/workflows/executions/{execution_id}",
             get(get_workflow_execution_handler),
         )
@@ -1971,6 +1973,8 @@ struct AppState {
     register_workflow_use_case: Arc<StandardRegisterWorkflowUseCase>,
     start_workflow_execution_use_case: Arc<StandardStartWorkflowExecutionUseCase>,
     workflow_repo: Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowRepository>,
+    workflow_execution_repo:
+        Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository>,
     temporal_client_container: Arc<
         tokio::sync::RwLock<
             Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
@@ -2851,6 +2855,49 @@ async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl Into
         .collect();
 
     (StatusCode::OK, Json(workflow_list))
+}
+
+/// GET /v1/workflows/executions - List workflow executions (paginated, newest first)
+async fn list_workflow_executions_handler(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let limit = params
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+    let offset = params
+        .get("offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+
+    match state
+        .workflow_execution_repo
+        .list_paginated(limit, offset)
+        .await
+    {
+        Ok(executions) => {
+            let list: Vec<serde_json::Value> = executions
+                .iter()
+                .map(|e| {
+                    serde_json::json!({
+                        "execution_id": e.id.0,
+                        "workflow_id": e.workflow_id.0,
+                        "status": format!("{:?}", e.status).to_lowercase(),
+                        "current_state": e.current_state.as_str(),
+                        "started_at": e.started_at,
+                        "last_transition_at": e.last_transition_at,
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(list)).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
 }
 
 /// GET /v1/workflows/:name - Get workflow YAML

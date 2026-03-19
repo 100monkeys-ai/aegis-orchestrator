@@ -680,6 +680,37 @@ impl DaemonClient {
         Ok(workflows)
     }
 
+    /// List workflow executions (paginated, newest first)
+    pub async fn list_workflow_executions(
+        &self,
+        limit: usize,
+        workflow_id: Option<uuid::Uuid>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut url = format!("{}/v1/workflows/executions?limit={}", self.base_url, limit);
+        if let Some(wid) = workflow_id {
+            url.push_str(&format!("&workflow_id={wid}"));
+        }
+
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to list workflow executions")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list workflow executions: {error_text}");
+        }
+
+        let executions: Vec<serde_json::Value> = response
+            .json()
+            .await
+            .context("Failed to parse workflow executions response")?;
+
+        Ok(executions)
+    }
+
     /// Describe a workflow (get YAML definition)
     pub async fn describe_workflow(&self, name: &str) -> Result<String> {
         let response = self

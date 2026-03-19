@@ -389,6 +389,17 @@ impl crate::domain::repository::WorkflowExecutionRepository
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn list_paginated(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut list: Vec<_> = executions.values().cloned().collect();
+        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(list.into_iter().skip(offset).take(limit).collect())
+    }
 }
 
 // ============================================================================
