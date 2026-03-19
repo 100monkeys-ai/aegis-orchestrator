@@ -82,6 +82,14 @@ Lightweight binary for hybrid cloud/on-prem deployments.
 
 ## Quick Start
 
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
+```
+
+This installs system dependencies, Docker, the Rust toolchain, and the `aegis` CLI via `cargo install`, then brings the local stack online with `aegis up`. Re-running is idempotent.
+
 ### Prerequisites
 
 - Rust 1.75+
