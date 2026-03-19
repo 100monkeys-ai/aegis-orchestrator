@@ -192,9 +192,9 @@ if [[ "$CURRENT_AEGIS_VERSION" == "$AEGIS_VERSION" ]]; then
 else
     info "Installing aegis-orchestrator CLI via cargo (version: $AEGIS_VERSION)..."
     if ! cargo install aegis-orchestrator --version "$AEGIS_VERSION"; then
-        info "Failed to install aegis-orchestrator version $AEGIS_VERSION. Falling back to latest published version..."
+        info "Failed to install aegis-orchestrator version $AEGIS_VERSION. Attempting to install latest version instead..."
         if ! cargo install aegis-orchestrator; then
-            die "Unable to install aegis-orchestrator (requested version: $AEGIS_VERSION). Please check that the version exists on crates.io or try again later."
+            die "Unable to install aegis-orchestrator. Both version $AEGIS_VERSION and latest version failed. Please check your network connection and cargo configuration."
         fi
     fi
     success "aegis installed: $(aegis --version)"
