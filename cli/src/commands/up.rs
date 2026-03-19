@@ -43,6 +43,13 @@ pub struct UpArgs {
     #[arg(long)]
     pub yes: bool,
 
+    /// Image tag for AEGIS-owned Docker images.
+    /// Defaults to the version of this binary.
+    /// Pass `latest` to track the most recent build, or a semver tag such as
+    /// `v0.10.0` to pin to a specific release.
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    pub tag: String,
+
     /// Start only services in this Docker Compose profile
     #[arg(long)]
     pub profile: Option<String>,
@@ -80,6 +87,7 @@ pub async fn run(args: UpArgs) -> Result<()> {
             dir: args.dir.clone(),
             host: args.host.clone(),
             port: args.port,
+            tag: args.tag.clone(),
             advanced_override,
         })
         .await?;

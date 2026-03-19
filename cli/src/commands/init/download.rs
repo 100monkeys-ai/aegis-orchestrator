@@ -30,13 +30,17 @@ pub struct StackFiles {
 }
 
 /// Load stack files from bundled templates.
-pub async fn fetch_stack() -> Result<StackFiles> {
+///
+/// `tag` — Docker image tag substituted into all `{{AEGIS_IMAGE_TAG}}` placeholders
+/// in the compose template (e.g. `"0.11.0-pre-alpha"` or `"latest"`).
+pub async fn fetch_stack(tag: &str) -> Result<StackFiles> {
     println!();
     println!("{}", "Loading bundled stack templates...".bold());
+    println!("  {} Using AEGIS image tag: {}", "✓".green(), tag);
     println!("  {} Stack files ready", "✓".green());
 
     Ok(StackFiles {
-        docker_compose: DOCKER_COMPOSE_TEMPLATE.to_string(),
+        docker_compose: DOCKER_COMPOSE_TEMPLATE.replace("{{AEGIS_IMAGE_TAG}}", tag),
         init_db_script: INIT_DB_SCRIPT_TEMPLATE.to_string(),
         runtime_registry: RUNTIME_REGISTRY_TEMPLATE.to_string(),
         temporal_dynamic_config: TEMPORAL_DYNAMIC_CONFIG_TEMPLATE.to_string(),

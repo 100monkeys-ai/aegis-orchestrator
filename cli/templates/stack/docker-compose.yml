@@ -84,7 +84,7 @@ services:
 
   # AEGIS Temporal Worker (TypeScript)
   temporal-worker:
-    image: ghcr.io/100monkeys-ai/aegis-temporal-worker:latest
+    image: ghcr.io/100monkeys-ai/aegis-temporal-worker:{{AEGIS_IMAGE_TAG}}
     container_name: aegis-temporal-worker
     profiles: [temporal]
     depends_on:
@@ -113,7 +113,7 @@ services:
 
   # AEGIS Runtime Service (Rust gRPC Server)
   aegis-runtime:
-    image: ghcr.io/100monkeys-ai/aegis-runtime:latest
+    image: ghcr.io/100monkeys-ai/aegis-runtime:{{AEGIS_IMAGE_TAG}}
     # build:
     #   context: ../../aegis-orchestrator
     #   dockerfile: docker/Dockerfile.runtime
@@ -172,7 +172,7 @@ services:
   # ============================================================================
 
   aegis-smcp-gateway:
-    image: ghcr.io/100monkeys-ai/aegis-smcp-gateway:latest
+    image: ghcr.io/100monkeys-ai/aegis-smcp-gateway:{{AEGIS_IMAGE_TAG}}
     container_name: aegis-smcp-gateway
     profiles: [smcp-gateway]
     depends_on:

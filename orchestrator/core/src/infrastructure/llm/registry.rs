@@ -468,6 +468,7 @@ mod tests {
                 iam: None,
                 grpc_auth: None,
                 smcp_gateway: None,
+                image_tag: None,
             },
         };
 

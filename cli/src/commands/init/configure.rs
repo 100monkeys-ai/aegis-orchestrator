@@ -91,6 +91,7 @@ impl ConfigWizard {
     /// and `runtime-registry.yaml` to the working directory.
     pub fn configure(
         &self,
+        tag: &str,
         components: &SelectedComponents,
         compose_content: &str,
         runtime_registry_content: &str,
@@ -196,7 +197,7 @@ impl ConfigWizard {
             .with_context(|| format!("Failed to create directory {}", working_dir.display()))?;
         ensure_local_volumes_dir_permissions(&working_dir)?;
 
-        let aegis_config_content = self.render_aegis_config(&node_config, components);
+        let aegis_config_content = self.render_aegis_config(&node_config, components, tag);
         let env_content = self.render_env(&node_config, components)?;
 
         std::fs::write(&config_path, &aegis_config_content)
@@ -467,6 +468,7 @@ impl ConfigWizard {
         &self,
         config: &NodeConfig,
         components: &SelectedComponents,
+        tag: &str,
     ) -> String {
         let (base_provider_section, default_provider) = match &components.llm {
             LlmChoice::Ollama => (
@@ -893,6 +895,7 @@ spec:
     id: "{node_id}"
     type: "{node_type}"
 
+  image_tag: "{image_tag}"
 {llm_section}
 {builtin_dispatchers_section}
   runtime:
@@ -914,6 +917,7 @@ spec:
             bind_address = config.advanced.bind_address,
             api_port = config.advanced.api_port,
             log_level = config.advanced.log_level,
+            image_tag = tag,
             llm_section = llm_section,
             builtin_dispatchers_section = builtin_dispatchers_section,
             database_section = database_section,

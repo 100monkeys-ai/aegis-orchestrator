@@ -67,6 +67,13 @@ pub struct InitArgs {
     #[arg(long, default_value = "8088")]
     pub port: u16,
 
+    /// Image tag for AEGIS-owned Docker images.
+    /// Defaults to the version of this binary.
+    /// Pass `latest` to track the most recent build, or a semver tag such as
+    /// `v0.10.0` to pin to a specific release.
+    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
+    pub tag: String,
+
     /// Internal override for whether to run the advanced walkthrough.
     /// `None` keeps the normal interactive prompt behavior.
     #[arg(skip = None)]
@@ -91,12 +98,13 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     // ─── Step 3: Prepare stack templates ──────────────────────────────────────
     print_step(3, 7, "Preparing stack files");
-    let stack = fetch_stack().await?;
+    let stack = fetch_stack(&args.tag).await?;
 
     // ─── Step 4: Configure node ───────────────────────────────────────────────
     print_step(4, 7, "Configuring node");
     let wizard = ConfigWizard::new(args.yes, dir.clone(), args.advanced_override);
     let node_config = wizard.configure(
+        &args.tag,
         &components,
         &stack.docker_compose,
         &stack.runtime_registry,

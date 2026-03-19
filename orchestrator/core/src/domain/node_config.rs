@@ -87,6 +87,12 @@ pub struct NodeConfigSpec {
     /// Node identity and capabilities
     pub node: NodeIdentity,
 
+    /// Image tag for AEGIS-owned Docker images (e.g. `"0.11.0-pre-alpha"`).
+    /// Written by `aegis init --tag <TAG>` and updated by `aegis update`.
+    /// Defaults to `env!("CARGO_PKG_VERSION")` when absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_tag: Option<String>,
+
     /// LLM provider configurations
     #[serde(default)]
     pub llm_providers: Vec<LLMProviderConfig>,
@@ -1254,6 +1260,7 @@ impl Default for NodeConfigSpec {
             iam: None,
             grpc_auth: None,
             smcp_gateway: None,
+            image_tag: None,
         }
     }
 }
@@ -1634,6 +1641,7 @@ mod tests {
                 iam: None,
                 grpc_auth: None,
                 smcp_gateway: None,
+                image_tag: None,
             },
         };
 

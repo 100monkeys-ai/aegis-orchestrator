@@ -26,6 +26,7 @@ use colored::Colorize;
 use sqlx::postgres::PgPoolOptions;
 
 use super::init::compose::ComposeRunner;
+use super::init::download::fetch_stack;
 
 #[derive(Args)]
 pub struct UpdateCommand {
@@ -52,6 +53,12 @@ pub struct UpdateCommand {
     /// Preview what would happen without making any changes
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Image tag for AEGIS-owned Docker images.
+    /// If not set, reads `spec.image_tag` from the node config.
+    /// Falls back to the version of this binary if neither is present.
+    #[arg(long)]
+    pub tag: Option<String>,
 }
 
 pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result<()> {
@@ -69,6 +76,33 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
             "No docker-compose.yml found in {}.\nHave you run `aegis init`?",
             dir.display()
         );
+    }
+
+    // ─── Resolve image tag ────────────────────────────────────────────────────
+    let config_file_path = config_path
+        .clone()
+        .unwrap_or_else(|| dir.join("aegis-config.yaml"));
+    let image_tag: String = cmd.tag.clone().unwrap_or_else(|| {
+        NodeConfigManifest::load_or_default(Some(config_file_path.clone()))
+            .ok()
+            .and_then(|c| c.spec.image_tag)
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    });
+    println!();
+    println!("  {} Targeting image tag: {}", "→".cyan(), image_tag.bold());
+
+    // ─── Rewrite docker-compose.yml with resolved tag ─────────────────────────
+    let stack = fetch_stack(&image_tag).await?;
+    if cmd.dry_run {
+        println!(
+            "  {} would rewrite docker-compose.yml with tag: {}",
+            "→".dimmed(),
+            image_tag
+        );
+    } else {
+        std::fs::write(dir.join("docker-compose.yml"), &stack.docker_compose)
+            .context("Failed to rewrite docker-compose.yml")?;
+        println!("  {} docker-compose.yml updated", "✓".green());
     }
 
     // ─── Step 1: Pull latest images ───────────────────────────────────────────
@@ -209,6 +243,29 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
             "{}",
             "[4/4] Re-deploying built-in templates... skipped".dimmed()
         );
+    }
+
+    // ─── Persist updated image_tag in node config ─────────────────────────────
+    println!();
+    if cmd.dry_run {
+        println!(
+            "  {} would update spec.image_tag to: {}",
+            "→".dimmed(),
+            image_tag
+        );
+    } else if config_file_path.exists() {
+        let raw = std::fs::read_to_string(&config_file_path)
+            .context("Failed to read aegis-config.yaml")?;
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(&raw).context("Failed to parse aegis-config.yaml")?;
+        if let Some(spec) = value.get_mut("spec") {
+            spec["image_tag"] = serde_yaml::Value::String(image_tag.clone());
+        }
+        let updated =
+            serde_yaml::to_string(&value).context("Failed to serialize updated config")?;
+        std::fs::write(&config_file_path, updated)
+            .context("Failed to write updated aegis-config.yaml")?;
+        println!("  {} spec.image_tag updated to: {}", "✓".green(), image_tag);
     }
 
     // ─── Done ─────────────────────────────────────────────────────────────────
