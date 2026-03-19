@@ -465,6 +465,123 @@ pub struct LoggingConfig {
     /// Log file path (optional, defaults to stdout)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file: Option<String>,
+
+    /// OTLP collector endpoint.
+    /// E.g. "http://localhost:4317" or "https://otlp.datadoghq.com"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
+
+    /// OTLP protocol. Defaults to `grpc`.
+    #[serde(default)]
+    pub otlp_protocol: OtlpProtocol,
+
+    /// Static headers to inject into OTLP requests (e.g. for API keys).
+    #[serde(default)]
+    pub otlp_headers: std::collections::BTreeMap<String, String>,
+
+    /// Minimum log level to export to OTLP. Defaults to "info".
+    /// Local file/stdout logging retains its own level control.
+    #[serde(default = "default_log_level")]
+    pub min_level: String,
+
+    /// Override the default service name ("aegis-orchestrator").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    /// Batch processing configuration.
+    #[serde(default)]
+    pub batch: OtlpBatchConfig,
+
+    /// TLS configuration for the OTLP exporter.
+    #[serde(default)]
+    pub tls: OtlpTlsConfig,
+}
+
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self {
+            level: default_log_level(),
+            format: default_log_format(),
+            file: None,
+            otlp_endpoint: None,
+            otlp_protocol: OtlpProtocol::default(),
+            otlp_headers: std::collections::BTreeMap::new(),
+            min_level: default_log_level(),
+            service_name: None,
+            batch: OtlpBatchConfig::default(),
+            tls: OtlpTlsConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum OtlpProtocol {
+    #[default]
+    Grpc,
+    Http,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtlpBatchConfig {
+    /// Maximum number of log records held in memory before the oldest are dropped.
+    #[serde(default = "default_otlp_queue_size")]
+    pub max_queue_size: usize,
+    /// How often the background exporter flushes the batch (milliseconds).
+    #[serde(default = "default_otlp_scheduled_delay_ms")]
+    pub scheduled_delay_ms: u64,
+    /// Max batch size in log records. Default: 512.
+    #[serde(default = "default_otlp_max_export_batch_size")]
+    pub max_export_batch_size: usize,
+    /// Batch export timeout in milliseconds. Default: 10000.
+    #[serde(default = "default_otlp_export_timeout_ms")]
+    pub export_timeout_ms: u64,
+}
+
+impl Default for OtlpBatchConfig {
+    fn default() -> Self {
+        Self {
+            max_queue_size: default_otlp_queue_size(),
+            scheduled_delay_ms: default_otlp_scheduled_delay_ms(),
+            max_export_batch_size: default_otlp_max_export_batch_size(),
+            export_timeout_ms: default_otlp_export_timeout_ms(),
+        }
+    }
+}
+
+fn default_otlp_queue_size() -> usize {
+    2048
+}
+
+fn default_otlp_scheduled_delay_ms() -> u64 {
+    5000
+}
+
+fn default_otlp_max_export_batch_size() -> usize {
+    512
+}
+
+fn default_otlp_export_timeout_ms() -> u64 {
+    10000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OtlpTlsConfig {
+    /// Verify the collector's TLS certificate. Default: true.
+    #[serde(default = "default_true")]
+    pub verify: bool,
+    /// Path to custom CA certificate PEM file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ca_cert_path: Option<PathBuf>,
+}
+
+impl Default for OtlpTlsConfig {
+    fn default() -> Self {
+        Self {
+            verify: true,
+            ca_cert_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1431,14 +1548,84 @@ impl NodeConfigManifest {
                     metrics: None,
                     tracing: None,
                 });
-                let logging = obs.logging.get_or_insert_with(|| LoggingConfig {
-                    level: default_log_level(),
-                    format: default_log_format(),
-                    file: None,
-                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
                 if logging.level == default_log_level() {
                     logging.level = level;
                 }
+            }
+        }
+
+        // AEGIS_OTLP_ENDPOINT
+        if let Ok(endpoint) = std::env::var("AEGIS_OTLP_ENDPOINT") {
+            if !endpoint.is_empty() {
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
+                logging.otlp_endpoint = Some(endpoint);
+            }
+        }
+
+        // AEGIS_OTLP_PROTOCOL
+        if let Ok(protocol) = std::env::var("AEGIS_OTLP_PROTOCOL") {
+            if !protocol.is_empty() {
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
+                logging.otlp_protocol = match protocol.to_lowercase().as_str() {
+                    "http" => OtlpProtocol::Http,
+                    _ => OtlpProtocol::Grpc,
+                };
+            }
+        }
+
+        // AEGIS_OTLP_HEADERS (format: key=value,key=value)
+        if let Ok(headers) = std::env::var("AEGIS_OTLP_HEADERS") {
+            if !headers.is_empty() {
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
+                for pair in headers.split(',') {
+                    if let Some((k, v)) = pair.split_once('=') {
+                        logging
+                            .otlp_headers
+                            .insert(k.trim().to_string(), v.trim().to_string());
+                    }
+                }
+            }
+        }
+
+        // AEGIS_OTLP_LOG_LEVEL
+        if let Ok(min_level) = std::env::var("AEGIS_OTLP_LOG_LEVEL") {
+            if !min_level.is_empty() {
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
+                logging.min_level = min_level;
+            }
+        }
+
+        // AEGIS_OTLP_SERVICE_NAME
+        if let Ok(service_name) = std::env::var("AEGIS_OTLP_SERVICE_NAME") {
+            if !service_name.is_empty() {
+                let obs = self.spec.observability.get_or_insert(ObservabilityConfig {
+                    logging: None,
+                    metrics: None,
+                    tracing: None,
+                });
+                let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
+                logging.service_name = Some(service_name);
             }
         }
     }

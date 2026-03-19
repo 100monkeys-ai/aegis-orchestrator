@@ -30,6 +30,8 @@ pub struct SelectedComponents {
     pub smcp_gateway: bool,
     /// Local Ollama LLM runtime
     pub ollama_llm: bool,
+    /// Enable OTLP observability stack (Jaeger)
+    pub observability: bool,
     /// LLM backend choice
     pub llm: LlmChoice,
 }
@@ -70,6 +72,9 @@ impl SelectedComponents {
         if self.ollama_llm {
             profiles.push("llm");
         }
+        if self.observability {
+            profiles.push("observability");
+        }
         profiles.join(",")
     }
 }
@@ -105,20 +110,22 @@ impl ComponentSelector {
                 secrets: false,
                 smcp_gateway: false,
                 ollama_llm: true,
+                observability: false,
                 llm: LlmChoice::Ollama,
             });
         }
 
         let items = vec![
-            "Temporal (workflow engine, UI, and worker)  [recommended for workflows]",
+            "Temporal (workflow engine, UI, and worker)  [required for workflows]",
             "SeaweedFS (distributed storage for agent volumes)",
-            "IAM (Keycloak OIDC identity provider)        [needed for multi-user / Zaru]",
-            "Secrets (OpenBao secrets backend)            [needed for secret manager integration]",
+            "IAM (Keycloak OIDC identity provider)        [required for multi-user / Zaru]",
+            "Secrets (OpenBao secrets backend)            [required for secret manager integration]",
             "SMCP Gateway (external tooling gateway)      [enables ToolWorkflows & secure external tool access]",
             "Ollama (local LLM runtime — no API key needed)",
+            "Observability (Jaeger OTLP collector + UI)   [recommended for logging/tracing]",
         ];
 
-        let defaults = vec![true, false, false, false, false, true];
+        let defaults = vec![true, false, false, false, false, false, false];
 
         let selections = MultiSelect::new()
             .with_prompt("Use SPACE to toggle, ENTER to confirm")
@@ -132,6 +139,7 @@ impl ComponentSelector {
         let secrets = selections.contains(&3);
         let smcp_gateway = selections.contains(&4);
         let ollama_llm = selections.contains(&5);
+        let observability = selections.contains(&6);
 
         // If Ollama was not selected, ask which cloud LLM to use
         let llm = if ollama_llm {
@@ -180,6 +188,11 @@ impl ComponentSelector {
             } else {
                 "  · SMCP Gateway (skipped)"
             },
+            if observability {
+                "  ✓ Jaeger (Observability)"
+            } else {
+                "  · Observability (skipped)"
+            },
             match &llm {
                 LlmChoice::Ollama => "  ✓ Ollama (local)",
                 LlmChoice::OpenAI => "  ✓ OpenAI",
@@ -200,6 +213,7 @@ impl ComponentSelector {
             secrets,
             smcp_gateway,
             ollama_llm,
+            observability,
             llm,
         })
     }

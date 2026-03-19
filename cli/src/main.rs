@@ -158,12 +158,31 @@ enum Commands {
     },
 }
 
+use aegis_orchestrator_core::domain::node_config::{LoggingConfig, OtlpProtocol};
+use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
+use opentelemetry_sdk::logs::LoggerProvider;
+use std::time::Duration;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Load config first to initialize logging properly (ADR-057)
+    let config = aegis_orchestrator_core::domain::node_config::NodeConfigManifest::load_or_default(
+        cli.config.clone(),
+    )
+    .unwrap_or_default();
+
     // Initialize logging
-    init_logging(&cli.log_level)?;
+    let log_provider = init_logging(
+        &cli.log_level,
+        config
+            .spec
+            .observability
+            .as_ref()
+            .and_then(|o| o.logging.as_ref()),
+    )?;
 
     // Handle daemon mode (background service)
     if cli.daemon {
@@ -172,7 +191,7 @@ async fn main() -> Result<()> {
     }
 
     // Handle commands in CLI mode
-    match cli.command {
+    let res = match cli.command {
         Some(Commands::Daemon { command }) => {
             commands::daemon::handle_command(command, cli.config, &cli.host, cli.port).await
         }
@@ -199,23 +218,124 @@ async fn main() -> Result<()> {
             eprintln!("{}", "No command specified. Use --help for usage.".yellow());
             std::process::exit(1);
         }
+    };
+
+    if let Some(provider) = log_provider {
+        let _ = provider.shutdown();
     }
+
+    res
 }
 
 /// Initialize tracing subscriber for logging
-fn init_logging(level: &str) -> Result<()> {
+fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<LoggerProvider>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(level))
         .context("Failed to create log filter")?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(false)
         .with_thread_ids(false)
         .with_file(false)
         .with_line_number(false)
-        .compact()
-        .init();
+        .compact();
 
-    Ok(())
+    let subscriber = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    if let Some(cfg) = config {
+        if let Some(endpoint) = &cfg.otlp_endpoint {
+            let exporter = match cfg.otlp_protocol {
+                OtlpProtocol::Grpc => {
+                    let mut exporter_builder = LogExporter::builder()
+                        .with_tonic()
+                        .with_endpoint(endpoint)
+                        .with_timeout(Duration::from_millis(cfg.batch.export_timeout_ms));
+
+                    let mut metadata = tonic_12::metadata::MetadataMap::new();
+                    for (k, v) in &cfg.otlp_headers {
+                        use std::str::FromStr;
+                        if let (Ok(key), Ok(val)) = (
+                            tonic_12::metadata::MetadataKey::from_str(k),
+                            tonic_12::metadata::MetadataValue::from_str(v),
+                        ) {
+                            metadata.insert(key, val);
+                        }
+                    }
+                    if !metadata.is_empty() {
+                        exporter_builder = exporter_builder.with_metadata(metadata);
+                    }
+
+                    if let Some(ca) = &cfg.tls.ca_cert_path {
+                        if let Ok(pem) = std::fs::read(ca) {
+                            let cert = tonic_12::transport::Certificate::from_pem(pem);
+                            let tls_config =
+                                tonic_12::transport::ClientTlsConfig::new().ca_certificate(cert);
+                            exporter_builder = exporter_builder.with_tls_config(tls_config);
+                        }
+                    }
+
+                    exporter_builder
+                        .build()
+                        .context("Failed to build OTLP gRPC log exporter")?
+                }
+                OtlpProtocol::Http => {
+                    let mut exporter_builder = LogExporter::builder()
+                        .with_http()
+                        .with_endpoint(endpoint)
+                        .with_timeout(Duration::from_millis(cfg.batch.export_timeout_ms));
+
+                    let mut headers = std::collections::HashMap::new();
+                    for (k, v) in &cfg.otlp_headers {
+                        headers.insert(k.clone(), v.clone());
+                    }
+                    if !headers.is_empty() {
+                        exporter_builder = exporter_builder.with_headers(headers);
+                    }
+
+                    exporter_builder
+                        .build()
+                        .context("Failed to build OTLP HTTP log exporter")?
+                }
+            };
+
+            let batch_config = opentelemetry_sdk::logs::BatchConfigBuilder::default()
+                .with_max_queue_size(cfg.batch.max_queue_size)
+                .with_scheduled_delay(Duration::from_millis(cfg.batch.scheduled_delay_ms))
+                .with_max_export_batch_size(cfg.batch.max_export_batch_size)
+                .with_max_export_timeout(Duration::from_millis(cfg.batch.export_timeout_ms))
+                .build();
+
+            let processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(
+                exporter,
+                opentelemetry_sdk::runtime::Tokio,
+            )
+            .with_batch_config(batch_config)
+            .build();
+
+            let provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+                .with_log_processor(processor)
+                .with_resource(opentelemetry_sdk::Resource::new(vec![
+                    opentelemetry::KeyValue::new(
+                        "service.name",
+                        cfg.service_name
+                            .clone()
+                            .unwrap_or_else(|| "aegis-orchestrator".to_string()),
+                    ),
+                ]))
+                .build();
+
+            let otlp_layer =
+                opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge::new(&provider);
+            let min_level_filter = tracing_subscriber::EnvFilter::new(&cfg.min_level);
+
+            subscriber
+                .with(otlp_layer.with_filter(min_level_filter))
+                .init();
+
+            return Ok(Some(provider));
+        }
+    }
+
+    subscriber.init();
+    Ok(None)
 }

@@ -148,6 +148,8 @@ services:
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
       # OpenBao Secret ID for AppRole authentication (referenced by spec.openbao.approle)
       - OPENBAO_SECRET_ID=${OPENBAO_SECRET_ID:-test-secret-id}
+      # OTLP External Logging (ADR-057)
+      - AEGIS_OTLP_ENDPOINT=${AEGIS_OTLP_ENDPOINT}
     ports:
       - "8088:8088"   # AEGIS HTTP API
       - "50051:50051" # gRPC for worker activities
@@ -253,6 +255,27 @@ services:
       timeout: 10s
       retries: 10
       start_period: 30s
+    restart: unless-stopped
+
+  # ============================================================================
+  # Observability & Monitoring (ADR-057)
+  # ============================================================================
+
+  # Jaeger (OTLP Collector + Query UI)
+  # UI: http://localhost:16686
+  # OTLP gRPC: http://localhost:4317
+  jaeger:
+    image: jaegertracing/all-in-one:1.55
+    container_name: aegis-jaeger
+    profiles: [observability]
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686" # UI
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+    networks:
+      - aegis-network
     restart: unless-stopped
 
   # ============================================================================

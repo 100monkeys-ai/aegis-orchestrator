@@ -221,10 +221,34 @@ spec:
   # --------------------------------------------------------------------------
   observability:
     logging:
-      # Log level: trace, debug, info, warn, error
+      # Local log level: trace, debug, info, warn, error
       level: "info"
       # Output format: text or json
       format: "text"
+      # Optional: Log file path (defaults to stdout)
+      # file: "/var/log/aegis/orchestrator.log"
+      
+      # Optional: Structured log export via OpenTelemetry Protocol (ADR-057)
+      # otlp_endpoint: "http://localhost:4317" # or "https://otlp.datadoghq.com"
+      # otlp_protocol: "grpc"                  # "grpc" or "http"
+      # min_level: "info"                      # Minimum level to export via OTLP
+      # service_name: "aegis-orchestrator"     # Override default service name
+      
+      # OTLP Static Headers (e.g. for API keys)
+      # otlp_headers:
+      #   "DD-API-KEY": "env:DATADOG_API_KEY"
+      
+      # OTLP Batch Export Configuration
+      # batch:
+      #   max_queue_size: 2048
+      #   scheduled_delay_ms: 5000
+      #   max_export_batch_size: 512
+      #   export_timeout_ms: 10000
+      
+      # OTLP TLS Configuration
+      # tls:
+      #   ca_cert_path: "/etc/ssl/certs/ca-certificates.crt"
+      #   verify: true
     
     metrics:
       # Enable Prometheus metrics endpoint (/metrics)
@@ -233,9 +257,6 @@ spec:
     tracing:
       # Enable distributed tracing
       enabled: false
-    
-    # Optional: OpenTelemetry exporter endpoint
-    # otel_endpoint: "http://localhost:4317"
   
   # --------------------------------------------------------------------------
   # Storage (Optional)
