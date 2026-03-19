@@ -79,7 +79,7 @@ lru = "0.16"
 
 [dev-dependencies]
 tokio-test = "0.4"
-tempfile = "3.10"
+tempfile = "3.27"
 rand = "0.10.0"
 
 [build-dependencies]
