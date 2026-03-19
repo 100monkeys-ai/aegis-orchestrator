@@ -154,6 +154,7 @@ services:
       - "8088:8088"   # AEGIS HTTP API
       - "50051:50051" # gRPC for worker activities
       - "2049:2049"   # NFS Server Gateway
+      # {{AEGIS_METRICS_PORT_EXPOSE}}
     networks:
       - aegis-network
     volumes:

@@ -208,6 +208,13 @@ impl ConfigWizard {
         let aegis_config_content = self.render_aegis_config(&node_config, components, tag);
         let env_content = self.render_env(&node_config, components)?;
 
+        let metrics_port_expose = if node_config.advanced.enable_metrics {
+            format!("- \"{port}:{port}\"", port = node_config.advanced.metrics_port)
+        } else {
+            String::new()
+        };
+        let compose_content = compose_content.replace("# {{AEGIS_METRICS_PORT_EXPOSE}}", &metrics_port_expose);
+
         std::fs::write(&config_path, &aegis_config_content)
             .with_context(|| format!("Failed to write {}", config_path.display()))?;
         std::fs::write(&env_path, &env_content)

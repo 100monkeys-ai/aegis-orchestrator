@@ -69,6 +69,8 @@ spec:
       level: "info"
     # metrics:
     #   enabled: true
+    #   port: 9091
+    #   path: "/metrics"
     # tracing:
     #   enabled: false
 
