@@ -78,11 +78,7 @@ impl PostgresWorkflowRepository {
                 serde_json::Value::Object(sorted_map)
             }
             serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(
-                    arr.iter()
-                        .map(|v| Self::canonicalize_json(v))
-                        .collect(),
-                )
+                serde_json::Value::Array(arr.iter().map(Self::canonicalize_json).collect())
             }
             _ => value.clone(),
         }
