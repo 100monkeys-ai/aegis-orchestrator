@@ -67,7 +67,7 @@ impl StorageEventPersister {
                         events_processed += 1;
 
                         // Log every 100 events for observability
-                        if events_processed % 100 == 0 {
+                        if events_processed.is_multiple_of(100) {
                             debug!(
                                 "Storage event persister processed {} events ({} errors)",
                                 events_processed, errors_encountered
@@ -84,7 +84,7 @@ impl StorageEventPersister {
                             );
 
                             // Log warning every 10 errors to avoid spam
-                            if errors_encountered % 10 == 0 {
+                            if errors_encountered.is_multiple_of(10) {
                                 warn!(
                                     "Storage event persistence has failed {} times",
                                     errors_encountered
