@@ -32,6 +32,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   # Temporal Server (auto-setup version for easy deployment)
   temporal:
@@ -66,6 +67,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    restart: unless-stopped
 
   # Temporal Web UI for workflow visualization and debugging
   temporal-ui:
@@ -81,6 +83,7 @@ services:
       - "8233:8080"   # Access UI at http://localhost:8233
     networks:
       - aegis-network
+    restart: unless-stopped
 
   # AEGIS Temporal Worker (TypeScript)
   temporal-worker:
