@@ -14,11 +14,12 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 # Copy workspace Cargo files for dependency caching
-COPY Cargo.toml Cargo.lock ./
-COPY orchestrator/core/Cargo.toml ./orchestrator/core/
-COPY orchestrator/swarm/Cargo.toml ./orchestrator/swarm/
-COPY cli/Cargo.toml ./cli/
-COPY sdks/Cargo.toml ./sdks/
+COPY aegis-orchestrator/Cargo.toml ./Cargo.toml
+COPY aegis-orchestrator/Cargo.lock ./Cargo.lock
+COPY aegis-orchestrator/orchestrator/core/Cargo.toml ./orchestrator/core/
+COPY aegis-orchestrator/orchestrator/swarm/Cargo.toml ./orchestrator/swarm/
+COPY aegis-orchestrator/cli/Cargo.toml ./cli/
+COPY aegis-orchestrator/sdks/Cargo.toml ./sdks/
 COPY aegis-proto/Cargo.toml ./aegis-proto/
 
 # Create dummy source files to build dependencies
@@ -37,13 +38,13 @@ RUN cargo fetch --locked
 RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src sdks/src aegis-proto/src target
 
 # Copy actual source code
-COPY orchestrator/core ./orchestrator/core
-COPY orchestrator/swarm ./orchestrator/swarm
-COPY cli/src ./cli/src
-COPY cli/templates ./cli/templates
-COPY cli/migrations ./cli/migrations
-COPY sdks/src ./sdks/src
-COPY proto ./proto
+COPY aegis-orchestrator/orchestrator/core ./orchestrator/core
+COPY aegis-orchestrator/orchestrator/swarm ./orchestrator/swarm
+COPY aegis-orchestrator/cli/src ./cli/src
+COPY aegis-orchestrator/cli/templates ./cli/templates
+COPY aegis-orchestrator/cli/migrations ./cli/migrations
+COPY aegis-orchestrator/sdks/src ./sdks/src
+COPY aegis-orchestrator/proto ./proto
 COPY aegis-proto ./aegis-proto
 
 # Build the actual binary with all real source
@@ -65,13 +66,13 @@ WORKDIR /app
 
 # Copy the built binary from builder
 COPY --from=builder /app/target/release/aegis /usr/local/bin/aegis-runtime
-COPY docker/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
+COPY aegis-orchestrator/docker/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
 
 # Configuration is injected at runtime via docker-compose volume mount
 # (see aegis-examples/deploy/docker-compose.yml)
 
 # Copy bootstrap script for mounting into agent containers
-COPY assets ./assets
+COPY aegis-orchestrator/assets ./assets
 
 # Expose gRPC ports
 EXPOSE 8088 50051

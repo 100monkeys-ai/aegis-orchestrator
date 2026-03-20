@@ -4,4 +4,4 @@
 //!
 //! Shim for `aegis-proto` crate types.
 
-pub use aegis_proto::aegis::smcp_gateway::v1::*;
+pub use aegis_orchestrator_proto::aegis::smcp_gateway::v1::*;

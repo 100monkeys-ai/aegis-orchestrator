@@ -7,13 +7,13 @@
 pub mod aegis {
     pub mod runtime {
         pub mod v1 {
-            pub use aegis_proto::aegis::runtime::v1::*;
+            pub use aegis_orchestrator_proto::aegis::runtime::v1::*;
         }
     }
 
     pub mod cluster {
         pub mod v1 {
-            pub use aegis_proto::aegis::cluster::v1::*;
+            pub use aegis_orchestrator_proto::aegis::cluster::v1::*;
         }
     }
 }

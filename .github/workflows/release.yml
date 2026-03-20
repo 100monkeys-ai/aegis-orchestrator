@@ -32,7 +32,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -46,12 +51,16 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Build release binary
+        working-directory: aegis-orchestrator
         run: |
           cargo build --release --bin aegis --locked
-          
+
       - name: Create tarball
+        working-directory: aegis-orchestrator
         run: |
           cd target/release
           tar -czf aegis-linux-x86_64.tar.gz aegis
@@ -72,7 +81,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -85,12 +99,16 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Build release binary
+        working-directory: aegis-orchestrator
         run: |
           cargo build --release --bin aegis --locked --target aarch64-apple-darwin
-          
+
       - name: Create tarball
+        working-directory: aegis-orchestrator
         run: |
           cd target/aarch64-apple-darwin/release
           tar -czf aegis-macos-aarch64.tar.gz aegis
@@ -114,7 +132,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8

@@ -30,7 +30,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -42,11 +47,15 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Verify workspace builds
+        working-directory: aegis-orchestrator
         run: cargo build --workspace --locked
 
       - name: Run tests
+        working-directory: aegis-orchestrator
         run: cargo test --workspace --locked --lib
 
   # Publish in dependency order: core → swarm → sdk → cli
@@ -57,7 +66,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -69,27 +83,26 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Prepare proto files for publishing
+        working-directory: aegis-orchestrator
         run: |
-          # Create proto-vendor directory structure
-          mkdir -p orchestrator/core/proto-vendor/aegis
           mkdir -p orchestrator/core/proto-vendor/temporal/api
           mkdir -p orchestrator/core/proto-vendor/google
-          
-          # Copy AEGIS proto files from submodule
-          cp aegis-proto/proto/*.proto orchestrator/core/proto-vendor/aegis/
-          
+
           # Copy Temporal API proto files
           cp -r proto/temporal/api/* orchestrator/core/proto-vendor/temporal/api/
-          
+
           # Copy Google proto dependencies
           cp -r proto/google/* orchestrator/core/proto-vendor/google/
-          
+
           echo "✅ Proto files prepared for packaging"
           find orchestrator/core/proto-vendor -name '*.proto' | wc -l
 
       - name: Publish aegis-orchestrator-core
+        working-directory: aegis-orchestrator/orchestrator/core
         run: |
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             echo "🔍 DRY RUN: Would publish aegis-orchestrator-core"
@@ -109,7 +122,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -121,8 +139,11 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Publish aegis-orchestrator-swarm
+        working-directory: aegis-orchestrator
         run: |
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             echo "🔍 DRY RUN: Would publish aegis-orchestrator-swarm"
@@ -142,7 +163,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -154,8 +180,11 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Publish aegis-orchestrator-sdk
+        working-directory: aegis-orchestrator
         run: |
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             echo "🔍 DRY RUN: Would publish aegis-orchestrator-sdk"
@@ -175,7 +204,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -187,8 +221,11 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Publish aegis-orchestrator (CLI)
+        working-directory: aegis-orchestrator
         run: |
           if [ "${{ github.event.inputs.dry_run }}" == "true" ]; then
             echo "🔍 DRY RUN: Would publish aegis-orchestrator"
@@ -207,7 +244,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -219,8 +261,11 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Generate documentation
+        working-directory: aegis-orchestrator
         run: |
           RUSTDOCFLAGS="--cfg docsrs" cargo doc --workspace --locked --no-deps --document-private-items
 

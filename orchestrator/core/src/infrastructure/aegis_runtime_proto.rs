@@ -4,4 +4,4 @@
 //!
 //! Shim for `aegis-proto` crate types.
 
-pub use aegis_proto::aegis::runtime::v1::*;
+pub use aegis_orchestrator_proto::aegis::runtime::v1::*;

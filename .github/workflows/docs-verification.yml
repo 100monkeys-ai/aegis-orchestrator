@@ -34,7 +34,12 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          submodules: recursive
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
 
       - name: Install dependencies
         run: |
@@ -46,8 +51,11 @@ jobs:
 
       - name: Cache cargo registry & build
         uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
 
       - name: Build documentation
+        working-directory: aegis-orchestrator
         run: |
           cargo doc \
             --workspace \

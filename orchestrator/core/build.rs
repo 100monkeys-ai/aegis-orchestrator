@@ -15,8 +15,8 @@
 //!
 //! # Proto File Sources
 //!
-//! - **Development**: Proto files are read from git submodules (proto/)
-//! - **CI Publishing**: GitHub Actions copies submodule files to proto-vendor/ before cargo publish
+//! - **Development**: Proto files are read from the workspace `proto/` directory
+//! - **CI Publishing**: GitHub Actions copies workspace proto files to `proto-vendor/` before cargo publish
 //! - **crates.io**: Published packages include proto-vendor/ directory in the tarball
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -30,7 +30,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|p| p.parent())
         .ok_or("Failed to find crate root")?;
 
-    // Try proto-vendor first (CI/crates.io), fall back to submodule (development)
+    // Try proto-vendor first (CI/crates.io), fall back to the workspace proto tree.
     let proto_vendor_dir = crate_dir.join("proto-vendor");
     let use_vendor = proto_vendor_dir.exists();
 
