@@ -137,16 +137,32 @@ elif [[ "$PLATFORM" == "linux" ]]; then
     sudo apt-get update -qq
     sudo apt-get install -y --no-install-recommends gnupg lsb-release
     sudo install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+    # Determine correct Docker repo base for Ubuntu vs Debian
+    DIST_ID="$(lsb_release -is 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+    case "$DIST_ID" in
+        ubuntu)
+            DOCKER_REPO_BASE="https://download.docker.com/linux/ubuntu"
+            ;;
+        debian)
+            DOCKER_REPO_BASE="https://download.docker.com/linux/debian"
+            ;;
+        *)
+            die "Unsupported distribution '$DIST_ID' for automatic Docker installation. Supported: Ubuntu, Debian."
+            ;;
+    esac
+    curl -fsSL "${DOCKER_REPO_BASE}/gpg" \
         | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
     sudo chmod a+r /etc/apt/keyrings/docker.gpg
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+${DOCKER_REPO_BASE} $(lsb_release -cs) stable" \
         | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
     sudo apt-get update -qq
     sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
     # Add current user to the docker group so we don't need sudo
     sudo usermod -aG docker "$USER"
+    echo ""
+    echo -e "${CYAN}${BOLD}[aegis] NOTE:${RESET} You may need to log out and back in (or restart your terminal)"
+    echo -e "        before using ${BOLD}docker${RESET} without ${BOLD}sudo${RESET}."
     # Start the daemon (best-effort; may fail in some WSL environments)
     sudo service docker start 2>/dev/null || true
     # Verify
@@ -196,6 +212,9 @@ else
         if ! cargo install aegis-orchestrator; then
             die "Unable to install aegis-orchestrator. Both version $AEGIS_VERSION and latest version failed. Please check your network connection and cargo configuration."
         fi
+        # We successfully installed the latest version; update AEGIS_VERSION to match
+        AEGIS_VERSION="$(aegis --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[^ ]+' || echo "$AEGIS_VERSION")"
+        info "Using installed aegis-orchestrator version: $AEGIS_VERSION"
     fi
     success "aegis installed: $(aegis --version)"
 fi
