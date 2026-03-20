@@ -203,6 +203,13 @@ async fn deploy_builtin_agent(
 
     if !force {
         if let Some(id) = client.lookup_agent(&manifest.metadata.name).await? {
+            println!(
+                "  {} Reusing existing built-in agent '{}' (id: {}) without verifying version; \
+                 use --force to redeploy from the bundled template if needed.",
+                "→".dimmed(),
+                manifest.metadata.name.cyan(),
+                id
+            );
             return Ok(id);
         }
     }

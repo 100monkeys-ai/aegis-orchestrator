@@ -63,9 +63,35 @@ impl PostgresWorkflowRepository {
         Self { pool }
     }
 
+    /// Recursively canonicalize a JSON value by sorting all object keys.
+    fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Object(map) => {
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_by(|(k1, _), (k2, _)| k1.cmp(k2));
+
+                let mut sorted_map = serde_json::Map::with_capacity(entries.len());
+                for (key, val) in entries {
+                    sorted_map.insert(key.clone(), Self::canonicalize_json(val));
+                }
+
+                serde_json::Value::Object(sorted_map)
+            }
+            serde_json::Value::Array(arr) => {
+                serde_json::Value::Array(
+                    arr.iter()
+                        .map(|v| Self::canonicalize_json(v))
+                        .collect(),
+                )
+            }
+            _ => value.clone(),
+        }
+    }
+
     fn compute_hash(json: &serde_json::Value) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(json.to_string().as_bytes());
+        let canonical = Self::canonicalize_json(json);
+        hasher.update(canonical.to_string().as_bytes());
         let result = hasher.finalize();
         let mut hex_string = String::new();
         for byte in result {
@@ -109,7 +135,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             INSERT INTO workflows (id, name, version, description, yaml_source, domain_json, temporal_def_json, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
             ON CONFLICT (name, version) DO UPDATE SET
-                version = EXCLUDED.version,
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
                 domain_json = EXCLUDED.domain_json,
