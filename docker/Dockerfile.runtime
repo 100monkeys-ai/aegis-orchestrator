@@ -20,22 +20,22 @@ COPY aegis-orchestrator/orchestrator/core/Cargo.toml ./orchestrator/core/
 COPY aegis-orchestrator/orchestrator/swarm/Cargo.toml ./orchestrator/swarm/
 COPY aegis-orchestrator/cli/Cargo.toml ./cli/
 COPY aegis-orchestrator/sdks/Cargo.toml ./sdks/
-COPY aegis-proto/Cargo.toml ./aegis-proto/
+COPY aegis-proto/Cargo.toml /aegis-proto/Cargo.toml
 
 # Create dummy source files to build dependencies
-RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src sdks/src aegis-proto/src && \
+RUN mkdir -p orchestrator/core/src orchestrator/swarm/src cli/src sdks/src /aegis-proto/src && \
     echo "fn main() {}" > cli/src/main.rs && \
     echo "pub fn dummy() {}" > orchestrator/core/src/lib.rs && \
     echo "pub fn dummy() {}" > orchestrator/swarm/src/lib.rs && \
     echo "pub fn dummy() {}" > sdks/src/lib.rs && \
-    echo "pub fn dummy() {}" > aegis-proto/src/lib.rs
+    echo "pub fn dummy() {}" > /aegis-proto/src/lib.rs
 
 # Build dependencies only (skip building to avoid edition2024 issues with dummy files)
 # We'll do a full build after copying real source
 RUN cargo fetch --locked
 
 # Remove dummy source files (keep cargo cache)
-RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src sdks/src aegis-proto/src target
+RUN rm -rf orchestrator/core/src orchestrator/swarm/src cli/src sdks/src /aegis-proto/src target
 
 # Copy actual source code
 COPY aegis-orchestrator/orchestrator/core ./orchestrator/core
@@ -45,7 +45,7 @@ COPY aegis-orchestrator/cli/templates ./cli/templates
 COPY aegis-orchestrator/cli/migrations ./cli/migrations
 COPY aegis-orchestrator/sdks/src ./sdks/src
 COPY aegis-orchestrator/proto ./proto
-COPY aegis-proto ./aegis-proto
+COPY aegis-proto /aegis-proto
 
 # Build the actual binary with all real source
 RUN cargo build --release --bin aegis --locked
