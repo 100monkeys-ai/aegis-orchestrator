@@ -219,39 +219,21 @@ install_aegis_from_release() {
 
     [[ -n "$bin_path" ]] || die "Downloaded archive did not contain an executable aegis binary."
 
-    install_dir="${HOME}/.local/bin"
-    mkdir -p "$install_dir"
+    install_dir="/usr/local/bin"
+    sudo install -d -m 0755 "$install_dir"
     install_path="$install_dir/aegis"
-    install -m 0755 "$bin_path" "$install_path"
-
-    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-        export PATH="$install_dir:$PATH"
-    fi
+    sudo install -m 0755 "$bin_path" "$install_path"
 
     success "Installed aegis to $install_path"
-}
-
-add_local_bin_to_rc() {
-    local rc="$1"
-    if [[ -f "$rc" ]] && ! grep -q '# Added by AEGIS installer' "$rc" 2>/dev/null; then
-        echo '' >> "$rc"
-        echo '# Added by AEGIS installer' >> "$rc"
-        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
-        info "Added ~/.local/bin to PATH in $rc"
-    fi
+    AEGIS_BIN_PATH="$install_path"
 }
 
 # ── Step 3: Install aegis release binary ──────────────────────────────────────
 install_aegis_from_release
-add_local_bin_to_rc "$HOME/.bashrc"
-add_local_bin_to_rc "$HOME/.zshrc"
-if [[ "$PLATFORM" == "macos" ]]; then
-    add_local_bin_to_rc "$HOME/.bash_profile"
-fi
 
 # ── Step 4: Start the AEGIS stack ─────────────────────────────────────────────
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
 info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
-aegis up --tag "$AEGIS_VERSION"
+"$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
 
 success "AEGIS is ready! Run 'aegis --help' to get started. To update in the future, just run this installer script again to get the latest version, then run 'aegis update' to apply the update to your stack."
