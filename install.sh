@@ -4,9 +4,8 @@
 #
 # install.sh — One-shot AEGIS installer for Ubuntu / macOS
 #
-# Installs the Rust toolchain (if absent), builds and installs the
-# aegis-orchestrator CLI via cargo, then runs `aegis up` with the pinned
-# version to bring the full local stack online.
+# Installs the aegis CLI from a GitHub release tarball, then runs `aegis up`
+# with the pinned version to bring the full local stack online.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
@@ -44,7 +43,7 @@ if [[ "$PLATFORM" == "linux" ]]; then
     command -v apt-get &>/dev/null \
         || die "apt-get not found. Linux installs require Ubuntu / Debian."
     MISSING_APT_PKGS=()
-    for pkg in curl build-essential pkg-config libssl-dev ca-certificates; do
+    for pkg in curl ca-certificates; do
         if ! dpkg-query -W -f='${Status}' "$pkg" 2>/dev/null | grep -q "install ok installed"; then
             MISSING_APT_PKGS+=("$pkg")
         fi
@@ -59,31 +58,7 @@ if [[ "$PLATFORM" == "linux" ]]; then
     fi
 
 elif [[ "$PLATFORM" == "macos" ]]; then
-    # Ensure Homebrew is present
-    if ! command -v brew &>/dev/null; then
-        info "Homebrew not found — installing..."
-        /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-        # Add brew to PATH for Apple Silicon or Intel
-        if [[ -f /opt/homebrew/bin/brew ]]; then
-            eval "$(/opt/homebrew/bin/brew shellenv)"
-        else
-            eval "$(/usr/local/bin/brew shellenv)"
-        fi
-    fi
-
-    MISSING_BREW_PKGS=()
-    for pkg in openssl pkg-config; do
-        if ! brew list --versions "$pkg" >/dev/null 2>&1; then
-            MISSING_BREW_PKGS+=("$pkg")
-        fi
-    done
-
-    if [[ ${#MISSING_BREW_PKGS[@]} -eq 0 ]]; then
-        success "System dependencies already installed. Skipping brew install."
-    else
-        info "Installing missing brew packages: ${MISSING_BREW_PKGS[*]}"
-        brew install "${MISSING_BREW_PKGS[@]}"
-    fi
+    success "macOS requires no extra system packages for the release binary install."
 fi
 
 # ── Step 2: Docker ────────────────────────────────────────────────────────────
@@ -181,69 +156,100 @@ elif [[ "$PLATFORM" == "macos" ]]; then
     die "Docker is not running. Please install and start Docker Desktop: https://docs.docker.com/desktop/mac/install/"
 fi
 
-# ── Step 3: Rust / Cargo ────────────────────────────────────────────────────────
-if command -v cargo &>/dev/null; then
-    success "Rust toolchain already installed ($(cargo --version)). Skipping."
-else
-    info "Installing Rust via rustup..."
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal
-    success "Rust installed."
-fi
+normalize_arch() {
+    local arch
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) echo "x86_64" ;;
+        arm64|aarch64) echo "aarch64" ;;
+        *)
+            die "Unsupported CPU architecture: $arch."
+            ;;
+    esac
+}
 
-# Make cargo available in the current shell whether it was just installed or
-# already present in a non-login environment (e.g. piped bash).
-export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+install_aegis_from_release() {
+    local arch asset url tmpdir extract_dir bin_path install_dir install_path
+    tmpdir="$(mktemp -d)"
+    cleanup_tmpdir() {
+        rm -rf "$tmpdir"
+    }
+    trap cleanup_tmpdir RETURN
 
-cargo --version &>/dev/null || die "cargo not found on PATH after install. Try: source \$HOME/.cargo/env"
+    arch="$(normalize_arch)"
+    case "${PLATFORM}:${arch}" in
+        linux:x86_64)
+            asset="aegis-linux-x86_64.tar.gz"
+            ;;
+        macos:aarch64)
+            asset="aegis-macos-aarch64.tar.gz"
+            ;;
+        *)
+            die "No release asset available for ${PLATFORM}/${arch}. Supported combinations are linux/x86_64 and macos/aarch64."
+            ;;
+    esac
 
-# ── Step 4: Install aegis-orchestrator ────────────────────────────────────────
-CURRENT_AEGIS_VERSION=""
-if command -v aegis &>/dev/null; then
-    CURRENT_AEGIS_VERSION="$(aegis --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[^ ]+' || true)"
-fi
-
-if [[ "$CURRENT_AEGIS_VERSION" == "$AEGIS_VERSION" ]]; then
-    success "aegis $AEGIS_VERSION already installed. Skipping cargo install."
-else
-    info "Installing aegis-orchestrator CLI via cargo (version: $AEGIS_VERSION)..."
-    if ! cargo install aegis-orchestrator --version "$AEGIS_VERSION"; then
-        info "Failed to install aegis-orchestrator version $AEGIS_VERSION. Attempting to install latest version instead..."
-        if ! cargo install aegis-orchestrator; then
-            die "Unable to install aegis-orchestrator. Both version $AEGIS_VERSION and latest version failed. Please check your network connection and cargo configuration."
+    if command -v aegis &>/dev/null; then
+        local current_version
+        current_version="$(aegis --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[^ ]+' || true)"
+        if [[ "$current_version" == "$AEGIS_VERSION" ]]; then
+            success "aegis $AEGIS_VERSION already installed. Skipping release download."
+            return
         fi
-        # We successfully installed the latest version; update AEGIS_VERSION to match
-        AEGIS_VERSION="$(aegis --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[^ ]+' || echo "$AEGIS_VERSION")"
-        info "Using installed aegis-orchestrator version: $AEGIS_VERSION"
     fi
-    success "aegis installed: $(aegis --version)"
-fi
 
-# Ensure the cargo bin dir is on PATH for the aegis up call and future sessions.
-CARGO_BIN="${CARGO_HOME:-$HOME/.cargo}/bin"
-if [[ ":$PATH:" != *":$CARGO_BIN:"* ]]; then
-    export PATH="$CARGO_BIN:$PATH"
-fi
+    url="https://github.com/100monkeys-ai/aegis-orchestrator/releases/download/${AEGIS_VERSION}/${asset}"
+    extract_dir="$tmpdir/extract"
+    mkdir -p "$extract_dir"
 
-# Persist to shell profile so it survives reboots.
-# Write to every RC file that exists (bash + zsh) so it works regardless of
-# which shell the user opens next.
-_add_cargo_to_rc() {
+    info "Downloading aegis ${AEGIS_VERSION} (${asset})..."
+    curl -fsSL "$url" -o "$tmpdir/$asset"
+
+    info "Extracting release archive..."
+    tar -xzf "$tmpdir/$asset" -C "$extract_dir"
+
+    bin_path=""
+    if [[ -x "$extract_dir/aegis" ]]; then
+        bin_path="$extract_dir/aegis"
+    elif [[ -x "$extract_dir/bin/aegis" ]]; then
+        bin_path="$extract_dir/bin/aegis"
+    else
+        bin_path="$(find "$extract_dir" -type f -name aegis -perm -111 | head -n 1 || true)"
+    fi
+
+    [[ -n "$bin_path" ]] || die "Downloaded archive did not contain an executable aegis binary."
+
+    install_dir="${HOME}/.local/bin"
+    mkdir -p "$install_dir"
+    install_path="$install_dir/aegis"
+    install -m 0755 "$bin_path" "$install_path"
+
+    if [[ ":$PATH:" != *":$install_dir:"* ]]; then
+        export PATH="$install_dir:$PATH"
+    fi
+
+    success "Installed aegis to $install_path"
+}
+
+add_local_bin_to_rc() {
     local rc="$1"
     if [[ -f "$rc" ]] && ! grep -q '# Added by AEGIS installer' "$rc" 2>/dev/null; then
         echo '' >> "$rc"
         echo '# Added by AEGIS installer' >> "$rc"
-        echo "export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >> "$rc"
-        info "Added ~/.cargo/bin to PATH in $rc"
+        echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$rc"
+        info "Added ~/.local/bin to PATH in $rc"
     fi
 }
-_add_cargo_to_rc "$HOME/.bashrc"
-_add_cargo_to_rc "$HOME/.zshrc"
+
+# ── Step 3: Install aegis release binary ──────────────────────────────────────
+install_aegis_from_release
+add_local_bin_to_rc "$HOME/.bashrc"
+add_local_bin_to_rc "$HOME/.zshrc"
 if [[ "$PLATFORM" == "macos" ]]; then
-    _add_cargo_to_rc "$HOME/.bash_profile"
+    add_local_bin_to_rc "$HOME/.bash_profile"
 fi
 
-# ── Step 5: Start the AEGIS stack ─────────────────────────────────────────────
+# ── Step 4: Start the AEGIS stack ─────────────────────────────────────────────
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
 info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
 aegis up --tag "$AEGIS_VERSION"
