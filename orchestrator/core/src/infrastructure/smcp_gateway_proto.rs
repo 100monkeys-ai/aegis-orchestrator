@@ -2,6 +2,6 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # SMCP Gateway Protocol Buffer Definitions
 //!
-//! Shim for `aegis-proto` crate types.
+//! Shim for `aegis_orchestrator_proto` crate types.
 
 pub use aegis_orchestrator_proto::aegis::smcp_gateway::v1::*;

@@ -2,7 +2,7 @@
 # This builds the Rust gRPC server that provides ExecutionService, ValidationService, etc.
 
 # Stage 1: Build the Rust binary
-FROM rust:latest as builder
+FROM rust:1.76 as builder
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
@@ -51,7 +51,7 @@ COPY aegis-proto /aegis-proto
 RUN cargo build --release --bin aegis --locked
 
 # Stage 2: Runtime image
-# Using Ubuntu 24.04 for GLIBC 2.39 compatibility with rust:latest
+# Using Ubuntu 24.04 for GLIBC 2.39 compatibility with rust:1.76 builder image
 FROM ubuntu:24.04
 
 # Install runtime dependencies
@@ -79,6 +79,8 @@ EXPOSE 8088 50051
 
 # Run as non-root user with Docker socket access
 # Create docker group (use build arg for custom GID) and add aegis user to it
+# Default 989 matches the docker group GID on many Linux distros; override at build time
+# (DOCKER_GID=<host-docker-gid>) so the container's docker group aligns with the host's.
 ARG DOCKER_GID=989
 RUN groupadd -g ${DOCKER_GID} docker || true && \
     useradd -m -u 10000 -G docker aegis && \
