@@ -5,7 +5,7 @@
 # install.sh — One-shot AEGIS installer for Ubuntu / macOS
 #
 # Installs the Rust toolchain (if absent), builds and installs the
-# aegis-orchestrator CLI via cargo, then runs `aegis init` with the pinned
+# aegis-orchestrator CLI via cargo, then runs `aegis up` with the pinned
 # version to bring the full local stack online.
 #
 # Usage:
@@ -245,7 +245,7 @@ fi
 
 # ── Step 5: Start the AEGIS stack ─────────────────────────────────────────────
 # Socket access is resolved dynamically inside the aegis-runtime container at startup.
-info "Starting AEGIS stack (aegis init --tag $AEGIS_VERSION)..."
-aegis init --tag "$AEGIS_VERSION"
+info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
+aegis up --tag "$AEGIS_VERSION"
 
-success "AEGIS is ready! Run 'aegis --help' to get started."
+success "AEGIS is ready! Run 'aegis --help' to get started. To update in the future, just run this installer script again to get the latest version, then run 'aegis update' to apply the update to your stack."

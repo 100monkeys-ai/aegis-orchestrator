@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! `aegis up` — start (or install-then-start) the local AEGIS stack.
 //!
-//! If `~/.aegis/docker-compose.yml` already exists the command simply runs
-//! `docker compose up -d --wait`, streaming output in real-time.
+//! If `~/.aegis/docker-compose.yml` already exists the command refreshes the
+//! stack to the requested image tag, updates `aegis-config.yaml`, and then
+//! runs `docker compose up -d --wait`, streaming output in real-time.
 //!
 //! If the working directory or compose file is missing the full `aegis init`
 //! wizard is invoked automatically so the user never has to remember which
@@ -22,6 +23,7 @@ use colored::Colorize;
 use dialoguer::Confirm;
 
 use super::init::{self, compose::ComposeRunner, InitArgs};
+use super::update::{persist_image_tag, refresh_compose};
 
 /// Arguments for `aegis up`
 #[derive(Args)]
@@ -44,6 +46,8 @@ pub struct UpArgs {
     pub yes: bool,
 
     /// Image tag for AEGIS-owned Docker images.
+    /// Refreshes `docker-compose.yml` and `aegis-config.yaml` before startup
+    /// when the stack already exists.
     /// Defaults to the version of this binary.
     /// Pass `latest` to track the most recent build, or a semver tag such as
     /// `v0.10.0` to pin to a specific release.
@@ -103,9 +107,13 @@ pub async fn run(args: UpArgs) -> Result<()> {
         return Ok(());
     }
 
-    // Stack already installed — just bring it up.
+    // Stack already installed — refresh the requested image tag, then bring it up.
     println!();
     println!("{}", "Starting AEGIS stack...".bold());
+
+    let config_file_path = dir.join("aegis-config.yaml");
+    refresh_compose(&dir, &args.tag, false).await?;
+    persist_image_tag(&config_file_path, &args.tag, false)?;
 
     let runner = ComposeRunner::new(dir.clone());
     runner.up_with_profile(args.profile.as_deref()).await?;

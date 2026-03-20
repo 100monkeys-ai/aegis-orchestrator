@@ -92,18 +92,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
     println!("  {} Targeting image tag: {}", "→".cyan(), image_tag.bold());
 
     // ─── Rewrite docker-compose.yml with resolved tag ─────────────────────────
-    let stack = fetch_stack(&image_tag).await?;
-    if cmd.dry_run {
-        println!(
-            "  {} would rewrite docker-compose.yml with tag: {}",
-            "→".dimmed(),
-            image_tag
-        );
-    } else {
-        std::fs::write(dir.join("docker-compose.yml"), &stack.docker_compose)
-            .context("Failed to rewrite docker-compose.yml")?;
-        println!("  {} docker-compose.yml updated", "✓".green());
-    }
+    refresh_compose(&dir, &image_tag, cmd.dry_run).await?;
 
     // ─── Step 1: Pull latest images ───────────────────────────────────────────
     if !cmd.skip_pull {
@@ -246,27 +235,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
     }
 
     // ─── Persist updated image_tag in node config ─────────────────────────────
-    println!();
-    if cmd.dry_run {
-        println!(
-            "  {} would update spec.image_tag to: {}",
-            "→".dimmed(),
-            image_tag
-        );
-    } else if config_file_path.exists() {
-        let raw = std::fs::read_to_string(&config_file_path)
-            .context("Failed to read aegis-config.yaml")?;
-        let mut value: serde_yaml::Value =
-            serde_yaml::from_str(&raw).context("Failed to parse aegis-config.yaml")?;
-        if let Some(spec) = value.get_mut("spec") {
-            spec["image_tag"] = serde_yaml::Value::String(image_tag.clone());
-        }
-        let updated =
-            serde_yaml::to_string(&value).context("Failed to serialize updated config")?;
-        std::fs::write(&config_file_path, updated)
-            .context("Failed to write updated aegis-config.yaml")?;
-        println!("  {} spec.image_tag updated to: {}", "✓".green(), image_tag);
-    }
+    persist_image_tag(&config_file_path, &image_tag, cmd.dry_run)?;
 
     // ─── Done ─────────────────────────────────────────────────────────────────
     println!();
@@ -293,4 +262,97 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+pub(crate) async fn refresh_compose(dir: &Path, image_tag: &str, dry_run: bool) -> Result<()> {
+    let stack = fetch_stack(image_tag).await?;
+    if dry_run {
+        println!(
+            "  {} would rewrite docker-compose.yml with tag: {}",
+            "→".dimmed(),
+            image_tag
+        );
+    } else {
+        std::fs::write(dir.join("docker-compose.yml"), &stack.docker_compose)
+            .context("Failed to rewrite docker-compose.yml")?;
+        println!("  {} docker-compose.yml updated", "✓".green());
+    }
+
+    Ok(())
+}
+
+pub(crate) fn persist_image_tag(
+    config_file_path: &Path,
+    image_tag: &str,
+    dry_run: bool,
+) -> Result<()> {
+    println!();
+    if dry_run {
+        println!(
+            "  {} would update spec.image_tag to: {}",
+            "→".dimmed(),
+            image_tag
+        );
+    } else if config_file_path.exists() {
+        let raw = std::fs::read_to_string(config_file_path)
+            .context("Failed to read aegis-config.yaml")?;
+        let mut value: serde_yaml::Value =
+            serde_yaml::from_str(&raw).context("Failed to parse aegis-config.yaml")?;
+        if let Some(spec) = value.get_mut("spec") {
+            spec["image_tag"] = serde_yaml::Value::String(image_tag.to_string());
+        }
+        let updated =
+            serde_yaml::to_string(&value).context("Failed to serialize updated config")?;
+        std::fs::write(config_file_path, updated)
+            .context("Failed to write updated aegis-config.yaml")?;
+        println!("  {} spec.image_tag updated to: {}", "✓".green(), image_tag);
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        dir.push(format!("aegis-update-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn refresh_compose_and_persist_image_tag_updates_compose_and_config() {
+        let dir = temp_dir();
+        let config_path = dir.join("aegis-config.yaml");
+
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.image_tag = Some("old-tag".to_string());
+        manifest
+            .to_yaml_file(&config_path)
+            .expect("write initial config");
+
+        refresh_compose(&dir, "new-tag", false)
+            .await
+            .expect("refresh compose");
+        persist_image_tag(&config_path, "new-tag", false).expect("persist tag");
+
+        let compose =
+            fs::read_to_string(dir.join("docker-compose.yml")).expect("read refreshed compose");
+        assert!(compose.contains("new-tag"));
+
+        let updated =
+            NodeConfigManifest::from_yaml_file(&config_path).expect("load updated config");
+        assert_eq!(updated.spec.image_tag.as_deref(), Some("new-tag"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }

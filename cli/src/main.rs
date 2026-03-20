@@ -18,7 +18,8 @@
 //! - `aegis task deploy|execute|status|logs` - Agent operations
 //! - `aegis config show|validate|generate` - Configuration management
 //! - `aegis init` - Interactive setup wizard
-//! - `aegis up [--yes]` - Start the stack (runs init automatically if needed)
+//! - `aegis up [--yes] [--tag <TAG>]` - Start the stack (runs init
+//!   automatically if needed)
 //! - `aegis down [--volumes]` - Stop the Docker Compose stack
 //! - `aegis restart [--profile <name>]` - Restart the Docker Compose services
 //! - `aegis uninstall [-y]` - Stop stack and remove the ~/.aegis directory
