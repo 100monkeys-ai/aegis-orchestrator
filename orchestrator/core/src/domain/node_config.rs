@@ -87,7 +87,7 @@ pub struct NodeConfigSpec {
     /// Node identity and capabilities
     pub node: NodeIdentity,
 
-    /// Image tag for AEGIS-owned Docker images (e.g. `"0.11.0-pre-alpha"`).
+    /// Image tag for AEGIS-owned Docker images (e.g. `"0.1.0-pre-alpha"`).
     /// Written by `aegis init --tag <TAG>` and updated by `aegis update`.
     /// Defaults to `env!("CARGO_PKG_VERSION")` when absent.
     #[serde(skip_serializing_if = "Option::is_none")]

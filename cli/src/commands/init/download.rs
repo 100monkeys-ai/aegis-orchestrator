@@ -32,7 +32,7 @@ pub struct StackFiles {
 /// Load stack files from bundled templates.
 ///
 /// `tag` — Docker image tag substituted into all `{{AEGIS_IMAGE_TAG}}` placeholders
-/// in the compose template (e.g. `"0.11.0-pre-alpha"` or `"latest"`).
+/// in the compose template (e.g. `"0.1.0-pre-alpha"` or `"latest"`).
 pub async fn fetch_stack(tag: &str) -> Result<StackFiles> {
     println!();
     println!("{}", "Loading bundled stack templates...".bold());

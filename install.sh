@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-AEGIS_VERSION="${AEGIS_VERSION:-0.11.0-pre-alpha}"
+AEGIS_VERSION="${AEGIS_VERSION:-0.12.0-pre-alpha}"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
