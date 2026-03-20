@@ -59,6 +59,7 @@ pub mod smcp_session_repository;
 pub mod stimulus;
 pub mod storage;
 pub mod supervisor;
+pub mod tenant;
 pub mod validation;
 pub mod volume;
 pub mod workflow;

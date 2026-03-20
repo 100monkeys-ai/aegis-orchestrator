@@ -24,11 +24,12 @@
 //! Agent container  ← uses JWT in every subsequent SmcpEnvelope
 //! ```
 //!
-//! ## Phase Note
+//! ## Context Resolution
 //!
-//! ⚠️ Phase 1 — Context resolution hard-codes `"default"` as the security context
-//! name. Phase 2 will look up the context name from the agent manifest via the
-//! `ExecutionRepository`.
+//! Attestation must bind the issued token to a real execution-specific or
+//! manifest-specific SMCP `SecurityContext`. If that mapping is unavailable,
+//! attestation fails closed rather than minting a token against an inferred
+//! default context.
 //!
 //! See ADR-035 §4.1, AGENTS.md §Attestation.
 
@@ -70,6 +71,19 @@ impl AttestationServiceImpl {
             token_issuer,
         }
     }
+
+    fn resolve_security_context_name(&self, request: &AttestationRequest) -> Result<String> {
+        tracing::warn!(
+            agent_id = %request.agent_id,
+            execution_id = %request.execution_id,
+            "Rejecting SMCP attestation because no execution-bound security context can be derived"
+        );
+        Err(anyhow::anyhow!(
+            "SMCP attestation requires an execution-bound or manifest-bound security context; none can be derived for agent {} execution {}",
+            request.agent_id,
+            request.execution_id
+        ))
+    }
 }
 
 #[async_trait]
@@ -79,11 +93,10 @@ impl AttestationService for AttestationServiceImpl {
         let execution_id = ExecutionId(uuid::Uuid::parse_str(&request.execution_id)?);
 
         // 1. Resolve agent identity and applicable security context.
-        // For MVP, we'll try to load "default" context. If it doesn't exist, we error.
-        let context_name = "default";
+        let context_name = self.resolve_security_context_name(&request)?;
         let security_context = self
             .security_context_repo
-            .find_by_name(context_name)
+            .find_by_name(&context_name)
             .await?
             .ok_or_else(|| {
                 anyhow::anyhow!(

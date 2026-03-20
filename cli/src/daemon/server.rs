@@ -6,17 +6,24 @@
 //!
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** Implements internal responsibilities for server
+//!
+//! # Code Quality Principles
+//!
+//! - Keep HTTP handlers thin and delegate business logic to application services.
+//! - Fail closed on auth, readiness, and runtime initialization boundaries.
+//! - Avoid exposing partial protocol support through the public transport surface.
 
 use anyhow::{Context, Result};
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{
         sse::{Event, Sse},
         IntoResponse,
     },
     routing::{get, post},
-    Json, Router,
+    Extension, Json, Router,
 };
 
 /// Extract the final output from the last iteration of an execution.
@@ -62,13 +69,16 @@ use aegis_orchestrator_core::{
         agent::AgentId,
         execution::ExecutionId,
         execution::ExecutionInput,
+        iam::{IdentityKind, IdentityProvider, UserIdentity},
         node_config::{resolve_env_value, NodeConfigManifest},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
+        tenant::TenantId,
     },
     infrastructure::{
         event_bus::EventBus,
+        iam::StandardIamService,
         llm::registry::ProviderRegistry,
         repositories::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
@@ -98,6 +108,15 @@ fn resolve_generated_artifacts_root(config_path: Option<&PathBuf>) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".aegis"));
 
     base_dir.join("generated")
+}
+
+fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
+    match identity.map(|identity| &identity.identity_kind) {
+        Some(IdentityKind::TenantUser { tenant_slug }) => {
+            TenantId::from_string(tenant_slug).unwrap_or_else(|_| TenantId::local_default())
+        }
+        _ => TenantId::local_default(),
+    }
 }
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
@@ -130,6 +149,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     config
         .validate()
         .context("Configuration validation failed")?;
+
+    if config.is_production()
+        && config
+            .spec
+            .temporal
+            .as_ref()
+            .is_some_and(|temporal| temporal.worker_secret.is_none())
+    {
+        anyhow::bail!(
+            "Production nodes with spec.temporal configured must set spec.temporal.worker_secret"
+        );
+    }
 
     // Initialize metrics if enabled (ADR-058 Step 2)
     if config
@@ -253,6 +284,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 Some(db_pool)
             }
             Err(e) => {
+                if config.is_production() {
+                    return Err(anyhow::anyhow!(
+                        "Failed to connect to PostgreSQL in production mode: {e}"
+                    ));
+                }
+
                 tracing::error!(
                     "Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
                     e
@@ -262,6 +299,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     } else {
+        if config.is_production() {
+            return Err(anyhow::anyhow!(
+                "Production mode requires spec.database; refusing to fall back to InMemory repositories"
+            ));
+        }
+
         println!("No database configured (spec.database omitted). Using InMemory repositories.");
         None
     };
@@ -286,6 +329,19 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
 
     let event_bus = Arc::new(EventBus::new(100));
+    let iam_service: Option<Arc<dyn IdentityProvider>> = config.spec.iam.as_ref().map(|iam| {
+        Arc::new(StandardIamService::new(iam, event_bus.clone())) as Arc<dyn IdentityProvider>
+    });
+
+    if config.is_production()
+        && config
+            .spec
+            .iam
+            .as_ref()
+            .is_some_and(|iam| iam.realms.is_empty())
+    {
+        anyhow::bail!("Production nodes must configure at least one IAM realm");
+    }
 
     println!("Initializing LLM registry...");
     let llm_registry = Arc::new(
@@ -611,6 +667,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Initializing workflow engine...");
 
     // Initialize Temporal Client — read from config (spec.temporal)
+    let temporal_required = config.spec.temporal.is_some();
     let temporal_config = config.spec.temporal.clone().unwrap_or_default();
     let temporal_address =
         resolve_env_value(&temporal_config.address).unwrap_or_else(|_| "temporal:7233".to_string());
@@ -638,70 +695,69 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let temporal_address_clone = temporal_address.clone();
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
 
-    /// Maximum number of retries when attempting to establish the Temporal connection.
-    ///
-    /// With the current 2-second backoff between attempts, `30` retries corresponds to
-    /// roughly one minute of retrying before giving up. This value is intended to balance
-    /// resilience to short-lived outages during startup against delaying server readiness
-    /// for too long in the face of persistent misconfiguration or a down Temporal cluster.
-    ///
-    /// If this maximum is reached, the daemon stops retrying, logs a warning and an error,
-    /// and continues running without an active Temporal client. As a result, any workflow
-    /// execution that depends on Temporal will fail until the process is restarted or the
-    /// connection is re-established by other means.
     const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
 
-    // Spawn background task to connect
-    tokio::spawn(async move {
+    async fn connect_temporal_with_retry(
+        temporal_address: &str,
+        temporal_namespace: &str,
+        temporal_task_queue: &str,
+        worker_http_endpoint: &str,
+    ) -> Result<Arc<TemporalClient>> {
         let mut retries: i32 = 0;
 
         loop {
             match TemporalClient::new(
-                &temporal_address_clone,
-                &temporal_namespace,
-                &temporal_task_queue,
-                &worker_http_endpoint_clone,
+                temporal_address,
+                temporal_namespace,
+                temporal_task_queue,
+                worker_http_endpoint,
             )
             .await
             {
                 Ok(client) => {
-                    println!("Async: Temporal Client connected successfully.");
-                    let client = Arc::new(client);
-                    let mut lock = temporal_client_container_clone.write().await;
-                    *lock = Some(client.clone());
-                    drop(lock);
-
-                    let mut workflow_lock = workflow_engine_container_clone.write().await;
-                    *workflow_lock = Some(
-                        client
-                            as Arc<
-                                dyn aegis_orchestrator_core::application::ports::WorkflowEnginePort,
-                            >,
-                    );
-                    break;
+                    println!("Temporal Client connected successfully.");
+                    return Ok(Arc::new(client));
                 }
                 Err(e) => {
                     retries += 1;
                     if retries >= TEMPORAL_CONNECTION_MAX_RETRIES {
-                        println!("Async WARNING: Failed to connect to Temporal after {retries} attempts. Giving up. Workflow execution will fail.");
-                        tracing::error!("Async: Failed to connect to Temporal: {}. Giving up.", e);
-                        break;
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Failed to connect to Temporal at {temporal_address} after {retries} attempts"
+                            )
+                        });
                     }
 
                     if retries % 5 == 0 {
                         println!(
-                            "Async INFO: Still verifying Temporal connection... ({retries}/{TEMPORAL_CONNECTION_MAX_RETRIES})"
+                            "Still verifying Temporal connection... ({retries}/{TEMPORAL_CONNECTION_MAX_RETRIES})"
                         );
                     }
-                    tracing::debug!(
-                        "Async: Failed to connect to Temporal: {}. Retrying in 2s...",
-                        e
-                    );
+                    tracing::debug!("Failed to connect to Temporal: {}. Retrying in 2s...", e);
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
         }
-    });
+    }
+
+    if temporal_required {
+        let client = connect_temporal_with_retry(
+            &temporal_address_clone,
+            &temporal_namespace,
+            &temporal_task_queue,
+            &worker_http_endpoint_clone,
+        )
+        .await?;
+
+        let mut lock = temporal_client_container_clone.write().await;
+        *lock = Some(client.clone());
+        drop(lock);
+
+        let mut workflow_lock = workflow_engine_container_clone.write().await;
+        *workflow_lock = Some(
+            client as Arc<dyn aegis_orchestrator_core::application::ports::WorkflowEnginePort>,
+        );
+    }
 
     // Initialize SMCP / Tool Routing Services (now hoisted for ExecutionService dependency)
     println!("Initializing SMCP & Tool Routing services...");
@@ -1494,7 +1550,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             None => {
                 warn!("No spec.secrets.backend configured; using in-memory secret store (development/testing only, not production-safe)");
                 Arc::new(aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager::from_store(
-                    Arc::new(aegis_orchestrator_core::infrastructure::secrets_manager::MockSecretStore::new()),
+                    Arc::new(aegis_orchestrator_core::infrastructure::secrets_manager::TestSecretStore::new()),
                     event_bus.clone(),
                 ))
             }
@@ -1621,7 +1677,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Building router...");
     // Build HTTP router
-    let app = create_router(Arc::new(app_state));
+    let app = create_router(Arc::new(app_state), iam_service.clone());
 
     // Start HTTP server
     let bind_addr = if let Some(network) = &config.spec.network {
@@ -1688,6 +1744,24 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
     let agent_service_for_grpc: Arc<dyn AgentLifecycleService> = agent_service.clone();
+    let grpc_auth = match (&iam_service, config.spec.grpc_auth.clone()) {
+        (Some(iam), Some(grpc_auth)) if grpc_auth.enabled => Some(
+            aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
+                iam.clone(),
+                &grpc_auth,
+            ),
+        ),
+        (Some(iam), None) => Some(
+            aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
+                iam.clone(),
+                &aegis_orchestrator_core::domain::node_config::GrpcAuthConfig {
+                    enabled: true,
+                    exempt_methods: vec![],
+                },
+            ),
+        ),
+        _ => None,
+    };
 
     tokio::spawn(async move {
         tracing::info!("Starting gRPC server on {}", grpc_addr);
@@ -1696,6 +1770,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             grpc_addr,
             exec_service_clone,
             val_service_clone,
+            grpc_auth,
             Some(attestation_service),
             Some(tool_invocation_service),
             cortex_client,
@@ -1790,12 +1865,14 @@ struct RegisterWorkflowQuery {
 
 async fn register_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<RegisterWorkflowQuery>,
     body: String,
 ) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .register_workflow_use_case
-        .register_workflow(&body, query.force)
+        .register_workflow_for_tenant(&tenant_id, &body, query.force)
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
@@ -1813,8 +1890,12 @@ async fn register_temporal_workflow_handler(
 /// Phase 2: Uses StandardStartWorkflowExecutionUseCase with Temporal
 async fn execute_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<StartWorkflowExecutionRequest>,
+    identity: Option<Extension<UserIdentity>>,
+    Json(mut request): Json<StartWorkflowExecutionRequest>,
 ) -> impl IntoResponse {
+    request.tenant_id.get_or_insert_with(|| {
+        tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0))
+    });
     match state
         .start_workflow_execution_use_case
         .start_execution(request)
@@ -1839,6 +1920,7 @@ struct RunWorkflowLegacyRequest {
 
 async fn run_workflow_legacy_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
     Json(request): Json<RunWorkflowLegacyRequest>,
 ) -> impl IntoResponse {
@@ -1846,8 +1928,11 @@ async fn run_workflow_legacy_handler(
         workflow_id: name,
         input: request.input,
         blackboard: None,
+        tenant_id: Some(tenant_id_from_identity(
+            identity.as_ref().map(|identity| &identity.0),
+        )),
     };
-    execute_temporal_workflow_handler(State(state), Json(req)).await
+    execute_temporal_workflow_handler(State(state), identity, Json(req)).await
 }
 
 /// POST /v1/temporal-events - Receive events from Temporal worker
@@ -1905,8 +1990,11 @@ async fn temporal_events_handler(
 }
 
 /// Create the HTTP router with all routes
-fn create_router(app_state: Arc<AppState>) -> Router {
-    Router::new()
+fn create_router(
+    app_state: Arc<AppState>,
+    iam_service: Option<Arc<dyn IdentityProvider>>,
+) -> Router {
+    let router = Router::new()
         .route("/health", get(health_handler))
         .route("/v1/agents/{agent_id}/execute", post(execute_agent_handler))
         .route("/v1/executions/{execution_id}", get(get_execution_handler))
@@ -1991,7 +2079,16 @@ fn create_router(app_state: Arc<AppState>) -> Router {
         )
         .route("/v1/smcp/attest", post(attest_smcp_handler))
         .route("/v1/smcp/invoke", post(invoke_smcp_handler))
-        .with_state(app_state)
+        .with_state(app_state);
+
+    if let Some(iam_service) = iam_service {
+        router.layer(middleware::from_fn_with_state(
+            iam_service,
+            aegis_orchestrator_core::presentation::keycloak_auth::iam_auth_middleware,
+        ))
+    } else {
+        router
+    }
 }
 
 // Application state
@@ -2039,13 +2136,15 @@ struct DeployAgentQuery {
 
 async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<DeployAgentQuery>,
     Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     // SDK now re-exports core types, so no conversion needed
     match state
         .agent_service
-        .deploy_agent(manifest, query.force)
+        .deploy_agent_for_tenant(&tenant_id, manifest, query.force)
         .await
     {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
@@ -2063,12 +2162,25 @@ struct ExecuteRequest {
 
 async fn execute_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
     Json(request): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let payload = match request.input {
+        serde_json::Value::Object(mut map) => {
+            map.entry("tenant_id".to_string())
+                .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
+            serde_json::Value::Object(map)
+        }
+        value => serde_json::json!({
+            "input": value,
+            "tenant_id": tenant_id.to_string(),
+        }),
+    };
     let input = ExecutionInput {
-        intent: Some(request.input.to_string()), // Simplified assumption
-        payload: request.input,
+        intent: Some(payload.to_string()),
+        payload,
     };
 
     match state
@@ -2089,11 +2201,13 @@ async fn execute_agent_handler(
 
 async fn get_execution_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
-        .get_execution(ExecutionId(execution_id))
+        .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
         Ok(exec) => Json(serde_json::json!({
@@ -2109,11 +2223,13 @@ async fn get_execution_handler(
 
 async fn cancel_execution_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
-        .cancel_execution(ExecutionId(execution_id))
+        .cancel_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
         Ok(_) => Json(serde_json::json!({"success": true})),
@@ -2123,17 +2239,22 @@ async fn cancel_execution_handler(
 
 async fn stream_events_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
     let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_execution(exec_id);
 
     // 2. Fetch history
-    let execution_result = state.execution_service.get_execution(exec_id).await;
+    let execution_result = state
+        .execution_service
+        .get_execution_for_tenant(&tenant_id, exec_id)
+        .await;
 
     let stream = async_stream::stream! {
         // 3. Replay history if execution exists
@@ -2321,11 +2442,13 @@ async fn stream_events_handler(
 
 async fn stream_agent_events_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
     let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     // 1. Subscribe FIRST to catch any events that happen while we fetch history
     let mut receiver = state.event_bus.subscribe_agent(aid);
@@ -2333,7 +2456,7 @@ async fn stream_agent_events_handler(
     // 2. Fetch all executions for this agent
     let executions_result = state
         .execution_service
-        .list_executions(Some(aid), 100)
+        .list_executions_for_tenant(&tenant_id, Some(aid), 100)
         .await;
 
     let stream = async_stream::stream! {
@@ -2605,11 +2728,13 @@ async fn stream_agent_events_handler(
 
 async fn delete_execution_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
-        .delete_execution(ExecutionId(execution_id))
+        .delete_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
         Ok(_) => Json(serde_json::json!({"success": true})),
@@ -2632,14 +2757,16 @@ const MAX_EXECUTION_LIST_LIMIT: usize = 1000;
 
 async fn list_executions_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<ListExecutionsQuery>,
 ) -> Json<serde_json::Value> {
     let agent_id = query.agent_id.map(AgentId);
     let limit = query.limit.unwrap_or(20).min(MAX_EXECUTION_LIST_LIMIT);
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     match state
         .execution_service
-        .list_executions(agent_id, limit)
+        .list_executions_for_tenant(&tenant_id, agent_id, limit)
         .await
     {
         Ok(executions) => {
@@ -2661,8 +2788,12 @@ async fn list_executions_handler(
     }
 }
 
-async fn list_agents_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    match state.agent_service.list_agents().await {
+async fn list_agents_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+) -> Json<serde_json::Value> {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state.agent_service.list_agents_for_tenant(&tenant_id).await {
         Ok(agents) => {
             let json_agents: Vec<serde_json::Value> = agents.into_iter().map(|agent| {
                 serde_json::json!({
@@ -2681,9 +2812,15 @@ async fn list_agents_handler(State(state): State<Arc<AppState>>) -> Json<serde_j
 
 async fn delete_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    match state.agent_service.delete_agent(AgentId(agent_id)).await {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .agent_service
+        .delete_agent_for_tenant(&tenant_id, AgentId(agent_id))
+        .await
+    {
         Ok(_) => Json(serde_json::json!({"success": true})),
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
@@ -2691,9 +2828,15 @@ async fn delete_agent_handler(
 
 async fn get_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    match state.agent_service.get_agent(AgentId(id)).await {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .agent_service
+        .get_agent_for_tenant(&tenant_id, AgentId(id))
+        .await
+    {
         Ok(agent) => Json(
             serde_json::to_value(agent.manifest)
                 .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
@@ -2704,9 +2847,15 @@ async fn get_agent_handler(
 
 async fn lookup_agent_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.agent_service.lookup_agent(&name).await {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .agent_service
+        .lookup_agent_for_tenant(&tenant_id, &name)
+        .await
+    {
         Ok(Some(id)) => (StatusCode::OK, Json(serde_json::json!({"id": id.0}))),
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -2873,8 +3022,16 @@ async fn dispatch_gateway_handler(
 // ========================================
 
 /// GET /v1/workflows - List all workflows
-async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let workflows = state.workflow_repo.list_all().await.unwrap_or_default();
+async fn list_workflows_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let workflows = state
+        .workflow_repo
+        .list_all_for_tenant(&tenant_id)
+        .await
+        .unwrap_or_default();
 
     let workflow_list: Vec<serde_json::Value> = workflows
         .iter()
@@ -2894,8 +3051,10 @@ async fn list_workflows_handler(State(state): State<Arc<AppState>>) -> impl Into
 /// GET /v1/workflows/executions - List workflow executions (paginated, newest first)
 async fn list_workflow_executions_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let limit = params
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -2907,7 +3066,7 @@ async fn list_workflow_executions_handler(
 
     match state
         .workflow_execution_repo
-        .list_paginated(limit, offset)
+        .list_paginated_for_tenant(&tenant_id, limit, offset)
         .await
     {
         Ok(executions) => {
@@ -2937,11 +3096,18 @@ async fn list_workflow_executions_handler(
 /// GET /v1/workflows/:name - Get workflow YAML
 async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
     use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 
-    match state.workflow_repo.find_by_name(&name).await {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+
+    match state
+        .workflow_repo
+        .find_by_name_for_tenant(&tenant_id, &name)
+        .await
+    {
         Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {
             Ok(yaml) => (StatusCode::OK, yaml),
             Err(e) => (
@@ -2959,11 +3125,21 @@ async fn get_workflow_handler(
 /// DELETE /v1/workflows/:name - Delete workflow
 async fn delete_workflow_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    match state.workflow_repo.find_by_name(&name).await {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_repo
+        .find_by_name_for_tenant(&tenant_id, &name)
+        .await
+    {
         Ok(Some(workflow)) => {
-            if let Err(e) = state.workflow_repo.delete(workflow.id).await {
+            if let Err(e) = state
+                .workflow_repo
+                .delete_for_tenant(&tenant_id, workflow.id)
+                .await
+            {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": e.to_string()})),
@@ -2981,8 +3157,32 @@ async fn delete_workflow_handler(
 /// GET /v1/workflows/executions/:execution_id - Get execution details
 async fn get_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
 ) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
     let guard = state.temporal_client_container.read().await;
     let client = match guard.as_ref() {
         Some(c) => c.clone(),

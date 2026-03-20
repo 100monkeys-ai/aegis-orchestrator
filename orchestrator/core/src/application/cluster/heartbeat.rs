@@ -37,7 +37,8 @@ impl HeartbeatUseCase {
         // 1. Record heartbeat and utilization snapshot
         let snapshot = ResourceSnapshot {
             cpu_utilization: req.cpu_utilization_percent,
-            gpu_utilization: 0.0, // TODO: Get from request if proto updated
+            // The current single-node cluster heartbeat proto does not carry GPU utilization.
+            gpu_utilization: 0.0,
             active_executions: req.active_executions,
         };
 
@@ -45,9 +46,8 @@ impl HeartbeatUseCase {
             .record_heartbeat(&req.node_id, snapshot)
             .await?;
 
-        // 2. Fetch pending commands (if any)
-        // For Phase 1, we don't have a command queue yet, so return empty.
-        // But let's check if the node is marked as Draining in the repo.
+        // 2. The single-node Phase 1 baseline has no command queue; only synthesize a drain
+        // command when the repository already marks the peer as draining.
         let mut pending_commands = Vec::new();
 
         if let Some(peer) = self.cluster_repo.find_peer(&req.node_id).await? {

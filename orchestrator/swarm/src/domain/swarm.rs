@@ -13,7 +13,7 @@
 use aegis_orchestrator_core::domain::agent::AgentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Unique identifier for a [`Swarm`].
@@ -33,23 +33,61 @@ impl Default for SwarmId {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SwarmStatus {
+    Active,
+    Dissolving,
+    Dissolved,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancellationReason {
+    ParentCancelled,
+    Manual,
+    AllChildrenComplete,
+    SecurityViolation,
+}
+
 /// Aggregate root for a group of coordinated agents (BC-6).
-///
-/// A `Swarm` is created when an agent spawns child agents. It tracks membership
-/// and provides the basis for cascade cancellation and resource lock deconfliction.
-///
-/// # Invariants
-///
-/// - An agent may only belong to one swarm at a time.
-/// - Removing the last agent dissolves the swarm.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Swarm {
-    /// Unique swarm identifier.
     pub id: SwarmId,
-    /// Set of all `AgentId`s participating in this swarm.
-    pub agents: HashSet<AgentId>,
-    /// When the swarm was created (first child spawned).
+    pub parent_agent_id: AgentId,
+    /// Tracks the current members keyed by their synthetic child slot.
+    pub members: HashMap<Uuid, AgentId>,
+    pub status: SwarmStatus,
     pub created_at: DateTime<Utc>,
+}
+
+impl Swarm {
+    pub fn new(parent_agent_id: AgentId) -> Self {
+        Self {
+            id: SwarmId::new(),
+            parent_agent_id,
+            members: HashMap::new(),
+            status: SwarmStatus::Active,
+            created_at: Utc::now(),
+        }
+    }
+
+    pub fn add_member(&mut self, agent_id: AgentId) {
+        self.members.insert(Uuid::new_v4(), agent_id);
+    }
+
+    pub fn contains(&self, agent_id: AgentId) -> bool {
+        agent_id == self.parent_agent_id || self.members.values().any(|member| *member == agent_id)
+    }
+
+    pub fn member_ids(&self) -> Vec<AgentId> {
+        let mut ids = Vec::with_capacity(self.members.len() + 1);
+        ids.push(self.parent_agent_id);
+        ids.extend(self.members.values().copied());
+        ids
+    }
+
+    pub fn dissolve(&mut self) {
+        self.status = SwarmStatus::Dissolved;
+    }
 }
 
 /// Optimistic resource lock held by an agent within a swarm.
@@ -59,10 +97,16 @@ pub struct Swarm {
 /// completion in Phase 1 (see AGENTS.md §Swarm Coordination Context).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceLock {
-    /// Opaque identifier for the locked resource (e.g. file path, DB row key).
     pub resource_id: String,
-    /// The agent currently holding the lock.
     pub held_by: AgentId,
-    /// When the lock was acquired.
     pub acquired_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageEnvelope {
+    pub from: AgentId,
+    pub to: AgentId,
+    pub payload: Vec<u8>,
+    pub sent_at: DateTime<Utc>,
 }

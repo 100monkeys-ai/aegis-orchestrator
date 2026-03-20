@@ -392,18 +392,18 @@ impl SecretStore for OpenBaoSecretStore {
 }
 
 // ---------------------------------------------------------------------------
-// MockSecretStore — in-memory implementation for unit tests
+// TestSecretStore - in-memory implementation for unit tests
 // ---------------------------------------------------------------------------
 
-/// In-memory mock for `SecretStore` used in unit tests (ADR-034 §Consequences).
+/// In-memory test store for `SecretStore` used in unit tests (ADR-034 §Consequences).
 ///
 /// Stores KV data in a `HashMap`, returns deterministic results for transit
 /// operations, and generates synthetic dynamic secrets.
-pub struct MockSecretStore {
+pub struct TestSecretStore {
     kv_store: RwLock<HashMap<String, HashMap<String, SensitiveString>>>,
 }
 
-impl MockSecretStore {
+impl TestSecretStore {
     pub fn new() -> Self {
         Self {
             kv_store: RwLock::new(HashMap::new()),
@@ -415,14 +415,14 @@ impl MockSecretStore {
     }
 }
 
-impl Default for MockSecretStore {
+impl Default for TestSecretStore {
     fn default() -> Self {
         Self::new()
     }
 }
 
 #[async_trait]
-impl SecretStore for MockSecretStore {
+impl SecretStore for TestSecretStore {
     async fn read(
         &self,
         engine: &str,
@@ -454,15 +454,15 @@ impl SecretStore for MockSecretStore {
         role: &str,
     ) -> Result<DomainDynamicSecret, SecretsError> {
         Ok(DomainDynamicSecret {
-            lease_id: format!("{engine}/creds/{role}/lease-mock-001"),
+            lease_id: format!("{engine}/creds/{role}/lease-test-001"),
             values: HashMap::from([
                 (
                     "username".to_string(),
-                    SensitiveString::new(format!("v-mock-{role}-abc123")),
+                    SensitiveString::new(format!("v-test-{role}-abc123")),
                 ),
                 (
                     "password".to_string(),
-                    SensitiveString::new("mock-dynamic-password"),
+                    SensitiveString::new("test-dynamic-password"),
                 ),
             ]),
             lease_duration: Duration::from_secs(300),
@@ -484,7 +484,7 @@ impl SecretStore for MockSecretStore {
     }
 
     async fn transit_sign(&self, key_name: &str, data: &[u8]) -> Result<String, SecretsError> {
-        // Deterministic mock signature: "secret:v1:<key_name>:<base64(data)>"
+        // Deterministic test signature: "secret:v1:<key_name>:<base64(data)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(data);
         Ok(format!("secret:v1:{key_name}:{encoded}"))
     }
@@ -504,7 +504,7 @@ impl SecretStore for MockSecretStore {
         key_name: &str,
         plaintext: &[u8],
     ) -> Result<String, SecretsError> {
-        // Deterministic mock ciphertext: "secret:v1:<key_name>:<base64(plaintext)>"
+        // Deterministic test ciphertext: "secret:v1:<key_name>:<base64(plaintext)>"
         let encoded = base64::engine::general_purpose::STANDARD.encode(plaintext);
         Ok(format!("secret:v1:{key_name}:{encoded}"))
     }
@@ -517,7 +517,7 @@ impl SecretStore for MockSecretStore {
         let prefix = format!("secret:v1:{key_name}:");
         let encoded = ciphertext.strip_prefix(&prefix).ok_or_else(|| {
             SecretsError::TransitError(format!(
-                "Invalid mock ciphertext format (expected prefix '{prefix}')"
+                "Invalid test ciphertext format (expected prefix '{prefix}')"
             ))
         })?;
         base64::engine::general_purpose::STANDARD
@@ -851,16 +851,16 @@ impl SecretsManager {
 mod tests {
     use super::*;
 
-    fn mock_store() -> Arc<MockSecretStore> {
-        Arc::new(MockSecretStore::new())
+    fn test_store() -> Arc<TestSecretStore> {
+        Arc::new(TestSecretStore::new())
     }
 
-    fn mock_event_bus() -> Arc<EventBus> {
+    fn test_event_bus() -> Arc<EventBus> {
         Arc::new(EventBus::new(16))
     }
 
-    fn mock_manager() -> SecretsManager {
-        SecretsManager::from_store(mock_store(), mock_event_bus())
+    fn test_manager() -> SecretsManager {
+        SecretsManager::from_store(test_store(), test_event_bus())
     }
 
     fn test_context() -> AccessContext {
@@ -874,11 +874,11 @@ mod tests {
             .collect()
     }
 
-    // -- MockSecretStore KV tests --
+    // -- TestSecretStore KV tests --
 
     #[tokio::test]
-    async fn test_mock_secret_store_read_write() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_read_write() {
+        let store = TestSecretStore::new();
         let data = sensitive_map(&[("api_key", "sk-abc123"), ("region", "us-east-1")]);
 
         store.write("kv", "openai", data.clone()).await.unwrap();
@@ -888,17 +888,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_secret_store_read_not_found() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_read_not_found() {
+        let store = TestSecretStore::new();
         let result = store.read("kv", "nonexistent").await;
         assert!(matches!(result, Err(SecretsError::SecretNotFound { .. })));
     }
 
-    // -- MockSecretStore Transit tests --
+    // -- TestSecretStore Transit tests --
 
     #[tokio::test]
-    async fn test_mock_secret_store_transit_sign_verify() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_transit_sign_verify() {
+        let store = TestSecretStore::new();
         let data = b"agent output payload";
         let signature = store.transit_sign("agent-identity", data).await.unwrap();
 
@@ -918,8 +918,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_secret_store_transit_encrypt_decrypt() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_transit_encrypt_decrypt() {
+        let store = TestSecretStore::new();
         let plaintext = b"workflow blackboard state with PII";
 
         let ciphertext = store
@@ -936,8 +936,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_secret_store_transit_decrypt_wrong_key() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_transit_decrypt_wrong_key() {
+        let store = TestSecretStore::new();
         let plaintext = b"data";
 
         let ciphertext = store.transit_encrypt("key-a", plaintext).await.unwrap();
@@ -946,11 +946,11 @@ mod tests {
         assert!(matches!(result, Err(SecretsError::TransitError(_))));
     }
 
-    // -- MockSecretStore Dynamic Secrets tests --
+    // -- TestSecretStore Dynamic Secrets tests --
 
     #[tokio::test]
-    async fn test_mock_secret_store_dynamic_secret() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_dynamic_secret() {
+        let store = TestSecretStore::new();
         let creds = store
             .generate_dynamic("database", "agent-readonly")
             .await
@@ -964,8 +964,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mock_secret_store_lease_lifecycle() {
-        let store = MockSecretStore::new();
+    async fn test_secret_store_lease_lifecycle() {
+        let store = TestSecretStore::new();
 
         // Renew returns the requested increment
         let renewed = store
@@ -982,9 +982,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_read_secret_field() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
-        let data = sensitive_map(&[("oauth_token", "ya29.mock"), ("client_id", "123.apps")]);
+        let data = sensitive_map(&[("oauth_token", "ya29.test"), ("client_id", "123.apps")]);
 
         manager
             .store
@@ -996,7 +996,7 @@ mod tests {
             .read_secret_field("kv", "mcp-tools/gmail", "oauth_token", &ctx)
             .await
             .unwrap();
-        assert_eq!(token.expose(), "ya29.mock");
+        assert_eq!(token.expose(), "ya29.test");
 
         // Missing field returns error
         let result = manager
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_sign_verify() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let data = b"code output";
 
         let sig = manager.sign("agent-identity", data).await.unwrap();
@@ -1017,7 +1017,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_encrypt_decrypt() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let plaintext = b"sensitive blackboard data";
 
         let ct = manager
@@ -1030,7 +1030,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_read_cache() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
         let data = sensitive_map(&[("key", "value-123")]);
         manager
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_write_invalidates_cache() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
 
         let initial = sensitive_map(&[("secret", "original")]);
@@ -1078,7 +1078,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_secrets_manager_dynamic_secret() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
 
         let domain = manager
@@ -1095,7 +1095,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_ref_resolution_env() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
         std::env::set_var("AEGIS_TEST_SECRET_XYZ", "test-value-123");
 
@@ -1111,7 +1111,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_ref_resolution_env_missing() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
         let cred = CredentialRef {
             store_type: CredentialStoreType::Environment,
@@ -1126,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
 
         let data = sensitive_map(&[("oauth_token", "ya29.vault-token")]);
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao_no_field() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
 
         let data = sensitive_map(&[("value", "single-secret")]);
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_credential_ref_resolution_openbao_invalid_path() {
-        let manager = mock_manager();
+        let manager = test_manager();
         let ctx = test_context();
         let cred = CredentialRef {
             store_type: CredentialStoreType::SecretStore,

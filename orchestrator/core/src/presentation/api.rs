@@ -64,6 +64,9 @@ pub struct AppState {
     pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
     /// SMCP tool invocation service (ADR-033). Optional until wired.
     pub tool_invocation_service: Option<Arc<ToolInvocationService>>,
+    /// SMCP attestation service (ADR-035). Optional until wired by the daemon.
+    pub attestation_service:
+        Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
     /// Workflow execution repository for event-log snapshots (BC-3). Optional until wired.
     pub workflow_execution_repo: Option<Arc<dyn WorkflowExecutionRepository>>,
     /// Event bus for workflow SSE streaming (ADR-030). Optional until wired.
@@ -90,6 +93,7 @@ pub fn app(
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
         tool_invocation_service: None,
+        attestation_service: None,
         workflow_execution_repo: None,
         event_bus: None,
     });
@@ -136,6 +140,7 @@ pub fn app_with_inner_loop(
         stimulus_service: None,
         webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
         tool_invocation_service: None,
+        attestation_service: None,
         workflow_execution_repo: None,
         event_bus: None,
     });
@@ -252,7 +257,7 @@ struct WorkflowLogsQuery {
 /// `GET /v1/workflows/executions/:id/logs` — return the persisted event log
 /// for a workflow execution as a JSON snapshot.
 ///
-/// Returns 404 (bad UUID), 501 (repo not wired), or 200 with the event list.
+/// Returns 400 (bad UUID), 503 (repo unavailable), or 200 with the event list.
 async fn get_workflow_execution_logs(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -273,7 +278,7 @@ async fn get_workflow_execution_logs(
         Some(r) => r.clone(),
         None => {
             return (
-                axum::http::StatusCode::NOT_IMPLEMENTED,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "error": "Workflow execution repository not configured",
                     "execution_id": id,
@@ -496,23 +501,45 @@ pub struct SmcpAttestationRequest {
 /// container identity, looks up the SecurityContext, creates an SmcpSession,
 /// and returns a signed SecurityToken (JWT).
 async fn smcp_attestation(
-    State(_state): State<Arc<AppState>>,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<SmcpAttestationRequest>,
 ) -> impl IntoResponse {
-    // Phase 1: Return a placeholder attestation response.
-    // Phase 2 will wire to AttestationServiceImpl for full crypto flow.
-    tracing::info!(
-        agent_id = %payload.agent_id,
-        execution_id = %payload.execution_id,
-        container_id = %payload.container_id,
-        "SMCP attestation request received"
-    );
+    let attestation_service = match &state.attestation_service {
+        Some(service) => service.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "error": "SMCP attestation service not configured"
+                })),
+            )
+                .into_response();
+        }
+    };
 
-    Json(json!({
-        "security_token": format!("placeholder-token-{}", payload.execution_id),
-        "session_id": uuid::Uuid::new_v4().to_string(),
-        "expires_at": chrono::Utc::now() + chrono::Duration::hours(1),
-    }))
+    let request = crate::infrastructure::smcp::attestation::AttestationRequest {
+        agent_id: payload.agent_id,
+        execution_id: payload.execution_id,
+        container_id: payload.container_id,
+        public_key_pem: payload.agent_public_key,
+    };
+
+    match attestation_service.attest(request).await {
+        Ok(response) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "security_token": response.security_token,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// SMCP tool invocation request payload (ADR-033 §3).
@@ -543,7 +570,7 @@ async fn smcp_tool_invoke(
         Some(svc) => svc.clone(),
         None => {
             return (
-                axum::http::StatusCode::NOT_IMPLEMENTED,
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
                     "error": "SMCP tool invocation service not wired in this configuration"
                 })),

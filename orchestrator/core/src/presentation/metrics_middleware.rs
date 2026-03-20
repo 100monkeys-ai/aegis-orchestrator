@@ -16,6 +16,10 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 use tower::{Layer, Service};
 
+fn normalize_grpc_method(path: &str) -> String {
+    path.trim_matches('/').replace('/', ".").replace(':', "_")
+}
+
 /// Axum middleware that tracks HTTP metrics.
 ///
 /// Tracks:
@@ -92,7 +96,7 @@ where
 
     fn call(&mut self, req: Request<ReqBody>) -> Self::Future {
         let start = Instant::now();
-        let method = req.uri().path().to_string();
+        let method = normalize_grpc_method(req.uri().path());
 
         let mut next_service = self.service.clone();
         Box::pin(async move {

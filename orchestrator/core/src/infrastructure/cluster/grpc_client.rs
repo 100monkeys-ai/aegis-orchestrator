@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # gRPC Client for Cluster Coordination
 
+use anyhow::bail;
+
 #[derive(Debug, Clone)]
 pub struct NodeClusterClient {
     pub endpoint: String,
@@ -13,14 +15,23 @@ impl NodeClusterClient {
     }
 
     pub async fn attest_node(&self) -> anyhow::Result<()> {
-        todo!("Implement NodeClusterClient::attest_node")
+        bail!(
+            "multi-node cluster attestation is disabled in the single-node Phase 1 baseline (endpoint: {})",
+            self.endpoint
+        )
     }
 
     pub async fn heartbeat(&self) -> anyhow::Result<()> {
-        todo!("Implement NodeClusterClient::heartbeat")
+        bail!(
+            "multi-node cluster heartbeats are disabled in the single-node Phase 1 baseline (endpoint: {})",
+            self.endpoint
+        )
     }
 
     pub async fn forward_execution(&self) -> anyhow::Result<()> {
-        todo!("Implement NodeClusterClient::forward_execution")
+        bail!(
+            "multi-node execution forwarding is disabled in the single-node Phase 1 baseline (endpoint: {})",
+            self.endpoint
+        )
     }
 }

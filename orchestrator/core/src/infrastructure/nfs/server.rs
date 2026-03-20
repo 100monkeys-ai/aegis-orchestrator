@@ -179,22 +179,18 @@ impl AegisFsalAdapter {
         }
     }
 
-    /// Get context for a volume, returns default if not found
-    fn get_context(&self, volume_id: VolumeId) -> NfsVolumeContext {
+    /// Get context for a registered volume.
+    fn get_context(
+        &self,
+        volume_id: VolumeId,
+    ) -> Result<NfsVolumeContext, nfsserve::nfs::nfsstat3> {
         self.volume_registry
             .read()
             .get(&volume_id)
             .cloned()
-            .unwrap_or_else(|| {
-                warn!("Volume {} not registered, using default context", volume_id);
-                NfsVolumeContext {
-                    execution_id: ExecutionId::new(),
-                    volume_id,
-                    container_uid: 1000,
-                    container_gid: 1000,
-                    policy: FilesystemPolicy::default(),
-                    mount_point: PathBuf::from("/workspace"),
-                }
+            .ok_or_else(|| {
+                warn!("Volume {} not registered in NFS volume registry", volume_id);
+                nfsserve::nfs::nfsstat3::NFS3ERR_STALE
             })
     }
 
@@ -229,7 +225,10 @@ impl AegisFsalAdapter {
         }
 
         // Get context for this volume
-        let context = self.get_context(volume_id);
+        let context = match self.get_context(volume_id) {
+            Ok(context) => context,
+            Err(_) => return 0,
+        };
 
         // Register new handle
         let handle = AegisFileHandle::new(context.execution_id, volume_id, path);
@@ -244,7 +243,38 @@ impl AegisFsalAdapter {
     ) -> fattr3 {
         use crate::domain::storage::FileType;
 
-        let context = self.get_context(volume_id);
+        let context = match self.get_context(volume_id) {
+            Ok(context) => context,
+            Err(_) => {
+                return fattr3 {
+                    ftype: ftype3::NF3DIR,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: 1000,
+                    gid: 1000,
+                    size: 4096,
+                    used: 4096,
+                    rdev: specdata3 {
+                        specdata1: 0,
+                        specdata2: 0,
+                    },
+                    fsid: 0,
+                    fileid: 0,
+                    atime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    mtime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    ctime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                };
+            }
+        };
 
         let ftype = match attrs.file_type {
             FileType::File => ftype3::NF3REG,
@@ -355,11 +385,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                         })?;
 
                 // Retrieve context ensuring it exists
-                let context = self.get_context(volume_id);
-                if context.volume_id != volume_id {
-                    warn!("Volume {} not registered in NFS Gateway", volume_id_str);
-                    return Err(nfsserve::nfs::nfsstat3::NFS3ERR_NOENT);
-                }
+                let context = self.get_context(volume_id)?;
 
                 // Now we have a real volume! Create the proper root handle for it.
                 let child_path = "/".to_string();
@@ -375,11 +401,7 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // We are inside a real volume.
         // Get context to ensure volume is valid
-        let context = self.get_context(parent_handle.volume_id);
-        if context.volume_id != parent_handle.volume_id {
-            warn!("Volume {} context missing", parent_handle.volume_id);
-            return Err(nfsserve::nfs::nfsstat3::NFS3ERR_STALE);
-        }
+        let _context = self.get_context(parent_handle.volume_id)?;
 
         // Lookup via FSAL (for paths inside the volume)
         let child_handle = self
@@ -490,7 +512,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         }
 
         // Get context for this volume
-        let context = self.get_context(handle.volume_id);
+        let context = self.get_context(handle.volume_id)?;
 
         // For the volume root path "/", return synthetic directory attributes.
         // The volume's existence is already proven by the DB authorization in the FSAL.
@@ -559,7 +581,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .decode_handle(id)
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
-        let context = self.get_context(handle.volume_id);
+        let context = self.get_context(handle.volume_id)?;
 
         let data = self
             .fsal
@@ -591,7 +613,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .decode_handle(id)
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
-        let context = self.get_context(handle.volume_id);
+        let context = self.get_context(handle.volume_id)?;
 
         let _bytes_written = self
             .fsal
@@ -640,7 +662,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
         // Get context for this volume
-        let context = self.get_context(dir_handle.volume_id);
+        let context = self.get_context(dir_handle.volume_id)?;
 
         // Read directory via FSAL
         let entries = self
@@ -704,7 +726,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
         // Get context for this volume
-        let context = self.get_context(parent_handle.volume_id);
+        let context = self.get_context(parent_handle.volume_id)?;
 
         // Get filename
         let name =
@@ -768,7 +790,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
         // Get context for this volume
-        let context = self.get_context(parent_handle.volume_id);
+        let context = self.get_context(parent_handle.volume_id)?;
 
         // Get directory name
         let name =
@@ -822,7 +844,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
         // Get context for this volume
-        let context = self.get_context(parent_handle.volume_id);
+        let context = self.get_context(parent_handle.volume_id)?;
 
         // Get filename
         let name =
@@ -885,7 +907,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
 
         // Get context for this volume
-        let context = self.get_context(from_parent.volume_id);
+        let context = self.get_context(from_parent.volume_id)?;
 
         // Get filenames
         let from_name = std::str::from_utf8(from_filename)

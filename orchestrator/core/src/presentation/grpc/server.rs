@@ -21,11 +21,14 @@ use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionInput;
+use crate::domain::iam::{IdentityKind, UserIdentity};
+use crate::domain::tenant::TenantId;
 
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 60;
 const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 500;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
+use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
 
 // Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
@@ -39,6 +42,7 @@ use crate::infrastructure::aegis_runtime_proto::*;
 pub struct AegisRuntimeService {
     execution_service: Arc<dyn ExecutionService>,
     validation_service: Arc<ValidationService>,
+    grpc_auth: Option<GrpcIamAuthInterceptor>,
     attestation_service:
         Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
     tool_invocation_service:
@@ -53,6 +57,15 @@ pub struct AegisRuntimeService {
 }
 
 impl AegisRuntimeService {
+    fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
+        match identity.map(|identity| &identity.identity_kind) {
+            Some(IdentityKind::TenantUser { tenant_slug }) => {
+                TenantId::from_string(tenant_slug).unwrap_or_else(|_| TenantId::local_default())
+            }
+            _ => TenantId::local_default(),
+        }
+    }
+
     pub fn new(
         execution_service: Arc<dyn ExecutionService>,
         validation_service: Arc<ValidationService>,
@@ -60,6 +73,7 @@ impl AegisRuntimeService {
         Self {
             execution_service,
             validation_service,
+            grpc_auth: None,
             attestation_service: None,
             tool_invocation_service: None,
             cortex_client: None,
@@ -79,6 +93,12 @@ impl AegisRuntimeService {
     ) -> Self {
         self.attestation_service = Some(attestation_service);
         self.tool_invocation_service = Some(tool_invocation_service);
+        self
+    }
+
+    /// Enable IAM/OIDC auth checks on protected gRPC methods.
+    pub fn with_grpc_auth(mut self, interceptor: GrpcIamAuthInterceptor) -> Self {
+        self.grpc_auth = Some(interceptor);
         self
     }
 
@@ -113,6 +133,18 @@ impl AegisRuntimeService {
     pub fn into_server(self) -> AegisRuntimeServer<Self> {
         AegisRuntimeServer::new(self)
     }
+
+    async fn authorize<T>(
+        &self,
+        request: &Request<T>,
+        method: &str,
+    ) -> Result<Option<UserIdentity>, Status> {
+        if let Some(interceptor) = &self.grpc_auth {
+            return validate_grpc_request(interceptor, request, method).await;
+        }
+
+        Ok(None)
+    }
 }
 
 #[tonic::async_trait]
@@ -125,13 +157,17 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteAgentRequest>,
     ) -> Result<Response<Self::ExecuteAgentStream>, Status> {
+        let identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteAgent")
+            .await?;
         let req = request.into_inner();
+        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
 
         // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
         let agent_id = if let Ok(id) = AgentId::from_string(&req.agent_id) {
             id
         } else if let Some(ref svc) = self.agent_service {
-            match svc.lookup_agent(&req.agent_id).await {
+            match svc.lookup_agent_for_tenant(&tenant_id, &req.agent_id).await {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     return Err(Status::not_found(format!(
@@ -168,7 +204,8 @@ impl AegisRuntime for AegisRuntimeService {
             intent: None, // Let ExecutionService render agent's prompt_template
             payload: serde_json::json!({
                 "input": req.input,  // User-provided input
-                "context": payload   // Additional context if provided
+                "context": payload,  // Additional context if provided
+                "tenant_id": tenant_id.to_string(),
             }),
         };
 
@@ -299,6 +336,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteSystemCommandRequest>,
     ) -> Result<Response<ExecuteSystemCommandResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteSystemCommand")
+            .await?;
         let req = request.into_inner();
 
         // Execute command using tokio::process::Command
@@ -344,6 +384,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ValidateRequest>,
     ) -> Result<Response<ValidateResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/ValidateWithJudges")
+            .await?;
         let req = request.into_inner();
 
         // Parse judge agent IDs and preserve per-judge weights (ADR-017)
@@ -456,6 +499,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<QueryCortexRequest>,
     ) -> Result<Response<QueryCortexResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/QueryCortexPatterns")
+            .await?;
         let req = request.into_inner();
 
         match &self.cortex_client {
@@ -471,6 +517,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<StoreCortexPatternRequest>,
     ) -> Result<Response<StoreCortexPatternResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/StoreCortexPattern")
+            .await?;
         let req = request.into_inner();
 
         match &self.cortex_client {
@@ -488,6 +537,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<StoreTrajectoryPatternRequest>,
     ) -> Result<Response<StoreTrajectoryPatternResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/StoreTrajectoryPattern")
+            .await?;
         let req = request.into_inner();
 
         match &self.cortex_client {
@@ -508,12 +560,14 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<AttestAgentRequest>,
     ) -> Result<Response<AttestAgentResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/AttestAgent")
+            .await?;
         let req = request.into_inner();
 
-        let attestation_service = self
-            .attestation_service
-            .as_ref()
-            .ok_or_else(|| Status::unimplemented("SMCP attestation service is not configured"))?;
+        let attestation_service = self.attestation_service.as_ref().ok_or_else(|| {
+            Status::failed_precondition("SMCP attestation service is not configured")
+        })?;
 
         let attestation_req = crate::infrastructure::smcp::attestation::AttestationRequest {
             agent_id: req.agent_id,
@@ -535,10 +589,13 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<InvokeToolRequest>,
     ) -> Result<Response<InvokeToolResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/InvokeTool")
+            .await?;
         let req = request.into_inner();
 
         let tool_invocation_service = self.tool_invocation_service.as_ref().ok_or_else(|| {
-            Status::unimplemented("SMCP tool invocation service is not configured")
+            Status::failed_precondition("SMCP tool invocation service is not configured")
         })?;
 
         // Construct SmcpEnvelope
@@ -598,13 +655,18 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<IngestStimulusRequest>,
     ) -> Result<Response<IngestStimulusResponse>, Status> {
+        let identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
+            .await?;
         let req = request.into_inner();
+        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
         let (stimulus_id, workflow_execution_id) = self
             .ingest_stimulus_rpc(
                 req.source_name,
                 req.content,
                 req.idempotency_key,
                 req.headers,
+                tenant_id,
             )
             .await?;
         Ok(Response::new(IngestStimulusResponse {
@@ -618,6 +680,9 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteContainerRunRequest>,
     ) -> Result<Response<ExecuteContainerRunResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteContainerRun")
+            .await?;
         let req = request.into_inner();
 
         let use_case = self
@@ -753,11 +818,17 @@ impl AegisRuntimeService {
         content: String,
         idempotency_key: String,
         headers: std::collections::HashMap<String, String>,
+        tenant_id: TenantId,
     ) -> Result<(String, String), Status> {
         let stimulus_service = self
             .stimulus_service
             .as_ref()
             .ok_or_else(|| Status::unavailable("Stimulus service is not configured"))?;
+
+        let mut headers = headers;
+        headers
+            .entry("x-aegis-tenant".to_string())
+            .or_insert_with(|| tenant_id.to_string());
 
         let stimulus = Stimulus::new(StimulusSource::Webhook { source_name }, content)
             .with_headers(headers)
@@ -905,6 +976,7 @@ pub async fn start_grpc_server(
     addr: std::net::SocketAddr,
     execution_service: Arc<dyn ExecutionService>,
     validation_service: Arc<ValidationService>,
+    grpc_auth: Option<GrpcIamAuthInterceptor>,
     attestation_service: Option<
         Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>,
     >,
@@ -916,6 +988,10 @@ pub async fn start_grpc_server(
     agent_service: Arc<dyn AgentLifecycleService>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut service = AegisRuntimeService::new(execution_service, validation_service);
+
+    if let Some(auth) = grpc_auth {
+        service = service.with_grpc_auth(auth);
+    }
 
     if let (Some(a), Some(t)) = (attestation_service, tool_invocation_service) {
         service = service.with_smcp(a, t);

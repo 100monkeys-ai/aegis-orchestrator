@@ -44,6 +44,7 @@
 //! ```
 
 use crate::domain::repository::{RepositoryError, WorkflowRepository};
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{Workflow, WorkflowId};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::Result;
@@ -99,7 +100,11 @@ impl PostgresWorkflowRepository {
 
 #[async_trait]
 impl WorkflowRepository for PostgresWorkflowRepository {
-    async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow: &Workflow,
+    ) -> Result<(), RepositoryError> {
         let definition_json = serde_json::to_value(workflow)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -128,9 +133,9 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflows (id, name, version, description, yaml_source, domain_json, temporal_def_json, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-            ON CONFLICT (name, version) DO UPDATE SET
+            INSERT INTO workflows (id, tenant_id, name, version, description, yaml_source, domain_json, temporal_def_json, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT (tenant_id, name, version) DO UPDATE SET
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
                 domain_json = EXCLUDED.domain_json,
@@ -139,6 +144,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             "#
         )
         .bind(workflow.id.0)
+        .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
         .bind(&description)
@@ -154,9 +160,9 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflow_definitions (workflow_id, name, version, definition, definition_hash, registered_at)
-            VALUES ($1, $2, $3, $4, $5, NOW())
-            ON CONFLICT (name, version) DO UPDATE SET
+            INSERT INTO workflow_definitions (workflow_id, tenant_id, name, version, definition, definition_hash, registered_at)
+            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            ON CONFLICT (tenant_id, name, version) DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
                 definition = EXCLUDED.definition,
                 definition_hash = EXCLUDED.definition_hash,
@@ -164,6 +170,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             "#
         )
         .bind(workflow.id.0)
+        .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
         .bind(&temporal_def_json)
@@ -175,14 +182,19 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         Ok(())
     }
 
-    async fn find_by_id(&self, id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT domain_json
             FROM workflows
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
@@ -200,14 +212,19 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         }
     }
 
-    async fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, RepositoryError> {
+    async fn find_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT domain_json
             FROM workflows
-            WHERE name = $1
+            WHERE tenant_id = $1 AND name = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(name)
         .fetch_optional(&self.pool)
         .await
@@ -225,14 +242,19 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         }
     }
 
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn list_all_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT domain_json
             FROM workflows
+            WHERE tenant_id = $1
             ORDER BY name ASC
             "#,
         )
+        .bind(tenant_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -249,13 +271,18 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         Ok(workflows)
     }
 
-    async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError> {
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> Result<(), RepositoryError> {
         sqlx::query(
             r#"
             DELETE FROM workflow_definitions
-            WHERE workflow_id = $1
+            WHERE tenant_id = $1 AND workflow_id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .execute(&self.pool)
         .await
@@ -264,9 +291,10 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         sqlx::query(
             r#"
             DELETE FROM workflows
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .execute(&self.pool)
         .await

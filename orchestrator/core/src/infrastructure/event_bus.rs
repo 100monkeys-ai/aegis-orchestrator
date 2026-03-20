@@ -38,6 +38,12 @@
 //! | `Iam` | BC-13 | ADR-041 |
 //! | `Secrets` | BC-11 | ADR-034 |
 //!
+//! # Code Quality Principles
+//!
+//! - Keep publish/subscribe semantics in-memory and explicit for the current runtime model.
+//! - Preserve typed domain events; do not smuggle transport-specific payloads through the bus.
+//! - Fail predictably on lag or delivery issues so subscribers can make their own recovery choices.
+//!
 //! ## Phase Notes
 //!
 //! ⚠️ Phase 1 — In-memory only; events are lost on orchestrator restart.
@@ -62,6 +68,25 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::warn;
+
+fn domain_event_type(event: &DomainEvent) -> &'static str {
+    match event {
+        DomainEvent::AgentLifecycle(_) => "agent_lifecycle",
+        DomainEvent::Execution(_) => "execution",
+        DomainEvent::Workflow(_) => "workflow",
+        DomainEvent::Learning(_) => "learning",
+        DomainEvent::Policy(_) => "policy",
+        DomainEvent::Volume(_) => "volume",
+        DomainEvent::Storage(_) => "storage",
+        DomainEvent::MCP(_) => "mcp",
+        DomainEvent::Smcp(_) => "smcp",
+        DomainEvent::Stimulus(_) => "stimulus",
+        DomainEvent::ImageManagement(_) => "image_management",
+        DomainEvent::Iam(_) => "iam",
+        DomainEvent::Secrets(_) => "secrets",
+        DomainEvent::ContainerRun(_) => "container_run",
+    }
+}
 
 /// Unified domain event type for the event bus
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,9 +203,15 @@ impl EventBus {
 
     /// Publish a domain event to all subscribers
     fn publish(&self, event: DomainEvent) {
-        // Send to all subscribers
-        // Note: send() returns the number of receivers that received the message
-        let _receiver_count = self.sender.send(event.clone()).unwrap_or(0);
+        let event_type = domain_event_type(&event);
+        metrics::counter!("aegis_event_bus_events_total", "event_type" => event_type).increment(1);
+        if self.sender.send(event).is_err() {
+            metrics::counter!(
+                "aegis_event_bus_delivery_failures_total",
+                "reason" => "no_receivers"
+            )
+            .increment(1);
+        }
     }
 
     /// Subscribe to all domain events
@@ -240,6 +271,7 @@ impl EventReceiver {
             broadcast::error::RecvError::Closed => EventBusError::Closed,
             broadcast::error::RecvError::Lagged(n) => {
                 warn!("Event receiver lagged by {} events", n);
+                metrics::counter!("aegis_event_bus_receiver_lag_total").increment(n);
                 EventBusError::Lagged(n)
             }
         })
@@ -252,6 +284,7 @@ impl EventReceiver {
             broadcast::error::TryRecvError::Closed => EventBusError::Closed,
             broadcast::error::TryRecvError::Lagged(n) => {
                 warn!("Event receiver lagged by {} events", n);
+                metrics::counter!("aegis_event_bus_receiver_lag_total").increment(n);
                 EventBusError::Lagged(n)
             }
         })
@@ -273,6 +306,7 @@ impl ExecutionEventReceiver {
                 broadcast::error::RecvError::Closed => EventBusError::Closed,
                 broadcast::error::RecvError::Lagged(n) => {
                     warn!("Event receiver lagged by {} events", n);
+                    metrics::counter!("aegis_event_bus_receiver_lag_total").increment(n);
                     EventBusError::Lagged(n)
                 }
             })?;
@@ -360,6 +394,7 @@ impl WorkflowEventReceiver {
                 Ok(_) => continue,
                 Err(broadcast::error::RecvError::Lagged(n)) => {
                     warn!("WorkflowEventReceiver lagged by {} events", n);
+                    metrics::counter!("aegis_event_bus_receiver_lag_total").increment(n);
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => {
@@ -402,6 +437,7 @@ impl AgentEventReceiver {
                 broadcast::error::RecvError::Closed => EventBusError::Closed,
                 broadcast::error::RecvError::Lagged(n) => {
                     warn!("Event receiver lagged by {} events", n);
+                    metrics::counter!("aegis_event_bus_receiver_lag_total").increment(n);
                     EventBusError::Lagged(n)
                 }
             })?;

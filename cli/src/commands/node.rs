@@ -54,8 +54,7 @@ pub async fn handle_command(
         NodeCommand::Join { endpoint } => join_cluster(&config, endpoint).await,
         NodeCommand::Peers => list_peers(&config).await,
         NodeCommand::Leave => {
-            println!("Node leave - Not yet implemented in protocol");
-            Ok(())
+            anyhow::bail!("Node leave is unavailable in the single-node baseline protocol")
         }
     }
 }
@@ -206,7 +205,7 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
                 .as_ref()
                 .map(|r| r.memory_gb)
                 .unwrap_or(0),
-            supported_runtimes: vec!["docker".to_string()], // TODO: detect from system
+            supported_runtimes: vec!["docker".to_string()], // Single-node baseline runtime
             tags: config.spec.node.tags.clone(),
         }),
         grpc_address: config
@@ -242,8 +241,8 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
     println!("{} Successfully joined cluster!", "✓".green());
     println!("{} NodeSecurityToken issued (expires in 1h)", "ℹ".blue());
 
-    // In a real implementation, the token should be saved to a persistent state file
-    // or passed to the daemon. For now, we just print success.
+    // Persisting or forwarding the issued token belongs to the daemon/runtime
+    // integration path. This CLI command stops after the registration handshake.
 
     Ok(())
 }

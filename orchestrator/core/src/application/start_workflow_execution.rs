@@ -20,6 +20,7 @@
 use crate::application::ports::WorkflowEnginePort;
 use crate::domain::execution::ExecutionId;
 use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{WorkflowExecution, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Context, Result};
@@ -42,6 +43,9 @@ pub struct StartWorkflowExecutionRequest {
     /// inside the worker via Handlebars templates (e.g. `{{blackboard.judges}}`).
     /// Rust does not mutate the blackboard during workflow execution.
     pub blackboard: Option<serde_json::Value>,
+
+    #[serde(default)]
+    pub tenant_id: Option<TenantId>,
 }
 
 /// Started workflow execution response
@@ -57,6 +61,12 @@ pub struct StartedWorkflowExecution {
 /// Start Workflow Execution Use Case
 #[async_trait]
 pub trait StartWorkflowExecutionUseCase: Send + Sync {
+    async fn start_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        request: StartWorkflowExecutionRequest,
+    ) -> Result<StartedWorkflowExecution>;
+
     /// Start a workflow execution
     ///
     /// # Arguments
@@ -75,7 +85,13 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
     async fn start_execution(
         &self,
         request: StartWorkflowExecutionRequest,
-    ) -> Result<StartedWorkflowExecution>;
+    ) -> Result<StartedWorkflowExecution> {
+        let tenant_id = request
+            .tenant_id
+            .clone()
+            .unwrap_or_else(TenantId::local_default);
+        self.start_execution_for_tenant(&tenant_id, request).await
+    }
 }
 
 /// Standard implementation of StartWorkflowExecutionUseCase
@@ -104,17 +120,20 @@ impl StandardStartWorkflowExecutionUseCase {
 
 #[async_trait]
 impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
-    async fn start_execution(
+    async fn start_execution_for_tenant(
         &self,
+        tenant_id: &TenantId,
         request: StartWorkflowExecutionRequest,
     ) -> Result<StartedWorkflowExecution> {
         // Step 1: Load workflow from repository
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
             let id = WorkflowId::from_uuid(uuid);
-            self.workflow_repository.find_by_id(id).await
+            self.workflow_repository
+                .find_by_id_for_tenant(tenant_id, id)
+                .await
         } else {
             self.workflow_repository
-                .find_by_name(&request.workflow_id)
+                .find_by_name_for_tenant(tenant_id, &request.workflow_id)
                 .await
         }
         .context("Failed to query workflow repository")?
@@ -138,7 +157,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
 
         // Step 4: Persist execution to repository (establishes idempotency key)
         self.execution_repository
-            .save(&workflow_execution)
+            .save_for_tenant(tenant_id, &workflow_execution)
             .await
             .context("Failed to persist workflow execution to repository")?;
 
@@ -330,6 +349,7 @@ mod tests {
                     "judges": ["lint-judge", "security-judge"],
                     "validation_threshold": 0.85
                 })),
+                tenant_id: Some(TenantId::local_default()),
             })
             .await
             .unwrap();
@@ -391,6 +411,7 @@ mod tests {
                 workflow_id: workflow.metadata.name.clone(),
                 input: json!({ "branch": "main" }),
                 blackboard: None,
+                tenant_id: Some(TenantId::local_default()),
             })
             .await
             .unwrap_err();
@@ -424,6 +445,7 @@ mod tests {
                 workflow_id: workflow.id.to_string(),
                 input: json!({ "target": "release" }),
                 blackboard: None,
+                tenant_id: Some(TenantId::local_default()),
             })
             .await
             .unwrap();
@@ -441,8 +463,24 @@ mod tests {
 
         #[async_trait]
         impl WorkflowRepository for EmptyWorkflowRepo {
+            async fn save_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                workflow: &Workflow,
+            ) -> Result<(), RepositoryError> {
+                self.save(workflow).await
+            }
+
             async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
                 Ok(())
+            }
+
+            async fn find_by_id_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                id: WorkflowId,
+            ) -> Result<Option<Workflow>, RepositoryError> {
+                self.find_by_id(id).await
             }
 
             async fn find_by_id(
@@ -452,12 +490,35 @@ mod tests {
                 Ok(None)
             }
 
+            async fn find_by_name_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                name: &str,
+            ) -> Result<Option<Workflow>, RepositoryError> {
+                self.find_by_name(name).await
+            }
+
             async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
                 Ok(None)
             }
 
+            async fn list_all_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+            ) -> Result<Vec<Workflow>, RepositoryError> {
+                self.list_all().await
+            }
+
             async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
                 Ok(vec![])
+            }
+
+            async fn delete_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                id: WorkflowId,
+            ) -> Result<(), RepositoryError> {
+                self.delete(id).await
             }
 
             async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
@@ -477,6 +538,7 @@ mod tests {
                 workflow_id: "does-not-exist".to_string(),
                 input: json!({}),
                 blackboard: None,
+                tenant_id: Some(TenantId::local_default()),
             })
             .await
             .unwrap_err();

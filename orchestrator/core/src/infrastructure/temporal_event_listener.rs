@@ -598,6 +598,14 @@ mod tests {
 
     #[async_trait]
     impl WorkflowExecutionRepository for FailingAppendRepo {
+        async fn save_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            execution: &crate::domain::workflow::WorkflowExecution,
+        ) -> Result<(), RepositoryError> {
+            self.save(execution).await
+        }
+
         async fn save(
             &self,
             _execution: &crate::domain::workflow::WorkflowExecution,
@@ -605,11 +613,26 @@ mod tests {
             Ok(())
         }
 
+        async fn find_by_id_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            id: ExecutionId,
+        ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            self.find_by_id(id).await
+        }
+
         async fn find_by_id(
             &self,
             _id: ExecutionId,
         ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
             Ok(None)
+        }
+
+        async fn find_active_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            self.find_active().await
         }
 
         async fn find_active(
@@ -645,6 +668,15 @@ mod tests {
             _offset: usize,
         ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
             Ok(vec![])
+        }
+
+        async fn list_paginated_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            self.list_paginated(limit, offset).await
         }
     }
 

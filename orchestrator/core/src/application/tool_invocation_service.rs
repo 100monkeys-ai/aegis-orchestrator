@@ -32,6 +32,7 @@ use crate::domain::mcp::{
     MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
 };
 use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::tenant::TenantId;
 use crate::domain::validation::extract_json_from_text;
 use crate::infrastructure::agent_manifest_parser::AgentManifestParser;
 use crate::infrastructure::event_bus::EventBus;
@@ -89,6 +90,18 @@ pub struct ToolInvocationService {
 
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
+    fn resolve_tenant_arg(args: &Value) -> Result<TenantId, SmcpSessionError> {
+        let tenant = args
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| args.get("tenant").and_then(|v| v.as_str()))
+            .unwrap_or("local");
+
+        TenantId::from_string(tenant).map_err(|e| {
+            SmcpSessionError::InvalidArguments(format!("invalid tenant identifier '{tenant}': {e}"))
+        })
+    }
+
     pub fn new(
         smcp_session_repo: Arc<dyn SmcpSessionRepository>,
         security_context_repo: Arc<dyn SecurityContextRepository>,
@@ -1691,6 +1704,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "aegis.workflow.delete requires 'name' string".to_string(),
@@ -1708,7 +1722,7 @@ impl ToolInvocationService {
         };
 
         // Find by name or ID
-        let workflow_id = match repo.find_by_name(name).await {
+        let workflow_id = match repo.find_by_name_for_tenant(&tenant_id, name).await {
             Ok(Some(w)) => w.id,
             _ => {
                 if let Ok(uuid) = uuid::Uuid::parse_str(name) {
@@ -1740,6 +1754,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "aegis.workflow.run requires 'name' string".to_string(),
@@ -1764,6 +1779,7 @@ impl ToolInvocationService {
                     workflow_id: name.to_string(),
                     input,
                     blackboard: None,
+                    tenant_id: Some(tenant_id.clone()),
                 },
             )
             .await
@@ -1784,6 +1800,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "aegis.workflow.generate requires 'input' string".to_string(),
@@ -1806,6 +1823,7 @@ impl ToolInvocationService {
                     workflow_id: "builtin-workflow-generator".to_string(),
                     input: serde_json::json!({ "input": input }),
                     blackboard: None,
+                    tenant_id: Some(tenant_id),
                 },
             )
             .await
@@ -2149,6 +2167,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
@@ -2185,10 +2204,14 @@ impl ToolInvocationService {
 
         let existing_agent = match self
             .agent_lifecycle
-            .lookup_agent(&manifest.metadata.name)
+            .lookup_agent_for_tenant(&tenant_id, &manifest.metadata.name)
             .await
         {
-            Ok(Some(id)) => self.agent_lifecycle.get_agent(id).await.ok(),
+            Ok(Some(id)) => self
+                .agent_lifecycle
+                .get_agent_for_tenant(&tenant_id, id)
+                .await
+                .ok(),
             _ => None,
         };
 
@@ -2223,7 +2246,7 @@ impl ToolInvocationService {
 
         match self
             .agent_lifecycle
-            .update_agent(agent_id, manifest.clone())
+            .update_agent_for_tenant(&tenant_id, agent_id, manifest.clone())
             .await
         {
             Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2249,13 +2272,18 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "aegis.agent.export requires 'name' string".to_string(),
             )
         })?;
 
-        let agent_id = match self.agent_lifecycle.lookup_agent(name).await {
+        let agent_id = match self
+            .agent_lifecycle
+            .lookup_agent_for_tenant(&tenant_id, name)
+            .await
+        {
             Ok(Some(id)) => id,
             _ => {
                 if let Ok(uuid) = uuid::Uuid::parse_str(name) {
@@ -2269,7 +2297,11 @@ impl ToolInvocationService {
             }
         };
 
-        match self.agent_lifecycle.get_agent(agent_id).await {
+        match self
+            .agent_lifecycle
+            .get_agent_for_tenant(&tenant_id, agent_id)
+            .await
+        {
             Ok(agent) => {
                 let yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2298,9 +2330,14 @@ impl ToolInvocationService {
             }
         };
 
-        let workflows = repo.list_all().await.map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list workflows: {e}"))
-        })?;
+        let workflows = repo
+            .list_all_for_tenant(&TenantId::local_default())
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to list workflows: {e}"
+                ))
+            })?;
 
         let entries: Vec<serde_json::Value> = workflows
             .iter()
@@ -2325,6 +2362,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "aegis.workflow.export requires 'name' string".to_string(),
@@ -2341,12 +2379,15 @@ impl ToolInvocationService {
             }
         };
 
-        let workflow = match repo.find_by_name(name).await {
+        let workflow = match repo.find_by_name_for_tenant(&tenant_id, name).await {
             Ok(Some(w)) => w,
             _ => {
                 if let Ok(uuid) = uuid::Uuid::parse_str(name) {
                     match repo
-                        .find_by_id(crate::domain::workflow::WorkflowId(uuid))
+                        .find_by_id_for_tenant(
+                            &tenant_id,
+                            crate::domain::workflow::WorkflowId(uuid),
+                        )
                         .await
                     {
                         Ok(Some(w)) => w,
@@ -2380,6 +2421,7 @@ impl ToolInvocationService {
         _execution_id: crate::domain::execution::ExecutionId,
         _agent_id: AgentId,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
@@ -2420,7 +2462,10 @@ impl ToolInvocationService {
             }
         };
 
-        let _existing = match repo.find_by_name(&workflow.metadata.name).await {
+        let _existing = match repo
+            .find_by_name_for_tenant(&tenant_id, &workflow.metadata.name)
+            .await
+        {
             Ok(Some(w)) => w,
             _ => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2442,7 +2487,7 @@ impl ToolInvocationService {
         };
 
         match register_workflow_use_case
-            .register_workflow(manifest_yaml, force)
+            .register_workflow_for_tenant(&tenant_id, manifest_yaml, force)
             .await
         {
             Ok(meta) => Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -2806,21 +2851,64 @@ mod tests {
     struct TestAgentLifecycleService;
     #[async_trait]
     impl AgentLifecycleService for TestAgentLifecycleService {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            manifest: AgentManifest,
+            force: bool,
+        ) -> Result<AgentId> {
+            self.deploy_agent(manifest, force).await
+        }
+
         async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
             anyhow::bail!("TestAgentLifecycleService::deploy_agent not exercised in this test")
         }
+
+        async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+            self.get_agent(id).await
+        }
+
         async fn get_agent(&self, _: AgentId) -> Result<Agent> {
             anyhow::bail!("TestAgentLifecycleService::get_agent not exercised in this test")
         }
+
+        async fn update_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: AgentId,
+            manifest: AgentManifest,
+        ) -> Result<()> {
+            self.update_agent(id, manifest).await
+        }
+
         async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
             anyhow::bail!("TestAgentLifecycleService::update_agent not exercised in this test")
         }
+
+        async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
+            self.delete_agent(id).await
+        }
+
         async fn delete_agent(&self, _: AgentId) -> Result<()> {
             anyhow::bail!("TestAgentLifecycleService::delete_agent not exercised in this test")
         }
+
+        async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+            self.list_agents().await
+        }
+
         async fn list_agents(&self) -> Result<Vec<Agent>> {
             anyhow::bail!("TestAgentLifecycleService::list_agents not exercised in this test")
         }
+
+        async fn lookup_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            name: &str,
+        ) -> Result<Option<AgentId>> {
+            self.lookup_agent(name).await
+        }
+
         async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
             anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
         }

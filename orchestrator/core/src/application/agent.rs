@@ -12,8 +12,15 @@
 //!   every execution to resolve the manifest and security policy.
 //! - The Control Plane (BC-9) calls `deploy_agent` / `list_agents` via the gRPC API.
 //! - Agent manifests drive the `SecurityContext` name used to initialise SMCP sessions.
+//!
+//! # Code Quality Principles
+//!
+//! - Treat manifest validation as a hard boundary before persistence or execution.
+//! - Keep the service interface transport-agnostic and side-effect free beyond its repository.
+//! - Fail closed on malformed or incomplete agent definitions.
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
+use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -28,6 +35,32 @@ use async_trait::async_trait;
 /// implementation backed by Postgres.
 #[async_trait]
 pub trait AgentLifecycleService: Send + Sync {
+    async fn deploy_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> Result<AgentId>;
+
+    async fn get_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent>;
+
+    async fn update_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> Result<()>;
+
+    async fn delete_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<()>;
+
+    async fn list_agents_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>>;
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>>;
+
     /// Parse, validate, and persist a new agent manifest, returning the assigned [`AgentId`].
     ///
     /// When `force` is `false` the call fails if an agent with the same `metadata.name` **and**
@@ -41,14 +74,20 @@ pub trait AgentLifecycleService: Send + Sync {
     /// - Manifest schema validation failures
     /// - Same name + same version already deployed and `force = false`
     /// - Database write errors
-    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId>;
+    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
+        self.deploy_agent_for_tenant(&TenantId::local_default(), manifest, force)
+            .await
+    }
 
     /// Retrieve a fully-hydrated [`Agent`] by its UUID.
     ///
     /// # Errors
     ///
     /// Returns an error if `id` does not exist in the registry.
-    async fn get_agent(&self, id: AgentId) -> Result<Agent>;
+    async fn get_agent(&self, id: AgentId) -> Result<Agent> {
+        self.get_agent_for_tenant(&TenantId::local_default(), id)
+            .await
+    }
 
     /// Replace the manifest of an existing agent in-place.
     ///
@@ -59,7 +98,10 @@ pub trait AgentLifecycleService: Send + Sync {
     ///
     /// - `id` not found
     /// - New manifest fails schema validation
-    async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()>;
+    async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()> {
+        self.update_agent_for_tenant(&TenantId::local_default(), id, manifest)
+            .await
+    }
 
     /// Permanently remove an agent manifest from the registry.
     ///
@@ -69,14 +111,23 @@ pub trait AgentLifecycleService: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if `id` does not exist.
-    async fn delete_agent(&self, id: AgentId) -> Result<()>;
+    async fn delete_agent(&self, id: AgentId) -> Result<()> {
+        self.delete_agent_for_tenant(&TenantId::local_default(), id)
+            .await
+    }
 
     /// Return all registered agents in unspecified order.
-    async fn list_agents(&self) -> Result<Vec<Agent>>;
+    async fn list_agents(&self) -> Result<Vec<Agent>> {
+        self.list_agents_for_tenant(&TenantId::local_default())
+            .await
+    }
 
     /// Resolve an agent name string to its [`AgentId`], or `None` if not found.
     ///
     /// Used by workflow execution to dereference agent name references in workflow
     /// manifests (e.g. `agent: "code-reviewer"`).
-    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>>;
+    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+        self.lookup_agent_for_tenant(&TenantId::local_default(), name)
+            .await
+    }
 }

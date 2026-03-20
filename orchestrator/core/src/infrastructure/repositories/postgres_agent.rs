@@ -6,13 +6,13 @@
 //! in PostgreSQL via `sqlx`. Translates between the `Agent` domain aggregate
 //! and the `agents` / `agent_manifests` relational schema.
 //!
-//! ⚠️ Phase 2 — In-memory repository (`InMemoryAgentRepository`) is used in
-//! Phase 1. This implementation requires an active `PgPool` connection.
+//! PostgreSQL-backed `AgentRepository` used when persistence is enabled.
 //!
 //! See ADR-025 (PostgreSQL Schema Design and Migration Strategy).
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentStatus};
 use crate::domain::repository::{AgentRepository, RepositoryError};
+use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
@@ -30,7 +30,11 @@ impl PostgresAgentRepository {
 
 #[async_trait]
 impl AgentRepository for PostgresAgentRepository {
-    async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent: &Agent,
+    ) -> Result<(), RepositoryError> {
         let manifest_json = serde_json::to_value(&agent.manifest)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -41,7 +45,7 @@ impl AgentRepository for PostgresAgentRepository {
             AgentStatus::Active => "active",
             AgentStatus::Paused => "paused",
             AgentStatus::Archived => "archived",
-            AgentStatus::Failed => "active", // Map Failed to active for now if table doesn't support it
+            AgentStatus::Failed => "active", // Table stores active/paused/archived states only.
         };
 
         // Extract security policy (from spec.security)
@@ -51,12 +55,13 @@ impl AgentRepository for PostgresAgentRepository {
         sqlx::query(
             r#"
             INSERT INTO agents (
-                id, name, version, manifest_yaml, manifest_json, 
+                id, tenant_id, name, version, manifest_yaml, manifest_json,
                 runtime, timeout_seconds, security_policy, status, 
                 created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT (id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
                 name = EXCLUDED.name,
                 version = EXCLUDED.version,
                 manifest_yaml = EXCLUDED.manifest_yaml,
@@ -69,6 +74,7 @@ impl AgentRepository for PostgresAgentRepository {
             "#,
         )
         .bind(agent.id.0)
+        .bind(tenant_id.as_str())
         .bind(&agent.name)
         .bind(agent.manifest.metadata.version.clone())
         .bind(manifest_yaml)
@@ -86,15 +92,20 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(())
     }
 
-    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<Option<Agent>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT 
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
@@ -132,15 +143,20 @@ impl AgentRepository for PostgresAgentRepository {
         }
     }
 
-    async fn find_by_name(&self, name: &str) -> Result<Option<Agent>, RepositoryError> {
+    async fn find_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT 
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
-            WHERE name = $1
+            WHERE tenant_id = $1 AND name = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(name)
         .fetch_optional(&self.pool)
         .await
@@ -178,15 +194,20 @@ impl AgentRepository for PostgresAgentRepository {
         }
     }
 
-    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
+    async fn list_all_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<Agent>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT 
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
+            WHERE tenant_id = $1
             ORDER BY name ASC
             "#,
         )
+        .bind(tenant_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -223,8 +244,13 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(agents)
     }
 
-    async fn delete(&self, id: AgentId) -> Result<(), RepositoryError> {
-        sqlx::query("DELETE FROM agents WHERE id = $1")
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM agents WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id.as_str())
             .bind(id.0)
             .execute(&self.pool)
             .await

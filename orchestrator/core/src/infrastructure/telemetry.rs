@@ -1,6 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! Telemetry and metrics infrastructure
+//!
+//! # Code Quality Principles
+//!
+//! - Keep metric names stable and low-cardinality.
+//! - Avoid request-specific or identity-specific labels on production metrics.
+//! - Prefer a single initialization path for exporter setup and node metadata.
 
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder};
 use std::net::SocketAddr;
@@ -10,8 +16,8 @@ use std::net::SocketAddr;
 /// Binds an HTTP listener to the specified port and registers initial node metadata.
 pub fn init_metrics(
     port: u16,
-    node_id: &str,
-    node_name: &str,
+    _node_id: &str,
+    _node_name: &str,
     region: Option<&str>,
     version: &str,
 ) -> anyhow::Result<()> {
@@ -34,8 +40,6 @@ pub fn init_metrics(
     // Register node metadata gauge
     metrics::gauge!(
         "aegis_node_info",
-        "node_id" => node_id.to_string(),
-        "name" => node_name.to_string(),
         "region" => region.unwrap_or("unknown").to_string(),
         "version" => version.to_string()
     )

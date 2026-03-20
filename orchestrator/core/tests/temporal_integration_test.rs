@@ -22,6 +22,7 @@ use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::repository::{
     RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
 };
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
@@ -32,25 +33,76 @@ struct MockAgentServiceInt;
 
 #[async_trait]
 impl AgentLifecycleService for MockAgentServiceInt {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> anyhow::Result<AgentId> {
+        self.deploy_agent(manifest, force).await
+    }
+
     async fn deploy_agent(
         &self,
         _manifest: AgentManifest,
         _force: bool,
     ) -> anyhow::Result<AgentId> {
-        unimplemented!()
+        panic!("test-only mock: deploy_agent is not exercised in this integration fixture")
     }
+
+    async fn get_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+    ) -> anyhow::Result<Agent> {
+        self.get_agent(id).await
+    }
+
     async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
-        unimplemented!()
+        panic!("test-only mock: get_agent is not exercised in this integration fixture")
     }
+
+    async fn update_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> anyhow::Result<()> {
+        self.update_agent(id, manifest).await
+    }
+
     async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
-        unimplemented!()
+        panic!("test-only mock: update_agent is not exercised in this integration fixture")
     }
+
+    async fn delete_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+    ) -> anyhow::Result<()> {
+        self.delete_agent(id).await
+    }
+
     async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
-        unimplemented!()
+        panic!("test-only mock: delete_agent is not exercised in this integration fixture")
     }
+
+    async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<Agent>> {
+        self.list_agents().await
+    }
+
     async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
-        unimplemented!()
+        panic!("test-only mock: list_agents is not exercised in this integration fixture")
     }
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        self.lookup_agent(name).await
+    }
+
     async fn lookup_agent(&self, _name: &str) -> anyhow::Result<Option<AgentId>> {
         Ok(Some(AgentId(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
@@ -62,18 +114,61 @@ impl AgentLifecycleService for MockAgentServiceInt {
 struct MockWorkflowRepo;
 #[async_trait]
 impl WorkflowRepository for MockWorkflowRepo {
+    async fn save_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow: &Workflow,
+    ) -> Result<(), RepositoryError> {
+        self.save(workflow).await
+    }
+
     async fn save(&self, _w: &Workflow) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    async fn find_by_id_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_id(workflow_id).await
+    }
+
     async fn find_by_id(&self, _i: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
+
+    async fn find_by_name_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_name(workflow_name).await
+    }
+
     async fn find_by_name(&self, _n: &str) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
+
+    async fn list_all_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        self.list_all().await
+    }
+
     async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn delete_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_id: WorkflowId,
+    ) -> Result<(), RepositoryError> {
+        self.delete(workflow_id).await
+    }
+
     async fn delete(&self, _i: WorkflowId) -> Result<(), RepositoryError> {
         Ok(())
     }
@@ -82,9 +177,26 @@ impl WorkflowRepository for MockWorkflowRepo {
 struct MockWorkflowExecRepo;
 #[async_trait]
 impl WorkflowExecutionRepository for MockWorkflowExecRepo {
+    async fn save_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        execution: &WorkflowExecution,
+    ) -> Result<(), RepositoryError> {
+        self.save(execution).await
+    }
+
     async fn save(&self, _e: &WorkflowExecution) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    async fn find_by_id_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        execution_id: ExecutionId,
+    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+        self.find_by_id(execution_id).await
+    }
+
     async fn find_by_id(
         &self,
         _i: ExecutionId,
@@ -101,6 +213,14 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     ) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    async fn find_active_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        self.find_active().await
+    }
+
     async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
@@ -121,6 +241,15 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
         _offset: usize,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
+    }
+
+    async fn list_paginated_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        self.list_paginated(limit, offset).await
     }
 }
 
@@ -170,6 +299,7 @@ states:
         workflow_id: reg.workflow_id.clone(),
         input: serde_json::json!({"message": "hello testing"}),
         blackboard: None,
+        tenant_id: Some(TenantId::local_default()),
     };
 
     let start_result = start_use_case.start_execution(req).await;

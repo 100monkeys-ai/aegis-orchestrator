@@ -54,6 +54,7 @@
 
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{Blackboard, StateName, WorkflowExecution, WorkflowId};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -73,7 +74,11 @@ impl PostgresWorkflowExecutionRepository {
 
 #[async_trait]
 impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
-    async fn save(&self, execution: &WorkflowExecution) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        execution: &WorkflowExecution,
+    ) -> Result<(), RepositoryError> {
         let input_json = serde_json::to_value(&execution.input)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -94,21 +99,22 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         sqlx::query(
             r#"
             INSERT INTO workflow_executions (
-                id, workflow_id, temporal_workflow_id, temporal_run_id, 
+                id, tenant_id, workflow_id, temporal_workflow_id, temporal_run_id,
                 input_params, status, 
                 current_state, blackboard, state_outputs, state_history,
                 started_at, last_transition_at, completed_at
             )
             VALUES (
-                $1, $2, 
-                COALESCE((SELECT name FROM workflows WHERE id = $2), 'unknown-workflow'), 
+                $1, $2, $3,
+                COALESCE((SELECT name FROM workflows WHERE tenant_id = $2 AND id = $3), 'unknown-workflow'),
                 $3, 
-                $4, $5, 
+                $4, $5,
                 $6, $7, $8, $9,
                 $10, $11,
-                CASE WHEN $5 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
+                CASE WHEN $6 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
             )
             ON CONFLICT (id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
                 status = EXCLUDED.status,
                 input_params = EXCLUDED.input_params,
                 current_state = EXCLUDED.current_state,
@@ -120,6 +126,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             "#,
         )
         .bind(execution.id.0)
+        .bind(tenant_id.as_str())
         .bind(execution.workflow_id.0)
         .bind(execution.id.0.to_string()) // temporal_run_id is execution_id
         .bind(input_json)
@@ -139,8 +146,9 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(())
     }
 
-    async fn find_by_id(
+    async fn find_by_id_for_tenant(
         &self,
+        tenant_id: &TenantId,
         id: ExecutionId,
     ) -> Result<Option<WorkflowExecution>, RepositoryError> {
         let row = sqlx::query(
@@ -150,9 +158,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 current_state, blackboard, state_outputs,
                 started_at, last_transition_at
             FROM workflow_executions
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
@@ -212,7 +221,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         }
     }
 
-    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+    async fn find_active_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -220,9 +232,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 current_state, blackboard, state_outputs,
                 started_at, last_transition_at
             FROM workflow_executions
-            WHERE status = 'running'
+            WHERE tenant_id = $1 AND status = 'running'
             "#,
         )
+        .bind(tenant_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -370,8 +383,9 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(records)
     }
 
-    async fn list_paginated(
+    async fn list_paginated_for_tenant(
         &self,
+        tenant_id: &TenantId,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
@@ -382,10 +396,12 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 current_state, blackboard, state_outputs,
                 started_at, last_transition_at
             FROM workflow_executions
+            WHERE tenant_id = $1
             ORDER BY started_at DESC
-            LIMIT $1 OFFSET $2
+            LIMIT $2 OFFSET $3
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(limit as i64)
         .bind(offset as i64)
         .fetch_all(&self.pool)

@@ -81,9 +81,7 @@ fn stimulus_error_response(e: StimulusError) -> (StatusCode, axum::Json<serde_js
 /// `POST /v1/stimuli` — Authenticated (IAM/OIDC Bearer JWT)
 ///
 /// Accepts a stimulus from any authenticated caller. Auth is enforced by the
-/// upstream middleware tower layer (Phase 2: `GrpcIamAuthInterceptor`).
-/// In Phase 1, the route is present and functional; a `TODO` tower middleware
-/// guard will be added in ADR-041 wiring.
+/// upstream middleware layer.
 ///
 /// Returns `202 Accepted` with `{ stimulus_id, workflow_execution_id }`.
 pub async fn ingest_stimulus_handler(
@@ -141,8 +139,7 @@ pub async fn ingest_stimulus_handler(
 ///
 /// Authentication is performed by [`WebhookHmacGuard`]: it reads the
 /// `X-Aegis-Signature: sha256=<hex>` header and verifies it against the
-/// secret configured for this source (Phase 1: env var
-/// `AEGIS_WEBHOOK_SECRET_<SOURCE>`; Phase 2: OpenBao KV).
+/// secret configured for this source.
 ///
 /// Returns `202 Accepted` with `{ stimulus_id, workflow_execution_id }`.
 pub async fn webhook_handler(

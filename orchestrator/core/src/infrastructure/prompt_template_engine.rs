@@ -3,12 +3,12 @@
 //! Prompt Template Engine
 //!
 //! This module provides template rendering functionality for agent prompts,
-//! using Handlebars for placeholder substitution.
+//! using Handlebars for template-variable substitution.
 //!
 //! # Architecture
 //!
 //! - **Layer:** Infrastructure
-//! - **Purpose:** Transform templates with placeholders into final prompts
+//! - **Purpose:** Transform templates with template variables into final prompts
 //! - **Integration:** Agent task.prompt_template → LLM input
 //!
 //! # Supported Placeholders

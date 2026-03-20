@@ -615,7 +615,7 @@ impl VolumeService for StandardVolumeService {
                     match self
                         .create_volume(
                             spec.name.clone(),
-                            tenant_id,
+                            tenant_id.clone(),
                             storage_class.clone(),
                             size_limit_bytes / (1024 * 1024), // Convert bytes to MB
                             ownership.clone(),
@@ -685,7 +685,7 @@ impl VolumeService for StandardVolumeService {
                     let volume = Volume {
                         id: volume_id,
                         name: spec.name.clone(),
-                        tenant_id,
+                        tenant_id: tenant_id.clone(),
                         storage_class: storage_class.clone(),
                         backend,
                         size_limit_bytes,
@@ -769,7 +769,7 @@ mod tests {
     use super::*;
     use crate::domain::execution::ExecutionId;
     use crate::domain::repository::RepositoryError;
-    use crate::infrastructure::storage::MockStorageProvider;
+    use crate::infrastructure::storage::TestStorageProvider;
     use chrono::Duration;
     use std::collections::HashMap;
     use tokio::sync::Mutex;
@@ -843,10 +843,10 @@ mod tests {
     fn create_test_service() -> (
         StandardVolumeService,
         Arc<TestVolumeRepository>,
-        Arc<MockStorageProvider>,
+        Arc<TestStorageProvider>,
     ) {
         let repository = Arc::new(TestVolumeRepository::new());
-        let storage_provider = Arc::new(MockStorageProvider::new());
+        let storage_provider = Arc::new(TestStorageProvider::new());
         let event_bus = Arc::new(EventBus::with_default_capacity());
 
         let service = StandardVolumeService::new(
@@ -869,7 +869,7 @@ mod tests {
         let volume_id = service
             .create_volume(
                 "test-volume".to_string(),
-                tenant_id,
+                tenant_id.clone(),
                 StorageClass::ephemeral_hours(6),
                 100,
                 VolumeOwnership::Execution {

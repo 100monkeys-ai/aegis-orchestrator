@@ -60,8 +60,7 @@ impl RegisterNodeUseCase {
 
         self.cluster_repo.upsert_peer(&peer).await?;
 
-        // 3. Return cluster ID (we use a static ID or one from config/db)
-        // For now, let's assume the cluster ID is derived from the controller's ID or hardcoded.
+        // 3. Return the fixed single-node cluster identifier used by the current baseline.
         let cluster_id = ClusterId(uuid::Uuid::new_v5(
             &uuid::Uuid::NAMESPACE_DNS,
             b"aegis-cluster",

@@ -36,20 +36,18 @@ impl ForwardExecutionUseCase {
         let input: ExecutionInput = serde_json::from_str(&req.input)
             .map_err(|e| anyhow!("Invalid execution input: {}", e))?;
 
-        // 2. Start execution locally
-        // Note: We might need a way to reuse the execution_id if it was pre-allocated by the controller.
-        // For now, we assume start_execution creates a new one, but we might want a 'resume' or 'import' call.
-        // ADR-059 says the worker runs it.
+        // 2. Start execution locally. Cluster execution identity import is not supported in the
+        // single-node Phase 1 baseline, so the local execution service allocates the execution id.
         let local_id = self
             .execution_service
             .start_execution(req.agent_id, input)
             .await?;
 
-        // If the execution_id from the request is different from local_id, we have a problem
-        // with identity across nodes. But in Phase 1, the client will use the local_id
-        // returned by the worker after the stream starts or similar.
-        // Actually, the proto has execution_id in ForwardExecutionInner.
-        // We should probably ensure the execution service can use a provided ID.
+        if local_id != req.execution_id {
+            return Err(anyhow!(
+                "cluster execution forwarding requires imported execution identities, which are disabled for the single-node Phase 1 baseline"
+            ));
+        }
 
         // 3. Stream events back
         let stream = self.execution_service.stream_execution(local_id).await?;

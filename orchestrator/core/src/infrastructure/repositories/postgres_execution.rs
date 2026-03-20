@@ -47,6 +47,7 @@ use crate::domain::execution::{
     Execution, ExecutionHierarchy, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
 };
 use crate::domain::repository::{ExecutionRepository, RepositoryError};
+use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
 use sqlx::postgres::PgPool;
@@ -64,7 +65,11 @@ impl PostgresExecutionRepository {
 
 #[async_trait]
 impl ExecutionRepository for PostgresExecutionRepository {
-    async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        execution: &Execution,
+    ) -> Result<(), RepositoryError> {
         let iterations_json = serde_json::to_value(execution.iterations())
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
@@ -87,22 +92,21 @@ impl ExecutionRepository for PostgresExecutionRepository {
         // Note: the `executions` table currently has columns such as input, status, iterations,
         // current_iteration, max_iterations, final_output, error_message, started_at, and completed_at,
         // but does not have fields for `workflow_execution_id` or `hierarchy`.
-        //
-        // TODO: If workflow execution IDs or execution hierarchy need to be persisted, extend the schema
-        // and `Execution` struct accordingly and map those fields here.
+        // If those fields become persisted later, extend the schema and `Execution` mapping here.
 
         let parent_execution_id = execution.hierarchy.parent_execution_id.map(|id| id.0);
 
         sqlx::query(
             r#"
             INSERT INTO executions (
-                id, agent_id, input, status, iterations, 
+                id, tenant_id, agent_id, input, status, iterations,
                 current_iteration, max_iterations, final_output, error_message, 
                 container_uid, container_gid,
                 started_at, completed_at, parent_execution_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
                 status = EXCLUDED.status,
                 iterations = EXCLUDED.iterations,
                 current_iteration = EXCLUDED.current_iteration,
@@ -115,6 +119,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             "#,
         )
         .bind(execution.id.0)
+        .bind(tenant_id.as_str())
         .bind(execution.agent_id.0)
         .bind(input_json)
         .bind(status_str)
@@ -135,7 +140,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(())
     }
 
-    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Option<Execution>, RepositoryError> {
         let row = sqlx::query(
             r#"
             SELECT 
@@ -144,9 +153,10 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 started_at, completed_at, error_message,
                 parent_execution_id
             FROM executions
-            WHERE id = $1
+            WHERE tenant_id = $1 AND id = $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(id.0)
         .fetch_optional(&self.pool)
         .await
@@ -244,8 +254,9 @@ impl ExecutionRepository for PostgresExecutionRepository {
         }
     }
 
-    async fn find_by_agent(
+    async fn find_by_agent_for_tenant(
         &self,
+        tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
@@ -256,11 +267,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id
             FROM executions
-            WHERE agent_id = $1
+            WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY started_at DESC
-            LIMIT $2
+            LIMIT $3
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(agent_id.0)
         .bind(limit as i64)
         .fetch_all(&self.pool)
@@ -269,8 +281,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
 
         let mut executions = Vec::new();
         for row in rows {
-            // Mapping logic same as find_by_id ...
-            // Duplicating logic here for now due to async context
+            // Mapping logic matches `find_by_id`; this loop stays local to the async query path.
             let id: uuid::Uuid = row.get("id");
             let agent_id: uuid::Uuid = row.get("agent_id");
             let status_str: String = row.get("status");
@@ -351,7 +362,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(executions)
     }
 
-    async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError> {
+    async fn find_recent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -359,10 +374,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id
             FROM executions
+            WHERE tenant_id = $1
             ORDER BY started_at DESC
-            LIMIT $1
+            LIMIT $2
             "#,
         )
+        .bind(tenant_id.as_str())
         .bind(limit as i64)
         .fetch_all(&self.pool)
         .await
@@ -449,8 +466,13 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(executions)
     }
 
-    async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError> {
-        sqlx::query("DELETE FROM executions WHERE id = $1")
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query("DELETE FROM executions WHERE tenant_id = $1 AND id = $2")
+            .bind(tenant_id.as_str())
             .bind(id.0)
             .execute(&self.pool)
             .await

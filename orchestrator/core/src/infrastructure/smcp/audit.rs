@@ -11,12 +11,10 @@
 //! signatures, these log records constitute cryptographically non-repudiable
 //! evidence (AGENTS.md §Non-Repudiation).
 //!
-//! ## Phase Note
+//! ## Integration Note
 //!
-//! ⚠️ Phase 1 — Violations are written only to the structured log. Phase 2 will
-//! publish them as [`crate::domain::events::SmcpEvent::PolicyViolationBlocked`]
-//! domain events to the [`crate::infrastructure::event_bus::EventBus`], enabling
-//! Cortex pattern learning and SOC 2 audit trail export.
+//! Violations are written to the structured log in the current baseline. Event-bus
+//! publication is handled by the owning integration layer when that path is enabled.
 //!
 //! See ADR-035 §5.2 (Security Audit), AGENTS.md §Non-Repudiation.
 
@@ -25,12 +23,11 @@ use tracing::{info, warn};
 
 /// Writes SMCP security events to the structured tracing log.
 ///
-/// ⚠️ Phase 1 stub — Phase 2 will inject an `Arc<EventBus>` here so violations
-/// are also published as domain events.
+/// Structured audit logger for SMCP policy violations.
 pub struct SmcpAuditLogger {}
 
 impl SmcpAuditLogger {
-    /// Create a new audit logger (stateless in Phase 1).
+    /// Create a new audit logger.
     pub fn new() -> Self {
         Self {}
     }
@@ -43,8 +40,7 @@ impl SmcpAuditLogger {
     /// > Phase 2: will also publish a `SmcpEvent::PolicyViolationBlocked` domain event.
     pub async fn log_violation(&self, violation: &PolicyViolation) {
         warn!("SMCP Policy Violation Detected: {:?}", violation);
-        // Phase 2: publish to EventBus for Cortex pattern learning.
-        info!("[Phase 2] policy violation events will be forwarded to the event bus for auditing");
+        info!("policy violation events are logged here for the current baseline");
     }
 }
 

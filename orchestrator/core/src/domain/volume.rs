@@ -28,6 +28,7 @@
 //! AGENTS.md §Volume, AGENTS.md §StorageClass.
 
 use crate::domain::execution::ExecutionId;
+pub use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -59,45 +60,6 @@ impl Default for VolumeId {
 }
 
 impl std::fmt::Display for VolumeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Unique identifier for a tenant
-///
-/// Enables multi-tenant namespace isolation.
-/// Default tenant UUID for MVP: 00000000-0000-0000-0000-000000000001
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct TenantId(pub Uuid);
-
-impl TenantId {
-    /// Create a new random tenant ID
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    /// Parse tenant ID from string
-    pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-
-    /// Get the default tenant ID for single-tenant MVP deployments
-    pub fn default_tenant() -> Self {
-        Self(
-            Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-                .expect("Default tenant UUID is valid"),
-        )
-    }
-}
-
-impl Default for TenantId {
-    fn default() -> Self {
-        Self::default_tenant()
-    }
-}
-
-impl std::fmt::Display for TenantId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.0)
     }
@@ -733,7 +695,7 @@ mod tests {
     #[test]
     fn test_tenant_id_default() {
         let tenant = TenantId::default();
-        assert_eq!(tenant.0.to_string(), "00000000-0000-0000-0000-000000000001");
+        assert_eq!(tenant.as_str(), "local");
     }
 
     #[test]

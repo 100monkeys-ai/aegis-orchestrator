@@ -14,10 +14,17 @@
 //! [`crate::application::agent`].
 //!
 //! See AGENTS.md §BC-1 Agent Lifecycle Context.
+//!
+//! # Code Quality Principles
+//!
+//! - Keep manifest validation and lifecycle persistence in one application boundary.
+//! - Fail closed on invalid manifests rather than synthesizing defaults.
+//! - Publish lifecycle state changes explicitly instead of relying on implicit side effects.
 
 use crate::application::agent::AgentLifecycleService;
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
 use crate::domain::repository::AgentRepository;
+use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -34,14 +41,19 @@ impl StandardAgentLifecycleService {
 
 #[async_trait]
 impl AgentLifecycleService for StandardAgentLifecycleService {
-    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
+    async fn deploy_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
 
         // Check if an agent with the same name already exists
         if let Some(existing) = self
             .repository
-            .find_by_name(&manifest.metadata.name)
+            .find_by_name_for_tenant(tenant_id, &manifest.metadata.name)
             .await?
         {
             let existing_version = &existing.manifest.metadata.version;
@@ -62,60 +74,78 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
                 // preserving its AgentId so existing execution references remain valid.
                 let mut updated = existing.clone();
                 updated.update_manifest(manifest);
-                self.repository.save(&updated).await?;
+                self.repository.save_for_tenant(tenant_id, &updated).await?;
                 return Ok(updated.id);
             }
 
             // Different version — treat as an in-place update (new version replaces old).
             let mut updated = existing.clone();
             updated.update_manifest(manifest);
-            self.repository.save(&updated).await?;
+            self.repository.save_for_tenant(tenant_id, &updated).await?;
             return Ok(updated.id);
         }
 
         // No existing agent with this name — create a fresh one
         let agent = Agent::new(manifest);
-        let agent_name = agent.manifest.metadata.name.clone();
-        self.repository.save(&agent).await?;
+        self.repository.save_for_tenant(tenant_id, &agent).await?;
 
-        metrics::counter!("agent_deploy_total", "name" => agent_name).increment(1);
+        metrics::counter!(
+            "aegis_agent_lifecycle_operations_total",
+            "operation" => "deploy",
+            "result" => "success"
+        )
+        .increment(1);
 
         Ok(agent.id)
     }
 
-    async fn get_agent(&self, id: AgentId) -> Result<Agent> {
+    async fn get_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
         self.repository
-            .find_by_id(id)
+            .find_by_id_for_tenant(tenant_id, id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))
     }
 
-    async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()> {
-        let mut agent = self.get_agent(id).await?;
+    async fn update_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> Result<()> {
+        let mut agent = self.get_agent_for_tenant(tenant_id, id).await?;
         agent.update_manifest(manifest);
-        self.repository.save(&agent).await?;
+        self.repository.save_for_tenant(tenant_id, &agent).await?;
         Ok(())
     }
 
-    async fn delete_agent(&self, id: AgentId) -> Result<()> {
-        self.repository.delete(id).await?;
+    async fn delete_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<()> {
+        self.repository.delete_for_tenant(tenant_id, id).await?;
 
-        metrics::counter!("agent_delete_total", "id" => id.0.to_string()).increment(1);
+        metrics::counter!(
+            "aegis_agent_lifecycle_operations_total",
+            "operation" => "delete",
+            "result" => "success"
+        )
+        .increment(1);
 
         Ok(())
     }
 
-    async fn list_agents(&self) -> Result<Vec<Agent>> {
+    async fn list_agents_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>> {
         self.repository
-            .list_all()
+            .list_all_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
     }
 
-    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+    async fn lookup_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
         let agent = self
             .repository
-            .find_by_name(name)
+            .find_by_name_for_tenant(tenant_id, name)
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))

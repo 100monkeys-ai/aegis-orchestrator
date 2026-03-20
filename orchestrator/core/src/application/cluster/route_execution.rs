@@ -1,6 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
+use crate::domain::agent::AgentId;
 use crate::domain::cluster::{
     ExecutionRoute, NodeCapabilityAdvertisement, NodeCluster, NodeClusterRepository, NodeId,
     NodePeerStatus, NodeRouter,
@@ -12,7 +13,7 @@ use std::sync::Arc;
 
 pub struct RouteExecutionRequest {
     pub execution_id: ExecutionId,
-    pub agent_id: String, // TODO: Use AgentId domain type
+    pub agent_id: AgentId,
     pub required_capabilities: NodeCapabilityAdvertisement,
     pub preferred_tags: Vec<String>,
     pub tenant_id: TenantId,

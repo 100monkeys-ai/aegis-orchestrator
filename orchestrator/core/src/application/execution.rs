@@ -24,6 +24,12 @@
 //!
 //! ## NFS Gateway Integration
 //!
+//! # Code Quality Principles
+//!
+//! - Keep execution lifecycle logic in this service, not in transport or persistence adapters.
+//! - Fail fast when agent, volume, or runtime prerequisites are missing.
+//! - Preserve deterministic iteration transitions and explicit state changes.
+//!
 //! Attach an NFS gateway using [`StandardExecutionService::with_nfs_gateway`] so that
 //! volume contexts are registered *before* the first container spawns. Without this,
 //! NFS mounts in the container will fail with `ESTALE`.
@@ -208,6 +214,96 @@ pub struct StandardExecutionService {
 }
 
 impl StandardExecutionService {
+    fn resolve_tenant_from_payload(payload: &serde_json::Value) -> Result<TenantId> {
+        let tenant = payload
+            .get("tenant_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| payload.get("tenant").and_then(|v| v.as_str()))
+            .unwrap_or("local");
+        TenantId::from_string(tenant).map_err(|e| anyhow!("Invalid tenant_id '{tenant}': {e}"))
+    }
+
+    fn resolve_tenant_from_input(input: &ExecutionInput) -> Result<TenantId> {
+        Self::resolve_tenant_from_payload(&input.payload)
+    }
+
+    pub async fn get_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Execution> {
+        self.repository
+            .find_by_id_for_tenant(tenant_id, id)
+            .await?
+            .ok_or_else(|| anyhow!("Execution not found"))
+    }
+
+    pub async fn get_iterations_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        exec_id: ExecutionId,
+    ) -> Result<Vec<Iteration>> {
+        let execution = self.get_execution_for_tenant(tenant_id, exec_id).await?;
+        Ok(execution.iterations().to_vec())
+    }
+
+    pub async fn cancel_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        if let Some(token) = self.cancellation_tokens.get(&id) {
+            token.cancel();
+        }
+
+        let mut execution = self.get_execution_for_tenant(tenant_id, id).await?;
+        execution.status = ExecutionStatus::Cancelled;
+        execution.ended_at = Some(Utc::now());
+        self.repository
+            .save_for_tenant(tenant_id, &execution)
+            .await?;
+
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ExecutionCancelled {
+                execution_id: id,
+                agent_id: execution.agent_id,
+                reason: None,
+                cancelled_at: Utc::now(),
+            });
+
+        self.cancellation_tokens.remove(&id);
+
+        Ok(())
+    }
+
+    pub async fn list_executions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: Option<AgentId>,
+        limit: usize,
+    ) -> Result<Vec<Execution>> {
+        if let Some(aid) = agent_id {
+            Ok(self
+                .repository
+                .find_by_agent_for_tenant(tenant_id, aid, limit)
+                .await?)
+        } else {
+            Ok(self
+                .repository
+                .find_recent_for_tenant(tenant_id, limit)
+                .await?)
+        }
+    }
+
+    pub async fn delete_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<()> {
+        self.repository.delete_for_tenant(tenant_id, id).await?;
+        Ok(())
+    }
+
     pub fn new(
         agent_service: Arc<dyn AgentLifecycleService>,
         volume_service: Arc<dyn VolumeService>,
@@ -292,8 +388,7 @@ impl SupervisorObserver for ExecutionMonitor {
     async fn on_iteration_start(&self, iteration: u8, action: &str) {
         let now = Utc::now();
 
-        metrics::counter!("execution_iteration_total", "agent_id" => self.agent_id.0.to_string())
-            .increment(1);
+        metrics::counter!("aegis_execution_iterations_total").increment(1);
 
         // Update DB
         if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
@@ -544,8 +639,13 @@ impl ExecutionService for StandardExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
     ) -> Result<ExecutionId> {
+        let tenant_id = Self::resolve_tenant_from_input(&input)?;
+
         // 1. Fetch Agent
-        let agent = self.agent_service.get_agent(agent_id).await?;
+        let agent = self
+            .agent_service
+            .get_agent_for_tenant(&tenant_id, agent_id)
+            .await?;
 
         // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
         if let Some(router) = &self.tool_router {
@@ -577,7 +677,9 @@ impl ExecutionService for StandardExecutionService {
         let execution_id = execution.id;
 
         // 3. Save initial state
-        self.repository.save(&execution).await?;
+        self.repository
+            .save_for_tenant(&tenant_id, &execution)
+            .await?;
 
         // Emit Started Event
         self.event_bus
@@ -587,10 +689,9 @@ impl ExecutionService for StandardExecutionService {
                 started_at: Utc::now(),
             });
 
-        metrics::counter!("execution_start_total", "agent_id" => agent_id.0.to_string())
+        metrics::counter!("aegis_executions_total", "kind" => "root", "status" => "started")
             .increment(1);
-        metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
-            .increment(1.0);
+        metrics::gauge!("aegis_execution_active").increment(1.0);
 
         // 4. Spawn Runtime
         let mut env = agent.manifest.spec.env.clone();
@@ -688,12 +789,11 @@ impl ExecutionService for StandardExecutionService {
             tracing::debug!("Storage config: backend={}", storage_config.backend);
 
             // Create volumes using volume service
-            let tenant_id = TenantId::default_tenant(); // Uses the default tenant context.
             let volumes = self
                 .volume_service
                 .create_volumes_for_execution(
                     execution_id,
-                    tenant_id,
+                    tenant_id.clone(),
                     &agent.manifest.spec.volumes,
                     &storage_config.backend,
                 )
@@ -866,13 +966,16 @@ impl ExecutionService for StandardExecutionService {
         };
 
         execution.start();
-        self.repository.save(&execution).await?;
+        self.repository
+            .save_for_tenant(&tenant_id, &execution)
+            .await?;
 
         // 5. Run Supervisor Loop
         let supervisor = self.supervisor.clone();
         let repository = self.repository.clone();
         let event_bus = self.event_bus.clone();
         let exec_input = prepared_input.clone();
+        let tenant_id_for_task = tenant_id.clone();
 
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
@@ -925,21 +1028,33 @@ impl ExecutionService for StandardExecutionService {
 
             let duration = Utc::now() - start_time;
             let duration_seconds = duration.num_milliseconds() as f64 / 1000.0;
-            metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
-                .decrement(1.0);
-            metrics::histogram!("execution_duration_seconds", "agent_id" => agent_id.0.to_string())
-                .record(duration_seconds);
+            metrics::gauge!("aegis_execution_active").decrement(1.0);
 
             // Clean up the token from the map now that the execution is done
             tokens_map.remove(&execution_id);
 
             match result {
                 Ok(final_output) => {
+                    metrics::counter!(
+                        "aegis_executions_total",
+                        "kind" => "root",
+                        "status" => "completed"
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "aegis_execution_duration_seconds",
+                        "kind" => "root",
+                        "status" => "completed"
+                    )
+                    .record(duration_seconds);
                     // Update to completed
-                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
+                        .await
+                    {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
 
                         StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
@@ -953,11 +1068,26 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
+                    metrics::counter!(
+                        "aegis_executions_total",
+                        "kind" => "root",
+                        "status" => "timed_out"
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "aegis_execution_duration_seconds",
+                        "kind" => "root",
+                        "status" => "timed_out"
+                    )
+                    .record(duration_seconds);
                     // Execution timed out — emit specific timeout event
-                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
+                        .await
+                    {
                         exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
 
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
                             execution_id,
@@ -969,13 +1099,28 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(RuntimeError::Cancelled) => {
+                    metrics::counter!(
+                        "aegis_executions_total",
+                        "kind" => "root",
+                        "status" => "cancelled"
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "aegis_execution_duration_seconds",
+                        "kind" => "root",
+                        "status" => "cancelled"
+                    )
+                    .record(duration_seconds);
                     // Execution was cancelled — status already set by cancel_execution(),
                     // but ensure we mark it if the token was triggered externally.
-                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
+                        .await
+                    {
                         if exec.status != ExecutionStatus::Cancelled {
                             exec.status = ExecutionStatus::Cancelled;
                             exec.ended_at = Some(Utc::now());
-                            let _ = repository.save(&exec).await;
+                            let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
 
                             event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
                                 execution_id,
@@ -987,11 +1132,26 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(e) => {
+                    metrics::counter!(
+                        "aegis_executions_total",
+                        "kind" => "root",
+                        "status" => "failed"
+                    )
+                    .increment(1);
+                    metrics::histogram!(
+                        "aegis_execution_duration_seconds",
+                        "kind" => "root",
+                        "status" => "failed"
+                    )
+                    .record(duration_seconds);
                     // Update to failed (generic failure)
-                    if let Ok(Some(mut exec)) = repository.find_by_id(execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, execution_id)
+                        .await
+                    {
                         exec.fail(e.to_string());
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
 
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
                             execution_id,
@@ -1009,43 +1169,18 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
-        self.repository
-            .find_by_id(id)
-            .await?
-            .ok_or_else(|| anyhow!("Execution not found"))
+        self.get_execution_for_tenant(&TenantId::local_default(), id)
+            .await
     }
 
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {
-        let execution = self.get_execution(exec_id).await?;
-        Ok(execution.iterations().to_vec())
+        self.get_iterations_for_tenant(&TenantId::local_default(), exec_id)
+            .await
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-        // Signal the Supervisor loop to stop via the CancellationToken.
-        // The Supervisor will terminate the running container and return
-        // RuntimeError::Cancelled, which the spawned task handles above.
-        if let Some(token) = self.cancellation_tokens.get(&id) {
-            token.cancel();
-        }
-
-        let mut execution = self.get_execution(id).await?;
-        execution.status = ExecutionStatus::Cancelled;
-        execution.ended_at = Some(Utc::now());
-        self.repository.save(&execution).await?;
-
-        self.event_bus
-            .publish_execution_event(ExecutionEvent::ExecutionCancelled {
-                execution_id: id,
-                agent_id: execution.agent_id,
-                reason: None,
-                cancelled_at: Utc::now(),
-            });
-
-        // Remove the token from the map — the Supervisor will also try to remove
-        // it when it exits, but this is idempotent.
-        self.cancellation_tokens.remove(&id);
-
-        Ok(())
+        self.cancel_execution_for_tenant(&TenantId::local_default(), id)
+            .await
     }
 
     async fn stream_execution(
@@ -1079,11 +1214,8 @@ impl ExecutionService for StandardExecutionService {
         agent_id: Option<AgentId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        if let Some(aid) = agent_id {
-            Ok(self.repository.find_by_agent(aid, limit).await?)
-        } else {
-            Ok(self.repository.find_recent(limit).await?)
-        }
+        self.list_executions_for_tenant(&TenantId::local_default(), agent_id, limit)
+            .await
     }
 
     async fn start_child_execution(
@@ -1098,6 +1230,7 @@ impl ExecutionService for StandardExecutionService {
             .find_by_id(parent_execution_id)
             .await?
             .ok_or_else(|| anyhow!("Parent execution {parent_execution_id} not found"))?;
+        let tenant_id = Self::resolve_tenant_from_input(&parent.input)?;
 
         if !parent.can_spawn_child() {
             return Err(anyhow!(
@@ -1108,7 +1241,10 @@ impl ExecutionService for StandardExecutionService {
         }
 
         // 2. Fetch judge agent.
-        let agent = self.agent_service.get_agent(agent_id).await?;
+        let agent = self
+            .agent_service
+            .get_agent_for_tenant(&tenant_id, agent_id)
+            .await?;
 
         // 3. Prepare input (render judge's prompt template).
         let prepared_input = self.prepare_execution_input(input, &agent)?;
@@ -1131,7 +1267,9 @@ impl ExecutionService for StandardExecutionService {
         .map_err(|e| anyhow!("Failed to create child execution: {e}"))?;
         let child_execution_id = child_execution.id;
         child_execution.start();
-        self.repository.save(&child_execution).await?;
+        self.repository
+            .save_for_tenant(&tenant_id, &child_execution)
+            .await?;
 
         self.event_bus
             .publish_execution_event(ExecutionEvent::ExecutionStarted {
@@ -1140,10 +1278,9 @@ impl ExecutionService for StandardExecutionService {
                 started_at: Utc::now(),
             });
 
-        metrics::counter!("execution_start_total", "agent_id" => agent_id.0.to_string())
+        metrics::counter!("aegis_executions_total", "kind" => "child", "status" => "started")
             .increment(1);
-        metrics::gauge!("execution_active_count", "agent_id" => agent_id.0.to_string())
-            .increment(1.0);
+        metrics::gauge!("aegis_execution_active").increment(1.0);
 
         // 5. Build runtime config.
         let mut env = agent.manifest.spec.env.clone();
@@ -1279,7 +1416,7 @@ impl ExecutionService for StandardExecutionService {
                     let proxy_volume = crate::domain::volume::Volume {
                         id: crate::domain::volume::VolumeId::new(),
                         name: format!("inherited-{}", parent_ctx.volume_id),
-                        tenant_id: crate::domain::volume::TenantId::default_tenant(),
+                        tenant_id: tenant_id.clone(),
                         storage_class: crate::domain::volume::StorageClass::persistent(),
                         status: crate::domain::volume::VolumeStatus::Available,
                         ownership: crate::domain::volume::VolumeOwnership::Execution {
@@ -1493,8 +1630,8 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
-        self.repository.delete(id).await?;
-        Ok(())
+        self.delete_execution_for_tenant(&TenantId::local_default(), id)
+            .await
     }
 
     async fn record_llm_interaction(

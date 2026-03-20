@@ -259,7 +259,7 @@ impl NodeClusterService for NodeClusterServiceHandler {
         
         let app_req = AppRouteExecutionRequest {
             execution_id: ExecutionId::from_string(&inner.execution_id).map_err(|_| Status::invalid_argument("Invalid execution_id"))?,
-            agent_id: inner.agent_id,
+            agent_id: AgentId::from_string(&inner.agent_id).map_err(|_| Status::invalid_argument("Invalid agent_id"))?,
             required_capabilities: if let Some(cap) = inner.required_capabilities {
                 NodeCapabilityAdvertisement {
                     gpu_count: cap.gpu_count,
@@ -319,14 +319,18 @@ impl NodeClusterService for NodeClusterServiceHandler {
         &self,
         _request: Request<SyncConfigRequest>,
     ) -> Result<Response<SyncConfigResponse>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        Err(Status::failed_precondition(
+            "cluster config sync is disabled for the single-node Phase 1 baseline",
+        ))
     }
 
     async fn push_config(
         &self,
         _request: Request<PushConfigRequest>,
     ) -> Result<Response<PushConfigResponse>, Status> {
-        Err(Status::unimplemented("Not yet implemented"))
+        Err(Status::failed_precondition(
+            "cluster config push is disabled for the single-node Phase 1 baseline",
+        ))
     }
 
     async fn list_peers(

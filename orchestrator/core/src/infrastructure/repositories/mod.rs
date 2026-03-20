@@ -61,6 +61,7 @@ use crate::domain::repository::{
     AgentRepository, ExecutionRepository, RepositoryError, StorageEventRepository,
     WorkflowRepository,
 };
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{Workflow, WorkflowId};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -68,7 +69,7 @@ use std::sync::{Arc, RwLock};
 
 #[derive(Clone)]
 pub struct InMemoryAgentRepository {
-    agents: Arc<RwLock<HashMap<AgentId, Agent>>>,
+    agents: Arc<RwLock<HashMap<TenantId, HashMap<AgentId, Agent>>>>,
 }
 
 impl InMemoryAgentRepository {
@@ -87,30 +88,63 @@ impl Default for InMemoryAgentRepository {
 
 #[async_trait]
 impl AgentRepository for InMemoryAgentRepository {
-    async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent: &Agent,
+    ) -> Result<(), RepositoryError> {
         let mut agents = self.agents.write().unwrap();
-        agents.insert(agent.id, agent.clone());
+        agents
+            .entry(tenant_id.clone())
+            .or_default()
+            .insert(agent.id, agent.clone());
         Ok(())
     }
 
-    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<Option<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
-        Ok(agents.get(&id).cloned())
+        Ok(agents
+            .get(tenant_id)
+            .and_then(|tenant_agents| tenant_agents.get(&id))
+            .cloned())
     }
 
-    async fn find_by_name(&self, name: &str) -> Result<Option<Agent>, RepositoryError> {
+    async fn find_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
-        Ok(agents.values().find(|a| a.name == name).cloned())
+        Ok(agents
+            .get(tenant_id)
+            .and_then(|tenant_agents| tenant_agents.values().find(|a| a.name == name))
+            .cloned())
     }
 
-    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
+    async fn list_all_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
-        Ok(agents.values().cloned().collect())
+        Ok(agents
+            .get(tenant_id)
+            .map(|tenant_agents| tenant_agents.values().cloned().collect())
+            .unwrap_or_default())
     }
 
-    async fn delete(&self, id: AgentId) -> Result<(), RepositoryError> {
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<(), RepositoryError> {
         let mut agents = self.agents.write().unwrap();
-        agents.remove(&id);
+        if let Some(tenant_agents) = agents.get_mut(tenant_id) {
+            tenant_agents.remove(&id);
+        }
         Ok(())
     }
 }
@@ -121,8 +155,16 @@ use crate::domain::agent::AgentManifest;
 
 #[async_trait]
 impl AgentLifecycleService for InMemoryAgentRepository {
-    async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> anyhow::Result<AgentId> {
-        if let Some(existing) = self.find_by_name(&manifest.metadata.name).await? {
+    async fn deploy_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> anyhow::Result<AgentId> {
+        if let Some(existing) = self
+            .find_by_name_for_tenant(tenant_id, &manifest.metadata.name)
+            .await?
+        {
             let existing_version = &existing.manifest.metadata.version;
             let incoming_version = &manifest.metadata.version;
 
@@ -138,7 +180,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
                 }
                 let mut updated = existing.clone();
                 updated.update_manifest(manifest);
-                self.save(&updated)
+                self.save_for_tenant(tenant_id, &updated)
                     .await
                     .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
                 return Ok(updated.id);
@@ -147,7 +189,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
             // Different version — update in place.
             let mut updated = existing.clone();
             updated.update_manifest(manifest);
-            self.save(&updated)
+            self.save_for_tenant(tenant_id, &updated)
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
             return Ok(updated.id);
@@ -155,42 +197,59 @@ impl AgentLifecycleService for InMemoryAgentRepository {
 
         let agent = Agent::new(manifest);
         let id = agent.id;
-        self.save(&agent)
+        self.save_for_tenant(tenant_id, &agent)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to save agent: {e}"))?;
         Ok(id)
     }
 
-    async fn get_agent(&self, id: AgentId) -> anyhow::Result<Agent> {
-        self.find_by_id(id)
+    async fn get_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> anyhow::Result<Agent> {
+        self.find_by_id_for_tenant(tenant_id, id)
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))
     }
 
-    async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> anyhow::Result<()> {
-        let mut agent = self.get_agent(id).await?;
+    async fn update_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> anyhow::Result<()> {
+        let mut agent = self.get_agent_for_tenant(tenant_id, id).await?;
         agent.update_manifest(manifest);
-        self.save(&agent)
+        self.save_for_tenant(tenant_id, &agent)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to update agent: {e}"))
     }
 
-    async fn delete_agent(&self, id: AgentId) -> anyhow::Result<()> {
-        self.delete(id)
+    async fn delete_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> anyhow::Result<()> {
+        self.delete_for_tenant(tenant_id, id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to delete agent: {e}"))
     }
 
-    async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
-        self.list_all()
+    async fn list_agents_for_tenant(&self, tenant_id: &TenantId) -> anyhow::Result<Vec<Agent>> {
+        self.list_all_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
     }
 
-    async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
+    async fn lookup_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
         let agent = self
-            .find_by_name(name)
+            .find_by_name_for_tenant(tenant_id, name)
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
@@ -199,7 +258,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
 
 #[derive(Clone)]
 pub struct InMemoryExecutionRepository {
-    executions: Arc<RwLock<HashMap<ExecutionId, Execution>>>,
+    executions: Arc<RwLock<HashMap<TenantId, HashMap<ExecutionId, Execution>>>>,
 }
 
 impl InMemoryExecutionRepository {
@@ -218,25 +277,42 @@ impl Default for InMemoryExecutionRepository {
 
 #[async_trait]
 impl ExecutionRepository for InMemoryExecutionRepository {
-    async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        execution: &Execution,
+    ) -> Result<(), RepositoryError> {
         let mut executions = self.executions.write().unwrap();
-        executions.insert(execution.id, execution.clone());
+        executions
+            .entry(tenant_id.clone())
+            .or_default()
+            .insert(execution.id, execution.clone());
         Ok(())
     }
 
-    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Option<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
-        Ok(executions.get(&id).cloned())
+        Ok(executions
+            .get(tenant_id)
+            .and_then(|tenant_execs| tenant_execs.get(&id))
+            .cloned())
     }
 
-    async fn find_by_agent(
+    async fn find_by_agent_for_tenant(
         &self,
+        tenant_id: &TenantId,
         agent_id: AgentId,
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         let mut results: Vec<Execution> = executions
-            .values()
+            .get(tenant_id)
+            .into_iter()
+            .flat_map(|tenant_execs| tenant_execs.values())
             .filter(|e| e.agent_id == agent_id)
             .cloned()
             .collect();
@@ -244,24 +320,37 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         Ok(results.into_iter().take(limit).collect())
     }
 
-    async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError> {
+    async fn find_recent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
-        let mut execution_list: Vec<Execution> = executions.values().cloned().collect();
+        let mut execution_list: Vec<Execution> = executions
+            .get(tenant_id)
+            .map(|tenant_execs| tenant_execs.values().cloned().collect())
+            .unwrap_or_default();
         // Sort by started_at desc
         execution_list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(execution_list.into_iter().take(limit).collect())
     }
 
-    async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError> {
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<(), RepositoryError> {
         let mut executions = self.executions.write().unwrap();
-        executions.remove(&id);
+        if let Some(tenant_execs) = executions.get_mut(tenant_id) {
+            tenant_execs.remove(&id);
+        }
         Ok(())
     }
 }
 
 #[derive(Clone)]
 pub struct InMemoryWorkflowRepository {
-    workflows: Arc<RwLock<HashMap<WorkflowId, Workflow>>>,
+    workflows: Arc<RwLock<HashMap<TenantId, HashMap<WorkflowId, Workflow>>>>,
 }
 
 impl InMemoryWorkflowRepository {
@@ -280,33 +369,65 @@ impl Default for InMemoryWorkflowRepository {
 
 #[async_trait]
 impl WorkflowRepository for InMemoryWorkflowRepository {
-    async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError> {
+    async fn save_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow: &Workflow,
+    ) -> Result<(), RepositoryError> {
         let mut workflows = self.workflows.write().unwrap();
-        workflows.insert(workflow.id, workflow.clone());
+        workflows
+            .entry(tenant_id.clone())
+            .or_default()
+            .insert(workflow.id, workflow.clone());
         Ok(())
     }
 
-    async fn find_by_id(&self, id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
-        let workflows = self.workflows.read().unwrap();
-        Ok(workflows.get(&id).cloned())
-    }
-
-    async fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, RepositoryError> {
+    async fn find_by_id_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
         Ok(workflows
-            .values()
-            .find(|w| w.metadata.name == name)
+            .get(tenant_id)
+            .and_then(|tenant_workflows| tenant_workflows.get(&id))
             .cloned())
     }
 
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn find_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
-        Ok(workflows.values().cloned().collect())
+        Ok(workflows
+            .get(tenant_id)
+            .and_then(|tenant_workflows| {
+                tenant_workflows.values().find(|w| w.metadata.name == name)
+            })
+            .cloned())
     }
 
-    async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError> {
+    async fn list_all_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        Ok(workflows
+            .get(tenant_id)
+            .map(|tenant_workflows| tenant_workflows.values().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    async fn delete_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> Result<(), RepositoryError> {
         let mut workflows = self.workflows.write().unwrap();
-        workflows.remove(&id);
+        if let Some(tenant_workflows) = workflows.get_mut(tenant_id) {
+            tenant_workflows.remove(&id);
+        }
         Ok(())
     }
 }
@@ -316,8 +437,11 @@ pub struct InMemoryWorkflowExecutionRepository {
     executions: Arc<
         RwLock<
             HashMap<
-                crate::domain::execution::ExecutionId,
-                crate::domain::workflow::WorkflowExecution,
+                TenantId,
+                HashMap<
+                    crate::domain::execution::ExecutionId,
+                    crate::domain::workflow::WorkflowExecution,
+                >,
             >,
         >,
     >,
@@ -341,29 +465,40 @@ impl Default for InMemoryWorkflowExecutionRepository {
 impl crate::domain::repository::WorkflowExecutionRepository
     for InMemoryWorkflowExecutionRepository
 {
-    async fn save(
+    async fn save_for_tenant(
         &self,
+        tenant_id: &TenantId,
         execution: &crate::domain::workflow::WorkflowExecution,
     ) -> Result<(), RepositoryError> {
         let mut executions = self.executions.write().unwrap();
-        executions.insert(execution.id, execution.clone());
+        executions
+            .entry(tenant_id.clone())
+            .or_default()
+            .insert(execution.id, execution.clone());
         Ok(())
     }
 
-    async fn find_by_id(
+    async fn find_by_id_for_tenant(
         &self,
+        tenant_id: &TenantId,
         id: crate::domain::execution::ExecutionId,
     ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
-        Ok(executions.get(&id).cloned())
+        Ok(executions
+            .get(tenant_id)
+            .and_then(|tenant_execs| tenant_execs.get(&id))
+            .cloned())
     }
 
-    async fn find_active(
+    async fn find_active_for_tenant(
         &self,
+        tenant_id: &TenantId,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
         Ok(executions
-            .values()
+            .get(tenant_id)
+            .into_iter()
+            .flat_map(|tenant_execs| tenant_execs.values())
             .filter(|e| e.status == crate::domain::execution::ExecutionStatus::Running)
             .cloned()
             .collect())
@@ -377,7 +512,7 @@ impl crate::domain::repository::WorkflowExecutionRepository
         _payload: serde_json::Value,
         _iteration_number: Option<u8>,
     ) -> Result<(), RepositoryError> {
-        // No-op for in memory for now
+        // No-op for in-memory repositories.
         Ok(())
     }
 
@@ -390,13 +525,17 @@ impl crate::domain::repository::WorkflowExecutionRepository
         Ok(vec![])
     }
 
-    async fn list_paginated(
+    async fn list_paginated_for_tenant(
         &self,
+        tenant_id: &TenantId,
         limit: usize,
         offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
         let executions = self.executions.read().unwrap();
-        let mut list: Vec<_> = executions.values().cloned().collect();
+        let mut list: Vec<_> = executions
+            .get(tenant_id)
+            .map(|tenant_execs| tenant_execs.values().cloned().collect())
+            .unwrap_or_default();
         list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(list.into_iter().skip(offset).take(limit).collect())
     }

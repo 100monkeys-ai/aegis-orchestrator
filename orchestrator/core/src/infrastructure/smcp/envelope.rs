@@ -183,7 +183,7 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SmcpEnvelope {
-            security_token: "mock-jwt.token.here".to_string(),
+            security_token: "test-jwt.token.here".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes.clone(),
         };
@@ -214,7 +214,7 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SmcpEnvelope {
-            security_token: "mock.jwt".to_string(),
+            security_token: "test.jwt".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes,
         };

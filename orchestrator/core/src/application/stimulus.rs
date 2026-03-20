@@ -11,6 +11,12 @@
 //!
 //! On success, calls [`StartWorkflowExecutionUseCase`] and publishes
 //! [`StimulusEvent`]s to the [`EventBus`].
+//!
+//! # Code Quality Principles
+//!
+//! - Resolve deterministic routes before invoking any classification fallback.
+//! - Fail closed on low-confidence or unauthenticated stimuli.
+//! - Keep transport-specific auth and webhook verification at the boundary.
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -26,6 +32,7 @@ use crate::application::{StartWorkflowExecutionRequest, StartWorkflowExecutionUs
 use crate::domain::events::StimulusEvent;
 use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 use crate::domain::stimulus::{RoutingDecision, RoutingMode, Stimulus, StimulusId};
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow_registry::WorkflowRegistry;
 use crate::infrastructure::event_bus::EventBus;
 
@@ -154,6 +161,15 @@ pub struct StandardStimulusService {
 }
 
 impl StandardStimulusService {
+    fn tenant_id_for_stimulus(stimulus: &Stimulus) -> TenantId {
+        stimulus
+            .headers
+            .get("x-aegis-tenant")
+            .or_else(|| stimulus.headers.get("x-tenant-id"))
+            .and_then(|value| TenantId::from_string(value).ok())
+            .unwrap_or_else(TenantId::local_default)
+    }
+
     pub fn new(
         registry: Arc<RwLock<WorkflowRegistry>>,
         execution_service: Arc<dyn ExecutionService>,
@@ -254,7 +270,10 @@ impl StandardStimulusService {
 
         let input = ExecutionInput {
             intent: None,
-            payload: json!({ "stimulus": stimulus.content }),
+            payload: json!({
+                "stimulus": stimulus.content,
+                "tenant_id": Self::tenant_id_for_stimulus(stimulus).to_string(),
+            }),
         };
 
         // Run the RouterAgent
@@ -413,6 +432,7 @@ impl StimulusService for StandardStimulusService {
                 "headers":          stimulus.headers,
             }),
             blackboard: None,
+            tenant_id: Some(Self::tenant_id_for_stimulus(&stimulus)),
         };
 
         let started = self

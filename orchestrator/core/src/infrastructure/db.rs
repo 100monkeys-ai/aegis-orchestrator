@@ -5,9 +5,8 @@
 //! Wraps `sqlx::postgres::PgPool` in a thin `Database` newtype that can be
 //! injected into all PostgreSQL repository implementations.
 //!
-//! ⚠️ Phase 1 — Most repositories use in-memory implementations. This module
-//! is required only for Phase 2+ production deployments where PostgreSQL
-//! persistence is enabled via `aegis-config.yaml`.
+//! PostgreSQL connection pool wrapper used by repository implementations when
+//! persistent storage is configured.
 //!
 //! See ADR-025 (PostgreSQL Schema Design).
 

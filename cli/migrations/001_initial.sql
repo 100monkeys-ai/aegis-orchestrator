@@ -19,7 +19,8 @@ DROP TABLE IF EXISTS agents CASCADE;
 -- -----------------------------------------------------------------------------
 CREATE TABLE workflows (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
     version TEXT NOT NULL,
     description TEXT,
     
@@ -38,10 +39,12 @@ CREATE TABLE workflows (
     
     -- Validation
     CONSTRAINT workflows_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT workflows_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT workflows_tenant_name_version_unique UNIQUE (tenant_id, name, version),
     CONSTRAINT workflows_version_format CHECK (version ~ '^\d+\.\d+\.\d+$')
 );
 
-CREATE INDEX idx_workflows_name ON workflows(name);
+CREATE INDEX idx_workflows_tenant_name ON workflows(tenant_id, name);
 CREATE INDEX idx_workflows_created_at ON workflows(created_at DESC);
 
 -- Trigger to update updated_at
@@ -66,6 +69,7 @@ CREATE TRIGGER trigger_workflows_updated_at
 -- -----------------------------------------------------------------------------
 CREATE TABLE workflow_executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id TEXT NOT NULL,
     workflow_id UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
     
     -- Temporal identifiers (for querying Temporal Server)
@@ -101,6 +105,7 @@ CREATE TABLE workflow_executions (
 );
 
 CREATE INDEX idx_workflow_executions_workflow_id ON workflow_executions(workflow_id);
+CREATE INDEX idx_workflow_executions_tenant_workflow_id ON workflow_executions(tenant_id, workflow_id);
 CREATE INDEX idx_workflow_executions_temporal_workflow_id ON workflow_executions(temporal_workflow_id);
 CREATE INDEX idx_workflow_executions_status ON workflow_executions(status);
 CREATE INDEX idx_workflow_executions_started_at ON workflow_executions(started_at DESC);
@@ -146,7 +151,8 @@ COMMENT ON TABLE execution_events IS 'Append-only Temporal event log per workflo
 -- -----------------------------------------------------------------------------
 CREATE TABLE agents (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    name TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
     version TEXT NOT NULL DEFAULT '1.0.0',
     
     -- Manifest artifacts
@@ -169,10 +175,12 @@ CREATE TABLE agents (
     
     -- Validation
     CONSTRAINT agents_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT agents_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT agents_tenant_name_unique UNIQUE (tenant_id, name),
     CONSTRAINT agents_status_check CHECK (status IN ('active', 'paused', 'archived'))
 );
 
-CREATE INDEX idx_agents_name ON agents(name);
+CREATE INDEX idx_agents_tenant_name ON agents(tenant_id, name);
 CREATE INDEX idx_agents_status ON agents(status);
 CREATE INDEX idx_agents_created_at ON agents(created_at DESC);
 
@@ -196,6 +204,7 @@ CREATE TRIGGER trigger_agents_updated_at
 -- -----------------------------------------------------------------------------
 CREATE TABLE executions (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id TEXT NOT NULL,
     agent_id UUID NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
     
     -- Optional link to workflow execution (if agent was called by workflow)
@@ -232,6 +241,7 @@ CREATE TABLE executions (
 );
 
 CREATE INDEX idx_executions_agent_id ON executions(agent_id);
+CREATE INDEX idx_executions_tenant_agent_id ON executions(tenant_id, agent_id);
 CREATE INDEX idx_executions_workflow_execution_id ON executions(workflow_execution_id);
 CREATE INDEX idx_executions_status ON executions(status);
 CREATE INDEX idx_executions_started_at ON executions(started_at DESC);
@@ -249,7 +259,8 @@ CREATE INDEX idx_executions_parent_execution_id ON executions(parent_execution_i
 -- -----------------------------------------------------------------------------
 CREATE TABLE workflow_definitions (
     workflow_id UUID PRIMARY KEY,
-    name TEXT NOT NULL UNIQUE,
+    tenant_id TEXT NOT NULL,
+    name TEXT NOT NULL,
     definition JSONB NOT NULL,
     
     -- Registration metadata
@@ -257,10 +268,14 @@ CREATE TABLE workflow_definitions (
     registered_by TEXT,
     
     -- Version tracking
+    version TEXT NOT NULL DEFAULT '0.0.1',
     definition_hash TEXT NOT NULL,
     
     CONSTRAINT workflow_definitions_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
 );
+
+CREATE UNIQUE INDEX idx_workflow_definitions_tenant_name_version
+    ON workflow_definitions(tenant_id, name, version);
 
 CREATE INDEX idx_workflow_definitions_name ON workflow_definitions(name);
 CREATE INDEX idx_workflow_definitions_registered_at ON workflow_definitions(registered_at DESC);

@@ -23,6 +23,12 @@
 //!
 //! - **Layer:** Domain Layer
 //! - **Purpose:** Implements internal responsibilities for workflow
+//!
+//! # Code Quality Principles
+//!
+//! - Keep workflow definitions immutable after validation.
+//! - Enforce FSM invariants in constructors and transitions, not in callers.
+//! - Avoid transport, persistence, or runtime-specific concerns in the domain model.
 
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};

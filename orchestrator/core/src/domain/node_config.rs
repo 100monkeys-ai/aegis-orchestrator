@@ -1591,6 +1591,22 @@ impl NodeConfigManifest {
         }
     }
 
+    /// Returns true when the node is explicitly configured for production use.
+    pub fn is_production(&self) -> bool {
+        self.metadata
+            .labels
+            .as_ref()
+            .and_then(|labels| labels.get("environment"))
+            .map(|value| value.eq_ignore_ascii_case("production"))
+            .unwrap_or(false)
+            || self
+                .spec
+                .node
+                .tags
+                .iter()
+                .any(|tag| tag.eq_ignore_ascii_case("production"))
+    }
+
     /// Apply environment variable overrides to configuration.
     ///
     /// Standard precedence: explicit YAML value > env var override > default.
@@ -1799,6 +1815,30 @@ impl NodeConfigManifest {
                 .any(|p| &p.name == fallback_provider)
             {
                 anyhow::bail!("Fallback provider '{fallback_provider}' not found in llm_providers");
+            }
+        }
+
+        if self.is_production() {
+            if self.spec.database.is_none() {
+                anyhow::bail!("Production nodes must configure spec.database");
+            }
+
+            if self.spec.smcp.is_none() {
+                anyhow::bail!("Production nodes must configure spec.smcp");
+            }
+
+            if self.spec.iam.is_none() {
+                anyhow::bail!("Production nodes must configure spec.iam");
+            }
+
+            if self
+                .spec
+                .network
+                .as_ref()
+                .and_then(|network| network.tls.as_ref())
+                .is_none()
+            {
+                anyhow::bail!("Production nodes must enable spec.network.tls");
             }
         }
 

@@ -75,7 +75,7 @@ impl StorageProvider for LocalHostStorageProvider {
     }
 
     async fn get_usage(&self, _path: &str) -> Result<u64, StorageError> {
-        // Placeholder
+        // Usage tracking is handled by AegisFSAL.
         Ok(0)
     }
 

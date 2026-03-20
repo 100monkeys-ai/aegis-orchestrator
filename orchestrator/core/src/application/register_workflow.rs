@@ -39,6 +39,7 @@
 use crate::application::agent::AgentLifecycleService;
 use crate::application::ports::WorkflowEnginePort;
 use crate::domain::repository::WorkflowRepository;
+use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::{Context, Result};
@@ -59,6 +60,13 @@ pub struct RegisteredWorkflow {
 /// Register Workflow Use Case
 #[async_trait]
 pub trait RegisterWorkflowUseCase: Send + Sync {
+    async fn register_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        yaml_manifest: &str,
+        force: bool,
+    ) -> Result<RegisteredWorkflow>;
+
     /// Register a new workflow from YAML manifest
     ///
     /// # Arguments
@@ -80,7 +88,10 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
         &self,
         yaml_manifest: &str,
         force: bool,
-    ) -> Result<RegisteredWorkflow>;
+    ) -> Result<RegisteredWorkflow> {
+        self.register_workflow_for_tenant(&TenantId::local_default(), yaml_manifest, force)
+            .await
+    }
 }
 
 /// Standard implementation of RegisterWorkflowUseCase
@@ -111,8 +122,9 @@ impl StandardRegisterWorkflowUseCase {
 
 #[async_trait]
 impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
-    async fn register_workflow(
+    async fn register_workflow_for_tenant(
         &self,
+        tenant_id: &TenantId,
         yaml_manifest: &str,
         force: bool,
     ) -> Result<RegisteredWorkflow> {
@@ -134,7 +146,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         if !force {
             if let Some(existing) = self
                 .workflow_repository
-                .find_by_name(&workflow_name)
+                .find_by_name_for_tenant(tenant_id, &workflow_name)
                 .await?
             {
                 if existing.metadata.version == workflow.metadata.version {
@@ -162,7 +174,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
                     if uuid::Uuid::parse_str(name).is_err() {
                         let agent_id = self
                             .agent_service
-                            .lookup_agent(name)
+                            .lookup_agent_for_tenant(tenant_id, name)
                             .await
                             .with_context(|| {
                                 format!("Failed to resolve agent '{name}' in state '{state_name}'")
@@ -193,7 +205,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
 
         // Step 4: Persist workflow to repository
         self.workflow_repository
-            .save(&workflow)
+            .save_for_tenant(tenant_id, &workflow)
             .await
             .context("Failed to persist workflow to repository")?;
 
@@ -234,29 +246,83 @@ mod tests {
 
     /// Test fixture: resolves any agent name to a deterministic UUID.
     /// Returns `None` only when `name == "nonexistent-agent"` (for error-path tests).
-    struct MockAgentService;
+    struct TestAgentService;
 
     #[async_trait]
-    impl AgentLifecycleService for MockAgentService {
+    impl AgentLifecycleService for TestAgentService {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            manifest: AgentManifest,
+            force: bool,
+        ) -> anyhow::Result<AgentId> {
+            self.deploy_agent(manifest, force).await
+        }
+
         async fn deploy_agent(
             &self,
             _manifest: AgentManifest,
             _force: bool,
         ) -> anyhow::Result<AgentId> {
-            unimplemented!()
+            panic!("test-only fixture: deploy_agent is not exercised in this test")
         }
+
+        async fn get_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: AgentId,
+        ) -> anyhow::Result<Agent> {
+            self.get_agent(id).await
+        }
+
         async fn get_agent(&self, _id: AgentId) -> anyhow::Result<Agent> {
-            unimplemented!()
+            panic!("test-only fixture: get_agent is not exercised in this test")
         }
+
+        async fn update_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: AgentId,
+            manifest: AgentManifest,
+        ) -> anyhow::Result<()> {
+            self.update_agent(id, manifest).await
+        }
+
         async fn update_agent(&self, _id: AgentId, _manifest: AgentManifest) -> anyhow::Result<()> {
-            unimplemented!()
+            panic!("test-only fixture: update_agent is not exercised in this test")
         }
+
+        async fn delete_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: AgentId,
+        ) -> anyhow::Result<()> {
+            self.delete_agent(id).await
+        }
+
         async fn delete_agent(&self, _id: AgentId) -> anyhow::Result<()> {
-            unimplemented!()
+            panic!("test-only fixture: delete_agent is not exercised in this test")
         }
+
+        async fn list_agents_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> anyhow::Result<Vec<Agent>> {
+            self.list_agents().await
+        }
+
         async fn list_agents(&self) -> anyhow::Result<Vec<Agent>> {
-            unimplemented!()
+            panic!("test-only fixture: list_agents is not exercised in this test")
         }
+
+        async fn lookup_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            name: &str,
+        ) -> anyhow::Result<Option<AgentId>> {
+            self.lookup_agent(name).await
+        }
+
         async fn lookup_agent(&self, name: &str) -> anyhow::Result<Option<AgentId>> {
             if name == "nonexistent-agent" {
                 return Ok(None);
@@ -267,8 +333,8 @@ mod tests {
         }
     }
 
-    fn mock_agent_service() -> Arc<dyn AgentLifecycleService> {
-        Arc::new(MockAgentService)
+    fn test_agent_service() -> Arc<dyn AgentLifecycleService> {
+        Arc::new(TestAgentService)
     }
 
     const VALID_WORKFLOW_YAML: &str = r#"
@@ -348,20 +414,59 @@ spec:
 
     #[async_trait]
     impl WorkflowRepository for SaveFailRepo {
+        async fn save_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            workflow: &Workflow,
+        ) -> Result<(), RepositoryError> {
+            self.save(workflow).await
+        }
+
         async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
             Err(RepositoryError::Database("write failed".to_string()))
+        }
+
+        async fn find_by_id_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: WorkflowId,
+        ) -> Result<Option<Workflow>, RepositoryError> {
+            self.find_by_id(id).await
         }
 
         async fn find_by_id(&self, _id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
 
+        async fn find_by_name_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            name: &str,
+        ) -> Result<Option<Workflow>, RepositoryError> {
+            self.find_by_name(name).await
+        }
+
         async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
 
+        async fn list_all_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<Vec<Workflow>, RepositoryError> {
+            self.list_all().await
+        }
+
         async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
             Ok(vec![])
+        }
+
+        async fn delete_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: WorkflowId,
+        ) -> Result<(), RepositoryError> {
+            self.delete(id).await
         }
 
         async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
@@ -380,7 +485,7 @@ spec:
             repo.clone(),
             Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
             event_bus,
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let response = service
@@ -419,7 +524,7 @@ spec:
             Arc::new(InMemoryWorkflowRepository::new()),
             Arc::new(tokio::sync::RwLock::new(None)),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let err = service
@@ -439,7 +544,7 @@ spec:
                 Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
             ))),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let err = service
@@ -458,7 +563,7 @@ spec:
                 Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
             ))),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let err = service
@@ -479,7 +584,7 @@ spec:
                 Arc::new(FailingEngine) as Arc<dyn WorkflowEnginePort>
             ))),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let _ = service
@@ -503,7 +608,7 @@ spec:
                 Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
             ))),
             event_bus,
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let _ = service
@@ -520,7 +625,7 @@ spec:
             Arc::new(InMemoryWorkflowRepository::new()),
             Arc::new(tokio::sync::RwLock::new(None)),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
         let err = service
             .register_workflow(&invalid, false)
@@ -543,7 +648,7 @@ spec:
                 engine.clone() as Arc<dyn WorkflowEnginePort>
             ))),
             event_bus,
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         // First registration
@@ -600,7 +705,7 @@ spec:
                 Arc::new(RecordingEngine::new()) as Arc<dyn WorkflowEnginePort>,
             ))),
             Arc::new(EventBus::new(8)),
-            mock_agent_service(),
+            test_agent_service(),
         );
 
         let err = service

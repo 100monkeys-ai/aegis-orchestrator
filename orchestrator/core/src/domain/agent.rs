@@ -18,6 +18,12 @@
 //!
 //! ## Manifest Schema
 //!
+//! # Code Quality Principles
+//!
+//! - Validate agent manifests before they cross into runtime or persistence code.
+//! - Keep the manifest model declarative and free of transport concerns.
+//! - Fail closed on missing runtime, security, or resource requirements.
+//!
 //! ```yaml
 //! apiVersion: aegis.ai/v1
 //! kind: Agent
@@ -738,8 +744,6 @@ impl ResourceLimits {
 pub struct AdvancedConfig {
     #[serde(default)]
     pub warm_pool_size: u32,
-    #[serde(default)]
-    pub swarm_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub startup_script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

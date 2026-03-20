@@ -5,6 +5,7 @@
 //! Verifies signatures and tokens for inter-node communication.
 
 use crate::domain::cluster::{SmcpNodeEnvelope, NodeSecurityToken};
+use anyhow::bail;
 
 #[derive(Debug, Default)]
 pub struct SmcpNodeVerifier {}
@@ -15,10 +16,10 @@ impl SmcpNodeVerifier {
     }
 
     pub fn verify_envelope(&self, _envelope: &SmcpNodeEnvelope) -> anyhow::Result<()> {
-        todo!("Implement SmcpNodeVerifier::verify_envelope")
+        bail!("inter-node SMCP verification is disabled in the single-node Phase 1 baseline")
     }
 
     pub fn verify_token(&self, _token: &NodeSecurityToken) -> anyhow::Result<()> {
-        todo!("Implement SmcpNodeVerifier::verify_token")
+        bail!("inter-node SMCP verification is disabled in the single-node Phase 1 baseline")
     }
 }

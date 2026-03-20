@@ -170,6 +170,51 @@ impl AegisFSAL {
         }
     }
 
+    fn routed_storage_path(&self, volume: &Volume, path: &str) -> String {
+        match &volume.backend {
+            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => host_path
+                .join(path.trim_start_matches('/'))
+                .to_string_lossy()
+                .to_string(),
+            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
+                format!("{}/{}", remote_path, path.trim_start_matches('/'))
+            }
+            crate::domain::volume::VolumeBackend::OpenDal { .. } => format!(
+                "/aegis/opendal/volumes/{}/{}/{}",
+                volume.tenant_id,
+                volume.id,
+                path.trim_start_matches('/')
+            ),
+            crate::domain::volume::VolumeBackend::Smcp {
+                node_id,
+                remote_volume_id,
+            } => format!(
+                "/aegis/smcp/{}/{}/{}",
+                node_id,
+                remote_volume_id,
+                path.trim_start_matches('/')
+            ),
+        }
+    }
+
+    fn routed_usage_path(&self, volume: &Volume) -> String {
+        match &volume.backend {
+            crate::domain::volume::VolumeBackend::HostPath { path } => {
+                path.to_string_lossy().to_string()
+            }
+            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
+                remote_path.clone()
+            }
+            crate::domain::volume::VolumeBackend::OpenDal { .. } => {
+                format!("/aegis/opendal/volumes/{}/{}", volume.tenant_id, volume.id)
+            }
+            crate::domain::volume::VolumeBackend::Smcp {
+                node_id,
+                remote_volume_id,
+            } => format!("/aegis/smcp/{}/{}", node_id, remote_volume_id),
+        }
+    }
+
     /// Validate that execution owns the volume
     async fn authorize(
         &self,
@@ -333,28 +378,7 @@ impl AegisFSAL {
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_read_policy(policy, path_str)?;
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            crate::domain::volume::VolumeBackend::OpenDal { .. }
-            | crate::domain::volume::VolumeBackend::Smcp { .. } => {
-                // Provider expects internal standardized ID/pathing
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 3. Read via storage provider
         let storage_handle = self
@@ -405,31 +429,8 @@ impl AegisFSAL {
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         self.enforce_write_policy(policy, path_str)?;
-        let (full_path, usage_path) = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                let p = host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string();
-                (p, host_path.to_string_lossy().to_string())
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => (
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/')),
-                remote_path.clone(),
-            ),
-            crate::domain::volume::VolumeBackend::OpenDal { .. }
-            | crate::domain::volume::VolumeBackend::Smcp { .. } => {
-                let p = format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                );
-                let u = format!("/aegis/volumes/{}/{}", volume.tenant_id, volume.id);
-                (p, u)
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
+        let usage_path = self.routed_usage_path(&volume);
 
         // 3. Proactive quota enforcement (ADR-036)
         // Check if write would exceed volume quota before attempting write
@@ -505,26 +506,7 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. Create file via storage provider (using default mode 0o644)
         let handle = self.storage_provider.create_file(&full_path, 0o644).await?;
@@ -564,26 +546,7 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. Get attributes from storage provider
         let mut attrs = self.storage_provider.stat(&full_path).await?;
@@ -614,26 +577,7 @@ impl AegisFSAL {
         self.enforce_read_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. List directory via storage provider
         let entries = self.storage_provider.readdir(&full_path).await?;
@@ -671,26 +615,7 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. Create directory via storage provider
         self.storage_provider.create_directory(&full_path).await?;
@@ -727,26 +652,7 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. Delete file via storage provider
         self.storage_provider.delete_file(&full_path).await?;
@@ -783,26 +689,7 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, path_str)?;
 
         // 4. Build full remote path
-        let full_path = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let canonical_clean = path_str.trim_start_matches('/');
-                host_path
-                    .join(canonical_clean)
-                    .to_string_lossy()
-                    .to_string()
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => {
-                format!("{}/{}", remote_path, path_str.trim_start_matches('/'))
-            }
-            _ => {
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    path_str.trim_start_matches('/')
-                )
-            }
-        };
+        let full_path = self.routed_storage_path(&volume, path_str);
 
         // 5. Delete directory via storage provider
         self.storage_provider.delete_directory(&full_path).await?;
@@ -843,37 +730,8 @@ impl AegisFSAL {
         self.enforce_write_policy(policy, to_str)?;
 
         // 4. Build full remote paths
-        let (from_full, to_full) = match &volume.backend {
-            crate::domain::volume::VolumeBackend::HostPath { path: host_path } => {
-                let fc = host_path
-                    .join(from_str.trim_start_matches('/'))
-                    .to_string_lossy()
-                    .to_string();
-                let tc = host_path
-                    .join(to_str.trim_start_matches('/'))
-                    .to_string_lossy()
-                    .to_string();
-                (fc, tc)
-            }
-            crate::domain::volume::VolumeBackend::SeaweedFS { remote_path, .. } => (
-                format!("{}/{}", remote_path, from_str.trim_start_matches('/')),
-                format!("{}/{}", remote_path, to_str.trim_start_matches('/')),
-            ),
-            _ => (
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    from_str.trim_start_matches('/')
-                ),
-                format!(
-                    "/aegis/volumes/{}/{}/{}",
-                    volume.tenant_id,
-                    volume.id,
-                    to_str.trim_start_matches('/')
-                ),
-            ),
-        };
+        let from_full = self.routed_storage_path(&volume, from_str);
+        let to_full = self.routed_storage_path(&volume, to_str);
 
         // 5. Rename via storage provider
         self.storage_provider.rename(&from_full, &to_full).await?;

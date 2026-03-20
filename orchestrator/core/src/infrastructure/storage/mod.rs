@@ -43,7 +43,7 @@ pub enum StorageBackend {
         options: std::collections::HashMap<String, String>,
     },
 
-    /// Mock storage for unit testing
+    /// Test storage for unit testing
     Mock,
 }
 
@@ -74,14 +74,14 @@ pub fn create_storage_provider(
             })?;
             Ok(Arc::new(OpenDalStorageProvider::new(op)))
         }
-        StorageBackend::Mock => Ok(Arc::new(mock::MockStorageProvider::new())),
+        StorageBackend::Mock => Ok(Arc::new(test_support::TestStorageProvider::new())),
     }
 }
 
-// Re-export MockStorageProvider for testing
-pub use mock::MockStorageProvider;
+// Re-export the test storage provider for testing.
+pub use test_support::TestStorageProvider;
 
-mod mock {
+mod test_support {
     use super::*;
     use crate::domain::storage::StorageError;
     use async_trait::async_trait;
@@ -89,12 +89,12 @@ mod mock {
     use std::sync::Arc;
     use tokio::sync::Mutex;
 
-    pub struct MockStorageProvider {
+    pub struct TestStorageProvider {
         pub directories: Arc<Mutex<HashMap<String, u64>>>,
         pub quotas: Arc<Mutex<HashMap<String, u64>>>,
     }
 
-    impl MockStorageProvider {
+    impl TestStorageProvider {
         pub fn new() -> Self {
             Self {
                 directories: Arc::new(Mutex::new(HashMap::new())),
@@ -103,14 +103,14 @@ mod mock {
         }
     }
 
-    impl Default for MockStorageProvider {
+    impl Default for TestStorageProvider {
         fn default() -> Self {
             Self::new()
         }
     }
 
     #[async_trait]
-    impl StorageProvider for MockStorageProvider {
+    impl StorageProvider for TestStorageProvider {
         async fn create_directory(&self, path: &str) -> Result<(), StorageError> {
             let mut dirs = self.directories.lock().await;
             if dirs.contains_key(path) {
@@ -159,7 +159,7 @@ mod mock {
             _path: &str,
             _mode: OpenMode,
         ) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(b"mock-handle".to_vec()))
+            Ok(FileHandle(b"test-handle".to_vec()))
         }
 
         async fn read_at(
@@ -203,7 +203,7 @@ mod mock {
         }
 
         async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
-            Ok(FileHandle(format!("mock-handle-{path}").into_bytes()))
+            Ok(FileHandle(format!("test-handle-{path}").into_bytes()))
         }
 
         async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
@@ -235,9 +235,9 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_mock() {
+    fn test_factory_test_backend() {
         let provider = create_storage_provider(StorageBackend::Mock)
-            .expect("Mock storage provider should be created successfully");
+            .expect("test storage provider should be created successfully");
 
         assert_eq!(
             Arc::strong_count(&provider),

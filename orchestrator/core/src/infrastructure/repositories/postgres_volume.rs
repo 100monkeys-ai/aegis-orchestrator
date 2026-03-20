@@ -6,8 +6,7 @@
 //! in PostgreSQL via `sqlx`. Handles `StorageClass` serialisation, TTL
 //! persistence for ephemeral volumes, and VolumeEvent reconstruction.
 //!
-//! ⚠️ Phase 2 — In-memory repository is used in Phase 1. This implementation
-//! requires an active `PgPool` connection.
+//! PostgreSQL-backed `VolumeRepository` used when persistence is enabled.
 //!
 //! See ADR-025 (PostgreSQL Schema), ADR-032 (Unified Storage via SeaweedFS).
 
@@ -69,7 +68,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         )
         .bind(volume.id.0)
         .bind(&volume.name)
-        .bind(volume.tenant_id.0)
+        .bind(volume.tenant_id.as_str())
         .bind(storage_class_json)
         .bind(backend_json)
         .bind(volume.size_limit_bytes as i64)
@@ -122,7 +121,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             ORDER BY created_at DESC
             "#,
         )
-        .bind(tenant_id.0)
+        .bind(tenant_id.as_str())
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -215,7 +214,7 @@ impl VolumeRepository for PostgresVolumeRepository {
 fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryError> {
     let id: uuid::Uuid = row.get("id");
     let name: String = row.get("name");
-    let tenant_id: uuid::Uuid = row.get("tenant_id");
+    let tenant_id: String = row.get("tenant_id");
     let storage_class: serde_json::Value = row.get("storage_class");
     let backend: serde_json::Value = row.get("backend");
     let size_limit_bytes: i64 = row.get("size_limit_bytes");
@@ -245,7 +244,8 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
     Ok(Volume {
         id: VolumeId(id),
         name,
-        tenant_id: TenantId(tenant_id),
+        tenant_id: TenantId::from_string(&tenant_id)
+            .map_err(|e| RepositoryError::Serialization(e.to_string()))?,
         storage_class,
         backend,
         size_limit_bytes: size_limit_bytes as u64,
