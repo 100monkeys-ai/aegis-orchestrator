@@ -71,7 +71,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: aegis-linux-x86_64
-          path: aegis-linux-x86_64.tar.gz
+          path: aegis-orchestrator/aegis-linux-x86_64.tar.gz
+          if-no-files-found: error
           retention-days: 1
 
   build-macos:
@@ -119,7 +120,8 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: aegis-macos-aarch64
-          path: aegis-macos-aarch64.tar.gz
+          path: aegis-orchestrator/aegis-macos-aarch64.tar.gz
+          if-no-files-found: error
           retention-days: 1
 
 
