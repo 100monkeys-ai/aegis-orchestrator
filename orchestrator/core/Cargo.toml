@@ -60,7 +60,6 @@ tonic-prost = "0.14"
 tar = "0.4"
 regex = "1"
 jsonschema = "0.45.0"
-rand = "0.8"
 
 # NFS Server Gateway (ADR-036)
 nfsserve = { workspace = true }
@@ -85,7 +84,6 @@ lru = "0.16"
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.27"
-rand = "0.10.0"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

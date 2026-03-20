@@ -29,11 +29,15 @@ impl AttestNodeUseCase {
     }
 
     pub async fn execute(&self, req: AttestNodeRequest) -> Result<AttestNodeResponse> {
+        let mut nonce = Vec::with_capacity(32);
+        nonce.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        nonce.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+
         // 1. Create a new challenge
         let challenge = NodeChallenge {
             challenge_id: uuid::Uuid::new_v4(),
             node_id: req.node_id,
-            nonce: rand::random::<[u8; 32]>().to_vec(),
+            nonce,
             public_key: req.public_key,
             role: req.role,
             capabilities: req.capabilities,

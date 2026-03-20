@@ -113,6 +113,8 @@ jobs:
     
     steps:
       - uses: actions/checkout@v6
+        with:
+          submodules: recursive
 
       - name: Download all artifacts
         uses: actions/download-artifact@v8
