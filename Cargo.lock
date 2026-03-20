@@ -20,6 +20,7 @@ dependencies = [
  "dialoguer",
  "dirs-next",
  "dotenvy",
+ "ed25519-dalek",
  "futures",
  "indicatif",
  "jsonwebtoken",
@@ -30,7 +31,8 @@ dependencies = [
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "rand 0.10.0",
+ "prost 0.14.3",
+ "rand 0.8.5",
  "reqwest 0.13.2",
  "rsa",
  "serde",
@@ -41,6 +43,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic 0.12.3",
+ "tonic 0.14.5",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -51,6 +54,7 @@ dependencies = [
 name = "aegis-orchestrator-core"
 version = "0.11.0-pre-alpha"
 dependencies = [
+ "aegis-proto",
  "anyhow",
  "async-trait",
  "axum 0.8.8",
@@ -81,6 +85,7 @@ dependencies = [
  "prost-types",
  "protoc-bin-vendored",
  "rand 0.10.0",
+ "rand 0.8.5",
  "regex",
  "reqwest 0.13.2",
  "schemars",
@@ -139,6 +144,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "aegis-proto"
+version = "0.11.0-pre-alpha"
+dependencies = [
+ "prost 0.14.3",
+ "prost-types",
+ "protoc-bin-vendored",
+ "tonic 0.14.5",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -4199,6 +4216,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "sha1_smol"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbfa15b3dddfee50a0fff136974b3e1bde555604ba463834a7eb7deb6417705d"
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5269,6 +5292,7 @@ dependencies = [
  "getrandom 0.4.1",
  "js-sys",
  "serde_core",
+ "sha1_smol",
  "wasm-bindgen",
 ]
 

@@ -464,6 +464,7 @@ mod tests {
                 cortex: None,
                 secrets: None,
                 builtin_dispatchers: None,
+                cluster: None,
                 registry_credentials: vec![],
                 iam: None,
                 grpc_auth: None,

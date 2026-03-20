@@ -51,6 +51,7 @@ hostname = "0.4"
 dirs = "6.0"
 reqwest = { version = "0.13", features = ["json", "multipart", "query"] }
 walkdir = "2.4"
+aegis-proto = { path = "../../aegis-proto" }
 tonic = { workspace = true }
 prost = { workspace = true }
 bytes = { workspace = true }
@@ -59,6 +60,7 @@ tonic-prost = "0.14"
 tar = "0.4"
 regex = "1"
 jsonschema = "0.45.0"
+rand = "0.8"
 
 # NFS Server Gateway (ADR-036)
 nfsserve = { workspace = true }

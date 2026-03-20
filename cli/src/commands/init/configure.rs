@@ -75,6 +75,16 @@ pub struct AdvancedConfig {
     pub enable_metrics: bool,
     pub metrics_port: u16,
     pub metrics_path: String,
+    pub enable_cluster: bool,
+    pub cluster_role: String,
+    pub cluster_grpc_port: u16,
+    pub cluster_controller_endpoint: String,
+    pub cluster_token: String,
+    pub cpu_cores: u32,
+    pub memory_gb: u32,
+    pub disk_gb: u32,
+    pub gpu_count: u32,
+    pub vram_gb: u32,
 }
 
 /// Drives the interactive configuration step.
@@ -209,11 +219,26 @@ impl ConfigWizard {
         let env_content = self.render_env(&node_config, components)?;
 
         let metrics_port_expose = if node_config.advanced.enable_metrics {
-            format!("- \"{port}:{port}\"", port = node_config.advanced.metrics_port)
+            format!(
+                "- \"{port}:{port}\"",
+                port = node_config.advanced.metrics_port
+            )
         } else {
             String::new()
         };
-        let compose_content = compose_content.replace("# {{AEGIS_METRICS_PORT_EXPOSE}}", &metrics_port_expose);
+        let compose_content =
+            compose_content.replace("# {{AEGIS_METRICS_PORT_EXPOSE}}", &metrics_port_expose);
+
+        let cluster_port_expose = if node_config.advanced.enable_cluster {
+            format!(
+                "- \"{port}:{port}\"",
+                port = node_config.advanced.cluster_grpc_port
+            )
+        } else {
+            String::new()
+        };
+        let compose_content =
+            compose_content.replace("# {{AEGIS_CLUSTER_PORT_EXPOSE}}", &cluster_port_expose);
 
         std::fs::write(&config_path, &aegis_config_content)
             .with_context(|| format!("Failed to write {}", config_path.display()))?;
@@ -275,6 +300,16 @@ impl ConfigWizard {
             enable_metrics: true,
             metrics_port: 9091,
             metrics_path: "/metrics".to_string(),
+            enable_cluster: false,
+            cluster_role: "hybrid".to_string(),
+            cluster_grpc_port: 50056,
+            cluster_controller_endpoint: "https://aegis-controller.example.com:50056".to_string(),
+            cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+            cpu_cores: 4,
+            memory_gb: 16,
+            disk_gb: 100,
+            gpu_count: 0,
+            vram_gb: 0,
         };
 
         if self.yes {
@@ -312,12 +347,16 @@ impl ConfigWizard {
             .default(true)
             .interact()?;
         let enable_otlp_logging = Confirm::new()
-            .with_prompt("Enable external OTLP logging (ADR-057)?")
+            .with_prompt("Enable external OTLP logging?")
             .default(defaults.enable_otlp_logging)
             .interact()?;
         let enable_metrics = Confirm::new()
-            .with_prompt("Enable Prometheus metrics endpoint (ADR-058)?")
+            .with_prompt("Enable Prometheus metrics endpoint?")
             .default(defaults.enable_metrics)
+            .interact()?;
+        let enable_cluster = Confirm::new()
+            .with_prompt("Enable clustering?")
+            .default(defaults.enable_cluster)
             .interact()?;
 
         Ok(AdvancedConfig {
@@ -498,6 +537,59 @@ impl ConfigWizard {
             } else {
                 defaults.metrics_path.clone()
             },
+            enable_cluster,
+            cluster_role: if enable_cluster {
+                Input::new()
+                    .with_prompt("Cluster role (controller/worker/hybrid)")
+                    .default(defaults.cluster_role.clone())
+                    .interact_text()?
+            } else {
+                defaults.cluster_role.clone()
+            },
+            cluster_grpc_port: if enable_cluster {
+                Input::new()
+                    .with_prompt("Cluster gRPC port")
+                    .default(defaults.cluster_grpc_port)
+                    .interact_text()?
+            } else {
+                defaults.cluster_grpc_port
+            },
+            cluster_controller_endpoint: if enable_cluster {
+                Input::new()
+                    .with_prompt("Cluster controller endpoint")
+                    .default(defaults.cluster_controller_endpoint.clone())
+                    .interact_text()?
+            } else {
+                defaults.cluster_controller_endpoint.clone()
+            },
+            cluster_token: if enable_cluster {
+                Input::new()
+                    .with_prompt("Cluster bootstrap token")
+                    .default(defaults.cluster_token.clone())
+                    .interact_text()?
+            } else {
+                defaults.cluster_token.clone()
+            },
+            cpu_cores: Input::new()
+                .with_prompt("CPU cores")
+                .default(defaults.cpu_cores)
+                .interact_text()?,
+            memory_gb: Input::new()
+                .with_prompt("Memory (GB)")
+                .default(defaults.memory_gb)
+                .interact_text()?,
+            disk_gb: Input::new()
+                .with_prompt("Disk (GB)")
+                .default(defaults.disk_gb)
+                .interact_text()?,
+            gpu_count: Input::new()
+                .with_prompt("GPU count")
+                .default(defaults.gpu_count)
+                .interact_text()?,
+            vram_gb: Input::new()
+                .with_prompt("VRAM (GB)")
+                .default(defaults.vram_gb)
+                .interact_text()?,
         })
     }
 
@@ -999,6 +1091,29 @@ impl ConfigWizard {
             String::new()
         };
 
+        let cluster_section = if config.advanced.enable_cluster {
+            format!(
+                r#"
+  cluster:
+    enabled: true
+    role: "{role}"
+    cluster_grpc_port: {port}
+    controller:
+      endpoint: "{endpoint}"
+      token: "{token}"
+    tls:
+      ca_cert: "/etc/aegis/certs/ca.crt"
+      cert_path: "/etc/aegis/certs/node.crt"
+      key_path: "/etc/aegis/certs/node.key""#,
+                role = config.advanced.cluster_role,
+                port = config.advanced.cluster_grpc_port,
+                endpoint = config.advanced.cluster_controller_endpoint,
+                token = config.advanced.cluster_token,
+            )
+        } else {
+            String::new()
+        };
+
         format!(
             r#"# AEGIS Agent Host — node configuration
 # Generated by `aegis init`
@@ -1015,6 +1130,12 @@ spec:
   node:
     id: "{node_id}"
     type: "{node_type}"
+    resources:
+      cpu_cores: {cpu_cores}
+      memory_gb: {memory_gb}
+      disk_gb: {disk_gb}
+      gpu_count: {gpu_count}
+      vram_gb: {vram_gb}
 
   image_tag: "{image_tag}"
 {llm_section}
@@ -1031,10 +1152,16 @@ spec:
   observability:
     logging:
       level: "{log_level}"{otlp_section}{metrics_section}
+{cluster_section}
 {database_section}{temporal_section}{storage_section}{smcp_gateway_section}"#,
             node_name = config.node_name,
             node_id = config.node_id,
             node_type = config.advanced.node_type,
+            cpu_cores = config.advanced.cpu_cores,
+            memory_gb = config.advanced.memory_gb,
+            disk_gb = config.advanced.disk_gb,
+            gpu_count = config.advanced.gpu_count,
+            vram_gb = config.advanced.vram_gb,
             bind_address = config.advanced.bind_address,
             api_port = config.advanced.api_port,
             log_level = config.advanced.log_level,
@@ -1043,6 +1170,7 @@ spec:
             builtin_dispatchers_section = builtin_dispatchers_section,
             otlp_section = otlp_section,
             metrics_section = metrics_section,
+            cluster_section = cluster_section,
             database_section = database_section,
             temporal_section = temporal_section,
             storage_section = storage_section,
@@ -1071,6 +1199,16 @@ spec:
             )
         } else {
             String::new()
+        };
+
+        let cluster_section = if config.advanced.enable_cluster {
+            format!(
+                "\n# ─── Cluster / Multi-Node ────────────────────────────────────────────────────\nAEGIS_CLUSTER_PORT={}\nAEGIS_CLUSTER_TOKEN={}\n",
+                config.advanced.cluster_grpc_port,
+                config.advanced.cluster_token
+            )
+        } else {
+            "".to_string()
         };
 
         let api_key_line = match &components.llm {
@@ -1147,7 +1285,7 @@ TEMPORAL_WORKER_SECRET={temporal_worker_secret}
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 AEGIS_KEEP_CONTAINER={keep_container}
 AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
-{smcp_gateway_url_section}{otlp_logging_section}"#,
+{smcp_gateway_url_section}{otlp_logging_section}{cluster_section}"#,
             profiles = profiles,
             api_key_line = api_key_line,
             additional_provider_env = additional_provider_env,
@@ -1166,6 +1304,7 @@ AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
             smcp_private_key = smcp_private_key,
             smcp_gateway_url_section = smcp_gateway_url_section,
             otlp_logging_section = otlp_logging_section,
+            cluster_section = cluster_section,
         ))
     }
 }

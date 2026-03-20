@@ -71,7 +71,10 @@ aegis-orchestrator-sdk = { path = "../sdks", version = "0.11.0-pre-alpha" }
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"
 rsa = { version = "0.9", features = ["pem"] }
-rand = "0.10.0"
+rand = "0.8"
+ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+tonic = { workspace = true }
+prost = { workspace = true }
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]

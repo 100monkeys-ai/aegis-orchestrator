@@ -454,42 +454,79 @@ CREATE INDEX idx_storage_events_details ON storage_events USING GIN (operation_d
 CREATE INDEX idx_storage_events_violations ON storage_events(execution_id, timestamp DESC)
 WHERE event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'UnauthorizedVolumeAccess');
 
--- AEGIS Temporal Era Database Schema Update
--- Created: February 19, 2026
--- Description: Adds execution_events table for event sourcing of Temporal workflow events
+-- AEGIS Cluster Orchestration Schema
+-- Created: February 16, 2026
+-- Description: Multi-node deployment schema for cluster-level auth and routing
 
 -- -----------------------------------------------------------------------------
--- Execution Events Table
--- Append-only event store for workflow execution history
+-- Cluster Nodes Table
+-- Stores all registered nodes in the AEGIS cluster
 -- -----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS execution_events (
-    id BIGSERIAL PRIMARY KEY,
-    execution_id UUID NOT NULL REFERENCES workflow_executions(id) ON DELETE CASCADE,
+CREATE TABLE cluster_nodes (
+    node_id         UUID        PRIMARY KEY,
+    role            TEXT        NOT NULL, -- 'controller', 'worker', 'hybrid'
+    public_key      BYTEA       NOT NULL, -- Raw Ed25519 public key (32 bytes)
+    grpc_address    TEXT        NOT NULL, -- "host:port" for ForwardExecution calls
+    status          TEXT        NOT NULL DEFAULT 'active', -- 'active', 'draining', 'unhealthy'
     
-    -- Temporal correlation and idempotency
-    temporal_sequence_number BIGINT NOT NULL,
+    -- Node Capabilities (Resource Profile)
+    gpu_count       INTEGER     NOT NULL DEFAULT 0,
+    vram_gb         INTEGER     NOT NULL DEFAULT 0,
+    cpu_cores       INTEGER     NOT NULL DEFAULT 0,
+    available_mem_gb INTEGER    NOT NULL DEFAULT 0,
+    supported_runtimes TEXT[]   NOT NULL DEFAULT '{}',
+    tags            TEXT[]      NOT NULL DEFAULT '{}',
     
-    -- Event tracking
-    event_type VARCHAR NOT NULL,
-    event_payload JSONB NOT NULL,
+    -- Resource Snapshot (updated via Heartbeat)
+    cpu_utilization_percent FLOAT4 NOT NULL DEFAULT 0.0,
+    gpu_utilization_percent FLOAT4 NOT NULL DEFAULT 0.0,
+    active_executions       INTEGER NOT NULL DEFAULT 0,
     
-    -- 100monkeys iteration tracking
-    iteration_number SMALLINT,
+    -- Metadata
+    last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    registered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
-    -- Timestamps
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
-    -- Ensure idempotent delivery from Temporal
-    CONSTRAINT execution_events_unique_seq UNIQUE (execution_id, temporal_sequence_number)
+    -- Config Tracking
+    current_config_version TEXT
 );
 
-CREATE INDEX IF NOT EXISTS idx_execution_events_execution_id ON execution_events(execution_id);
-CREATE INDEX IF NOT EXISTS idx_execution_events_type ON execution_events(event_type);
-CREATE INDEX IF NOT EXISTS idx_execution_events_created_at ON execution_events(created_at DESC);
+CREATE INDEX idx_cluster_nodes_status ON cluster_nodes (status);
+CREATE INDEX idx_cluster_nodes_role   ON cluster_nodes (role, status);
 
 -- -----------------------------------------------------------------------------
--- Workflow Executions Updates
--- Support for iteration counting
+-- Node Challenges Table
+-- Temporary challenge nonces for node attestation (Step 1 -> Step 2)
 -- -----------------------------------------------------------------------------
-ALTER TABLE workflow_executions 
-ADD COLUMN IF NOT EXISTS iteration_count SMALLINT DEFAULT 0;
+CREATE TABLE node_challenges (
+    challenge_id    UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    node_id         UUID        NOT NULL,
+    nonce           BYTEA       NOT NULL, -- 32-byte random challenge
+    public_key      BYTEA       NOT NULL,
+    role            TEXT        NOT NULL,
+    
+    -- Cached capabilities from AttestNodeRequest to avoid re-sending in ChallengeNodeRequest
+    gpu_count       INTEGER     NOT NULL DEFAULT 0,
+    vram_gb         INTEGER     NOT NULL DEFAULT 0,
+    cpu_cores       INTEGER     NOT NULL DEFAULT 0,
+    available_mem_gb INTEGER    NOT NULL DEFAULT 0,
+    supported_runtimes TEXT[]   NOT NULL DEFAULT '{}',
+    tags            TEXT[]      NOT NULL DEFAULT '{}',
+    
+    grpc_address    TEXT        NOT NULL,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Index for TTL cleanup (challenges should be deleted after 5 minutes)
+CREATE INDEX idx_node_challenges_created_at ON node_challenges (created_at);
+
+-- -----------------------------------------------------------------------------
+-- Stimulus Idempotency Table
+-- Multi-node stimulus idempotency store (fulfills ADR-021 Phase 2 deferral)
+-- -----------------------------------------------------------------------------
+CREATE TABLE stimulus_idempotency (
+    id              UUID        PRIMARY KEY,
+    processed_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    node_id         UUID        REFERENCES cluster_nodes(node_id) ON DELETE SET NULL
+);
+
+CREATE INDEX idx_stimulus_idempotency_processed_at ON stimulus_idempotency (processed_at);

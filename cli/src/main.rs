@@ -23,7 +23,7 @@
 //! - `aegis restart [--profile <name>]` - Restart the Docker Compose services
 //! - `aegis uninstall [-y]` - Stop stack and remove the ~/.aegis directory
 //!
-//! See ADR-008 for architecture details.
+//! See the architecture documentation for details.
 //!
 //! # Architecture
 //!
@@ -40,8 +40,8 @@ mod commands;
 mod daemon;
 
 use commands::{
-    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, RestartArgs, TaskCommand,
-    UninstallArgs, UpArgs, WorkflowCommand,
+    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
+    TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
 
 /// AEGIS Agent Host - Enable autonomous agent execution
@@ -93,6 +93,13 @@ enum Commands {
     Task {
         #[command(subcommand)]
         command: TaskCommand,
+    },
+
+    /// Cluster node operations
+    #[command(name = "node")]
+    Node {
+        #[command(subcommand)]
+        command: NodeCommand,
     },
 
     /// Configuration management
@@ -168,7 +175,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Load config first to initialize logging properly (ADR-057)
+    // Load config first to initialize logging properly
     let config = aegis_orchestrator_core::domain::node_config::NodeConfigManifest::load_or_default(
         cli.config.clone(),
     )
@@ -197,6 +204,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Task { command }) => {
             commands::task::handle_command(command, &cli.host, cli.port).await
+        }
+        Some(Commands::Node { command }) => {
+            commands::node::handle_command(command, cli.config, &cli.host, cli.port).await
         }
         Some(Commands::Config { command }) => {
             commands::config::handle_command(command, cli.config).await

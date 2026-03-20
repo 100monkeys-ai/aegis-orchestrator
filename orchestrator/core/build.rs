@@ -8,7 +8,6 @@
 //! # Compilation Targets
 //!
 //! - **Temporal API**: Workflow service, common types, task queues, history
-//! - **AEGIS Runtime**: Custom runtime protocol definitions
 //!
 //! # Code Generation
 //!
@@ -16,25 +15,9 @@
 //!
 //! # Proto File Sources
 //!
-//! - **Development**: Proto files are read from git submodules (aegis-proto/, proto/)
+//! - **Development**: Proto files are read from git submodules (proto/)
 //! - **CI Publishing**: GitHub Actions copies submodule files to proto-vendor/ before cargo publish
 //! - **crates.io**: Published packages include proto-vendor/ directory in the tarball
-//!
-//! This hybrid approach ensures:
-//! - Single source of truth (git submodules)
-//! - No drift (proto files not committed to consumer repos)
-//! - Publishing works (proto-vendor/ included in cargo package)
-//!
-//! # Proto Files
-//!
-//! - `proto-vendor/aegis/aegis_runtime.proto` - AEGIS runtime protocol
-//! - `proto-vendor/temporal/api/**/*.proto` - Temporal API definitions
-//! - `proto-vendor/google/api/**/*.proto` - Google API annotations
-//!
-//! # Dependencies
-//!
-//! - **protoc**: Protocol buffer compiler (vendored via `protoc-bin-vendored`)
-//! - **tonic-build**: Code generator for Rust gRPC stubs
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Set PROTOC environment variable to point to the vendored protoc binary
@@ -51,64 +34,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_vendor_dir = crate_dir.join("proto-vendor");
     let use_vendor = proto_vendor_dir.exists();
 
-    let (aegis_proto_path, smcp_gateway_proto_path, temporal_api_base, include_dirs) = if use_vendor
-    {
-        // CI/crates.io mode: use proto-vendor/
-        let smcp_gateway_path = {
-            let namespaced = proto_vendor_dir.join("aegis/smcp_gateway.proto");
-            if namespaced.exists() {
-                namespaced
-            } else {
-                proto_vendor_dir.join("smcp_gateway.proto")
-            }
-        };
+    let (temporal_api_base, include_dirs) = if use_vendor {
         (
-            proto_vendor_dir.join("aegis/aegis_runtime.proto"),
-            smcp_gateway_path,
             proto_vendor_dir.join("temporal/api"),
             vec![proto_vendor_dir.to_string_lossy().to_string()],
         )
     } else {
-        let smcp_gateway_path = {
-            let direct = crate_root.join("aegis-proto/proto/smcp_gateway.proto");
-            if direct.exists() {
-                direct
-            } else {
-                crate_root.join("../aegis-proto/proto/smcp_gateway.proto")
-            }
-        };
-        // Development mode: use git submodule
         (
-            crate_root.join("aegis-proto/proto/aegis_runtime.proto"),
-            smcp_gateway_path,
             crate_root.join("proto/temporal/api"),
-            vec![
-                crate_root.join("proto").to_string_lossy().to_string(),
-                crate_root
-                    .join("aegis-proto/proto")
-                    .to_string_lossy()
-                    .to_string(),
-                crate_root
-                    .join("../aegis-proto/proto")
-                    .to_string_lossy()
-                    .to_string(),
-            ],
+            vec![crate_root.join("proto").to_string_lossy().to_string()],
         )
     };
 
     let mut protos = Vec::new();
-
-    // Add aegis_runtime proto
-    if aegis_proto_path.exists() {
-        protos.push(aegis_proto_path.to_string_lossy().to_string());
-    } else {
-        return Err(format!("aegis_runtime.proto not found at {aegis_proto_path:?}").into());
-    }
-    if smcp_gateway_proto_path.exists() {
-        protos.push(smcp_gateway_proto_path.to_string_lossy().to_string());
-    } else {
-        return Err(format!("smcp_gateway.proto not found at {smcp_gateway_proto_path:?}").into());
-    }
 
     let temporal_protos = &[
         "workflowservice/v1/service.proto",
@@ -170,10 +108,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Trigger rebuild if proto files change (development mode)
     if !use_vendor {
-        println!(
-            "cargo:rerun-if-changed={}",
-            crate_root.join("aegis-proto/proto").display()
-        );
         println!(
             "cargo:rerun-if-changed={}",
             crate_root.join("proto/temporal/api").display()

@@ -37,6 +37,7 @@
 
 pub mod agent;
 pub mod attestation_service;
+pub mod cluster;
 pub mod execution;
 pub mod lifecycle;
 pub mod schema_registry;

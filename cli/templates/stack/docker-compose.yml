@@ -150,11 +150,14 @@ services:
       - OPENBAO_SECRET_ID=${OPENBAO_SECRET_ID:-test-secret-id}
       # OTLP External Logging (ADR-057)
       - AEGIS_OTLP_ENDPOINT=${AEGIS_OTLP_ENDPOINT}
+      # Cluster gRPC Port (ADR-059)
+      - AEGIS_CLUSTER_PORT=${AEGIS_CLUSTER_PORT:-50056}
     ports:
       - "8088:8088"   # AEGIS HTTP API
       - "50051:50051" # gRPC for worker activities
       - "2049:2049"   # NFS Server Gateway
       # {{AEGIS_METRICS_PORT_EXPOSE}}
+      # {{AEGIS_CLUSTER_PORT_EXPOSE}}
     networks:
       - aegis-network
     volumes:

@@ -34,9 +34,11 @@
 //! | [`validation`] | BC-2 Execution | `ValidationConfig`, gradient validation types (ADR-017) |
 //! | [`llm`] | Cross-cutting | `LLMProvider` trait, LLM request/response value objects |
 //! | [`node_config`] | Infrastructure config | `NodeConfigManifest` parsed from `aegis-config.yaml` |
+//! | [`cluster`] | BC-7 Infrastructure & Hosting | `NodeCluster` aggregate, `NodePeer`, `NodeRouter` (ADR-059) |
 //! | [`iam`] | BC-13 IAM & Identity Federation | `IdentityRealm`, `UserIdentity`, `IdentityProvider` trait (ADR-041) |
 
 pub mod agent;
+pub mod cluster;
 pub mod dispatch;
 pub mod events;
 pub mod execution;

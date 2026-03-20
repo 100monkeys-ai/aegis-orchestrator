@@ -72,6 +72,12 @@ aegis task execute <agent-name>       # Execute task
 aegis task list                       # List executions
 aegis task logs <execution-id>        # View execution logs
 aegis task cancel <execution-id>      # Cancel execution
+
+# Cluster management
+aegis node init                       # Initialize node keypair
+aegis node join <endpoint>            # Join a cluster
+aegis node leave                      # Leave the cluster
+aegis node peers                      # List cluster peers
 ```
 
 See [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) for complete documentation.

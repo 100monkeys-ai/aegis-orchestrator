@@ -34,6 +34,7 @@
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 //! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
 
+pub mod aegis_cluster_proto;
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
 pub mod agentskills_client;

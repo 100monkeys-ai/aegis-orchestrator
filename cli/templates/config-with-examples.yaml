@@ -337,3 +337,51 @@ spec:
   #   # Cortex gRPC service URL (supports "env:VAR_NAME")
   #   grpc_url: "http://cortex:50052"
 
+  # --------------------------------------------------------------------------
+  # Cluster / Multi-Node Topology (Optional)
+  # --------------------------------------------------------------------------
+  # Configures the Controller-Worker cluster topology (ADR-059).
+  # Controllers manage routing and registration; workers run agent executions.
+  # See: aegis-docs/docs/deployment/multi-node
+  cluster:
+    # Enable cluster functionality on this node
+    enabled: true
+
+    # Role of this node in the cluster:
+    # - controller: Manages routing and registration; does not run executions.
+    # - worker: Runs agent executions; does not perform routing decisions.
+    # - hybrid: Both controller and worker duties (default).
+    role: "hybrid"
+
+    # Port for the NodeClusterService gRPC server (default: 50056)
+    cluster_grpc_port: 50056
+
+    # Controller-specific settings
+    controller:
+      # Public endpoint of the cluster controller (required for workers)
+      endpoint: "https://aegis-controller.example.com"
+      
+      # Secret token for initial node-to-controller authentication (Step 0)
+      # Usually passed via environment variable.
+      token: "env:AEGIS_CLUSTER_TOKEN"
+
+    # Worker-specific settings (routing hints)
+    worker:
+      # Optional: Override reported gRPC address (e.g., if behind a NAT/proxy)
+      # grpc_address_override: "worker-1.internal:50056"
+      
+      # Optional: Static capability tags (merged with hardware auto-discovery)
+      # tags: ["gpu:a100", "region:us-west"]
+
+    # Cluster-level security (mTLS recommended for inter-node gRPC)
+    tls:
+      # Path to CA certificate for verifying other nodes
+      ca_cert: "/etc/aegis/certs/ca.crt"
+      
+      # Path to this node's certificate for mTLS
+      client_cert: "/etc/aegis/certs/node.crt"
+      
+      # Path to this node's private key for mTLS
+      client_key: "/etc/aegis/certs/node.key"
+
+
