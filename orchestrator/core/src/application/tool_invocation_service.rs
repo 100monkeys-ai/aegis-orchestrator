@@ -2814,7 +2814,12 @@ mod tests {
         );
         let vol_repo = Arc::new(InMemoryVolumeRepository::new());
         let publisher = Arc::new(NoOpEventPublisher);
-        let fsal = Arc::new(AegisFSAL::new(storage, vol_repo, publisher));
+        let fsal = Arc::new(AegisFSAL::new(
+            storage,
+            vol_repo,
+            Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            publisher,
+        ));
         let registry = NfsVolumeRegistry::new();
         (fsal, registry)
     }

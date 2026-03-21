@@ -32,7 +32,9 @@ use crate::domain::{
 };
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -143,6 +145,8 @@ pub struct AegisFSAL {
     storage_provider: Arc<dyn StorageProvider>,
     /// Volume repository for ownership validation
     volume_repository: Arc<dyn VolumeRepository>,
+    /// Read-only borrowed volume aliases keyed by the alias volume ID.
+    borrowed_volumes: Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>>,
     /// Path sanitizer for traversal prevention
     path_sanitizer: PathSanitizer,
     /// Event publisher (injected, not owned)
@@ -155,16 +159,25 @@ pub trait EventPublisher: Send + Sync {
     async fn publish_storage_event(&self, event: StorageEvent);
 }
 
+/// Borrowed read-only access to an existing volume, exposed under a distinct alias volume ID.
+#[derive(Debug, Clone)]
+pub struct BorrowedVolumeAccess {
+    pub execution_id: ExecutionId,
+    pub source_volume: Volume,
+}
+
 impl AegisFSAL {
     /// Create a new FSAL instance
     pub fn new(
         storage_provider: Arc<dyn StorageProvider>,
         volume_repository: Arc<dyn VolumeRepository>,
+        borrowed_volumes: Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>>,
         event_publisher: Arc<dyn EventPublisher>,
     ) -> Self {
         Self {
             storage_provider,
             volume_repository,
+            borrowed_volumes,
             path_sanitizer: PathSanitizer::new(),
             event_publisher,
         }
@@ -221,6 +234,34 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
     ) -> Result<Volume, FsalError> {
+        let borrowed = { self.borrowed_volumes.read().get(&volume_id).cloned() };
+        if let Some(borrowed) = borrowed {
+            if borrowed.execution_id != execution_id {
+                self.event_publisher
+                    .publish_storage_event(StorageEvent::UnauthorizedVolumeAccess {
+                        execution_id,
+                        volume_id,
+                        attempted_at: Utc::now(),
+                    })
+                    .await;
+
+                return Err(FsalError::UnauthorizedAccess {
+                    execution_id,
+                    volume_id,
+                });
+            }
+
+            let is_usable = matches!(
+                borrowed.source_volume.status,
+                VolumeStatus::Available | VolumeStatus::Attached
+            );
+            if !is_usable {
+                return Err(FsalError::VolumeNotAttached(volume_id));
+            }
+
+            return Ok(borrowed.source_volume);
+        }
+
         let volume = self
             .volume_repository
             .find_by_id(volume_id)

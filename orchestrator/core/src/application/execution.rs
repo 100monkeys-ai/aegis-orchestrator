@@ -53,7 +53,9 @@ use crate::domain::policy::FilesystemPolicy;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
-use crate::domain::volume::{AccessMode, TenantId, VolumeMount};
+use crate::domain::volume::{
+    AccessMode, FilerEndpoint, TenantId, VolumeId, VolumeMount, VolumeOwnership,
+};
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
 use anyhow::{anyhow, Result};
@@ -227,6 +229,146 @@ impl StandardExecutionService {
         Self::resolve_tenant_from_payload(&input.payload)
     }
 
+    fn is_workspace_mount(path: &str) -> bool {
+        path == "/workspace" || path.starts_with("/workspace/")
+    }
+
+    fn build_borrowed_mount(
+        tenant_id: &TenantId,
+        alias_volume_id: VolumeId,
+        mount_point: PathBuf,
+    ) -> VolumeMount {
+        VolumeMount::new(
+            alias_volume_id,
+            mount_point,
+            AccessMode::ReadOnly,
+            FilerEndpoint::new("http://localhost:8888").expect("valid fallback filer endpoint"),
+            format!("/aegis/volumes/{tenant_id}/{alias_volume_id}"),
+        )
+    }
+
+    async fn build_judge_inherited_mounts(
+        &self,
+        tenant_id: &TenantId,
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        parent_agent: &crate::domain::agent::Agent,
+    ) -> Result<Vec<VolumeMount>> {
+        let declared_volumes = &parent_agent.manifest.spec.volumes;
+        if declared_volumes.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let gateway = self.nfs_gateway.as_ref().ok_or_else(|| {
+            anyhow!(
+                "Judge execution {} requires inherited worker volumes, but the NFS gateway is not configured",
+                child_execution_id
+            )
+        })?;
+
+        let parent_mount_contexts = gateway
+            .volume_registry()
+            .find_all_by_execution(parent_execution_id);
+        if parent_mount_contexts.is_empty() {
+            return Err(anyhow!(
+                "Judge execution {} requires inherited worker volumes, but parent execution {} has no registered NFS mount contexts",
+                child_execution_id,
+                parent_execution_id
+            ));
+        }
+
+        let parent_volumes = self
+            .volume_service
+            .list_volumes_by_ownership(&VolumeOwnership::execution(parent_execution_id))
+            .await?;
+        if parent_volumes.is_empty() {
+            return Err(anyhow!(
+                "Judge execution {} requires inherited worker volumes, but parent execution {} has no provisioned volumes to inherit",
+                child_execution_id,
+                parent_execution_id
+            ));
+        }
+
+        let volumes_by_name = parent_volumes
+            .into_iter()
+            .map(|volume| (volume.name.clone(), volume))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mount_contexts_by_volume_id = parent_mount_contexts
+            .into_iter()
+            .map(|ctx| (ctx.volume_id, ctx))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mut borrowed = Vec::with_capacity(declared_volumes.len());
+        for spec in declared_volumes {
+            if !Self::is_workspace_mount(&spec.mount_path) {
+                return Err(anyhow!(
+                    "Invalid inherited mount path '{}': all mounts must be /workspace or /workspace/*",
+                    spec.mount_path
+                ));
+            }
+
+            let source_volume = volumes_by_name.get(&spec.name).cloned().ok_or_else(|| {
+                anyhow!(
+                    "Judge execution {} requires inherited worker volume '{}', but parent execution {} did not provision it",
+                    child_execution_id,
+                    spec.name,
+                    parent_execution_id
+                )
+            })?;
+            let parent_ctx = mount_contexts_by_volume_id
+                .get(&source_volume.id)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Judge execution {} requires inherited worker volume '{}', but parent execution {} did not register it with the NFS gateway",
+                        child_execution_id,
+                        spec.name,
+                        parent_execution_id
+                    )
+                })?;
+
+            let mount_path = parent_ctx.mount_point.to_string_lossy().to_string();
+            if !Self::is_workspace_mount(&mount_path) {
+                return Err(anyhow!(
+                    "Invalid inherited mount path '{}': all mounts must be /workspace or /workspace/*",
+                    mount_path
+                ));
+            }
+
+            borrowed.push((
+                VolumeId::new(),
+                source_volume,
+                parent_ctx.mount_point.clone(),
+            ));
+        }
+
+        let read_policy = FilesystemPolicy {
+            read: vec!["/*".to_string()],
+            write: vec![],
+        };
+        let mut mounts = Vec::with_capacity(borrowed.len());
+        for (alias_volume_id, source_volume, mount_point) in borrowed {
+            gateway.register_borrowed_volume(alias_volume_id, child_execution_id, source_volume);
+            let mount = Self::build_borrowed_mount(tenant_id, alias_volume_id, mount_point);
+            gateway.register_volume(
+                alias_volume_id,
+                child_execution_id,
+                1000,
+                1000,
+                read_policy.clone(),
+                mount.mount_point.clone(),
+            );
+            mounts.push(mount);
+        }
+
+        tracing::info!(
+            "ADR-049: injecting {} read-only inherited worker volume(s) into judge execution {}",
+            mounts.len(),
+            child_execution_id
+        );
+
+        Ok(mounts)
+    }
+
     pub async fn get_execution_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -373,6 +515,411 @@ impl StandardExecutionService {
     pub fn with_cortex_client(mut self, cortex_client: Arc<dyn CortexPatternPort>) -> Self {
         self.cortex_client = Some(cortex_client);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::application::nfs_gateway::EventBusPublisher;
+    use crate::domain::agent::{
+        Agent, AgentManifest, AgentSpec, ImagePullPolicy, ManifestMetadata, RuntimeConfig,
+        TaskConfig, VolumeSpec,
+    };
+    use crate::domain::execution::ExecutionInput;
+    use crate::domain::repository::{AgentRepository, ExecutionRepository, VolumeRepository};
+    use crate::domain::runtime::{
+        AgentRuntime, InstanceId, InstanceStatus, RuntimeConfig as WorkerRuntimeConfig, TaskInput,
+        TaskOutput,
+    };
+    use crate::domain::storage::StorageProvider;
+    use crate::domain::tenant::TenantId as CoreTenantId;
+    use crate::domain::volume::{StorageClass, Volume, VolumeBackend};
+    use crate::infrastructure::event_bus::EventBus;
+    use crate::infrastructure::repositories::{
+        InMemoryAgentRepository, InMemoryExecutionRepository, InMemoryVolumeRepository,
+    };
+    use crate::infrastructure::storage::LocalHostStorageProvider;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct TestRuntime {
+        spawned: Mutex<Vec<WorkerRuntimeConfig>>,
+    }
+
+    #[async_trait]
+    impl AgentRuntime for TestRuntime {
+        async fn spawn(&self, config: WorkerRuntimeConfig) -> Result<InstanceId, RuntimeError> {
+            self.spawned.lock().unwrap().push(config);
+            Ok(InstanceId::new("test-instance"))
+        }
+
+        async fn execute(
+            &self,
+            _id: &InstanceId,
+            _input: TaskInput,
+        ) -> Result<TaskOutput, RuntimeError> {
+            Ok(TaskOutput {
+                result: serde_json::Value::String("ok".to_string()),
+                logs: Vec::new(),
+                tool_calls: Vec::new(),
+                exit_code: 0,
+            })
+        }
+
+        async fn terminate(&self, _id: &InstanceId) -> Result<(), RuntimeError> {
+            Ok(())
+        }
+
+        async fn status(&self, _id: &InstanceId) -> Result<InstanceStatus, RuntimeError> {
+            Ok(InstanceStatus {
+                id: InstanceId::new("test-instance"),
+                state: "running".to_string(),
+                uptime_seconds: 0,
+                memory_usage_mb: 0,
+                cpu_usage_percent: 0.0,
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct TestVolumeService {
+        volumes: HashMap<VolumeId, Volume>,
+    }
+
+    #[async_trait]
+    impl VolumeService for TestVolumeService {
+        async fn create_volume(
+            &self,
+            _name: String,
+            _tenant_id: TenantId,
+            _storage_class: StorageClass,
+            _size_limit_mb: u64,
+            _ownership: VolumeOwnership,
+        ) -> Result<VolumeId> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn get_volume(&self, id: VolumeId) -> Result<Volume> {
+            self.volumes
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| anyhow!("volume {id} not found"))
+        }
+
+        async fn list_volumes_by_tenant(&self, tenant_id: TenantId) -> Result<Vec<Volume>> {
+            Ok(self
+                .volumes
+                .values()
+                .filter(|volume| volume.tenant_id == tenant_id)
+                .cloned()
+                .collect())
+        }
+
+        async fn list_volumes_by_ownership(
+            &self,
+            ownership: &VolumeOwnership,
+        ) -> Result<Vec<Volume>> {
+            Ok(self
+                .volumes
+                .values()
+                .filter(|volume| &volume.ownership == ownership)
+                .cloned()
+                .collect())
+        }
+
+        async fn attach_volume(
+            &self,
+            _volume_id: VolumeId,
+            _instance_id: crate::domain::runtime::InstanceId,
+            _mount_point: PathBuf,
+            _access_mode: AccessMode,
+        ) -> Result<VolumeMount> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn detach_volume(
+            &self,
+            _volume_id: VolumeId,
+            _instance_id: crate::domain::runtime::InstanceId,
+        ) -> Result<()> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn delete_volume(&self, _volume_id: VolumeId) -> Result<()> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn get_volume_usage(&self, _volume_id: VolumeId) -> Result<u64> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn cleanup_expired_volumes(&self) -> Result<usize> {
+            anyhow::bail!("not used in test")
+        }
+
+        async fn create_volumes_for_execution(
+            &self,
+            _execution_id: ExecutionId,
+            _tenant_id: TenantId,
+            _volume_specs: &[VolumeSpec],
+            _storage_mode: &str,
+        ) -> Result<Vec<Volume>> {
+            anyhow::bail!("not used in test")
+        }
+    }
+
+    fn make_agent(name: &str, role: Option<&str>, mount_path: Option<&str>) -> Agent {
+        let mut labels = HashMap::new();
+        if let Some(role) = role {
+            labels.insert("role".to_string(), role.to_string());
+        }
+
+        Agent::new(AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: ManifestMetadata {
+                name: name.to_string(),
+                version: "1.0.0".to_string(),
+                description: Some(format!("{name} description")),
+                labels,
+                annotations: HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: None,
+                    version: None,
+                    image: Some(format!("ghcr.io/example/{name}:latest")),
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "docker".to_string(),
+                    model: "default".to_string(),
+                },
+                task: Some(TaskConfig {
+                    agentskills: Vec::new(),
+                    instruction: Some(format!("Run the {name} task")),
+                    prompt_template: None,
+                    input_data: None,
+                }),
+                context: Vec::new(),
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: Vec::new(),
+                env: HashMap::new(),
+                volumes: mount_path
+                    .map(|path| {
+                        vec![VolumeSpec {
+                            name: "workspace".to_string(),
+                            storage_class: "persistent".to_string(),
+                            volume_type: "hostPath".to_string(),
+                            provider: None,
+                            config: None,
+                            mount_path: path.to_string(),
+                            access_mode: "read-write".to_string(),
+                            size_limit: "1Gi".to_string(),
+                            ttl_hours: None,
+                        }]
+                    })
+                    .unwrap_or_default(),
+                advanced: None,
+            },
+        })
+    }
+
+    fn make_parent_execution(agent_id: AgentId) -> Execution {
+        Execution::new(
+            agent_id,
+            ExecutionInput {
+                intent: Some("parent".to_string()),
+                payload: serde_json::json!({ "tenant_id": "local" }),
+            },
+            1,
+        )
+    }
+
+    async fn wait_for_spawn(runtime: &TestRuntime) -> WorkerRuntimeConfig {
+        for _ in 0..20 {
+            if let Some(config) = runtime.spawned.lock().unwrap().last().cloned() {
+                return config;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("runtime spawn was not observed");
+    }
+
+    #[tokio::test]
+    async fn judge_inherits_parent_explicit_volumes_as_read_only_mounts() {
+        let tenant_id = CoreTenantId::local_default();
+        let parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        let judge_agent = make_agent("judge", Some("judge"), None);
+        let parent_execution = make_parent_execution(parent_agent.id);
+
+        let storage_root = tempfile::tempdir().unwrap();
+        let storage_provider: Arc<dyn StorageProvider> =
+            Arc::new(LocalHostStorageProvider::new(storage_root.path()).unwrap());
+        let volume_repository: Arc<dyn VolumeRepository> =
+            Arc::new(InMemoryVolumeRepository::new());
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let nfs_gateway = Arc::new(NfsGatewayService::new(
+            storage_provider.clone(),
+            volume_repository,
+            Arc::new(EventBusPublisher::new(event_bus.clone())),
+            Some(0),
+        ));
+
+        let mut parent_volume = Volume::new(
+            "workspace".to_string(),
+            tenant_id.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: PathBuf::from("/tmp/worker-volume"),
+            },
+            1024 * 1024,
+            VolumeOwnership::execution(parent_execution.id),
+        )
+        .unwrap();
+        parent_volume.mark_available().unwrap();
+
+        nfs_gateway.register_volume(
+            parent_volume.id,
+            parent_execution.id,
+            1000,
+            1000,
+            FilesystemPolicy {
+                read: vec!["/*".to_string()],
+                write: vec!["/*".to_string()],
+            },
+            PathBuf::from("/workspace/project"),
+        );
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &parent_agent)
+            .await
+            .unwrap();
+        agent_repo
+            .save_for_tenant(&tenant_id, &judge_agent)
+            .await
+            .unwrap();
+
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(&tenant_id, &parent_execution)
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::from([(parent_volume.id, parent_volume.clone())]),
+        });
+
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo,
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+        .with_nfs_gateway(nfs_gateway.clone());
+
+        let child_execution_id = service
+            .start_child_execution(
+                judge_agent.id,
+                ExecutionInput {
+                    intent: Some("judge".to_string()),
+                    payload: serde_json::json!({ "tenant_id": "local" }),
+                },
+                parent_execution.id,
+            )
+            .await
+            .unwrap();
+
+        let spawned = wait_for_spawn(runtime.as_ref()).await;
+        assert_eq!(spawned.volumes.len(), 1);
+        assert_eq!(
+            spawned.volumes[0].mount_point,
+            PathBuf::from("/workspace/project")
+        );
+        assert_eq!(spawned.volumes[0].access_mode, AccessMode::ReadOnly);
+        assert!(
+            !spawned.volumes[0].remote_path.starts_with("/aegis/smcp/"),
+            "judge should no longer mount via the SMCP proxy path"
+        );
+
+        let child_mounts = nfs_gateway
+            .volume_registry()
+            .find_all_by_execution(child_execution_id);
+        assert_eq!(child_mounts.len(), 1);
+        assert_eq!(
+            child_mounts[0].mount_point,
+            PathBuf::from("/workspace/project")
+        );
+        assert_ne!(child_mounts[0].volume_id, parent_volume.id);
+    }
+
+    #[tokio::test]
+    async fn judge_fails_fast_when_parent_declares_volumes_but_inheritance_is_unavailable() {
+        let tenant_id = CoreTenantId::local_default();
+        let parent_agent = make_agent("worker", None, Some("/workspace/project"));
+        let judge_agent = make_agent("judge", Some("judge"), None);
+        let parent_execution = make_parent_execution(parent_agent.id);
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &parent_agent)
+            .await
+            .unwrap();
+        agent_repo
+            .save_for_tenant(&tenant_id, &judge_agent)
+            .await
+            .unwrap();
+
+        let execution_repo = Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(&tenant_id, &parent_execution)
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime));
+        let service = StandardExecutionService::new(
+            agent_repo,
+            Arc::new(TestVolumeService {
+                volumes: HashMap::new(),
+            }),
+            supervisor,
+            execution_repo.clone(),
+            Arc::new(EventBus::with_default_capacity()),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+
+        let err = service
+            .start_child_execution(
+                judge_agent.id,
+                ExecutionInput {
+                    intent: Some("judge".to_string()),
+                    payload: serde_json::json!({ "tenant_id": "local" }),
+                },
+                parent_execution.id,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("requires inherited worker volumes"));
+        let executions = execution_repo
+            .find_recent_for_tenant(&tenant_id, 10)
+            .await
+            .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(executions[0].id, parent_execution.id);
     }
 }
 
@@ -1245,6 +1792,10 @@ impl ExecutionService for StandardExecutionService {
             .agent_service
             .get_agent_for_tenant(&tenant_id, agent_id)
             .await?;
+        let parent_agent = self
+            .agent_service
+            .get_agent_for_tenant(&tenant_id, parent.agent_id)
+            .await?;
 
         // 3. Prepare input (render judge's prompt template).
         let prepared_input = self.prepare_execution_input(input, &agent)?;
@@ -1266,21 +1817,6 @@ impl ExecutionService for StandardExecutionService {
         )
         .map_err(|e| anyhow!("Failed to create child execution: {e}"))?;
         let child_execution_id = child_execution.id;
-        child_execution.start();
-        self.repository
-            .save_for_tenant(&tenant_id, &child_execution)
-            .await?;
-
-        self.event_bus
-            .publish_execution_event(ExecutionEvent::ExecutionStarted {
-                execution_id: child_execution_id,
-                agent_id,
-                started_at: Utc::now(),
-            });
-
-        metrics::counter!("aegis_executions_total", "kind" => "child", "status" => "started")
-            .increment(1);
-        metrics::gauge!("aegis_execution_active").increment(1.0);
 
         // 5. Build runtime config.
         let mut env = agent.manifest.spec.env.clone();
@@ -1374,11 +1910,7 @@ impl ExecutionService for StandardExecutionService {
             }
         };
 
-        // ADR-049 Pillar 3: Build judge proxy volume mounts from the parent execution's
-        // active NFS registry contexts so judges inherit the exact mounted volume topology.
-        // Non-fatal: if the parent has no mounted volumes yet, the judge is spawned without
-        // workspace visibility rather than blocking the spawn entirely.
-        let judge_proxy_mounts: Vec<crate::domain::volume::VolumeMount> = {
+        let judge_inherited_mounts: Vec<VolumeMount> = {
             let is_judge = agent
                 .manifest
                 .metadata
@@ -1387,60 +1919,13 @@ impl ExecutionService for StandardExecutionService {
                 .map(|s| s.as_str())
                 == Some("judge");
             if is_judge {
-                let parent_mount_contexts = self
-                    .nfs_gateway
-                    .as_ref()
-                    .map(|gw| {
-                        gw.volume_registry()
-                            .find_all_by_execution(parent_execution_id)
-                    })
-                    .unwrap_or_default();
-
-                let mut mounts = Vec::new();
-                for parent_ctx in parent_mount_contexts {
-                    let mount_path = parent_ctx.mount_point.to_string_lossy().to_string();
-                    if !(mount_path == "/workspace" || mount_path.starts_with("/workspace/")) {
-                        tracing::warn!(
-                            volume_id = %parent_ctx.volume_id,
-                            mount_path = %mount_path,
-                            "Skipping inherited judge mount: path must be /workspace or /workspace/*"
-                        );
-                        continue;
-                    }
-
-                    let proxy_backend = crate::domain::volume::VolumeBackend::Smcp {
-                        node_id: "local".to_string(),
-                        // Routing key: SmcpStorageProvider forwards reads to this volume ID.
-                        remote_volume_id: parent_ctx.volume_id,
-                    };
-                    let proxy_volume = crate::domain::volume::Volume {
-                        id: crate::domain::volume::VolumeId::new(),
-                        name: format!("inherited-{}", parent_ctx.volume_id),
-                        tenant_id: tenant_id.clone(),
-                        storage_class: crate::domain::volume::StorageClass::persistent(),
-                        status: crate::domain::volume::VolumeStatus::Available,
-                        ownership: crate::domain::volume::VolumeOwnership::Execution {
-                            execution_id: parent_execution_id,
-                        },
-                        size_limit_bytes: 1024 * 1024 * 100, // 100 MiB cap
-                        created_at: chrono::Utc::now(),
-                        attached_at: None,
-                        detached_at: None,
-                        expires_at: None,
-                        backend: proxy_backend,
-                    };
-                    mounts.push(proxy_volume.to_mount(
-                        std::path::PathBuf::from(mount_path),
-                        crate::domain::volume::AccessMode::ReadOnly,
-                    ));
-                }
-
-                tracing::info!(
-                    "ADR-049: injecting {} read-only parent volume mount(s) into judge execution {}",
-                    mounts.len(),
-                    child_execution_id
-                );
-                mounts
+                self.build_judge_inherited_mounts(
+                    &tenant_id,
+                    parent_execution_id,
+                    child_execution_id,
+                    &parent_agent,
+                )
+                .await?
             } else {
                 Vec::new()
             }
@@ -1466,8 +1951,7 @@ impl ExecutionService for StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            // ADR-049 Pillar 3: judge_proxy_mounts was computed above (async-safe).
-            volumes: judge_proxy_mounts.clone(),
+            volumes: judge_inherited_mounts.clone(),
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")
@@ -1483,30 +1967,21 @@ impl ExecutionService for StandardExecutionService {
             execution_id: child_execution_id,
         };
 
-        // ADR-049 Pillar 3: Register judge proxy volumes with NFS gateway so the NFS FSAL
-        // can authorize file-handle requests from the judge container.
-        if let Some(ref gw) = self.nfs_gateway {
-            for proxy_mount in &judge_proxy_mounts {
-                let read_policy = crate::domain::policy::FilesystemPolicy {
-                    read: vec!["/*".to_string()],
-                    write: vec![],
-                };
-                gw.register_volume(
-                    proxy_mount.volume_id,
-                    child_execution_id,
-                    1000, // container_uid
-                    1000, // container_gid
-                    read_policy,
-                    proxy_mount.mount_point.clone(),
-                );
-                tracing::info!(
-                    "ADR-049: registered read-only NFS volume {} at '{}' for judge execution {}",
-                    proxy_mount.volume_id,
-                    proxy_mount.mount_point.display(),
-                    child_execution_id
-                );
-            }
-        }
+        child_execution.start();
+        self.repository
+            .save_for_tenant(&tenant_id, &child_execution)
+            .await?;
+
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ExecutionStarted {
+                execution_id: child_execution_id,
+                agent_id,
+                started_at: Utc::now(),
+            });
+
+        metrics::counter!("aegis_executions_total", "kind" => "child", "status" => "started")
+            .increment(1);
+        metrics::gauge!("aegis_execution_active").increment(1.0);
 
         // 6. Run Supervisor loop in background task.
         let supervisor = self.supervisor.clone();

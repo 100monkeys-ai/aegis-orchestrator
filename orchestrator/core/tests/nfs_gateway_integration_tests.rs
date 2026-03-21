@@ -19,7 +19,9 @@
 use aegis_orchestrator_core::application::nfs_gateway::{EventBusPublisher, NfsGatewayService};
 use aegis_orchestrator_core::domain::events::StorageEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
-use aegis_orchestrator_core::domain::fsal::{AegisFSAL, EventPublisher, FsalError};
+use aegis_orchestrator_core::domain::fsal::{
+    AegisFSAL, AegisFileHandle, BorrowedVolumeAccess, EventPublisher, FsalError,
+};
 use aegis_orchestrator_core::domain::policy::FilesystemPolicy;
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::storage::{
@@ -31,6 +33,8 @@ use aegis_orchestrator_core::domain::volume::{
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
 use chrono::Utc;
+use parking_lot::RwLock;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ── Test helper ─────────────────────────────────────────────────────────────
@@ -66,8 +70,8 @@ struct TestStorageProvider;
 
 #[async_trait]
 impl StorageProvider for TestStorageProvider {
-    async fn open_file(&self, _path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
-        Ok(FileHandle(uuid::Uuid::new_v4().as_bytes().to_vec()))
+    async fn open_file(&self, path: &str, _mode: OpenMode) -> Result<FileHandle, StorageError> {
+        Ok(FileHandle(path.as_bytes().to_vec()))
     }
 
     async fn read_at(
@@ -119,8 +123,8 @@ impl StorageProvider for TestStorageProvider {
         ])
     }
 
-    async fn create_file(&self, _path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
-        Ok(FileHandle(uuid::Uuid::new_v4().as_bytes().to_vec()))
+    async fn create_file(&self, path: &str, _mode: u32) -> Result<FileHandle, StorageError> {
+        Ok(FileHandle(path.as_bytes().to_vec()))
     }
 
     async fn delete_file(&self, _path: &str) -> Result<(), StorageError> {
@@ -167,6 +171,10 @@ impl TestVolumeRepository {
     async fn add_volume(&self, volume: Volume) {
         self.volumes.write().await.push(volume);
     }
+}
+
+fn empty_borrowed_volume_registry() -> Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>> {
+    Arc::new(RwLock::new(HashMap::new()))
 }
 
 #[async_trait]
@@ -251,7 +259,12 @@ async fn test_fsal_mode_validation() {
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
-    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        empty_borrowed_volume_registry(),
+        event_publisher,
+    );
 
     let execution_id = ExecutionId::new();
     let volume_id =
@@ -287,7 +300,12 @@ async fn test_fsal_path_traversal_prevention() {
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
-    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        empty_borrowed_volume_registry(),
+        event_publisher,
+    );
 
     // Create test volume (path traversal check occurs after authorization, so volume must be attached)
     let execution_id = ExecutionId::new();
@@ -331,7 +349,12 @@ async fn test_fsal_policy_enforcement() {
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
-    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        empty_borrowed_volume_registry(),
+        event_publisher,
+    );
 
     let execution_id = ExecutionId::new();
     let volume_id =
@@ -387,7 +410,12 @@ async fn test_fsal_audit_events() {
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
-    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        empty_borrowed_volume_registry(),
+        event_publisher,
+    );
 
     let execution_id = ExecutionId::new();
     let volume_id =
@@ -438,7 +466,12 @@ async fn test_fsal_quota_enforcement() {
     let event_publisher =
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
-    let fsal = AegisFSAL::new(storage_provider, volume_repository.clone(), event_publisher);
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        empty_borrowed_volume_registry(),
+        event_publisher,
+    );
 
     // Create test volume with a very small quota (1KB)
     let execution_id = ExecutionId::new();
@@ -500,4 +533,147 @@ async fn test_fsal_quota_enforcement() {
         found_quota_event,
         "QuotaExceeded event should have been published"
     );
+}
+
+#[tokio::test]
+async fn test_gateway_borrowed_volume_alias_allows_judge_read_only_access() {
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    let event_bus = Arc::new(EventBus::new(1000));
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
+        event_publisher,
+        Some(12050),
+    );
+
+    let worker_execution_id = ExecutionId::new();
+    let judge_execution_id = ExecutionId::new();
+    let mut source_volume = Volume::new(
+        "worker-workspace".to_string(),
+        TenantId::default(),
+        StorageClass::persistent(),
+        VolumeBackend::OpenDal {
+            provider: "memory".to_string(),
+            config: None,
+            cache_path: None,
+        },
+        1024 * 1024,
+        VolumeOwnership::Execution {
+            execution_id: worker_execution_id,
+        },
+    )
+    .unwrap();
+    source_volume.mark_available().unwrap();
+    source_volume.mark_attached().unwrap();
+    volume_repository.save(&source_volume).await.unwrap();
+    let borrowed_alias_id = VolumeId::new();
+
+    gateway.register_borrowed_volume(borrowed_alias_id, judge_execution_id, source_volume.clone());
+    gateway.register_volume(
+        borrowed_alias_id,
+        judge_execution_id,
+        1000,
+        1000,
+        FilesystemPolicy {
+            read: vec!["/workspace/**".to_string()],
+            write: vec![],
+        },
+        "/workspace".into(),
+    );
+
+    let policy = FilesystemPolicy {
+        read: vec!["/workspace/**".to_string()],
+        write: vec![],
+    };
+    let handle = AegisFileHandle::new(
+        judge_execution_id,
+        borrowed_alias_id,
+        "/workspace/review.txt",
+    );
+
+    let read_result = gateway
+        .fsal()
+        .read(&handle, "/workspace/review.txt", &policy, 0, 64)
+        .await;
+    assert!(
+        read_result.is_ok(),
+        "judge should read inherited worker volume: {:?}",
+        read_result
+    );
+
+    let write_result = gateway
+        .fsal()
+        .write(&handle, "/workspace/review.txt", &policy, 0, b"mutate")
+        .await;
+    assert!(matches!(write_result, Err(FsalError::PolicyViolation(_))));
+}
+
+#[tokio::test]
+async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    let event_bus = Arc::new(EventBus::new(1000));
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+    let gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
+        event_publisher,
+        Some(12051),
+    );
+
+    let worker_execution_id = ExecutionId::new();
+    let judge_execution_id = ExecutionId::new();
+    let wrong_execution_id = ExecutionId::new();
+    let source_volume_id =
+        create_attached_test_volume(&volume_repository, worker_execution_id, 1024 * 1024).await;
+    let source_volume = volume_repository
+        .find_by_id(source_volume_id)
+        .await
+        .unwrap()
+        .expect("source volume should exist");
+    let borrowed_alias_id = VolumeId::new();
+
+    gateway.register_borrowed_volume(borrowed_alias_id, judge_execution_id, source_volume);
+    gateway.register_volume(
+        borrowed_alias_id,
+        judge_execution_id,
+        1000,
+        1000,
+        FilesystemPolicy {
+            read: vec!["/workspace/**".to_string()],
+            write: vec![],
+        },
+        "/workspace".into(),
+    );
+
+    let handle = AegisFileHandle::new(
+        wrong_execution_id,
+        borrowed_alias_id,
+        "/workspace/review.txt",
+    );
+    let read_result = gateway
+        .fsal()
+        .read(
+            &handle,
+            "/workspace/review.txt",
+            &FilesystemPolicy {
+                read: vec!["/workspace/**".to_string()],
+                write: vec![],
+            },
+            0,
+            64,
+        )
+        .await;
+
+    assert!(matches!(
+        read_result,
+        Err(FsalError::UnauthorizedAccess {
+            execution_id,
+            volume_id
+        }) if execution_id == wrong_execution_id && volume_id == borrowed_alias_id
+    ));
 }

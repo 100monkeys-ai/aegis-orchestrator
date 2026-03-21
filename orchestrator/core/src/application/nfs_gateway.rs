@@ -20,11 +20,11 @@ use crate::application::storage_router::StorageRouter;
 use crate::domain::{
     events::StorageEvent,
     execution::ExecutionId,
-    fsal::{AegisFSAL, EventPublisher},
+    fsal::{AegisFSAL, BorrowedVolumeAccess, EventPublisher},
     policy::FilesystemPolicy,
     repository::VolumeRepository,
     storage::StorageProvider,
-    volume::VolumeId,
+    volume::{Volume, VolumeId},
 };
 use crate::infrastructure::nfs::server::{NfsServer, NfsServerError, NfsVolumeContext};
 use crate::infrastructure::storage::{LocalHostStorageProvider, SmcpStorageProvider};
@@ -207,6 +207,8 @@ pub struct NfsGatewayService {
 
     /// Volume registry for export path routing
     volume_registry: NfsVolumeRegistry,
+    /// Read-only borrowed volume aliases used by judge executions.
+    borrowed_volumes: Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>>,
 
     /// Whether server is running (wrapped in Mutex for interior mutability)
     is_running: Arc<Mutex<bool>>,
@@ -242,10 +244,12 @@ impl NfsGatewayService {
             local_provider,
             smcp_provider,
         ));
+        let borrowed_volumes = Arc::new(RwLock::new(HashMap::new()));
 
         let fsal = Arc::new(AegisFSAL::new(
             storage_router,
             volume_repository,
+            borrowed_volumes.clone(),
             event_publisher,
         ));
 
@@ -256,8 +260,29 @@ impl NfsGatewayService {
         Self {
             nfs_server,
             volume_registry,
+            borrowed_volumes,
             is_running: Arc::new(Mutex::new(false)),
         }
+    }
+
+    /// Register a read-only alias for an existing source volume under a distinct exported volume ID.
+    pub fn register_borrowed_volume(
+        &self,
+        alias_volume_id: VolumeId,
+        execution_id: ExecutionId,
+        source_volume: Volume,
+    ) {
+        self.borrowed_volumes.write().insert(
+            alias_volume_id,
+            BorrowedVolumeAccess {
+                execution_id,
+                source_volume,
+            },
+        );
+    }
+
+    pub fn deregister_borrowed_volume(&self, alias_volume_id: VolumeId) {
+        self.borrowed_volumes.write().remove(&alias_volume_id);
     }
 
     /// Start the NFS server
