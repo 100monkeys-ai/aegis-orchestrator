@@ -429,22 +429,6 @@ async fn test_fsal_policy_enforcement() {
         write: vec!["/workspace/data/*".to_string()],
     };
 
-    // Register the volume with the NFS gateway to mirror production initialization (ADR-036)
-    let nfs_gateway = NfsGatewayService::new(
-        storage_provider,
-        volume_repository.clone(),
-        event_publisher,
-        None,
-    );
-    nfs_gateway.register_volume(
-        volume_id,
-        execution_id,
-        0,
-        0,
-        policy.clone(),
-        std::path::PathBuf::from("/workspace/data"),
-    );
-
     // Test: Attempt to write outside allowlist
     let handle1 = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
         execution_id,
