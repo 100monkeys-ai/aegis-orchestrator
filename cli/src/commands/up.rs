@@ -23,7 +23,7 @@ use colored::Colorize;
 use dialoguer::Confirm;
 
 use super::init::{self, compose::ComposeRunner, InitArgs};
-use super::update::{persist_image_tag, refresh_compose};
+use super::update::{persist_image_tag, refresh_compose, resolve_image_tag};
 
 /// Arguments for `aegis up`
 #[derive(Args)]
@@ -48,11 +48,12 @@ pub struct UpArgs {
     /// Image tag for AEGIS-owned Docker images.
     /// Refreshes `docker-compose.yml` and `aegis-config.yaml` before startup
     /// when the stack already exists.
-    /// Defaults to the version of this binary.
+    /// For existing stacks, defaults to `spec.image_tag` from `aegis-config.yaml`.
+    /// Falls back to the version of this binary when no persisted tag exists.
     /// Pass `latest` to track the most recent build, or a semver tag such as
     /// `v0.10.0` to pin to a specific release.
-    #[arg(long, default_value = env!("CARGO_PKG_VERSION"))]
-    pub tag: String,
+    #[arg(long)]
+    pub tag: Option<String>,
 
     /// Start only services in this Docker Compose profile
     #[arg(long)]
@@ -62,6 +63,7 @@ pub struct UpArgs {
 /// Run `aegis up`.
 pub async fn run(args: UpArgs) -> Result<()> {
     let dir = expand_tilde(Path::new(&args.dir));
+    let config_file_path = dir.join("aegis-config.yaml");
 
     if !dir.join("docker-compose.yml").exists() {
         // Stack has never been set up — run the full init wizard first.
@@ -85,13 +87,14 @@ pub async fn run(args: UpArgs) -> Result<()> {
             )
         };
 
+        let initial_tag = resolve_image_tag(&config_file_path, args.tag.as_deref());
         init::run(InitArgs {
             yes: args.yes,
             manual: false,
             dir: args.dir.clone(),
             host: args.host.clone(),
             port: args.port,
-            tag: args.tag.clone(),
+            tag: initial_tag,
             advanced_override,
         })
         .await?;
@@ -111,9 +114,9 @@ pub async fn run(args: UpArgs) -> Result<()> {
     println!();
     println!("{}", "Starting AEGIS stack...".bold());
 
-    let config_file_path = dir.join("aegis-config.yaml");
-    refresh_compose(&dir, &args.tag, false).await?;
-    persist_image_tag(&config_file_path, &args.tag, false)?;
+    let image_tag = resolve_image_tag(&config_file_path, args.tag.as_deref());
+    refresh_compose(&dir, &image_tag, false).await?;
+    persist_image_tag(&config_file_path, &image_tag, false)?;
 
     let runner = ComposeRunner::new(dir.clone());
     runner.up_with_profile(args.profile.as_deref()).await?;
@@ -152,4 +155,40 @@ fn expand_tilde(path: &Path) -> PathBuf {
     }
 
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        dir.push(format!("aegis-up-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn existing_stack_prefers_persisted_image_tag_when_override_missing() {
+        let dir = temp_dir();
+        let config_path = dir.join("aegis-config.yaml");
+
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.image_tag = Some("latest".to_string());
+        manifest
+            .to_yaml_file(&config_path)
+            .expect("write config with latest tag");
+
+        let resolved = resolve_image_tag(&config_path, None);
+        assert_eq!(resolved, "latest");
+
+        let _ = fs::remove_dir_all(dir);
+    }
 }

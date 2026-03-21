@@ -82,12 +82,7 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
     let config_file_path = config_path
         .clone()
         .unwrap_or_else(|| dir.join("aegis-config.yaml"));
-    let image_tag: String = cmd.tag.clone().unwrap_or_else(|| {
-        NodeConfigManifest::load_or_default(Some(config_file_path.clone()))
-            .ok()
-            .and_then(|c| c.spec.image_tag)
-            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
-    });
+    let image_tag = resolve_image_tag(&config_file_path, cmd.tag.as_deref());
     println!();
     println!("  {} Targeting image tag: {}", "→".cyan(), image_tag.bold());
 
@@ -255,6 +250,17 @@ pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
 
+pub(crate) fn resolve_image_tag(config_file_path: &Path, requested_tag: Option<&str>) -> String {
+    requested_tag
+        .map(str::to_string)
+        .or_else(|| {
+            NodeConfigManifest::load_or_default(Some(config_file_path.to_path_buf()))
+                .ok()
+                .and_then(|c| c.spec.image_tag)
+        })
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
 fn expand_tilde(path: &Path) -> PathBuf {
     if let Ok(stripped) = path.strip_prefix("~") {
         if let Some(home) = dirs_next::home_dir() {
@@ -352,6 +358,40 @@ mod tests {
         let updated =
             NodeConfigManifest::from_yaml_file(&config_path).expect("load updated config");
         assert_eq!(updated.spec.image_tag.as_deref(), Some("new-tag"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_image_tag_prefers_explicit_override() {
+        let dir = temp_dir();
+        let config_path = dir.join("aegis-config.yaml");
+
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.image_tag = Some("latest".to_string());
+        manifest
+            .to_yaml_file(&config_path)
+            .expect("write config with latest tag");
+
+        let resolved = resolve_image_tag(&config_path, Some("v1.2.3"));
+        assert_eq!(resolved, "v1.2.3");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolve_image_tag_uses_persisted_config_tag_when_override_missing() {
+        let dir = temp_dir();
+        let config_path = dir.join("aegis-config.yaml");
+
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.image_tag = Some("latest".to_string());
+        manifest
+            .to_yaml_file(&config_path)
+            .expect("write config with latest tag");
+
+        let resolved = resolve_image_tag(&config_path, None);
+        assert_eq!(resolved, "latest");
 
         let _ = fs::remove_dir_all(dir);
     }
