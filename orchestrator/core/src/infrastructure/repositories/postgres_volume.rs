@@ -143,7 +143,7 @@ impl VolumeRepository for PostgresVolumeRepository {
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE expires_at IS NOT NULL AND expires_at < $1
-              AND status::text NOT IN ('deleted', 'deleting')
+              AND status #>> '{}' NOT IN ('deleted', 'deleting')
             ORDER BY expires_at ASC
             "#,
         )
@@ -203,7 +203,10 @@ impl VolumeRepository for PostgresVolumeRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!("Volume {id} not found")));
+            return Err(RepositoryError::NotFound(format!(
+                "Volume {} not found",
+                id
+            )));
         }
 
         Ok(())

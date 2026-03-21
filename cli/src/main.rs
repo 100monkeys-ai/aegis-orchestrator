@@ -31,11 +31,16 @@
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** Implements internal responsibilities for main
 
+use aegis_orchestrator_core::domain::node_config::{LoggingConfig, OtlpProtocol};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
+use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
+use opentelemetry_sdk::logs::LoggerProvider;
 use std::path::PathBuf;
+use std::time::Duration;
 use tracing::info;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 mod commands;
 mod daemon;
@@ -172,12 +177,6 @@ enum Commands {
         args: UninstallArgs,
     },
 }
-
-use aegis_orchestrator_core::domain::node_config::{LoggingConfig, OtlpProtocol};
-use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
-use opentelemetry_sdk::logs::LoggerProvider;
-use std::time::Duration;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 #[tokio::main]
 async fn main() -> Result<()> {
