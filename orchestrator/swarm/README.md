@@ -41,7 +41,7 @@ Stimulus ──► SwarmService.dispatch()
 
 ```toml
 [dependencies]
-aegis-orchestrator-swarm = "0.12.0-pre-alpha"
+aegis-orchestrator-swarm = "0.13.0-pre-alpha"
 ```
 
 ```rust

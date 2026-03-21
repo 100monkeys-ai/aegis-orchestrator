@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-PINNED_VERSION="0.12.0-pre-alpha"
+PINNED_VERSION="0.13.0-pre-alpha"
 AEGIS_VERSION="${AEGIS_VERSION:-$PINNED_VERSION}"
 
 if [[ "$AEGIS_VERSION" == "latest" ]]; then
