@@ -14,7 +14,14 @@
 
 set -euo pipefail
 
-AEGIS_VERSION="${AEGIS_VERSION:-0.12.0-pre-alpha}"
+PINNED_VERSION="0.12.0-pre-alpha"
+AEGIS_VERSION="${AEGIS_VERSION:-$PINNED_VERSION}"
+
+if [[ "$AEGIS_VERSION" == "latest" ]]; then
+    DOWNLOAD_VERSION="$PINNED_VERSION"
+else
+    DOWNLOAD_VERSION="$AEGIS_VERSION"
+fi
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -192,17 +199,20 @@ install_aegis_from_release() {
     if command -v aegis &>/dev/null; then
         local current_version
         current_version="$(aegis --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+\.[^ ]+' || true)"
-        if [[ "$current_version" == "$AEGIS_VERSION" ]]; then
-            success "aegis $AEGIS_VERSION already installed. Skipping release download."
+        if [[ "$current_version" == "$DOWNLOAD_VERSION" ]]; then
+            success "aegis $DOWNLOAD_VERSION already installed. Skipping release download."
+            if [[ -z "${AEGIS_BIN_PATH:-}" ]]; then
+                AEGIS_BIN_PATH="$(command -v aegis)"
+            fi
             return
         fi
     fi
 
-    url="https://github.com/100monkeys-ai/aegis-orchestrator/releases/download/${AEGIS_VERSION}/${asset}"
+    url="https://github.com/100monkeys-ai/aegis-orchestrator/releases/download/${DOWNLOAD_VERSION}/${asset}"
     extract_dir="$tmpdir/extract"
     mkdir -p "$extract_dir"
 
-    info "Downloading aegis ${AEGIS_VERSION} (${asset})..."
+    info "Downloading aegis ${DOWNLOAD_VERSION} (${asset})..."
     curl -fsSL "$url" -o "$tmpdir/$asset"
 
     info "Extracting release archive..."
