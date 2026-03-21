@@ -42,7 +42,7 @@ mod daemon;
 
 use commands::{
     AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
-    TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
+    StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
 
 /// AEGIS Agent Host - Enable autonomous agent execution
@@ -158,6 +158,13 @@ enum Commands {
         args: RestartArgs,
     },
 
+    /// Check AEGIS service health
+    #[command(name = "status")]
+    Status {
+        #[command(flatten)]
+        args: StatusArgs,
+    },
+
     /// Stop the stack and permanently remove the AEGIS data directory
     #[command(name = "uninstall")]
     Uninstall {
@@ -223,6 +230,9 @@ async fn main() -> Result<()> {
         Some(Commands::Down { args }) => commands::down::run(args).await,
         Some(Commands::Up { args }) => commands::up::run(args).await,
         Some(Commands::Restart { args }) => commands::restart::run(args).await,
+        Some(Commands::Status { args }) => {
+            commands::status::run(args, cli.config, &cli.host, cli.port).await
+        }
         Some(Commands::Uninstall { args }) => commands::uninstall::run(args).await,
         None => {
             // No command provided - show help

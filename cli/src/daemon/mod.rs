@@ -14,6 +14,8 @@
 //! - **Purpose:** Implements internal responsibilities for mod
 
 use anyhow::{Context, Result};
+use reqwest::Client;
+use serde_json::Value;
 use std::path::PathBuf;
 use std::time::Duration;
 #[cfg(unix)]
@@ -37,24 +39,14 @@ pub enum DaemonStatus {
     Unhealthy { pid: u32, error: String },
 }
 
+#[derive(Debug, Clone)]
+pub enum HealthEndpointStatus {
+    Healthy { uptime: Option<u64> },
+    Unhealthy { error: String },
+}
+
 /// Check if daemon is running via HTTP health check (primary) or PID file (secondary)
 pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus> {
-    // 1. Try HTTP health check first (works for local and remote/forwarded ports)
-    // Use 127.0.0.1 to avoid ipv4/ipv6 ambiguity with localhost if host is explicitly localhost
-    // otherwise use provided host.
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_millis(500)) // Fast timeout for local checks
-        .build()?;
-
-    let base_url = if host.starts_with("http://") || host.starts_with("https://") {
-        format!("{host}:{port}")
-    } else {
-        format!("http://{host}:{port}")
-    };
-
-    let health_url = format!("{base_url}/health");
-
     // We check the PID file primarily to return the PID in the Running status if available locally.
     // If not available (remote), we return 0 or another indicator.
     let pid_file = get_pid_file_path();
@@ -63,35 +55,16 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
         Err(_) => None,
     };
 
-    match client.get(&health_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            // Parse uptime from response
-            let uptime = resp
-                .json::<serde_json::Value>()
-                .await
-                .ok()
-                .and_then(|v| v["uptime_seconds"].as_u64());
-
-            // If we have a local PID, use it. Otherwise, this may be a remote daemon.
-            // Existing `DaemonStatus::Running` requires `pid: u32`, so use 0 when unknown.
+    match probe_health_endpoint(host, port).await {
+        Ok(HealthEndpointStatus::Healthy { uptime }) => {
             let pid = local_pid.unwrap_or(0);
-
             Ok(DaemonStatus::Running { pid, uptime })
         }
-        Ok(resp) => {
-            // HTTP reached but returned error
+        Ok(HealthEndpointStatus::Unhealthy { error }) => {
             if let Some(pid) = local_pid {
-                Ok(DaemonStatus::Unhealthy {
-                    pid,
-                    error: format!("HTTP {}", resp.status()),
-                })
+                Ok(DaemonStatus::Unhealthy { pid, error })
             } else {
-                // If no PID file and unhealthy HTTP, it's ambiguous but likely "Running but broken" or incompatible version?
-                // Let's treat as Unhealthy with PID 0
-                Ok(DaemonStatus::Unhealthy {
-                    pid: 0,
-                    error: format!("HTTP {}", resp.status()),
-                })
+                Ok(DaemonStatus::Unhealthy { pid: 0, error })
             }
         }
         Err(e) => {
@@ -113,6 +86,37 @@ pub async fn check_daemon_running(host: &str, port: u16) -> Result<DaemonStatus>
                 Ok(DaemonStatus::Stopped)
             }
         }
+    }
+}
+
+pub async fn probe_health_endpoint(host: &str, port: u16) -> Result<HealthEndpointStatus> {
+    let client = Client::builder()
+        .timeout(Duration::from_millis(500))
+        .build()?;
+
+    let health_url = format!("{}/health", build_base_url(host, port));
+
+    match client.get(&health_url).send().await {
+        Ok(resp) if resp.status().is_success() => {
+            let uptime = resp
+                .json::<Value>()
+                .await
+                .ok()
+                .and_then(|v| v["uptime_seconds"].as_u64());
+            Ok(HealthEndpointStatus::Healthy { uptime })
+        }
+        Ok(resp) => Ok(HealthEndpointStatus::Unhealthy {
+            error: format!("HTTP {}", resp.status()),
+        }),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn build_base_url(host: &str, port: u16) -> String {
+    if host.starts_with("http://") || host.starts_with("https://") {
+        format!("{host}:{port}")
+    } else {
+        format!("http://{host}:{port}")
     }
 }
 
