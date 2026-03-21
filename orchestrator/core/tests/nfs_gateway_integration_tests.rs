@@ -489,22 +489,6 @@ async fn test_fsal_audit_events() {
         write: vec!["/workspace/*".to_string()],
     };
 
-    // Register the volume with the NFS gateway to mirror production behavior
-    let nfs_gateway = NfsGatewayService::new(
-        storage_provider,
-        volume_repository.clone(),
-        event_publisher,
-        None,
-    );
-    nfs_gateway.register_volume(
-        volume_id,
-        execution_id,
-        0,
-        0,
-        policy.clone(),
-        std::path::PathBuf::from("/workspace"),
-    );
-
     // Subscribe to domain events (filter for storage events)
     let mut event_rx = event_bus.subscribe();
 
