@@ -246,4 +246,8 @@ install_aegis_from_release
 info "Starting AEGIS stack (aegis up --tag $AEGIS_VERSION)..."
 "$AEGIS_BIN_PATH" up --tag "$AEGIS_VERSION"
 
-success "AEGIS is ready! Run 'aegis --help' to get started. To update in the future, just run this installer script again to get the latest version, then run 'aegis update' to apply the update to your stack."
+success "AEGIS is ready!"
+info "Run 'aegis --help' to get started."
+info "To update in the future:"
+info "  1) Rerun this installer script to install the latest aegis CLI version."
+info "  2) Run 'aegis update' to apply the update to your stack."

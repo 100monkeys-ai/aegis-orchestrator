@@ -234,19 +234,40 @@ async fn test_nfs_gateway_lifecycle() {
 
     // Start server
     let result = gateway.start_server().await;
-    // Note: This will fail in CI without network permissions, but structure is validated
-    // In local testing with proper permissions, this would succeed
-    if result.is_ok() {
-        assert!(gateway.is_running());
+    // Note: This may fail in CI without network permissions; in that case we still
+    // assert that the error is reported, while in local runs we exercise the full
+    // lifecycle (start -> health_check -> stop).
+    match result {
+        Ok(_) => {
+            // On successful start, the gateway must report as running.
+            assert!(gateway.is_running(), "gateway should be running after start_server()");
 
-        // Health check
-        let health = gateway.health_check().await;
-        assert!(health.is_ok() || health.is_err()); // Either works, depends on actual NFS start
+            // Health check should be callable and succeed for a running gateway.
+            let health = gateway.health_check().await;
+            assert!(
+                health.is_ok(),
+                "expected health_check() to succeed for running gateway, got {:?}",
+                health
+            );
 
-        // Stop server
-        let stop_result = gateway.stop_server().await;
-        assert!(stop_result.is_ok());
-        // Note: is_running() may still return true briefly due to async shutdown
+            // Stop server should succeed.
+            let stop_result = gateway.stop_server().await;
+            assert!(
+                stop_result.is_ok(),
+                "expected stop_server() to succeed, got {:?}",
+                stop_result
+            );
+        }
+        Err(e) => {
+            // In constrained environments (e.g., CI without network permissions),
+            // we at least assert that start_server reports a failure instead of
+            // silently ignoring it.
+            eprintln!("start_server() failed in test_nfs_gateway_lifecycle: {:?}", e);
+            assert!(
+                !gateway.is_running(),
+                "gateway should not report running when start_server() fails"
+            );
+        }
     }
 }
 
@@ -260,10 +281,18 @@ async fn test_fsal_mode_validation() {
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(
-        storage_provider,
+        storage_provider.clone(),
         volume_repository.clone(),
         empty_borrowed_volume_registry(),
+        event_publisher.clone(),
+    );
+
+    // Create NFS gateway service to mirror production export registration
+    let gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
         event_publisher,
+        None, // Use default or ephemeral port for test; server is not started
     );
 
     let execution_id = ExecutionId::new();
@@ -274,6 +303,16 @@ async fn test_fsal_mode_validation() {
         read: vec!["/workspace/*".to_string()],
         write: vec![], // Read-only policy
     };
+
+    // Register the volume with the NFS gateway to establish export context
+    gateway.register_volume(
+        volume_id,
+        execution_id,
+        0,
+        0,
+        policy.clone(),
+        std::path::PathBuf::from("/workspace"),
+    );
 
     let path = "/workspace/test.txt";
     let handle =
@@ -301,10 +340,18 @@ async fn test_fsal_path_traversal_prevention() {
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(
-        storage_provider,
+        storage_provider.clone(),
         volume_repository.clone(),
         empty_borrowed_volume_registry(),
+        event_publisher.clone(),
+    );
+
+    // Create NFS gateway service and register the test volume to mirror production lifecycle
+    let nfs_gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
         event_publisher,
+        None,
     );
 
     // Create test volume (path traversal check occurs after authorization, so volume must be attached)
@@ -316,6 +363,16 @@ async fn test_fsal_path_traversal_prevention() {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
     };
+
+    // Register the attached volume with the NFS gateway before performing FSAL operations
+    nfs_gateway.register_volume(
+        volume_id,
+        execution_id,
+        0,
+        0,
+        policy.clone(),
+        std::path::PathBuf::from("/workspace"),
+    );
 
     // Test: Attempt path traversal attack
     let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
@@ -350,10 +407,10 @@ async fn test_fsal_policy_enforcement() {
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(
-        storage_provider,
+        storage_provider.clone(),
         volume_repository.clone(),
         empty_borrowed_volume_registry(),
-        event_publisher,
+        event_publisher.clone(),
     );
 
     let execution_id = ExecutionId::new();
@@ -365,6 +422,22 @@ async fn test_fsal_policy_enforcement() {
         read: vec!["/workspace/data/*".to_string()],
         write: vec!["/workspace/data/*".to_string()],
     };
+
+    // Register the volume with the NFS gateway to mirror production initialization (ADR-036)
+    let nfs_gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
+        event_publisher,
+        None,
+    );
+    nfs_gateway.register_volume(
+        volume_id,
+        execution_id,
+        0,
+        0,
+        policy.clone(),
+        std::path::PathBuf::from("/workspace/data"),
+    );
 
     // Test: Attempt to write outside allowlist
     let handle1 = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
@@ -411,10 +484,10 @@ async fn test_fsal_audit_events() {
         Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
 
     let fsal = AegisFSAL::new(
-        storage_provider,
+        storage_provider.clone(),
         volume_repository.clone(),
         empty_borrowed_volume_registry(),
-        event_publisher,
+        event_publisher.clone(),
     );
 
     let execution_id = ExecutionId::new();
@@ -425,6 +498,22 @@ async fn test_fsal_audit_events() {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
     };
+
+    // Register the volume with the NFS gateway to mirror production behavior
+    let nfs_gateway = NfsGatewayService::new(
+        storage_provider,
+        volume_repository.clone(),
+        event_publisher,
+        None,
+    );
+    nfs_gateway.register_volume(
+        volume_id,
+        execution_id,
+        0,
+        0,
+        policy.clone(),
+        std::path::PathBuf::from("/workspace"),
+    );
 
     // Subscribe to domain events (filter for storage events)
     let mut event_rx = event_bus.subscribe();

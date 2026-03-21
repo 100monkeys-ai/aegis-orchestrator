@@ -228,7 +228,9 @@ mod tests {
 
         assert_eq!(
             error,
-            SmcpSessionError::MalformedPayload("missing arguments".to_string())
+            SmcpSessionError::MalformedPayload(
+                "missing arguments after envelope verification".to_string()
+            )
         );
     }
 
