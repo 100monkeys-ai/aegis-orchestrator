@@ -203,7 +203,10 @@ impl VolumeRepository for PostgresVolumeRepository {
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if result.rows_affected() == 0 {
-            return Err(RepositoryError::NotFound(format!("Volume {} not found", id)));
+            return Err(RepositoryError::NotFound(format!(
+                "Volume {} not found",
+                id
+            )));
         }
 
         Ok(())

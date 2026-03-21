@@ -240,7 +240,10 @@ async fn test_nfs_gateway_lifecycle() {
     match result {
         Ok(_) => {
             // On successful start, the gateway must report as running.
-            assert!(gateway.is_running(), "gateway should be running after start_server()");
+            assert!(
+                gateway.is_running(),
+                "gateway should be running after start_server()"
+            );
 
             // Health check should be callable and succeed for a running gateway.
             let health = gateway.health_check().await;
@@ -262,7 +265,10 @@ async fn test_nfs_gateway_lifecycle() {
             // In constrained environments (e.g., CI without network permissions),
             // we at least assert that start_server reports a failure instead of
             // silently ignoring it.
-            eprintln!("start_server() failed in test_nfs_gateway_lifecycle: {:?}", e);
+            eprintln!(
+                "start_server() failed in test_nfs_gateway_lifecycle: {:?}",
+                e
+            );
             assert!(
                 !gateway.is_running(),
                 "gateway should not report running when start_server() fails"
