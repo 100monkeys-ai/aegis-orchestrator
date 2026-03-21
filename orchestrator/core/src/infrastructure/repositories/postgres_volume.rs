@@ -39,7 +39,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         let backend_json = serde_json::to_value(&volume.backend)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
-        let status_json = serde_json::to_value(&volume.status)
+        let status_json = serde_json::to_value(volume.status)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         let ownership_json = serde_json::to_value(&volume.ownership)
