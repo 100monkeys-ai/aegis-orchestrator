@@ -86,3 +86,171 @@ impl Default for SmcpMiddleware {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::AgentId;
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::mcp::PolicyViolation;
+    use crate::domain::security_context::{Capability, SecurityContext, SecurityContextMetadata};
+    use serde_json::json;
+
+    struct DummyEnvelope {
+        signature_result: Result<(), SmcpSessionError>,
+        tool_name: Option<String>,
+        arguments: Option<Value>,
+    }
+
+    impl EnvelopeVerifier for DummyEnvelope {
+        fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+            self.signature_result.clone()
+        }
+
+        fn extract_tool_name(&self) -> Option<String> {
+            self.tool_name.clone()
+        }
+
+        fn extract_arguments(&self) -> Option<Value> {
+            self.arguments.clone()
+        }
+    }
+
+    fn allow_all_context() -> SecurityContext {
+        SecurityContext {
+            name: "test".to_string(),
+            description: "test".to_string(),
+            capabilities: vec![Capability {
+                tool_pattern: "*".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            }],
+            deny_list: vec![],
+            metadata: SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    fn denied_context() -> SecurityContext {
+        SecurityContext {
+            name: "locked-down".to_string(),
+            description: "locked-down".to_string(),
+            capabilities: vec![],
+            deny_list: vec!["tool.run".to_string()],
+            metadata: SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    fn session_with_context(context: SecurityContext) -> SmcpSession {
+        SmcpSession::new(
+            AgentId::new(),
+            ExecutionId::new(),
+            vec![1, 2, 3],
+            "token".to_string(),
+            context,
+        )
+    }
+
+    #[test]
+    fn verify_and_unwrap_returns_only_inner_arguments() {
+        let middleware = SmcpMiddleware::new();
+        let mut session = session_with_context(allow_all_context());
+        let envelope = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tool.run".to_string()),
+            arguments: Some(json!({
+                "path": "/workspace/file.txt",
+                "flags": ["--check"]
+            })),
+        };
+
+        let args = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .unwrap();
+
+        assert_eq!(
+            args,
+            json!({
+                "path": "/workspace/file.txt",
+                "flags": ["--check"]
+            })
+        );
+        assert!(args.get("security_token").is_none());
+        assert!(args.get("signature").is_none());
+    }
+
+    #[test]
+    fn verify_and_unwrap_propagates_signature_failures() {
+        let middleware = SmcpMiddleware::new();
+        let mut session = session_with_context(allow_all_context());
+        let envelope = DummyEnvelope {
+            signature_result: Err(SmcpSessionError::SignatureVerificationFailed(
+                "bad signature".to_string(),
+            )),
+            tool_name: Some("tool.run".to_string()),
+            arguments: Some(json!({"path": "/workspace/file.txt"})),
+        };
+
+        let error = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            SmcpSessionError::SignatureVerificationFailed("bad signature".to_string())
+        );
+    }
+
+    #[test]
+    fn verify_and_unwrap_rejects_missing_arguments_as_malformed_payload() {
+        let middleware = SmcpMiddleware::new();
+        let mut session = session_with_context(allow_all_context());
+        let envelope = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tool.run".to_string()),
+            arguments: None,
+        };
+
+        let error = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            SmcpSessionError::MalformedPayload("missing arguments".to_string())
+        );
+    }
+
+    #[test]
+    fn verify_and_unwrap_propagates_policy_violations() {
+        let middleware = SmcpMiddleware::new();
+        let mut session = session_with_context(denied_context());
+        let envelope = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("tool.run".to_string()),
+            arguments: Some(json!({"path": "/workspace/file.txt"})),
+        };
+
+        let error = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            SmcpSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
+                tool_name: "tool.run".to_string(),
+            })
+        );
+    }
+}

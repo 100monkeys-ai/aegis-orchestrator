@@ -328,3 +328,327 @@ impl RunParallelContainerStepsUseCase {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::agent::ImagePullPolicy;
+    use crate::domain::events::ContainerRunEvent;
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::runtime::{
+        ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
+    };
+    use crate::domain::workflow::{ContainerRunConfig, ParallelCompletionStrategy, StateName};
+    use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventReceiver};
+    use async_trait::async_trait;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    enum StubOutcome {
+        Success(ContainerStepResult),
+        Error(ContainerStepError),
+    }
+
+    #[derive(Default)]
+    struct StubContainerStepRunner {
+        outcomes: Mutex<HashMap<String, VecDeque<StubOutcome>>>,
+        recorded_configs: Mutex<Vec<ContainerStepConfig>>,
+    }
+
+    impl StubContainerStepRunner {
+        fn with_step_outcomes(
+            step_outcomes: impl IntoIterator<Item = (String, Vec<StubOutcome>)>,
+        ) -> Self {
+            let outcomes = step_outcomes
+                .into_iter()
+                .map(|(name, outcomes)| (name, outcomes.into()))
+                .collect();
+            Self {
+                outcomes: Mutex::new(outcomes),
+                recorded_configs: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn recorded_configs(&self) -> Vec<ContainerStepConfig> {
+            self.recorded_configs.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ContainerStepRunner for StubContainerStepRunner {
+        async fn run_step(
+            &self,
+            config: ContainerStepConfig,
+        ) -> Result<ContainerStepResult, ContainerStepError> {
+            self.recorded_configs.lock().unwrap().push(config.clone());
+
+            let mut outcomes = self.outcomes.lock().unwrap();
+            let queue = outcomes
+                .get_mut(&config.name)
+                .unwrap_or_else(|| panic!("missing stub outcomes for step '{}'", config.name));
+
+            match queue.pop_front() {
+                Some(StubOutcome::Success(result)) => Ok(result),
+                Some(StubOutcome::Error(error)) => Err(error),
+                None => panic!("no remaining stub outcomes for step '{}'", config.name),
+            }
+        }
+    }
+
+    fn make_input(name: &str) -> RunContainerStepInput {
+        RunContainerStepInput {
+            execution_id: ExecutionId::new(),
+            state_name: StateName::new("BUILD").unwrap(),
+            name: name.to_string(),
+            image: "rust:1.88".to_string(),
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            command: vec!["cargo".to_string(), "test".to_string()],
+            env: HashMap::new(),
+            workdir: Some("/workspace".to_string()),
+            volumes: Vec::new(),
+            resources: None,
+            registry_credentials: None,
+            max_attempts: 1,
+            shell: false,
+        }
+    }
+
+    fn make_step(name: &str, command: &[&str], shell: bool) -> ContainerRunConfig {
+        ContainerRunConfig {
+            name: name.to_string(),
+            image: "rust:1.88".to_string(),
+            command: command.iter().map(|part| part.to_string()).collect(),
+            env: HashMap::new(),
+            workdir: Some("/workspace".to_string()),
+            volumes: Vec::new(),
+            resources: None,
+            registry_credentials: None,
+            shell,
+        }
+    }
+
+    fn ok_result(exit_code: i32) -> ContainerStepResult {
+        ContainerStepResult {
+            exit_code,
+            stdout: "ok".to_string(),
+            stderr: String::new(),
+            duration_ms: 25,
+        }
+    }
+
+    async fn recv_parallel_aggregated_event(receiver: &mut EventReceiver) -> ContainerRunEvent {
+        match receiver.recv().await.unwrap() {
+            DomainEvent::ContainerRun(event) => event,
+            other => panic!("expected container run event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_wraps_shell_commands_with_sh_c() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([(
+            "build".to_string(),
+            vec![StubOutcome::Success(ok_result(0))],
+        )]));
+        let use_case = RunContainerStepUseCase::new(runner.clone());
+        let mut input = make_input("build");
+        input.shell = true;
+        input.command = vec!["echo".to_string(), "hello world".to_string()];
+
+        let output = use_case.execute(input).await.unwrap();
+
+        assert_eq!(output.exit_code, 0);
+        let recorded = runner.recorded_configs();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0].command,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "echo hello world".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_retries_until_successful_attempt() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([(
+            "build".to_string(),
+            vec![
+                StubOutcome::Error(ContainerStepError::DockerError("first failure".to_string())),
+                StubOutcome::Success(ok_result(0)),
+            ],
+        )]));
+        let use_case = Arc::new(RunContainerStepUseCase::new(runner.clone()));
+        let mut input = make_input("build");
+        input.max_attempts = 2;
+
+        let handle = tokio::spawn({
+            let use_case = use_case.clone();
+            async move { use_case.execute(input).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let output = handle.await.unwrap().unwrap();
+
+        assert_eq!(output.attempts, 2);
+        assert_eq!(runner.recorded_configs().len(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_returns_last_error_after_max_attempts() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([(
+            "build".to_string(),
+            vec![
+                StubOutcome::Error(ContainerStepError::DockerError("first".to_string())),
+                StubOutcome::Error(ContainerStepError::DockerError("second".to_string())),
+                StubOutcome::Error(ContainerStepError::TimeoutExpired { timeout_secs: 30 }),
+            ],
+        )]));
+        let use_case = Arc::new(RunContainerStepUseCase::new(runner.clone()));
+        let mut input = make_input("build");
+        input.max_attempts = 3;
+
+        let handle = tokio::spawn({
+            let use_case = use_case.clone();
+            async move { use_case.execute(input).await }
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+
+        let error = match handle.await.unwrap() {
+            Ok(output) => panic!(
+                "expected retries to fail after max attempts, got exit_code={}",
+                output.exit_code
+            ),
+            Err(error) => error,
+        };
+
+        assert!(matches!(
+            error,
+            ContainerStepError::TimeoutExpired { timeout_secs: 30 }
+        ));
+        assert_eq!(runner.recorded_configs().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn parallel_all_succeed_returns_success_and_publishes_aggregate_event() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([
+            ("lint".to_string(), vec![StubOutcome::Success(ok_result(0))]),
+            ("test".to_string(), vec![StubOutcome::Success(ok_result(0))]),
+        ]));
+        let single_use_case = Arc::new(RunContainerStepUseCase::new(runner));
+        let event_bus = Arc::new(EventBus::new(8));
+        let parallel_use_case =
+            RunParallelContainerStepsUseCase::new(single_use_case, event_bus.clone());
+        let execution_id = ExecutionId::new();
+        let state_name = StateName::new("CI").unwrap();
+        let mut receiver = event_bus.subscribe();
+
+        let output = parallel_use_case
+            .execute(
+                execution_id,
+                state_name.clone(),
+                vec![
+                    make_step("lint", &["cargo", "fmt", "--check"], false),
+                    make_step("test", &["cargo", "test"], false),
+                ],
+                ParallelCompletionStrategy::AllSucceed,
+                ImagePullPolicy::IfNotPresent,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.succeeded, 2);
+        assert_eq!(output.failed, 0);
+        assert_eq!(output.strategy, ParallelCompletionStrategy::AllSucceed);
+
+        let event = recv_parallel_aggregated_event(&mut receiver).await;
+        assert!(matches!(
+            event,
+            ContainerRunEvent::ParallelContainerRunAggregated {
+                execution_id: id,
+                state_name: ref state,
+                total_steps: 2,
+                succeeded: 2,
+                failed: 0,
+                ref strategy,
+                ..
+            } if id == execution_id && state == state_name.as_str() && strategy == "all_succeed"
+        ));
+    }
+
+    #[tokio::test]
+    async fn parallel_any_succeed_accepts_non_zero_exit_when_one_step_succeeds() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([
+            ("pass".to_string(), vec![StubOutcome::Success(ok_result(0))]),
+            (
+                "warn".to_string(),
+                vec![StubOutcome::Success(ok_result(17))],
+            ),
+        ]));
+        let single_use_case = Arc::new(RunContainerStepUseCase::new(runner));
+        let parallel_use_case =
+            RunParallelContainerStepsUseCase::new(single_use_case, Arc::new(EventBus::new(8)));
+
+        let output = parallel_use_case
+            .execute(
+                ExecutionId::new(),
+                StateName::new("CI").unwrap(),
+                vec![
+                    make_step("pass", &["cargo", "check"], false),
+                    make_step("warn", &["cargo", "clippy"], false),
+                ],
+                ParallelCompletionStrategy::AnySucceed,
+                ImagePullPolicy::IfNotPresent,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.succeeded, 1);
+        assert_eq!(output.failed, 1);
+        assert_eq!(output.results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_best_effort_returns_success_even_when_a_step_errors() {
+        let runner = Arc::new(StubContainerStepRunner::with_step_outcomes([
+            ("pass".to_string(), vec![StubOutcome::Success(ok_result(0))]),
+            (
+                "fail".to_string(),
+                vec![StubOutcome::Error(ContainerStepError::ResourceExhausted {
+                    detail: "oom-killed".to_string(),
+                })],
+            ),
+        ]));
+        let single_use_case = Arc::new(RunContainerStepUseCase::new(runner));
+        let parallel_use_case =
+            RunParallelContainerStepsUseCase::new(single_use_case, Arc::new(EventBus::new(8)));
+
+        let output = parallel_use_case
+            .execute(
+                ExecutionId::new(),
+                StateName::new("CI").unwrap(),
+                vec![
+                    make_step("pass", &["cargo", "check"], false),
+                    make_step("fail", &["cargo", "test"], false),
+                ],
+                ParallelCompletionStrategy::BestEffort,
+                ImagePullPolicy::IfNotPresent,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(output.succeeded, 1);
+        assert_eq!(output.failed, 1);
+        assert_eq!(output.strategy, ParallelCompletionStrategy::BestEffort);
+        assert!(output.results.iter().any(|result| result.outcome.is_err()));
+    }
+}
