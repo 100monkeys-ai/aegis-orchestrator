@@ -233,7 +233,7 @@ impl VolumeService for StandardVolumeService {
         let mut volume = Volume {
             id: volume_id,
             name: name.clone(),
-            tenant_id,
+            tenant_id: tenant_id.clone(),
             storage_class: storage_class.clone(),
             backend,
             size_limit_bytes,
@@ -263,10 +263,17 @@ impl VolumeService for StandardVolumeService {
             .context("Failed to mark volume as available")?;
 
         // Persist to database
-        self.repository
-            .save(&volume)
-            .await
-            .context("Failed to save volume to repository")?;
+        self.repository.save(&volume).await.map_err(|e| {
+            error!(
+                volume_id = %volume_id,
+                volume_name = %name,
+                tenant_id = %tenant_id,
+                storage_mode = %self.storage_mode,
+                error = %e,
+                "Failed to save volume to repository"
+            );
+            anyhow::Error::new(e).context("Failed to save volume to repository")
+        })?;
 
         // Publish domain event
         self.event_bus
@@ -769,9 +776,11 @@ mod tests {
     use super::*;
     use crate::domain::execution::ExecutionId;
     use crate::domain::repository::RepositoryError;
+    use crate::infrastructure::storage::LocalHostStorageProvider;
     use crate::infrastructure::storage::TestStorageProvider;
     use chrono::Duration;
     use std::collections::HashMap;
+    use tempfile::TempDir;
     use tokio::sync::Mutex;
 
     // Test repository for volume persistence behavior.
@@ -840,6 +849,43 @@ mod tests {
         }
     }
 
+    struct FailingVolumeRepository;
+
+    #[async_trait]
+    impl VolumeRepository for FailingVolumeRepository {
+        async fn save(&self, _volume: &Volume) -> Result<(), RepositoryError> {
+            Err(RepositoryError::Database(
+                "synthetic repository failure".to_string(),
+            ))
+        }
+
+        async fn find_by_id(&self, _id: VolumeId) -> Result<Option<Volume>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn find_by_tenant(
+            &self,
+            _tenant_id: TenantId,
+        ) -> Result<Vec<Volume>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn find_expired(&self) -> Result<Vec<Volume>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn find_by_ownership(
+            &self,
+            _ownership: &VolumeOwnership,
+        ) -> Result<Vec<Volume>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn delete(&self, _id: VolumeId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+    }
+
     fn create_test_service() -> (
         StandardVolumeService,
         Arc<TestVolumeRepository>,
@@ -859,6 +905,28 @@ mod tests {
         .expect("Failed to create test service");
 
         (service, repository, storage_provider)
+    }
+
+    fn create_local_host_test_service(
+    ) -> (StandardVolumeService, Arc<TestVolumeRepository>, TempDir) {
+        let repository = Arc::new(TestVolumeRepository::new());
+        let tempdir = TempDir::new().expect("Failed to create tempdir");
+        let storage_provider = Arc::new(
+            LocalHostStorageProvider::new(tempdir.path())
+                .expect("Failed to create local_host storage provider"),
+        );
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+
+        let service = StandardVolumeService::new(
+            repository.clone(),
+            storage_provider,
+            event_bus,
+            "http://localhost:8888".to_string(),
+            "local_host",
+        )
+        .expect("Failed to create local_host test service");
+
+        (service, repository, tempdir)
     }
 
     #[tokio::test]
@@ -1032,5 +1100,91 @@ mod tests {
             .await
             .expect("Volume not found");
         assert!(!volume.can_attach(), "Expired volume should be deleted");
+    }
+
+    #[tokio::test]
+    async fn test_create_volumes_for_execution_local_host_with_local_tenant() {
+        let (service, repository, tempdir) = create_local_host_test_service();
+        let execution_id = ExecutionId::new();
+        let tenant_id = TenantId::local_default();
+        let volume_specs = vec![VolumeSpec {
+            name: "workspace".to_string(),
+            storage_class: "ephemeral".to_string(),
+            volume_type: "local_host".to_string(),
+            provider: None,
+            config: None,
+            mount_path: "/workspace".to_string(),
+            access_mode: "read-write".to_string(),
+            size_limit: "1Gi".to_string(),
+            ttl_hours: Some(1),
+        }];
+
+        let volumes = service
+            .create_volumes_for_execution(
+                execution_id,
+                tenant_id.clone(),
+                &volume_specs,
+                "local_host",
+            )
+            .await
+            .expect("Failed to create local_host volumes");
+
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0].tenant_id, tenant_id);
+
+        let volume = repository
+            .find_by_id(volumes[0].id)
+            .await
+            .expect("Repository error")
+            .expect("Volume not found");
+
+        assert_eq!(volume.name, "workspace");
+        assert_eq!(volume.tenant_id, TenantId::local_default());
+
+        let expected_dir = tempdir.path().join(format!(
+            "aegis/volumes/{}/{}",
+            TenantId::local_default(),
+            volume.id
+        ));
+        assert!(
+            expected_dir.is_dir(),
+            "Expected local_host directory to exist at {}",
+            expected_dir.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_volume_surfaces_repository_failure_details() {
+        let repository = Arc::new(FailingVolumeRepository);
+        let storage_provider = Arc::new(TestStorageProvider::new());
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+
+        let service = StandardVolumeService::new(
+            repository,
+            storage_provider,
+            event_bus,
+            "http://localhost:8888".to_string(),
+            "local_host",
+        )
+        .expect("Failed to create test service");
+
+        let err = service
+            .create_volume(
+                "workspace".to_string(),
+                TenantId::local_default(),
+                StorageClass::ephemeral_hours(1),
+                100,
+                VolumeOwnership::Execution {
+                    execution_id: ExecutionId::new(),
+                },
+            )
+            .await
+            .expect_err("repository save should fail");
+
+        let err_text = err.to_string();
+        assert!(err_text.contains("Failed to save volume to repository"));
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("synthetic repository failure")));
     }
 }

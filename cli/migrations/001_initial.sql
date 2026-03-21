@@ -372,7 +372,7 @@ END $$;
 CREATE TABLE volumes (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name TEXT NOT NULL,
-    tenant_id UUID NOT NULL,
+    tenant_id TEXT NOT NULL,
     
     -- Storage configuration
     storage_class JSONB NOT NULL,      -- {"type": "ephemeral", "ttl": "PT24H"} or {"type": "persistent"}
@@ -390,7 +390,8 @@ CREATE TABLE volumes (
     expires_at TIMESTAMPTZ,            -- NULL for persistent volumes
     
     -- Constraints
-    CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0)
+    CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0),
+    CONSTRAINT volumes_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
     -- Note: Volume names are logical labels, NOT globally unique.
     -- Multiple executions can have volumes with the same name but different volume_ids.
     -- Uniqueness is enforced by: id (PRIMARY KEY).
@@ -408,7 +409,7 @@ CREATE INDEX idx_volumes_tenant_status ON volumes(tenant_id, (status->>'type'));
 
 -- Add comment for documentation
 COMMENT ON TABLE volumes IS 'Volume metadata mapping to diverse StorageBackends (ADR-047)';
-COMMENT ON COLUMN volumes.tenant_id IS 'Multi-tenant namespace isolation (default: 00000000-0000-0000-0000-000000000001)';
+COMMENT ON COLUMN volumes.tenant_id IS 'Multi-tenant namespace isolation using canonical tenant slug IDs (default: local)';
 COMMENT ON COLUMN volumes.storage_class IS 'Ephemeral (TTL-based) or Persistent storage classification';
 COMMENT ON COLUMN volumes.ownership IS 'Execution-scoped, Workflow-scoped, or User-owned persistent';
 COMMENT ON COLUMN volumes.expires_at IS 'Auto-cleanup timestamp for ephemeral volumes (NULL for persistent)';

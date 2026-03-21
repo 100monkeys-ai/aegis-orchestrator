@@ -260,6 +260,86 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
 
 #[cfg(test)]
 mod tests {
-    // Integration tests would go here (require PostgreSQL connection)
-    // For now, we'll rely on unit tests in volume.rs and manual integration testing
+    use super::*;
+    use crate::domain::execution::ExecutionId;
+    use sqlx::postgres::PgPoolOptions;
+
+    async fn connect_test_pool() -> Option<PgPool> {
+        let database_url = std::env::var("AEGIS_DATABASE_URL")
+            .or_else(|_| std::env::var("DATABASE_URL"))
+            .ok()?;
+
+        PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+            .ok()
+    }
+
+    #[tokio::test]
+    async fn test_save_and_load_volume_with_local_tenant() {
+        let Some(pool) = connect_test_pool().await else {
+            eprintln!("Skipping Postgres volume repository test: DATABASE_URL/AEGIS_DATABASE_URL not set or unreachable");
+            return;
+        };
+
+        sqlx::query(
+            r#"
+            CREATE TEMP TABLE volumes (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                storage_class JSONB NOT NULL,
+                backend JSONB NOT NULL,
+                size_limit_bytes BIGINT NOT NULL,
+                status JSONB NOT NULL,
+                ownership JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                attached_at TIMESTAMPTZ,
+                detached_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create temp volumes table");
+
+        let repository = PostgresVolumeRepository::new(pool);
+        let execution_id = ExecutionId::new();
+        let now = Utc::now();
+        let volume = Volume {
+            id: VolumeId::new(),
+            name: "workspace".to_string(),
+            tenant_id: TenantId::local_default(),
+            storage_class: StorageClass::ephemeral_hours(1),
+            backend: VolumeBackend::HostPath {
+                path: "/aegis/volumes/local/workspace".into(),
+            },
+            size_limit_bytes: 1024 * 1024,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::Execution { execution_id },
+            created_at: now,
+            attached_at: None,
+            detached_at: None,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+        };
+
+        repository
+            .save(&volume)
+            .await
+            .expect("Failed to save volume");
+
+        let loaded = repository
+            .find_by_id(volume.id)
+            .await
+            .expect("Failed to load volume")
+            .expect("Saved volume not found");
+
+        assert_eq!(loaded.id, volume.id);
+        assert_eq!(loaded.name, volume.name);
+        assert_eq!(loaded.tenant_id, TenantId::local_default());
+        assert_eq!(loaded.backend, volume.backend);
+        assert_eq!(loaded.ownership, volume.ownership);
+    }
 }
