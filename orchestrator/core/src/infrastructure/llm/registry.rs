@@ -23,6 +23,11 @@ use super::gemini::GeminiAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
+/// Maximum exponent for exponential backoff, preventing overflow on `u64` arithmetic.
+/// With `retry_delay_ms = 1000` (1 second), 2^16 × 1 s ≈ 18 hours, which is a safe
+/// upper bound for any retry scenario.
+const MAX_BACKOFF_EXPONENT: u32 = 16;
+
 /// Registry for managing LLM providers and resolving model aliases.
 ///
 /// Each entry in `alias_map` is an `Arc<dyn LLMProvider>` that was constructed at
@@ -284,9 +289,13 @@ impl ProviderRegistry {
                         }
                     }
 
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        self.retry_delay_ms * 2_u64.pow(attempt),
-                    ))
+                    tokio::time::sleep(tokio::time::Duration::from_millis({
+                        let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
+                        let backoff_multiplier = 2_u64.pow(capped_attempt);
+                        self.retry_delay_ms
+                            .checked_mul(backoff_multiplier)
+                            .unwrap_or(u64::MAX)
+                    }))
                     .await;
                 }
             }
@@ -344,11 +353,12 @@ impl ProviderRegistry {
                         }
                     }
 
-                    // Exponential backoff
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        self.retry_delay_ms * 2_u64.pow(attempt),
-                    ))
-                    .await;
+                    // Exponential backoff with capped exponent to avoid overflow
+                    let exp = std::cmp::min(attempt, MAX_BACKOFF_EXPONENT);
+                    let backoff_factor = 2_u64.saturating_pow(exp);
+                    let delay_ms = self.retry_delay_ms.saturating_mul(backoff_factor);
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
             }
         }

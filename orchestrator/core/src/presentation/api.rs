@@ -599,17 +599,6 @@ async fn smcp_tool_invoke(
         }
     };
 
-    let agent_id = match uuid::Uuid::parse_str(&req.agent_id) {
-        Ok(uid) => AgentId(uid),
-        Err(_) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Invalid agent_id" })),
-            )
-                .into_response();
-        }
-    };
-
     let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
     let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
         protocol: None,
@@ -619,7 +608,7 @@ async fn smcp_tool_invoke(
         timestamp: None,
     };
 
-    match tool_svc.invoke_tool(&agent_id, &envelope).await {
+    match tool_svc.invoke_tool(&envelope).await {
         Ok(res) => (axum::http::StatusCode::OK, Json(res)).into_response(),
         Err(e) => {
             // Map domain errors to HTTP status + MCP JSON-RPC error codes (ADR-055).

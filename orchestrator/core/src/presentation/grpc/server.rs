@@ -603,7 +603,9 @@ impl AegisRuntime for AegisRuntimeService {
             Status::failed_precondition("SMCP tool invocation service is not configured")
         })?;
 
-        // Construct SmcpEnvelope
+        // Construct SmcpEnvelope. The ToolInvocationService is responsible for
+        // validating the security_token and extracting any required claims
+        // (such as agent_id) from it in a verified manner.
         let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
             protocol: None,
             security_token: req.security_token,
@@ -612,37 +614,8 @@ impl AegisRuntime for AegisRuntimeService {
             timestamp: None,
         };
 
-        // We need the agent_id to route appropriately. This would typically be extracted
-        // from the security token (JWT) by the middleware, but for the sake of the API
-        // if we need it here, we should perhaps peek the token or let the service do it.
-        // Wait, ToolInvocationService takes agent_id in its arguments. Let's decode it.
-        // The middleware `verify_and_unwrap` happens inside `invoke_tool`.
-        // The service uses `agent_id` to lookup the session.
-        // We can peek the sub (agent_id) from the unverified token right now to pass it to the service,
-        // and the service will securely verify it anyway.
-
-        let token_parts: Vec<&str> = envelope.security_token.split('.').collect();
-        if token_parts.len() != 3 {
-            return Err(Status::unauthenticated("Invalid security token format"));
-        }
-        use base64::Engine;
-        let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .decode(token_parts[1])
-            .map_err(|_| Status::unauthenticated("Invalid token payload base64"))?;
-
-        let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
-            .map_err(|_| Status::unauthenticated("Invalid token payload JSON"))?;
-
-        let agent_id_str = claims
-            .get("agent_id")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Status::unauthenticated("Token missing agent_id claim"))?;
-
-        let agent_id = crate::domain::agent::AgentId::from_string(agent_id_str)
-            .map_err(|e| Status::internal(format!("Invalid agent_id in token: {e}")))?;
-
         match tool_invocation_service
-            .invoke_tool(&agent_id, &envelope)
+            .invoke_tool(&envelope)
             .await
         {
             Ok(result) => {

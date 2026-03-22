@@ -322,13 +322,44 @@ impl ToolInvocationService {
     /// Invokes a tool by validating the SMCP Envelope for the agent and routing to the right server
     pub async fn invoke_tool(
         &self,
-        agent_id: &AgentId,
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
-        // 1. Get active session for agent
+        // 1. Extract agent_id from the security token. Full JWT verification and
+        //    signature validation happen below via verify_and_unwrap; the claim is
+        //    only used here to locate the corresponding session record.
+        let agent_id = {
+            use base64::Engine;
+            let token = envelope.security_token();
+            let parts: Vec<&str> = token.split('.').collect();
+            if parts.len() != 3 {
+                return Err(SmcpSessionError::MalformedPayload(
+                    "Invalid security token format".to_string(),
+                ));
+            }
+            let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[1])
+                .map_err(|_| {
+                    SmcpSessionError::MalformedPayload("Invalid token payload base64".to_string())
+                })?;
+            let claims: serde_json::Value =
+                serde_json::from_slice(&payload_bytes).map_err(|_| {
+                    SmcpSessionError::MalformedPayload("Invalid token payload JSON".to_string())
+                })?;
+            let agent_id_str = claims
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    SmcpSessionError::MalformedPayload("Token missing agent_id claim".to_string())
+                })?;
+            AgentId::from_string(agent_id_str).map_err(|e| {
+                SmcpSessionError::MalformedPayload(format!("Invalid agent_id in token: {e}"))
+            })?
+        };
+
+        // 2. Get active session for agent
         let mut session = self
             .smcp_session_repo
-            .find_active_by_agent(agent_id)
+            .find_active_by_agent(&agent_id)
             .await
             .map_err(|_| {
                 SmcpSessionError::MalformedPayload("session repository lookup failed".to_string())
@@ -3230,13 +3261,31 @@ mod tests {
         (fsal, registry)
     }
 
+    fn make_fake_token(agent_id: AgentId) -> String {
+        use base64::Engine;
+        let claims = serde_json::json!({"agent_id": agent_id.0.to_string()});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap_or_default());
+        format!("eyJhbGciOiJSUzI1NiJ9.{}.sig", payload)
+    }
+
     struct DummyEnvelope {
         valid: bool,
+        token: String,
+    }
+
+    impl DummyEnvelope {
+        fn for_agent(valid: bool, agent_id: AgentId) -> Self {
+            Self {
+                valid,
+                token: make_fake_token(agent_id),
+            }
+        }
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
         fn security_token(&self) -> &str {
-            "token"
+            &self.token
         }
 
         fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
@@ -3694,9 +3743,9 @@ spec:
             None,
         );
         let agent_id = AgentId::new();
-        let envelope = DummyEnvelope { valid: true };
+        let envelope = DummyEnvelope::for_agent(true, agent_id);
 
-        let result = service.invoke_tool(&agent_id, &envelope).await;
+        let result = service.invoke_tool(&envelope).await;
         assert!(matches!(result, Err(SmcpSessionError::SessionInactive(_))));
     }
 
@@ -3744,9 +3793,9 @@ spec:
             Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
             None,
         );
-        let envelope = DummyEnvelope { valid: false };
+        let envelope = DummyEnvelope::for_agent(false, agent_id);
 
-        let result = service.invoke_tool(&agent_id, &envelope).await;
+        let result = service.invoke_tool(&envelope).await;
         assert!(matches!(
             result,
             Err(SmcpSessionError::SignatureVerificationFailed(_))
@@ -4181,8 +4230,8 @@ spec:
 
         router.add_server(local_server).await.unwrap();
 
-        let envelope = DummyEnvelope { valid: true }; // extracts "test_tool"
-        let result = service.invoke_tool(&agent_id, &envelope).await.unwrap();
+        let envelope = DummyEnvelope::for_agent(true, agent_id); // extracts "test_tool"
+        let result = service.invoke_tool(&envelope).await.unwrap();
 
         let exec_mode = result
             .get("execution_mode")
@@ -4215,10 +4264,11 @@ spec:
 
         struct DummyRemoteEnvelope {
             valid: bool,
+            token: String,
         }
         impl EnvelopeVerifier for DummyRemoteEnvelope {
             fn security_token(&self) -> &str {
-                "token"
+                &self.token
             }
 
             fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
@@ -4236,9 +4286,12 @@ spec:
             }
         }
 
-        let remote_envelope = DummyRemoteEnvelope { valid: true };
+        let remote_envelope = DummyRemoteEnvelope {
+            valid: true,
+            token: make_fake_token(agent_id),
+        };
         let result = service
-            .invoke_tool(&agent_id, &remote_envelope)
+            .invoke_tool(&remote_envelope)
             .await
             .unwrap();
 
