@@ -3554,11 +3554,7 @@ async fn invoke_smcp_handler(
 
     // The ToolInvocationService is responsible for validating the security_token
     // and extracting any required claims (such as agent_id) from it in a verified manner.
-    match state
-        .tool_invocation_service
-        .invoke_tool(&envelope)
-        .await
-    {
+    match state.tool_invocation_service.invoke_tool(&envelope).await {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

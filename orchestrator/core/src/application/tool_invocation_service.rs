@@ -345,12 +345,15 @@ impl ToolInvocationService {
                 serde_json::from_slice(&payload_bytes).map_err(|_| {
                     SmcpSessionError::MalformedPayload("Invalid token payload JSON".to_string())
                 })?;
-            let agent_id_str = claims
-                .get("agent_id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    SmcpSessionError::MalformedPayload("Token missing agent_id claim".to_string())
-                })?;
+            let agent_id_str =
+                claims
+                    .get("agent_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        SmcpSessionError::MalformedPayload(
+                            "Token missing agent_id claim".to_string(),
+                        )
+                    })?;
             AgentId::from_string(agent_id_str).map_err(|e| {
                 SmcpSessionError::MalformedPayload(format!("Invalid agent_id in token: {e}"))
             })?
@@ -4290,10 +4293,7 @@ spec:
             valid: true,
             token: make_fake_token(agent_id),
         };
-        let result = service
-            .invoke_tool(&remote_envelope)
-            .await
-            .unwrap();
+        let result = service.invoke_tool(&remote_envelope).await.unwrap();
 
         let exec_mode = result
             .get("execution_mode")

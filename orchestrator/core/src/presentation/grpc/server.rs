@@ -614,10 +614,7 @@ impl AegisRuntime for AegisRuntimeService {
             timestamp: None,
         };
 
-        match tool_invocation_service
-            .invoke_tool(&envelope)
-            .await
-        {
+        match tool_invocation_service.invoke_tool(&envelope).await {
             Ok(result) => {
                 let bytes = serde_json::to_vec(&result).map_err(|e| {
                     Status::internal(format!("Failed to serialize tool result: {e}"))
