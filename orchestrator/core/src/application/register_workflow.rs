@@ -132,10 +132,8 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         info!("Registering workflow from manifest (force={force})");
 
         // Step 1: Parse YAML → Workflow domain aggregate
-        let workflow = WorkflowParser::parse_yaml(yaml_manifest)
+        let mut workflow = WorkflowParser::parse_yaml(yaml_manifest)
             .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {e}"))?;
-
-        let workflow_id = workflow.id.to_string();
         let workflow_name = workflow.metadata.name.clone();
         let workflow_version = workflow
             .metadata
@@ -144,19 +142,25 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .unwrap_or_else(|| DEFAULT_WORKFLOW_VERSION.to_string());
 
         // Step 1b: Check for existing version if force=false
-        if !force {
-            if let Some(existing) = self
-                .workflow_repository
-                .find_by_name_for_tenant(tenant_id, &workflow_name)
-                .await?
-            {
-                if existing.metadata.version == workflow.metadata.version {
+        if let Some(existing) = self
+            .workflow_repository
+            .find_by_name_for_tenant(tenant_id, &workflow_name)
+            .await?
+        {
+            if existing.metadata.version == workflow.metadata.version {
+                if !force {
                     anyhow::bail!(
                         "Workflow '{workflow_name}' with version '{workflow_version}' already exists. Create a new version or use 'force' to overwrite."
                     );
                 }
+
+                // Force-overwrites keep the original workflow identity stable so
+                // downstream persistence and execution references stay aligned.
+                workflow.id = existing.id;
             }
         }
+
+        let workflow_id = workflow.id.to_string();
 
         // Step 2: Map to Temporal definition via anti-corruption layer
         let mut temporal_definition =
@@ -702,6 +706,40 @@ spec:
             .await
             .unwrap();
         assert_eq!(response.status, "registered");
+    }
+
+    #[tokio::test]
+    async fn register_workflow_force_overwrite_preserves_existing_workflow_id() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(
+                engine.clone() as Arc<dyn WorkflowEnginePort>
+            ))),
+            Arc::new(EventBus::new(8)),
+            test_agent_service(),
+        );
+
+        let first = service
+            .register_workflow(VALID_WORKFLOW_YAML, false)
+            .await
+            .unwrap();
+        let second = service
+            .register_workflow(VALID_WORKFLOW_YAML, true)
+            .await
+            .unwrap();
+
+        assert_eq!(second.workflow_id, first.workflow_id);
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].workflow_id, first.workflow_id);
+        assert_eq!(calls[1].workflow_id, first.workflow_id);
+
+        let workflows = repo.list_all().await.unwrap();
+        assert_eq!(workflows.len(), 1);
+        assert_eq!(workflows[0].id.to_string(), first.workflow_id);
     }
 
     /// Workflow YAML that references a non-existent agent; should fail during step 2b.

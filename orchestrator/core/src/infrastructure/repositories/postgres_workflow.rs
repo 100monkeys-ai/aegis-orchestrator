@@ -105,16 +105,42 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         tenant_id: &TenantId,
         workflow: &Workflow,
     ) -> Result<(), RepositoryError> {
-        let definition_json = serde_json::to_value(workflow)
+        let version = workflow
+            .metadata
+            .version
+            .clone()
+            .unwrap_or_else(|| "0.0.1".to_string());
+
+        let persisted_workflow_id = sqlx::query_scalar::<_, uuid::Uuid>(
+            r#"
+            SELECT id
+            FROM workflows
+            WHERE tenant_id = $1 AND name = $2 AND version = $3
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(&workflow.metadata.name)
+        .bind(&version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to load existing workflow: {e}")))?
+        .map(WorkflowId)
+        .unwrap_or(workflow.id);
+
+        let mut persisted_workflow = workflow.clone();
+        persisted_workflow.id = persisted_workflow_id;
+
+        let definition_json = serde_json::to_value(&persisted_workflow)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
-        let yaml_source = WorkflowParser::to_yaml(workflow)
+        let yaml_source = WorkflowParser::to_yaml(&persisted_workflow)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
         // Generate Temporal definition
         let temporal_def =
             crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
-                workflow, tenant_id,
+                &persisted_workflow,
+                tenant_id,
             )
             .map_err(|e| {
                 RepositoryError::Serialization(format!("Failed to map temporal definition: {e}"))
@@ -123,12 +149,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             RepositoryError::Serialization(format!("Failed to serialize temporal definition: {e}"))
         })?;
 
-        // Version
-        let version = workflow
-            .metadata
-            .version
-            .clone()
-            .unwrap_or_else(|| "0.0.1".to_string());
         let description = workflow.metadata.description.clone();
 
         sqlx::query(
@@ -143,7 +163,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 updated_at = NOW()
             "#
         )
-        .bind(workflow.id.0)
+        .bind(persisted_workflow.id.0)
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
@@ -169,7 +189,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 registered_at = NOW()
             "#
         )
-        .bind(workflow.id.0)
+        .bind(persisted_workflow.id.0)
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
