@@ -178,7 +178,7 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smcp_gateway: Option<SmcpGatewayConfig>,
 
-    /// AgentSkills configuration (e.g. https://agentskills.io/api)
+    /// AgentSkills configuration (e.g. <https://agentskills.io/api>)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_skills: Option<AgentSkillsConfig>,
 }
@@ -1481,7 +1481,7 @@ impl Default for NodeConfigSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSkillsConfig {
     /// AgentSkills API endpoint URL
-    /// Default: "https://agentskills.io/api"
+    /// Default: "<https://agentskills.io/api>"
     #[serde(default = "default_agentskills_url")]
     pub endpoint: String,
 }
