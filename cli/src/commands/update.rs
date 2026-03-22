@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! `aegis update` — upgrade the AEGIS stack to the latest version.
 //!
-//! Performs three steps in order:
+//! Performs four steps in order:
 //!
 //! 1. **Pull** — `docker compose pull` fetches the latest image tags.
 //! 2. **Restart** — `docker compose up -d --wait` replaces running containers.
 //! 3. **Migrate** — applies any pending database schema migrations.
+//! 4. **Sync built-ins** — re-deploys bundled agents and workflows.
 //!
 //! Individual steps can be skipped via `--skip-pull`, `--skip-restart`, or
 //! `--skip-migrations`. Use `--dry-run` to preview without making changes.
@@ -132,67 +133,7 @@ pub async fn execute(
     if !cmd.skip_migrations {
         println!();
         println!("{}", "[3/4] Running database migrations...".bold());
-
-        // Load the stack .env file so that `env:VAR` references in
-        // aegis-config.yaml (e.g. `url: env:AEGIS_DATABASE_URL`) resolve
-        // correctly when `aegis update` is run from outside the stack dir.
-        let env_file = dir.join(".env");
-        if env_file.exists() {
-            dotenvy::from_path(&env_file).ok();
-        }
-
-        let config = NodeConfigManifest::load_or_default(config_path.clone())?;
-        let db_config = config
-            .spec
-            .database
-            .as_ref()
-            .context("spec.database not configured in aegis-config.yaml")?;
-        let database_url =
-            resolve_env_value(&db_config.url).context("Failed to resolve spec.database.url")?;
-
-        static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
-
-        if cmd.dry_run {
-            println!(
-                "  {} would connect to database and run pending migrations",
-                "→".dimmed()
-            );
-            println!(
-                "  {} total migrations available: {}",
-                "→".dimmed(),
-                MIGRATOR.iter().count()
-            );
-        } else {
-            let pool = PgPoolOptions::new()
-                .max_connections(1)
-                .connect(&database_url)
-                .await
-                .context("Failed to connect to database")?;
-
-            let applied_count = sqlx::query("SELECT version FROM _sqlx_migrations")
-                .fetch_all(&pool)
-                .await
-                .map(|r| r.len())
-                .unwrap_or(0);
-
-            let total = MIGRATOR.iter().count();
-            let pending = total.saturating_sub(applied_count);
-
-            if pending == 0 {
-                println!(
-                    "  {} Database schema is up to date ({} migrations applied)",
-                    "✓".green(),
-                    applied_count
-                );
-            } else {
-                println!("  Applying {pending} pending migration(s)...");
-                MIGRATOR
-                    .run(&pool)
-                    .await
-                    .context("Failed to apply migrations")?;
-                println!("  {} {} migration(s) applied", "✓".green(), pending);
-            }
-        }
+        run_database_migrations(&dir, config_path.clone(), cmd.dry_run).await?;
     } else {
         println!();
         println!("{}", "[3/4] Database migrations... skipped".dimmed());
@@ -202,34 +143,7 @@ pub async fn execute(
     if !cmd.skip_builtins {
         println!();
         println!("{}", "[4/4] Re-deploying built-in templates...".bold());
-
-        // Load the stack .env file so that `env:VAR` references in
-        // aegis-config.yaml resolve correctly.
-        let env_file = dir.join(".env");
-        if env_file.exists() {
-            dotenvy::from_path(&env_file).ok();
-        }
-
-        let config = NodeConfigManifest::load_or_default(config_path.clone())?;
-        let host = config
-            .spec
-            .network
-            .as_ref()
-            .map(|n| n.bind_address.clone())
-            .unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = config.spec.network.as_ref().map(|n| n.port).unwrap_or(8088);
-
-        if cmd.dry_run {
-            println!(
-                "  {} would connect to daemon and re-deploy all built-in agents and workflows",
-                "→".dimmed()
-            );
-        } else {
-            let client = crate::daemon::DaemonClient::new(&host, port)?;
-            // Force re-deployment of built-ins to ensure they are updated
-            super::builtins::deploy_all_builtins(&client, true).await?;
-            println!("  {} All built-in templates updated", "✓".green());
-        }
+        sync_builtins(&dir, config_path.clone(), cmd.dry_run, true).await?;
     } else {
         println!();
         println!(
@@ -277,6 +191,109 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+pub(crate) async fn run_database_migrations(
+    dir: &Path,
+    config_path: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    load_stack_env(dir);
+
+    let config = NodeConfigManifest::load_or_default(config_path)?;
+    let db_config = config
+        .spec
+        .database
+        .as_ref()
+        .context("spec.database not configured in aegis-config.yaml")?;
+    let database_url =
+        resolve_env_value(&db_config.url).context("Failed to resolve spec.database.url")?;
+
+    static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
+    if dry_run {
+        println!(
+            "  {} would connect to database and run pending migrations",
+            "→".dimmed()
+        );
+        println!(
+            "  {} total migrations available: {}",
+            "→".dimmed(),
+            MIGRATOR.iter().count()
+        );
+        return Ok(());
+    }
+
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .context("Failed to connect to database")?;
+
+    let applied_count = sqlx::query("SELECT version FROM _sqlx_migrations")
+        .fetch_all(&pool)
+        .await
+        .map(|r| r.len())
+        .unwrap_or(0);
+
+    let total = MIGRATOR.iter().count();
+    let pending = total.saturating_sub(applied_count);
+
+    if pending == 0 {
+        println!(
+            "  {} Database schema is up to date ({} migrations applied)",
+            "✓".green(),
+            applied_count
+        );
+    } else {
+        println!("  Applying {pending} pending migration(s)...");
+        MIGRATOR
+            .run(&pool)
+            .await
+            .context("Failed to apply migrations")?;
+        println!("  {} {} migration(s) applied", "✓".green(), pending);
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn sync_builtins(
+    dir: &Path,
+    config_path: Option<PathBuf>,
+    dry_run: bool,
+    force: bool,
+) -> Result<()> {
+    load_stack_env(dir);
+
+    let config = NodeConfigManifest::load_or_default(config_path)?;
+    let host = config
+        .spec
+        .network
+        .as_ref()
+        .map(|n| n.bind_address.clone())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    let port = config.spec.network.as_ref().map(|n| n.port).unwrap_or(8088);
+
+    if dry_run {
+        println!(
+            "  {} would connect to daemon and sync built-in agents and workflows",
+            "→".dimmed()
+        );
+        return Ok(());
+    }
+
+    let client = crate::daemon::DaemonClient::new(&host, port)?;
+    super::builtins::deploy_all_builtins(&client, force).await?;
+    println!("  {} Built-in agents and workflows are ready", "✓".green());
+
+    Ok(())
+}
+
+fn load_stack_env(dir: &Path) {
+    let env_file = dir.join(".env");
+    if env_file.exists() {
+        dotenvy::from_path(&env_file).ok();
+    }
 }
 
 pub(crate) async fn refresh_compose(dir: &Path, image_tag: &str, dry_run: bool) -> Result<()> {

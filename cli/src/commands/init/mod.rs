@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! `aegis init` — interactive setup wizard.
 //!
-//! Guides the user through a seven-step process that downloads the AEGIS stack
+//! Guides the user through an eight-step process that downloads the AEGIS stack
 //! from GitHub, lets them toggle optional services, generates the node config,
-//! starts the Docker Compose stack, runs database migrations, and verifies that
-//! the orchestrator is healthy. An optional eighth step deploys the
-//! `hello-world` example agent as a smoke test.
+//! starts the Docker Compose stack, applies database migrations, verifies that
+//! the orchestrator is healthy, and syncs the built-in agents and workflows
+//! needed for first-use flows.
 //!
 //! ## Flags
 //!
@@ -26,7 +26,6 @@ pub mod components;
 pub mod compose;
 pub mod configure;
 pub mod download;
-pub mod examples;
 pub mod prereqs;
 pub mod verify;
 
@@ -40,9 +39,9 @@ use self::components::ComponentSelector;
 use self::compose::ComposeRunner;
 use self::configure::ConfigWizard;
 use self::download::fetch_stack;
-use self::examples::ExamplesLoader;
 use self::prereqs::PrereqChecker;
 use self::verify::HealthChecker;
+use super::update::{run_database_migrations, sync_builtins};
 
 /// Arguments for `aegis init`
 #[derive(Args)]
@@ -87,21 +86,21 @@ pub async fn run(args: InitArgs) -> Result<()> {
     let dir = PathBuf::from(&args.dir);
 
     // ─── Step 1: Select components ────────────────────────────────────────────
-    print_step(1, 7, "Select components");
+    print_step(1, 8, "Select components");
     let selector = ComponentSelector::new(args.yes);
     let components = selector.select()?;
 
     // ─── Step 2: Check prerequisites ─────────────────────────────────────────
-    print_step(2, 7, "Checking prerequisites");
+    print_step(2, 8, "Checking prerequisites");
     let checker = PrereqChecker::new(args.manual, components.ollama_llm);
     checker.check_and_install().await?;
 
     // ─── Step 3: Prepare stack templates ──────────────────────────────────────
-    print_step(3, 7, "Preparing stack files");
+    print_step(3, 8, "Preparing stack files");
     let stack = fetch_stack(&args.tag).await?;
 
     // ─── Step 4: Configure node ───────────────────────────────────────────────
-    print_step(4, 7, "Configuring node");
+    print_step(4, 8, "Configuring node");
     let wizard = ConfigWizard::new(args.yes, dir.clone(), args.advanced_override);
     let node_config = wizard.configure(
         &args.tag,
@@ -133,7 +132,7 @@ pub async fn run(args: InitArgs) -> Result<()> {
     )?;
 
     // ─── Step 5: Pull images & start services ────────────────────────────────
-    print_step(5, 7, "Starting Docker Compose stack");
+    print_step(5, 8, "Starting Docker Compose stack");
     let runner = ComposeRunner::new(node_config.working_dir.clone());
     runner.pull().await?;
     runner.up().await?;
@@ -141,20 +140,19 @@ pub async fn run(args: InitArgs) -> Result<()> {
         runner.pull_ollama_model(&node_config.ollama_model).await?;
     }
 
-    // ─── Step 6: Run database migrations ─────────────────────────────────────
-    print_step(6, 7, "Running database migrations");
-    run_migrations(&node_config.working_dir)?;
+    // ─── Step 6: Apply database migrations ───────────────────────────────────
+    print_step(6, 8, "Applying database migrations");
+    let config_path = node_config.working_dir.join("aegis-config.yaml");
+    run_database_migrations(&node_config.working_dir, Some(config_path.clone()), false).await?;
 
     // ─── Step 7: Verify health ────────────────────────────────────────────────
-    print_step(7, 7, "Verifying health");
+    print_step(7, 8, "Verifying health");
     let checker = HealthChecker::new(&args.host, args.port);
     checker.wait_for_healthy().await?;
 
-    // ─── Optional: Load examples ──────────────────────────────────────────────
-    let loader = ExamplesLoader::new(&args.host, args.port, args.yes);
-    loader
-        .maybe_load_hello_world(node_config.advanced.deploy_smoketest_agents)
-        .await?;
+    // ─── Step 8: Sync built-in agents and workflows ──────────────────────────
+    print_step(8, 8, "Syncing built-in agents and workflows");
+    sync_builtins(&node_config.working_dir, Some(config_path), false, true).await?;
 
     // ─── Done ─────────────────────────────────────────────────────────────────
     print_success(&args.host, args.port, &components);
@@ -180,28 +178,6 @@ fn print_step(n: u8, total: u8, label: &str) {
         format!("[{n}/{total}]").bold().cyan(),
         label.bold()
     );
-}
-
-/// Invoke `aegis update` (db migration) programmatically via the existing
-/// `UpdateCommand` without forking a subprocess.
-fn run_migrations(working_dir: &std::path::Path) -> Result<()> {
-    use colored::Colorize;
-
-    // The UpdateCommand reads DB URL from AEGIS_DATABASE_URL env var or
-    // the aegis-config.yaml file. The config was written to `working_dir`.
-    // We set AEGIS_CONFIG_PATH so the migration runner finds it.
-    let config_path = working_dir.join("aegis-config.yaml");
-    std::env::set_var("AEGIS_CONFIG_PATH", &config_path);
-
-    println!(
-        "  {} Migrations deferred to `aegis update` after daemon start.",
-        "ℹ".cyan()
-    );
-    println!(
-        "  → Run {} once the orchestrator daemon is running.",
-        "aegis update".bold()
-    );
-    Ok(())
 }
 
 fn print_success(host: &str, port: u16, components: &components::SelectedComponents) {
@@ -234,13 +210,28 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
     println!();
     println!("  Next steps:");
     println!(
-        "    1. Start the AEGIS daemon:  {}",
-        "aegis daemon start".cyan()
+        "    1. Read the docs:           {}",
+        "https://docs.100monkeys.ai".cyan()
     );
-    println!("    2. Run DB migrations:       {}", "aegis update".cyan());
     println!(
-        "    3. Deploy an agent:         {}",
+        "    2. Explore the CLI:         {}",
+        "aegis --help".cyan()
+    );
+    println!(
+        "    3. Check stack health:      {}",
+        "aegis status".cyan()
+    );
+    println!(
+        "    4. Deploy your own agent:   {}",
         "aegis agent deploy <manifest.yaml>".cyan()
+    );
+    println!(
+        "    5. Run a task:              {}",
+        "aegis task execute hello-world --input \"Hello, AEGIS!\"".cyan()
+    );
+    println!(
+        "    6. Stop the stack:          {}",
+        "aegis down".cyan()
     );
     println!();
 }

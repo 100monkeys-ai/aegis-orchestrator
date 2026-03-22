@@ -12,6 +12,7 @@ use crate::domain::llm::{
     LLMError, LLMProvider, ToolSchema,
 };
 use async_trait::async_trait;
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 pub struct AnthropicAdapter {
@@ -84,6 +85,52 @@ impl AnthropicAdapter {
             Some("end_turn") | Some("stop_sequence") => FinishReason::Stop,
             Some("max_tokens") => FinishReason::Length,
             _ => FinishReason::Stop,
+        }
+    }
+
+    fn classify_error(&self, status: StatusCode, error_text: &str) -> LLMError {
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            LLMError::Authentication(error_text.to_string())
+        } else if status == StatusCode::TOO_MANY_REQUESTS {
+            LLMError::RateLimit
+        } else if status == StatusCode::NOT_FOUND {
+            let mentions_model = serde_json::from_str::<serde_json::Value>(error_text)
+                .ok()
+                .and_then(|json| json.get("error").cloned().or(Some(json)))
+                .and_then(|value| {
+                    let message = value
+                        .get("message")
+                        .and_then(|message| message.as_str())
+                        .map(str::to_owned);
+                    let error_type = value
+                        .get("type")
+                        .and_then(|error_type| error_type.as_str())
+                        .map(str::to_owned);
+                    Some((message, error_type))
+                })
+                .map(|(message, error_type)| {
+                    message
+                        .as_deref()
+                        .is_some_and(|message| {
+                            message.contains(&self.model)
+                                || message.to_ascii_lowercase().contains("model")
+                        })
+                        || error_type
+                            .as_deref()
+                            .is_some_and(|error_type| error_type.contains("model"))
+                })
+                .unwrap_or_else(|| {
+                    let lower = error_text.to_ascii_lowercase();
+                    lower.contains(&self.model.to_ascii_lowercase()) || lower.contains("model")
+                });
+
+            if mentions_model {
+                LLMError::ModelNotFound(self.model.clone())
+            } else {
+                LLMError::Provider(format!("HTTP {status}: {error_text}"))
+            }
+        } else {
+            LLMError::Provider(format!("HTTP {status}: {error_text}"))
         }
     }
 }
@@ -219,15 +266,7 @@ impl LLMProvider for AnthropicAdapter {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            return Err(if status == 401 || status == 403 {
-                LLMError::Authentication(error_text)
-            } else if status == 429 {
-                LLMError::RateLimit
-            } else if status == 404 {
-                LLMError::ModelNotFound(self.model.clone())
-            } else {
-                LLMError::Provider(format!("HTTP {status}: {error_text}"))
-            });
+            return Err(self.classify_error(status, &error_text));
         }
 
         let ar: AnthropicResponse = response
@@ -300,11 +339,11 @@ mod tests {
         let adapter = AnthropicAdapter::new(
             "https://api.anthropic.com/v1".to_string(),
             "k".to_string(),
-            "claude-3-5-sonnet-20241022".to_string(),
+            "claude-sonnet-4-6".to_string(),
         );
         assert_eq!(adapter.api_key, "k");
         assert_eq!(adapter.endpoint, "https://api.anthropic.com/v1");
-        assert_eq!(adapter.model, "claude-3-5-sonnet-20241022");
+        assert_eq!(adapter.model, "claude-sonnet-4-6");
     }
 
     #[test]
@@ -327,7 +366,7 @@ mod tests {
     #[test]
     fn test_request_serialization() {
         let request = AnthropicRequest {
-            model: "claude-3-5-sonnet-20241022".to_string(),
+            model: "claude-sonnet-4-6".to_string(),
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::Value::String("Hello".to_string()),
@@ -338,7 +377,7 @@ mod tests {
             tools: None,
         };
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "claude-3-5-sonnet-20241022");
+        assert_eq!(json["model"], "claude-sonnet-4-6");
         assert_eq!(json["messages"][0]["content"], "Hello");
         assert!(json.get("tools").is_none());
     }
@@ -409,5 +448,46 @@ mod tests {
             output_tokens: 200,
         };
         assert_eq!(usage.input_tokens + usage.output_tokens, 300);
+    }
+
+    #[test]
+    fn test_classify_error_returns_provider_for_generic_404() {
+        let adapter = AnthropicAdapter::new(
+            "https://api.anthropic.com/v1".to_string(),
+            "k".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
+
+        let error = adapter.classify_error(
+            StatusCode::NOT_FOUND,
+            r#"{"type":"about:blank","title":"Not Found","detail":"Route not found"}"#,
+        );
+
+        match error {
+            LLMError::Provider(message) => {
+                assert!(message.contains("HTTP 404"));
+                assert!(message.contains("Route not found"));
+            }
+            other => panic!("expected Provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_classify_error_returns_model_not_found_for_model_404() {
+        let adapter = AnthropicAdapter::new(
+            "https://api.anthropic.com/v1".to_string(),
+            "k".to_string(),
+            "claude-sonnet-4-6".to_string(),
+        );
+
+        let error = adapter.classify_error(
+            StatusCode::NOT_FOUND,
+            r#"{"error":{"type":"not_found_error","message":"Model claude-sonnet-4-6 not found"}}"#,
+        );
+
+        match error {
+            LLMError::ModelNotFound(model) => assert_eq!(model, "claude-sonnet-4-6"),
+            other => panic!("expected ModelNotFound error, got {other:?}"),
+        }
     }
 }

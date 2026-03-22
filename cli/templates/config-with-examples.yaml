@@ -103,7 +103,7 @@ spec:
       api_key: "env:ANTHROPIC_API_KEY"
       models:
         - alias: "smart"
-          model: "claude-3-5-sonnet-20241022"
+          model: "claude-sonnet-4-6"
           capabilities: ["code", "reasoning", "general"]
           context_window: 200000
           cost_per_1k_tokens: 0.003  # $3 per 1M tokens

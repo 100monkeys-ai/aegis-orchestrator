@@ -72,7 +72,6 @@ pub struct AdvancedConfig {
     pub gemini_api_key: String,
     pub gemini_smart_model: String,
     pub gemini_judge_model: String,
-    pub deploy_smoketest_agents: Option<bool>,
     pub enable_otlp_logging: bool,
     pub otlp_endpoint: String,
     pub otlp_protocol: String,
@@ -345,14 +344,13 @@ impl ConfigWizard {
             lmstudio_judge_model: "google/gemma-3-4b".to_string(),
             enable_anthropic_extra: false,
             anthropic_api_key: String::new(),
-            anthropic_smart_model: "claude-sonnet-4-5".to_string(),
-            anthropic_judge_model: "claude-sonnet-4-5".to_string(),
+            anthropic_smart_model: "claude-sonnet-4-6".to_string(),
+            anthropic_judge_model: "claude-sonnet-4-6".to_string(),
             enable_gemini: false,
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_api_key: String::new(),
             gemini_smart_model: "gemini-2.5-flash".to_string(),
             gemini_judge_model: "gemini-2.5-pro".to_string(),
-            deploy_smoketest_agents: None,
             enable_otlp_logging: components.observability,
             otlp_endpoint: if components.observability {
                 "http://jaeger:4317".to_string()
@@ -406,10 +404,6 @@ impl ConfigWizard {
         let enable_gemini = Confirm::new()
             .with_prompt("Enable Gemini provider (OpenAI-compatible endpoint)?")
             .default(defaults.enable_gemini)
-            .interact()?;
-        let deploy_smoketest_agents = Confirm::new()
-            .with_prompt("Install smoke-test agents during init?")
-            .default(true)
             .interact()?;
         let enable_otlp_logging = Confirm::new()
             .with_prompt("Enable external OTLP logging?")
@@ -551,7 +545,6 @@ impl ConfigWizard {
             } else {
                 defaults.gemini_judge_model.clone()
             },
-            deploy_smoketest_agents: Some(deploy_smoketest_agents),
             enable_otlp_logging,
             otlp_endpoint: if enable_otlp_logging {
                 Input::new()
@@ -771,7 +764,7 @@ impl ConfigWizard {
             LlmChoice::Anthropic => (
                 r#"    - name: "anthropic"
       type: "anthropic"
-      endpoint: "https://api.anthropic.com"
+      endpoint: "https://api.anthropic.com/v1"
       enabled: true
       api_key: "env:ANTHROPIC_API_KEY"
       models:
@@ -781,12 +774,12 @@ impl ConfigWizard {
           context_window: 200000
           cost_per_1k_tokens: 0.0008
         - alias: "smart"
-          model: "claude-sonnet-4-5"
+          model: "claude-sonnet-4-6"
           capabilities: ["code", "reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
         - alias: "judge"
-          model: "claude-sonnet-4-5"
+          model: "claude-sonnet-4-6"
           capabilities: ["reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
@@ -894,7 +887,7 @@ impl ConfigWizard {
                 r#"
     - name: "anthropic-extra"
       type: "anthropic"
-      endpoint: "https://api.anthropic.com"
+      endpoint: "https://api.anthropic.com/v1"
       enabled: true
       api_key: "env:ANTHROPIC_API_KEY"
       models:
@@ -1548,15 +1541,14 @@ mod tests {
                 lmstudio_judge_model: "google/gemma-3-4b".to_string(),
                 enable_anthropic_extra: false,
                 anthropic_api_key: String::new(),
-                anthropic_smart_model: "claude-sonnet-4-5".to_string(),
-                anthropic_judge_model: "claude-sonnet-4-5".to_string(),
+                anthropic_smart_model: "claude-sonnet-4-6".to_string(),
+                anthropic_judge_model: "claude-sonnet-4-6".to_string(),
                 enable_gemini: false,
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
                 gemini_api_key: String::new(),
                 gemini_smart_model: "gemini-2.5-flash".to_string(),
                 gemini_judge_model: "gemini-2.5-pro".to_string(),
-                deploy_smoketest_agents: None,
                 enable_otlp_logging: false,
                 otlp_endpoint: "http://localhost:4317".to_string(),
                 otlp_protocol: "grpc".to_string(),
@@ -1593,5 +1585,84 @@ mod tests {
 
         assert!(rendered.contains("aegis.task.logs"));
         assert!(rendered.contains("Returns paginated execution events for a task by UUID."));
+    }
+
+    #[test]
+    fn render_aegis_config_uses_anthropic_v1_and_updated_models() {
+        let wizard = ConfigWizard::new(true, PathBuf::from("/tmp"), None);
+        let config = NodeConfig {
+            node_name: "test-node".to_string(),
+            node_id: "test-node-id".to_string(),
+            ollama_model: "llama3.2:latest".to_string(),
+            api_key: Some("anthropic-key".to_string()),
+            working_dir: PathBuf::from("/tmp"),
+            gemini_model: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            advanced: AdvancedConfig {
+                node_type: "hybrid".to_string(),
+                bind_address: "0.0.0.0".to_string(),
+                api_port: 8088,
+                log_level: "info".to_string(),
+                docker_network: "aegis-network".to_string(),
+                orchestrator_url: "http://aegis-runtime:8088".to_string(),
+                nfs_host: "127.0.0.1".to_string(),
+                keycloak_admin_password: "admin".to_string(),
+                openbao_secret_id: "test-secret-id".to_string(),
+                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                temporal_worker_secret: "dev-temporal-secret".to_string(),
+                keep_container: false,
+                enable_lmstudio: false,
+                lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
+                lmstudio_smart_model: "google/gemma-3-4b".to_string(),
+                lmstudio_judge_model: "google/gemma-3-4b".to_string(),
+                enable_anthropic_extra: false,
+                anthropic_api_key: String::new(),
+                anthropic_smart_model: "claude-sonnet-4-6".to_string(),
+                anthropic_judge_model: "claude-sonnet-4-6".to_string(),
+                enable_gemini: false,
+                gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
+                    .to_string(),
+                gemini_api_key: String::new(),
+                gemini_smart_model: "gemini-2.5-flash".to_string(),
+                gemini_judge_model: "gemini-2.5-pro".to_string(),
+                enable_otlp_logging: false,
+                otlp_endpoint: "http://localhost:4317".to_string(),
+                otlp_protocol: "grpc".to_string(),
+                otlp_min_level: "info".to_string(),
+                otlp_service_name: "aegis-orchestrator".to_string(),
+                enable_metrics: true,
+                metrics_port: 9091,
+                metrics_path: "/metrics".to_string(),
+                enable_cluster: false,
+                cluster_role: "hybrid".to_string(),
+                cluster_grpc_port: 50056,
+                cluster_controller_endpoint: "https://aegis-controller.example.com:50056"
+                    .to_string(),
+                cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+                cpu_cores: 4,
+                memory_gb: 16,
+                disk_gb: 100,
+                gpu_count: 0,
+                vram_gb: 0,
+            },
+        };
+        let components = SelectedComponents {
+            temporal: false,
+            storage: false,
+            iam: false,
+            secrets: false,
+            smcp_gateway: false,
+            ollama_llm: false,
+            observability: false,
+            llm: LlmChoice::Anthropic,
+        };
+
+        let rendered = wizard.render_aegis_config(&config, &components, "test-tag");
+
+        assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
+        assert!(rendered.contains(r#"model: "claude-sonnet-4-6""#));
+        assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
+        assert!(!rendered.contains(r#"model: "claude-sonnet-4-5""#));
     }
 }
