@@ -1916,6 +1916,8 @@ async fn execute_temporal_workflow_handler(
 #[derive(serde::Deserialize)]
 struct RunWorkflowLegacyRequest {
     input: serde_json::Value,
+    #[serde(default)]
+    blackboard: Option<serde_json::Value>,
 }
 
 async fn run_workflow_legacy_handler(
@@ -1927,7 +1929,7 @@ async fn run_workflow_legacy_handler(
     let req = StartWorkflowExecutionRequest {
         workflow_id: name,
         input: request.input,
-        blackboard: None,
+        blackboard: request.blackboard,
         tenant_id: Some(tenant_id_from_identity(
             identity.as_ref().map(|identity| &identity.0),
         )),
@@ -2159,6 +2161,8 @@ async fn deploy_agent_handler(
 #[derive(serde::Deserialize)]
 struct ExecuteRequest {
     input: serde_json::Value,
+    #[serde(default)]
+    context_overrides: Option<serde_json::Value>,
 }
 
 async fn execute_agent_handler(
@@ -2168,17 +2172,11 @@ async fn execute_agent_handler(
     Json(request): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    let payload = match request.input {
-        serde_json::Value::Object(mut map) => {
-            map.entry("tenant_id".to_string())
-                .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
-            serde_json::Value::Object(map)
-        }
-        value => serde_json::json!({
-            "input": value,
-            "tenant_id": tenant_id.to_string(),
-        }),
-    };
+    let payload = serde_json::json!({
+        "input": request.input,
+        "context_overrides": request.context_overrides,
+        "tenant_id": tenant_id.to_string(),
+    });
     let input = ExecutionInput {
         intent: Some(payload.to_string()),
         payload,

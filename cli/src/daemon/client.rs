@@ -76,16 +76,26 @@ impl DaemonClient {
         Ok(deploy_response.agent_id)
     }
 
-    pub async fn execute_agent(&self, agent_id: Uuid, input: serde_json::Value) -> Result<Uuid> {
+    pub async fn execute_agent(
+        &self,
+        agent_id: Uuid,
+        input: serde_json::Value,
+        context_overrides: Option<serde_json::Value>,
+    ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct ExecuteRequest {
             input: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            context_overrides: Option<serde_json::Value>,
         }
 
         let response = self
             .client
             .post(format!("{}/v1/agents/{}/execute", self.base_url, agent_id))
-            .json(&ExecuteRequest { input })
+            .json(&ExecuteRequest {
+                input,
+                context_overrides,
+            })
             .send()
             .await
             .context("Failed to execute agent")?;
@@ -621,16 +631,23 @@ impl DaemonClient {
     }
 
     /// Run a workflow
-    pub async fn run_workflow(&self, name: &str, input: serde_json::Value) -> Result<Uuid> {
+    pub async fn run_workflow(
+        &self,
+        name: &str,
+        input: serde_json::Value,
+        blackboard: Option<serde_json::Value>,
+    ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct RunRequest {
             input: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            blackboard: Option<serde_json::Value>,
         }
 
         let response = self
             .client
             .post(format!("{}/v1/workflows/{}/run", self.base_url, name))
-            .json(&RunRequest { input })
+            .json(&RunRequest { input, blackboard })
             .send()
             .await
             .context("Failed to run workflow")?;

@@ -33,6 +33,10 @@ pub enum TaskCommand {
         #[arg(short, long, value_name = "INPUT")]
         input: Option<String>,
 
+        /// Context override dictionary (JSON/YAML string or @file)
+        #[arg(long, value_name = "DICT")]
+        context: Option<String>,
+
         /// Wait for execution to complete
         #[arg(short, long)]
         wait: bool,
@@ -125,9 +129,10 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
         TaskCommand::Execute {
             agent,
             input,
+            context,
             wait,
             follow,
-        } => execute_daemon(agent, input, wait, follow, client).await,
+        } => execute_daemon(agent, input, context, wait, follow, client).await,
         TaskCommand::Status { execution_id } => status_daemon(execution_id, client).await,
         TaskCommand::Logs {
             execution_id,
@@ -148,6 +153,7 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
 async fn execute_daemon(
     agent: String,
     input: Option<String>,
+    context: Option<String>,
     wait: bool,
     follow: bool,
     client: DaemonClient,
@@ -187,10 +193,13 @@ async fn execute_daemon(
 
     // Parse input
     let input_data = parse_input(input).await?;
+    let context_overrides = parse_object_input(context, "context override").await?;
 
     println!("Executing agent {agent_id}...");
 
-    let execution_id = client.execute_agent(agent_id, input_data).await?;
+    let execution_id = client
+        .execute_agent(agent_id, input_data, context_overrides)
+        .await?;
 
     println!("{}", format!("✓ Execution started: {execution_id}").green());
 
@@ -272,7 +281,7 @@ async fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
             let content = tokio::fs::read_to_string(path)
                 .await
                 .with_context(|| format!("Failed to read input file: {path}"))?;
-            serde_json::from_str(&content).context("Failed to parse input JSON")
+            parse_json_or_yaml(&content).context("Failed to parse input JSON/YAML")
         }
         Some(s) => {
             // Try parsing as JSON first
@@ -284,6 +293,38 @@ async fn parse_input(input: Option<String>) -> Result<serde_json::Value> {
             }
         }
     }
+}
+
+async fn parse_object_input(
+    input: Option<String>,
+    label: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(raw) = input else {
+        return Ok(None);
+    };
+
+    let value = if raw.starts_with('@') {
+        let path = &raw[1..];
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("Failed to read {label} file: {path}"))?;
+        parse_json_or_yaml(&content)
+            .with_context(|| format!("Failed to parse {label} JSON/YAML"))?
+    } else {
+        parse_json_or_yaml(&raw).with_context(|| format!("Failed to parse {label} JSON/YAML"))?
+    };
+
+    if !value.is_object() {
+        anyhow::bail!("{label} must be a JSON/YAML object");
+    }
+
+    Ok(Some(value))
+}
+
+fn parse_json_or_yaml(input: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(input)
+        .or_else(|_| serde_yaml::from_str(input))
+        .context("Invalid JSON or YAML")
 }
 
 async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {
@@ -323,4 +364,35 @@ async fn remove_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
     client.delete_execution(execution_id).await?;
     println!("{}", format!("✓ Execution {execution_id} removed").green());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_input_supports_yaml_files() {
+        let path = std::env::temp_dir().join(format!("aegis-task-input-{}.yaml", Uuid::new_v4()));
+        tokio::fs::write(&path, "message: hello\ncount: 2\n")
+            .await
+            .unwrap();
+
+        let parsed = parse_input(Some(format!("@{}", path.display())))
+            .await
+            .unwrap();
+        assert_eq!(parsed["message"], serde_json::json!("hello"));
+        assert_eq!(parsed["count"], serde_json::json!(2));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn parse_object_input_rejects_scalar_values() {
+        let err = parse_object_input(Some("hello".to_string()), "context override")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("context override must be a JSON/YAML object"));
+    }
 }

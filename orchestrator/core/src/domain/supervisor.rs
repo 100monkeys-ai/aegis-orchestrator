@@ -200,7 +200,7 @@ impl Supervisor {
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
-        // Payload merge into context is handled by ExecutionService::prepare_execution_input
+        let execution_context = Self::extract_execution_context(&input.payload);
 
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
@@ -260,7 +260,7 @@ impl Supervisor {
 
             let task_input = TaskInput {
                 prompt: original_intent.clone(),
-                context: std::collections::HashMap::new(),
+                context: execution_context.clone(),
             };
 
             // Execute task with per-iteration timeout and cancellation support
@@ -464,6 +464,24 @@ impl Supervisor {
             "Max retries exceeded".to_string(),
         ))
     }
+
+    fn extract_execution_context(
+        payload: &serde_json::Value,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let serde_json::Value::Object(map) = payload else {
+            return std::collections::HashMap::new();
+        };
+
+        map.get("context_overrides")
+            .and_then(|value| value.as_object())
+            .map(|context| {
+                context
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -479,6 +497,7 @@ mod tests {
     struct TestRuntime {
         spawn_results: Arc<Mutex<Vec<Result<InstanceId, RuntimeError>>>>,
         execute_results: Arc<Mutex<Vec<Result<TaskOutput, RuntimeError>>>>,
+        execute_inputs: Arc<Mutex<Vec<TaskInput>>>,
         terminate_calls: Arc<Mutex<Vec<InstanceId>>>,
         /// Optional delay injected into `execute()` to simulate long-running work.
         execute_delay: Option<Duration>,
@@ -489,6 +508,7 @@ mod tests {
             Self {
                 spawn_results: Arc::new(Mutex::new(Vec::new())),
                 execute_results: Arc::new(Mutex::new(Vec::new())),
+                execute_inputs: Arc::new(Mutex::new(Vec::new())),
                 terminate_calls: Arc::new(Mutex::new(Vec::new())),
                 execute_delay: None,
             }
@@ -541,11 +561,12 @@ mod tests {
         async fn execute(
             &self,
             _id: &InstanceId,
-            _input: TaskInput,
+            input: TaskInput,
         ) -> Result<TaskOutput, RuntimeError> {
             if let Some(delay) = self.execute_delay {
                 tokio::time::sleep(delay).await;
             }
+            self.execute_inputs.lock().await.push(input);
             let mut results = self.execute_results.lock().await;
             results.remove(0)
         }
@@ -716,6 +737,47 @@ mod tests {
         assert_eq!(observer.iteration_starts.lock().await.len(), 2);
         assert_eq!(observer.iteration_fails.lock().await.len(), 1);
         assert_eq!(observer.iteration_completes.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_supervisor_passes_context_overrides_to_runtime() {
+        let runtime = Arc::new(
+            TestRuntime::new()
+                .with_spawn_success(1)
+                .with_execute_success(vec!["Success output".to_string()]),
+        );
+        let supervisor = Supervisor::new(runtime.clone());
+
+        let result = supervisor
+            .run_loop(
+                create_test_config(),
+                ExecutionInput {
+                    intent: Some("Test task".to_string()),
+                    payload: serde_json::json!({
+                        "context_overrides": {
+                            "repo": "aegis",
+                            "owner": "100monkeys"
+                        }
+                    }),
+                },
+                1,
+                Arc::new(TestObserver::default()),
+                CancellationToken::new(),
+                None,
+            )
+            .await;
+
+        assert!(result.is_ok());
+        let execute_inputs = runtime.execute_inputs.lock().await;
+        assert_eq!(execute_inputs.len(), 1);
+        assert_eq!(
+            execute_inputs[0].context.get("repo"),
+            Some(&serde_json::json!("aegis"))
+        );
+        assert_eq!(
+            execute_inputs[0].context.get("owner"),
+            Some(&serde_json::json!("100monkeys"))
+        );
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@
 [![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
 The `aegis` CLI and daemon binary for the [100monkeys.ai AEGIS](https://docs.100monkeys.ai) platform — a secure, serverless runtime for autonomous AI agents.
+For the complete command reference, use [the canonical docs](https://docs.100monkeys.ai/docs/reference/cli).
 
 ## Install
 
@@ -40,72 +41,13 @@ aegis agent logs my-agent
 aegis daemon stop
 ```
 
-## Command Reference
+## Command Surface
 
-### Daemon
+Implemented top-level commands: `daemon`, `task`, `node`, `config`, `agent`, `workflow`, `update`, `init`, `down`, `up`, `restart`, `status`, `uninstall`.
 
-```bash
-aegis daemon start               # Start the orchestrator daemon
-aegis daemon stop                # Stop the daemon
-aegis daemon status              # Show daemon health and version
-```
+`aegis node leave` currently exists in the CLI surface, but it returns the baseline-protocol error and should not be documented as a working workflow.
 
-### Agents
-
-```bash
-aegis agent deploy agent.yaml    # Deploy an agent from a manifest
-aegis agent list                 # List all deployed agents
-aegis agent logs <name>          # Stream live agent logs
-aegis agent remove <id>          # Remove a deployed agent
-aegis agent generate "..."       # Generate and deploy an agent from natural language
-```
-
-### Tasks (Executions)
-
-```bash
-aegis task execute <agent> --input "..."   # Submit a task
-aegis task list                            # List recent executions
-aegis task logs <execution-id>             # View execution logs
-aegis task cancel <execution-id>           # Cancel a running execution
-```
-
-### Workflows
-
-```bash
-aegis workflow generate "..."    # Generate and register a workflow from natural language
-```
-
-Generated manifests are also persisted locally by the daemon for source control:
-
-- `~/.aegis/generated/agents/<name>/<version>.yaml`
-- `~/.aegis/generated/workflows/<name>/<version>.yaml`
-
-Bundled generator templates are also materialized by the CLI:
-
-- `~/.aegis/templates/agents/*.yaml`
-- `~/.aegis/templates/workflows/*.yaml`
-
-### Authoring Agent Templates
-
-```bash
-# Agent that creates/deploys agent manifests
-cli/templates/agents/agent-creator-agent.yaml
-
-# Agent that plans workflow generation and discovers existing agents
-cli/templates/agents/workflow-generator-planner-agent.yaml
-
-# Agent that creates/validates/registers workflow manifests
-cli/templates/agents/workflow-creator-validator-agent.yaml
-
-# Judge for agent generation quality
-cli/templates/agents/agent-generator-judge.yaml
-
-# Judge for workflow generation quality
-cli/templates/agents/workflow-generator-judge.yaml
-
-# Built-in workflow that orchestrates planner -> missing-agent generation -> workflow registration
-cli/templates/workflows/builtin-workflow-generator.yaml
-```
+Use the docs reference for current subcommands, flags, and behavior.
 
 ### Debug Logging
 

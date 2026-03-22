@@ -204,7 +204,7 @@ impl AegisRuntime for AegisRuntimeService {
             intent: None, // Let ExecutionService render agent's prompt_template
             payload: serde_json::json!({
                 "input": req.input,  // User-provided input
-                "context": payload,  // Additional context if provided
+                "context_overrides": payload,  // Additional context if provided
                 "tenant_id": tenant_id.to_string(),
             }),
         };

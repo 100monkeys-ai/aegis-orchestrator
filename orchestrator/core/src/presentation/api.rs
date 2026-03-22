@@ -176,6 +176,8 @@ pub fn app_with_inner_loop(
 pub struct StartExecutionRequest {
     pub agent_id: String,
     pub input: String,
+    #[serde(default)]
+    pub context_overrides: Option<serde_json::Value>,
 }
 
 async fn start_execution(
@@ -193,7 +195,8 @@ async fn start_execution(
     let input = ExecutionInput {
         intent: None, // Let ExecutionService render agent's prompt_template
         payload: serde_json::json!({
-            "input": payload.input  // User-provided input from REST API
+            "input": payload.input,  // User-provided input from REST API
+            "context_overrides": payload.context_overrides,
         }),
     };
 

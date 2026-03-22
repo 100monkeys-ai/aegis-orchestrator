@@ -446,6 +446,7 @@ struct StartCall {
     workflow_id: String,
     execution_id: ExecutionId,
     input: HashMap<String, serde_json::Value>,
+    blackboard: Option<HashMap<String, serde_json::Value>>,
 }
 
 struct RecordingWorkflowEngine {
@@ -480,11 +481,13 @@ impl aegis_orchestrator_core::application::ports::WorkflowEnginePort for Recordi
         workflow_id: &str,
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
+        blackboard: Option<HashMap<String, serde_json::Value>>,
     ) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push(StartCall {
             workflow_id: workflow_id.to_string(),
             execution_id,
             input,
+            blackboard,
         });
         Ok(self.run_id.clone())
     }
@@ -644,7 +647,7 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
     ]);
 
     let run_id = engine
-        .start_workflow("workflow-alpha", execution_id.clone(), input.clone())
+        .start_workflow("workflow-alpha", execution_id.clone(), input.clone(), None)
         .await
         .expect("recording engine should return its configured run id");
 
@@ -654,4 +657,5 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
     assert_eq!(calls[0].workflow_id, "workflow-alpha");
     assert_eq!(calls[0].execution_id, execution_id);
     assert_eq!(calls[0].input, input);
+    assert_eq!(calls[0].blackboard, None);
 }

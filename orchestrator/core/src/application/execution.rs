@@ -62,6 +62,7 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -216,6 +217,15 @@ pub struct StandardExecutionService {
 }
 
 impl StandardExecutionService {
+    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 6] = [
+        "instruction",
+        "input",
+        "iteration_number",
+        "previous_error",
+        "agentskills",
+        "context",
+    ];
+
     fn resolve_tenant_from_payload(payload: &serde_json::Value) -> Result<TenantId> {
         let tenant = payload
             .get("tenant_id")
@@ -548,6 +558,7 @@ mod tests {
     #[derive(Default)]
     struct TestRuntime {
         spawned: Mutex<Vec<WorkerRuntimeConfig>>,
+        executed_inputs: Mutex<Vec<TaskInput>>,
     }
 
     #[async_trait]
@@ -560,8 +571,9 @@ mod tests {
         async fn execute(
             &self,
             _id: &InstanceId,
-            _input: TaskInput,
+            input: TaskInput,
         ) -> Result<TaskOutput, RuntimeError> {
+            self.executed_inputs.lock().unwrap().push(input);
             Ok(TaskOutput {
                 result: serde_json::Value::String("ok".to_string()),
                 logs: Vec::new(),
@@ -921,6 +933,39 @@ mod tests {
         assert_eq!(executions.len(), 1);
         assert_eq!(executions[0].id, parent_execution.id);
     }
+
+    #[test]
+    fn extract_context_overrides_rejects_reserved_keys() {
+        let err = StandardExecutionService::extract_context_overrides(&serde_json::json!({
+            "context_overrides": {
+                "input": "nope"
+            }
+        }))
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Context override key 'input' is reserved"));
+    }
+
+    #[test]
+    fn extract_context_overrides_accepts_object_values() {
+        let overrides = StandardExecutionService::extract_context_overrides(&serde_json::json!({
+            "context_overrides": {
+                "repo": "aegis",
+                "metadata": {
+                    "owner": "100monkeys"
+                }
+            }
+        }))
+        .unwrap();
+
+        assert_eq!(overrides.get("repo"), Some(&serde_json::json!("aegis")));
+        assert_eq!(
+            overrides.get("metadata"),
+            Some(&serde_json::json!({ "owner": "100monkeys" }))
+        );
+    }
 }
 
 struct ExecutionMonitor {
@@ -1098,13 +1143,13 @@ impl StandardExecutionService {
             // Object - check for special keys in priority order
             serde_json::Value::Object(map) => {
                 // Priority 1: workflow_input (from WorkflowEngine)
-                if let Some(serde_json::Value::String(s)) = map.get("workflow_input") {
-                    return Ok(s.clone());
+                if let Some(value) = map.get("workflow_input") {
+                    return Self::stringify_user_input_value(value);
                 }
 
                 // Priority 2: input (from CLI/direct calls)
-                if let Some(serde_json::Value::String(s)) = map.get("input") {
-                    return Ok(s.clone());
+                if let Some(value) = map.get("input") {
+                    return Self::stringify_user_input_value(value);
                 }
 
                 // Fallback: serialize the whole object as JSON string
@@ -1119,6 +1164,54 @@ impl StandardExecutionService {
 
             // Other types: serialize as string representation
             _ => Ok(payload.to_string()),
+        }
+    }
+
+    fn stringify_user_input_value(value: &serde_json::Value) -> Result<String> {
+        match value {
+            serde_json::Value::String(s) => Ok(s.clone()),
+            serde_json::Value::Null => Err(ExecutionError::InvalidExecutionInput(
+                "Input value cannot be null".to_string(),
+            )
+            .into()),
+            _ => Ok(serde_json::to_string_pretty(value)?),
+        }
+    }
+
+    fn validate_context_override_keys(map: &JsonMap<String, JsonValue>) -> Result<()> {
+        if let Some(key) = map.keys().find(|key| {
+            Self::RESERVED_CONTEXT_OVERRIDE_KEYS
+                .iter()
+                .any(|reserved| reserved == key)
+        }) {
+            return Err(ExecutionError::InvalidExecutionInput(format!(
+                "Context override key '{key}' is reserved and cannot be overridden"
+            ))
+            .into());
+        }
+
+        Ok(())
+    }
+
+    fn extract_context_overrides(
+        payload: &serde_json::Value,
+    ) -> Result<JsonMap<String, JsonValue>> {
+        let serde_json::Value::Object(map) = payload else {
+            return Ok(JsonMap::new());
+        };
+
+        let overrides = map.get("context_overrides").cloned();
+
+        match overrides {
+            None | Some(JsonValue::Null) => Ok(JsonMap::new()),
+            Some(JsonValue::Object(map)) => {
+                Self::validate_context_override_keys(&map)?;
+                Ok(map)
+            }
+            Some(_) => Err(ExecutionError::InvalidExecutionInput(
+                "Context overrides must be a JSON object".to_string(),
+            )
+            .into()),
         }
     }
 
@@ -1160,11 +1253,15 @@ impl StandardExecutionService {
         // Extract user input from payload
         let user_input = Self::extract_user_input(&input.payload)?;
 
+        let context_overrides = Self::extract_context_overrides(&input.payload)?;
+
         // Build prompt context
-        let context = PromptContext::new()
+        let mut context = PromptContext::new()
             .instruction(agent_instruction)
             .input(user_input)
             .iteration_number(1);
+
+        context.extras = context_overrides.clone().into_iter().collect();
 
         // Render template
         let template_engine = PromptTemplateEngine::new();
@@ -1174,6 +1271,13 @@ impl StandardExecutionService {
 
         // Set the rendered prompt as intent (overwriting any pre-existing value)
         input.intent = Some(rendered_prompt);
+
+        if let serde_json::Value::Object(payload) = &mut input.payload {
+            payload.insert(
+                "context_overrides".to_string(),
+                JsonValue::Object(context_overrides),
+            );
+        }
 
         Ok(input)
     }

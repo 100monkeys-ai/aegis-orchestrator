@@ -61,6 +61,10 @@ pub enum WorkflowCommand {
         #[arg(long = "param", short = 'p', value_name = "KEY=VALUE")]
         params: Vec<String>,
 
+        /// Blackboard override dictionary (JSON/YAML string or @file)
+        #[arg(long, value_name = "DICT")]
+        blackboard: Option<String>,
+
         /// Follow execution logs
         #[arg(long, short = 'f')]
         follow: bool,
@@ -167,8 +171,9 @@ pub async fn handle_command(
             name,
             input,
             params,
+            blackboard,
             follow,
-        } => run_workflow(name, input, params, follow, host, port).await,
+        } => run_workflow(name, input, params, blackboard, follow, host, port).await,
         WorkflowCommand::List { long, labels } => list_workflows(long, labels, host, port).await,
         WorkflowCommand::Describe { name, output } => {
             describe_workflow(name, output, host, port).await
@@ -304,6 +309,7 @@ async fn run_workflow(
     name: String,
     input_json: Option<String>,
     params: Vec<String>,
+    blackboard: Option<String>,
     follow: bool,
     host: &str,
     port: u16,
@@ -327,10 +333,11 @@ async fn run_workflow(
 
     // Parse JSON input if provided
     if let Some(json) = input_json {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json).context("Invalid JSON input")?;
+        let parsed = parse_json_or_yaml_input(&json).await?;
         if let Some(obj) = parsed.as_object() {
             input_params.extend(obj.clone());
+        } else {
+            anyhow::bail!("Workflow input must be a JSON/YAML object");
         }
     }
 
@@ -361,8 +368,9 @@ async fn run_workflow(
 
     // Start execution via daemon API
     let client = DaemonClient::new(host, port)?;
+    let blackboard = parse_optional_object_input(blackboard, "workflow blackboard").await?;
     let execution_id = client
-        .run_workflow(&name, serde_json::Value::Object(input_params))
+        .run_workflow(&name, serde_json::Value::Object(input_params), blackboard)
         .await
         .context("Failed to start workflow execution")?;
 
@@ -382,6 +390,79 @@ async fn run_workflow(
     }
 
     Ok(())
+}
+
+async fn parse_json_or_yaml_input(raw: &str) -> Result<serde_json::Value> {
+    if let Some(path) = raw.strip_prefix('@') {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("Failed to read input file: {path}"))?;
+        parse_json_or_yaml(&content)
+    } else {
+        parse_json_or_yaml(raw)
+    }
+}
+
+async fn parse_optional_object_input(
+    raw: Option<String>,
+    label: &str,
+) -> Result<Option<serde_json::Value>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+
+    let parsed = if let Some(path) = raw.strip_prefix('@') {
+        let content = tokio::fs::read_to_string(path)
+            .await
+            .with_context(|| format!("Failed to read {label} file: {path}"))?;
+        parse_json_or_yaml(&content)?
+    } else {
+        parse_json_or_yaml(&raw)?
+    };
+
+    if !parsed.is_object() {
+        anyhow::bail!("{label} must be a JSON/YAML object");
+    }
+
+    Ok(Some(parsed))
+}
+
+fn parse_json_or_yaml(input: &str) -> Result<serde_json::Value> {
+    serde_json::from_str(input)
+        .or_else(|_| serde_yaml::from_str(input))
+        .context("Invalid JSON or YAML")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_json_or_yaml_input_supports_yaml_files() {
+        let path =
+            std::env::temp_dir().join(format!("aegis-workflow-input-{}.yaml", Uuid::new_v4()));
+        tokio::fs::write(&path, "branch: main\nretries: 2\n")
+            .await
+            .unwrap();
+
+        let parsed = parse_json_or_yaml_input(&format!("@{}", path.display()))
+            .await
+            .unwrap();
+        assert_eq!(parsed["branch"], serde_json::json!("main"));
+        assert_eq!(parsed["retries"], serde_json::json!(2));
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    async fn parse_optional_object_input_rejects_scalar_values() {
+        let err = parse_optional_object_input(Some("hello".to_string()), "workflow blackboard")
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("workflow blackboard must be a JSON/YAML object"));
+    }
 }
 
 async fn generate_workflow(
@@ -433,6 +514,7 @@ async fn generate_workflow(
             serde_json::json!({
                 "input": input
             }),
+            None,
         )
         .await
         .context("Failed to start workflow generation execution")?;

@@ -53,34 +53,12 @@ HTTP/gRPC server built with Axum for:
 
 ### CLI (`cli/`)
 
-Command-line tool for local development and agent management:
+Command-line tool for local development and agent management. The canonical command reference lives in [the docs site](https://docs.100monkeys.ai/docs/reference/cli).
 
-```bash
-# Daemon management
-aegis daemon start                    # Start daemon
-aegis daemon stop                     # Stop daemon
-aegis daemon status                   # Check status
+Implemented top-level commands:
+`daemon`, `task`, `node`, `config`, `agent`, `workflow`, `update`, `init`, `down`, `up`, `restart`, `status`, `uninstall`.
 
-# Agent management
-aegis agent deploy agent.yaml         # Deploy agent
-aegis agent list                      # List agents
-aegis agent logs <agent-name>         # Stream agent logs
-aegis agent remove <agent-id>         # Remove agent
-
-# Task execution
-aegis task execute <agent-name>       # Execute task
-aegis task list                       # List executions
-aegis task logs <execution-id>        # View execution logs
-aegis task cancel <execution-id>      # Cancel execution
-
-# Cluster management
-aegis node init                       # Initialize node keypair
-aegis node join <endpoint>            # Join a cluster
-aegis node leave                      # Leave the cluster
-aegis node peers                      # List cluster peers
-```
-
-See [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) for complete documentation.
+Use the docs reference for the current syntax, flags, and command behavior.
 
 ### Edge Node (`edge-node/`)
 

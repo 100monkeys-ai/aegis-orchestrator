@@ -388,6 +388,7 @@ spec:
             _workflow_name: &str,
             _execution_id: crate::domain::execution::ExecutionId,
             _input: std::collections::HashMap<String, serde_json::Value>,
+            _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }
@@ -406,6 +407,7 @@ spec:
             _workflow_name: &str,
             _execution_id: crate::domain::execution::ExecutionId,
             _input: std::collections::HashMap<String, serde_json::Value>,
+            _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }

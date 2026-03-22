@@ -104,6 +104,16 @@ pub struct StandardStartWorkflowExecutionUseCase {
 }
 
 impl StandardStartWorkflowExecutionUseCase {
+    const RESERVED_BLACKBOARD_KEYS: [&'static str; 7] = [
+        "instruction",
+        "input",
+        "iteration_number",
+        "previous_error",
+        "agentskills",
+        "context",
+        "workflow",
+    ];
+
     pub fn new(
         workflow_repository: Arc<dyn WorkflowRepository>,
         execution_repository: Arc<dyn WorkflowExecutionRepository>,
@@ -117,6 +127,28 @@ impl StandardStartWorkflowExecutionUseCase {
             event_bus,
         }
     }
+
+    fn normalize_blackboard(
+        blackboard: Option<serde_json::Value>,
+    ) -> Result<Option<HashMap<String, serde_json::Value>>> {
+        match blackboard {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::Object(map)) => {
+                if let Some(key) = map.keys().find(|key| {
+                    Self::RESERVED_BLACKBOARD_KEYS
+                        .iter()
+                        .any(|reserved| reserved == key)
+                }) {
+                    anyhow::bail!("Workflow blackboard overrides contain reserved key '{key}'");
+                }
+
+                Ok(Some(map.into_iter().collect()))
+            }
+            Some(_) => Err(anyhow::anyhow!(
+                "Workflow blackboard overrides must be a JSON/YAML object"
+            )),
+        }
+    }
 }
 
 #[async_trait]
@@ -126,6 +158,8 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         tenant_id: &TenantId,
         request: StartWorkflowExecutionRequest,
     ) -> Result<StartedWorkflowExecution> {
+        let normalized_blackboard = Self::normalize_blackboard(request.blackboard.clone())?;
+
         // Step 1: Load workflow from repository
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
             let id = WorkflowId::from_uuid(uuid);
@@ -146,13 +180,9 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             WorkflowExecution::new(&workflow, execution_id, request.input.clone());
 
         // Step 3: Merge initial blackboard if provided
-        if let Some(blackboard_json) = request.blackboard {
-            if let Ok(blackboard_map) =
-                serde_json::from_value::<HashMap<String, serde_json::Value>>(blackboard_json)
-            {
-                for (key, value) in blackboard_map {
-                    workflow_execution.blackboard.set(key, value);
-                }
+        if let Some(blackboard_map) = normalized_blackboard.clone() {
+            for (key, value) in blackboard_map {
+                workflow_execution.blackboard.set(key, value);
             }
         }
 
@@ -197,6 +227,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                         map
                     }
                 },
+                normalized_blackboard,
             )
             .await
             .context("Failed to start workflow execution in Temporal")?;
@@ -264,6 +295,7 @@ mod tests {
         workflow_id: String,
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
+        blackboard: Option<HashMap<String, serde_json::Value>>,
     }
 
     struct RecordingWorkflowEngine {
@@ -298,11 +330,13 @@ mod tests {
             workflow_id: &str,
             execution_id: ExecutionId,
             input: HashMap<String, serde_json::Value>,
+            blackboard: Option<HashMap<String, serde_json::Value>>,
         ) -> Result<String> {
             self.calls.lock().unwrap().push(StartCall {
                 workflow_id: workflow_id.to_string(),
                 execution_id,
                 input,
+                blackboard,
             });
             Ok(self.run_id.clone())
         }
@@ -493,6 +527,13 @@ mod tests {
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].workflow_id, workflow.id.to_string());
         assert_eq!(calls[0].input.get("input"), Some(&json!("run-ci")));
+        assert_eq!(
+            calls[0]
+                .blackboard
+                .as_ref()
+                .and_then(|blackboard| blackboard.get("validation_threshold")),
+            Some(&json!(0.85))
+        );
         assert_eq!(calls[0].execution_id.to_string(), result.execution_id);
 
         let execution_id = ExecutionId::from_string(&result.execution_id).unwrap();
@@ -555,6 +596,64 @@ mod tests {
         let active = execution_repo.find_active().await.unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].workflow_id, workflow.id);
+    }
+
+    #[tokio::test]
+    async fn start_execution_rejects_non_object_blackboard() {
+        let workflow = build_test_workflow("invalid-blackboard");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-invalid"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({ "target": "release" }),
+                blackboard: Some(json!(["not", "an", "object"])),
+                tenant_id: Some(TenantId::local_default()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("Workflow blackboard overrides must be a JSON/YAML object"));
+    }
+
+    #[tokio::test]
+    async fn start_execution_rejects_reserved_blackboard_keys() {
+        let workflow = build_test_workflow("reserved-blackboard");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-reserved"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({ "target": "release" }),
+                blackboard: Some(json!({ "input": "reserved" })),
+                tenant_id: Some(TenantId::local_default()),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(err.to_string().contains("reserved key 'input'"));
     }
 
     #[tokio::test]
