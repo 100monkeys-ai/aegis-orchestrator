@@ -114,7 +114,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         // Generate Temporal definition
         let temporal_def =
             crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
-                workflow,
+                workflow, tenant_id,
             )
             .map_err(|e| {
                 RepositoryError::Serialization(format!("Failed to map temporal definition: {e}"))

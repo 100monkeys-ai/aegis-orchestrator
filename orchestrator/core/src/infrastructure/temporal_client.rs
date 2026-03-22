@@ -27,7 +27,7 @@
 //! Input structure:
 //! ```json
 //! {
-//!   "workflow_name": "user-query-pipeline",
+//!   "workflow_id": "550e8400-e29b-41d4-a716-446655440000",
 //!   "input": { "query": "..." }
 //! }
 //! ```
@@ -122,19 +122,19 @@ impl TemporalClient {
     /// Start a workflow execution using the Generic Interpreter pattern
     pub async fn start_workflow(
         &self,
-        workflow_name: &str,
+        workflow_id: &str,
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
     ) -> Result<String> {
-        let workflow_id = execution_id.0.to_string();
+        let execution_workflow_id = execution_id.0.to_string();
 
         // Generic workflow type that the worker registers
         let workflow_type_name = "aegis_workflow";
 
         // Construct input payload matching GenericWorkflowInput interface in TS
-        // interface GenericWorkflowInput { workflow_name: string; input: Record<string, any>; }
+        // interface GenericWorkflowInput { workflow_id: string; input: Record<string, any>; }
         let input_obj = serde_json::json!({
-            "workflow_name": workflow_name,
+            "workflow_id": workflow_id,
             "input": input
         });
 
@@ -164,7 +164,7 @@ impl TemporalClient {
 
         let request = StartWorkflowExecutionRequest {
             namespace: self.namespace.clone(),
-            workflow_id: workflow_id.clone(),
+            workflow_id: execution_workflow_id.clone(),
             workflow_type: Some(WorkflowType {
                 name: workflow_type_name.to_string(),
             }),
@@ -324,10 +324,10 @@ impl WorkflowEnginePort for TemporalClient {
 
     async fn start_workflow(
         &self,
-        workflow_name: &str,
+        workflow_id: &str,
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
     ) -> Result<String> {
-        TemporalClient::start_workflow(self, workflow_name, execution_id, input).await
+        TemporalClient::start_workflow(self, workflow_id, execution_id, input).await
     }
 }

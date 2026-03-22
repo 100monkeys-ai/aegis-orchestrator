@@ -25,7 +25,7 @@ pub trait WorkflowEnginePort: Send + Sync {
 
     async fn start_workflow(
         &self,
-        workflow_name: &str,
+        workflow_id: &str,
         execution_id: ExecutionId,
         input: HashMap<String, Value>,
     ) -> anyhow::Result<String>;

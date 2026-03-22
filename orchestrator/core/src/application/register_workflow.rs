@@ -38,6 +38,7 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::application::ports::WorkflowEnginePort;
+use crate::application::temporal_mapper::DEFAULT_WORKFLOW_VERSION;
 use crate::domain::repository::WorkflowRepository;
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
@@ -140,7 +141,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .metadata
             .version
             .clone()
-            .unwrap_or_else(|| "0.1.0".to_string());
+            .unwrap_or_else(|| DEFAULT_WORKFLOW_VERSION.to_string());
 
         // Step 1b: Check for existing version if force=false
         if !force {
@@ -160,7 +161,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         // Step 2: Map to Temporal definition via anti-corruption layer
         let mut temporal_definition =
             crate::application::temporal_mapper::TemporalWorkflowMapper::to_temporal_definition(
-                &workflow,
+                &workflow, tenant_id,
             )
             .context("Failed to map workflow to Temporal definition")?;
 
@@ -499,6 +500,8 @@ spec:
         let calls = engine.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "registration-test-workflow");
+        assert_eq!(calls[0].tenant_id, TenantId::local_default().to_string());
+        assert_eq!(calls[0].version, "1.2.3");
 
         let persisted = repo
             .find_by_name("registration-test-workflow")
@@ -516,6 +519,32 @@ spec:
             }
             other => panic!("unexpected event type: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn register_workflow_for_tenant_uses_explicit_tenant_in_temporal_payload() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let event_bus = Arc::new(EventBus::new(8));
+        let tenant_id = TenantId::from_string("tenant-one").unwrap();
+
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            event_bus,
+            test_agent_service(),
+        );
+
+        service
+            .register_workflow_for_tenant(&tenant_id, VALID_WORKFLOW_YAML, false)
+            .await
+            .unwrap();
+
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tenant_id, tenant_id.to_string());
+        assert_eq!(calls[0].version, "1.2.3");
+        assert_eq!(calls[0].workflow_id.len(), 36);
     }
 
     #[tokio::test]
@@ -716,5 +745,43 @@ spec:
             err.to_string().contains("nonexistent-agent"),
             "error should mention the unknown agent name, got: {err}"
         );
+    }
+
+    const WORKFLOW_YAML_NO_VERSION: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: registration-default-version-workflow
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: System
+      command: echo start
+      transitions: []
+"#;
+
+    #[tokio::test]
+    async fn register_workflow_defaults_missing_version_to_one_zero_zero() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let event_bus = Arc::new(EventBus::new(8));
+
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo,
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            event_bus,
+            test_agent_service(),
+        );
+
+        let response = service
+            .register_workflow(WORKFLOW_YAML_NO_VERSION, false)
+            .await
+            .unwrap();
+
+        assert_eq!(response.version, "1.0.0");
+        let calls = engine.calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].version, "1.0.0");
     }
 }

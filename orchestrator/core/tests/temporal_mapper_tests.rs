@@ -9,7 +9,10 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements temporal mapper tests
 
-use aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowMapper;
+use aegis_orchestrator_core::application::temporal_mapper::{
+    TemporalWorkflowMapper, DEFAULT_WORKFLOW_VERSION,
+};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::*;
 use std::collections::HashMap;
 
@@ -88,10 +91,12 @@ fn test_map_100monkeys_workflow() {
     )
     .unwrap();
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow).expect("Mapping failed");
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+        .expect("Mapping failed");
 
     // Assertions
     assert_eq!(def.name, "100monkeys-test");
+    assert_eq!(def.tenant_id, TenantId::local_default().to_string());
     assert_eq!(def.initial_state, "GENERATE");
 
     // Verify GENERATE state
@@ -112,4 +117,43 @@ fn test_map_100monkeys_workflow() {
     let execute_state = def.states.get("EXECUTE").expect("EXECUTE state missing");
     assert_eq!(execute_state.kind, "System");
     assert_eq!(execute_state.command, Some("python script.py".to_string()));
+}
+
+#[test]
+fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
+    let mut states = HashMap::new();
+    states.insert(
+        StateName::new("START").unwrap(),
+        WorkflowState {
+            kind: StateKind::System {
+                command: "echo start".to_string(),
+                env: HashMap::new(),
+                workdir: None,
+            },
+            transitions: vec![],
+            timeout: None,
+        },
+    );
+
+    let workflow = Workflow::new(
+        WorkflowMetadata {
+            name: "default-version-workflow".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        },
+        WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        },
+    )
+    .unwrap();
+
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+        .expect("Mapping failed");
+
+    assert_eq!(def.version, DEFAULT_WORKFLOW_VERSION);
 }

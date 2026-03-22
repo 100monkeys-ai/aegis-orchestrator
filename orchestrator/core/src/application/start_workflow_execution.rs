@@ -168,9 +168,11 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 .ok_or_else(|| anyhow::anyhow!("Workflow engine not connected yet"))?
         };
 
+        let workflow_id = workflow.id.to_string();
+
         let temporal_run_id = engine
             .start_workflow(
-                &workflow.metadata.name,
+                &workflow_id,
                 execution_id,
                 match &request.input {
                     serde_json::Value::Object(map) => {
@@ -201,7 +203,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
 
         Ok(StartedWorkflowExecution {
             execution_id: execution_id.0.to_string(),
-            workflow_id: request.workflow_id,
+            workflow_id,
             temporal_run_id,
             status: "running".to_string(),
             started_at: Utc::now(),
@@ -228,7 +230,7 @@ mod tests {
 
     #[derive(Debug, Clone)]
     struct StartCall {
-        workflow_name: String,
+        workflow_id: String,
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
     }
@@ -262,12 +264,12 @@ mod tests {
 
         async fn start_workflow(
             &self,
-            workflow_name: &str,
+            workflow_id: &str,
             execution_id: ExecutionId,
             input: HashMap<String, serde_json::Value>,
         ) -> Result<String> {
             self.calls.lock().unwrap().push(StartCall {
-                workflow_name: workflow_name.to_string(),
+                workflow_id: workflow_id.to_string(),
                 execution_id,
                 input,
             });
@@ -359,7 +361,7 @@ mod tests {
 
         let calls = engine.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].workflow_name, "build-and-test");
+        assert_eq!(calls[0].workflow_id, workflow.id.to_string());
         assert_eq!(calls[0].input.get("input"), Some(&json!("run-ci")));
         assert_eq!(calls[0].execution_id.to_string(), result.execution_id);
 
@@ -452,7 +454,7 @@ mod tests {
 
         let calls = engine.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].workflow_name, "uuid-resolve-workflow");
+        assert_eq!(calls[0].workflow_id, workflow.id.to_string());
         assert_eq!(calls[0].input.get("target"), Some(&json!("release")));
         assert_eq!(response.temporal_run_id, "temporal-run-xyz");
     }

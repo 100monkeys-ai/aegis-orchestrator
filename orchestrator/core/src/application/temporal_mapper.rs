@@ -27,10 +27,13 @@
 //! - **Layer:** Application Layer
 //! - **Purpose:** Implements internal responsibilities for temporal mapper
 
+use crate::domain::tenant::TenantId;
 use crate::domain::workflow::*;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+pub const DEFAULT_WORKFLOW_VERSION: &str = "1.0.0";
 
 // ============================================================================
 // Temporal Workflow Definition (Target Format)
@@ -43,6 +46,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemporalWorkflowDefinition {
     pub workflow_id: String,
+    pub tenant_id: String,
     pub name: String,
     pub version: String,
     pub initial_state: String,
@@ -195,9 +199,15 @@ impl TemporalWorkflowMapper {
     ///
     /// ```rust,ignore
     /// let workflow = Workflow::new(metadata, spec)?;
-    /// let temporal_def = TemporalWorkflowMapper::to_temporal_definition(&workflow)?;
+    /// let temporal_def = TemporalWorkflowMapper::to_temporal_definition(
+    ///     &workflow,
+    ///     &TenantId::local_default(),
+    /// )?;
     /// ```
-    pub fn to_temporal_definition(workflow: &Workflow) -> Result<TemporalWorkflowDefinition> {
+    pub fn to_temporal_definition(
+        workflow: &Workflow,
+        tenant_id: &TenantId,
+    ) -> Result<TemporalWorkflowDefinition> {
         // Map states
         let mut temporal_states = HashMap::new();
         for (state_name, state) in &workflow.spec.states {
@@ -207,12 +217,13 @@ impl TemporalWorkflowMapper {
 
         Ok(TemporalWorkflowDefinition {
             workflow_id: workflow.id.to_string(),
+            tenant_id: tenant_id.as_str().to_string(),
             name: workflow.metadata.name.clone(),
             version: workflow
                 .metadata
                 .version
                 .clone()
-                .unwrap_or_else(|| "1.0.0".to_string()),
+                .unwrap_or_else(|| DEFAULT_WORKFLOW_VERSION.to_string()),
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states: temporal_states,
@@ -855,9 +866,15 @@ mod tests {
         )
         .unwrap();
 
-        let temporal_def = TemporalWorkflowMapper::to_temporal_definition(&workflow).unwrap();
+        let temporal_def =
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+                .unwrap();
 
         assert_eq!(temporal_def.name, "test-workflow");
+        assert_eq!(
+            temporal_def.tenant_id,
+            TenantId::local_default().to_string()
+        );
         assert_eq!(temporal_def.initial_state, "START");
         assert_eq!(temporal_def.states.len(), 2);
         assert_eq!(temporal_def.states.get("START").unwrap().kind, "Agent");
@@ -905,7 +922,9 @@ mod tests {
         )
         .unwrap();
 
-        let temporal_def = TemporalWorkflowMapper::to_temporal_definition(&workflow).unwrap();
+        let temporal_def =
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+                .unwrap();
         assert_eq!(
             temporal_def
                 .states
