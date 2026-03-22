@@ -565,8 +565,6 @@ async fn smcp_attestation(
 /// SMCP tool invocation request payload (ADR-033 §3).
 #[derive(serde::Deserialize)]
 pub struct SmcpToolInvokeRequest {
-    /// Agent ID (UUID).
-    pub agent_id: String,
     /// Signed SMCP security token (JWT issued at attestation).
     pub security_token: String,
     /// Ed25519 signature over the serialized `payload`.
@@ -584,7 +582,7 @@ async fn smcp_tool_invoke(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SmcpToolInvokeRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(agent_id = %req.agent_id, "SMCP tool invocation request received");
+    tracing::info!("SMCP tool invocation request received");
 
     let tool_svc = match &state.tool_invocation_service {
         Some(svc) => svc.clone(),

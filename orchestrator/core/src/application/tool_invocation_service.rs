@@ -324,52 +324,21 @@ impl ToolInvocationService {
         &self,
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
-        // 1. Extract agent_id from the security token. Full JWT verification and
-        //    signature validation happen below via verify_and_unwrap; the claim is
-        //    only used here to locate the corresponding session record.
-        let agent_id = {
-            use base64::Engine;
-            let token = envelope.security_token();
-            let parts: Vec<&str> = token.split('.').collect();
-            if parts.len() != 3 {
-                return Err(SmcpSessionError::MalformedPayload(
-                    "Invalid security token format".to_string(),
-                ));
-            }
-            let payload_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(parts[1])
-                .map_err(|_| {
-                    SmcpSessionError::MalformedPayload("Invalid token payload base64".to_string())
-                })?;
-            let claims: serde_json::Value =
-                serde_json::from_slice(&payload_bytes).map_err(|_| {
-                    SmcpSessionError::MalformedPayload("Invalid token payload JSON".to_string())
-                })?;
-            let agent_id_str =
-                claims
-                    .get("agent_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        SmcpSessionError::MalformedPayload(
-                            "Token missing agent_id claim".to_string(),
-                        )
-                    })?;
-            AgentId::from_string(agent_id_str).map_err(|e| {
-                SmcpSessionError::MalformedPayload(format!("Invalid agent_id in token: {e}"))
-            })?
-        };
-
-        // 2. Get active session for agent
+        // 1. Look up the active session by the opaque security_token string.
+        //    This avoids relying on unverified JWT payload content to route the request;
+        //    the agent_id and other claims are read from the already-loaded session record.
         let mut session = self
             .smcp_session_repo
-            .find_active_by_agent(&agent_id)
+            .find_active_by_security_token(envelope.security_token())
             .await
             .map_err(|_| {
                 SmcpSessionError::MalformedPayload("session repository lookup failed".to_string())
-            })? // generic fallback error
+            })?
             .ok_or(SmcpSessionError::SessionInactive(
                 crate::domain::smcp_session::SessionStatus::Expired,
             ))?;
+
+        let agent_id = session.agent_id;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
@@ -3770,7 +3739,8 @@ spec:
             },
         };
 
-        let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
+        let session_token = make_fake_token(agent_id);
+        let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
         let _ = repo.save(session).await;
 
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
@@ -4183,7 +4153,8 @@ spec:
             },
         };
 
-        let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
+        let session_token = make_fake_token(agent_id);
+        let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
         let _ = repo.save(session).await;
 
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =

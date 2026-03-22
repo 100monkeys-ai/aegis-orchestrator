@@ -604,8 +604,8 @@ impl AegisRuntime for AegisRuntimeService {
         })?;
 
         // Construct SmcpEnvelope. The ToolInvocationService is responsible for
-        // validating the security_token and extracting any required claims
-        // (such as agent_id) from it in a verified manner.
+        // validating the security_token and handling extraction of any required
+        // claims (such as agent_id) according to its own verification logic.
         let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
             protocol: None,
             security_token: req.security_token,
