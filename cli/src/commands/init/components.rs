@@ -45,6 +45,10 @@ pub enum LlmChoice {
     OpenAI,
     /// Anthropic API
     Anthropic,
+    /// Gemini API (Google)
+    Gemini,
+    /// vLLM, LM Studio, or other OpenAI-compatible endpoints
+    OpenAICompatible,
 }
 
 impl SelectedComponents {
@@ -148,9 +152,14 @@ impl ComponentSelector {
             println!();
             println!(
                 "{}",
-                "Ollama not selected — choose a cloud LLM provider:".bold()
+                "Ollama not selected — choose a primary LLM provider:".bold()
             );
-            let providers = vec!["OpenAI (GPT-4o, etc.)", "Anthropic (Claude 3.x)"];
+            let providers = vec![
+                "OpenAI (GPT-4o, etc.)",
+                "Anthropic (Claude 3.x)",
+                "Gemini (Google)",
+                "vLLM / LM Studio (OpenAI-compatible)",
+            ];
             let idx = dialoguer::Select::new()
                 .with_prompt("LLM provider")
                 .items(&providers)
@@ -158,7 +167,9 @@ impl ComponentSelector {
                 .interact()?;
             match idx {
                 0 => LlmChoice::OpenAI,
-                _ => LlmChoice::Anthropic,
+                1 => LlmChoice::Anthropic,
+                2 => LlmChoice::Gemini,
+                _ => LlmChoice::OpenAICompatible,
             }
         };
 
@@ -197,6 +208,8 @@ impl ComponentSelector {
                 LlmChoice::Ollama => "  ✓ Ollama (local)",
                 LlmChoice::OpenAI => "  ✓ OpenAI",
                 LlmChoice::Anthropic => "  ✓ Anthropic",
+                LlmChoice::Gemini => "  ✓ Gemini",
+                LlmChoice::OpenAICompatible => "  ✓ vLLM / OpenAI-compatible",
             },
         ];
 

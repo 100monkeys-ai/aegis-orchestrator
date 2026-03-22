@@ -34,6 +34,12 @@ pub struct NodeConfig {
     pub api_key: Option<String>,
     /// The working directory where stack files will be written
     pub working_dir: PathBuf,
+    /// Gemini model alias if Gemini is the primary provider
+    pub gemini_model: Option<String>,
+    /// Endpoint if an OpenAI-compatible provider is selected
+    pub openai_compatible_endpoint: Option<String>,
+    /// Model alias if an OpenAI-compatible provider is selected
+    pub openai_compatible_model: Option<String>,
     /// Extended init settings collected via advanced walkthrough
     pub advanced: AdvancedConfig,
 }
@@ -144,6 +150,10 @@ impl ConfigWizard {
             String::new()
         };
 
+        let mut gemini_model = None;
+        let mut openai_compatible_endpoint = None;
+        let mut openai_compatible_model = None;
+
         let api_key: Option<String> = match &components.llm {
             LlmChoice::Ollama => None,
             LlmChoice::OpenAI => {
@@ -174,6 +184,58 @@ impl ConfigWizard {
                     Some(key)
                 }
             }
+            LlmChoice::Gemini => {
+                if self.yes {
+                    println!(
+                        "  {} No Gemini API key provided in --yes mode. Set GEMINI_API_KEY in .env.",
+                        "⚠".yellow()
+                    );
+                    gemini_model = Some("gemini-2.5-flash".to_string());
+                    None
+                } else {
+                    let key: String = Password::new().with_prompt("Gemini API key").interact()?;
+                    let model: String = Input::new()
+                        .with_prompt("Gemini model")
+                        .default("gemini-2.5-flash".to_string())
+                        .interact_text()?;
+                    gemini_model = Some(model);
+                    Some(key)
+                }
+            }
+            LlmChoice::OpenAICompatible => {
+                if self.yes {
+                    println!(
+                        "  {} No endpoint/key provided for OpenAI-compatible provider in --yes mode.",
+                        "⚠".yellow()
+                    );
+                    openai_compatible_endpoint =
+                        Some("http://host.docker.internal:1234/v1".to_string());
+                    openai_compatible_model = Some("google/gemma-3-4b".to_string());
+                    None
+                } else {
+                    let endpoint: String = Input::new()
+                        .with_prompt("OpenAI-compatible Endpoint URL")
+                        .default("http://host.docker.internal:1234/v1".to_string())
+                        .interact_text()?;
+                    let model: String = Input::new()
+                        .with_prompt("Model Name")
+                        .default("google/gemma-3-4b".to_string())
+                        .interact_text()?;
+                    let key: String = Password::new()
+                        .with_prompt("API key (optional, press Enter to skip)")
+                        .allow_empty_password(true)
+                        .interact()?;
+
+                    openai_compatible_endpoint = Some(endpoint);
+                    openai_compatible_model = Some(model);
+
+                    if key.is_empty() {
+                        None
+                    } else {
+                        Some(key)
+                    }
+                }
+            }
         };
 
         let mut advanced = self.collect_advanced_config(components)?;
@@ -186,6 +248,9 @@ impl ConfigWizard {
             ollama_model,
             api_key,
             working_dir: working_dir.clone(),
+            gemini_model,
+            openai_compatible_endpoint,
+            openai_compatible_model,
             advanced,
         };
 
@@ -727,6 +792,69 @@ impl ConfigWizard {
                 .to_string(),
                 "anthropic",
             ),
+            LlmChoice::Gemini => (
+                format!(
+                    r#"    - name: "gemini"
+      type: "gemini"
+      endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
+      enabled: true
+      api_key: "env:GEMINI_API_KEY"
+      models:
+        - alias: "default"
+          model: "{model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+        - alias: "smart"
+          model: "{model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+        - alias: "judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 1048576
+          cost_per_1k_tokens: 0.0
+"#,
+                    model = config.gemini_model.as_deref().unwrap_or("gemini-2.5-flash")
+                ),
+                "gemini",
+            ),
+            LlmChoice::OpenAICompatible => (
+                format!(
+                    r#"    - name: "openai-compatible"
+      type: "openai-compatible"
+      endpoint: "{endpoint}"
+      enabled: true
+      api_key: "env:OPENAI_COMPATIBLE_API_KEY"
+      models:
+        - alias: "default"
+          model: "{model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+        - alias: "smart"
+          model: "{model}"
+          capabilities: ["code", "reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+        - alias: "judge"
+          model: "{model}"
+          capabilities: ["reasoning"]
+          context_window: 8192
+          cost_per_1k_tokens: 0.0
+"#,
+                    endpoint = config
+                        .openai_compatible_endpoint
+                        .as_deref()
+                        .unwrap_or("http://host.docker.internal:1234/v1"),
+                    model = config
+                        .openai_compatible_model
+                        .as_deref()
+                        .unwrap_or("google/gemma-3-4b")
+                ),
+                "openai-compatible",
+            ),
         };
         let extra_lmstudio_section = if config.advanced.enable_lmstudio {
             format!(
@@ -1222,6 +1350,14 @@ spec:
             LlmChoice::Anthropic => format!(
                 "ANTHROPIC_API_KEY={}",
                 config.api_key.as_deref().unwrap_or("sk-ant-...")
+            ),
+            LlmChoice::Gemini => format!(
+                "GEMINI_API_KEY={}",
+                config.api_key.as_deref().unwrap_or("AIza...")
+            ),
+            LlmChoice::OpenAICompatible => format!(
+                "OPENAI_COMPATIBLE_API_KEY={}",
+                config.api_key.as_deref().unwrap_or("")
             ),
         };
         let anthropic_key_line = if config.advanced.enable_anthropic_extra
