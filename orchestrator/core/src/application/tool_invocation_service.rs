@@ -331,8 +331,11 @@ impl ToolInvocationService {
             .smcp_session_repo
             .find_active_by_security_token(envelope.security_token())
             .await
-            .map_err(|_| {
-                SmcpSessionError::MalformedPayload("session repository lookup failed".to_string())
+            .map_err(|e| {
+                SmcpSessionError::InternalError(format!(
+                    "session repository lookup failed: {}",
+                    e
+                ))
             })?
             .ok_or(SmcpSessionError::SessionInactive(
                 crate::domain::smcp_session::SessionStatus::Expired,
