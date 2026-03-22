@@ -38,6 +38,8 @@ spec:
         deployed agent before scoring.
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
+      - A deployment call without a prior `aegis.schema.get` and `aegis.schema.validate` in the same run
+        is a hard process failure, even if the manifest itself looks valid.
       - If `aegis.schema.validate` was NOT called before `aegis.agent.create` or `aegis.agent.update`, reduce the `correctness`
         score by at least 0.2 and note "aegis.schema.validate was not called before agent deployment".
       - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at

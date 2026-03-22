@@ -306,6 +306,44 @@ mod tests {
     }
 
     #[test]
+    fn agent_creator_template_requires_full_sequence_before_deploying() {
+        assert!(
+            AGENT_GENERATOR_AGENT_TEMPLATE.contains("HARD PRECONDITION"),
+            "agent creator template should make the required sequence a hard precondition"
+        );
+        assert!(
+            AGENT_GENERATOR_AGENT_TEMPLATE.contains(
+                "Do not call `aegis.agent.create` or `aegis.agent.update` from a draft manifest"
+            ),
+            "agent creator template should forbid deployment from unvalidated drafts"
+        );
+        assert!(
+            AGENT_GENERATOR_AGENT_TEMPLATE
+                .contains("Skipping, reordering, or collapsing steps 1–4 is a policy violation"),
+            "agent creator template should reject shortcutting the required workflow"
+        );
+    }
+
+    #[test]
+    fn workflow_creator_template_requires_full_sequence_before_deploying() {
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE.contains("HARD PRECONDITION"),
+            "workflow creator template should make the required sequence a hard precondition"
+        );
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE.contains(
+                "Do not call `aegis.workflow.create` or `aegis.workflow.update` from a draft manifest"
+            ),
+            "workflow creator template should forbid deployment from unvalidated drafts"
+        );
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE
+                .contains("Skipping, reordering, or collapsing steps 1–4 is a policy violation"),
+            "workflow creator template should reject shortcutting the required workflow"
+        );
+    }
+
+    #[test]
     fn workflow_generator_planner_template_includes_judge_dependencies() {
         assert!(
             WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE.contains("required_judge_agents"),
@@ -339,6 +377,22 @@ mod tests {
             WORKFLOW_GENERATOR_JUDGE_TEMPLATE
                 .contains("If tool call history is missing, treat that as insufficient evidence"),
             "judge template should not claim validation failure without audit evidence"
+        );
+        assert!(
+            WORKFLOW_GENERATOR_JUDGE_TEMPLATE.contains(
+                "A deployment call without a prior `aegis.schema.get` and `aegis.schema.validate` in the same run"
+            ),
+            "judge template should treat a missing schema sequence as a hard process failure"
+        );
+    }
+
+    #[test]
+    fn agent_generator_judge_template_treats_missing_schema_history_as_hard_failure() {
+        assert!(
+            AGENT_GENERATOR_JUDGE_TEMPLATE.contains(
+                "A deployment call without a prior `aegis.schema.get` and `aegis.schema.validate` in the same run"
+            ),
+            "agent judge template should treat a missing schema sequence as a hard process failure"
         );
     }
 

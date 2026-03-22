@@ -265,7 +265,7 @@ impl ToolInvocationService {
         serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
     }
 
-    fn build_workflow_create_tool_audit_history(
+    fn build_tool_audit_history(
         execution_id: crate::domain::execution::ExecutionId,
         execution: Option<&Execution>,
     ) -> Value {
@@ -275,7 +275,9 @@ impl ToolInvocationService {
                 "available": false,
                 "iteration_number": null,
                 "tool_calls": [],
+                "latest_schema_get": null,
                 "latest_schema_validate": null,
+                "schema_get_evidence": null,
                 "schema_validate_evidence": null,
             });
         };
@@ -310,6 +312,12 @@ impl ToolInvocationService {
                 step.get("tool_name").and_then(|v| v.as_str()) == Some("aegis.schema.validate")
             })
             .cloned();
+        let latest_schema_get = tool_calls
+            .iter()
+            .rev()
+            .find(|step| step.get("tool_name").and_then(|v| v.as_str()) == Some("aegis.schema.get"))
+            .cloned();
+        let schema_get_evidence = latest_schema_get.clone();
         let schema_validate_evidence = latest_schema_validate.clone();
 
         serde_json::json!({
@@ -317,8 +325,43 @@ impl ToolInvocationService {
             "available": true,
             "iteration_number": current_iteration.map(|iter| iter.number),
             "tool_calls": tool_calls,
+            "latest_schema_get": latest_schema_get,
             "latest_schema_validate": latest_schema_validate,
+            "schema_get_evidence": schema_get_evidence,
             "schema_validate_evidence": schema_validate_evidence,
+        })
+    }
+
+    fn build_semantic_judge_payload(
+        execution_id: crate::domain::execution::ExecutionId,
+        execution: Option<&Execution>,
+        task: String,
+        tool_name: &str,
+        arguments: &Value,
+        available_tools: Vec<String>,
+        worker_mounts: Vec<String>,
+        criteria: &str,
+        validation_context: &str,
+    ) -> Value {
+        let semantic_input = serde_json::to_string_pretty(&serde_json::json!({
+            "tool": tool_name,
+            "arguments": arguments,
+        }))
+        .unwrap_or_default();
+        let tool_audit_history = Self::build_tool_audit_history(execution_id, execution);
+
+        serde_json::json!({
+            "task": task,
+            "proposed_tool_call": {
+                "name": tool_name,
+                "arguments": arguments,
+            },
+            "available_tools": available_tools,
+            "worker_mounts": worker_mounts,
+            "tool_audit_history": tool_audit_history,
+            "output": semantic_input,
+            "criteria": criteria,
+            "validation_context": validation_context,
         })
     }
 
@@ -599,12 +642,6 @@ impl ToolInvocationService {
                                 ))
                             })?;
 
-                        let semantic_input = serde_json::to_string_pretty(&serde_json::json!({
-                            "tool": tool_name.clone(),
-                            "arguments": args.clone()
-                        }))
-                        .unwrap_or_default();
-
                         let execution_objective = self
                             .execution_service
                             .get_execution(execution_id)
@@ -626,20 +663,24 @@ impl ToolInvocationService {
                             .map(|ctx| ctx.mount_point.to_string_lossy().to_string())
                             .collect::<Vec<String>>();
 
+                        let execution = self
+                            .execution_service
+                            .get_execution(execution_id)
+                            .await
+                            .ok();
                         let input = ExecutionInput {
                             intent: None,
-                            payload: serde_json::json!({
-                                "task": execution_objective,
-                                "proposed_tool_call": {
-                                    "name": tool_name.clone(),
-                                    "arguments": args.clone()
-                                },
-                                "available_tools": available_tools,
-                                "worker_mounts": worker_mounts,
-                                "output": semantic_input,
-                                "criteria": criteria,
-                                "validation_context": "semantic_judge_pre_execution_inner_loop"
-                            }),
+                            payload: Self::build_semantic_judge_payload(
+                                execution_id,
+                                execution.as_ref(),
+                                execution_objective,
+                                &tool_name,
+                                &args,
+                                available_tools,
+                                worker_mounts,
+                                criteria,
+                                "semantic_judge_pre_execution_inner_loop",
+                            ),
                         };
 
                         // Start the single iteration judge as child execution
@@ -3107,8 +3148,7 @@ impl ToolInvocationService {
             .get_execution(execution_id)
             .await
             .ok();
-        let tool_audit_history =
-            Self::build_workflow_create_tool_audit_history(execution_id, execution.as_ref());
+        let tool_audit_history = Self::build_tool_audit_history(execution_id, execution.as_ref());
 
         let judge_names: Vec<String> = args
             .get("judge_agents")
@@ -4057,7 +4097,7 @@ spec:
     }
 
     #[test]
-    fn build_workflow_create_tool_audit_history_includes_schema_validate_evidence() {
+    fn build_tool_audit_history_includes_schema_validate_and_get_evidence() {
         let workflow = build_test_workflow("audit-history");
         let execution_id = ExecutionId::new();
         let mut execution = Execution::new(
@@ -4097,24 +4137,115 @@ spec:
             )
             .unwrap();
 
-        let audit_history = ToolInvocationService::build_workflow_create_tool_audit_history(
-            execution_id,
-            Some(&execution),
-        );
+        let audit_history =
+            ToolInvocationService::build_tool_audit_history(execution_id, Some(&execution));
 
         assert_eq!(audit_history["execution_id"], execution_id.to_string());
         assert_eq!(audit_history["available"], true);
         assert_eq!(audit_history["iteration_number"], 1);
         assert_eq!(audit_history["tool_calls"].as_array().unwrap().len(), 2);
         assert_eq!(
+            audit_history["tool_calls"][0]["tool_name"],
+            "aegis.schema.get"
+        );
+        assert_eq!(
+            audit_history["tool_calls"][1]["tool_name"],
+            "aegis.schema.validate"
+        );
+        assert_eq!(
+            audit_history["latest_schema_get"]["tool_name"],
+            "aegis.schema.get"
+        );
+        assert_eq!(
             audit_history["latest_schema_validate"]["tool_name"],
             "aegis.schema.validate"
+        );
+        assert_eq!(
+            audit_history["schema_get_evidence"]["tool_name"],
+            "aegis.schema.get"
         );
         assert_eq!(
             audit_history["schema_validate_evidence"]["result"]["valid"],
             true
         );
         assert_eq!(workflow.metadata.name, "audit-history");
+    }
+
+    #[test]
+    fn build_semantic_judge_payload_includes_tool_audit_history() {
+        let execution_id = ExecutionId::new();
+        let mut execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("create agent".to_string()),
+                payload: serde_json::json!({}),
+            },
+            3,
+        );
+        execution.id = execution_id;
+        execution.start();
+        execution.start_iteration("authoring".to_string()).unwrap();
+        execution
+            .store_iteration_trajectory(
+                1,
+                vec![
+                    crate::domain::execution::TrajectoryStep {
+                        tool_name: "aegis.schema.get".to_string(),
+                        arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
+                        status: "completed".to_string(),
+                        result_json: Some(r#"{"ok":true}"#.to_string()),
+                        error: None,
+                    },
+                    crate::domain::execution::TrajectoryStep {
+                        tool_name: "aegis.schema.validate".to_string(),
+                        arguments_json:
+                            r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
+                                .to_string(),
+                        status: "completed".to_string(),
+                        result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                        error: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let payload = ToolInvocationService::build_semantic_judge_payload(
+            execution_id,
+            Some(&execution),
+            "Create an agent".to_string(),
+            "aegis.agent.create",
+            &serde_json::json!({
+                "manifest_yaml": "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: copy-refiner\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      refine copy\n"
+            }),
+            vec![
+                "aegis.schema.get".to_string(),
+                "aegis.schema.validate".to_string(),
+            ],
+            vec!["/workspace".to_string()],
+            "use the workflow-required sequence",
+            "semantic_judge_pre_execution_inner_loop",
+        );
+
+        assert_eq!(
+            payload["validation_context"],
+            "semantic_judge_pre_execution_inner_loop"
+        );
+        assert_eq!(payload["proposed_tool_call"]["name"], "aegis.agent.create");
+        assert_eq!(
+            payload["tool_audit_history"]["tool_calls"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
+            "aegis.schema.validate"
+        );
+        assert_eq!(
+            payload["tool_audit_history"]["schema_get_evidence"]["tool_name"],
+            "aegis.schema.get"
+        );
     }
 
     #[tokio::test]
