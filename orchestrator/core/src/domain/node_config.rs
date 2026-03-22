@@ -367,7 +367,7 @@ pub struct RuntimeConfig {
     /// - "host.docker.internal" (Docker Desktop on Mac/Windows)
     /// - "172.17.0.1" (Docker bridge gateway IP)
     /// Examples for production:
-    /// - "Physical host IP address" (Firecracker VMs, Remote Hosts)
+    /// - "192.168.1.10" (example physical host IP address for Firecracker VMs or remote hosts)
     /// Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nfs_server_host: Option<String>,
