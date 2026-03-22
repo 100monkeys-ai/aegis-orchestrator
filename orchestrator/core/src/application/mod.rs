@@ -38,6 +38,7 @@
 pub mod agent;
 pub mod attestation_service;
 pub mod cluster;
+pub mod correlated_activity_stream;
 pub mod execution;
 pub mod lifecycle;
 pub mod schema_registry;
@@ -66,6 +67,7 @@ pub use complete_workflow_execution::{
     CompleteWorkflowExecutionRequest, CompleteWorkflowExecutionUseCase, CompletedWorkflowExecution,
     StandardCompleteWorkflowExecutionUseCase,
 };
+pub use correlated_activity_stream::CorrelatedActivityStreamService;
 pub use register_workflow::{
     RegisterWorkflowUseCase, RegisteredWorkflow, StandardRegisterWorkflowUseCase,
 };

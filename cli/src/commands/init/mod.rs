@@ -213,14 +213,8 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
         "    1. Read the docs:           {}",
         "https://docs.100monkeys.ai".cyan()
     );
-    println!(
-        "    2. Explore the CLI:         {}",
-        "aegis --help".cyan()
-    );
-    println!(
-        "    3. Check stack health:      {}",
-        "aegis status".cyan()
-    );
+    println!("    2. Explore the CLI:         {}", "aegis --help".cyan());
+    println!("    3. Check stack health:      {}", "aegis status".cyan());
     println!(
         "    4. Deploy your own agent:   {}",
         "aegis agent deploy <manifest.yaml>".cyan()
@@ -229,9 +223,6 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
         "    5. Run a task:              {}",
         "aegis task execute hello-world --input \"Hello, AEGIS!\"".cyan()
     );
-    println!(
-        "    6. Stop the stack:          {}",
-        "aegis down".cyan()
-    );
+    println!("    6. Stop the stack:          {}", "aegis down".cyan());
     println!();
 }

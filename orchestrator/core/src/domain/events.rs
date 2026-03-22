@@ -38,6 +38,26 @@ use crate::domain::secrets::AccessContext;
 use crate::domain::volume::{StorageClass, VolumeId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+/// Canonical correlated activity envelope for task/agent follow surfaces.
+///
+/// This stays in the domain layer so downstream transports can serialize one
+/// stable shape without rebuilding per-surface log payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CorrelatedActivityEvent {
+    pub event_type: String,
+    pub category: String,
+    pub timestamp: DateTime<Utc>,
+    pub execution_id: Option<ExecutionId>,
+    pub agent_id: Option<AgentId>,
+    pub iteration: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    pub message: String,
+    #[serde(default)]
+    pub details: Value,
+}
 
 /// Whether a container image was retrieved from the local Docker cache or pulled
 /// fresh from a remote registry (ADR-045).

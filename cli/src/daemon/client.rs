@@ -10,9 +10,11 @@
 use anyhow::{Context, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::domain::events::CorrelatedActivityEvent;
 use aegis_orchestrator_sdk::AgentManifest;
 
 #[derive(Deserialize)]
@@ -210,25 +212,7 @@ impl DaemonClient {
             anyhow::bail!("Failed to stream logs: {error_text}");
         }
 
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Failed to read event stream chunk")?;
-            let text = String::from_utf8_lossy(&chunk);
-
-            for line in text.lines() {
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if errors_only && !is_error_event(&event) {
-                            continue;
-                        }
-                        print_event(&event, verbose);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        stream_correlated_events(response, errors_only, verbose).await
     }
 
     pub async fn stream_agent_logs(
@@ -257,26 +241,7 @@ impl DaemonClient {
             anyhow::bail!("Failed to stream agent logs: {error_text}");
         }
 
-        let mut stream = response.bytes_stream();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Failed to read event stream chunk")?;
-            let text = String::from_utf8_lossy(&chunk);
-
-            for line in text.lines() {
-                if let Some(json_str) = line.strip_prefix("data: ") {
-                    if let Ok(event) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        // Reuse the print logic? Yes.
-                        if errors_only && !is_error_event(&event) {
-                            continue;
-                        }
-                        print_event(&event, verbose);
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        stream_correlated_events(response, errors_only, verbose).await
     }
 
     pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
@@ -397,189 +362,204 @@ pub struct AgentInfo {
     pub status: String,
 }
 
-fn is_error_event(event: &serde_json::Value) -> bool {
+async fn stream_correlated_events(
+    response: reqwest::Response,
+    errors_only: bool,
+    verbose: bool,
+) -> Result<()> {
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read event stream chunk")?;
+        let text = String::from_utf8_lossy(&chunk);
+
+        for line in text.lines() {
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if let Ok(event) = serde_json::from_str::<CorrelatedActivityEvent>(json_str) {
+                    if errors_only && !is_error_event(&event) {
+                        continue;
+                    }
+                    print_event(&event, verbose);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn is_error_event(event: &CorrelatedActivityEvent) -> bool {
+    let event_type = canonical_event_type(&event.event_type);
+
     matches!(
-        event["event_type"].as_str(),
-        Some("IterationFailed") | Some("ExecutionFailed") | Some("PolicyViolation")
+        event_type.as_str(),
+        "iteration_failed"
+            | "execution_failed"
+            | "execution_timed_out"
+            | "workflow_iteration_failed"
+            | "workflow_execution_failed"
+            | "volume_mount_failed"
+            | "volume_quota_exceeded"
+            | "filesystem_policy_violation"
+            | "path_traversal_blocked"
+            | "quota_exceeded"
+            | "unauthorized_volume_access"
+            | "policy_violation"
+            | "invocation_failed"
+            | "policy_violation_blocked"
+            | "server_failed"
+            | "server_unhealthy"
+            | "container_run_failed"
+            | "image_pull_failed"
+            | "classification_failed"
+            | "stimulus_rejected"
+            | "secret_access_denied"
+            | "token_validation_failed"
+            | "jwks_cache_refresh_failed"
+            | "agent_failed"
     )
 }
 
-fn extract_iteration_error_message(event: &serde_json::Value) -> &str {
-    // Precedence:
-    // 1. event.data.error.message (when error is an object)
-    // 2. event.data.error as a string
-    // 3. event.error as a string
-    // 4. Fallback: "Unknown error"
-    if let Some(err_obj) = event
-        .get("data")
-        .and_then(|d| d.get("error"))
-        .and_then(|e| e.as_object())
+fn extract_iteration_error_message(event: &CorrelatedActivityEvent) -> String {
+    if let Some(msg) = event
+        .details
+        .get("error")
+        .and_then(|e| e.get("message"))
+        .and_then(Value::as_str)
     {
-        if let Some(msg) = err_obj.get("message").and_then(|m| m.as_str()) {
-            return msg;
-        }
+        return msg.to_string();
     }
 
     if let Some(msg) = event
-        .get("data")
-        .and_then(|d| d.get("error"))
-        .and_then(|e| e.as_str())
+        .details
+        .get("error")
+        .and_then(Value::as_str)
+        .or_else(|| event.details.get("reason").and_then(Value::as_str))
     {
-        return msg;
+        return msg.to_string();
     }
 
-    if let Some(msg) = event.get("error").and_then(|e| e.as_str()) {
-        return msg;
+    if !event.message.is_empty() {
+        return event.message.clone();
     }
 
-    "Unknown error"
+    "Unknown error".to_string()
 }
 
-fn print_event(event: &serde_json::Value, verbose: bool) {
+fn print_event(event: &CorrelatedActivityEvent, verbose: bool) {
+    println!("{}", format_event(event, verbose));
+}
+
+fn format_event(event: &CorrelatedActivityEvent, verbose: bool) -> String {
     use colored::Colorize;
 
-    let event_type = event["event_type"].as_str().unwrap_or("Unknown");
-    let timestamp = event["timestamp"].as_str().unwrap_or("");
+    let event_type = canonical_event_type(&event.event_type);
+    let timestamp = event.timestamp.to_rfc3339();
+    let header = format!("[{timestamp}]").dimmed().to_string();
+    let category = format!("[{}]", event.category).dimmed().to_string();
 
-    match event_type {
-        "ExecutionStarted" => {
-            println!(
-                "{} {}",
-                format!("[{timestamp}]").dimmed(),
-                "Execution started".bold()
-            );
-        }
-        "IterationStarted" => {
-            let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-
-            if verbose {
-                let action = event["action"].as_str().unwrap_or("");
-                println!(
-                    "{} {} {} - {}",
-                    format!("[{timestamp}]").dimmed(),
-                    "Iteration".yellow(),
-                    iteration,
-                    action
-                );
-            } else {
-                println!(
-                    "{} {} {}",
-                    format!("[{timestamp}]").dimmed(),
-                    "Iteration".yellow(),
-                    iteration
-                );
-            }
-        }
-        "IterationCompleted" => {
-            let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let output = event["data"]["output"].as_str().unwrap_or("");
-
-            if verbose {
-                println!(
-                    "{} {} {} {}\n{}",
-                    format!("[{timestamp}]").dimmed(),
-                    "Iteration".yellow(),
-                    iteration,
-                    "completed".green(),
-                    output.cyan()
-                );
-            } else {
-                println!(
-                    "{} {} {} {}",
-                    format!("[{timestamp}]").dimmed(),
-                    "Iteration".yellow(),
-                    iteration,
-                    "completed".green()
-                );
-            }
-        }
-        "IterationFailed" => {
-            let iteration = event["iteration_number"].as_u64().unwrap_or(0);
-            let error = extract_iteration_error_message(event);
-            println!(
-                "{} {} {} {} - {}",
-                format!("[{timestamp}]").dimmed(),
-                "Iteration".yellow(),
-                iteration,
-                "failed".red(),
-                error
-            );
-        }
-        "ConsoleOutput" => {
-            let stream = event["stream"].as_str().unwrap_or("stdout");
-            let content = event["data"]["output"].as_str().unwrap_or("");
+    match event_type.as_str() {
+        "console_output" => {
+            let stream = event
+                .details
+                .get("stream")
+                .and_then(Value::as_str)
+                .unwrap_or("stdout");
+            let content = event
+                .details
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or(&event.message);
             let prefix = match stream {
-                "stderr" => "[STDERR]".red(),
-                "judge" => "[JUDGE]".magenta().bold(),
-                _ => "[STDOUT]".cyan(),
+                "stderr" => "[STDERR]".red().to_string(),
+                "judge" => "[JUDGE]".magenta().bold().to_string(),
+                _ => "[STDOUT]".cyan().to_string(),
             };
-            println!("{} {}", prefix, content.trim_end());
+            format!("{prefix} {}", content.trim_end())
         }
-        "LlmInteraction" => {
-            let model = event["data"]["model"].as_str().unwrap_or("unknown");
-
-            if verbose {
-                let response = event["data"]["response"].as_str().unwrap_or("");
-                let prompt = event["data"]["prompt"].as_str().unwrap_or("");
-
-                println!(
-                    "{} {} [{}]",
-                    format!("[{timestamp}]").dimmed(),
-                    "LLM Interaction".purple().bold(),
-                    model
-                );
-                println!("{}", "PROMPT:".dimmed());
-                println!("{prompt}");
-                println!("{}", "RESPONSE:".dimmed());
-                println!("{response}");
-                println!("{}", "-".repeat(40).dimmed());
+        "llm_interaction" if verbose => {
+            let model = event
+                .details
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let prompt = event
+                .details
+                .get("prompt")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let response = event
+                .details
+                .get("response")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            format!(
+                "{header} {category} {} [{model}]\n{}\n{prompt}\n{}\n{response}\n{}",
+                "LLM Interaction".purple().bold(),
+                "PROMPT:".dimmed(),
+                "RESPONSE:".dimmed(),
+                "-".repeat(40).dimmed()
+            )
+        }
+        "llm_interaction" => {
+            let model = event
+                .details
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("{header} {category} {} [{model}]", "LLM".purple())
+        }
+        "iteration_failed" => {
+            let error = extract_iteration_error_message(event);
+            format!(
+                "{header} {category} {}",
+                format!("Iteration failed: {error}").red().bold()
+            )
+        }
+        "execution_failed" | "execution_timed_out" => {
+            format!("{header} {category} {}", event.message.red().bold())
+        }
+        "execution_completed" if !verbose => format!(
+            "{header} {category} {}",
+            "Execution completed".green().bold()
+        ),
+        _ if verbose => {
+            let base = format!("{header} {category} {}", event.message);
+            let pretty_details = format_details(&event.details);
+            if pretty_details.is_empty() {
+                base
             } else {
-                // Show model interaction indicator without response content
-                println!(
-                    "{} {} [{}]",
-                    format!("[{timestamp}]").dimmed(),
-                    "LLM".purple(),
-                    model
-                );
+                format!("{base}\n{pretty_details}")
             }
         }
-        "ExecutionCompleted" => {
-            if verbose {
-                println!(
-                    "{} {} {}",
-                    format!("[{timestamp}]").dimmed(),
-                    event_type.cyan(),
-                    serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
-                );
+        _ => format!("{header} {category} {}", event.message),
+    }
+}
+
+fn canonical_event_type(event_type: &str) -> String {
+    if event_type.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        let mut canonical = String::with_capacity(event_type.len() + 4);
+        for (index, ch) in event_type.chars().enumerate() {
+            if ch.is_ascii_uppercase() {
+                if index != 0 {
+                    canonical.push('_');
+                }
+                canonical.push(ch.to_ascii_lowercase());
             } else {
-                println!(
-                    "{} {}",
-                    format!("[{timestamp}]").dimmed(),
-                    "Execution completed".green().bold()
-                );
+                canonical.push(ch);
             }
         }
-        "ExecutionFailed" => {
-            println!(
-                "{} {} {}",
-                format!("[{timestamp}]").dimmed(),
-                "Execution failed".red().bold(),
-                event["data"]["error"]
-                    .as_str()
-                    .or(event["reason"].as_str())
-                    .unwrap_or("Unknown error")
-            );
-        }
-        _ => {
-            if event_type != "Unknown" {
-                println!(
-                    "{} {} {}",
-                    format!("[{timestamp}]").dimmed(),
-                    event_type.cyan(),
-                    serde_json::to_string_pretty(&event["data"]).unwrap_or_default()
-                );
-            }
-        }
+        canonical
+    } else {
+        event_type.to_string()
+    }
+}
+
+fn format_details(details: &Value) -> String {
+    match details {
+        Value::Null => String::new(),
+        Value::Object(map) if map.is_empty() => String::new(),
+        _ => serde_json::to_string_pretty(details).unwrap_or_default(),
     }
 }
 
@@ -819,21 +799,32 @@ impl DaemonClient {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_iteration_error_message;
-    use super::WorkflowListResponse;
-    use serde_json::json;
+    use super::{
+        extract_iteration_error_message, format_event, is_error_event, CorrelatedActivityEvent,
+        WorkflowListResponse,
+    };
+    use chrono::Utc;
+    use serde_json::{json, Value};
+    use uuid::Uuid;
 
     #[test]
     fn test_error_object_with_message_precedence() {
-        let event = json!({
-            "data": {
+        let event = CorrelatedActivityEvent {
+            event_type: "IterationFailed".to_string(),
+            category: "execution".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: Some(1),
+            stage: None,
+            message: "top-level error".to_string(),
+            details: json!({
                 "error": {
                     "message": "object message",
                     "code": "SOME_CODE"
                 }
-            },
-            "error": "top-level error"
-        });
+            }),
+        };
 
         let msg = extract_iteration_error_message(&event);
         assert_eq!(msg, "object message");
@@ -841,12 +832,19 @@ mod tests {
 
     #[test]
     fn test_error_string_in_data_precedence() {
-        let event = json!({
-            "data": {
+        let event = CorrelatedActivityEvent {
+            event_type: "IterationFailed".to_string(),
+            category: "execution".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: Some(1),
+            stage: None,
+            message: "top-level error".to_string(),
+            details: json!({
                 "error": "data error string"
-            },
-            "error": "top-level error"
-        });
+            }),
+        };
 
         let msg = extract_iteration_error_message(&event);
         assert_eq!(msg, "data error string");
@@ -854,9 +852,17 @@ mod tests {
 
     #[test]
     fn test_error_string_top_level_precedence() {
-        let event = json!({
-            "error": "top-level error"
-        });
+        let event = CorrelatedActivityEvent {
+            event_type: "IterationFailed".to_string(),
+            category: "execution".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: Some(1),
+            stage: None,
+            message: "top-level error".to_string(),
+            details: json!({}),
+        };
 
         let msg = extract_iteration_error_message(&event);
         assert_eq!(msg, "top-level error");
@@ -864,16 +870,84 @@ mod tests {
 
     #[test]
     fn test_error_fallback_unknown() {
-        let event = json!({
-            "data": {
+        let event = CorrelatedActivityEvent {
+            event_type: "IterationFailed".to_string(),
+            category: "execution".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: Some(1),
+            stage: None,
+            message: String::new(),
+            details: json!({
                 "error": {
                     "not_message": "no message field here"
                 }
-            }
-        });
+            }),
+        };
 
         let msg = extract_iteration_error_message(&event);
         assert_eq!(msg, "Unknown error");
+    }
+
+    #[test]
+    fn detects_backend_failures_as_errors() {
+        let event = CorrelatedActivityEvent {
+            event_type: "FilesystemPolicyViolation".to_string(),
+            category: "storage".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: None,
+            stage: None,
+            message: "Filesystem policy violation".to_string(),
+            details: json!({}),
+        };
+
+        assert!(is_error_event(&event));
+    }
+
+    #[test]
+    fn verbose_output_includes_structured_details() {
+        let event = CorrelatedActivityEvent {
+            event_type: "PolicyViolation".to_string(),
+            category: "mcp".to_string(),
+            timestamp: Utc::now(),
+            execution_id: None,
+            agent_id: None,
+            iteration: None,
+            stage: Some("fs.write".to_string()),
+            message: "Tool policy violation blocked: fs.write".to_string(),
+            details: json!({
+                "tool_name": "fs.write",
+                "details": "attempted to write outside workspace"
+            }),
+        };
+
+        let rendered = format_event(&event, true);
+        assert!(rendered.contains("Tool policy violation blocked: fs.write"));
+        assert!(rendered.contains("\"tool_name\": \"fs.write\""));
+    }
+
+    #[test]
+    fn parses_typed_correlated_activity_event() {
+        let payload = json!({
+            "event_type": "ContainerRunFailed",
+            "category": "container_run",
+            "timestamp": Utc::now(),
+            "execution_id": Uuid::nil(),
+            "agent_id": Value::Null,
+            "iteration": Value::Null,
+            "stage": "BUILD",
+            "message": "Container step failed: Compile",
+            "details": { "step_name": "Compile" }
+        })
+        .to_string();
+
+        let parsed: CorrelatedActivityEvent = serde_json::from_str(&payload).expect("must parse");
+        assert_eq!(parsed.event_type, "ContainerRunFailed");
+        assert_eq!(parsed.category, "container_run");
+        assert_eq!(parsed.stage.as_deref(), Some("BUILD"));
     }
 
     #[test]

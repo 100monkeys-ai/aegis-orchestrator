@@ -25,17 +25,7 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
-
-/// Extract the final output from the last iteration of an execution.
-///
-/// Returns `None` if the execution has no iterations or if the last iteration
-/// produced no output.
-fn final_output_from_execution(
-    execution: &aegis_orchestrator_core::domain::execution::Execution,
-) -> Option<String> {
-    execution.iterations().last().and_then(|i| i.output.clone())
-}
-
+use futures::StreamExt;
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -52,6 +42,7 @@ use tokio::signal;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService,
@@ -64,6 +55,7 @@ use aegis_orchestrator_core::{
             StartWorkflowExecutionUseCase,
         },
         validation_service::ValidationService,
+        CorrelatedActivityStreamService,
     },
     domain::{
         agent::AgentId,
@@ -89,8 +81,6 @@ use aegis_orchestrator_core::{
         TemporalEventListener, TemporalEventPayload,
     },
 };
-
-use super::{remove_pid_file, write_pid_file};
 
 fn default_local_host_mount_point() -> String {
     if let Ok(path) = std::env::var("AEGIS_LOCAL_HOST_MOUNT_POINT") {
@@ -1678,6 +1668,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
+        correlated_activity_stream_service: Arc::new(CorrelatedActivityStreamService::new(
+            event_bus.clone(),
+            execution_repo.clone(),
+            Some(workflow_execution_repo.clone()),
+        )),
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
         human_input_service: human_input_service.clone(),
@@ -2117,6 +2112,7 @@ fn create_router(
 struct AppState {
     agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
+    correlated_activity_stream_service: Arc<CorrelatedActivityStreamService>,
     event_bus: Arc<EventBus>,
     inner_loop_service:
         Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
@@ -2262,194 +2258,20 @@ async fn stream_events_handler(
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
     let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-
-    // 1. Subscribe FIRST to catch any events that happen while we fetch history
-    let mut receiver = state.event_bus.subscribe_execution(exec_id);
-
-    // 2. Fetch history
-    let execution_result = state
-        .execution_service
-        .get_execution_for_tenant(&tenant_id, exec_id)
-        .await;
+    let _tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let activity_service = state.correlated_activity_stream_service.clone();
 
     let stream = async_stream::stream! {
-        // 3. Replay history if execution exists
-        if let Ok(execution) = execution_result {
-            // ExecutionStarted
-            let start_event = serde_json::json!({
-                "event_type": "ExecutionStarted",
-                "timestamp": execution.started_at.to_rfc3339(),
-                "data": {}
-            });
-            yield Ok::<_, anyhow::Error>(Event::default().data(start_event.to_string()));
-
-            // Iterations
-            for iter in execution.iterations() { // Iterate over reference to avoid move
-                // IterationStarted
-                let iter_start = serde_json::json!({
-                    "event_type": "IterationStarted",
-                    "iteration_number": iter.number,
-                    "action": iter.action,
-                    "timestamp": iter.started_at.to_rfc3339(),
-                    "data": { "action": iter.action }
-                });
-                yield Ok::<_, anyhow::Error>(Event::default().data(iter_start.to_string()));
-
-                // Replay LlmInteractions
-                for interaction in &iter.llm_interactions {
-                    let event = serde_json::json!({
-                        "event_type": "LlmInteraction",
-                        "timestamp": interaction.timestamp.to_rfc3339(),
-                        "data": {
-                            "model": interaction.model,
-                            "provider": interaction.provider,
-                            "prompt": interaction.prompt,
-                            "response": interaction.response
-                        }
-                    });
-                    yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
-                }
-
-                // Completion/Failure
-                if let Some(output) = &iter.output {
-                     let iter_end = serde_json::json!({
-                        "event_type": "IterationCompleted",
-                        "iteration_number": iter.number,
-                        "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                        "data": { "output": output }
-                    });
-                     yield Ok::<_, anyhow::Error>(Event::default().data(iter_end.to_string()));
-                } else if let Some(error) = &iter.error {
-                     // Need to map IterationError to string or struct
-                     let iter_fail = serde_json::json!({
-                        "event_type": "IterationFailed",
-                        "iteration_number": iter.number,
-                        "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                        "data": { "error": error.message }
-                    });
-                     yield Ok::<_, anyhow::Error>(Event::default().data(iter_fail.to_string()));
-                }
-            }
-
-            // Execution Terminal State
-            if let Some(ended_at) = execution.ended_at {
-
-                match execution.status {
-                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
-                         // NOTE: The Execution struct does not expose an explicit `final_output` field.
-                         // By convention, we treat the last iteration's `output` (if any) as the final result.
-                         // If no such output exists, we surface `null` and keep the semantics explicit instead of
-                         // silently defaulting to an empty string.
-                        let final_output = final_output_from_execution(&execution);
-
-                        let exec_end = serde_json::json!({
-                            "event_type": "ExecutionCompleted",
-                            "total_iterations": execution.iterations().len(),
-                            "timestamp": ended_at.to_rfc3339(),
-                            "data": {
-                                "result": final_output,
-                                "final_output_source": "last_iteration_output"
-                            }
-                        });
-                        yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
-                    },
-                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Failed => {
-                        let reason = execution.error.clone().unwrap_or_else(|| "Execution failed".to_string());
-                        let exec_fail = serde_json::json!({
-                            "event_type": "ExecutionFailed",
-                            "reason": reason,
-                            "timestamp": ended_at.to_rfc3339(),
-                            "data": { "error": reason }
-                        });
-                        yield Ok::<_, anyhow::Error>(Event::default().data(exec_fail.to_string()));
-                    },
-                    aegis_orchestrator_core::domain::execution::ExecutionStatus::Cancelled => {
-                         // Add Cancelled event if needed
-                    },
-                    _ => {}
-                }
-            }
-        }
-
-        // 4. Stream new events if following
         if follow {
-            while let Ok(event) = receiver.recv().await {
-                // Convert domain event to JSON (Same logic as before)
-                let json = match event {
-                            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionStarted { .. } => {
-                                // Skip if we already replayed it?
-                                // Simple filter: check timestamp?
-                                // Stream the event directly.
-                                serde_json::json!({
-                                    "event_type": "ExecutionStarted",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": {}
-                                })
-                            },
-                             aegis_orchestrator_core::domain::events::ExecutionEvent::IterationStarted { iteration_number, action, .. } => {
-                                serde_json::json!({
-                                    "event_type": "IterationStarted",
-                                    "iteration_number": iteration_number,
-                                    "action": action,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": { "action": action }
-                                })
-                            },
-                             aegis_orchestrator_core::domain::events::ExecutionEvent::IterationCompleted { iteration_number, output, .. } => {
-                                serde_json::json!({
-                                    "event_type": "IterationCompleted",
-                                    "iteration_number": iteration_number,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": { "output": output }
-                                })
-                            },
-                            aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted { final_output, .. } => {
-                                serde_json::json!({
-                                    "event_type": "ExecutionCompleted",
-                                    "total_iterations": 0,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": { "result": final_output }
-                                })
-                            },
-                             aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { reason, .. } => {
-                                serde_json::json!({
-                                    "event_type": "ExecutionFailed",
-                                    "reason": reason,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": { "error": reason }
-                                })
-                            },
-                            aegis_orchestrator_core::domain::events::ExecutionEvent::ConsoleOutput { stream, content, .. } => {
-                                serde_json::json!({
-                                    "event_type": "ConsoleOutput",
-                                    "stream": stream,
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": { "output": content }
-                                })
-                            },
-                            aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction { provider, model, prompt, response, .. } => {
-                                serde_json::json!({
-                                    "event_type": "LlmInteraction",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": {
-                                        "provider": provider,
-                                        "model": model,
-                                        "prompt": prompt,
-                                        "response": response
-                                    }
-                                })
-                            },
-                            _ => {
-                                 serde_json::json!({
-                                    "event_type": "Unknown",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": {}
-                                })
-                            }
-                        };
-
-                        yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
+            let mut activity_stream = activity_service.stream_execution_activity(exec_id).await?;
+            while let Some(activity) = activity_stream.next().await {
+                let payload = serde_json::to_string(&activity?)?;
+                yield Ok::<_, anyhow::Error>(Event::default().data(payload));
+            }
+        } else {
+            for activity in activity_service.execution_history(exec_id).await? {
+                let payload = serde_json::to_string(&activity)?;
+                yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
         }
     };
@@ -2465,277 +2287,20 @@ async fn stream_agent_events_handler(
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
     let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-
-    // 1. Subscribe FIRST to catch any events that happen while we fetch history
-    let mut receiver = state.event_bus.subscribe_agent(aid);
-
-    // 2. Fetch all executions for this agent
-    let executions_result = state
-        .execution_service
-        .list_executions_for_tenant(&tenant_id, Some(aid), 100)
-        .await;
+    let _tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let activity_service = state.correlated_activity_stream_service.clone();
 
     let stream = async_stream::stream! {
-        // 3. Replay history for all executions
-        if let Ok(mut executions) = executions_result {
-            // Sort by started_at to replay in chronological order
-            executions.sort_by(|a, b| a.started_at.cmp(&b.started_at));
-
-            for execution in executions {
-                // ExecutionStarted
-                let start_event = serde_json::json!({
-                    "event_type": "ExecutionStarted",
-                    "execution_id": execution.id.0,
-                    "agent_id": execution.agent_id.0,
-                    "timestamp": execution.started_at.to_rfc3339(),
-                    "data": {}
-                });
-                yield Ok::<_, anyhow::Error>(Event::default().data(start_event.to_string()));
-
-                // Iterations
-                for iter in execution.iterations() {
-                    // IterationStarted
-                    let iter_start = serde_json::json!({
-                        "event_type": "IterationStarted",
-                        "execution_id": execution.id.0,
-                        "iteration_number": iter.number,
-                        "action": iter.action,
-                        "timestamp": iter.started_at.to_rfc3339(),
-                        "data": { "action": iter.action }
-                    });
-                    yield Ok::<_, anyhow::Error>(Event::default().data(iter_start.to_string()));
-
-                    // Replay LlmInteractions
-                    for interaction in &iter.llm_interactions {
-                         let event = serde_json::json!({
-                            "event_type": "LlmInteraction",
-                            "execution_id": execution.id.0,
-                            "agent_id": execution.agent_id.0,
-                            "iteration_number": iter.number,
-                            "timestamp": interaction.timestamp.to_rfc3339(),
-                            "data": {
-                                "model": interaction.model,
-                                "provider": interaction.provider,
-                                "prompt": interaction.prompt,
-                                "response": interaction.response
-                            }
-                         });
-                         yield Ok::<_, anyhow::Error>(Event::default().data(event.to_string()));
-                    }
-
-                    // Replay validation results as console output
-                    if let Some(validation_results) = &iter.validation_results {
-                        if let Some(system) = &validation_results.system {
-                            // Replay stdout
-                            if !system.stdout.is_empty() {
-                                let stdout_event = serde_json::json!({
-                                    "event_type": "ConsoleOutput",
-                                    "execution_id": execution.id.0,
-                                    "stream": "stdout",
-                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
-                                    "data": { "output": system.stdout }
-                                });
-                                yield Ok::<_, anyhow::Error>(Event::default().data(stdout_event.to_string()));
-                            }
-                            // Replay stderr
-                            if !system.stderr.is_empty() {
-                                let stderr_event = serde_json::json!({
-                                    "event_type": "ConsoleOutput",
-                                    "execution_id": execution.id.0,
-                                    "stream": "stderr",
-                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
-                                    "data": { "output": system.stderr }
-                                });
-                                yield Ok::<_, anyhow::Error>(Event::default().data(stderr_event.to_string()));
-                            }
-                        }
-
-                        // Replay judge evaluation
-                        if let Some(semantic) = &validation_results.semantic {
-                            let judge_start = serde_json::json!({
-                                "event_type": "ConsoleOutput",
-                                "execution_id": execution.id.0,
-                                "stream": "judge",
-                                "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
-                                "data": { "output": "🧑‍⚖️ Evaluating output..." }
-                            });
-                            yield Ok::<_, anyhow::Error>(Event::default().data(judge_start.to_string()));
-
-                            let judge_result = if semantic.success {
-                                format!("✅ Judge: PASS (confidence: {:.2})", semantic.score)
-                            } else {
-                                format!("❌ Judge: FAIL (confidence: {:.2})", semantic.score)
-                            };
-                            let judge_event = serde_json::json!({
-                                "event_type": "ConsoleOutput",
-                                "execution_id": execution.id.0,
-                                "stream": "judge",
-                                "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
-                                "data": { "output": judge_result }
-                            });
-                            yield Ok::<_, anyhow::Error>(Event::default().data(judge_event.to_string()));
-
-                            if !semantic.reasoning.is_empty() {
-                                let feedback_event = serde_json::json!({
-                                    "event_type": "ConsoleOutput",
-                                    "execution_id": execution.id.0,
-                                    "stream": "judge",
-                                    "timestamp": iter.ended_at.unwrap_or(iter.started_at).to_rfc3339(),
-                                    "data": { "output": format!("   {}", semantic.reasoning) }
-                                });
-                                yield Ok::<_, anyhow::Error>(Event::default().data(feedback_event.to_string()));
-                            }
-                        }
-                    }
-
-                    // Completion/Failure
-                    if let Some(output) = &iter.output {
-                        let iter_end = serde_json::json!({
-                            "event_type": "IterationCompleted",
-                            "execution_id": execution.id.0,
-                            "iteration_number": iter.number,
-                            "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                            "data": { "output": output }
-                        });
-                        yield Ok::<_, anyhow::Error>(Event::default().data(iter_end.to_string()));
-                    } else if let Some(error) = &iter.error {
-                        let iter_fail = serde_json::json!({
-                            "event_type": "IterationFailed",
-                            "execution_id": execution.id.0,
-                            "iteration_number": iter.number,
-                            "timestamp": iter.ended_at.map(|t| t.to_rfc3339()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
-                            "data": { "error": error.message }
-                        });
-                        yield Ok::<_, anyhow::Error>(Event::default().data(iter_fail.to_string()));
-                    }
-                }
-
-                // Execution Terminal State
-                if let Some(ended_at) = execution.ended_at {
-                    match execution.status {
-                        aegis_orchestrator_core::domain::execution::ExecutionStatus::Completed => {
-                            let result = execution.iterations().last().and_then(|i| i.output.clone());
-                            let exec_end = serde_json::json!({
-                                "event_type": "ExecutionCompleted",
-                                "execution_id": execution.id.0,
-                                "total_iterations": execution.iterations().len(),
-                                "timestamp": ended_at.to_rfc3339(),
-                                "data": { "result": result }
-                            });
-                            yield Ok::<_, anyhow::Error>(Event::default().data(exec_end.to_string()));
-                        },
-                        aegis_orchestrator_core::domain::execution::ExecutionStatus::Failed => {
-                            let reason = execution.error.clone().unwrap_or_else(|| "Execution failed".to_string());
-                            let exec_fail = serde_json::json!({
-                                "event_type": "ExecutionFailed",
-                                "execution_id": execution.id.0,
-                                "reason": reason,
-                                "timestamp": ended_at.to_rfc3339(),
-                                "data": { "error": reason }
-                            });
-                            yield Ok::<_, anyhow::Error>(Event::default().data(exec_fail.to_string()));
-                        },
-                        _ => {}
-                    }
-                }
-            }
-        }
-
-        // 4. Stream new events if following
         if follow {
-            while let Ok(event) = receiver.recv().await {
-                use aegis_orchestrator_core::infrastructure::event_bus::DomainEvent;
-                let json = match event {
-                            DomainEvent::Execution(exec_event) => {
-                                match exec_event {
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionStarted { execution_id, agent_id, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "ExecutionStarted",
-                                            "execution_id": execution_id.0,
-                                            "agent_id": agent_id.0,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": {}
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::IterationStarted { execution_id, iteration_number, action, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "IterationStarted",
-                                            "execution_id": execution_id.0,
-                                            "iteration_number": iteration_number,
-                                            "action": action,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": { "action": action }
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::IterationCompleted { execution_id, iteration_number, output, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "IterationCompleted",
-                                            "execution_id": execution_id.0,
-                                            "iteration_number": iteration_number,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": { "output": output }
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionCompleted { execution_id, final_output, total_iterations, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "ExecutionCompleted",
-                                            "execution_id": execution_id.0,
-                                            "total_iterations": total_iterations,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": { "result": final_output }
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ExecutionFailed { execution_id, reason, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "ExecutionFailed",
-                                            "execution_id": execution_id.0,
-                                            "reason": reason,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": { "error": reason }
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::ConsoleOutput { execution_id, stream, content, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "ConsoleOutput",
-                                            "execution_id": execution_id.0,
-                                            "stream": stream,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": { "output": content }
-                                        })
-                                    },
-                                    aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction { execution_id, provider, model, prompt, response, .. } => {
-                                        serde_json::json!({
-                                            "event_type": "LlmInteraction",
-                                            "execution_id": execution_id.0,
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": {
-                                                "provider": provider,
-                                                "model": model,
-                                                "prompt": prompt,
-                                                "response": response
-                                            }
-                                        })
-                                    },
-                                    _ => {
-                                        serde_json::json!({
-                                            "event_type": "Unknown",
-                                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                                            "data": {}
-                                        })
-                                    }
-                                }
-                            },
-                            _ => {
-                                serde_json::json!({
-                                    "event_type": "Other",
-                                    "timestamp": chrono::Utc::now().to_rfc3339(),
-                                    "data": {}
-                                })
-                            }
-                        };
-
-                yield Ok::<_, anyhow::Error>(Event::default().data(json.to_string()));
+            let mut activity_stream = activity_service.stream_agent_activity(aid).await?;
+            while let Some(activity) = activity_stream.next().await {
+                let payload = serde_json::to_string(&activity?)?;
+                yield Ok::<_, anyhow::Error>(Event::default().data(payload));
+            }
+        } else {
+            for activity in activity_service.agent_history(aid).await? {
+                let payload = serde_json::to_string(&activity)?;
+                yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
         }
     };

@@ -96,8 +96,8 @@ impl AnthropicAdapter {
         } else if status == StatusCode::NOT_FOUND {
             let mentions_model = serde_json::from_str::<serde_json::Value>(error_text)
                 .ok()
-                .and_then(|json| json.get("error").cloned().or(Some(json)))
-                .and_then(|value| {
+                .map(|json| json.get("error").cloned().unwrap_or(json))
+                .map(|value| {
                     let message = value
                         .get("message")
                         .and_then(|message| message.as_str())
@@ -106,18 +106,15 @@ impl AnthropicAdapter {
                         .get("type")
                         .and_then(|error_type| error_type.as_str())
                         .map(str::to_owned);
-                    Some((message, error_type))
+                    (message, error_type)
                 })
                 .map(|(message, error_type)| {
-                    message
+                    message.as_deref().is_some_and(|message| {
+                        message.contains(&self.model)
+                            || message.to_ascii_lowercase().contains("model")
+                    }) || error_type
                         .as_deref()
-                        .is_some_and(|message| {
-                            message.contains(&self.model)
-                                || message.to_ascii_lowercase().contains("model")
-                        })
-                        || error_type
-                            .as_deref()
-                            .is_some_and(|error_type| error_type.contains("model"))
+                        .is_some_and(|error_type| error_type.contains("model"))
                 })
                 .unwrap_or_else(|| {
                     let lower = error_text.to_ascii_lowercase();
