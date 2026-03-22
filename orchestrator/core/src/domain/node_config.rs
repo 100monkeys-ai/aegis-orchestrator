@@ -177,6 +177,10 @@ pub struct NodeConfigSpec {
     /// If omitted, orchestrator does not forward unknown tools to the gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub smcp_gateway: Option<SmcpGatewayConfig>,
+
+    /// AgentSkills configuration (e.g. https://agentskills.io/api)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_skills: Option<AgentSkillsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1468,6 +1472,28 @@ impl Default for NodeConfigSpec {
             grpc_auth: None,
             smcp_gateway: None,
             image_tag: None,
+            agent_skills: None,
+        }
+    }
+}
+
+/// AgentSkills configuration block
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSkillsConfig {
+    /// AgentSkills API endpoint URL
+    /// Default: "https://agentskills.io/api"
+    #[serde(default = "default_agentskills_url")]
+    pub endpoint: String,
+}
+
+fn default_agentskills_url() -> String {
+    "https://agentskills.io/api".to_string()
+}
+
+impl Default for AgentSkillsConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_agentskills_url(),
         }
     }
 }
@@ -1962,6 +1988,7 @@ mod tests {
                 grpc_auth: None,
                 smcp_gateway: None,
                 image_tag: None,
+                agent_skills: None,
             },
         };
 

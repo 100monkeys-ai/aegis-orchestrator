@@ -247,12 +247,13 @@ impl StandardExecutionService {
         tenant_id: &TenantId,
         alias_volume_id: VolumeId,
         mount_point: PathBuf,
+        filer_url: &str,
     ) -> VolumeMount {
         VolumeMount::new(
             alias_volume_id,
             mount_point,
             AccessMode::ReadOnly,
-            FilerEndpoint::new("http://localhost:8888").expect("valid fallback filer endpoint"),
+            FilerEndpoint::new(filer_url).expect("valid fallback filer endpoint"),
             format!("/aegis/volumes/{tenant_id}/{alias_volume_id}"),
         )
     }
@@ -356,9 +357,18 @@ impl StandardExecutionService {
             write: vec![],
         };
         let mut mounts = Vec::with_capacity(borrowed.len());
+        let filer_url = self
+            .config
+            .spec
+            .storage
+            .as_ref()
+            .and_then(|s| s.seaweedfs.as_ref())
+            .map(|sf| sf.filer_url.clone())
+            .unwrap_or_else(|| "http://localhost:8888".to_string());
         for (alias_volume_id, source_volume, mount_point) in borrowed {
             gateway.register_borrowed_volume(alias_volume_id, child_execution_id, source_volume);
-            let mount = Self::build_borrowed_mount(tenant_id, alias_volume_id, mount_point);
+            let mount =
+                Self::build_borrowed_mount(tenant_id, alias_volume_id, mount_point, &filer_url);
             gateway.register_volume(
                 alias_volume_id,
                 child_execution_id,

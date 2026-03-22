@@ -261,6 +261,13 @@ spec:
       enabled: false
   
   # --------------------------------------------------------------------------
+  # AgentSkills API (Optional)
+  # --------------------------------------------------------------------------
+  # External registry for fetching advanced agent capabilities.
+  # agent_skills:
+  #   endpoint: "https://agentskills.io/api"
+
+  # --------------------------------------------------------------------------
   # Storage (Optional)
   # --------------------------------------------------------------------------
   # Distributed storage for agent file system volumes

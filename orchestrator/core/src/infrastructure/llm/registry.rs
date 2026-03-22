@@ -198,28 +198,28 @@ impl ProviderRegistry {
     ) -> anyhow::Result<Arc<dyn LLMProvider>> {
         let api_key = Self::resolve_api_key(&config.api_key)?;
 
+        let endpoint = if config.endpoint.is_empty() {
+            match config.provider_type.as_str() {
+                "openai" | "openai-compatible" => "https://api.openai.com/v1",
+                "anthropic" => "https://api.anthropic.com/v1",
+                "gemini" => "https://generativelanguage.googleapis.com/v1beta",
+                "ollama" => "http://localhost:11434",
+                _ => "",
+            }
+            .to_string()
+        } else {
+            config.endpoint.clone()
+        };
+
         let provider: Arc<dyn LLMProvider> = match config.provider_type.as_str() {
-            "openai" => Arc::new(OpenAIAdapter::new(
-                config.endpoint.clone(),
-                api_key,
-                model.to_string(),
-            )),
-            "ollama" => Arc::new(OllamaAdapter::new(
-                config.endpoint.clone(),
-                model.to_string(),
-            )),
-            "anthropic" => Arc::new(AnthropicAdapter::new(api_key, model.to_string())),
-            "gemini" => Arc::new(GeminiAdapter::new(
-                config.endpoint.clone(),
-                api_key,
-                model.to_string(),
-            )),
+            "openai" => Arc::new(OpenAIAdapter::new(endpoint, api_key, model.to_string())),
+            "ollama" => Arc::new(OllamaAdapter::new(endpoint, model.to_string())),
+            "anthropic" => Arc::new(AnthropicAdapter::new(endpoint, api_key, model.to_string())),
+            "gemini" => Arc::new(GeminiAdapter::new(endpoint, api_key, model.to_string())),
             // OpenAI-compatible APIs (LM Studio, vLLM, etc.)
-            "openai-compatible" => Arc::new(OpenAIAdapter::new(
-                config.endpoint.clone(),
-                api_key,
-                model.to_string(),
-            )),
+            "openai-compatible" => {
+                Arc::new(OpenAIAdapter::new(endpoint, api_key, model.to_string()))
+            }
             _ => anyhow::bail!("Unsupported provider type: {}", config.provider_type),
         };
 
@@ -470,6 +470,7 @@ mod tests {
                 grpc_auth: None,
                 smcp_gateway: None,
                 image_tag: None,
+                agent_skills: None,
             },
         };
 

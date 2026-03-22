@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct AnthropicAdapter {
     client: reqwest::Client,
+    endpoint: String,
     api_key: String,
     model: String,
 }
@@ -69,9 +70,10 @@ struct AnthropicUsage {
 }
 
 impl AnthropicAdapter {
-    pub fn new(api_key: String, model: String) -> Self {
+    pub fn new(endpoint: String, api_key: String, model: String) -> Self {
         Self {
             client: reqwest::Client::new(),
+            endpoint,
             api_key,
             model,
         }
@@ -201,9 +203,11 @@ impl LLMProvider for AnthropicAdapter {
             tools: anthropic_tools,
         };
 
+        let url = format!("{}/messages", self.endpoint.trim_end_matches('/'));
+
         let response = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("Content-Type", "application/json")
@@ -268,9 +272,10 @@ impl LLMProvider for AnthropicAdapter {
     }
 
     async fn health_check(&self) -> Result<(), LLMError> {
+        let url = format!("{}/models", self.endpoint.trim_end_matches('/'));
         let response = self
             .client
-            .get("https://api.anthropic.com/v1/models")
+            .get(&url)
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .send()
@@ -292,9 +297,13 @@ mod tests {
 
     #[test]
     fn test_anthropic_adapter_creation() {
-        let adapter =
-            AnthropicAdapter::new("k".to_string(), "claude-3-5-sonnet-20241022".to_string());
+        let adapter = AnthropicAdapter::new(
+            "https://api.anthropic.com/v1".to_string(),
+            "k".to_string(),
+            "claude-3-5-sonnet-20241022".to_string(),
+        );
         assert_eq!(adapter.api_key, "k");
+        assert_eq!(adapter.endpoint, "https://api.anthropic.com/v1");
         assert_eq!(adapter.model, "claude-3-5-sonnet-20241022");
     }
 
