@@ -328,6 +328,10 @@ impl AegisRuntime for AegisRuntimeService {
             }
         });
 
+        // Drop the outer sender so the gRPC stream closes once the spawned task
+        // finishes and releases its cloned sender.
+        drop(tx);
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
@@ -995,4 +999,180 @@ pub async fn start_grpc_server(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::events::ExecutionEvent as DomainExecutionEvent;
+    use crate::domain::execution::{Execution, ExecutionId, ExecutionInput};
+    use crate::infrastructure::event_bus::{DomainEvent, EventBus};
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use chrono::Utc;
+    use futures::Stream;
+    use std::pin::Pin;
+    use tokio::time::{timeout, Duration};
+    use tokio_stream::StreamExt;
+
+    struct TestExecutionService {
+        execution_id: ExecutionId,
+        stream_events: Vec<DomainExecutionEvent>,
+    }
+
+    #[async_trait]
+    impl ExecutionService for TestExecutionService {
+        async fn start_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+        ) -> Result<ExecutionId> {
+            Ok(self.execution_id)
+        }
+
+        async fn start_child_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _parent_execution_id: ExecutionId,
+        ) -> Result<ExecutionId> {
+            Err(anyhow!(
+                "start_child_execution not used in grpc server tests"
+            ))
+        }
+
+        async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
+            Err(anyhow!("get_execution not used in grpc server tests"))
+        }
+
+        async fn get_iterations(
+            &self,
+            _exec_id: ExecutionId,
+        ) -> Result<Vec<crate::domain::execution::Iteration>> {
+            Err(anyhow!("get_iterations not used in grpc server tests"))
+        }
+
+        async fn cancel_execution(&self, _id: ExecutionId) -> Result<()> {
+            Err(anyhow!("cancel_execution not used in grpc server tests"))
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainExecutionEvent>> + Send>>> {
+            Ok(Box::pin(tokio_stream::iter(
+                self.stream_events.clone().into_iter().map(Ok),
+            )))
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            Err(anyhow!("stream_agent_events not used in grpc server tests"))
+        }
+
+        async fn list_executions(
+            &self,
+            _agent_id: Option<AgentId>,
+            _limit: usize,
+        ) -> Result<Vec<Execution>> {
+            Err(anyhow!("list_executions not used in grpc server tests"))
+        }
+
+        async fn delete_execution(&self, _id: ExecutionId) -> Result<()> {
+            Err(anyhow!("delete_execution not used in grpc server tests"))
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _interaction: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            Err(anyhow!(
+                "record_llm_interaction not used in grpc server tests"
+            ))
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            Err(anyhow!(
+                "store_iteration_trajectory not used in grpc server tests"
+            ))
+        }
+    }
+
+    fn test_validation_service(
+        execution_service: Arc<dyn ExecutionService>,
+    ) -> Arc<ValidationService> {
+        Arc::new(ValidationService::new(
+            Arc::new(EventBus::new(8)),
+            execution_service,
+        ))
+    }
+
+    #[tokio::test]
+    async fn execute_agent_stream_closes_after_execution_stream_ends() {
+        let execution_id = ExecutionId::new();
+        let agent_id = AgentId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: vec![DomainExecutionEvent::ExecutionCompleted {
+                execution_id,
+                agent_id,
+                final_output: "done".to_string(),
+                total_iterations: 1,
+                completed_at: Utc::now(),
+            }],
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let response = service
+            .execute_agent(Request::new(ExecuteAgentRequest {
+                agent_id: agent_id.0.to_string(),
+                input: "generate workflow".to_string(),
+                context_json: String::new(),
+                parent_execution_id: None,
+                workflow_execution_id: None,
+                security_policy: None,
+            }))
+            .await
+            .expect("execute_agent should succeed");
+
+        let mut stream = response.into_inner();
+
+        let started = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("started event should arrive before timeout")
+            .expect("stream should emit execution started event")
+            .expect("started event should be Ok");
+        assert!(matches!(
+            started.event,
+            Some(execution_event::Event::ExecutionStarted(_))
+        ));
+
+        let completed = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("completed event should arrive before timeout")
+            .expect("stream should emit terminal event")
+            .expect("completed event should be Ok");
+        assert!(matches!(
+            completed.event,
+            Some(execution_event::Event::ExecutionCompleted(_))
+        ));
+
+        let end = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should close instead of hanging");
+        assert!(
+            end.is_none(),
+            "stream should terminate after task completion"
+        );
+    }
 }

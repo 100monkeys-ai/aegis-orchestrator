@@ -264,3 +264,49 @@ async fn deploy_builtin_workflow(
         .await
         .context("Failed to deploy built-in workflow template")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workflow_generator_template_uses_nested_output_fields() {
+        let workflow: serde_yaml::Value =
+            serde_yaml::from_str(WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE).unwrap();
+        let states = &workflow["spec"]["states"];
+
+        let generate_missing_agents_input = states["GENERATE_MISSING_AGENTS"]["input"]
+            .as_str()
+            .expect("GENERATE_MISSING_AGENTS input should be a string");
+        assert!(
+            generate_missing_agents_input.contains("{{PLAN.output}}"),
+            "GENERATE_MISSING_AGENTS should reference the planner state's output payload"
+        );
+
+        let generate_and_register_workflow_input = states["GENERATE_AND_REGISTER_WORKFLOW"]
+            ["input"]
+            .as_str()
+            .expect("GENERATE_AND_REGISTER_WORKFLOW input should be a string");
+        assert!(
+            generate_and_register_workflow_input.contains("{{PLAN.output}}"),
+            "GENERATE_AND_REGISTER_WORKFLOW should reference the planner state's output payload"
+        );
+        assert!(
+            generate_and_register_workflow_input.contains("{{GENERATE_MISSING_AGENTS.output}}"),
+            "GENERATE_AND_REGISTER_WORKFLOW should reference the agent generation state's output payload"
+        );
+    }
+
+    #[test]
+    fn workflow_generator_template_remains_three_stage() {
+        let workflow: serde_yaml::Value =
+            serde_yaml::from_str(WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE).unwrap();
+        let states = workflow["spec"]["states"]
+            .as_mapping()
+            .expect("workflow states should be a mapping");
+
+        assert!(states.contains_key(&serde_yaml::Value::from("PLAN")));
+        assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
+        assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
+    }
+}
