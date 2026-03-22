@@ -44,11 +44,13 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 mod commands;
 mod daemon;
+mod output;
 
 use commands::{
     AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
     StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
+use output::{structured_output_unsupported, OutputFormat};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -80,6 +82,10 @@ struct Cli {
     /// Log level (trace, debug, info, warn, error)
     #[arg(long, global = true, env = "AEGIS_LOG_LEVEL", default_value = "info")]
     log_level: String,
+
+    /// Output format for supported scriptable commands
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    output: OutputFormat,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -207,32 +213,68 @@ async fn main() -> Result<()> {
     // Handle commands in CLI mode
     let res = match cli.command {
         Some(Commands::Daemon { command }) => {
-            commands::daemon::handle_command(command, cli.config, &cli.host, cli.port).await
+            commands::daemon::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
+                .await
         }
         Some(Commands::Task { command }) => {
-            commands::task::handle_command(command, &cli.host, cli.port).await
+            commands::task::handle_command(command, &cli.host, cli.port, cli.output).await
         }
         Some(Commands::Node { command }) => {
-            commands::node::handle_command(command, cli.config, &cli.host, cli.port).await
+            commands::node::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
+                .await
         }
         Some(Commands::Config { command }) => {
-            commands::config::handle_command(command, cli.config).await
+            commands::config::handle_command(command, cli.config, cli.output).await
         }
         Some(Commands::Agent { command }) => {
-            commands::agent::handle_command(command, cli.config, &cli.host, cli.port).await
+            commands::agent::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
+                .await
         }
         Some(Commands::Workflow { command }) => {
-            commands::workflow::handle_command(command, cli.config, &cli.host, cli.port).await
+            commands::workflow::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
+                .await
         }
-        Some(Commands::Update { command }) => commands::update::execute(command, cli.config).await,
-        Some(Commands::Init { args }) => commands::init::run(args).await,
-        Some(Commands::Down { args }) => commands::down::run(args).await,
-        Some(Commands::Up { args }) => commands::up::run(args).await,
-        Some(Commands::Restart { args }) => commands::restart::run(args).await,
+        Some(Commands::Update { command }) => {
+            commands::update::execute(command, cli.config, cli.output).await
+        }
+        Some(Commands::Init { args }) => {
+            if cli.output.is_structured() {
+                structured_output_unsupported("aegis init", cli.output)
+            } else {
+                commands::init::run(args).await
+            }
+        }
+        Some(Commands::Down { args }) => {
+            if cli.output.is_structured() {
+                structured_output_unsupported("aegis down", cli.output)
+            } else {
+                commands::down::run(args).await
+            }
+        }
+        Some(Commands::Up { args }) => {
+            if cli.output.is_structured() {
+                structured_output_unsupported("aegis up", cli.output)
+            } else {
+                commands::up::run(args).await
+            }
+        }
+        Some(Commands::Restart { args }) => {
+            if cli.output.is_structured() {
+                structured_output_unsupported("aegis restart", cli.output)
+            } else {
+                commands::restart::run(args).await
+            }
+        }
         Some(Commands::Status { args }) => {
-            commands::status::run(args, cli.config, &cli.host, cli.port).await
+            commands::status::run(args, cli.config, &cli.host, cli.port, cli.output).await
         }
-        Some(Commands::Uninstall { args }) => commands::uninstall::run(args).await,
+        Some(Commands::Uninstall { args }) => {
+            if cli.output.is_structured() {
+                structured_output_unsupported("aegis uninstall", cli.output)
+            } else {
+                commands::uninstall::run(args).await
+            }
+        }
         None => {
             // No command provided - show help
             eprintln!("{}", "No command specified. Use --help for usage.".yellow());

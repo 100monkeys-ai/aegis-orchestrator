@@ -325,6 +325,87 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(executions)
     }
 
+    async fn find_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: WorkflowId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, workflow_id, input_params, status,
+                current_state, blackboard, state_outputs,
+                started_at, last_transition_at
+            FROM workflow_executions
+            WHERE tenant_id = $1 AND workflow_id = $2
+            ORDER BY started_at DESC
+            LIMIT $3 OFFSET $4
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(workflow_id.0)
+        .bind(limit as i64)
+        .bind(offset as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut executions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            let workflow_id: uuid::Uuid = row.get("workflow_id");
+            let input_val: serde_json::Value = row.get("input_params");
+            let status_str: String = row.get("status");
+            let current_state_str: String = row.get("current_state");
+            let blackboard_val: serde_json::Value = row.get("blackboard");
+            let state_outputs_val: serde_json::Value = row.get("state_outputs");
+            let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
+            let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
+
+            let status = match status_str.as_str() {
+                "pending" => ExecutionStatus::Pending,
+                "running" => ExecutionStatus::Running,
+                "completed" => ExecutionStatus::Completed,
+                "failed" => ExecutionStatus::Failed,
+                "cancelled" => ExecutionStatus::Cancelled,
+                _ => ExecutionStatus::Pending,
+            };
+
+            let blackboard =
+                Blackboard::from_json(&blackboard_val).unwrap_or_else(|_| Blackboard::new());
+
+            let state_outputs: HashMap<StateName, serde_json::Value> = state_outputs_val
+                .as_object()
+                .map(|obj| {
+                    obj.iter()
+                        .filter_map(|(key, value)| {
+                            StateName::new(key)
+                                .ok()
+                                .map(|state_name| (state_name, value.clone()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            executions.push(WorkflowExecution {
+                id: ExecutionId(id),
+                workflow_id: WorkflowId(workflow_id),
+                status,
+                current_state: StateName::new(&current_state_str)
+                    .unwrap_or_else(|_| StateName::new("start").unwrap()),
+                blackboard,
+                input: input_val,
+                state_outputs,
+                started_at,
+                last_transition_at,
+            });
+        }
+
+        Ok(executions)
+    }
+
     async fn append_event(
         &self,
         execution_id: ExecutionId,

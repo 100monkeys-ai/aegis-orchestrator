@@ -588,16 +588,15 @@ fn print_event(event: &serde_json::Value, verbose: bool) {
 // ============================================================================
 
 impl DaemonClient {
-    /// Deploy a workflow from a file
-    pub async fn deploy_workflow(&self, file: &std::path::Path) -> Result<()> {
+    /// Deploy a workflow from a file with optional force overwrite.
+    pub async fn deploy_workflow_with_force(
+        &self,
+        file: &std::path::Path,
+        force: bool,
+    ) -> Result<()> {
         let workflow_yaml =
             std::fs::read_to_string(file).context("Failed to read workflow file")?;
-        self.deploy_workflow_manifest(&workflow_yaml).await
-    }
-
-    /// Deploy a workflow from YAML content.
-    pub async fn deploy_workflow_manifest(&self, workflow_yaml: &str) -> Result<()> {
-        self.deploy_workflow_manifest_with_force(workflow_yaml, false)
+        self.deploy_workflow_manifest_with_force(&workflow_yaml, force)
             .await
     }
 

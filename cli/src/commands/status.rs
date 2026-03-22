@@ -19,12 +19,13 @@ use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Args;
 use colored::Colorize;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tonic::Request;
 
 use crate::daemon::{
     check_daemon_running, probe_health_endpoint, DaemonStatus, HealthEndpointStatus,
 };
+use crate::output::{render_serialized, OutputFormat};
 
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {
@@ -45,15 +46,40 @@ pub async fn run(
     config_path: Option<PathBuf>,
     host: &str,
     port: u16,
+    output_format: OutputFormat,
 ) -> Result<()> {
     if args.cluster {
-        run_cluster_status(config_path, port).await
+        run_cluster_status(config_path, port, output_format).await
     } else {
-        run_local_status(&expand_tilde(Path::new(&args.dir)), host, port).await
+        run_local_status(
+            &expand_tilde(Path::new(&args.dir)),
+            host,
+            port,
+            output_format,
+        )
+        .await
     }
 }
 
-async fn run_local_status(dir: &Path, host: &str, port: u16) -> Result<()> {
+#[derive(Serialize)]
+struct LocalStatusOutput {
+    mode: &'static str,
+    services: Vec<LocalStatusRow>,
+}
+
+#[derive(Serialize)]
+struct ClusterStatusOutput {
+    mode: &'static str,
+    controller_endpoint: String,
+    nodes: Vec<ClusterStatusRow>,
+}
+
+async fn run_local_status(
+    dir: &Path,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
     let compose_file = dir.join("docker-compose.yml");
     if !compose_file.exists() {
         bail!(
@@ -105,7 +131,17 @@ async fn run_local_status(dir: &Path, host: &str, port: u16) -> Result<()> {
         rows.push(compose_service);
     }
 
-    print_local_status_table(&rows);
+    if output_format.is_structured() {
+        render_serialized(
+            output_format,
+            &LocalStatusOutput {
+                mode: "local",
+                services: rows.clone(),
+            },
+        )?;
+    } else {
+        print_local_status_table(&rows);
+    }
 
     if has_failures {
         return Err(anyhow!("One or more local services are unhealthy"));
@@ -114,7 +150,11 @@ async fn run_local_status(dir: &Path, host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn run_cluster_status(config_path: Option<PathBuf>, port: u16) -> Result<()> {
+async fn run_cluster_status(
+    config_path: Option<PathBuf>,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
     let config = NodeConfigManifest::load_or_default(config_path)?;
     let cluster_config = config
         .spec
@@ -128,22 +168,24 @@ async fn run_cluster_status(config_path: Option<PathBuf>, port: u16) -> Result<(
         .map(|controller| controller.endpoint.clone())
         .context("Controller endpoint not configured in spec.cluster.controller.endpoint")?;
 
-    println!(
-        "{} Querying cluster peers from {}...",
-        "⚙".yellow(),
-        endpoint.cyan()
-    );
-    println!(
-        "{} Probing orchestrator health on HTTP port {} for each node.",
-        "ℹ".cyan(),
-        port.to_string().cyan()
-    );
-    println!(
-        "{} Heartbeat freshness is unavailable here because ListPeers does not expose last-heartbeat timestamps.",
-        "ℹ".cyan()
-    );
+    if !output_format.is_structured() {
+        println!(
+            "{} Querying cluster peers from {}...",
+            "⚙".yellow(),
+            endpoint.cyan()
+        );
+        println!(
+            "{} Probing orchestrator health on HTTP port {} for each node.",
+            "ℹ".cyan(),
+            port.to_string().cyan()
+        );
+        println!(
+            "{} Heartbeat freshness is unavailable here because ListPeers does not expose last-heartbeat timestamps.",
+            "ℹ".cyan()
+        );
+    }
 
-    let mut client = NodeClusterServiceClient::connect(endpoint)
+    let mut client = NodeClusterServiceClient::connect(endpoint.clone())
         .await
         .context("Failed to connect to cluster controller")?;
 
@@ -153,47 +195,73 @@ async fn run_cluster_status(config_path: Option<PathBuf>, port: u16) -> Result<(
         .context("Failed to list peers")?
         .into_inner();
 
-    println!();
-    println!(
-        "{:<36} {:<12} {:<14} {:<16} {}",
-        "NODE ID".bold(),
-        "ROLE".bold(),
-        "CLUSTER".bold(),
-        "ORCHESTRATOR".bold(),
-        "ADDRESS".bold()
-    );
-    println!("{}", "-".repeat(98));
-
+    let mut rows = Vec::new();
     let mut has_failures = false;
     for node in resp.nodes {
-        let cluster_rendered = render_cluster_state(node.status());
+        let node_status = node.status();
+        let cluster_status = format!("{:?}", node_status).to_ascii_lowercase();
         let health_host = extract_host(&node.grpc_address);
+        let role = format!("{:?}", node.role());
+        let node_id = node.node_id;
+        let grpc_address = node.grpc_address;
         let orchestrator = match probe_health_endpoint(&health_host, port).await {
-            Ok(HealthEndpointStatus::Healthy { .. }) => "healthy".green().to_string(),
+            Ok(HealthEndpointStatus::Healthy { .. }) => "healthy".to_string(),
             Ok(HealthEndpointStatus::Unhealthy { .. }) => {
                 has_failures = true;
-                "unhealthy".red().to_string()
+                "unhealthy".to_string()
             }
             Err(_) => {
                 has_failures = true;
-                "unreachable".red().to_string()
+                "unreachable".to_string()
             }
         };
 
-        if !matches!(node.status(), NodeStatus::Active) {
+        if !matches!(node_status, NodeStatus::Active) {
             has_failures = true;
         }
 
-        println!(
-            "{:<36} {:<12?} {:<14} {:<16} {}",
-            node.node_id.dimmed(),
-            node.role(),
-            cluster_rendered,
-            orchestrator,
-            node.grpc_address.cyan()
-        );
+        rows.push(ClusterStatusRow {
+            node_id,
+            role,
+            cluster_status,
+            orchestrator_status: orchestrator,
+            grpc_address,
+        });
     }
-    println!();
+
+    if output_format.is_structured() {
+        render_serialized(
+            output_format,
+            &ClusterStatusOutput {
+                mode: "cluster",
+                controller_endpoint: endpoint,
+                nodes: rows,
+            },
+        )?;
+    } else {
+        println!();
+        println!(
+            "{:<36} {:<12} {:<14} {:<16} {}",
+            "NODE ID".bold(),
+            "ROLE".bold(),
+            "CLUSTER".bold(),
+            "ORCHESTRATOR".bold(),
+            "ADDRESS".bold()
+        );
+        println!("{}", "-".repeat(98));
+
+        for row in rows {
+            println!(
+                "{:<36} {:<12} {:<14} {:<16} {}",
+                row.node_id.dimmed(),
+                row.role,
+                render_cluster_state_label(&row.cluster_status),
+                render_orchestrator_health_label(&row.orchestrator_status),
+                row.grpc_address.cyan()
+            );
+        }
+        println!();
+    }
 
     if has_failures {
         return Err(anyhow!("One or more cluster nodes are unhealthy"));
@@ -290,11 +358,20 @@ fn color_health(health: &str) -> colored::ColoredString {
     }
 }
 
-fn render_cluster_state(status: NodeStatus) -> colored::ColoredString {
+fn render_cluster_state_label(status: &str) -> colored::ColoredString {
     match status {
-        NodeStatus::Active => "active".green(),
-        NodeStatus::Draining => "draining".yellow(),
-        NodeStatus::Unhealthy => "unhealthy".red(),
+        "active" => "active".green(),
+        "draining" => "draining".yellow(),
+        "unhealthy" => "unhealthy".red(),
+        _ => "unknown".yellow(),
+    }
+}
+
+fn render_orchestrator_health_label(status: &str) -> colored::ColoredString {
+    match status {
+        "healthy" => "healthy".green(),
+        "unhealthy" => "unhealthy".red(),
+        "unreachable" => "unreachable".red(),
         _ => "unknown".yellow(),
     }
 }
@@ -459,13 +536,22 @@ fn expand_tilde(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize)]
 struct LocalStatusRow {
     name: String,
     lifecycle: String,
     health: String,
     details: String,
     failing: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ClusterStatusRow {
+    node_id: String,
+    role: String,
+    cluster_status: String,
+    orchestrator_status: String,
+    grpc_address: String,
 }
 
 #[derive(Debug)]

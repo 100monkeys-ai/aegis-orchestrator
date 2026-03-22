@@ -27,6 +27,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use super::init::compose::ComposeRunner;
 use super::init::download::fetch_stack;
+use crate::output::{structured_output_unsupported, OutputFormat};
 
 #[derive(Args)]
 pub struct UpdateCommand {
@@ -61,7 +62,15 @@ pub struct UpdateCommand {
     pub tag: Option<String>,
 }
 
-pub async fn execute(cmd: UpdateCommand, config_path: Option<PathBuf>) -> Result<()> {
+pub async fn execute(
+    cmd: UpdateCommand,
+    config_path: Option<PathBuf>,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if output_format.is_structured() {
+        return structured_output_unsupported("aegis update", output_format);
+    }
+
     let dir = expand_tilde(Path::new(&cmd.dir));
 
     println!();

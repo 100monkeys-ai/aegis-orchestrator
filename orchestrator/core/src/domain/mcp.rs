@@ -665,10 +665,14 @@ impl ToolInputContract {
             "aegis.agent.export" => &["name"],
             "aegis.agent.delete" | "aegis.task.execute" => &["agent_id"],
             "aegis.agent.generate" | "aegis.workflow.generate" => &["input"],
+            "aegis.workflow.validate" => &["manifest_yaml"],
             "aegis.workflow.create" | "aegis.workflow.update" => &["manifest_yaml"],
             "aegis.workflow.export" | "aegis.workflow.delete" | "aegis.workflow.run" => &["name"],
             "aegis.workflow.logs" => &["execution_id"],
-            "aegis.task.status" | "aegis.task.cancel" | "aegis.task.remove" => &["execution_id"],
+            "aegis.workflow.executions.get" => &["execution_id"],
+            "aegis.task.status" | "aegis.task.logs" | "aegis.task.cancel" | "aegis.task.remove" => {
+                &["execution_id"]
+            }
             "aegis.schema.get" => &["key"],
             "aegis.schema.validate" => &["kind", "manifest_yaml"],
             "cmd.run" => &["command"],
@@ -819,6 +823,27 @@ mod tests {
         // Health check failing should move it to Unhealthy
         server.record_health_check(false);
         assert_eq!(server.status, ToolServerStatus::Unhealthy);
+    }
+
+    #[test]
+    fn test_tool_input_contract_requires_execution_id_for_task_logs() {
+        assert_eq!(
+            ToolInputContract::required_fields("aegis.task.logs"),
+            &["execution_id"]
+        );
+
+        let validation = ToolInputContract::validate("aegis.task.logs", &json!({}));
+        assert!(validation.is_err());
+        assert_eq!(
+            validation.unwrap_err(),
+            "required field 'execution_id' is missing or null for tool 'aegis.task.logs'"
+        );
+
+        assert!(ToolInputContract::validate(
+            "aegis.task.logs",
+            &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
+        )
+        .is_ok());
     }
 
     #[test]

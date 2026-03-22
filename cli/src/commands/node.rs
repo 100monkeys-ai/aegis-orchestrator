@@ -12,14 +12,16 @@ use clap::Subcommand;
 use colored::Colorize;
 use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
+use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
 use tonic::Request;
 
+use crate::output::{render_serialized, OutputFormat};
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
     node_cluster_service_client::NodeClusterServiceClient, AttestNodeRequest, ChallengeNodeRequest,
-    ListPeersRequest, NodeCapabilities, NodeRole, NodeStatus,
+    ListPeersRequest, NodeCapabilities, NodeRole,
 };
 
 #[derive(Subcommand)]
@@ -46,20 +48,48 @@ pub async fn handle_command(
     config_path: Option<PathBuf>,
     _host: &str,
     _port: u16,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let config = NodeConfigManifest::load_or_default(config_path)?;
 
     match command {
-        NodeCommand::Init { dev: _ } => init_node(&config).await,
-        NodeCommand::Join { endpoint } => join_cluster(&config, endpoint).await,
-        NodeCommand::Peers => list_peers(&config).await,
+        NodeCommand::Init { dev: _ } => init_node(&config, output_format).await,
+        NodeCommand::Join { endpoint } => join_cluster(&config, endpoint, output_format).await,
+        NodeCommand::Peers => list_peers(&config, output_format).await,
         NodeCommand::Leave => {
             anyhow::bail!("Node leave is unavailable in the single-node baseline protocol")
         }
     }
 }
 
-async fn init_node(config: &NodeConfigManifest) -> Result<()> {
+#[derive(Serialize)]
+struct NodeInitOutput {
+    created: bool,
+    path: String,
+}
+
+#[derive(Serialize)]
+struct NodeJoinOutput {
+    endpoint: String,
+    node_id: String,
+    token_issued: bool,
+}
+
+#[derive(Serialize)]
+struct NodePeerOutput {
+    node_id: String,
+    role: String,
+    status: String,
+    grpc_address: String,
+}
+
+#[derive(Serialize)]
+struct NodePeersOutput {
+    controller_endpoint: String,
+    peers: Vec<NodePeerOutput>,
+}
+
+async fn init_node(config: &NodeConfigManifest, output_format: OutputFormat) -> Result<()> {
     let path = config
         .spec
         .cluster
@@ -83,6 +113,15 @@ async fn init_node(config: &NodeConfigManifest) -> Result<()> {
     };
 
     if path.exists() {
+        if output_format.is_structured() {
+            return render_serialized(
+                output_format,
+                &NodeInitOutput {
+                    created: false,
+                    path: path.display().to_string(),
+                },
+            );
+        }
         println!(
             "{} Node identity keypair already exists at {}",
             "ℹ".blue(),
@@ -100,6 +139,16 @@ async fn init_node(config: &NodeConfigManifest) -> Result<()> {
     }
     fs::write(&path, bytes).context("Failed to write node keypair")?;
 
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &NodeInitOutput {
+                created: true,
+                path: path.display().to_string(),
+            },
+        );
+    }
+
     println!(
         "{} Generated new node identity keypair at {}",
         "✓".green(),
@@ -108,12 +157,18 @@ async fn init_node(config: &NodeConfigManifest) -> Result<()> {
     Ok(())
 }
 
-async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<()> {
-    println!(
-        "{} Attempting to join cluster at {}...",
-        "⚙".yellow(),
-        endpoint.cyan()
-    );
+async fn join_cluster(
+    config: &NodeConfigManifest,
+    endpoint: String,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if !output_format.is_structured() {
+        println!(
+            "{} Attempting to join cluster at {}...",
+            "⚙".yellow(),
+            endpoint.cyan()
+        );
+    }
 
     let mut client = NodeClusterServiceClient::connect(endpoint.clone())
         .await
@@ -216,7 +271,9 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
             .unwrap_or_else(|| "localhost:50051".to_string()),
     };
 
-    println!("{} Sending AttestNodeRequest (Step 1)...", "➜".blue());
+    if !output_format.is_structured() {
+        println!("{} Sending AttestNodeRequest (Step 1)...", "➜".blue());
+    }
     let attest_resp = client
         .attest_node(Request::new(attest_req))
         .await
@@ -224,7 +281,9 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
         .into_inner();
 
     // 2. Step 2: ChallengeNode (Proof of Possession)
-    println!("{} Solving challenge nonce (Step 2)...", "➜".blue());
+    if !output_format.is_structured() {
+        println!("{} Solving challenge nonce (Step 2)...", "➜".blue());
+    }
     let signature = signing_key.sign(&attest_resp.challenge_nonce);
     let challenge_req = ChallengeNodeRequest {
         challenge_id: attest_resp.challenge_id,
@@ -238,6 +297,17 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
         .context("Attestation failed at Step 2 (ChallengeNode)")?
         .into_inner();
 
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &NodeJoinOutput {
+                endpoint,
+                node_id: config.spec.node.id.clone(),
+                token_issued: true,
+            },
+        );
+    }
+
     println!("{} Successfully joined cluster!", "✓".green());
     println!("{} NodeSecurityToken issued (expires in 1h)", "ℹ".blue());
 
@@ -247,7 +317,7 @@ async fn join_cluster(config: &NodeConfigManifest, endpoint: String) -> Result<(
     Ok(())
 }
 
-async fn list_peers(config: &NodeConfigManifest) -> Result<()> {
+async fn list_peers(config: &NodeConfigManifest, output_format: OutputFormat) -> Result<()> {
     let cluster_config = config
         .spec
         .cluster
@@ -260,13 +330,15 @@ async fn list_peers(config: &NodeConfigManifest) -> Result<()> {
         .map(|c| c.endpoint.clone())
         .context("Controller endpoint not configured in spec.cluster.controller.endpoint")?;
 
-    println!(
-        "{} Querying cluster peers from {}...",
-        "⚙".yellow(),
-        endpoint.cyan()
-    );
+    if !output_format.is_structured() {
+        println!(
+            "{} Querying cluster peers from {}...",
+            "⚙".yellow(),
+            endpoint.cyan()
+        );
+    }
 
-    let mut client = NodeClusterServiceClient::connect(endpoint)
+    let mut client = NodeClusterServiceClient::connect(endpoint.clone())
         .await
         .context("Failed to connect to cluster controller")?;
 
@@ -275,6 +347,33 @@ async fn list_peers(config: &NodeConfigManifest) -> Result<()> {
         .await
         .context("Failed to list peers")?
         .into_inner();
+
+    let peers = resp
+        .nodes
+        .into_iter()
+        .map(|node| {
+            let role = format!("{:?}", node.role());
+            let status = format!("{:?}", node.status()).to_ascii_lowercase();
+            let node_id = node.node_id;
+            let grpc_address = node.grpc_address;
+            NodePeerOutput {
+                node_id,
+                role,
+                status,
+                grpc_address,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &NodePeersOutput {
+                controller_endpoint: endpoint,
+                peers,
+            },
+        );
+    }
 
     println!(
         "\n{:<36} {:<12} {:<10} {:<15}",
@@ -285,19 +384,19 @@ async fn list_peers(config: &NodeConfigManifest) -> Result<()> {
     );
     println!("{}", "-".repeat(85));
 
-    for node in resp.nodes {
-        let status_color = match node.status() {
-            NodeStatus::Active => "green",
-            NodeStatus::Draining => "yellow",
-            NodeStatus::Unhealthy => "red",
+    for node in peers {
+        let status_color = match node.status.as_str() {
+            "active" => "green",
+            "draining" => "yellow",
+            "unhealthy" => "red",
             _ => "white",
         };
 
         println!(
-            "{:<36} {:<12?} {:<10} {:<15}",
+            "{:<36} {:<12} {:<10} {:<15}",
             node.node_id.dimmed(),
-            node.role(),
-            format!("{:?}", node.status()).color(status_color),
+            node.role,
+            node.status.color(status_color),
             node.grpc_address.cyan()
         );
     }

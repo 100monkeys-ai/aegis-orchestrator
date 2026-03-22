@@ -60,6 +60,18 @@ Implemented top-level commands:
 
 Use the docs reference for the current syntax, flags, and command behavior.
 
+Scriptable CLI commands now support a global `--output <text|table|json|yaml>` flag for automation.
+Example:
+
+```bash
+target/debug/aegis --output json agent list
+target/debug/aegis --output yaml workflow describe hello-world
+target/debug/aegis config generate --out ./aegis-config.yaml
+```
+
+Streaming and interactive flows remain text-only: `init`, `up`, `down`, `restart`, `uninstall`,
+and the `logs`/`--follow` command paths.
+
 ### Edge Node (`edge-node/`)
 
 Lightweight binary for hybrid cloud/on-prem deployments.

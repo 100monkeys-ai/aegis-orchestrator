@@ -1137,6 +1137,12 @@ impl ConfigWizard {
       description: "Removes a completed or failed execution record by UUID."
       capabilities:
         - name: "aegis.task.remove"
+    - name: "aegis.task.logs"
+      enabled: true
+      description: "Returns paginated execution events for a task by UUID."
+      capabilities:
+        - name: "aegis.task.logs"
+          skip_judge: true
     - name: "aegis.system.info"
       enabled: true
       description: "Returns system version, status, and capabilities."
@@ -1505,4 +1511,87 @@ fn expand_tilde(path: &Path) -> PathBuf {
         }
     }
     path.to_path_buf()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_aegis_config_includes_task_logs_dispatcher() {
+        let wizard = ConfigWizard::new(true, PathBuf::from("/tmp"), None);
+        let config = NodeConfig {
+            node_name: "test-node".to_string(),
+            node_id: "test-node-id".to_string(),
+            ollama_model: "llama3.2:latest".to_string(),
+            api_key: None,
+            working_dir: PathBuf::from("/tmp"),
+            gemini_model: None,
+            openai_compatible_endpoint: None,
+            openai_compatible_model: None,
+            advanced: AdvancedConfig {
+                node_type: "hybrid".to_string(),
+                bind_address: "0.0.0.0".to_string(),
+                api_port: 8088,
+                log_level: "info".to_string(),
+                docker_network: "aegis-network".to_string(),
+                orchestrator_url: "http://aegis-runtime:8088".to_string(),
+                nfs_host: "127.0.0.1".to_string(),
+                keycloak_admin_password: "admin".to_string(),
+                openbao_secret_id: "test-secret-id".to_string(),
+                database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
+                temporal_worker_secret: "dev-temporal-secret".to_string(),
+                keep_container: false,
+                enable_lmstudio: false,
+                lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
+                lmstudio_smart_model: "google/gemma-3-4b".to_string(),
+                lmstudio_judge_model: "google/gemma-3-4b".to_string(),
+                enable_anthropic_extra: false,
+                anthropic_api_key: String::new(),
+                anthropic_smart_model: "claude-sonnet-4-5".to_string(),
+                anthropic_judge_model: "claude-sonnet-4-5".to_string(),
+                enable_gemini: false,
+                gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
+                    .to_string(),
+                gemini_api_key: String::new(),
+                gemini_smart_model: "gemini-2.5-flash".to_string(),
+                gemini_judge_model: "gemini-2.5-pro".to_string(),
+                deploy_smoketest_agents: None,
+                enable_otlp_logging: false,
+                otlp_endpoint: "http://localhost:4317".to_string(),
+                otlp_protocol: "grpc".to_string(),
+                otlp_min_level: "info".to_string(),
+                otlp_service_name: "aegis-orchestrator".to_string(),
+                enable_metrics: true,
+                metrics_port: 9091,
+                metrics_path: "/metrics".to_string(),
+                enable_cluster: false,
+                cluster_role: "hybrid".to_string(),
+                cluster_grpc_port: 50056,
+                cluster_controller_endpoint: "https://aegis-controller.example.com:50056"
+                    .to_string(),
+                cluster_token: "env:AEGIS_CLUSTER_TOKEN".to_string(),
+                cpu_cores: 4,
+                memory_gb: 16,
+                disk_gb: 100,
+                gpu_count: 0,
+                vram_gb: 0,
+            },
+        };
+        let components = SelectedComponents {
+            temporal: false,
+            storage: false,
+            iam: false,
+            secrets: false,
+            smcp_gateway: false,
+            ollama_llm: false,
+            observability: false,
+            llm: LlmChoice::Ollama,
+        };
+
+        let rendered = wizard.render_aegis_config(&config, &components, "test-tag");
+
+        assert!(rendered.contains("aegis.task.logs"));
+        assert!(rendered.contains("Returns paginated execution events for a task by UUID."));
+    }
 }

@@ -1345,6 +1345,24 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             },
         );
     }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.task.logs")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.task.logs".to_string(),
+                description: "Returns paginated execution events for a task by UUID.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.task.logs".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
 
     // aegis.system tools
     if !builtin_dispatchers

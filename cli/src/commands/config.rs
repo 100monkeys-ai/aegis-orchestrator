@@ -12,9 +12,12 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::Serialize;
 use std::path::PathBuf;
 
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
+
+use crate::output::{render_serialized, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -34,9 +37,9 @@ pub enum ConfigCommand {
 
     /// Generate sample configuration
     Generate {
-        /// Output path (default: ./aegis-config.yaml)
-        #[arg(short, long, default_value = "./aegis-config.yaml")]
-        output: PathBuf,
+        /// Destination path (default: ./aegis-config.yaml)
+        #[arg(short = 'o', long = "out", default_value = "./aegis-config.yaml")]
+        out: PathBuf,
 
         /// Include examples and comments
         #[arg(long)]
@@ -47,17 +50,68 @@ pub enum ConfigCommand {
 pub async fn handle_command(
     command: ConfigCommand,
     config_override: Option<PathBuf>,
+    output_format: OutputFormat,
 ) -> Result<()> {
     match command {
-        ConfigCommand::Show { paths } => show(config_override, paths).await,
-        ConfigCommand::Validate { file } => validate(file.or(config_override)).await,
-        ConfigCommand::Generate { output, examples } => generate(output, examples).await,
+        ConfigCommand::Show { paths } => show(config_override, paths, output_format).await,
+        ConfigCommand::Validate { file } => validate(file.or(config_override), output_format).await,
+        ConfigCommand::Generate { out, examples } => generate(out, examples, output_format).await,
     }
 }
 
-async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> {
+#[derive(Serialize)]
+struct ConfigShowOutput {
+    config: NodeConfigManifest,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    discovery_paths: Option<Vec<String>>,
+}
+
+#[derive(Serialize)]
+struct ConfigValidateOutput {
+    valid: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ConfigGenerateOutput {
+    path: String,
+    examples: bool,
+}
+
+async fn show(
+    config_override: Option<PathBuf>,
+    show_paths: bool,
+    output_format: OutputFormat,
+) -> Result<()> {
     let config = NodeConfigManifest::load_or_default(config_override.clone())
         .context("Failed to load configuration")?;
+
+    if output_format.is_structured() {
+        let discovery_paths = show_paths.then(|| {
+            vec![
+                config_override
+                    .as_ref()
+                    .map(|path| format!("--config: {}", path.display()))
+                    .unwrap_or_else(|| "--config: (not set)".to_string()),
+                format!(
+                    "AEGIS_CONFIG_PATH: {}",
+                    std::env::var("AEGIS_CONFIG_PATH").unwrap_or_else(|_| "(not set)".to_string())
+                ),
+                "./aegis-config.yaml".to_string(),
+                "~/.aegis/config.yaml".to_string(),
+                "/etc/aegis/config.yaml".to_string(),
+            ]
+        });
+
+        return render_serialized(
+            output_format,
+            &ConfigShowOutput {
+                config,
+                discovery_paths,
+            },
+        );
+    }
 
     if show_paths {
         println!("{}", "Configuration discovery paths:".bold());
@@ -147,22 +201,34 @@ async fn show(config_override: Option<PathBuf>, show_paths: bool) -> Result<()> 
     Ok(())
 }
 
-async fn validate(config_path: Option<PathBuf>) -> Result<()> {
-    println!("Validating configuration...");
+async fn validate(config_path: Option<PathBuf>, output_format: OutputFormat) -> Result<()> {
+    if !output_format.is_structured() {
+        println!("Validating configuration...");
+    }
 
-    let config =
-        NodeConfigManifest::load_or_default(config_path).context("Failed to load configuration")?;
+    let config = NodeConfigManifest::load_or_default(config_path.clone())
+        .context("Failed to load configuration")?;
 
     config
         .validate()
         .context("Configuration validation failed")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &ConfigValidateOutput {
+                valid: true,
+                path: config_path.map(|path| path.display().to_string()),
+            },
+        );
+    }
 
     println!("{}", "✓ Configuration is valid".green());
 
     Ok(())
 }
 
-async fn generate(output: PathBuf, with_examples: bool) -> Result<()> {
+async fn generate(output: PathBuf, with_examples: bool, output_format: OutputFormat) -> Result<()> {
     let sample = if with_examples {
         include_str!("../../templates/config-with-examples.yaml")
     } else {
@@ -171,6 +237,16 @@ async fn generate(output: PathBuf, with_examples: bool) -> Result<()> {
 
     std::fs::write(&output, sample)
         .with_context(|| format!("Failed to write config to {output:?}"))?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &ConfigGenerateOutput {
+                path: output.display().to_string(),
+                examples: with_examples,
+            },
+        );
+    }
 
     println!(
         "{}",

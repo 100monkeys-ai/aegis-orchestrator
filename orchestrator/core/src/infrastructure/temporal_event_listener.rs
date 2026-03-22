@@ -641,6 +641,16 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn find_by_workflow_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _workflow_id: crate::domain::workflow::WorkflowId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
+        }
+
         async fn update_temporal_linkage_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,

@@ -314,6 +314,17 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn find_by_workflow_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: WorkflowId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
     async fn find_events_by_execution(
         &self,
         _id: ExecutionId,
@@ -408,6 +419,16 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
     }
 
     async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn find_by_workflow_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: WorkflowId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
 

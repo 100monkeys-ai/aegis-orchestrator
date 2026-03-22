@@ -12,12 +12,14 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::Serialize;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
@@ -102,7 +104,12 @@ pub enum TaskCommand {
     },
 }
 
-pub async fn handle_command(command: TaskCommand, host: &str, port: u16) -> Result<()> {
+pub async fn handle_command(
+    command: TaskCommand,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
     let daemon_status = check_daemon_running(host, port).await;
 
     if let Ok(DaemonStatus::Unhealthy { pid, error }) = &daemon_status {
@@ -116,7 +123,7 @@ pub async fn handle_command(command: TaskCommand, host: &str, port: u16) -> Resu
         Ok(DaemonStatus::Running { .. }) => {
             info!("Delegating to daemon API");
             let client = DaemonClient::new(host, port)?;
-            handle_command_daemon(command, client).await
+            handle_command_daemon(command, client, output_format).await
         }
         _ => {
             anyhow::bail!("Daemon is not running. Start it with 'aegis-orchestrator daemon start'.")
@@ -124,7 +131,33 @@ pub async fn handle_command(command: TaskCommand, host: &str, port: u16) -> Resu
     }
 }
 
-async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Result<()> {
+#[derive(Serialize)]
+struct TaskExecuteOutput {
+    agent_id: Uuid,
+    execution_id: Uuid,
+    wait: bool,
+    follow: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_execution: Option<crate::daemon::client::ExecutionInfo>,
+}
+
+#[derive(Serialize)]
+struct TaskMutationOutput {
+    execution_id: Uuid,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct TaskListOutput {
+    count: usize,
+    executions: Vec<crate::daemon::client::ExecutionInfo>,
+}
+
+async fn handle_command_daemon(
+    command: TaskCommand,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     match command {
         TaskCommand::Execute {
             agent,
@@ -132,20 +165,32 @@ async fn handle_command_daemon(command: TaskCommand, client: DaemonClient) -> Re
             context,
             wait,
             follow,
-        } => execute_daemon(agent, input, context, wait, follow, client).await,
-        TaskCommand::Status { execution_id } => status_daemon(execution_id, client).await,
+        } => execute_daemon(agent, input, context, wait, follow, client, output_format).await,
+        TaskCommand::Status { execution_id } => {
+            status_daemon(execution_id, client, output_format).await
+        }
         TaskCommand::Logs {
             execution_id,
             follow,
             errors_only,
             verbose,
-        } => logs_daemon(execution_id, follow, errors_only, verbose, client).await,
+        } => {
+            if output_format.is_structured() {
+                structured_output_unsupported("aegis task logs", output_format)
+            } else {
+                logs_daemon(execution_id, follow, errors_only, verbose, client).await
+            }
+        }
         TaskCommand::Cancel {
             execution_id,
             force,
-        } => cancel_daemon(execution_id, force, client).await,
-        TaskCommand::Remove { execution_id } => remove_daemon(execution_id, client).await,
-        TaskCommand::List { agent_id, limit } => list_daemon(agent_id, limit, client).await,
+        } => cancel_daemon(execution_id, force, client, output_format).await,
+        TaskCommand::Remove { execution_id } => {
+            remove_daemon(execution_id, client, output_format).await
+        }
+        TaskCommand::List { agent_id, limit } => {
+            list_daemon(agent_id, limit, client, output_format).await
+        }
     }
 }
 
@@ -157,6 +202,7 @@ async fn execute_daemon(
     wait: bool,
     follow: bool,
     client: DaemonClient,
+    output_format: OutputFormat,
 ) -> Result<()> {
     // Parse agent (UUID or manifest path)
     // Parse agent (UUID, Name, or Manifest Path)
@@ -195,26 +241,67 @@ async fn execute_daemon(
     let input_data = parse_input(input).await?;
     let context_overrides = parse_object_input(context, "context override").await?;
 
-    println!("Executing agent {agent_id}...");
+    if output_format.is_structured() && follow {
+        return structured_output_unsupported("aegis task execute --follow", output_format);
+    }
+
+    if !output_format.is_structured() {
+        println!("Executing agent {agent_id}...");
+    }
 
     let execution_id = client
         .execute_agent(agent_id, input_data, context_overrides)
         .await?;
 
-    println!("{}", format!("✓ Execution started: {execution_id}").green());
-
     if follow {
         logs_daemon(execution_id, true, false, false, client).await?;
     } else if wait {
-        println!("Waiting for completion...");
-        wait_for_execution_completion(execution_id, &client).await?;
+        if !output_format.is_structured() {
+            println!("{}", format!("✓ Execution started: {execution_id}").green());
+            println!("Waiting for completion...");
+        }
+        let final_execution =
+            wait_for_execution_completion(execution_id, &client, output_format).await?;
+        if output_format.is_structured() {
+            return render_serialized(
+                output_format,
+                &TaskExecuteOutput {
+                    agent_id,
+                    execution_id,
+                    wait,
+                    follow,
+                    final_execution: Some(final_execution),
+                },
+            );
+        }
+    } else if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &TaskExecuteOutput {
+                agent_id,
+                execution_id,
+                wait,
+                follow,
+                final_execution: None,
+            },
+        );
+    } else {
+        println!("{}", format!("✓ Execution started: {execution_id}").green());
     }
 
     Ok(())
 }
 
-async fn status_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
+async fn status_daemon(
+    execution_id: Uuid,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     let execution = client.get_execution(execution_id).await?;
+
+    if output_format.is_structured() {
+        return render_serialized(output_format, &execution);
+    }
 
     println!("Execution {execution_id}");
     println!("  Status: {}", format_status(&execution.status));
@@ -242,8 +329,22 @@ async fn logs_daemon(
     Ok(())
 }
 
-async fn cancel_daemon(execution_id: Uuid, _force: bool, client: DaemonClient) -> Result<()> {
+async fn cancel_daemon(
+    execution_id: Uuid,
+    _force: bool,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     client.cancel_execution(execution_id).await?;
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &TaskMutationOutput {
+                execution_id,
+                status: "cancelled",
+            },
+        );
+    }
     println!(
         "{}",
         format!("✓ Execution {execution_id} cancelled").green()
@@ -251,8 +352,23 @@ async fn cancel_daemon(execution_id: Uuid, _force: bool, client: DaemonClient) -
     Ok(())
 }
 
-async fn list_daemon(agent_id: Option<Uuid>, limit: usize, client: DaemonClient) -> Result<()> {
+async fn list_daemon(
+    agent_id: Option<Uuid>,
+    limit: usize,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     let executions = client.list_executions(agent_id, limit).await?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &TaskListOutput {
+                count: executions.len(),
+                executions,
+            },
+        );
+    }
 
     if executions.is_empty() {
         println!("{}", "No executions found".yellow());
@@ -303,8 +419,7 @@ async fn parse_object_input(
         return Ok(None);
     };
 
-    let value = if raw.starts_with('@') {
-        let path = &raw[1..];
+    let value = if let Some(path) = raw.strip_prefix('@') {
         let content = tokio::fs::read_to_string(path)
             .await
             .with_context(|| format!("Failed to read {label} file: {path}"))?;
@@ -327,7 +442,11 @@ fn parse_json_or_yaml(input: &str) -> Result<serde_json::Value> {
         .context("Invalid JSON or YAML")
 }
 
-async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {
+async fn wait_for_execution_completion(
+    execution_id: Uuid,
+    client: &DaemonClient,
+    output_format: OutputFormat,
+) -> Result<crate::daemon::client::ExecutionInfo> {
     const MAX_POLLS: u32 = 300;
     const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -338,11 +457,13 @@ async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient
             normalized.as_str(),
             "completed" | "failed" | "cancelled" | "canceled"
         ) {
-            println!(
-                "Execution {} finished with status: {}",
-                execution.id, execution.status
-            );
-            return Ok(());
+            if !output_format.is_structured() {
+                println!(
+                    "Execution {} finished with status: {}",
+                    execution.id, execution.status
+                );
+            }
+            return Ok(execution);
         }
         tokio::time::sleep(POLL_INTERVAL).await;
     }
@@ -360,8 +481,21 @@ fn format_status(status: &str) -> colored::ColoredString {
     }
 }
 
-async fn remove_daemon(execution_id: Uuid, client: DaemonClient) -> Result<()> {
+async fn remove_daemon(
+    execution_id: Uuid,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     client.delete_execution(execution_id).await?;
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &TaskMutationOutput {
+                execution_id,
+                status: "removed",
+            },
+        );
+    }
     println!("{}", format!("✓ Execution {execution_id} removed").green());
     Ok(())
 }

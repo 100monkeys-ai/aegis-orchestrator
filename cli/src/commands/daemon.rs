@@ -12,10 +12,12 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::Serialize;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
 use crate::daemon::{check_daemon_running, stop_daemon, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]
@@ -57,17 +59,65 @@ pub async fn handle_command(
     config_path: Option<PathBuf>,
     host: &str,
     port: u16,
+    output_format: OutputFormat,
 ) -> Result<()> {
     match command {
-        DaemonCommand::Start => start(config_path, host, port).await,
-        DaemonCommand::Stop { force, timeout } => stop(force, timeout, host, port).await,
-        DaemonCommand::Status => status(host, port).await,
-        DaemonCommand::Install { binary_path, user } => install(binary_path, user).await,
-        DaemonCommand::Uninstall => uninstall().await,
+        DaemonCommand::Start => start(config_path, host, port, output_format).await,
+        DaemonCommand::Stop { force, timeout } => {
+            stop(force, timeout, host, port, output_format).await
+        }
+        DaemonCommand::Status => status(host, port, output_format).await,
+        DaemonCommand::Install { binary_path, user } => {
+            if output_format.is_structured() {
+                structured_output_unsupported("aegis daemon install", output_format)
+            } else {
+                install(binary_path, user).await
+            }
+        }
+        DaemonCommand::Uninstall => {
+            if output_format.is_structured() {
+                structured_output_unsupported("aegis daemon uninstall", output_format)
+            } else {
+                uninstall().await
+            }
+        }
     }
 }
 
-async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()> {
+#[derive(Serialize)]
+struct DaemonStartOutput {
+    status: &'static str,
+    pid: u32,
+    stdout_log: String,
+    stderr_log: String,
+}
+
+#[derive(Serialize)]
+struct DaemonStopOutput {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    force: bool,
+    timeout_seconds: u64,
+}
+
+#[derive(Serialize)]
+struct DaemonStatusOutput {
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    uptime_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+async fn start(
+    config_path: Option<PathBuf>,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
     // 1. Validation: Load config to check for existence and validity
     // logic in NodeConfigManifest::load_or_default handles explicit path check (errors if missing)
     let config = NodeConfigManifest::load_or_default(config_path.clone())
@@ -89,6 +139,17 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
 
     match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, .. }) => {
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStartOutput {
+                        status: "already_running",
+                        pid,
+                        stdout_log: std::env::temp_dir().join("aegis.out").display().to_string(),
+                        stderr_log: std::env::temp_dir().join("aegis.err").display().to_string(),
+                    },
+                );
+            }
             println!(
                 "{}",
                 format!("✓ Daemon already running (PID: {pid})").green()
@@ -143,10 +204,21 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
         .stdout(stdout_file)
         .stderr(stderr_file);
 
-    println!("Redirecting logs to: {}", stdout_path.display());
-
     let child = cmd.spawn().context("Failed to spawn daemon process")?;
 
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &DaemonStartOutput {
+                status: "starting",
+                pid: child.id(),
+                stdout_log: stdout_path.display().to_string(),
+                stderr_log: stderr_path.display().to_string(),
+            },
+        );
+    }
+
+    println!("Redirecting logs to: {}", stdout_path.display());
     println!(
         "{}",
         format!("✓ Daemon starting (PID: {})", child.id()).green()
@@ -156,17 +228,47 @@ async fn start(config_path: Option<PathBuf>, host: &str, port: u16) -> Result<()
     Ok(())
 }
 
-async fn stop(force: bool, timeout: u64, host: &str, port: u16) -> Result<()> {
+async fn stop(
+    force: bool,
+    timeout: u64,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
     info!("Stopping daemon...");
 
     match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Stopped) => {
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStopOutput {
+                        status: "not_running",
+                        pid: None,
+                        force,
+                        timeout_seconds: timeout,
+                    },
+                );
+            }
             println!("{}", "ℹ Daemon not running".yellow());
             return Ok(());
         }
         Ok(DaemonStatus::Running { pid, .. }) | Ok(DaemonStatus::Unhealthy { pid, .. }) => {
-            println!("Stopping daemon (PID: {pid})...");
+            if !output_format.is_structured() {
+                println!("Stopping daemon (PID: {pid})...");
+            }
             stop_daemon(force, timeout).await?;
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStopOutput {
+                        status: "stopped",
+                        pid: Some(pid),
+                        force,
+                        timeout_seconds: timeout,
+                    },
+                );
+            }
             println!("{}", "✓ Daemon stopped".green());
         }
         Err(e) => {
@@ -178,9 +280,20 @@ async fn stop(force: bool, timeout: u64, host: &str, port: u16) -> Result<()> {
     Ok(())
 }
 
-async fn status(host: &str, port: u16) -> Result<()> {
+async fn status(host: &str, port: u16, output_format: OutputFormat) -> Result<()> {
     match check_daemon_running(host, port).await {
         Ok(DaemonStatus::Running { pid, uptime }) => {
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStatusOutput {
+                        status: "running",
+                        pid: Some(pid),
+                        uptime_seconds: uptime,
+                        error: None,
+                    },
+                );
+            }
             println!("{}", "✓ Daemon is running".green());
             println!("  PID: {pid}");
             if let Some(uptime) = uptime {
@@ -188,9 +301,31 @@ async fn status(host: &str, port: u16) -> Result<()> {
             }
         }
         Ok(DaemonStatus::Stopped) => {
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStatusOutput {
+                        status: "stopped",
+                        pid: None,
+                        uptime_seconds: None,
+                        error: None,
+                    },
+                );
+            }
             println!("{}", "✗ Daemon is not running".red());
         }
         Ok(DaemonStatus::Unhealthy { pid, error }) => {
+            if output_format.is_structured() {
+                return render_serialized(
+                    output_format,
+                    &DaemonStatusOutput {
+                        status: "unhealthy",
+                        pid: Some(pid),
+                        uptime_seconds: None,
+                        error: Some(error),
+                    },
+                );
+            }
             println!("{}", format!("⚠ Daemon unhealthy (PID: {pid})").yellow());
             println!("  Process exists but HTTP API check failed: {error}");
             println!("  Check logs at /tmp/aegis.out and /tmp/aegis.err");

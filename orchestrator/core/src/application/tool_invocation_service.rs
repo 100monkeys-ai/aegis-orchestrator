@@ -73,7 +73,8 @@ pub struct ToolInvocationService {
     validation_service: Option<Arc<ValidationService>>,
     /// Optional workflow repository for managing workflows.
     workflow_repository: Option<Arc<dyn crate::domain::repository::WorkflowRepository>>,
-    /// Optional workflow execution repository for `aegis.workflow.logs`.
+    /// Optional workflow execution repository for `aegis.workflow.logs` and
+    /// `aegis.task.logs`.
     workflow_execution_repo:
         Option<Arc<dyn crate::domain::repository::WorkflowExecutionRepository>>,
     /// Optional workflow execution use case.
@@ -157,7 +158,8 @@ impl ToolInvocationService {
         self
     }
 
-    /// Attach a `WorkflowExecutionRepository` to enable `aegis.workflow.logs`.
+    /// Attach a `WorkflowExecutionRepository` to enable `aegis.workflow.logs`
+    /// and `aegis.task.logs`.
     pub fn with_workflow_execution_repo(
         mut self,
         repo: Arc<dyn crate::domain::repository::WorkflowExecutionRepository>,
@@ -659,9 +661,7 @@ impl ToolInvocationService {
                                             format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
-                                                result.score,
-                                                min_score,
-                                                result.reasoning,
+                                                result.score, min_score, result.reasoning,
                                             ),
                                         ));
                                     }
@@ -824,8 +824,86 @@ impl ToolInvocationService {
             }
             return result;
         }
+        if tool_name == "aegis.workflow.validate" {
+            let result = self.invoke_aegis_workflow_validate_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
         if tool_name == "aegis.workflow.run" {
             let result = self.invoke_aegis_workflow_run_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.executions.list" {
+            let result = self.invoke_aegis_workflow_execution_list_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.executions.get" {
+            let result = self.invoke_aegis_workflow_execution_get_tool(&args).await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                     invocation_id,
@@ -930,6 +1008,32 @@ impl ToolInvocationService {
         }
         if tool_name == "aegis.task.status" {
             let result = self.invoke_aegis_task_status_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.task.logs" {
+            let result = self.invoke_aegis_task_logs_tool(&args).await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                     invocation_id,
@@ -1772,6 +1876,58 @@ impl ToolInvocationService {
         }
     }
 
+    async fn invoke_aegis_workflow_validate_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.workflow.validate requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+
+        let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
+            Ok(workflow) => workflow,
+            Err(error) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.validate",
+                    "valid": false,
+                    "deterministic_validation": {
+                        "passed": false,
+                        "error": format!("Workflow parser validation failed: {error}"),
+                    },
+                })));
+            }
+        };
+
+        if let Err(error) = WorkflowValidator::check_for_cycles(&workflow) {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.validate",
+                "valid": false,
+                "deterministic_validation": {
+                    "passed": false,
+                    "error": format!("Workflow cycle validation failed: {error}"),
+                },
+            })));
+        }
+
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.workflow.validate",
+            "valid": true,
+            "deterministic_validation": { "passed": true },
+            "workflow": {
+                "workflow_id": workflow.id.to_string(),
+                "name": workflow.metadata.name,
+                "version": workflow.metadata.version.clone().unwrap_or_default(),
+                "state_count": workflow.spec.states.len(),
+                "initial_state": workflow.spec.initial_state.as_str(),
+            },
+        })))
+    }
+
     async fn invoke_aegis_workflow_run_tool(
         &self,
         args: &Value,
@@ -1784,6 +1940,7 @@ impl ToolInvocationService {
         })?;
 
         let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let blackboard = args.get("blackboard").cloned();
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,
@@ -1800,7 +1957,7 @@ impl ToolInvocationService {
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: name.to_string(),
                     input,
-                    blackboard: None,
+                    blackboard,
                     tenant_id: Some(tenant_id.clone()),
                 },
             )
@@ -1814,6 +1971,158 @@ impl ToolInvocationService {
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.run",
                 "error": format!("Failed to start workflow: {e}")
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_workflow_execution_list_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let limit: usize = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(200))
+            .unwrap_or(20);
+        let offset: usize = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+
+        let repo = match &self.workflow_execution_repo {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.executions.list",
+                    "error": "Workflow execution repository not configured"
+                })));
+            }
+        };
+
+        let executions = if let Some(workflow_ref) =
+            args.get("workflow_id").and_then(|v| v.as_str())
+        {
+            let workflow_id = if let Ok(uuid) = uuid::Uuid::parse_str(workflow_ref) {
+                crate::domain::workflow::WorkflowId(uuid)
+            } else if let Some(workflow_repo) = &self.workflow_repository {
+                match workflow_repo
+                    .find_by_name_for_tenant(&tenant_id, workflow_ref)
+                    .await
+                {
+                    Ok(Some(workflow)) => workflow.id,
+                    Ok(None) => {
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.workflow.executions.list",
+                            "error": format!("Workflow '{workflow_ref}' not found")
+                        })));
+                    }
+                    Err(error) => {
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.workflow.executions.list",
+                            "error": format!("Failed to resolve workflow '{workflow_ref}': {error}")
+                        })));
+                    }
+                }
+            } else {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.executions.list",
+                    "error": format!("workflow_id '{workflow_ref}' is not a UUID and workflow repository is not configured")
+                })));
+            };
+
+            repo.find_by_workflow_for_tenant(&tenant_id, workflow_id, limit, offset)
+                .await
+        } else {
+            repo.list_paginated_for_tenant(&tenant_id, limit, offset)
+                .await
+        };
+
+        match executions {
+            Ok(executions) => {
+                let items: Vec<Value> = executions
+                    .into_iter()
+                    .map(|execution| {
+                        serde_json::json!({
+                            "execution_id": execution.id.to_string(),
+                            "workflow_id": execution.workflow_id.to_string(),
+                            "status": format!("{:?}", execution.status).to_lowercase(),
+                            "current_state": execution.current_state.as_str(),
+                            "started_at": execution.started_at,
+                            "last_transition_at": execution.last_transition_at,
+                        })
+                    })
+                    .collect();
+
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.executions.list",
+                    "count": items.len(),
+                    "executions": items,
+                    "limit": limit,
+                    "offset": offset,
+                })))
+            }
+            Err(error) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.executions.list",
+                "error": format!("Failed to list workflow executions: {error}")
+            }))),
+        }
+    }
+
+    async fn invoke_aegis_workflow_execution_get_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let execution_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.executions.get requires 'execution_id' string".to_string(),
+                )
+            })?;
+        let execution_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.workflow.executions.get: invalid execution_id UUID: {error}"
+                ))
+            })?,
+        );
+
+        let repo = match &self.workflow_execution_repo {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.executions.get",
+                    "error": "Workflow execution repository not configured"
+                })));
+            }
+        };
+
+        match repo.find_by_id_for_tenant(&tenant_id, execution_id).await {
+            Ok(Some(execution)) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.executions.get",
+                "execution": {
+                    "execution_id": execution.id.to_string(),
+                    "workflow_id": execution.workflow_id.to_string(),
+                    "status": format!("{:?}", execution.status).to_lowercase(),
+                    "current_state": execution.current_state.as_str(),
+                    "input": execution.input,
+                    "blackboard": execution.blackboard.data(),
+                    "state_outputs": execution.state_outputs,
+                    "started_at": execution.started_at,
+                    "last_transition_at": execution.last_transition_at,
+                }
+            }))),
+            Ok(None) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.executions.get",
+                "error": format!("Workflow execution '{execution_id_str}' not found")
+            }))),
+            Err(error) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.executions.get",
+                "error": format!("Failed to fetch workflow execution: {error}")
             }))),
         }
     }
@@ -2034,6 +2343,80 @@ impl ToolInvocationService {
                 "error": format!("Failed to get execution: {e}")
             }))),
         }
+    }
+
+    async fn invoke_aegis_task_logs_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let exec_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.task.logs requires 'execution_id' string".to_string(),
+                )
+            })?;
+
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.task.logs: invalid execution_id UUID: {e}"
+                ))
+            })?,
+        );
+
+        let limit: usize = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(200))
+            .unwrap_or(50);
+        let offset: usize = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+
+        let execution = match self.execution_service.get_execution(exec_id).await {
+            Ok(execution) => execution,
+            Err(error) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.logs",
+                    "error": format!("Failed to fetch execution: {error}")
+                })));
+            }
+        };
+
+        let repo = match &self.workflow_execution_repo {
+            Some(repo) => repo.clone(),
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.logs",
+                    "error": "Workflow execution repository not configured"
+                })));
+            }
+        };
+
+        let events = match repo.find_events_by_execution(exec_id, limit, offset).await {
+            Ok(events) => events,
+            Err(error) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.logs",
+                    "error": format!("Failed to fetch execution events: {error}")
+                })));
+            }
+        };
+
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.task.logs",
+            "execution_id": exec_id_str,
+            "agent_id": execution.agent_id.0.to_string(),
+            "status": format!("{:?}", execution.status).to_lowercase(),
+            "events": events,
+            "total": events.len(),
+            "limit": limit,
+            "offset": offset,
+        })))
     }
 
     async fn invoke_aegis_task_list_tool(
@@ -2417,7 +2800,7 @@ impl ToolInvocationService {
                             return Ok(ToolInvocationResult::Direct(serde_json::json!({
                                 "tool": "aegis.workflow.export",
                                 "error": "Workflow not found"
-                            })))
+                            })));
                         }
                     }
                 } else {
@@ -2875,10 +3258,18 @@ mod tests {
 
     use crate::domain::agent::{Agent, AgentManifest};
     use crate::domain::events::ExecutionEvent;
-    use crate::domain::execution::{Execution, Iteration};
+    use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus, Iteration};
+    use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
+    use crate::domain::workflow::WorkflowExecutionEventRecord;
     use crate::infrastructure::event_bus::DomainEvent;
+    use crate::infrastructure::repositories::{
+        InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+    };
     use futures::Stream;
+    use std::collections::HashMap;
     use std::pin::Pin;
+    use std::sync::RwLock;
+    use tokio::sync::Mutex;
 
     struct TestAgentLifecycleService;
     #[async_trait]
@@ -3007,6 +3398,275 @@ mod tests {
         }
     }
 
+    struct LogsTestExecutionService {
+        execution: Execution,
+    }
+
+    #[async_trait]
+    impl ExecutionService for LogsTestExecutionService {
+        async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+            anyhow::bail!("LogsTestExecutionService::start_execution not exercised in this test")
+        }
+
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!(
+                "LogsTestExecutionService::start_child_execution not exercised in this test"
+            )
+        }
+
+        async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+            if self.execution.id == id {
+                Ok(self.execution.clone())
+            } else {
+                anyhow::bail!("execution not found")
+            }
+        }
+
+        async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+            anyhow::bail!("LogsTestExecutionService::get_iterations not exercised in this test")
+        }
+
+        async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("LogsTestExecutionService::cancel_execution not exercised in this test")
+        }
+
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("LogsTestExecutionService::stream_execution not exercised in this test")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!(
+                "LogsTestExecutionService::stream_agent_events not exercised in this test"
+            )
+        }
+
+        async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+            anyhow::bail!("LogsTestExecutionService::list_executions not exercised in this test")
+        }
+
+        async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("LogsTestExecutionService::delete_execution not exercised in this test")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            anyhow::bail!(
+                "LogsTestExecutionService::record_llm_interaction not exercised in this test"
+            )
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            anyhow::bail!(
+                "LogsTestExecutionService::store_iteration_trajectory not exercised in this test"
+            )
+        }
+    }
+
+    #[derive(Default)]
+    struct StubWorkflowExecutionRepository {
+        events: RwLock<HashMap<ExecutionId, Vec<WorkflowExecutionEventRecord>>>,
+    }
+
+    impl StubWorkflowExecutionRepository {
+        fn with_events(
+            execution_id: ExecutionId,
+            events: Vec<WorkflowExecutionEventRecord>,
+        ) -> Self {
+            let mut by_execution = HashMap::new();
+            by_execution.insert(execution_id, events);
+            Self {
+                events: RwLock::new(by_execution),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
+        async fn save_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _execution: &crate::domain::workflow::WorkflowExecution,
+        ) -> Result<(), crate::domain::repository::RepositoryError> {
+            Ok(())
+        }
+
+        async fn find_by_id_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _id: ExecutionId,
+        ) -> Result<
+            Option<crate::domain::workflow::WorkflowExecution>,
+            crate::domain::repository::RepositoryError,
+        > {
+            Ok(None)
+        }
+
+        async fn find_active_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<
+            Vec<crate::domain::workflow::WorkflowExecution>,
+            crate::domain::repository::RepositoryError,
+        > {
+            Ok(vec![])
+        }
+
+        async fn find_by_workflow_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _workflow_id: crate::domain::workflow::WorkflowId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<
+            Vec<crate::domain::workflow::WorkflowExecution>,
+            crate::domain::repository::RepositoryError,
+        > {
+            Ok(vec![])
+        }
+
+        async fn list_paginated_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<
+            Vec<crate::domain::workflow::WorkflowExecution>,
+            crate::domain::repository::RepositoryError,
+        > {
+            Ok(vec![])
+        }
+
+        async fn update_temporal_linkage_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _execution_id: ExecutionId,
+            _temporal_workflow_id: &str,
+            _temporal_run_id: &str,
+        ) -> Result<(), crate::domain::repository::RepositoryError> {
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            execution_id: ExecutionId,
+            temporal_sequence_number: i64,
+            event_type: String,
+            payload: serde_json::Value,
+            iteration_number: Option<u8>,
+        ) -> Result<(), crate::domain::repository::RepositoryError> {
+            let mut events = self.events.write().unwrap();
+            events
+                .entry(execution_id)
+                .or_default()
+                .push(WorkflowExecutionEventRecord {
+                    sequence: temporal_sequence_number,
+                    event_type,
+                    state_name: None,
+                    iteration_number,
+                    payload,
+                    recorded_at: chrono::Utc::now(),
+                });
+            Ok(())
+        }
+
+        async fn find_events_by_execution(
+            &self,
+            id: ExecutionId,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<WorkflowExecutionEventRecord>, crate::domain::repository::RepositoryError>
+        {
+            let events = self
+                .events
+                .read()
+                .unwrap()
+                .get(&id)
+                .cloned()
+                .unwrap_or_default();
+            Ok(events.into_iter().skip(offset).take(limit).collect())
+        }
+    }
+
+    #[derive(Default)]
+    struct TestStartWorkflowExecutionUseCase {
+        last_request: Mutex<
+            Option<crate::application::start_workflow_execution::StartWorkflowExecutionRequest>,
+        >,
+    }
+
+    #[async_trait]
+    impl StartWorkflowExecutionUseCase for TestStartWorkflowExecutionUseCase {
+        async fn start_execution_for_tenant(
+            &self,
+            tenant_id: &TenantId,
+            mut request: crate::application::start_workflow_execution::StartWorkflowExecutionRequest,
+        ) -> Result<crate::application::start_workflow_execution::StartedWorkflowExecution>
+        {
+            request.tenant_id = Some(tenant_id.clone());
+            *self.last_request.lock().await = Some(request.clone());
+
+            Ok(
+                crate::application::start_workflow_execution::StartedWorkflowExecution {
+                    execution_id: ExecutionId::new().to_string(),
+                    workflow_id: request.workflow_id,
+                    temporal_run_id: "temporal-run-id".to_string(),
+                    status: "started".to_string(),
+                    started_at: chrono::Utc::now(),
+                },
+            )
+        }
+    }
+
+    fn test_workflow_manifest_yaml(name: &str) -> String {
+        format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: Agent
+      agent: builder
+      input: "{{{{workflow.task}}}}"
+      transitions:
+        - condition: always
+          target: END
+    END:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#
+        )
+    }
+
+    fn build_test_workflow(name: &str) -> crate::domain::workflow::Workflow {
+        WorkflowParser::parse_yaml(&test_workflow_manifest_yaml(name))
+            .expect("test workflow manifest should parse")
+    }
+
     #[tokio::test]
     async fn test_invoke_tool_no_session() {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
@@ -3091,6 +3751,341 @@ mod tests {
             result,
             Err(SmcpSessionError::SignatureVerificationFailed(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn workflow_validate_tool_returns_success_for_valid_manifest() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        );
+
+        let result = service
+            .invoke_aegis_workflow_validate_tool(&serde_json::json!({
+                "manifest_yaml": test_workflow_manifest_yaml("validate-me"),
+            }))
+            .await
+            .expect("workflow validate should return a result");
+
+        let ToolInvocationResult::Direct(payload) = result else {
+            panic!("expected direct payload");
+        };
+
+        assert_eq!(payload["tool"], "aegis.workflow.validate");
+        assert_eq!(payload["valid"], true);
+        assert_eq!(payload["workflow"]["name"], "validate-me");
+    }
+
+    #[tokio::test]
+    async fn workflow_run_tool_forwards_blackboard() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+        let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        )
+        .with_workflow_execution(start_use_case.clone());
+
+        let result = service
+            .invoke_aegis_workflow_run_tool(&serde_json::json!({
+                "name": "run-me",
+                "input": { "job": "demo" },
+                "blackboard": { "priority": "high" },
+            }))
+            .await
+            .expect("workflow run should return a result");
+
+        let ToolInvocationResult::Direct(payload) = result else {
+            panic!("expected direct payload");
+        };
+
+        assert_eq!(payload["tool"], "aegis.workflow.run");
+        assert_eq!(payload["status"], "started");
+
+        let request = start_use_case
+            .last_request
+            .lock()
+            .await
+            .clone()
+            .expect("workflow run should record the request");
+        assert_eq!(
+            request.blackboard,
+            Some(serde_json::json!({ "priority": "high" }))
+        );
+    }
+
+    #[tokio::test]
+    async fn workflow_execution_tools_list_and_get() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let tenant_id = TenantId::local_default();
+        let workflow = build_test_workflow("execution-list");
+
+        workflow_repo
+            .save_for_tenant(&tenant_id, &workflow)
+            .await
+            .expect("workflow should save");
+
+        let mut execution = crate::domain::workflow::WorkflowExecution::new(
+            &workflow,
+            ExecutionId::new(),
+            serde_json::json!({ "task": "demo" }),
+        );
+        execution
+            .blackboard
+            .set("priority".to_string(), serde_json::json!("high"));
+        workflow_execution_repo
+            .save_for_tenant(&tenant_id, &execution)
+            .await
+            .expect("workflow execution should save");
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        )
+        .with_workflow_repository(workflow_repo)
+        .with_workflow_execution_repo(workflow_execution_repo);
+
+        let list_result = service
+            .invoke_aegis_workflow_execution_list_tool(&serde_json::json!({
+                "workflow_id": workflow.id.to_string(),
+            }))
+            .await
+            .expect("workflow execution list should return a result");
+        let ToolInvocationResult::Direct(list_payload) = list_result else {
+            panic!("expected direct list payload");
+        };
+        assert_eq!(list_payload["tool"], "aegis.workflow.executions.list");
+        assert_eq!(list_payload["count"], 1);
+        assert_eq!(
+            list_payload["executions"][0]["execution_id"],
+            execution.id.to_string()
+        );
+
+        let get_result = service
+            .invoke_aegis_workflow_execution_get_tool(&serde_json::json!({
+                "execution_id": execution.id.to_string(),
+            }))
+            .await
+            .expect("workflow execution get should return a result");
+        let ToolInvocationResult::Direct(get_payload) = get_result else {
+            panic!("expected direct get payload");
+        };
+        assert_eq!(get_payload["tool"], "aegis.workflow.executions.get");
+        assert_eq!(
+            get_payload["execution"]["execution_id"],
+            execution.id.to_string()
+        );
+        assert_eq!(get_payload["execution"]["blackboard"]["priority"], "high");
+    }
+
+    #[tokio::test]
+    async fn task_logs_tool_returns_paginated_execution_events() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+
+        let agent_id = AgentId::new();
+        let mut execution = Execution::new(
+            agent_id,
+            ExecutionInput {
+                intent: None,
+                payload: serde_json::json!({"task":"demo"}),
+            },
+            3,
+        );
+        execution.status = ExecutionStatus::Running;
+
+        let workflow_execution_repo = Arc::new(StubWorkflowExecutionRepository::with_events(
+            execution.id,
+            vec![
+                WorkflowExecutionEventRecord {
+                    sequence: 1,
+                    event_type: "ExecutionStarted".to_string(),
+                    state_name: None,
+                    iteration_number: None,
+                    payload: serde_json::json!({"message":"started"}),
+                    recorded_at: chrono::Utc::now(),
+                },
+                WorkflowExecutionEventRecord {
+                    sequence: 2,
+                    event_type: "ConsoleOutput".to_string(),
+                    state_name: None,
+                    iteration_number: Some(1),
+                    payload: serde_json::json!({"stream":"stdout","content":"hello"}),
+                    recorded_at: chrono::Utc::now(),
+                },
+                WorkflowExecutionEventRecord {
+                    sequence: 3,
+                    event_type: "IterationCompleted".to_string(),
+                    state_name: None,
+                    iteration_number: Some(1),
+                    payload: serde_json::json!({"result":"ok"}),
+                    recorded_at: chrono::Utc::now(),
+                },
+            ],
+        ));
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(LogsTestExecutionService {
+                execution: execution.clone(),
+            }),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        )
+        .with_workflow_execution_repo(workflow_execution_repo);
+
+        let result = service
+            .invoke_aegis_task_logs_tool(&serde_json::json!({
+                "execution_id": execution.id.to_string(),
+                "limit": 500,
+                "offset": 1,
+            }))
+            .await
+            .expect("task logs should return a result");
+
+        let ToolInvocationResult::Direct(payload) = result else {
+            panic!("expected direct task logs payload");
+        };
+
+        assert_eq!(payload["tool"], "aegis.task.logs");
+        assert_eq!(payload["execution_id"], execution.id.to_string());
+        assert_eq!(payload["agent_id"], agent_id.0.to_string());
+        assert_eq!(payload["status"], "running");
+        assert_eq!(payload["limit"], 200);
+        assert_eq!(payload["offset"], 1);
+        assert_eq!(payload["total"], 2);
+        assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+        assert_eq!(payload["events"][0]["sequence"], 2);
+    }
+
+    #[tokio::test]
+    async fn task_logs_tool_returns_execution_fetch_error() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+        let missing_execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: None,
+                payload: serde_json::json!({}),
+            },
+            1,
+        );
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(LogsTestExecutionService {
+                execution: missing_execution,
+            }),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        )
+        .with_workflow_execution_repo(Arc::new(StubWorkflowExecutionRepository::default()));
+
+        let result = service
+            .invoke_aegis_task_logs_tool(&serde_json::json!({
+                "execution_id": ExecutionId::new().to_string(),
+            }))
+            .await
+            .expect("task logs should return direct error payload");
+
+        let ToolInvocationResult::Direct(payload) = result else {
+            panic!("expected direct task logs error payload");
+        };
+
+        assert_eq!(payload["tool"], "aegis.task.logs");
+        assert!(payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to fetch execution"));
     }
 
     #[tokio::test]

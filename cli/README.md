@@ -34,11 +34,38 @@ aegis agent deploy agent.yaml
 # 3. Run a task
 aegis task execute my-agent --input "Summarise the README"
 
-# 4. Stream logs
+# 4. Use machine-readable output for automation
+aegis --output json agent list
+aegis --output yaml workflow describe my-workflow
+
+# 5. Stream logs
 aegis agent logs my-agent
 
-# 5. Stop the daemon
+# 6. Stop the daemon
 aegis daemon stop
+```
+
+## Output Formats
+
+Scriptable commands support a global `--output <text|table|json|yaml>` flag.
+Use `json` or `yaml` for automation, and keep the default text/table output for operator workflows.
+
+Examples:
+
+```bash
+aegis --output json daemon status
+aegis --output json task list
+aegis --output yaml config show
+```
+
+Streaming and interactive commands remain text-only in this pass, including:
+`aegis init`, `aegis up`, `aegis down`, `aegis restart`, `aegis uninstall`,
+`aegis task logs`, `aegis agent logs`, and `aegis workflow logs`.
+
+`aegis config generate` now uses `--out <path>` for the destination file:
+
+```bash
+aegis config generate --out ./aegis-config.yaml
 ```
 
 ## Command Surface

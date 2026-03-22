@@ -271,6 +271,14 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         tenant_id: &TenantId,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
 
+    async fn find_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
+
     async fn list_paginated_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -301,6 +309,16 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         &self,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
         self.find_active_for_tenant(&TenantId::local_default())
+            .await
+    }
+
+    async fn find_by_workflow(
+        &self,
+        workflow_id: crate::domain::workflow::WorkflowId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        self.find_by_workflow_for_tenant(&TenantId::local_default(), workflow_id, limit, offset)
             .await
     }
 

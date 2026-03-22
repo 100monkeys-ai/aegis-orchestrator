@@ -391,6 +391,26 @@ mod tests {
             Ok(self.executions.lock().unwrap().values().cloned().collect())
         }
 
+        async fn find_by_workflow_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            workflow_id: crate::domain::workflow::WorkflowId,
+            limit: usize,
+            offset: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            let mut matches: Vec<_> = self
+                .executions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|execution| execution.workflow_id == workflow_id)
+                .cloned()
+                .collect();
+            matches.sort_by_key(|execution| execution.started_at);
+            matches.reverse();
+            Ok(matches.into_iter().skip(offset).take(limit).collect())
+        }
+
         async fn update_temporal_linkage_for_tenant(
             &self,
             tenant_id: &TenantId,

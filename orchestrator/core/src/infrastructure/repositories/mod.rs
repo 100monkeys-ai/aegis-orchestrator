@@ -504,6 +504,28 @@ impl crate::domain::repository::WorkflowExecutionRepository
             .collect())
     }
 
+    async fn find_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let mut list: Vec<_> = executions
+            .get(tenant_id)
+            .map(|tenant_execs| {
+                tenant_execs
+                    .values()
+                    .filter(|execution| execution.workflow_id == workflow_id)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        list.sort_by(|a, b| b.started_at.cmp(&a.started_at));
+        Ok(list.into_iter().skip(offset).take(limit).collect())
+    }
+
     async fn update_temporal_linkage_for_tenant(
         &self,
         _tenant_id: &TenantId,

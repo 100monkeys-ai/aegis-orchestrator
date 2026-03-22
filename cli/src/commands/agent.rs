@@ -13,11 +13,13 @@
 use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
+use serde::Serialize;
 use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::commands::builtins;
 use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 
 const AGENT_GENERATOR_NAME: &str = builtins::AGENT_GENERATOR_AGENT_NAME;
 
@@ -93,6 +95,7 @@ pub async fn handle_command(
     config_path: Option<PathBuf>,
     host: &str,
     port: u16,
+    output_format: OutputFormat,
 ) -> Result<()> {
     // Agents are currently managed via the daemon.
     // Embedded mode may later support direct repository access.
@@ -121,38 +124,91 @@ pub async fn handle_command(
     let client = DaemonClient::new(host, port)?;
 
     match command {
-        AgentCommand::List => list_agents(client).await,
+        AgentCommand::List => list_agents(client, output_format).await,
         AgentCommand::Deploy {
             manifest,
             validate_only,
             force,
-        } => deploy_agent(manifest, validate_only, force, client).await,
-        AgentCommand::Show { agent_id } => show_agent(agent_id, client).await,
-        AgentCommand::Remove { agent_id } => remove_agent(agent_id, client).await,
+        } => deploy_agent(manifest, validate_only, force, client, output_format).await,
+        AgentCommand::Show { agent_id } => show_agent(agent_id, client, output_format).await,
+        AgentCommand::Remove { agent_id } => remove_agent(agent_id, client, output_format).await,
         AgentCommand::Logs {
             agent_id,
             follow,
             errors,
             verbose,
-        } => logs_agent(agent_id, follow, errors, verbose, client).await,
+        } => {
+            if output_format.is_structured() {
+                structured_output_unsupported("aegis agent logs", output_format)
+            } else {
+                logs_agent(agent_id, follow, errors, verbose, client).await
+            }
+        }
         AgentCommand::Generate { input, follow } => {
-            generate_agent(input, follow, client, config_path.as_ref()).await
+            generate_agent(input, follow, client, config_path.as_ref(), output_format).await
         }
     }
 }
 
-async fn show_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
+#[derive(Serialize)]
+struct AgentListOutput {
+    count: usize,
+    agents: Vec<crate::daemon::client::AgentInfo>,
+}
+
+#[derive(Serialize)]
+struct AgentDeployOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<Uuid>,
+    name: String,
+    version: String,
+    validate_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AgentMutationOutput {
+    agent_id: Uuid,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct AgentGenerateOutput {
+    generator_agent_id: Uuid,
+    execution_id: Uuid,
+    follow: bool,
+}
+
+async fn show_agent(
+    agent_id: Uuid,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     let manifest = client.get_agent(agent_id).await?;
 
-    // Export as YAML to stdout
+    if output_format.is_structured() {
+        return render_serialized(output_format, &manifest);
+    }
+
     let yaml = serde_yaml::to_string(&manifest).context("Failed to serialize manifest to YAML")?;
-    println!("{yaml}");
+    print!("{yaml}");
 
     Ok(())
 }
 
-async fn list_agents(client: DaemonClient) -> Result<()> {
+async fn list_agents(client: DaemonClient, output_format: OutputFormat) -> Result<()> {
     let agents = client.list_agents().await?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &AgentListOutput {
+                count: agents.len(),
+                agents,
+            },
+        );
+    }
 
     if agents.is_empty() {
         println!("{}", "No agents found".yellow());
@@ -175,8 +231,21 @@ async fn list_agents(client: DaemonClient) -> Result<()> {
     Ok(())
 }
 
-async fn remove_agent(agent_id: Uuid, client: DaemonClient) -> Result<()> {
+async fn remove_agent(
+    agent_id: Uuid,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
     client.delete_agent(agent_id).await?;
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &AgentMutationOutput {
+                agent_id,
+                status: "removed",
+            },
+        );
+    }
     println!("{}", format!("✓ Agent {agent_id} removed").green());
     Ok(())
 }
@@ -186,6 +255,7 @@ async fn deploy_agent(
     validate_only: bool,
     force: bool,
     client: DaemonClient,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let manifest_content = tokio::fs::read_to_string(&manifest)
         .await
@@ -201,16 +271,8 @@ async fn deploy_agent(
         .map_err(|e| anyhow::anyhow!("Manifest validation failed: {e}"))?;
 
     if validate_only {
-        println!(
-            "{}",
-            format!("✓ Manifest is valid: {}", agent_manifest.metadata.name).green()
-        );
-        println!("  API Version: {}", agent_manifest.api_version);
-        println!("  Kind: {}", agent_manifest.kind);
-        println!("  Name: {}", agent_manifest.metadata.name);
-        println!("  Version: {}", agent_manifest.metadata.version);
-        println!(
-            "  Runtime: {}:{}",
+        let runtime = format!(
+            "{}:{}",
             agent_manifest
                 .spec
                 .runtime
@@ -224,12 +286,66 @@ async fn deploy_agent(
                 .as_deref()
                 .unwrap_or("unknown")
         );
+        if output_format.is_structured() {
+            return render_serialized(
+                output_format,
+                &AgentDeployOutput {
+                    agent_id: None,
+                    name: agent_manifest.metadata.name.clone(),
+                    version: agent_manifest.metadata.version.clone(),
+                    validate_only: true,
+                    runtime: Some(runtime.clone()),
+                },
+            );
+        }
+
+        println!(
+            "{}",
+            format!("✓ Manifest is valid: {}", agent_manifest.metadata.name).green()
+        );
+        println!("  API Version: {}", agent_manifest.api_version);
+        println!("  Kind: {}", agent_manifest.kind);
+        println!("  Name: {}", agent_manifest.metadata.name);
+        println!("  Version: {}", agent_manifest.metadata.version);
+        println!("  Runtime: {runtime}");
         return Ok(());
     }
 
-    println!("Deploying agent: {}", agent_manifest.metadata.name.bold());
+    if !output_format.is_structured() {
+        println!("Deploying agent: {}", agent_manifest.metadata.name.bold());
+    }
 
+    let name = agent_manifest.metadata.name.clone();
+    let version = agent_manifest.metadata.version.clone();
+    let runtime = Some(format!(
+        "{}:{}",
+        agent_manifest
+            .spec
+            .runtime
+            .language
+            .as_deref()
+            .unwrap_or("unknown"),
+        agent_manifest
+            .spec
+            .runtime
+            .version
+            .as_deref()
+            .unwrap_or("unknown")
+    ));
     let agent_id = client.deploy_agent(agent_manifest, force).await?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &AgentDeployOutput {
+                agent_id: Some(agent_id),
+                name,
+                version,
+                validate_only: false,
+                runtime,
+            },
+        );
+    }
 
     println!("{}", format!("✓ Agent deployed: {agent_id}").green());
 
@@ -276,6 +392,7 @@ async fn generate_agent(
     follow: bool,
     client: DaemonClient,
     config_path: Option<&PathBuf>,
+    output_format: OutputFormat,
 ) -> Result<()> {
     let templates_root = builtins::resolve_templates_root(config_path);
     builtins::sync_generator_templates_to_disk(&templates_root)?;
@@ -283,19 +400,36 @@ async fn generate_agent(
     // Ensure built-ins are deployed (but don't force overwrite unless it's an update)
     builtins::deploy_all_builtins(&client, false).await?;
 
+    if output_format.is_structured() && follow {
+        return structured_output_unsupported("aegis agent generate --follow", output_format);
+    }
+
     let generator_id = client
         .lookup_agent(AGENT_GENERATOR_NAME)
         .await?
         .context("Generator agent not found even after deployment attempt")?;
 
-    println!(
-        "{}",
-        format!("Generating agent via '{AGENT_GENERATOR_NAME}' (id: {generator_id})...").cyan()
-    );
+    if !output_format.is_structured() {
+        println!(
+            "{}",
+            format!("Generating agent via '{AGENT_GENERATOR_NAME}' (id: {generator_id})...").cyan()
+        );
+    }
     let execution_id = client
         .execute_agent(generator_id, serde_json::Value::String(input), None)
         .await
         .context("Failed to start agent generation execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &AgentGenerateOutput {
+                generator_agent_id: generator_id,
+                execution_id,
+                follow,
+            },
+        );
+    }
 
     println!(
         "{}",

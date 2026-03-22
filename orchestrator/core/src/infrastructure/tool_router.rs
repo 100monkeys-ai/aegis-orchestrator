@@ -533,7 +533,22 @@ impl ToolRouter {
                     }),
                     "aegis.workflow.list" => json!({
                         "type": "object",
-                        "properties": {}
+                        "properties": {
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        }
+                    }),
+                    "aegis.workflow.validate" => json!({
+                        "type": "object",
+                        "properties": {
+                            "manifest_yaml": {
+                                "type": "string",
+                                "description": "Full Workflow manifest YAML to parse and deterministically validate."
+                            }
+                        },
+                        "required": ["manifest_yaml"]
                     }),
                     "aegis.workflow.update" => json!({
                         "type": "object",
@@ -579,9 +594,54 @@ impl ToolRouter {
                             "input": {
                                 "type": "object",
                                 "description": "Workflow input parameters."
+                            },
+                            "blackboard": {
+                                "type": "object",
+                                "description": "Optional blackboard overrides merged into the workflow execution before startup."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
                             }
                         },
                         "required": ["name"]
+                    }),
+                    "aegis.workflow.executions.list" => json!({
+                        "type": "object",
+                        "properties": {
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of results to return.",
+                                "default": 20
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Pagination offset.",
+                                "default": 0
+                            },
+                            "workflow_id": {
+                                "type": "string",
+                                "description": "Optional workflow UUID filter."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        }
+                    }),
+                    "aegis.workflow.executions.get" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to inspect."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["execution_id"]
                     }),
                     "aegis.workflow.generate" => json!({
                         "type": "object",
@@ -613,6 +673,26 @@ impl ToolRouter {
                             "execution_id": {
                                 "type": "string",
                                 "description": "UUID of the execution to check."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.task.logs" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution whose event log should be retrieved."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of events to return.",
+                                "default": 50
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Zero-based starting offset into the persisted event log.",
+                                "default": 0
                             }
                         },
                         "required": ["execution_id"]
@@ -1194,6 +1274,15 @@ mod tests {
                     skip_judge: false,
                 }],
             },
+            BuiltinDispatcherConfig {
+                name: "aegis.task.logs".to_string(),
+                description: "Inspect persisted task execution events".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.task.logs".to_string(),
+                    skip_judge: true,
+                }],
+            },
         ];
 
         let router = ToolRouter::new(registry, servers, builtins);
@@ -1222,6 +1311,23 @@ mod tests {
         assert!(
             workflow_schema["properties"]["judge_agents"].is_object(),
             "judge_agents property should be present in workflow schema"
+        );
+
+        let task_logs_tool = tools.iter().find(|t| t.name == "aegis.task.logs");
+        assert!(task_logs_tool.is_some(), "expected aegis.task.logs tool");
+        let task_logs_schema = &task_logs_tool.unwrap().input_schema;
+        assert_eq!(
+            task_logs_schema["required"][0].as_str(),
+            Some("execution_id"),
+            "execution_id must be required for aegis.task.logs"
+        );
+        assert_eq!(
+            task_logs_schema["properties"]["limit"]["default"],
+            json!(50)
+        );
+        assert_eq!(
+            task_logs_schema["properties"]["offset"]["default"],
+            json!(0)
         );
     }
 }
