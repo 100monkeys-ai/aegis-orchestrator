@@ -14,7 +14,6 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 use std::path::PathBuf;
-use std::time::Duration;
 use uuid::Uuid;
 
 use crate::commands::builtins;
@@ -306,31 +305,8 @@ async fn generate_agent(
     if follow {
         client.stream_logs(execution_id, true, false, false).await?;
     } else {
-        wait_for_execution_completion(execution_id, &client).await?;
+        println!("Follow generator agent logs with:\n  aegis agent logs {execution_id} --follow");
     }
 
     Ok(())
-}
-
-async fn wait_for_execution_completion(execution_id: Uuid, client: &DaemonClient) -> Result<()> {
-    const MAX_POLLS: u32 = 300;
-    const POLL_INTERVAL: Duration = Duration::from_secs(1);
-
-    for _ in 0..MAX_POLLS {
-        let execution = client.get_execution(execution_id).await?;
-        let normalized = execution.status.to_ascii_lowercase();
-        if matches!(
-            normalized.as_str(),
-            "completed" | "failed" | "cancelled" | "canceled"
-        ) {
-            println!(
-                "Generation execution {} finished with status: {}",
-                execution.id, execution.status
-            );
-            return Ok(());
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
-    }
-
-    anyhow::bail!("Timed out waiting for generation execution {execution_id} to finish");
 }
