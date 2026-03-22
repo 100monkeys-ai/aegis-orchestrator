@@ -278,6 +278,7 @@ impl ConfigWizard {
         std::fs::create_dir_all(&working_dir)
             .with_context(|| format!("Failed to create directory {}", working_dir.display()))?;
         ensure_local_volumes_dir_permissions(&working_dir)?;
+        ensure_generated_artifacts_dir_permissions(&working_dir)?;
 
         let aegis_config_content = self.render_aegis_config(&node_config, components, tag);
         let env_content = self.render_env(&node_config, components)?;
@@ -1497,6 +1498,31 @@ fn ensure_local_volumes_dir_permissions(working_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Ensure `./generated` exists with permissions that allow the runtime
+/// container user to persist generated agent and workflow manifests.
+fn ensure_generated_artifacts_dir_permissions(working_dir: &Path) -> Result<()> {
+    let generated_dir = working_dir.join("generated");
+    std::fs::create_dir_all(&generated_dir).with_context(|| {
+        format!(
+            "Failed to create generated artifacts directory {}",
+            generated_dir.display()
+        )
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&generated_dir)
+            .with_context(|| format!("Failed to read metadata for {}", generated_dir.display()))?
+            .permissions();
+        perms.set_mode(0o777);
+        std::fs::set_permissions(&generated_dir, perms)
+            .with_context(|| format!("Failed to set permissions on {}", generated_dir.display()))?;
+    }
+
+    Ok(())
+}
+
 /// Expand a leading `~` to the user's home directory.
 fn expand_tilde(path: &Path) -> PathBuf {
     let s = path.to_string_lossy();
@@ -1511,6 +1537,22 @@ fn expand_tilde(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        dir.push(format!(
+            "aegis-configure-test-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn render_aegis_config_includes_task_logs_dispatcher() {
@@ -1665,5 +1707,17 @@ mod tests {
         assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
         assert!(rendered.contains(r#"model: "claude-sonnet-4-5""#));
         assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
+    }
+
+    #[test]
+    fn ensure_generated_artifacts_dir_permissions_creates_generated_directory() {
+        let tmp = temp_dir();
+        ensure_generated_artifacts_dir_permissions(&tmp).expect("create generated dir");
+
+        let generated_dir = tmp.join("generated");
+        assert!(generated_dir.exists());
+        assert!(generated_dir.is_dir());
+
+        let _ = fs::remove_dir_all(tmp);
     }
 }

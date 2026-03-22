@@ -93,13 +93,9 @@ fn default_local_host_mount_point() -> String {
     default_path.to_string_lossy().into_owned()
 }
 
-fn resolve_generated_artifacts_root(config_path: Option<&PathBuf>) -> PathBuf {
-    let base_dir = config_path
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .or_else(|| dirs_next::home_dir().map(|h| h.join(".aegis")))
-        .unwrap_or_else(|| PathBuf::from(".aegis"));
-
-    base_dir.join("generated")
+fn resolve_generated_artifacts_root(config_path: Option<PathBuf>) -> PathBuf {
+    let config_path = config_path.or_else(NodeConfigManifest::discover_config);
+    crate::commands::builtins::resolve_generated_root(config_path.as_ref())
 }
 
 fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
@@ -135,12 +131,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let _guard = PidFileGuard;
 
     info!("AEGIS daemon starting (PID: {})", pid);
-    let generated_artifacts_root = resolve_generated_artifacts_root(config_path.as_ref());
-
     // Load configuration
     println!("Loading configuration...");
     let config = NodeConfigManifest::load_or_default(config_path.clone())
         .context("Failed to load configuration")?;
+
+    // Prefer the discovered config path so Docker deployments that set
+    // AEGIS_CONFIG_PATH resolve generated artifacts under the mounted stack root.
+    let generated_artifacts_root = resolve_generated_artifacts_root(config_path.clone());
 
     config
         .validate()
@@ -3199,7 +3197,21 @@ async fn list_smcp_tools_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::temporal_connection_max_retries;
+    use super::{resolve_generated_artifacts_root, temporal_connection_max_retries};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        dir.push(format!("aegis-server-test-{}-{nanos}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     #[test]
     fn test_create_router_returns_router() {
@@ -3217,5 +3229,24 @@ mod tests {
         assert_eq!(temporal_connection_max_retries(Some(0)), 1);
         assert_eq!(temporal_connection_max_retries(Some(-4)), 1);
         assert_eq!(temporal_connection_max_retries(Some(7)), 7);
+    }
+
+    #[test]
+    fn generated_artifacts_root_uses_discovered_config_directory() {
+        let tmp = temp_dir();
+        let stack_dir = tmp.join(".aegis");
+        fs::create_dir_all(&stack_dir).expect("create stack dir");
+        let config_path = stack_dir.join("aegis-config.yaml");
+        fs::write(
+            &config_path,
+            "apiVersion: 100monkeys.ai/v1\nkind: NodeConfig\n",
+        )
+        .expect("write config");
+
+        let resolved = resolve_generated_artifacts_root(Some(PathBuf::from(&config_path)));
+
+        assert_eq!(resolved, stack_dir.join("generated"));
+
+        let _ = fs::remove_dir_all(tmp);
     }
 }

@@ -127,6 +127,7 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info,aegis_orchestrator=debug
+      - AEGIS_CONFIG_PATH=/app/aegis-config.yaml
       # -----------------------------------------------------------------------
       # Environment variables below are referenced by aegis-config.yaml via
       # the "env:VAR_NAME" syntax. The actual service configuration (database,
@@ -167,6 +168,7 @@ services:
       - /var/run/docker.sock:/var/run/docker.sock  # For Docker-based agent isolation
       - ./aegis-config.yaml:/app/aegis-config.yaml
       - ./runtime-registry.yaml:/app/runtime-registry.yaml
+      - ./generated:/app/generated
       - aegis-runtime-data:/app/data
       - ./local-volumes:/tmp/aegis-volumes
     healthcheck:

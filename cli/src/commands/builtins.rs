@@ -108,20 +108,20 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
     Ok(())
 }
 
-pub fn resolve_templates_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
+fn resolve_stack_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
     let base_dir = config_path
         .and_then(|config| config.parent().map(|parent| parent.to_path_buf()))
         .or_else(|| dirs_next::home_dir().map(|home| home.join(".aegis")))
         .unwrap_or_else(|| std::path::PathBuf::from(".aegis"));
-    base_dir.join("templates")
+    base_dir
+}
+
+pub fn resolve_templates_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
+    resolve_stack_root(config_path).join("templates")
 }
 
 pub fn resolve_generated_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
-    let base_dir = config_path
-        .and_then(|config| config.parent().map(|parent| parent.to_path_buf()))
-        .or_else(|| dirs_next::home_dir().map(|home| home.join(".aegis")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".aegis"));
-    base_dir.join("generated")
+    resolve_stack_root(config_path).join("generated")
 }
 
 pub fn sync_generator_templates_to_disk(templates_root: &std::path::Path) -> Result<()> {
@@ -353,5 +353,15 @@ mod tests {
         assert!(states.contains_key(&serde_yaml::Value::from("PLAN")));
         assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
         assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
+    }
+
+    #[test]
+    fn generated_root_uses_config_parent_directory() {
+        let config_path = std::path::PathBuf::from("/tmp/custom-stack/aegis-config.yaml");
+        let generated_root = resolve_generated_root(Some(&config_path));
+        assert_eq!(
+            generated_root,
+            std::path::PathBuf::from("/tmp/custom-stack/generated")
+        );
     }
 }
