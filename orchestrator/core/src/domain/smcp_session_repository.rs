@@ -39,6 +39,12 @@ pub trait SmcpSessionRepository: Send + Sync {
     /// Returns `Ok(None)` if the session does not exist (not an error).
     async fn find_by_id(&self, id: &SessionId) -> Result<Option<SmcpSession>>;
 
+    /// Return the single `Active` session whose `security_token_raw` matches `token`, or `None`.
+    ///
+    /// Used by the tool invocation service to resolve a session from the opaque token string
+    /// without requiring prior JWT decode; claim extraction then happens from the loaded session.
+    async fn find_active_by_security_token(&self, token: &str) -> Result<Option<SmcpSession>>;
+
     /// Return the single `Active` session for `agent_id`, or `None` if no active session exists.
     ///
     /// Used by the attestation service to enforce the one-active-session-per-agent invariant

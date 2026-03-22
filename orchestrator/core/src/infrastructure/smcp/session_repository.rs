@@ -43,6 +43,18 @@ impl SmcpSessionRepository for InMemorySmcpSessionRepository {
         Ok(guard.get(id).cloned())
     }
 
+    async fn find_active_by_security_token(&self, token: &str) -> Result<Option<SmcpSession>> {
+        let guard = self.sessions.read().await;
+        Ok(guard
+            .values()
+            .filter(|s| {
+                s.security_token_raw == token
+                    && s.status == crate::domain::smcp_session::SessionStatus::Active
+            })
+            .max_by_key(|s| s.created_at)
+            .cloned())
+    }
+
     async fn find_active_by_agent(&self, agent_id: &AgentId) -> Result<Option<SmcpSession>> {
         let guard = self.sessions.read().await;
         // Returns the most recently created active session for the agent

@@ -23,6 +23,16 @@ use super::gemini::GeminiAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
+/// Maximum exponent for exponential backoff, preventing `u64` overflow in delay calculations.
+/// For example, with `retry_delay_ms = 1000` (1 second), 2^16 × 1 s ≈ 18 hours; the
+/// actual upper bound on backoff duration still depends on the configured base delay.
+const MAX_BACKOFF_EXPONENT: u32 = 16;
+
+/// Maximum backoff duration in milliseconds. Delays are clamped to this value regardless
+/// of the configured base delay, ensuring retries always terminate in bounded time.
+/// Matches the value produced by `retry_delay_ms = 1000` and `MAX_BACKOFF_EXPONENT = 16`.
+const MAX_BACKOFF_MS: u64 = 65_536_000; // 2^16 * 1000 ms
+
 /// Registry for managing LLM providers and resolving model aliases.
 ///
 /// Each entry in `alias_map` is an `Arc<dyn LLMProvider>` that was constructed at
@@ -284,9 +294,12 @@ impl ProviderRegistry {
                         }
                     }
 
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        self.retry_delay_ms * 2_u64.pow(attempt),
-                    ))
+                    tokio::time::sleep(tokio::time::Duration::from_millis({
+                        let capped_attempt = attempt.min(MAX_BACKOFF_EXPONENT);
+                        self.retry_delay_ms
+                            .saturating_mul(2_u64.saturating_pow(capped_attempt))
+                            .min(MAX_BACKOFF_MS)
+                    }))
                     .await;
                 }
             }
@@ -344,11 +357,15 @@ impl ProviderRegistry {
                         }
                     }
 
-                    // Exponential backoff
-                    tokio::time::sleep(tokio::time::Duration::from_millis(
-                        self.retry_delay_ms * 2_u64.pow(attempt),
-                    ))
-                    .await;
+                    // Exponential backoff with capped exponent to avoid overflow
+                    let exp = std::cmp::min(attempt, MAX_BACKOFF_EXPONENT);
+                    let backoff_factor = 2_u64.saturating_pow(exp);
+                    let delay_ms = self
+                        .retry_delay_ms
+                        .saturating_mul(backoff_factor)
+                        .min(MAX_BACKOFF_MS);
+
+                    tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
                 }
             }
         }
