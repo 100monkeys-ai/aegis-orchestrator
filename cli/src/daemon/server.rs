@@ -2545,6 +2545,9 @@ async fn dispatch_gateway_handler(
                                         tool_name: call.name.clone(),
                                         arguments_json: serde_json::to_string(&call.arguments)
                                             .unwrap_or_default(),
+                                        status: "pending".to_string(),
+                                        result_json: None,
+                                        error: None,
                                     },
                                 );
                             }

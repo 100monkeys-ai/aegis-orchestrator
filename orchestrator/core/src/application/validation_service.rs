@@ -488,12 +488,29 @@ impl GradientValidator for SemanticAgentValidator {
             .await?
             .ok_or_else(|| anyhow!("Judge agent '{}' not found", self.judge_agent_name))?;
 
+        let generation_evidence = extract_json_from_text(&ctx.output)
+            .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
+            .or_else(|| serde_json::from_str::<serde_json::Value>(&ctx.output).ok());
+        let tool_audit_history = self
+            .execution_service
+            .get_execution(self.parent_execution_id)
+            .await
+            .ok()
+            .and_then(|execution| {
+                execution
+                    .current_iteration()
+                    .and_then(|iter| iter.trajectory.clone())
+            })
+            .unwrap_or_default();
+
         // 2. Build input for judge.
         let input = ExecutionInput {
             intent: None,
             payload: serde_json::json!({
                 "task": ctx.task,
                 "output": ctx.output,
+                "generation_evidence": generation_evidence,
+                "tool_audit_history": tool_audit_history,
                 "worker_mounts": ctx.worker_mounts.clone(),
                 "criteria": self.criteria,
                 "validation_context": "semantic_judge"

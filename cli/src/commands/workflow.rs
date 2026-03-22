@@ -307,6 +307,8 @@ struct WorkflowGenerateOutput {
     workflow_name: &'static str,
     execution_id: Uuid,
     follow: bool,
+    generated_workflows_root: String,
+    generated_agents_root: String,
 }
 
 /// Validate a workflow manifest file
@@ -616,6 +618,9 @@ async fn generate_workflow(
     }
 
     let templates_root = builtins::resolve_templates_root(config_path);
+    let generated_root = builtins::resolve_generated_root(config_path);
+    let generated_workflows_root = generated_root.join("workflows");
+    let generated_agents_root = generated_root.join("agents");
     builtins::sync_generator_templates_to_disk(&templates_root)?;
 
     let client = DaemonClient::new(host, port)?;
@@ -652,6 +657,8 @@ async fn generate_workflow(
                 workflow_name: WORKFLOW_GENERATOR_WORKFLOW_NAME,
                 execution_id,
                 follow,
+                generated_workflows_root: generated_workflows_root.display().to_string(),
+                generated_agents_root: generated_agents_root.display().to_string(),
             },
         );
     } else {
@@ -659,6 +666,10 @@ async fn generate_workflow(
             "{}",
             format!("✓ Workflow generation execution started: {execution_id}").green()
         );
+        println!("Generated workflow manifests will be persisted under:");
+        println!("  {}", generated_workflows_root.display());
+        println!("Generated agent manifests from this flow will be persisted under:");
+        println!("  {}", generated_agents_root.display());
         println!(
             "Follow generator workflow logs with:\n  aegis workflow logs {execution_id} --follow"
         );

@@ -188,6 +188,18 @@ impl InnerLoopService {
                     "stderr": stderr,
                 });
 
+                if let Some(step) = ctx.trajectory.last_mut() {
+                    step.status = if exit_code == 0 {
+                        "succeeded".to_string()
+                    } else {
+                        "failed".to_string()
+                    };
+                    step.result_json = Some(result_json.to_string());
+                    if exit_code != 0 {
+                        step.error = Some(stderr.clone());
+                    }
+                }
+
                 ctx.conversation.push(ConversationMessage {
                     role: "tool".to_string(),
                     content: result_json.to_string(),
@@ -227,7 +239,7 @@ impl InnerLoopService {
 
             let available_tools = self
                 .tool_invocation_service
-                .get_available_tools()
+                .get_available_tools_for_agent(ctx.agent_id)
                 .await
                 .unwrap_or_default();
 
@@ -323,6 +335,9 @@ impl InnerLoopService {
                             tool_name: tool_call.name.clone(),
                             arguments_json: serde_json::to_string(&tool_call.arguments)
                                 .unwrap_or_else(|_| "{}".to_string()),
+                            status: "pending".to_string(),
+                            result_json: None,
+                            error: None,
                         };
                         tracing::debug!(
                             execution_id = %execution_id_str,
@@ -361,6 +376,8 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+                                let mut step = step;
+                                step.status = "dispatched".to_string();
                                 next_ctx.trajectory.push(step);
                                 next_ctx.pending_dispatch_id = Some(dispatch_id);
                                 next_ctx.pending_tool_call_id = Some(tool_call.id.clone());
@@ -389,6 +406,9 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+                                let mut step = step;
+                                step.status = "succeeded".to_string();
+                                step.result_json = Some(tool_result.clone());
                                 next_ctx.trajectory.push(step);
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
@@ -424,10 +444,17 @@ impl InnerLoopService {
                                         error = %e,
                                         "Fatal tool validation/policy error — terminating inner loop"
                                     );
-                                    self.active_executions
+                                    if let Some(mut failed_ctx) = self
+                                        .active_executions
                                         .write()
                                         .await
-                                        .remove(execution_id_str);
+                                        .remove(execution_id_str)
+                                    {
+                                        let mut step = step;
+                                        step.status = "fatal".to_string();
+                                        step.error = Some(e.to_string());
+                                        failed_ctx.trajectory.push(step);
+                                    }
                                     anyhow::bail!(
                                         "Tool '{}' blocked by policy: {}",
                                         tool_call.name,
@@ -454,6 +481,10 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+                                let mut step = step;
+                                step.status = "failed".to_string();
+                                step.error = Some(e.to_string());
+                                next_ctx.trajectory.push(step);
                                 next_ctx.conversation.push(ConversationMessage {
                                     role: "tool".to_string(),
                                     content: tool_result,

@@ -21,9 +21,21 @@ spec:
 
       Input typically includes:
       - user objective or generation task
-      - generated manifest YAML and/or deployment result summary
+      - generated manifest YAML and persisted artifact metadata
+      - deployment result summary
       - tool call history from the worker's execution
+      - worker_mounts: list of inherited mounted paths when the worker actually had mounted volumes
       - optional criteria and validation context
+
+      Evaluate bundled evidence first. Treat the structured input payload as the source of truth for
+      generated manifests, artifact paths, deployment results, and tool audit history.
+
+      Filesystem inspection is optional, not default:
+      - Only inspect files under `/workspace` if `worker_mounts` is present and explicitly exposes
+        the relevant path.
+      - Do not assume `/workspace` exists for generation flows.
+      - If bundled evidence is missing or inconsistent, use read-only retrieval tools to verify the
+        deployed agent before scoring.
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
       - If `aegis.schema.validate` was NOT called before `aegis.agent.create` or `aegis.agent.update`, reduce the `correctness`
@@ -113,3 +125,6 @@ spec:
       memory: 512Mi
       disk: 1Gi
       timeout: 180s
+
+  tools:
+    - aegis.agent.export

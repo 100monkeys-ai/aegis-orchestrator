@@ -22,11 +22,20 @@ spec:
       Input typically includes:
       - user workflow objective
       - generated workflow plan and/or workflow YAML
+      - persisted artifact metadata
       - tool call history from the worker's execution
-      - worker_mounts: list of inherited mounted paths (for example `/workspace/cache`)
+      - worker_mounts: list of inherited mounted paths when the worker actually had mounted volumes
       - optional criteria and validation context
 
-      If worker artifacts are available under `/workspace`, inspect them directly before scoring.
+      Evaluate bundled evidence first. Treat the structured input payload as the source of truth for
+      workflow YAML, artifact paths, deployment results, and tool audit history.
+
+      Filesystem inspection is optional, not default:
+      - Only inspect files under `/workspace` if `worker_mounts` is present and explicitly exposes
+        the relevant path.
+      - Do not assume `/workspace` exists for generation flows.
+      - If bundled evidence is missing or inconsistent, use read-only retrieval tools to verify the
+        deployed workflow before scoring.
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
       - If `aegis.schema.validate` was NOT called before `aegis.workflow.create` or `aegis.workflow.update`, reduce
@@ -116,3 +125,6 @@ spec:
       memory: 512Mi
       disk: 1Gi
       timeout: 180s
+
+  tools:
+    - aegis.workflow.export

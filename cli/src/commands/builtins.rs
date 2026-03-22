@@ -116,6 +116,14 @@ pub fn resolve_templates_root(config_path: Option<&std::path::PathBuf>) -> std::
     base_dir.join("templates")
 }
 
+pub fn resolve_generated_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
+    let base_dir = config_path
+        .and_then(|config| config.parent().map(|parent| parent.to_path_buf()))
+        .or_else(|| dirs_next::home_dir().map(|home| home.join(".aegis")))
+        .unwrap_or_else(|| std::path::PathBuf::from(".aegis"));
+    base_dir.join("generated")
+}
+
 pub fn sync_generator_templates_to_disk(templates_root: &std::path::Path) -> Result<()> {
     persist_template(
         templates_root,

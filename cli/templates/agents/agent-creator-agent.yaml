@@ -34,6 +34,7 @@ spec:
       5. Only after validation passes:
          - For new agents: call `aegis.agent.create` with the validated manifest.
          - For updates: call `aegis.agent.update` with the validated manifest.
+         - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
       Skipping steps 1–4 is a policy violation and will cause judge rejection.
 
       If input includes a planner JSON with `missing_agents` and `generation_prompts`,
@@ -43,10 +44,24 @@ spec:
       Return JSON only:
       {
         "created": [
-          {"name": "...", "version": "...", "deployed": true, "agent_id": "..."}
+          {
+            "name": "...",
+            "version": "...",
+            "deployed": true,
+            "agent_id": "...",
+            "manifest_path": "...",
+            "manifest_yaml": "..."
+          }
         ],
         "updated": [
-          {"name": "...", "version": "...", "updated": true, "agent_id": "..."}
+          {
+            "name": "...",
+            "version": "...",
+            "updated": true,
+            "agent_id": "...",
+            "manifest_path": "...",
+            "manifest_yaml": "..."
+          }
         ],
         "skipped": [{"requirement": "...", "reason": "..."}],
         "errors": ["..."]

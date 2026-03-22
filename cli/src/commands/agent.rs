@@ -178,6 +178,7 @@ struct AgentGenerateOutput {
     generator_agent_id: Uuid,
     execution_id: Uuid,
     follow: bool,
+    generated_agents_root: String,
 }
 
 async fn show_agent(
@@ -395,6 +396,7 @@ async fn generate_agent(
     output_format: OutputFormat,
 ) -> Result<()> {
     let templates_root = builtins::resolve_templates_root(config_path);
+    let generated_root = builtins::resolve_generated_root(config_path).join("agents");
     builtins::sync_generator_templates_to_disk(&templates_root)?;
 
     // Ensure built-ins are deployed (but don't force overwrite unless it's an update)
@@ -427,6 +429,7 @@ async fn generate_agent(
                 generator_agent_id: generator_id,
                 execution_id,
                 follow,
+                generated_agents_root: generated_root.display().to_string(),
             },
         );
     }
@@ -435,6 +438,8 @@ async fn generate_agent(
         "{}",
         format!("✓ Agent generation execution started: {execution_id}").green()
     );
+    println!("Generated manifests will be persisted under:");
+    println!("  {}", generated_root.display());
 
     if follow {
         client.stream_logs(execution_id, true, false, false).await?;

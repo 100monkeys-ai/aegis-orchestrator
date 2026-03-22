@@ -552,7 +552,7 @@ impl ToolInvocationService {
                             .and_then(|exec| exec.input.intent)
                             .unwrap_or_else(|| "No objective available".to_string());
                         let available_tools = self
-                            .get_available_tools()
+                            .get_available_tools_for_agent(*agent_id)
                             .await
                             .unwrap_or_default()
                             .into_iter()
@@ -1507,6 +1507,32 @@ impl ToolInvocationService {
         Ok(tools)
     }
 
+    pub async fn get_available_tools_for_agent(
+        &self,
+        agent_id: AgentId,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent(agent_id)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to load agent for tool scoping: {e}"
+                ))
+            })?;
+
+        let declared_tools = agent.manifest.spec.tools;
+        if declared_tools.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let tools = self.get_available_tools().await?;
+        Ok(tools
+            .into_iter()
+            .filter(|tool| declared_tools.iter().any(|name| name == &tool.name))
+            .collect())
+    }
+
     pub async fn get_available_tools_for_context(
         &self,
         security_context_name: &str,
@@ -1711,6 +1737,7 @@ impl ToolInvocationService {
                     "name": manifest.metadata.name,
                     "version": manifest.metadata.version,
                     "force": force,
+                    "manifest_yaml": manifest_yaml,
                     "manifest_path": persisted_path
                 })))
             }
@@ -2657,14 +2684,30 @@ impl ToolInvocationService {
             .update_agent_for_tenant(&tenant_id, agent_id, manifest.clone())
             .await
         {
-            Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.agent.update",
-                "validated": true,
-                "updated": true,
-                "name": manifest.metadata.name,
-                "version": manifest.metadata.version,
-                "agent_id": agent_id.0.to_string(),
-            }))),
+            Ok(_) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "agents",
+                        &manifest.metadata.name,
+                        &manifest.metadata.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Agent updated but failed to persist manifest: {e}"
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": true,
+                    "updated": true,
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "agent_id": agent_id.0.to_string(),
+                    "manifest_yaml": manifest_yaml,
+                    "manifest_path": persisted_path,
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.agent.update",
                 "validated": true,
@@ -2898,12 +2941,28 @@ impl ToolInvocationService {
             .register_workflow_for_tenant(&tenant_id, manifest_yaml, force)
             .await
         {
-            Ok(meta) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.update",
-                "updated": true,
-                "name": meta.name,
-                "workflow_id": meta.workflow_id
-            }))),
+            Ok(meta) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "workflows",
+                        &meta.name,
+                        &meta.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Workflow updated but failed to persist manifest: {e}"
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.update",
+                    "updated": true,
+                    "name": meta.name,
+                    "workflow_id": meta.workflow_id,
+                    "manifest_yaml": manifest_yaml,
+                    "manifest_path": persisted_path
+                })))
+            }
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.update",
                 "updated": false,
@@ -3121,6 +3180,7 @@ impl ToolInvocationService {
                         "version": registered.version,
                         "status": registered.status
                     },
+                    "manifest_yaml": manifest_yaml,
                     "manifest_path": persisted_path
                 })))
             }
@@ -3277,7 +3337,7 @@ mod tests {
         }
     }
 
-    use crate::domain::agent::{Agent, AgentManifest};
+    use crate::domain::agent::{Agent, AgentManifest, AgentStatus};
     use crate::domain::events::ExecutionEvent;
     use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus, Iteration};
     use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
@@ -3291,6 +3351,40 @@ mod tests {
     use std::pin::Pin;
     use std::sync::RwLock;
     use tokio::sync::Mutex;
+
+    fn test_agent_with_tools(tools: &[&str]) -> Agent {
+        let manifest_yaml = format!(
+            r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+  tools:
+{}
+"#,
+            tools
+                .iter()
+                .map(|tool| format!("    - {tool}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        let manifest: AgentManifest = serde_yaml::from_str(&manifest_yaml).unwrap();
+        Agent {
+            id: AgentId::new(),
+            name: manifest.metadata.name.clone(),
+            manifest,
+            status: AgentStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
 
     struct TestAgentLifecycleService;
     #[async_trait]
@@ -3355,6 +3449,79 @@ mod tests {
 
         async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
             anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
+        }
+    }
+
+    struct FilteringAgentLifecycleService {
+        agent: Agent,
+    }
+
+    #[async_trait]
+    impl AgentLifecycleService for FilteringAgentLifecycleService {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            manifest: AgentManifest,
+            force: bool,
+        ) -> Result<AgentId> {
+            self.deploy_agent(manifest, force).await
+        }
+
+        async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
+            anyhow::bail!("FilteringAgentLifecycleService::deploy_agent not exercised in this test")
+        }
+
+        async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+            self.get_agent(id).await
+        }
+
+        async fn get_agent(&self, id: AgentId) -> Result<Agent> {
+            if id == self.agent.id {
+                Ok(self.agent.clone())
+            } else {
+                anyhow::bail!("agent not found")
+            }
+        }
+
+        async fn update_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: AgentId,
+            manifest: AgentManifest,
+        ) -> Result<()> {
+            self.update_agent(id, manifest).await
+        }
+
+        async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+            anyhow::bail!("FilteringAgentLifecycleService::update_agent not exercised in this test")
+        }
+
+        async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
+            self.delete_agent(id).await
+        }
+
+        async fn delete_agent(&self, _: AgentId) -> Result<()> {
+            anyhow::bail!("FilteringAgentLifecycleService::delete_agent not exercised in this test")
+        }
+
+        async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+            self.list_agents().await
+        }
+
+        async fn list_agents(&self) -> Result<Vec<Agent>> {
+            Ok(vec![self.agent.clone()])
+        }
+
+        async fn lookup_agent_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            name: &str,
+        ) -> Result<Option<AgentId>> {
+            self.lookup_agent(name).await
+        }
+
+        async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+            Ok((name == self.agent.name).then_some(self.agent.id))
         }
     }
 
@@ -4394,6 +4561,66 @@ spec:
 
         let tools = service
             .get_available_tools_for_context("zaru-free")
+            .await
+            .unwrap();
+
+        assert!(tools.iter().any(|tool| tool.name == "fs.read"));
+        assert!(!tools.iter().any(|tool| tool.name == "cmd.run"));
+    }
+
+    #[tokio::test]
+    async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(
+            registry,
+            servers,
+            vec![
+                BuiltinDispatcherConfig {
+                    name: "fs.read".to_string(),
+                    description: "Read files".to_string(),
+                    enabled: true,
+                    capabilities: vec![CapabilityConfig {
+                        name: "fs.read".to_string(),
+                        skip_judge: true,
+                    }],
+                },
+                BuiltinDispatcherConfig {
+                    name: "cmd.run".to_string(),
+                    description: "Run commands".to_string(),
+                    enabled: true,
+                    capabilities: vec![CapabilityConfig {
+                        name: "cmd.run".to_string(),
+                        skip_judge: false,
+                    }],
+                },
+            ],
+        ));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let agent = test_agent_with_tools(&["fs.read"]);
+        let agent_id = agent.id;
+        let (fsal, volume_registry) = test_fsal_deps();
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(FilteringAgentLifecycleService { agent }),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        );
+
+        let tools = service
+            .get_available_tools_for_agent(agent_id)
             .await
             .unwrap();
 

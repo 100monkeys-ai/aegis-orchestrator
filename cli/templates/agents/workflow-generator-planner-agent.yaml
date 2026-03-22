@@ -34,6 +34,9 @@ spec:
       - workflow_prompt: a complete natural-language prompt for generating the final workflow,
         explicitly referencing existing and newly generated agent names and which step each serves.
 
+      This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
+      available unless `worker_mounts` in the evaluation payload explicitly says so.
+
       Return JSON only.
     prompt_template: |
       {{instruction}}

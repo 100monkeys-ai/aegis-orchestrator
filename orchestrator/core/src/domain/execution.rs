@@ -224,6 +224,12 @@ pub struct Iteration {
 pub struct TrajectoryStep {
     pub tool_name: String,
     pub arguments_json: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
