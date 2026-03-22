@@ -33,8 +33,8 @@
 //! # Temporal Integration
 //!
 //! Links AEGIS workflow executions to Temporal.io workflow runs:
-//! - `temporal_workflow_id`: Temporal workflow type identifier
-//! - `temporal_run_id`: Unique run identifier for status tracking
+//! - `temporal_workflow_id`: Temporal workflow execution identifier
+//! - `temporal_run_id`: Unique Temporal run identifier for status tracking
 //!
 //! # Usage
 //!
@@ -95,6 +95,9 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             ExecutionStatus::Failed => "failed",
             ExecutionStatus::Cancelled => "cancelled",
         };
+        let temporal_workflow_id = execution.id.0.to_string();
+        let temporal_run_id = String::new();
+        let state_history_json = serde_json::json!([execution.current_state.as_str()]);
 
         sqlx::query(
             r#"
@@ -105,16 +108,17 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 started_at, last_transition_at, completed_at
             )
             VALUES (
-                $1, $2, $3,
-                COALESCE((SELECT name FROM workflows WHERE tenant_id = $2 AND id = $3), 'unknown-workflow'),
-                $3, 
-                $4, $5,
-                $6, $7, $8, $9,
-                $10, $11,
-                CASE WHEN $6 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
+                $1, $2, $3, $4, $5,
+                $6, $7,
+                $8, $9, $10, $11,
+                $12, $13,
+                CASE WHEN $7 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
             )
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
+                workflow_id = EXCLUDED.workflow_id,
+                temporal_workflow_id = EXCLUDED.temporal_workflow_id,
+                temporal_run_id = EXCLUDED.temporal_run_id,
                 status = EXCLUDED.status,
                 input_params = EXCLUDED.input_params,
                 current_state = EXCLUDED.current_state,
@@ -128,19 +132,51 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(execution.id.0)
         .bind(tenant_id.as_str())
         .bind(execution.workflow_id.0)
-        .bind(execution.id.0.to_string()) // temporal_run_id is execution_id
+        .bind(temporal_workflow_id)
+        .bind(temporal_run_id)
         .bind(input_json)
         .bind(status_str)
         .bind(execution.current_state.as_str())
         .bind(blackboard_json)
         .bind(state_outputs_json)
-        .bind(serde_json::json!(vec![execution.current_state.as_str()])) // state_history
+        .bind(state_history_json)
         .bind(execution.started_at)
         .bind(execution.last_transition_at)
         .execute(&self.pool)
         .await
         .map_err(|e| {
             RepositoryError::Database(format!("Failed to save workflow execution: {e}"))
+        })?;
+
+        Ok(())
+    }
+
+    async fn update_temporal_linkage_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        execution_id: ExecutionId,
+        temporal_workflow_id: &str,
+        temporal_run_id: &str,
+    ) -> Result<(), RepositoryError> {
+        sqlx::query(
+            r#"
+            UPDATE workflow_executions
+            SET temporal_workflow_id = $3,
+                temporal_run_id = $4
+            WHERE tenant_id = $1 AND id = $2
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(execution_id.0)
+        .bind(temporal_workflow_id)
+        .bind(temporal_run_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!(
+                "Failed to update Temporal linkage for workflow execution {}: {e}",
+                execution_id.0
+            ))
         })?;
 
         Ok(())

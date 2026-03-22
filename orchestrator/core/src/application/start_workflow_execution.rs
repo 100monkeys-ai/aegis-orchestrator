@@ -28,6 +28,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::error;
 
 /// Workflow execution start request
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -159,6 +160,16 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         self.execution_repository
             .save_for_tenant(tenant_id, &workflow_execution)
             .await
+            .map_err(|error| {
+                error!(
+                    tenant_id = %tenant_id.as_str(),
+                    execution_id = %workflow_execution.id.0,
+                    workflow_id = %workflow_execution.workflow_id.0,
+                    error = %error,
+                    "Failed to persist workflow execution before Temporal start"
+                );
+                anyhow::Error::new(error)
+            })
             .context("Failed to persist workflow execution to repository")?;
 
         // Step 5: Start execution in Temporal via gRPC
@@ -169,6 +180,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         };
 
         let workflow_id = workflow.id.to_string();
+        let temporal_workflow_id = execution_id.0.to_string();
 
         let temporal_run_id = engine
             .start_workflow(
@@ -189,8 +201,27 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             .await
             .context("Failed to start workflow execution in Temporal")?;
 
-        // Step 6: Update execution with temporal_run_id (for tracking)
-        // Current behavior attaches the run_id to the response payload.
+        self.execution_repository
+            .update_temporal_linkage_for_tenant(
+                tenant_id,
+                execution_id,
+                &temporal_workflow_id,
+                &temporal_run_id,
+            )
+            .await
+            .map_err(|error| {
+                error!(
+                    tenant_id = %tenant_id.as_str(),
+                    execution_id = %execution_id.0,
+                    workflow_id = %workflow.id.0,
+                    temporal_workflow_id = %temporal_workflow_id,
+                    temporal_run_id = %temporal_run_id,
+                    error = %error,
+                    "Failed to persist Temporal linkage for workflow execution"
+                );
+                anyhow::Error::new(error)
+            })
+            .context("Failed to persist Temporal linkage for workflow execution")?;
 
         // Step 7: Publish domain event
         self.event_bus.publish_workflow_event(
@@ -274,6 +305,105 @@ mod tests {
                 input,
             });
             Ok(self.run_id.clone())
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct TemporalLinkageCall {
+        tenant_id: TenantId,
+        execution_id: ExecutionId,
+        temporal_workflow_id: String,
+        temporal_run_id: String,
+    }
+
+    #[derive(Default)]
+    struct RecordingWorkflowExecutionRepository {
+        executions: Mutex<HashMap<ExecutionId, WorkflowExecution>>,
+        temporal_linkage_updates: Mutex<Vec<TemporalLinkageCall>>,
+    }
+
+    impl RecordingWorkflowExecutionRepository {
+        fn temporal_linkage_updates(&self) -> Vec<TemporalLinkageCall> {
+            self.temporal_linkage_updates.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl WorkflowExecutionRepository for RecordingWorkflowExecutionRepository {
+        async fn save_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            execution: &WorkflowExecution,
+        ) -> Result<(), RepositoryError> {
+            self.executions
+                .lock()
+                .unwrap()
+                .insert(execution.id, execution.clone());
+            Ok(())
+        }
+
+        async fn find_by_id_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+            Ok(self.executions.lock().unwrap().get(&id).cloned())
+        }
+
+        async fn find_active_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            Ok(self.executions.lock().unwrap().values().cloned().collect())
+        }
+
+        async fn update_temporal_linkage_for_tenant(
+            &self,
+            tenant_id: &TenantId,
+            execution_id: ExecutionId,
+            temporal_workflow_id: &str,
+            temporal_run_id: &str,
+        ) -> Result<(), RepositoryError> {
+            self.temporal_linkage_updates
+                .lock()
+                .unwrap()
+                .push(TemporalLinkageCall {
+                    tenant_id: tenant_id.clone(),
+                    execution_id,
+                    temporal_workflow_id: temporal_workflow_id.to_string(),
+                    temporal_run_id: temporal_run_id.to_string(),
+                });
+            Ok(())
+        }
+
+        async fn append_event(
+            &self,
+            _execution_id: ExecutionId,
+            _temporal_sequence_number: i64,
+            _event_type: String,
+            _payload: serde_json::Value,
+            _iteration_number: Option<u8>,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn find_events_by_execution(
+            &self,
+            _id: ExecutionId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError>
+        {
+            Ok(vec![])
+        }
+
+        async fn list_paginated_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _limit: usize,
+            _offset: usize,
+        ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+            Ok(vec![])
         }
     }
 
@@ -457,6 +587,45 @@ mod tests {
         assert_eq!(calls[0].workflow_id, workflow.id.to_string());
         assert_eq!(calls[0].input.get("target"), Some(&json!("release")));
         assert_eq!(response.temporal_run_id, "temporal-run-xyz");
+    }
+
+    #[tokio::test]
+    async fn start_execution_persists_temporal_linkage_after_temporal_start() {
+        let workflow = build_test_workflow("temporal-linkage-workflow");
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo.save(&workflow).await.unwrap();
+        let execution_repo = Arc::new(RecordingWorkflowExecutionRepository::default());
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-456"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            execution_repo.clone(),
+            Arc::new(tokio::sync::RwLock::new(Some(engine))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let response = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({ "prompt": "ship it" }),
+                blackboard: None,
+                tenant_id: Some(TenantId::local_default()),
+            })
+            .await
+            .unwrap();
+
+        let execution_id = ExecutionId::from_string(&response.execution_id).unwrap();
+        let updates = execution_repo.temporal_linkage_updates();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0],
+            TemporalLinkageCall {
+                tenant_id: TenantId::local_default(),
+                execution_id,
+                temporal_workflow_id: response.execution_id.clone(),
+                temporal_run_id: "temporal-run-456".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

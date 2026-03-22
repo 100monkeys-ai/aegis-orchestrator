@@ -304,6 +304,30 @@ pub trait WorkflowExecutionRepository: Send + Sync {
             .await
     }
 
+    /// Persist Temporal workflow/run linkage for an already-created workflow execution.
+    async fn update_temporal_linkage_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        execution_id: ExecutionId,
+        temporal_workflow_id: &str,
+        temporal_run_id: &str,
+    ) -> Result<(), RepositoryError>;
+
+    async fn update_temporal_linkage(
+        &self,
+        execution_id: ExecutionId,
+        temporal_workflow_id: &str,
+        temporal_run_id: &str,
+    ) -> Result<(), RepositoryError> {
+        self.update_temporal_linkage_for_tenant(
+            &TenantId::local_default(),
+            execution_id,
+            temporal_workflow_id,
+            temporal_run_id,
+        )
+        .await
+    }
+
     /// Append an execution event to the event sourcing audit trail (idempotent)
     async fn append_event(
         &self,

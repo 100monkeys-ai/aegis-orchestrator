@@ -641,6 +641,16 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn update_temporal_linkage_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _execution_id: ExecutionId,
+            _temporal_workflow_id: &str,
+            _temporal_run_id: &str,
+        ) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
         async fn append_event(
             &self,
             _execution_id: ExecutionId,

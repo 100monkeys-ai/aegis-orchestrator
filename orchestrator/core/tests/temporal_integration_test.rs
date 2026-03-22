@@ -10,6 +10,7 @@
 //! - **Purpose:** Implements temporal integration test
 
 use aegis_orchestrator_core::application::agent::AgentLifecycleService;
+use aegis_orchestrator_core::application::ports::WorkflowEnginePort;
 use aegis_orchestrator_core::application::register_workflow::{
     RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase,
 };
@@ -23,10 +24,16 @@ use aegis_orchestrator_core::domain::repository::{
     RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
-use aegis_orchestrator_core::domain::workflow::{Workflow, WorkflowExecution, WorkflowId};
+use aegis_orchestrator_core::domain::workflow::{
+    StateKind, StateName, TransitionCondition, TransitionRule, Workflow, WorkflowExecution,
+    WorkflowId, WorkflowMetadata, WorkflowSpec, WorkflowState,
+};
 use aegis_orchestrator_core::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
+use serde_json::json;
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::RwLock;
 
 struct MockAgentServiceInt;
@@ -174,6 +181,79 @@ impl WorkflowRepository for MockWorkflowRepo {
     }
 }
 
+struct StaticWorkflowRepo {
+    workflow: Workflow,
+}
+
+#[async_trait]
+impl WorkflowRepository for StaticWorkflowRepo {
+    async fn save_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow: &Workflow,
+    ) -> Result<(), RepositoryError> {
+        self.save(workflow).await
+    }
+
+    async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    async fn find_by_id_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_id(workflow_id).await
+    }
+
+    async fn find_by_id(
+        &self,
+        workflow_id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok((self.workflow.id == workflow_id).then(|| self.workflow.clone()))
+    }
+
+    async fn find_by_name_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_name(workflow_name).await
+    }
+
+    async fn find_by_name(&self, workflow_name: &str) -> Result<Option<Workflow>, RepositoryError> {
+        Ok((self.workflow.metadata.name == workflow_name).then(|| self.workflow.clone()))
+    }
+
+    async fn list_all_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        self.list_all().await
+    }
+
+    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![self.workflow.clone()])
+    }
+
+    async fn delete_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        workflow_id: WorkflowId,
+    ) -> Result<(), RepositoryError> {
+        self.delete(workflow_id).await
+    }
+
+    async fn delete(&self, workflow_id: WorkflowId) -> Result<(), RepositoryError> {
+        if self.workflow.id == workflow_id {
+            Ok(())
+        } else {
+            Err(RepositoryError::NotFound(workflow_id.to_string()))
+        }
+    }
+}
+
 struct MockWorkflowExecRepo;
 #[async_trait]
 impl WorkflowExecutionRepository for MockWorkflowExecRepo {
@@ -205,11 +285,21 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     }
     async fn append_event(
         &self,
-        _id: ExecutionId,
-        _iteration: i64,
+        _execution_id: ExecutionId,
+        _temporal_sequence_number: i64,
         _event_type: String,
-        _data: serde_json::Value,
-        _agent_id: Option<u8>,
+        _payload: serde_json::Value,
+        _iteration_number: Option<u8>,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    async fn update_temporal_linkage_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution_id: ExecutionId,
+        _temporal_workflow_id: &str,
+        _temporal_run_id: &str,
     ) -> Result<(), RepositoryError> {
         Ok(())
     }
@@ -251,6 +341,202 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         self.list_paginated(limit, offset).await
     }
+}
+
+struct FailingWorkflowExecRepo;
+
+#[async_trait]
+impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
+    async fn save_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution: &WorkflowExecution,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Database(
+            "simulated workflow execution persistence failure".to_string(),
+        ))
+    }
+
+    async fn save(&self, execution: &WorkflowExecution) -> Result<(), RepositoryError> {
+        self.save_for_tenant(&TenantId::local_default(), execution)
+            .await
+    }
+
+    async fn find_by_id_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution_id: ExecutionId,
+    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+        Ok(None)
+    }
+
+    async fn find_by_id(
+        &self,
+        _execution_id: ExecutionId,
+    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
+        Ok(None)
+    }
+
+    async fn append_event(
+        &self,
+        _execution_id: ExecutionId,
+        _temporal_sequence_number: i64,
+        _event_type: String,
+        _payload: serde_json::Value,
+        _iteration_number: Option<u8>,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
+
+    async fn update_temporal_linkage_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution_id: ExecutionId,
+        _temporal_workflow_id: &str,
+        _temporal_run_id: &str,
+    ) -> Result<(), RepositoryError> {
+        Err(RepositoryError::Database(
+            "simulated workflow execution persistence failure".to_string(),
+        ))
+    }
+
+    async fn find_active_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn find_events_by_execution(
+        &self,
+        _id: ExecutionId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<aegis_orchestrator_core::domain::workflow::WorkflowExecutionEventRecord>,
+        RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn list_paginated(
+        &self,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn list_paginated_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
+        Ok(vec![])
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StartCall {
+    workflow_id: String,
+    execution_id: ExecutionId,
+    input: HashMap<String, serde_json::Value>,
+}
+
+struct RecordingWorkflowEngine {
+    calls: Mutex<Vec<StartCall>>,
+    run_id: String,
+}
+
+impl RecordingWorkflowEngine {
+    fn new(run_id: &str) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            run_id: run_id.to_string(),
+        }
+    }
+
+    fn calls(&self) -> Vec<StartCall> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl aegis_orchestrator_core::application::ports::WorkflowEnginePort for RecordingWorkflowEngine {
+    async fn register_workflow(
+        &self,
+        _definition: &aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowDefinition,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn start_workflow(
+        &self,
+        workflow_id: &str,
+        execution_id: ExecutionId,
+        input: HashMap<String, serde_json::Value>,
+    ) -> anyhow::Result<String> {
+        self.calls.lock().unwrap().push(StartCall {
+            workflow_id: workflow_id.to_string(),
+            execution_id,
+            input,
+        });
+        Ok(self.run_id.clone())
+    }
+}
+
+fn build_test_workflow(name: &str) -> Workflow {
+    let mut states = HashMap::new();
+    states.insert(
+        StateName::new("START").unwrap(),
+        WorkflowState {
+            kind: StateKind::System {
+                command: "echo ready".to_string(),
+                env: HashMap::new(),
+                workdir: None,
+            },
+            transitions: vec![TransitionRule {
+                condition: TransitionCondition::Always,
+                target: StateName::new("END").unwrap(),
+                feedback: None,
+            }],
+            timeout: None,
+        },
+    );
+    states.insert(
+        StateName::new("END").unwrap(),
+        WorkflowState {
+            kind: StateKind::System {
+                command: "echo done".to_string(),
+                env: HashMap::new(),
+                workdir: None,
+            },
+            transitions: vec![],
+            timeout: None,
+        },
+    );
+
+    Workflow::new(
+        WorkflowMetadata {
+            name: name.to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        },
+        WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        },
+    )
+    .unwrap()
 }
 
 // NOTE: This is a full Temporal integration test that may require external services
@@ -306,4 +592,66 @@ states:
     let exec =
         start_result.expect("Failed to start workflow execution in temporal integration test");
     assert_eq!(exec.workflow_id, reg.workflow_id);
+}
+
+#[tokio::test]
+async fn start_execution_surfaces_repository_save_failure_before_temporal_start() {
+    let workflow = build_test_workflow("save-failure-workflow");
+    let workflow_repo = Arc::new(StaticWorkflowRepo {
+        workflow: workflow.clone(),
+    });
+    let failing_exec_repo = Arc::new(FailingWorkflowExecRepo);
+    let engine = Arc::new(RecordingWorkflowEngine::new(
+        "temporal-run-should-not-start",
+    ));
+    let event_bus = Arc::new(EventBus::new(8));
+
+    let service = StandardStartWorkflowExecutionUseCase::new(
+        workflow_repo,
+        failing_exec_repo,
+        Arc::new(RwLock::new(Some(engine.clone()))),
+        event_bus,
+    );
+
+    let err = service
+        .start_execution(StartWorkflowExecutionRequest {
+            workflow_id: workflow.metadata.name.clone(),
+            input: json!({"topic": "copy"}),
+            blackboard: None,
+            tenant_id: Some(TenantId::local_default()),
+        })
+        .await
+        .unwrap_err();
+
+    let err_text = err.to_string();
+    assert!(err_text.contains("Failed to persist workflow execution to repository"));
+    assert!(engine.calls().is_empty());
+}
+
+#[tokio::test]
+async fn recording_workflow_engine_captures_start_call_arguments() {
+    let engine = RecordingWorkflowEngine::new("recorded-run-id");
+    let execution_id = ExecutionId::new();
+    let input = HashMap::from([
+        (
+            "topic".to_string(),
+            serde_json::Value::String("copy".to_string()),
+        ),
+        (
+            "priority".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(3)),
+        ),
+    ]);
+
+    let run_id = engine
+        .start_workflow("workflow-alpha", execution_id.clone(), input.clone())
+        .await
+        .expect("recording engine should return its configured run id");
+
+    let calls = engine.calls();
+    assert_eq!(run_id, "recorded-run-id");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].workflow_id, "workflow-alpha");
+    assert_eq!(calls[0].execution_id, execution_id);
+    assert_eq!(calls[0].input, input);
 }
