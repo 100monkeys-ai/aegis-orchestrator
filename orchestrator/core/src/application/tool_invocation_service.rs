@@ -322,20 +322,26 @@ impl ToolInvocationService {
     /// Invokes a tool by validating the SMCP Envelope for the agent and routing to the right server
     pub async fn invoke_tool(
         &self,
-        agent_id: &AgentId,
         envelope: &impl EnvelopeVerifier,
     ) -> Result<Value, SmcpSessionError> {
-        // 1. Get active session for agent
+        // 1. Look up the active session by the opaque security_token string.
+        //    This avoids relying on unverified JWT payload content to route the request;
+        //    the agent_id and other claims are read from the already-loaded session record.
         let mut session = self
             .smcp_session_repo
-            .find_active_by_agent(agent_id)
+            .find_active_by_security_token(envelope.security_token())
             .await
-            .map_err(|_| {
-                SmcpSessionError::MalformedPayload("session repository lookup failed".to_string())
-            })? // generic fallback error
+            .map_err(|e| {
+                SmcpSessionError::InternalError(format!(
+                    "session repository lookup failed: {}",
+                    e
+                ))
+            })?
             .ok_or(SmcpSessionError::SessionInactive(
                 crate::domain::smcp_session::SessionStatus::Expired,
             ))?;
+
+        let agent_id = session.agent_id;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
@@ -3230,13 +3236,31 @@ mod tests {
         (fsal, registry)
     }
 
+    fn make_fake_token(agent_id: AgentId) -> String {
+        use base64::Engine;
+        let claims = serde_json::json!({"agent_id": agent_id.0.to_string()});
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&claims).unwrap_or_default());
+        format!("eyJhbGciOiJSUzI1NiJ9.{}.sig", payload)
+    }
+
     struct DummyEnvelope {
         valid: bool,
+        token: String,
+    }
+
+    impl DummyEnvelope {
+        fn for_agent(valid: bool, agent_id: AgentId) -> Self {
+            Self {
+                valid,
+                token: make_fake_token(agent_id),
+            }
+        }
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
         fn security_token(&self) -> &str {
-            "token"
+            &self.token
         }
 
         fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
@@ -3694,9 +3718,9 @@ spec:
             None,
         );
         let agent_id = AgentId::new();
-        let envelope = DummyEnvelope { valid: true };
+        let envelope = DummyEnvelope::for_agent(true, agent_id);
 
-        let result = service.invoke_tool(&agent_id, &envelope).await;
+        let result = service.invoke_tool(&envelope).await;
         assert!(matches!(result, Err(SmcpSessionError::SessionInactive(_))));
     }
 
@@ -3718,7 +3742,8 @@ spec:
             },
         };
 
-        let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
+        let session_token = make_fake_token(agent_id);
+        let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
         let _ = repo.save(session).await;
 
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
@@ -3744,9 +3769,9 @@ spec:
             Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
             None,
         );
-        let envelope = DummyEnvelope { valid: false };
+        let envelope = DummyEnvelope::for_agent(false, agent_id);
 
-        let result = service.invoke_tool(&agent_id, &envelope).await;
+        let result = service.invoke_tool(&envelope).await;
         assert!(matches!(
             result,
             Err(SmcpSessionError::SignatureVerificationFailed(_))
@@ -4131,7 +4156,8 @@ spec:
             },
         };
 
-        let session = SmcpSession::new(agent_id, exec_id, vec![], "token".to_string(), context);
+        let session_token = make_fake_token(agent_id);
+        let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
         let _ = repo.save(session).await;
 
         let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
@@ -4181,8 +4207,8 @@ spec:
 
         router.add_server(local_server).await.unwrap();
 
-        let envelope = DummyEnvelope { valid: true }; // extracts "test_tool"
-        let result = service.invoke_tool(&agent_id, &envelope).await.unwrap();
+        let envelope = DummyEnvelope::for_agent(true, agent_id); // extracts "test_tool"
+        let result = service.invoke_tool(&envelope).await.unwrap();
 
         let exec_mode = result
             .get("execution_mode")
@@ -4215,10 +4241,11 @@ spec:
 
         struct DummyRemoteEnvelope {
             valid: bool,
+            token: String,
         }
         impl EnvelopeVerifier for DummyRemoteEnvelope {
             fn security_token(&self) -> &str {
-                "token"
+                &self.token
             }
 
             fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
@@ -4236,11 +4263,11 @@ spec:
             }
         }
 
-        let remote_envelope = DummyRemoteEnvelope { valid: true };
-        let result = service
-            .invoke_tool(&agent_id, &remote_envelope)
-            .await
-            .unwrap();
+        let remote_envelope = DummyRemoteEnvelope {
+            valid: true,
+            token: make_fake_token(agent_id),
+        };
+        let result = service.invoke_tool(&remote_envelope).await.unwrap();
 
         let exec_mode = result
             .get("execution_mode")

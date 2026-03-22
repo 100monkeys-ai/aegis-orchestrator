@@ -3552,53 +3552,9 @@ async fn invoke_smcp_handler(
         timestamp: request.timestamp,
     };
 
-    let payload_b64 = envelope.security_token.split('.').nth(1).unwrap_or("");
-    let payload_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
-        payload_b64,
-    ) {
-        Ok(b) => b,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Malformed security token base64" })),
-            )
-                .into_response()
-        }
-    };
-
-    let token_data: serde_json::Value = match serde_json::from_slice(&payload_bytes) {
-        Ok(d) => d,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "Malformed security token JSON" })),
-            )
-                .into_response()
-        }
-    };
-
-    let agent_id_str = token_data
-        .get("agent_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-
-    let agent_id = match uuid::Uuid::parse_str(agent_id_str) {
-        Ok(uid) => AgentId(uid),
-        Err(_) => return (
-            StatusCode::BAD_REQUEST,
-            Json(
-                serde_json::json!({ "error": "agent_id in token is missing or not a valid UUID" }),
-            ),
-        )
-            .into_response(),
-    };
-
-    match state
-        .tool_invocation_service
-        .invoke_tool(&agent_id, &envelope)
-        .await
-    {
+    // The ToolInvocationService is responsible for validating the security_token
+    // and extracting any required claims (such as agent_id) from it as appropriate.
+    match state.tool_invocation_service.invoke_tool(&envelope).await {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,

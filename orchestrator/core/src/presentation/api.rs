@@ -565,8 +565,6 @@ async fn smcp_attestation(
 /// SMCP tool invocation request payload (ADR-033 §3).
 #[derive(serde::Deserialize)]
 pub struct SmcpToolInvokeRequest {
-    /// Agent ID (UUID).
-    pub agent_id: String,
     /// Signed SMCP security token (JWT issued at attestation).
     pub security_token: String,
     /// Ed25519 signature over the serialized `payload`.
@@ -584,7 +582,7 @@ async fn smcp_tool_invoke(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SmcpToolInvokeRequest>,
 ) -> impl IntoResponse {
-    tracing::info!(agent_id = %req.agent_id, "SMCP tool invocation request received");
+    tracing::info!("SMCP tool invocation request received");
 
     let tool_svc = match &state.tool_invocation_service {
         Some(svc) => svc.clone(),
@@ -599,17 +597,6 @@ async fn smcp_tool_invoke(
         }
     };
 
-    let agent_id = match uuid::Uuid::parse_str(&req.agent_id) {
-        Ok(uid) => AgentId(uid),
-        Err(_) => {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Invalid agent_id" })),
-            )
-                .into_response();
-        }
-    };
-
     let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
     let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
         protocol: None,
@@ -619,7 +606,7 @@ async fn smcp_tool_invoke(
         timestamp: None,
     };
 
-    match tool_svc.invoke_tool(&agent_id, &envelope).await {
+    match tool_svc.invoke_tool(&envelope).await {
         Ok(res) => (axum::http::StatusCode::OK, Json(res)).into_response(),
         Err(e) => {
             // Map domain errors to HTTP status + MCP JSON-RPC error codes (ADR-055).
