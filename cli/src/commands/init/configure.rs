@@ -344,8 +344,8 @@ impl ConfigWizard {
             lmstudio_judge_model: "google/gemma-3-4b".to_string(),
             enable_anthropic_extra: false,
             anthropic_api_key: String::new(),
-            anthropic_smart_model: "claude-sonnet-4-6".to_string(),
-            anthropic_judge_model: "claude-sonnet-4-6".to_string(),
+            anthropic_smart_model: "claude-sonnet-4-5".to_string(),
+            anthropic_judge_model: "claude-sonnet-4-5".to_string(),
             enable_gemini: false,
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_api_key: String::new(),
@@ -774,12 +774,12 @@ impl ConfigWizard {
           context_window: 200000
           cost_per_1k_tokens: 0.0008
         - alias: "smart"
-          model: "claude-sonnet-4-6"
+          model: "claude-sonnet-4-5"
           capabilities: ["code", "reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
         - alias: "judge"
-          model: "claude-sonnet-4-6"
+          model: "claude-sonnet-4-5"
           capabilities: ["reasoning"]
           context_window: 200000
           cost_per_1k_tokens: 0.003
@@ -1541,8 +1541,8 @@ mod tests {
                 lmstudio_judge_model: "google/gemma-3-4b".to_string(),
                 enable_anthropic_extra: false,
                 anthropic_api_key: String::new(),
-                anthropic_smart_model: "claude-sonnet-4-6".to_string(),
-                anthropic_judge_model: "claude-sonnet-4-6".to_string(),
+                anthropic_smart_model: "claude-sonnet-4-5".to_string(),
+                anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
@@ -1618,8 +1618,8 @@ mod tests {
                 lmstudio_judge_model: "google/gemma-3-4b".to_string(),
                 enable_anthropic_extra: false,
                 anthropic_api_key: String::new(),
-                anthropic_smart_model: "claude-sonnet-4-6".to_string(),
-                anthropic_judge_model: "claude-sonnet-4-6".to_string(),
+                anthropic_smart_model: "claude-sonnet-4-5".to_string(),
+                anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
@@ -1661,7 +1661,7 @@ mod tests {
         let rendered = wizard.render_aegis_config(&config, &components, "test-tag");
 
         assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
-        assert!(rendered.contains(r#"model: "claude-sonnet-4-6""#));
+        assert!(rendered.contains(r#"model: "claude-sonnet-4-5""#));
         assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
         assert!(!rendered.contains(r#"model: "claude-sonnet-4-5""#));
     }

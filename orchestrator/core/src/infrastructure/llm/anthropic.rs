@@ -336,11 +336,11 @@ mod tests {
         let adapter = AnthropicAdapter::new(
             "https://api.anthropic.com/v1".to_string(),
             "k".to_string(),
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-4-5".to_string(),
         );
         assert_eq!(adapter.api_key, "k");
         assert_eq!(adapter.endpoint, "https://api.anthropic.com/v1");
-        assert_eq!(adapter.model, "claude-sonnet-4-6");
+        assert_eq!(adapter.model, "claude-sonnet-4-5");
     }
 
     #[test]
@@ -363,7 +363,7 @@ mod tests {
     #[test]
     fn test_request_serialization() {
         let request = AnthropicRequest {
-            model: "claude-sonnet-4-6".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
             messages: vec![AnthropicMessage {
                 role: "user".to_string(),
                 content: serde_json::Value::String("Hello".to_string()),
@@ -374,7 +374,7 @@ mod tests {
             tools: None,
         };
         let json = serde_json::to_value(&request).unwrap();
-        assert_eq!(json["model"], "claude-sonnet-4-6");
+        assert_eq!(json["model"], "claude-sonnet-4-5");
         assert_eq!(json["messages"][0]["content"], "Hello");
         assert!(json.get("tools").is_none());
     }
@@ -452,7 +452,7 @@ mod tests {
         let adapter = AnthropicAdapter::new(
             "https://api.anthropic.com/v1".to_string(),
             "k".to_string(),
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-4-5".to_string(),
         );
 
         let error = adapter.classify_error(
@@ -474,16 +474,16 @@ mod tests {
         let adapter = AnthropicAdapter::new(
             "https://api.anthropic.com/v1".to_string(),
             "k".to_string(),
-            "claude-sonnet-4-6".to_string(),
+            "claude-sonnet-4-5".to_string(),
         );
 
         let error = adapter.classify_error(
             StatusCode::NOT_FOUND,
-            r#"{"error":{"type":"not_found_error","message":"Model claude-sonnet-4-6 not found"}}"#,
+            r#"{"error":{"type":"not_found_error","message":"Model claude-sonnet-4-5 not found"}}"#,
         );
 
         match error {
-            LLMError::ModelNotFound(model) => assert_eq!(model, "claude-sonnet-4-6"),
+            LLMError::ModelNotFound(model) => assert_eq!(model, "claude-sonnet-4-5"),
             other => panic!("expected ModelNotFound error, got {other:?}"),
         }
     }
