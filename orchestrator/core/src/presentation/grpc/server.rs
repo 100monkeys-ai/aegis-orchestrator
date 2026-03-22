@@ -570,10 +570,15 @@ impl AegisRuntime for AegisRuntimeService {
         })?;
 
         let attestation_req = crate::infrastructure::smcp::attestation::AttestationRequest {
-            agent_id: req.agent_id,
-            execution_id: req.execution_id,
-            container_id: req.container_id,
+            agent_id: Some(req.agent_id),
+            execution_id: Some(req.execution_id),
+            container_id: Some(req.container_id),
             public_key_pem: req.public_key_pem,
+            security_context: None,
+            principal_subject: None,
+            user_id: None,
+            workload_id: None,
+            zaru_tier: None,
         };
 
         match attestation_service.attest(attestation_req).await {
@@ -600,9 +605,11 @@ impl AegisRuntime for AegisRuntimeService {
 
         // Construct SmcpEnvelope
         let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
+            protocol: None,
             security_token: req.security_token,
             signature: req.signature,
             inner_mcp: req.inner_mcp,
+            timestamp: None,
         };
 
         // We need the agent_id to route appropriately. This would typically be extracted

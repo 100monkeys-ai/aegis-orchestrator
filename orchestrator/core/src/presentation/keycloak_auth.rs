@@ -14,6 +14,7 @@
 //! - `/v1/dispatch-gateway/*` — Dispatch Protocol (container ↔ orchestrator)
 //! - `/v1/smcp/attest` — SMCP attestation handshake
 //! - `/v1/smcp/invoke` — SMCP tool invocation (uses SecurityToken)
+//! - `/v1/smcp/tools` — SMCP tool discovery metadata
 //! - `/v1/webhooks/*` — webhook ingestion (HMAC auth)
 //! - `/v1/temporal-events` — Temporal callbacks (HMAC auth)
 
@@ -34,6 +35,7 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/v1/dispatch-gateway",
     "/v1/smcp/attest",
     "/v1/smcp/invoke",
+    "/v1/smcp/tools",
     "/v1/webhooks",
     "/v1/temporal-events",
 ];
@@ -123,6 +125,7 @@ mod tests {
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
         assert!(is_exempt("/v1/smcp/attest"));
         assert!(is_exempt("/v1/smcp/invoke"));
+        assert!(is_exempt("/v1/smcp/tools"));
         assert!(is_exempt("/v1/webhooks/github"));
         assert!(is_exempt("/v1/temporal-events"));
     }

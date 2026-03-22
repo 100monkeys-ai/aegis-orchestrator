@@ -1400,6 +1400,28 @@ impl ToolInvocationService {
         Ok(tools)
     }
 
+    pub async fn get_available_tools_for_context(
+        &self,
+        security_context_name: &str,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+        let security_context = self
+            .security_context_repo
+            .find_by_name(security_context_name)
+            .await
+            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Security context '{security_context_name}' not found"
+                ))
+            })?;
+
+        let tools = self.get_available_tools().await?;
+        Ok(tools
+            .into_iter()
+            .filter(|tool| security_context.permits_tool_name(&tool.name))
+            .collect())
+    }
+
     async fn fetch_gateway_tools_grpc(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
@@ -2790,6 +2812,7 @@ mod tests {
     use crate::domain::events::StorageEvent;
     use crate::domain::execution::ExecutionId;
     use crate::domain::fsal::{AegisFSAL, EventPublisher};
+    use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
     use crate::domain::security_context::SecurityContext;
     use crate::domain::smcp_session::SmcpSession;
     use crate::infrastructure::repositories::InMemoryVolumeRepository;
@@ -2829,6 +2852,10 @@ mod tests {
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
+        fn security_token(&self) -> &str {
+            "token"
+        }
+
         fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
             if self.valid {
                 Ok(())
@@ -3195,6 +3222,10 @@ mod tests {
             valid: bool,
         }
         impl EnvelopeVerifier for DummyRemoteEnvelope {
+            fn security_token(&self) -> &str {
+                "token"
+            }
+
             fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
                 if self.valid {
                     Ok(())
@@ -3221,6 +3252,134 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(exec_mode, "remote_jsonrpc");
+    }
+
+    #[tokio::test]
+    async fn get_available_tools_returns_builtin_dispatcher_metadata() {
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(
+            registry,
+            servers,
+            vec![BuiltinDispatcherConfig {
+                name: "fs.read".to_string(),
+                description: "Read files from the workspace".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "fs.read".to_string(),
+                    skip_judge: true,
+                }],
+            }],
+        ));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        );
+
+        let tools = service.get_available_tools().await.unwrap();
+        let fs_read = tools.iter().find(|tool| tool.name == "fs.read").unwrap();
+
+        assert_eq!(fs_read.description, "Read files from the workspace");
+        assert_eq!(
+            fs_read.input_schema["required"],
+            serde_json::json!(["path"])
+        );
+    }
+
+    #[tokio::test]
+    async fn get_available_tools_for_context_filters_disallowed_tools() {
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(
+            registry,
+            servers,
+            vec![
+                BuiltinDispatcherConfig {
+                    name: "fs.read".to_string(),
+                    description: "Read files".to_string(),
+                    enabled: true,
+                    capabilities: vec![CapabilityConfig {
+                        name: "fs.read".to_string(),
+                        skip_judge: true,
+                    }],
+                },
+                BuiltinDispatcherConfig {
+                    name: "cmd.run".to_string(),
+                    description: "Run commands".to_string(),
+                    enabled: true,
+                    capabilities: vec![CapabilityConfig {
+                        name: "cmd.run".to_string(),
+                        skip_judge: false,
+                    }],
+                },
+            ],
+        ));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        security_context_repo
+            .save(crate::domain::security_context::SecurityContext {
+                name: "zaru-free".to_string(),
+                description: "Free tier".to_string(),
+                capabilities: vec![crate::domain::security_context::Capability {
+                    tool_pattern: "fs.read".to_string(),
+                    path_allowlist: None,
+                    command_allowlist: None,
+                    subcommand_allowlist: None,
+                    domain_allowlist: None,
+                    rate_limit: None,
+                    max_response_size: None,
+                }],
+                deny_list: vec!["cmd.run".to_string()],
+                metadata: crate::domain::security_context::SecurityContextMetadata {
+                    created_at: chrono::Utc::now(),
+                    updated_at: chrono::Utc::now(),
+                    version: 1,
+                },
+            })
+            .await
+            .unwrap();
+        let (fsal, volume_registry) = test_fsal_deps();
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        );
+
+        let tools = service
+            .get_available_tools_for_context("zaru-free")
+            .await
+            .unwrap();
+
+        assert!(tools.iter().any(|tool| tool.name == "fs.read"));
+        assert!(!tools.iter().any(|tool| tool.name == "cmd.run"));
     }
 
     #[test]

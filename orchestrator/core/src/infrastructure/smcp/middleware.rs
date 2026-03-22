@@ -103,6 +103,10 @@ mod tests {
     }
 
     impl EnvelopeVerifier for DummyEnvelope {
+        fn security_token(&self) -> &str {
+            "token"
+        }
+
         fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
             self.signature_result.clone()
         }

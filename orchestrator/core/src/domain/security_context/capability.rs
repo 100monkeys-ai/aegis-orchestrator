@@ -68,6 +68,11 @@ pub struct Capability {
 }
 
 impl Capability {
+    /// Check whether a tool name matches this capability's tool pattern.
+    pub fn matches_tool_name(&self, tool_name: &str) -> bool {
+        self.matches_tool(tool_name)
+    }
+
     /// Evaluate whether `tool_name` with `args` is permitted by this capability.
     ///
     /// Returns `Ok(())` if the call is allowed. On any constraint violation, returns

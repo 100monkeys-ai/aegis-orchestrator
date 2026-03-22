@@ -101,6 +101,8 @@ pub enum SmcpSessionError {
     PolicyViolation(PolicyViolation),
     /// The SMCP envelope could not be parsed (missing required fields).
     MalformedPayload(String),
+    /// Replay protection rejected the envelope metadata.
+    ReplayProtectionFailed(String),
     /// The Ed25519 signature on the envelope did not verify against the session's stored public key.
     SignatureVerificationFailed(String),
     /// A semantic judge agent did not respond within the allotted timeout window.
@@ -123,6 +125,7 @@ impl std::fmt::Display for SmcpSessionError {
             Self::SessionExpired => write!(f, "Session has expired"),
             Self::PolicyViolation(v) => write!(f, "Policy violation: {v:?}"),
             Self::MalformedPayload(msg) => write!(f, "Malformed MCP payload: {msg}"),
+            Self::ReplayProtectionFailed(msg) => write!(f, "Replay protection failed: {msg}"),
             Self::SignatureVerificationFailed(e) => {
                 write!(f, "Signature verification failed: {e}")
             }
@@ -146,6 +149,9 @@ impl std::error::Error for SmcpSessionError {}
 /// Implementations **must** perform constant-time signature verification. Timing
 /// side-channels on `verify_signature` can leak private key material.
 pub trait EnvelopeVerifier {
+    /// Return the raw SMCP security token carried by the envelope.
+    fn security_token(&self) -> &str;
+
     /// Verify that the envelope's Ed25519 signature was produced by the holder of `public_key_bytes`.
     ///
     /// # Errors
@@ -197,6 +203,18 @@ pub struct SmcpSession {
     /// Assigned SecurityContext
     pub security_context: SecurityContext,
 
+    /// Optional upstream principal subject for audit correlation.
+    pub principal_subject: Option<String>,
+
+    /// Optional upstream user identifier for consumer-facing sessions.
+    pub user_id: Option<String>,
+
+    /// Optional workload identifier associated with this session.
+    pub workload_id: Option<String>,
+
+    /// Optional Zaru subscription tier bound at attestation time.
+    pub zaru_tier: Option<String>,
+
     /// Session status
     pub status: SessionStatus,
 
@@ -224,10 +242,29 @@ impl SmcpSession {
             agent_public_key,
             security_token_raw,
             security_context,
+            principal_subject: None,
+            user_id: None,
+            workload_id: None,
+            zaru_tier: None,
             status: SessionStatus::Active,
             created_at: now,
             expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),
         }
+    }
+
+    /// Attach optional upstream identity metadata captured during attestation.
+    pub fn with_principal_metadata(
+        mut self,
+        principal_subject: Option<String>,
+        user_id: Option<String>,
+        workload_id: Option<String>,
+        zaru_tier: Option<String>,
+    ) -> Self {
+        self.principal_subject = principal_subject.filter(|value| !value.trim().is_empty());
+        self.user_id = user_id.filter(|value| !value.trim().is_empty());
+        self.workload_id = workload_id.filter(|value| !value.trim().is_empty());
+        self.zaru_tier = zaru_tier.filter(|value| !value.trim().is_empty());
+        self
     }
 
     /// Authorise a single MCP tool call against this session's policy.
@@ -271,10 +308,17 @@ impl SmcpSession {
             return Err(SmcpSessionError::SessionExpired);
         }
 
-        // 3. Verify signature
+        // 3. Ensure the presented token matches the token issued for this session.
+        if envelope.security_token() != self.security_token_raw {
+            return Err(SmcpSessionError::SignatureVerificationFailed(
+                "security token does not match the active SMCP session".to_string(),
+            ));
+        }
+
+        // 4. Verify signature
         envelope.verify_signature(&self.agent_public_key)?;
 
-        // 4. Extract tool name from MCP payload
+        // 5. Extract tool name from MCP payload
         let tool_name = envelope
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload(
@@ -287,7 +331,7 @@ impl SmcpSession {
                 "missing arguments".to_string(),
             ))?;
 
-        // 5. Evaluate against SecurityContext
+        // 6. Evaluate against SecurityContext
         self.security_context
             .evaluate(&tool_name, &args)
             .map_err(SmcpSessionError::PolicyViolation)

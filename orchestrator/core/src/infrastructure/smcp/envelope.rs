@@ -26,6 +26,7 @@
 //! See ADR-035 §3 (Protocol Wire Format).
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use chrono::{DateTime, Utc};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -44,12 +45,19 @@ use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 /// `inner_mcp` with a key that was bound during attestation. See ADR-035 §5.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SmcpEnvelope {
+    /// Protocol identifier for version negotiation. `None` is accepted only for
+    /// internal legacy callers that still send the pre-spec envelope shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
     /// Signed JWT (`SecurityToken`) issued during attestation. Encodes `ContextClaims`.
     pub security_token: String,
     /// Base64-encoded Ed25519 signature over `inner_mcp` bytes.
     pub signature: String,
     /// Raw MCP JSON-RPC payload bytes (method + params).
     pub inner_mcp: Vec<u8>,
+    /// ISO-8601 UTC timestamp used for replay protection and canonical signing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 /// Represents the JWT `aud` claim, which may be either a single string or an array of strings.
@@ -93,6 +101,10 @@ pub struct ContextClaims {
 }
 
 impl EnvelopeVerifier for SmcpEnvelope {
+    fn security_token(&self) -> &str {
+        &self.security_token
+    }
+
     fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
         let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
             SmcpSessionError::SignatureVerificationFailed(
@@ -115,9 +127,10 @@ impl EnvelopeVerifier for SmcpEnvelope {
         })?;
 
         let signature = Signature::from_bytes(&sig_bytes);
+        let signed_message = self.signed_message()?;
 
         verifying_key
-            .verify(&self.inner_mcp, &signature)
+            .verify(&signed_message, &signature)
             .map_err(|e| {
                 SmcpSessionError::SignatureVerificationFailed(format!(
                     "Signature verification failed: {e}"
@@ -154,9 +167,107 @@ impl EnvelopeVerifier for SmcpEnvelope {
     }
 }
 
+impl SmcpEnvelope {
+    fn signed_message(&self) -> Result<Vec<u8>, SmcpSessionError> {
+        match (&self.protocol, &self.timestamp) {
+            (Some(protocol), Some(timestamp)) => {
+                if protocol != "smcp/v1" {
+                    return Err(SmcpSessionError::MalformedPayload(format!(
+                        "unsupported SMCP protocol '{protocol}'"
+                    )));
+                }
+
+                let timestamp = parse_iso8601_timestamp(timestamp)?;
+                let age_seconds = (Utc::now() - timestamp).num_seconds().abs();
+                if age_seconds > 30 {
+                    return Err(SmcpSessionError::ReplayProtectionFailed(format!(
+                        "envelope timestamp is outside the 30 second freshness window ({age_seconds}s)"
+                    )));
+                }
+
+                canonical_message(&self.security_token, &self.inner_mcp, timestamp)
+            }
+            (None, None) => Ok(self.inner_mcp.clone()),
+            _ => Err(SmcpSessionError::MalformedPayload(
+                "SMCP envelopes must provide both protocol and timestamp together".to_string(),
+            )),
+        }
+    }
+}
+
+/// Normalize an attested Ed25519 public key into the raw 32-byte form stored in SmcpSession.
+///
+/// Accepts:
+/// - raw 32-byte key material already present as bytes
+/// - base64-encoded raw 32-byte key material
+/// - PEM/SPKI public keys
+/// - base64-encoded Ed25519 SPKI DER public keys
+pub fn normalize_public_key_bytes(input: &str) -> Result<Vec<u8>, SmcpSessionError> {
+    const ED25519_SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    let trimmed = input.trim();
+    let candidate = if trimmed.contains("BEGIN PUBLIC KEY") {
+        trimmed
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect::<String>()
+    } else {
+        trimmed.to_string()
+    };
+
+    let decoded = STANDARD
+        .decode(&candidate)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&candidate))
+        .unwrap_or_else(|_| candidate.as_bytes().to_vec());
+
+    if decoded.len() == 32 {
+        return Ok(decoded);
+    }
+
+    if decoded.len() == 44 && decoded.starts_with(&ED25519_SPKI_PREFIX) {
+        return Ok(decoded[ED25519_SPKI_PREFIX.len()..].to_vec());
+    }
+
+    Err(SmcpSessionError::SignatureVerificationFailed(
+        "unsupported Ed25519 public key encoding".to_string(),
+    ))
+}
+
+fn parse_iso8601_timestamp(input: &str) -> Result<DateTime<Utc>, SmcpSessionError> {
+    DateTime::parse_from_rfc3339(input)
+        .map(|ts| ts.with_timezone(&Utc))
+        .map_err(|e| {
+            SmcpSessionError::MalformedPayload(format!("invalid SMCP timestamp '{input}': {e}"))
+        })
+}
+
+fn canonical_message(
+    security_token: &str,
+    payload: &[u8],
+    timestamp: DateTime<Utc>,
+) -> Result<Vec<u8>, SmcpSessionError> {
+    let payload_json: Value = serde_json::from_slice(payload).map_err(|e| {
+        SmcpSessionError::MalformedPayload(format!("invalid inner MCP payload JSON: {e}"))
+    })?;
+    let canonical = serde_json::json!({
+        "payload": payload_json,
+        "security_token": security_token,
+        "timestamp": timestamp.timestamp(),
+    });
+
+    serde_json::to_vec(&canonical).map_err(|e| {
+        SmcpSessionError::MalformedPayload(format!(
+            "failed to serialize canonical SMCP message: {e}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::SecondsFormat;
     use ed25519_dalek::{Signer, SigningKey};
     use serde_json::json;
 
@@ -179,13 +290,23 @@ mod tests {
         let inner_mcp_bytes = serde_json::to_vec(&inner_mcp_json).unwrap();
 
         // Sign the MCP message
-        let signature = signing_key.sign(&inner_mcp_bytes);
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let signature = signing_key.sign(
+            &canonical_message(
+                "test-jwt.token.here",
+                &inner_mcp_bytes,
+                parse_iso8601_timestamp(&timestamp).unwrap(),
+            )
+            .unwrap(),
+        );
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SmcpEnvelope {
+            protocol: Some("smcp/v1".to_string()),
             security_token: "test-jwt.token.here".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes.clone(),
+            timestamp: Some(timestamp),
         };
 
         // Should verify successfully with the public key
@@ -210,13 +331,23 @@ mod tests {
         let inner_mcp_bytes = b"{\"method\": \"something\"}".to_vec();
 
         // Sign with key 1
-        let signature = signing_key1.sign(&inner_mcp_bytes);
+        let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let signature = signing_key1.sign(
+            &canonical_message(
+                "test.jwt",
+                &inner_mcp_bytes,
+                parse_iso8601_timestamp(&timestamp).unwrap(),
+            )
+            .unwrap(),
+        );
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SmcpEnvelope {
+            protocol: Some("smcp/v1".to_string()),
             security_token: "test.jwt".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes,
+            timestamp: Some(timestamp),
         };
 
         // Verification with key 2 should fail
@@ -224,5 +355,19 @@ mod tests {
             envelope.verify_signature(verifying_key2.as_bytes()),
             Err(SmcpSessionError::SignatureVerificationFailed(_))
         ));
+    }
+
+    #[test]
+    fn normalize_public_key_accepts_spki_der_base64() {
+        let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+        let verifying_key = signing_key.verifying_key();
+        let mut spki = vec![
+            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+        ];
+        spki.extend_from_slice(verifying_key.as_bytes());
+        let encoded = STANDARD.encode(spki);
+
+        let normalized = normalize_public_key_bytes(&encoded).unwrap();
+        assert_eq!(normalized, verifying_key.as_bytes());
     }
 }

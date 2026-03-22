@@ -68,6 +68,18 @@ pub struct SecurityContext {
 }
 
 impl SecurityContext {
+    /// Determine whether this context may invoke a tool by name, ignoring runtime-only
+    /// constraints such as path, command, or URL arguments.
+    pub fn permits_tool_name(&self, tool_name: &str) -> bool {
+        if self.deny_list.contains(&tool_name.to_string()) {
+            return false;
+        }
+
+        self.capabilities
+            .iter()
+            .any(|capability| capability.matches_tool_name(tool_name))
+    }
+
     /// Evaluate whether a tool call is permitted by this `SecurityContext`.
     ///
     /// Applies the three-step policy algorithm:
@@ -191,5 +203,28 @@ mod tests {
             ctx.evaluate("fs.delete", &json!({"path": "/workspace/test.txt"})),
             Err(PolicyViolation::ToolExplicitlyDenied { .. })
         ));
+    }
+
+    #[test]
+    fn test_security_context_permits_tool_name_uses_patterns_and_denylist() {
+        let ctx = SecurityContext {
+            name: "test-ctx".to_string(),
+            description: "Testing context".to_string(),
+            capabilities: vec![Capability {
+                tool_pattern: "fs.*".to_string(),
+                path_allowlist: Some(vec!["/workspace".into()]),
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            }],
+            deny_list: vec!["fs.delete".to_string()],
+            metadata: test_metadata(),
+        };
+
+        assert!(ctx.permits_tool_name("fs.read"));
+        assert!(!ctx.permits_tool_name("fs.delete"));
+        assert!(!ctx.permits_tool_name("cmd.run"));
     }
 }

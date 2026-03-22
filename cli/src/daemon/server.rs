@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     middleware,
     response::{
@@ -2079,6 +2079,7 @@ fn create_router(
         )
         .route("/v1/smcp/attest", post(attest_smcp_handler))
         .route("/v1/smcp/invoke", post(invoke_smcp_handler))
+        .route("/v1/smcp/tools", get(list_smcp_tools_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
@@ -3465,10 +3466,16 @@ async fn reject_request_handler(
 
 #[derive(serde::Deserialize)]
 pub struct HttpAttestationRequest {
-    pub agent_id: String,
+    pub agent_id: Option<String>,
     pub execution_id: Option<String>,
-    pub container_id: String,
+    pub container_id: Option<String>,
+    #[serde(alias = "public_key_pem", alias = "agent_public_key")]
     pub public_key: String,
+    pub security_context: Option<String>,
+    pub principal_subject: Option<String>,
+    pub user_id: Option<String>,
+    pub workload_id: Option<String>,
+    pub zaru_tier: Option<String>,
 }
 
 async fn attest_smcp_handler(
@@ -3478,11 +3485,14 @@ async fn attest_smcp_handler(
     let internal_req =
         aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
             agent_id: request.agent_id.clone(),
-            execution_id: request
-                .execution_id
-                .unwrap_or_else(|| request.agent_id.clone()),
+            execution_id: request.execution_id.clone(),
             container_id: request.container_id.clone(),
             public_key_pem: request.public_key.clone(),
+            security_context: request.security_context.clone(),
+            principal_subject: request.principal_subject.clone(),
+            user_id: request.user_id.clone(),
+            workload_id: request.workload_id.clone(),
+            zaru_tier: request.zaru_tier.clone(),
         };
 
     match state.attestation_service.attest(internal_req).await {
@@ -3505,9 +3515,11 @@ async fn attest_smcp_handler(
 
 #[derive(serde::Deserialize)]
 pub struct HttpSmcpEnvelope {
+    pub protocol: Option<String>,
     pub security_token: String,
     pub signature: String,
     pub payload: serde_json::Value,
+    pub timestamp: Option<String>,
 }
 
 async fn invoke_smcp_handler(
@@ -3517,9 +3529,11 @@ async fn invoke_smcp_handler(
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
 
     let envelope = aegis_orchestrator_core::infrastructure::smcp::envelope::SmcpEnvelope {
+        protocol: request.protocol,
         security_token: request.security_token,
         signature: request.signature,
         inner_mcp: payload_bytes,
+        timestamp: request.timestamp,
     };
 
     let payload_b64 = envelope.security_token.split('.').nth(1).unwrap_or("");
@@ -3574,6 +3588,55 @@ async fn invoke_smcp_handler(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize, Default)]
+struct SmcpToolsQuery {
+    security_context: Option<String>,
+}
+
+async fn list_smcp_tools_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SmcpToolsQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let security_context = headers
+        .get("X-Zaru-Security-Context")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(query.security_context);
+
+    let tools_result = if let Some(ref security_context) = security_context {
+        state
+            .tool_invocation_service
+            .get_available_tools_for_context(security_context)
+            .await
+    } else {
+        state.tool_invocation_service.get_available_tools().await
+    };
+
+    match tools_result {
+        Ok(tools) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "protocol": "smcp/v1",
+                "attestation_endpoint": "/v1/smcp/attest",
+                "invoke_endpoint": "/v1/smcp/invoke",
+                "security_context": security_context,
+                "tools": tools,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": error.to_string(),
             })),
         )
             .into_response(),
