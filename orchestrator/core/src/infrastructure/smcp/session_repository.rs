@@ -58,17 +58,14 @@ impl SmcpSessionRepository for InMemorySmcpSessionRepository {
     async fn find_active_by_agent(&self, agent_id: &AgentId) -> Result<Option<SmcpSession>> {
         let guard = self.sessions.read().await;
         // Returns the most recently created active session for the agent
-        let mut active_sessions: Vec<_> = guard
+        Ok(guard
             .values()
             .filter(|s| {
                 s.agent_id == *agent_id
                     && s.status == crate::domain::smcp_session::SessionStatus::Active
             })
-            .collect();
-
-        active_sessions.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-        Ok(active_sessions.first().map(|s| (*s).clone()))
+            .max_by_key(|s| s.created_at)
+            .cloned())
     }
 
     async fn revoke_for_agent(&self, agent_id: &AgentId, reason: String) -> Result<()> {
