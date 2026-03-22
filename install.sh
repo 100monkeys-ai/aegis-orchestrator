@@ -17,12 +17,6 @@ set -euo pipefail
 PINNED_VERSION="0.14.0-pre-alpha"
 AEGIS_VERSION="${AEGIS_VERSION:-$PINNED_VERSION}"
 
-if [[ "$AEGIS_VERSION" == "latest" ]]; then
-    DOWNLOAD_VERSION="$PINNED_VERSION"
-else
-    DOWNLOAD_VERSION="$AEGIS_VERSION"
-fi
-
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -33,6 +27,36 @@ RESET='\033[0m'
 info()    { echo -e "${CYAN}${BOLD}[aegis]${RESET} $*"; }
 success() { echo -e "${GREEN}${BOLD}[aegis]${RESET} $*"; }
 die()     { echo -e "${RED}${BOLD}[aegis] ERROR:${RESET} $*" >&2; exit 1; }
+
+if [[ "$AEGIS_VERSION" == "latest" ]]; then
+    # Resolve "latest" to the most recent GitHub release tag.
+    # Fall back to the pinned version if resolution fails.
+    LATEST_TAG=""
+    if command -v curl >/dev/null 2>&1; then
+        GITHUB_API_URL="https://api.github.com/repos/100monkeys-ai/aegis-orchestrator/releases/latest"
+        RAW_RELEASE_JSON="$(curl -fsSL "$GITHUB_API_URL" 2>/dev/null || true)"
+        if [[ -n "${RAW_RELEASE_JSON:-}" ]]; then
+            if command -v jq >/dev/null 2>&1; then
+                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | jq -r '.tag_name // empty')"
+            else
+                # Minimal JSON parsing fallback if jq is unavailable.
+                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+            fi
+        fi
+        if [[ -n "${LATEST_TAG}" ]]; then
+            DOWNLOAD_VERSION="$LATEST_TAG"
+            info "Resolved AEGIS_VERSION=latest to GitHub release tag: $DOWNLOAD_VERSION"
+        else
+            info "Could not resolve latest GitHub release; falling back to pinned version $PINNED_VERSION"
+            DOWNLOAD_VERSION="$PINNED_VERSION"
+        fi
+    else
+        info "curl not available to resolve latest release; falling back to pinned version $PINNED_VERSION"
+        DOWNLOAD_VERSION="$PINNED_VERSION"
+    fi
+else
+    DOWNLOAD_VERSION="$AEGIS_VERSION"
+fi
 
 # ── Detect OS ─────────────────────────────────────────────────────────────────
 OS="$(uname -s)"
@@ -78,7 +102,7 @@ if grep -qiE 'microsoft|WSL' /proc/version 2>/dev/null; then
 fi
 
 if command -v docker &>/dev/null; then
-    if docker info &>/dev/null 2>&1; then
+    if docker info &>/dev/null; then
         success "Docker is running ($(docker --version))."
     else
         info "Docker is installed but daemon is not reachable. Attempting to start daemon..."
@@ -88,7 +112,7 @@ if command -v docker &>/dev/null; then
             sudo service docker start 2>/dev/null || true
         fi
 
-        if docker info &>/dev/null 2>&1; then
+        if docker info &>/dev/null; then
             success "Docker daemon started successfully."
         else
             echo ""
@@ -148,7 +172,7 @@ ${DOCKER_REPO_BASE} $(lsb_release -cs) stable" \
     # Start the daemon (best-effort; may fail in some WSL environments)
     sudo service docker start 2>/dev/null || true
     # Verify
-    if ! docker info &>/dev/null 2>&1; then
+    if ! docker info &>/dev/null; then
         echo ""
         echo -e "${RED}${BOLD}[aegis] WARNING:${RESET} Docker daemon is not reachable after install."
         if [[ "$IS_WSL" == "true" ]]; then
@@ -192,7 +216,7 @@ install_aegis_from_release() {
             asset="aegis-macos-aarch64.tar.gz"
             ;;
         *)
-            die "No release asset available for ${PLATFORM}/${arch}. Supported combinations are linux/x86_64 and macos/aarch64."
+            die "No release asset available for ${PLATFORM}/${arch}. Supported combinations are linux/x86_64 and macos/aarch64 (Apple Silicon). Note: macOS on Intel (x86_64) is not supported."
             ;;
     esac
 

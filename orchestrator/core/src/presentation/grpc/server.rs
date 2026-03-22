@@ -147,6 +147,10 @@ impl AegisRuntimeService {
     }
 }
 
+fn normalize_judge_weight(weight: f32) -> f64 {
+    if weight > 0.0 { weight as f64 } else { 1.0 }
+}
+
 #[tonic::async_trait]
 impl AegisRuntime for AegisRuntimeService {
     type ExecuteAgentStream = ReceiverStream<Result<ExecutionEvent, Status>>;
@@ -230,9 +234,11 @@ impl AegisRuntime for AegisRuntimeService {
                 .await;
 
             // Check for ADR-016 nested execution
-            let start_result = if let Some(parent_id_str) = req.parent_execution_id {
-                let parent_id =
-                    match crate::domain::execution::ExecutionId::from_string(&parent_id_str) {
+            let start_result =
+                if let Some(parent_execution_id_str) = req.parent_execution_id {
+                    let parent_id = match crate::domain::execution::ExecutionId::from_string(
+                        &parent_execution_id_str,
+                    ) {
                         Ok(id) => id,
                         Err(e) => {
                             let _ = tx_clone
@@ -250,10 +256,10 @@ impl AegisRuntime for AegisRuntimeService {
                             return;
                         }
                     };
-                execution_service
-                    .start_child_execution(agent_id, input, parent_id)
-                    .await
-            } else {
+                    execution_service
+                        .start_child_execution(agent_id, input, parent_id)
+                        .await
+                } else {
                 execution_service.start_execution(agent_id, input).await
             };
 
@@ -400,7 +406,7 @@ impl AegisRuntime for AegisRuntimeService {
             .iter()
             .map(|j| {
                 AgentId::from_string(&j.agent_id)
-                    .map(|id| (id, if j.weight > 0.0 { j.weight as f64 } else { 1.0 }))
+                    .map(|id| (id, normalize_judge_weight(j.weight)))
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {e}")))?;
@@ -704,7 +710,15 @@ impl AegisRuntime for AegisRuntimeService {
             let timeout = if res.timeout.is_empty() {
                 None
             } else {
-                humantime_serde::re::humantime::parse_duration(&res.timeout).ok()
+                match humantime_serde::re::humantime::parse_duration(&res.timeout) {
+                    Ok(dur) => Some(dur),
+                    Err(e) => {
+                        return Err(Status::invalid_argument(format!(
+                            "Invalid timeout duration '{}': {e}",
+                            res.timeout
+                        )));
+                    }
+                }
             };
             Some(ContainerResources {
                 cpu: if res.cpu_millicores == 0 {
@@ -724,11 +738,18 @@ impl AegisRuntime for AegisRuntimeService {
         };
 
         let env: HashMap<String, String> = req.env;
-        let max_attempts = if req.max_attempts == 0 {
-            1
-        } else {
-            req.max_attempts
-        };
+
+        fn normalize_max_attempts(value: u32) -> u32 {
+            // Treat 0 as 1: proto3 defaults unset fields to 0, but at least
+            // one attempt must always be made to run the container step.
+            if value == 0 {
+                1
+            } else {
+                value
+            }
+        }
+
+        let max_attempts = normalize_max_attempts(req.max_attempts);
 
         let input = RunContainerStepInput {
             execution_id,
@@ -952,50 +973,57 @@ fn convert_domain_event_to_proto(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn start_grpc_server(
-    addr: std::net::SocketAddr,
-    execution_service: Arc<dyn ExecutionService>,
-    validation_service: Arc<ValidationService>,
-    grpc_auth: Option<GrpcIamAuthInterceptor>,
-    attestation_service: Option<
+#[derive(Clone)]
+pub struct GrpcServerConfig {
+    pub addr: std::net::SocketAddr,
+    pub execution_service: Arc<dyn ExecutionService>,
+    pub validation_service: Arc<ValidationService>,
+    pub grpc_auth: Option<GrpcIamAuthInterceptor>,
+    pub attestation_service: Option<
         Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>,
     >,
-    tool_invocation_service: Option<
+    pub tool_invocation_service: Option<
         Arc<crate::application::tool_invocation_service::ToolInvocationService>,
     >,
-    cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
-    run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
-    agent_service: Arc<dyn AgentLifecycleService>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut service = AegisRuntimeService::new(execution_service, validation_service);
+    pub cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
+    pub run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
+    pub agent_service: Arc<dyn AgentLifecycleService>,
+}
 
-    if let Some(auth) = grpc_auth {
+pub async fn start_grpc_server(
+    config: GrpcServerConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut service =
+        AegisRuntimeService::new(config.execution_service, config.validation_service);
+
+    if let Some(auth) = config.grpc_auth {
         service = service.with_grpc_auth(auth);
     }
 
-    if let (Some(a), Some(t)) = (attestation_service, tool_invocation_service) {
+    if let (Some(a), Some(t)) =
+        (config.attestation_service, config.tool_invocation_service)
+    {
         service = service.with_smcp(a, t);
     }
 
-    if let Some(c) = cortex_client {
+    if let Some(c) = config.cortex_client {
         service = service.with_cortex(c);
     }
 
-    if let Some(uc) = run_container_step_use_case {
+    if let Some(uc) = config.run_container_step_use_case {
         service = service.with_container_step_runner(uc);
     }
 
-    service = service.with_agent_service(agent_service);
+    service = service.with_agent_service(config.agent_service);
 
     let server = service.into_server();
 
-    tracing::info!("Starting AEGIS gRPC server on {}", addr);
+    tracing::info!("Starting AEGIS gRPC server on {}", config.addr);
 
     tonic::transport::Server::builder()
         .layer(GrpcMetricsLayer)
         .add_service(server)
-        .serve(addr)
+        .serve(config.addr)
         .await?;
 
     Ok(())

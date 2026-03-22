@@ -181,6 +181,11 @@ pub struct NodeConfigSpec {
     /// AgentSkills configuration (e.g. <https://agentskills.io/api>)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_skills: Option<AgentSkillsConfig>,
+
+    /// Maximum number of executions returned by a single `list_executions` request.
+    /// Protects against excessive memory usage. Defaults to 1000 if not configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_execution_list_limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -939,6 +944,11 @@ pub struct TemporalConfig {
     /// Temporal task queue.
     #[serde(default = "default_temporal_task_queue")]
     pub task_queue: String,
+
+    /// Maximum number of connection retries when establishing the Temporal client.
+    /// If omitted, a default of 30 retries is used.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connection_retries: Option<i32>,
 }
 
 impl Default for TemporalConfig {
@@ -949,6 +959,7 @@ impl Default for TemporalConfig {
             worker_secret: None,
             namespace: default_temporal_namespace(),
             task_queue: default_temporal_task_queue(),
+            max_connection_retries: None,
         }
     }
 }
@@ -1074,6 +1085,10 @@ impl Default for SmcpConfig {
     }
 }
 
+fn default_node_role() -> NodeRole {
+    NodeRole::default()
+}
+
 /// Cluster configuration (ADR-059).
 ///
 /// Defines the node's role in a multi-node cluster (Controller, Worker, Hybrid).
@@ -1085,7 +1100,7 @@ pub struct ClusterConfig {
     #[serde(default)]
     pub enabled: bool,
     /// Node role in the cluster. Default: "hybrid" (single-node backward compat).
-    #[serde(default = "NodeRole::default")]
+    #[serde(default = "default_node_role")]
     pub role: NodeRole,
     /// Controller settings (required for workers)
     pub controller: Option<ClusterControllerConfig>,
@@ -1576,7 +1591,7 @@ impl NodeConfigManifest {
         #[cfg(windows)]
         let system_config = std::env::var_os("ProgramData")
             .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir)
+            .unwrap_or_else(|| std::env::temp_dir())
             .join("Aegis")
             .join("aegis-config.yaml");
 
