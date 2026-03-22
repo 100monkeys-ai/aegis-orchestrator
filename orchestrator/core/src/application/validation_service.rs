@@ -533,22 +533,7 @@ impl GradientValidator for SemanticAgentValidator {
             .await?;
 
         // 4. Poll for completion.
-        let max_attempts = {
-            // Compute max attempts in an overflow-safe way:
-            //   max_attempts = (timeout_seconds * 1000) / poll_interval_ms
-            // Guard against overflow and division by zero.
-            let timeout_ms = self.timeout_seconds.saturating_mul(1000);
-            if self.poll_interval_ms == 0 {
-                0
-            } else {
-                let attempts = timeout_ms / self.poll_interval_ms;
-                if attempts == 0 && timeout_ms > 0 {
-                    1
-                } else {
-                    attempts
-                }
-            }
-        };
+        let max_attempts = calculate_max_attempts(self.timeout_seconds, self.poll_interval_ms)?;
         let mut attempts = 0;
         loop {
             if attempts >= max_attempts {
@@ -687,19 +672,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     .start_child_execution(jid, exec_input, parent_id)
                     .await?;
                 // Poll for completion.
-                let max_attempts = {
-                    let timeout_ms = timeout.saturating_mul(1000);
-                    if poll_interval == 0 {
-                        0
-                    } else {
-                        let attempts = timeout_ms / poll_interval;
-                        if attempts == 0 && timeout_ms > 0 {
-                            1
-                        } else {
-                            attempts
-                        }
-                    }
-                };
+                let max_attempts = calculate_max_attempts(timeout, poll_interval)?;
                 let mut attempts = 0;
                 loop {
                     if attempts >= max_attempts {

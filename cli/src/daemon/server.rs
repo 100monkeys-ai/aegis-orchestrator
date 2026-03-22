@@ -25,6 +25,8 @@ use axum::{
     routing::{get, post},
     Extension, Json, Router,
 };
+
+const DEFAULT_ORCHESTRATOR_URL: &str = "http://localhost:8088";
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -348,7 +350,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let orchestrator_url =
         resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
-            "http://localhost:8088".to_string()
+            DEFAULT_ORCHESTRATOR_URL.to_string()
         });
 
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
