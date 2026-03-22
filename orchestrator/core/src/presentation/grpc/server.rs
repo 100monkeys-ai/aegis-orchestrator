@@ -148,7 +148,11 @@ impl AegisRuntimeService {
 }
 
 fn normalize_judge_weight(weight: f32) -> f64 {
-    if weight > 0.0 { weight as f64 } else { 1.0 }
+    if weight > 0.0 {
+        weight as f64
+    } else {
+        1.0
+    }
 }
 
 #[tonic::async_trait]
@@ -234,32 +238,31 @@ impl AegisRuntime for AegisRuntimeService {
                 .await;
 
             // Check for ADR-016 nested execution
-            let start_result =
-                if let Some(parent_execution_id_str) = req.parent_execution_id {
-                    let parent_id = match crate::domain::execution::ExecutionId::from_string(
-                        &parent_execution_id_str,
-                    ) {
-                        Ok(id) => id,
-                        Err(e) => {
-                            let _ = tx_clone
-                                .send(Ok(ExecutionEvent {
-                                    event: Some(execution_event::Event::ExecutionFailed(
-                                        ExecutionFailed {
-                                            execution_id: uuid::Uuid::new_v4().to_string(),
-                                            reason: format!("Invalid parent_execution_id: {e}"),
-                                            total_iterations: 0,
-                                            failed_at: Utc::now().to_rfc3339(),
-                                        },
-                                    )),
-                                }))
-                                .await;
-                            return;
-                        }
-                    };
-                    execution_service
-                        .start_child_execution(agent_id, input, parent_id)
-                        .await
-                } else {
+            let start_result = if let Some(parent_execution_id_str) = req.parent_execution_id {
+                let parent_id = match crate::domain::execution::ExecutionId::from_string(
+                    &parent_execution_id_str,
+                ) {
+                    Ok(id) => id,
+                    Err(e) => {
+                        let _ = tx_clone
+                            .send(Ok(ExecutionEvent {
+                                event: Some(execution_event::Event::ExecutionFailed(
+                                    ExecutionFailed {
+                                        execution_id: uuid::Uuid::new_v4().to_string(),
+                                        reason: format!("Invalid parent_execution_id: {e}"),
+                                        total_iterations: 0,
+                                        failed_at: Utc::now().to_rfc3339(),
+                                    },
+                                )),
+                            }))
+                            .await;
+                        return;
+                    }
+                };
+                execution_service
+                    .start_child_execution(agent_id, input, parent_id)
+                    .await
+            } else {
                 execution_service.start_execution(agent_id, input).await
             };
 
@@ -405,8 +408,7 @@ impl AegisRuntime for AegisRuntimeService {
             .judges
             .iter()
             .map(|j| {
-                AgentId::from_string(&j.agent_id)
-                    .map(|id| (id, normalize_judge_weight(j.weight)))
+                AgentId::from_string(&j.agent_id).map(|id| (id, normalize_judge_weight(j.weight)))
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| Status::invalid_argument(format!("Invalid judge agent_id: {e}")))?;
@@ -979,30 +981,23 @@ pub struct GrpcServerConfig {
     pub execution_service: Arc<dyn ExecutionService>,
     pub validation_service: Arc<ValidationService>,
     pub grpc_auth: Option<GrpcIamAuthInterceptor>,
-    pub attestation_service: Option<
-        Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>,
-    >,
-    pub tool_invocation_service: Option<
-        Arc<crate::application::tool_invocation_service::ToolInvocationService>,
-    >,
+    pub attestation_service:
+        Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+    pub tool_invocation_service:
+        Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
     pub cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
     pub run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
     pub agent_service: Arc<dyn AgentLifecycleService>,
 }
 
-pub async fn start_grpc_server(
-    config: GrpcServerConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut service =
-        AegisRuntimeService::new(config.execution_service, config.validation_service);
+pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut service = AegisRuntimeService::new(config.execution_service, config.validation_service);
 
     if let Some(auth) = config.grpc_auth {
         service = service.with_grpc_auth(auth);
     }
 
-    if let (Some(a), Some(t)) =
-        (config.attestation_service, config.tool_invocation_service)
-    {
+    if let (Some(a), Some(t)) = (config.attestation_service, config.tool_invocation_service) {
         service = service.with_smcp(a, t);
     }
 

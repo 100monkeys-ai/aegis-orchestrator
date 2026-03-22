@@ -685,7 +685,11 @@ impl GradientValidator for MultiJudgeAgentValidator {
                         0
                     } else {
                         let attempts = timeout_ms / poll_interval;
-                        if attempts == 0 && timeout_ms > 0 { 1 } else { attempts }
+                        if attempts == 0 && timeout_ms > 0 {
+                            1
+                        } else {
+                            attempts
+                        }
                     }
                 };
                 let mut attempts = 0;

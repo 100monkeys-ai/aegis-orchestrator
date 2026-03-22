@@ -665,9 +665,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
-    let temporal_connection_max_retries: i32 = temporal_config
-        .max_connection_retries
-        .unwrap_or(30);
+    let temporal_connection_max_retries: i32 = temporal_config.max_connection_retries.unwrap_or(30);
     println!("Initializing Temporal Client (Address: {temporal_address})...");
 
     // Create shared containers for the concrete Temporal client and the workflow engine port.
@@ -2351,11 +2349,7 @@ async fn list_executions_handler(
 
     // Determine the maximum allowed page size from configuration, with a
     // backward-compatible default of 1000 if not set.
-    let max_limit = state
-        .config
-        .spec
-        .max_execution_list_limit
-        .unwrap_or(1000);
+    let max_limit = state.config.spec.max_execution_list_limit.unwrap_or(1000);
 
     let limit = query.limit.unwrap_or(20).min(max_limit);
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
