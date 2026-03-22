@@ -360,7 +360,8 @@ impl AegisRuntime for AegisRuntimeService {
         // Execute with timeout
         let timeout = std::time::Duration::from_secs(
             req.timeout_seconds
-                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS as u32) as u64,
+                .map(|secs| secs as u64)
+                .unwrap_or(DEFAULT_COMMAND_TIMEOUT_SECS),
         );
 
         match tokio::time::timeout(timeout, cmd.output()).await {
@@ -794,7 +795,7 @@ impl AegisRuntimeService {
         source_name: String,
         content: String,
         idempotency_key: String,
-        headers: std::collections::HashMap<String, String>,
+        mut headers: std::collections::HashMap<String, String>,
         tenant_id: TenantId,
     ) -> Result<(String, String), Status> {
         let stimulus_service = self
@@ -802,7 +803,6 @@ impl AegisRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("Stimulus service is not configured"))?;
 
-        let mut headers = headers;
         headers
             .entry("x-aegis-tenant".to_string())
             .or_insert_with(|| tenant_id.to_string());

@@ -39,7 +39,7 @@ pub struct NodeConfigManifest {
     #[serde(rename = "apiVersion")]
     pub api_version: String,
 
-    ///   Resource kind (must be "NodeConfig")
+    /// Resource kind (must be "NodeConfig")
     pub kind: String,
 
     /// Node metadata (name, labels, version)
@@ -55,7 +55,7 @@ pub struct ManifestMetadata {
     /// Human-readable node name (unique identifier)
     pub name: String,
 
-    ///   Optional: Configuration version for tracking
+    /// Optional: Configuration version for tracking
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 
@@ -366,9 +366,9 @@ pub struct RuntimeConfig {
     /// - "127.0.0.1" (WSL2/Linux Native with exposed port 2049)
     /// - "host.docker.internal" (Docker Desktop on Mac/Windows)
     /// - "172.17.0.1" (Docker bridge gateway IP)
-    ///   Examples for production:
-    /// - `<Physical Host IP>` (Firecracker VMs, Remote Hosts)
-    ///   Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
+    /// Examples for production:
+    /// - "Physical host IP address" (Firecracker VMs, Remote Hosts)
+    /// Default: "127.0.0.1" (covers local native daemon and WSL2 deployments)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nfs_server_host: Option<String>,
 
