@@ -1665,6 +1665,5 @@ mod tests {
         assert!(rendered.contains(r#"endpoint: "https://api.anthropic.com/v1""#));
         assert!(rendered.contains(r#"model: "claude-sonnet-4-5""#));
         assert!(!rendered.contains(r#"endpoint: "https://api.anthropic.com""#));
-        assert!(!rendered.contains(r#"model: "claude-sonnet-4-5""#));
     }
 }

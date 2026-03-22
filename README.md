@@ -1,342 +1,164 @@
 # AEGIS Orchestrator
 
-The core runtime and orchestrator for Project AEGIS - a secure, serverless runtime environment for autonomous AI agents.
+The runtime and control plane for AEGIS: secure, policy-governed infrastructure for running autonomous AI agents without giving up control.
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
 [![Documentation](https://img.shields.io/badge/docs-docs.100monkeys.ai-brightgreen.svg)](https://docs.100monkeys.ai)
 
-## Overview
+AEGIS is built for teams that want automation to be useful in production, not just impressive in a demo. If you are a DevOps engineer, SRE, or developer trying to run agents with predictable behavior, strong isolation, and operational visibility, this repository is the place to start.
 
-The AEGIS Orchestrator is the control plane that manages agent lifecycle, enforces security policies, and provides runtime isolation through Docker (development) and Firecracker (production) micro-VMs.
+## Why Teams Use AEGIS
 
-## Architecture
+- **Deterministic control:** explicit workflows, typed manifests, and orchestrator-managed execution reduce hidden behavior and ad hoc agent sprawl.
+- **Security by default:** network and filesystem access are policy-governed, runtimes are isolated, and tool calls flow through the orchestrator instead of directly from the agent.
+- **Reliable operations:** one command brings up the local stack, health checks are built in, and the CLI is designed for repeatable operator workflows.
+- **Auditable automation:** structured logs, machine-readable CLI output, and orchestrator-mediated dispatch make agent activity easier to inspect and automate around.
+- **Clear path to production:** Docker supports local development, while Firecracker-backed isolation is the intended production direction.
 
-```markdown
-┌─────────────────────────────────────────────┐
-│         AEGIS Orchestrator (Rust)            │
-│  • Scheduling  • Security  • State Mgmt     │
-└─────────────────────────────────────────────┘
-                    │
-    ┌───────────────┴───────────────┐
-    ▼                               ▼
-┌─────────┐                   ┌─────────┐
-│ Docker  │                   │Firecracker│
-│ Runtime │                   │  Runtime  │
-└─────────┘                   └─────────┘
-```
+## What AEGIS Is
 
-## Components
-
-### Core (`core/`)
-
-Pure domain logic implementing:
-
-- Agent lifecycle management
-- Runtime trait abstraction
-- Security policy engine
-- Swarm coordination
-
-### API (`api/`)
-
-HTTP/gRPC server built with Axum for:
-
-- Agent deployment
-- Task execution
-- Status monitoring
-- Management operations
-
-### Runtimes
-
-- **Docker** (`runtime-docker/`): Development runtime using containers
-- **Firecracker** (`runtime-firecracker/`): Production runtime with micro-VMs
-
-### CLI (`cli/`)
-
-Command-line tool for local development and agent management. The canonical command reference lives in [the docs site](https://docs.100monkeys.ai/docs/reference/cli).
-
-Implemented top-level commands:
-`daemon`, `task`, `node`, `config`, `agent`, `workflow`, `update`, `init`, `down`, `up`, `restart`, `status`, `uninstall`.
-
-Use the docs reference for the current syntax, flags, and command behavior.
-
-Scriptable CLI commands now support a global `--output <text|table|json|yaml>` flag for automation.
-Example:
-
-```bash
-target/debug/aegis --output json agent list
-target/debug/aegis --output yaml workflow describe hello-world
-target/debug/aegis config generate --out ./aegis-config.yaml
-```
-
-Streaming and interactive flows remain text-only: `init`, `up`, `down`, `restart`, `uninstall`,
-and the `logs`/`--follow` command paths.
-
-### Edge Node (`edge-node/`)
-
-Lightweight binary for hybrid cloud/on-prem deployments.
+AEGIS Orchestrator is the layer that manages agent lifecycle, workflow execution, runtime isolation, security enforcement, and the operator experience around all of it. It gives you a controlled environment for running autonomous systems while preserving the things infrastructure teams care about most: predictable change, traceability, and blast-radius containment.
 
 ## Quick Start
 
-### Install
+### 1. Install the CLI
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
 ```
 
-This installs system dependencies, Docker, the Rust toolchain, and the `aegis` CLI via `cargo install`, then brings the local stack online with `aegis up`. Re-running is idempotent.
+That installer bootstraps system dependencies, Docker, the Rust toolchain, the `aegis` CLI, and then brings the local stack online. Re-running it is intended to be idempotent.
 
-### Prerequisites
-
-- Rust 1.75+
-- Docker 24.0+
-- Ollama (for local LLM) or OpenAI API key
-- (Production) Linux with KVM support
-
-### Build
+If you prefer to install the binary directly:
 
 ```bash
-# Build the CLI and orchestrator
-cargo build -p aegis-orchestrator
-
-# Or build in release mode
-cargo build --release -p aegis-orchestrator
+cargo install aegis-orchestrator
 ```
 
-### Configuration
-
-Create or edit `aegis-config.yaml`:
-
-```yaml
-apiVersion: 100monkeys.ai/v1
-kind: NodeConfig
-
-metadata:
-  name: "my-aegis-node"
-
-spec:
-  node:
-    id: "my-node-001"
-    type: "edge"
-
-  max_execution_list_limit: 1000
-
-  llm_providers:
-    - name: "local"
-      type: "ollama"
-      endpoint: "http://localhost:11434"
-      enabled: true
-      models:
-        - alias: "default"
-          model: "phi3:mini"
-          capabilities: ["code", "reasoning"]
-          context_window: 4096
-          cost_per_1k_tokens: 0.0
-
-  llm_selection:
-    strategy: "prefer-local"
-    default_provider: "local"
-
-  temporal:
-    address: "temporal:7233"
-    namespace: "default"
-    task_queue: "aegis-agents"
-    max_connection_retries: 30
-
-  observability:
-    logging:
-      level: "info"
-```
-
-See the [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-config) for the full schema and defaults.
-
-### Debugging and Logging
-
-The orchestrator uses structured logging via the `tracing` crate. Log levels: `trace`, `debug`, `info`, `warn`, `error`.
-
-**Set Log Level:**
+### 2. Initialize a local AEGIS stack
 
 ```bash
-# Via environment variable (recommended for development)
-export RUST_LOG=debug
-cargo run -p aegis-orchestrator -- daemon start
-
-# Via CLI flag
-cargo run -p aegis-orchestrator -- daemon start --log-level debug
-
-# Via config file (aegis-config.yaml)
-spec:
-  observability:
-    logging:
-      level: "debug"  # trace, debug, info, warn, error
+aegis init
 ```
 
-**Bootstrap.py Debugging:**
+`aegis init` is the guided first-run path. It prepares stack files, configures the node, starts Docker Compose services, applies database migrations, verifies health, and syncs built-in agents and workflows.
 
-When running at `debug` level, the orchestrator automatically:
-
-- Logs all stdout from `bootstrap.py` (the Python script inside agent containers)
-- Logs all stderr from `bootstrap.py` as warnings
-- Enables verbose mode in `bootstrap.py` (via `AEGIS_BOOTSTRAP_DEBUG=true` environment variable)
-
-This is useful for tracing LLM connectivity issues, prompt delivery, or agent execution failures.
-
-**Example Debug Output:**
+### 3. Check health
 
 ```bash
-# Start with debug logging
-RUST_LOG=debug cargo run -p aegis-orchestrator -- daemon start
-
-# In another terminal, execute an agent
-cargo run -p aegis-orchestrator -- task execute my-agent --input "test"
-
-# You'll see in the orchestrator logs:
-# DEBUG aegis_orchestrator_core::infrastructure::runtime: Starting bootstrap.py execution container_id="abc123"
-# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "Attempting to connect to Orchestrator at http://host.docker.internal:8088..."
-# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Bootstrap starting - execution_id=xxx, iteration=1"
-# DEBUG aegis_orchestrator_core::infrastructure::runtime: Bootstrap output: "[BOOTSTRAP DEBUG] Received prompt (1234 chars)"
+aegis status
 ```
 
-**Troubleshooting Bootstrap Issues:**
-
-If agents fail to execute or you see connection errors:
-
-1. Enable debug logging: `RUST_LOG=debug`
-2. Check bootstrap.py output in orchestrator logs
-3. Verify `AEGIS_ORCHESTRATOR_URL` is reachable from inside containers
-
-### Running Locally
+### 4. Deploy an agent
 
 ```bash
-# Start the daemon
-target/debug/aegis daemon start
-
-# Check daemon status
-target/debug/aegis daemon status
-
-# Deploy demo agents
-cd ../aegis-examples && aegis agent deploy ./agents/echo/agent.yaml
-cd ../aegis-examples && aegis agent deploy ./agents/greeter/agent.yaml
-
-# List deployed agents
-target/debug/aegis agent list
-
-# Execute a task
-target/debug/aegis task execute echo --input "Hello Daemon"
-
-# View agent logs
-target/debug/aegis agent logs echo
-
-# Stop the daemon
-target/debug/aegis daemon stop
+aegis agent deploy <manifest.yaml>
 ```
 
-For detailed instructions, see [Getting Started Guide](https://docs.100monkeys.ai/docs/getting-started).
+See the [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) for the schema and the [Deploying Agents guide](https://docs.100monkeys.ai/docs/guides/deploying-agents) for examples.
+
+### 5. Execute a task
+
+```bash
+aegis task execute hello-world --input "Write a Python function that sums 2 numbers together and outputs the result."
+```
+
+### 6. Stop the stack when you are done
+
+```bash
+aegis down
+```
+
+## What You Just Started
+
+A local AEGIS setup gives you an orchestrator API, a gRPC surface, and supporting services needed for workflows and agent execution. The generated local stack typically exposes:
+
+- Orchestrator API: `http://localhost:8088`
+- gRPC: `localhost:50051`
+- Temporal UI: `http://localhost:8233`
+
+This is enough to start understanding the operator model: the orchestrator owns lifecycle, policy enforcement, and execution visibility, while agents run inside controlled runtimes.
+
+## Core Concepts
+
+### Deterministic execution
+
+AEGIS is designed to make automation easier to reason about. Workflows are explicit, configuration is typed, and execution flows through the orchestrator rather than through a loose collection of direct agent integrations. That structure gives operators a more reproducible system and gives developers a clearer contract for how work is scheduled, executed, and observed.
+
+### Security and isolation
+
+AEGIS enforces default-deny security policies around network and filesystem access. In development, agents run with Docker-backed isolation; in production, the architecture is aimed at Firecracker micro-VM isolation. At the protocol layer, SMCP verifies tool calls end to end, and orchestrator-mediated dispatch means agents do not call external APIs directly without going through the control boundary.
+
+### Reliability and auditability
+
+The CLI supports repeatable bring-up and shutdown flows such as `aegis init`, `aegis up`, `aegis status`, and `aegis down`. Structured logging via `tracing`, health checks, and machine-readable `--output <text|table|json|yaml>` modes make AEGIS friendlier to both human operators and automation pipelines.
+
+### Building blocks
+
+- **Agents:** stateless units of autonomous work defined by manifests.
+- **Executions:** individual agent runs with a managed lifecycle.
+- **Workflows:** explicit orchestration across states and agents.
+- **Swarms:** multi-agent coordination with bounded control.
+- **Security policies:** the permissions and runtime constraints that keep execution contained.
+
+## Common Commands
+
+```bash
+# Start the stack if it has already been initialized
+aegis up
+
+# Show current stack health
+aegis status
+
+# Generate a node config file
+aegis config generate --out ./aegis-config.yaml
+
+# List agents in a machine-readable format
+aegis --output json agent list
+
+# Start the daemon with verbose logs
+RUST_LOG=debug aegis daemon start
+```
+
+Interactive and streaming workflows remain text-first. For the current command surface, flags, and behavior, use the [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli).
+
+## Learn More
+
+Start here if you are new:
+
+- [Getting Started](https://docs.100monkeys.ai/docs/getting-started)
+- [Architecture Overview](https://docs.100monkeys.ai/docs/architecture)
+- [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model)
+
+Use these when you are ready to configure and build:
+
+- [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli)
+- [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-config)
+- [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest)
+- [LLM Providers Guide](https://docs.100monkeys.ai/docs/guides/llm-providers)
+- [Deploying Agents](https://docs.100monkeys.ai/docs/guides/deploying-agents)
+- [Building Workflows](https://docs.100monkeys.ai/docs/guides/building-workflows)
+- [Building Swarms](https://docs.100monkeys.ai/docs/guides/building-swarms)
 
 ## Development
 
-### Project Structure
-
-```markdown
-aegis-orchestrator/
-├── core/              # Domain logic (DDD)
-├── api/               # HTTP/gRPC server
-├── runtime-docker/    # Docker adapter
-├── runtime-firecracker/ # Firecracker adapter
-├── security/          # Policy enforcement
-├── cli/               # CLI tool
-├── edge-node/         # Edge node binary
-└── tests/             # Integration tests
-```
-
-### Architecture Principles
-
-- **Domain-Driven Design**: Clear bounded contexts
-- **Hexagonal Architecture**: Pure domain core with infrastructure adapters
-- **Type Safety**: Leverage Rust's type system
-- **Security First**: Default-deny policies
-
-### Running Tests
+If you want to work from source instead of the install script:
 
 ```bash
-# Unit tests
-cargo test --lib
-
-# Integration tests
-cargo test --test '*'
-
-# Specific component
-cargo test -p aegis-core
+git clone https://github.com/100monkeys-ai/aegis-orchestrator
+cd aegis-orchestrator
+cargo build --release -p aegis-orchestrator
 ```
 
-## Configuration Reference
+The CLI README and crate READMEs go deeper on command surface and internals:
 
-See [`examples/`](examples/) for sample configurations.
-
-## Security
-
-The orchestrator enforces:
-
-- **Isolation**: Kernel-level (Firecracker) or namespace-based (Docker)
-- **Network Control**: DNS/IP allow-listing
-- **Resource Limits**: CPU, memory, execution time
-- **Audit Trail**: Immutable logging
-
-For details, see [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model).
-
-## Performance
-
-- **Cold Start**: <125ms (Firecracker)
-- **Throughput**: 1,000+ agents/second (target)
-- **Memory**: ~128MB per Firecracker VM
-
-## Documentation
-
-Full documentation is available at **[docs.100monkeys.ai](https://docs.100monkeys.ai)**.
-
-| Section | Description |
-| --- | --- |
-| [Getting Started](https://docs.100monkeys.ai/docs/getting-started) | Install, configure, and run your first agent |
-| [Core Concepts](https://docs.100monkeys.ai/docs/concepts) | Agents, executions, workflows, swarms, security model |
-| [Writing Agents](https://docs.100monkeys.ai/docs/guides/writing-agents) | Author and structure agent code |
-| [Deploying Agents](https://docs.100monkeys.ai/docs/guides/deploying-agents) | Deploy agents with the CLI or API |
-| [LLM Providers](https://docs.100monkeys.ai/docs/guides/llm-providers) | Configure Ollama, OpenAI, and other LLM backends |
-| [Building Workflows](https://docs.100monkeys.ai/docs/guides/building-workflows) | Chain agents into multi-step workflows |
-| [Building Swarms](https://docs.100monkeys.ai/docs/guides/building-swarms) | Coordinate parallel agent swarms |
-| [Configuring Storage](https://docs.100monkeys.ai/docs/guides/configuring-storage) | Persistent storage backends for agents |
-| [Local Testing](https://docs.100monkeys.ai/docs/guides/local-testing) | Test agents locally before deploying |
-| [Architecture](https://docs.100monkeys.ai/docs/architecture) | Execution engine, SMCP, storage gateway, event bus |
-| [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model) | Isolation, network control, secrets, audit trail |
-| [Deployment — Docker](https://docs.100monkeys.ai/docs/deployment/docker) | Run the orchestrator with Docker |
-| [Deployment — Firecracker](https://docs.100monkeys.ai/docs/deployment/firecracker) | Production micro-VM setup |
-| [Secrets Management](https://docs.100monkeys.ai/docs/deployment/secrets) | OpenBao integration via secret-store ACL (Keymaster Pattern) |
-| [IAM](https://docs.100monkeys.ai/docs/deployment/iam) | Keycloak identity and access management |
-| [Configuration Reference](https://docs.100monkeys.ai/docs/reference/node-config) | `NodeConfig` YAML reference (`aegis-config.yaml`) |
-| [Agent Manifest Reference](https://docs.100monkeys.ai/docs/reference/agent-manifest) | `AgentManifest` YAML field reference |
-| [Workflow Manifest Reference](https://docs.100monkeys.ai/docs/reference/workflow-manifest) | `WorkflowManifest` YAML field reference |
-| [CLI Reference](https://docs.100monkeys.ai/docs/reference/cli) | Complete `aegis` CLI command reference |
-| [gRPC API](https://docs.100monkeys.ai/docs/reference/grpc-api) | `aegis.runtime.v1` service methods and message types |
-
-### References
-
-- Enable CUDA for containers
-  - <https://learn.microsoft.com/en-us/windows/ai/directml/gpu-cuda-in-wsl>
-  - <https://docs.nvidia.com/cuda/wsl-user-guide/index.html#getting-started-with-cuda-on-wsl-2>
-  - <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html>
-  - `sudo nvidia-ctk runtime configure --runtime=docker`
-  - `sudo systemctl restart docker`
+- [`cli/README.md`](./cli/README.md)
+- [`orchestrator/core/README.md`](./orchestrator/core/README.md)
+- [`orchestrator/swarm/README.md`](./orchestrator/swarm/README.md)
 
 ## License
 
-AGPL-3.0. See [LICENSE](LICENSE) for details.
+Copyright © 2026 100monkeys AI, Inc.
 
-## Related Repositories
-
-- [aegis-sdk-python](https://github.com/100monkeys-ai/aegis-sdk-python) - Python SDK
-- [aegis-sdk-typescript](https://github.com/100monkeys-ai/aegis-sdk-typescript) - TypeScript SDK
-- [aegis-control-plane](https://github.com/100monkeys-ai/aegis-control-plane) - Web dashboard
-- [aegis-examples](https://github.com/100monkeys-ai/aegis-examples) - Example agents
-
----
-
-**Built with Rust for security, performance, and reliability.**
+Licensed under the [GNU Affero General Public License v3.0](https://www.gnu.org/licenses/agpl-3.0) (AGPL-3.0).
