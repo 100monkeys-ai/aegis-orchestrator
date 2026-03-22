@@ -25,8 +25,9 @@ use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::tenant::TenantId;
 
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 60;
-const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 500;
+const DEFAULT_JUDGE_WEIGHT: f64 = 1.0;
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
@@ -37,6 +38,17 @@ use crate::infrastructure::aegis_runtime_proto::aegis_runtime_server::{
     AegisRuntime, AegisRuntimeServer,
 };
 use crate::infrastructure::aegis_runtime_proto::*;
+
+/// Normalizes the maximum number of attempts for running a container step.
+/// Treats `0` (the proto3 default for unset fields) as `1`, since at least
+/// one attempt must always be made to run the container step.
+fn normalize_max_attempts(value: u32) -> u32 {
+    if value == 0 {
+        1
+    } else {
+        value
+    }
+}
 
 /// Implementation of the AegisRuntime gRPC service
 pub struct AegisRuntimeService {
@@ -151,7 +163,7 @@ fn normalize_judge_weight(weight: f32) -> f64 {
     if weight > 0.0 {
         weight as f64
     } else {
-        1.0
+        DEFAULT_JUDGE_WEIGHT
     }
 }
 
@@ -740,16 +752,6 @@ impl AegisRuntime for AegisRuntimeService {
         };
 
         let env: HashMap<String, String> = req.env;
-
-        fn normalize_max_attempts(value: u32) -> u32 {
-            // Treat 0 as 1: proto3 defaults unset fields to 0, but at least
-            // one attempt must always be made to run the container step.
-            if value == 0 {
-                1
-            } else {
-                value
-            }
-        }
 
         let max_attempts = normalize_max_attempts(req.max_attempts);
 
