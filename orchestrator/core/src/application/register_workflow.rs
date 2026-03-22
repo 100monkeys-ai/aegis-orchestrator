@@ -141,6 +141,35 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             .clone()
             .unwrap_or_else(|| DEFAULT_WORKFLOW_VERSION.to_string());
 
+        // Step 1a: Ensure every judge reference already exists before we try to
+        // map or register the workflow. This fails deterministically instead of
+        // surfacing a runtime "judge agent not found" error later.
+        let judge_references = workflow.referenced_judge_agents();
+        if !judge_references.is_empty() {
+            let mut missing_judges = Vec::new();
+            for judge_name in judge_references {
+                let judge_id = self
+                    .agent_service
+                    .lookup_agent_for_tenant(tenant_id, &judge_name)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to resolve judge agent '{judge_name}' in workflow '{workflow_name}'"
+                        )
+                    })?;
+                if judge_id.is_none() {
+                    missing_judges.push(judge_name);
+                }
+            }
+
+            if !missing_judges.is_empty() {
+                anyhow::bail!(
+                    "Workflow '{workflow_name}' references missing judge agents: {}",
+                    missing_judges.join(", ")
+                );
+            }
+        }
+
         // Step 1b: Check for existing version if force=false
         if let Some(existing) = self
             .workflow_repository
@@ -784,6 +813,64 @@ spec:
         assert!(
             err.to_string().contains("nonexistent-agent"),
             "error should mention the unknown agent name, got: {err}"
+        );
+    }
+
+    /// Workflow YAML that references an unknown judge; should fail before Temporal registration.
+    const WORKFLOW_YAML_UNKNOWN_JUDGE: &str = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: test-unknown-judge
+  version: "1.0.0"
+  description: "Workflow with an unknown judge agent"
+spec:
+  initial_state: step1
+  states:
+    step1:
+      kind: Agent
+      agent: builder
+      input: "test input"
+      judges:
+        - agent_id: nonexistent-agent
+      transitions:
+        - condition: always
+          target: done
+    done:
+      kind: System
+      command: echo done
+      transitions: []
+"#;
+
+    #[tokio::test]
+    async fn register_workflow_fails_when_judge_agent_not_found() {
+        let repo = Arc::new(InMemoryWorkflowRepository::new());
+        let engine = Arc::new(RecordingEngine::new());
+        let service = StandardRegisterWorkflowUseCase::new(
+            repo,
+            Arc::new(tokio::sync::RwLock::new(Some(
+                engine.clone() as Arc<dyn WorkflowEnginePort>
+            ))),
+            Arc::new(EventBus::new(8)),
+            test_agent_service(),
+        );
+
+        let err = service
+            .register_workflow(WORKFLOW_YAML_UNKNOWN_JUDGE, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("missing judge agents"),
+            "error should mention missing judge agents, got: {msg}"
+        );
+        assert!(
+            msg.contains("nonexistent-agent"),
+            "error should mention the unknown judge name, got: {msg}"
+        );
+        assert!(
+            engine.calls().is_empty(),
+            "workflow must not reach Temporal registration when judges are missing"
         );
     }
 

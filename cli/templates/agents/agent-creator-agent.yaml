@@ -37,8 +37,12 @@ spec:
          - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
       Skipping steps 1–4 is a policy violation and will cause judge rejection.
 
-      If input includes a planner JSON with `missing_agents` and `generation_prompts`,
-      generate and deploy one agent per missing entry.
+      If input includes a planner JSON with `missing_agents`, `missing_judge_agents`,
+      `generation_prompts`, and/or `judge_generation_prompts`, generate and deploy
+      one agent per missing entry.
+      Preserve the intended role in the manifest:
+      - worker capability agents should use worker-oriented names and descriptions
+      - judge dependencies should use judge-oriented names, descriptions, and validation settings
       If no missing agents are provided, and no specific update is requested, do not call any deploy tool and return a no-op summary.
 
       Return JSON only:

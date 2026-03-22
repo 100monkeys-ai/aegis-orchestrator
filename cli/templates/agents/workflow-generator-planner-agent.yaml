@@ -23,6 +23,8 @@ spec:
       Then analyze the user workflow request step-by-step. For each required workflow step:
       - map it to an existing deployed agent when possible
       - only mark it as missing when no suitable deployed agent exists
+      - treat any semantic validator, tool validator, judge_agent, or judges reference as a judge dependency
+      - determine whether each judge dependency is already deployed or must be generated
 
       If the user is requesting an update to an existing workflow, identify the existing workflow name from the list.
 
@@ -31,8 +33,12 @@ spec:
       - existing_agents: array of matching deployed agents
       - missing_agents: array of agent requirements that need generation
       - generation_prompts: array of natural-language prompts to create each missing agent
+      - required_judge_agents: array of judge agent names/capabilities needed for the workflow
+      - existing_judge_agents: array of matching deployed judge agents
+      - missing_judge_agents: array of judge requirements that need generation
+      - judge_generation_prompts: array of natural-language prompts to create each missing judge agent
       - workflow_prompt: a complete natural-language prompt for generating the final workflow,
-        explicitly referencing existing and newly generated agent names and which step each serves.
+        explicitly referencing existing and newly generated agent names and judge names, and which step each serves.
 
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
       available unless `worker_mounts` in the evaluation payload explicitly says so.

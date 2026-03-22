@@ -40,6 +40,11 @@ spec:
            "min_score": 0.8,
            "min_confidence": 0.7
          }
+         Resolve judge names from the planner output and the agent-generation output before calling
+         `aegis.workflow.create`. Do not reference any judge agent unless it is already deployed or
+         was created in the current generation flow.
+         If the workflow manifest requires additional judge agents, ensure those resolved names are
+         passed through `judge_agents` explicitly.
          Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
       Skipping steps 1–4 is a policy violation and will cause judge rejection.
 

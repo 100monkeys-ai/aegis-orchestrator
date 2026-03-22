@@ -27,7 +27,7 @@ use crate::application::execution::ExecutionService;
 use crate::application::ports::ExternalWebToolPort;
 use crate::application::schema_registry::SchemaRegistry;
 use crate::domain::events::{MCPToolEvent, ViolationType};
-use crate::domain::execution::ExecutionInput;
+use crate::domain::execution::{Execution, ExecutionInput};
 use crate::domain::mcp::{
     MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
 };
@@ -259,6 +259,67 @@ impl ToolInvocationService {
                 },
                 failed_at: Utc::now(),
             });
+    }
+
+    fn parse_json_or_string(raw: &str) -> Value {
+        serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+    }
+
+    fn build_workflow_create_tool_audit_history(
+        execution_id: crate::domain::execution::ExecutionId,
+        execution: Option<&Execution>,
+    ) -> Value {
+        let Some(execution) = execution else {
+            return serde_json::json!({
+                "execution_id": execution_id.to_string(),
+                "available": false,
+                "iteration_number": null,
+                "tool_calls": [],
+                "latest_schema_validate": null,
+                "schema_validate_evidence": null,
+            });
+        };
+
+        let current_iteration = execution.current_iteration();
+        let tool_calls: Vec<Value> = current_iteration
+            .and_then(|iter| iter.trajectory.as_ref())
+            .map(|trajectory| {
+                trajectory
+                    .iter()
+                    .map(|step| {
+                        serde_json::json!({
+                            "tool_name": step.tool_name,
+                            "arguments": Self::parse_json_or_string(&step.arguments_json),
+                            "status": step.status,
+                            "result": step
+                                .result_json
+                                .as_deref()
+                                .map(Self::parse_json_or_string)
+                                .unwrap_or(Value::Null),
+                            "error": step.error,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let latest_schema_validate = tool_calls
+            .iter()
+            .rev()
+            .find(|step| {
+                step.get("tool_name").and_then(|v| v.as_str()) == Some("aegis.schema.validate")
+            })
+            .cloned();
+        let schema_validate_evidence = latest_schema_validate.clone();
+
+        serde_json::json!({
+            "execution_id": execution.id.to_string(),
+            "available": true,
+            "iteration_number": current_iteration.map(|iter| iter.number),
+            "tool_calls": tool_calls,
+            "latest_schema_validate": latest_schema_validate,
+            "schema_validate_evidence": schema_validate_evidence,
+        })
     }
 
     fn map_policy_violation(violation: &PolicyViolation) -> (ViolationType, String) {
@@ -3041,6 +3102,13 @@ impl ToolInvocationService {
                     "Workflow registration use case not configured".to_string(),
                 )
             })?;
+        let execution = self
+            .execution_service
+            .get_execution(execution_id)
+            .await
+            .ok();
+        let tool_audit_history =
+            Self::build_workflow_create_tool_audit_history(execution_id, execution.as_ref());
 
         let judge_names: Vec<String> = args
             .get("judge_agents")
@@ -3098,6 +3166,9 @@ impl ToolInvocationService {
                 "validation_context": "workflow_create",
                 "workflow_name": workflow.metadata.name,
                 "state_count": workflow.spec.states.len(),
+                "force": force,
+                "task_context": task_context,
+                "tool_audit_history": tool_audit_history,
             })),
         };
 
@@ -3983,6 +4054,67 @@ spec:
         assert_eq!(payload["tool"], "aegis.workflow.validate");
         assert_eq!(payload["valid"], true);
         assert_eq!(payload["workflow"]["name"], "validate-me");
+    }
+
+    #[test]
+    fn build_workflow_create_tool_audit_history_includes_schema_validate_evidence() {
+        let workflow = build_test_workflow("audit-history");
+        let execution_id = ExecutionId::new();
+        let mut execution = Execution::new(
+            AgentId::new(),
+            ExecutionInput {
+                intent: Some("generate workflow".to_string()),
+                payload: serde_json::json!({}),
+            },
+            3,
+        );
+        execution.id = execution_id;
+        execution.start();
+        execution
+            .start_iteration("workflow authoring".to_string())
+            .unwrap();
+        execution
+            .store_iteration_trajectory(
+                1,
+                vec![
+                    crate::domain::execution::TrajectoryStep {
+                        tool_name: "aegis.schema.get".to_string(),
+                        arguments_json: r#"{"key":"workflow/manifest/v1"}"#.to_string(),
+                        status: "completed".to_string(),
+                        result_json: Some(r#"{"ok":true}"#.to_string()),
+                        error: None,
+                    },
+                    crate::domain::execution::TrajectoryStep {
+                        tool_name: "aegis.schema.validate".to_string(),
+                        arguments_json:
+                            r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
+                                .to_string(),
+                        status: "completed".to_string(),
+                        result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                        error: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        let audit_history = ToolInvocationService::build_workflow_create_tool_audit_history(
+            execution_id,
+            Some(&execution),
+        );
+
+        assert_eq!(audit_history["execution_id"], execution_id.to_string());
+        assert_eq!(audit_history["available"], true);
+        assert_eq!(audit_history["iteration_number"], 1);
+        assert_eq!(audit_history["tool_calls"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            audit_history["latest_schema_validate"]["tool_name"],
+            "aegis.schema.validate"
+        );
+        assert_eq!(
+            audit_history["schema_validate_evidence"]["result"]["valid"],
+            true
+        );
+        assert_eq!(workflow.metadata.name, "audit-history");
     }
 
     #[tokio::test]

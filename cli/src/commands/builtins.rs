@@ -282,6 +282,10 @@ mod tests {
             generate_missing_agents_input.contains("{{PLAN.output}}"),
             "GENERATE_MISSING_AGENTS should reference the planner state's output payload"
         );
+        assert!(
+            generate_missing_agents_input.contains("missing_judge_agents"),
+            "GENERATE_MISSING_AGENTS should mention missing judge agents"
+        );
 
         let generate_and_register_workflow_input = states["GENERATE_AND_REGISTER_WORKFLOW"]
             ["input"]
@@ -294,6 +298,47 @@ mod tests {
         assert!(
             generate_and_register_workflow_input.contains("{{GENERATE_MISSING_AGENTS.output}}"),
             "GENERATE_AND_REGISTER_WORKFLOW should reference the agent generation state's output payload"
+        );
+        assert!(
+            generate_and_register_workflow_input.contains("resolved existing judge agents"),
+            "GENERATE_AND_REGISTER_WORKFLOW should require resolved judge agents"
+        );
+    }
+
+    #[test]
+    fn workflow_generator_planner_template_includes_judge_dependencies() {
+        assert!(
+            WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE.contains("required_judge_agents"),
+            "planner template should explicitly model required judge dependencies"
+        );
+        assert!(
+            WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE.contains("missing_judge_agents"),
+            "planner template should explicitly model missing judge dependencies"
+        );
+        assert!(
+            WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE.contains("judge_generation_prompts"),
+            "planner template should provide prompts for missing judges"
+        );
+    }
+
+    #[test]
+    fn workflow_generator_validator_template_uses_resolved_judge_agents() {
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE.contains("Resolve judge names"),
+            "workflow creator template should require resolved judge names"
+        );
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE.contains("judge_agents"),
+            "workflow creator template should still pass explicit judge agents to workflow.create"
+        );
+    }
+
+    #[test]
+    fn workflow_generator_judge_template_handles_missing_audit_history_conservatively() {
+        assert!(
+            WORKFLOW_GENERATOR_JUDGE_TEMPLATE
+                .contains("If tool call history is missing, treat that as insufficient evidence"),
+            "judge template should not claim validation failure without audit evidence"
         );
     }
 

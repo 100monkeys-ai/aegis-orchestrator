@@ -35,7 +35,7 @@ use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -310,6 +310,43 @@ impl Workflow {
             spec,
             created_at: Utc::now(),
         })
+    }
+
+    /// Return all judge-agent references used anywhere in the workflow.
+    ///
+    /// Includes state-level semantic judges, pre-execution validators, and
+    /// parallel-output judges. Names are deduplicated and sorted to keep
+    /// dependency checks deterministic.
+    pub fn referenced_judge_agents(&self) -> Vec<String> {
+        let mut judge_names = BTreeSet::new();
+
+        for state in self.spec.states.values() {
+            match &state.kind {
+                StateKind::Agent {
+                    judges,
+                    pre_execution_validator,
+                    ..
+                } => {
+                    for judge in judges {
+                        judge_names.insert(judge.agent_id.clone());
+                    }
+                    if let Some(judge) = pre_execution_validator {
+                        judge_names.insert(judge.clone());
+                    }
+                }
+                StateKind::ParallelAgents {
+                    judges_for_parallel,
+                    ..
+                } => {
+                    for judge in judges_for_parallel {
+                        judge_names.insert(judge.agent_id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        judge_names.into_iter().collect()
     }
 
     /// Get the initial state
@@ -1298,6 +1335,106 @@ mod tests {
 
         blackboard.remove("iteration");
         assert_eq!(blackboard.get("iteration"), None);
+    }
+
+    #[test]
+    fn test_referenced_judge_agents_collects_all_judge_variants() {
+        let mut states = std::collections::HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::Agent {
+                    agent: "builder".to_string(),
+                    input: "{{workflow.task}}".to_string(),
+                    isolation: None,
+                    judges: vec![
+                        JudgeConfig {
+                            agent_id: "judge-b".to_string(),
+                            input_template: None,
+                            weight: 1.0,
+                        },
+                        JudgeConfig {
+                            agent_id: "judge-a".to_string(),
+                            input_template: None,
+                            weight: 1.0,
+                        },
+                        JudgeConfig {
+                            agent_id: "judge-b".to_string(),
+                            input_template: None,
+                            weight: 0.5,
+                        },
+                    ],
+                    max_iterations: None,
+                    pre_execution_validator: Some("validator-z".to_string()),
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        states.insert(
+            StateName::new("PARALLEL").unwrap(),
+            WorkflowState {
+                kind: StateKind::ParallelAgents {
+                    agents: vec![ParallelAgentConfig {
+                        agent: "worker".to_string(),
+                        input: "{{workflow.task}}".to_string(),
+                        weight: 1.0,
+                        timeout_seconds: 60,
+                        poll_interval_ms: 500,
+                    }],
+                    consensus: ConsensusConfig {
+                        strategy: ConsensusStrategy::WeightedAverage,
+                        threshold: None,
+                        min_agreement_confidence: None,
+                        n: None,
+                        min_judges_required: 1,
+                        confidence_weighting: None,
+                    },
+                    judges_for_parallel: vec![
+                        JudgeConfig {
+                            agent_id: "judge-c".to_string(),
+                            input_template: None,
+                            weight: 1.0,
+                        },
+                        JudgeConfig {
+                            agent_id: "judge-a".to_string(),
+                            input_template: None,
+                            weight: 1.0,
+                        },
+                    ],
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+
+        let workflow = Workflow {
+            id: WorkflowId::new(),
+            metadata: WorkflowMetadata {
+                name: "test".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: std::collections::HashMap::new(),
+                annotations: std::collections::HashMap::new(),
+            },
+            spec: WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: std::collections::HashMap::new(),
+                states,
+                volumes: vec![],
+            },
+            created_at: Utc::now(),
+        };
+
+        assert_eq!(
+            workflow.referenced_judge_agents(),
+            vec![
+                "judge-a".to_string(),
+                "judge-b".to_string(),
+                "judge-c".to_string(),
+                "validator-z".to_string()
+            ]
+        );
     }
 
     #[test]

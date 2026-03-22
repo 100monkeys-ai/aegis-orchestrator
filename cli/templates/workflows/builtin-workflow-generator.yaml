@@ -27,8 +27,9 @@ spec:
         Use this planner output:
         {{PLAN.output}}
 
-        Create all missing agents listed in `missing_agents` using `generation_prompts`.
-        If there are no missing agents, return a JSON no-op summary with empty `created`.
+        Create all missing agents listed in `missing_agents` and `missing_judge_agents`
+        using `generation_prompts` and `judge_generation_prompts`.
+        If there are no missing agents or judges, return a JSON no-op summary with empty `created`.
       transitions:
         - condition: on_success
           target: GENERATE_AND_REGISTER_WORKFLOW
@@ -49,4 +50,5 @@ spec:
         {{GENERATE_MISSING_AGENTS.output}}
 
         Generate and register the final workflow so it is runnable immediately.
+        Use only resolved existing judge agents or judges created in this generation flow.
       transitions: []

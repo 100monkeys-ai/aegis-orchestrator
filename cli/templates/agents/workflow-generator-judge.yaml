@@ -38,6 +38,8 @@ spec:
         deployed workflow before scoring.
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
+      - If tool call history is present, use it as the source of truth for validating ordering.
+      - If tool call history is missing, treat that as insufficient evidence rather than proof of failure.
       - If `aegis.schema.validate` was NOT called before `aegis.workflow.create` or `aegis.workflow.update`, reduce
         the `correctness` score by at least 0.2 and note "aegis.schema.validate was not called before workflow deployment".
       - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at
