@@ -712,7 +712,7 @@ impl ConfigWizard {
         components: &SelectedComponents,
         tag: &str,
     ) -> String {
-        let (base_provider_section, default_provider) = match &components.llm {
+        let (base_provider_section, default_provider, strategy) = match &components.llm {
             LlmChoice::Ollama => (
                 format!(
                     r#"    - name: "local"
@@ -739,6 +739,7 @@ impl ConfigWizard {
                     model = config.ollama_model
                 ),
                 "local",
+                "prefer-local",
             ),
             LlmChoice::OpenAI => (
                 r#"    - name: "openai"
@@ -765,6 +766,7 @@ impl ConfigWizard {
 "#
                 .to_string(),
                 "openai",
+                "prefer-cloud",
             ),
             LlmChoice::Anthropic => (
                 r#"    - name: "anthropic"
@@ -791,6 +793,7 @@ impl ConfigWizard {
 "#
                 .to_string(),
                 "anthropic",
+                "prefer-cloud",
             ),
             LlmChoice::Gemini => (
                 format!(
@@ -819,6 +822,7 @@ impl ConfigWizard {
                     model = config.gemini_model.as_deref().unwrap_or("gemini-2.5-flash")
                 ),
                 "gemini",
+                "prefer-cloud",
             ),
             LlmChoice::OpenAICompatible => (
                 format!(
@@ -854,6 +858,7 @@ impl ConfigWizard {
                         .unwrap_or("google/gemma-3-4b")
                 ),
                 "openai-compatible",
+                "prefer-local",
             ),
         };
         let extra_lmstudio_section = if config.advanced.enable_lmstudio {
@@ -942,7 +947,7 @@ impl ConfigWizard {
 {base_provider_section}{extra_lmstudio_section}{extra_anthropic_section}{extra_gemini_section}
 
   llm_selection:
-    strategy: "prefer-cloud"
+    strategy: "{strategy}"
     default_provider: "{default_provider}"
     max_retries: 3
     retry_delay_ms: 1000
