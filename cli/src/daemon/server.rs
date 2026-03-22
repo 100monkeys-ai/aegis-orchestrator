@@ -665,6 +665,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
+    let temporal_connection_max_retries: i32 = temporal_config
+        .max_connection_retries
+        .unwrap_or(30);
     println!("Initializing Temporal Client (Address: {temporal_address})...");
 
     // Create shared containers for the concrete Temporal client and the workflow engine port.
@@ -685,13 +688,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let temporal_address_clone = temporal_address.clone();
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
 
-    const TEMPORAL_CONNECTION_MAX_RETRIES: i32 = 30;
-
     async fn connect_temporal_with_retry(
         temporal_address: &str,
         temporal_namespace: &str,
         temporal_task_queue: &str,
         worker_http_endpoint: &str,
+        max_retries: i32,
     ) -> Result<Arc<TemporalClient>> {
         let mut retries: i32 = 0;
 
@@ -710,7 +712,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
                 Err(e) => {
                     retries += 1;
-                    if retries >= TEMPORAL_CONNECTION_MAX_RETRIES {
+                    if retries >= max_retries {
                         return Err(e).with_context(|| {
                             format!(
                                 "Failed to connect to Temporal at {temporal_address} after {retries} attempts"
@@ -720,7 +722,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
                     if retries % 5 == 0 {
                         println!(
-                            "Still verifying Temporal connection... ({retries}/{TEMPORAL_CONNECTION_MAX_RETRIES})"
+                            "Still verifying Temporal connection... ({retries}/{max_retries})"
                         );
                     }
                     tracing::debug!("Failed to connect to Temporal: {}. Retrying in 2s...", e);
@@ -736,6 +738,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             &temporal_namespace,
             &temporal_task_queue,
             &worker_http_endpoint_clone,
+            temporal_connection_max_retries,
         )
         .await?;
 
@@ -1780,15 +1783,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tracing::info!("Starting gRPC server on {}", grpc_addr);
         println!("Starting gRPC server on {grpc_addr}");
         if let Err(e) = aegis_orchestrator_core::presentation::grpc::server::start_grpc_server(
-            grpc_addr,
-            exec_service_clone,
-            val_service_clone,
-            grpc_auth,
-            Some(attestation_service),
-            Some(tool_invocation_service),
-            cortex_client,
-            Some(run_container_step_use_case),
-            agent_service_for_grpc,
+            aegis_orchestrator_core::presentation::grpc::server::GrpcServerConfig {
+                addr: grpc_addr,
+                execution_service: exec_service_clone,
+                validation_service: val_service_clone,
+                grpc_auth,
+                attestation_service: Some(attestation_service),
+                tool_invocation_service: Some(tool_invocation_service),
+                cortex_client,
+                run_container_step_use_case: Some(run_container_step_use_case),
+                agent_service: agent_service_for_grpc,
+            },
         )
         .await
         {
@@ -2333,9 +2338,9 @@ struct ListExecutionsQuery {
 /// Maximum number of executions that can be returned by a single
 /// `list_executions` request. This upper bound protects the daemon from
 /// excessive memory usage and response sizes when clients request very
-/// large pages. If a client supplies a `limit` greater than this value,
-/// the requested limit is clamped down to `MAX_EXECUTION_LIST_LIMIT`.
-const MAX_EXECUTION_LIST_LIMIT: usize = 1000;
+/// large pages. The effective limit is configurable via NodeConfig to
+/// allow tuning based on deployment capacity and client requirements. If
+/// not explicitly configured, a safe default of 1000 is used.
 
 async fn list_executions_handler(
     State(state): State<Arc<AppState>>,
@@ -2343,7 +2348,16 @@ async fn list_executions_handler(
     axum::extract::Query(query): axum::extract::Query<ListExecutionsQuery>,
 ) -> Json<serde_json::Value> {
     let agent_id = query.agent_id.map(AgentId);
-    let limit = query.limit.unwrap_or(20).min(MAX_EXECUTION_LIST_LIMIT);
+
+    // Determine the maximum allowed page size from configuration, with a
+    // backward-compatible default of 1000 if not set.
+    let max_limit = state
+        .config
+        .spec
+        .max_execution_list_limit
+        .unwrap_or(1000);
+
+    let limit = query.limit.unwrap_or(20).min(max_limit);
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     match state

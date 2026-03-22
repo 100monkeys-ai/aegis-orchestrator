@@ -221,7 +221,8 @@ impl ValidationService {
             .await?;
 
         // Poll for completion with configurable timeout and interval.
-        let max_attempts = (timeout_seconds * 1000) / poll_interval_ms;
+        let max_attempts =
+            ((timeout_seconds as f64 * 1000.0) / poll_interval_ms as f64).ceil() as u64;
         let mut attempts = 0;
 
         loop {
@@ -524,7 +525,22 @@ impl GradientValidator for SemanticAgentValidator {
             .await?;
 
         // 4. Poll for completion.
-        let max_attempts = (self.timeout_seconds * 1000) / self.poll_interval_ms;
+        let max_attempts = {
+            // Compute max attempts in an overflow-safe way:
+            //   max_attempts = (timeout_seconds * 1000) / poll_interval_ms
+            // Guard against overflow and division by zero.
+            let timeout_ms = self.timeout_seconds.saturating_mul(1000);
+            if self.poll_interval_ms == 0 {
+                0
+            } else {
+                let attempts = timeout_ms / self.poll_interval_ms;
+                if attempts == 0 && timeout_ms > 0 {
+                    1
+                } else {
+                    attempts
+                }
+            }
+        };
         let mut attempts = 0;
         loop {
             if attempts >= max_attempts {
@@ -663,7 +679,15 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     .start_child_execution(jid, exec_input, parent_id)
                     .await?;
                 // Poll for completion.
-                let max_attempts = (timeout * 1000) / poll_interval;
+                let max_attempts = {
+                    let timeout_ms = timeout.saturating_mul(1000);
+                    if poll_interval == 0 {
+                        0
+                    } else {
+                        let attempts = timeout_ms / poll_interval;
+                        if attempts == 0 && timeout_ms > 0 { 1 } else { attempts }
+                    }
+                };
                 let mut attempts = 0;
                 loop {
                     if attempts >= max_attempts {
