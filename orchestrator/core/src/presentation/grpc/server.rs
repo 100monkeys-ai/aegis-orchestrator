@@ -26,6 +26,8 @@ use crate::domain::tenant::TenantId;
 
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_JUDGE_WEIGHT: f64 = 1.0;
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
