@@ -1,6 +1,6 @@
 # AEGIS Orchestrator
 
-The runtime and control plane for AEGIS: secure, policy-governed infrastructure for running autonomous AI agents without giving up control.
+The runtime and control plane for AEGIS: policy-governed infrastructure for running autonomous AI agents without giving up control.
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
@@ -11,8 +11,8 @@ AEGIS is built for teams that want automation to be useful in production, not ju
 ## Why Teams Use AEGIS
 
 - **Deterministic control:** explicit workflows, typed manifests, and orchestrator-managed execution reduce hidden behavior and ad hoc agent sprawl.
-- **Security by default:** network and filesystem access are policy-governed, runtimes are isolated, and tool calls flow through the orchestrator instead of directly from the agent.
-- **Reliable operations:** one command brings up the local stack, health checks are built in, and the CLI is designed for repeatable operator workflows.
+- **Built-in security controls:** network and filesystem access are policy-governed, runtimes are isolated, and production deployments can layer IAM and SMCP gateway controls on top of the orchestrator boundary.
+- **Reliable operator workflows:** the CLI provides repeatable stack bring-up, status, update, and shutdown paths with health checks and machine-readable output.
 - **Auditable automation:** structured logs, machine-readable CLI output, and orchestrator-mediated dispatch make agent activity easier to inspect and automate around.
 - **Clear path to production:** Docker supports local development, while Firecracker-backed isolation is the intended production direction.
 
@@ -30,19 +30,21 @@ curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/ma
 
 That installer bootstraps system dependencies, Docker, the Rust toolchain, the `aegis` CLI, and then brings the local stack online. Re-running it is intended to be idempotent.
 
-If you prefer to install the binary directly:
+That installer installs the `aegis` CLI from a pinned GitHub release, installs local prerequisites such as Docker when needed, and then runs `aegis up --tag <pinned-version>` to bring the local stack online. Re-running it is intended to be idempotent.
+
+If you prefer to build the CLI yourself instead of using the installer:
 
 ```bash
 cargo install aegis-orchestrator
 ```
 
-### 2. Initialize a local AEGIS stack
+### 2. If you installed the CLI manually, initialize a local AEGIS stack
 
 ```bash
 aegis init
 ```
 
-`aegis init` is the guided first-run path. It prepares stack files, configures the node, starts Docker Compose services, applies database migrations, verifies health, and syncs built-in agents and workflows.
+`aegis init` is the guided first-run path when you are not using the one-shot installer. It prepares stack files, configures the node, starts Docker Compose services, verifies health, and syncs built-in agents and workflows.
 
 ### 3. Check health
 
@@ -78,21 +80,21 @@ A local AEGIS setup gives you an orchestrator API, a gRPC surface, and supportin
 - gRPC: `localhost:50051`
 - Temporal UI: `http://localhost:8233`
 
-This is enough to start understanding the operator model: the orchestrator owns lifecycle, policy enforcement, and execution visibility, while agents run inside controlled runtimes.
+This is enough to start understanding the operator model: the orchestrator owns lifecycle, policy enforcement, and execution visibility, while agents run inside controlled runtimes. Local defaults are tuned for development bring-up rather than full production hardening.
 
 ## Core Concepts
 
 ### Deterministic execution
 
-AEGIS is designed to make automation easier to reason about. Workflows are explicit, configuration is typed, and execution flows through the orchestrator rather than through a loose collection of direct agent integrations. That structure gives operators a more reproducible system and gives developers a clearer contract for how work is scheduled, executed, and observed.
+AEGIS is designed to make automation easier to reason about. Workflows are explicit, configuration is typed, and execution flows through the orchestrator rather than through a loose collection of direct agent integrations. That structure gives operators a more reproducible control plane and gives developers a clearer contract for how work is scheduled, executed, and observed.
 
 ### Security and isolation
 
-AEGIS enforces default-deny security policies around network and filesystem access. In development, agents run with Docker-backed isolation; in production, the architecture is aimed at Firecracker micro-VM isolation. At the protocol layer, SMCP verifies tool calls end to end, and orchestrator-mediated dispatch means agents do not call external APIs directly without going through the control boundary.
+AEGIS centers security controls in the orchestrator. Network and filesystem policy are defined in manifests, development runs use Docker-backed isolation, and the production architecture is aimed at Firecracker micro-VM isolation. At the protocol layer, SMCP verifies tool calls end to end, and orchestrator-mediated dispatch keeps agent actions behind a control boundary. Local stack templates prioritize fast setup, so IAM and SMCP gateway auth are not enabled in every local dev path by default.
 
 ### Reliability and auditability
 
-The CLI supports repeatable bring-up and shutdown flows such as `aegis init`, `aegis up`, `aegis status`, and `aegis down`. Structured logging via `tracing`, health checks, and machine-readable `--output <text|table|json|yaml>` modes make AEGIS friendlier to both human operators and automation pipelines.
+The CLI supports repeatable bring-up and shutdown flows such as `aegis init`, `aegis up`, `aegis status`, and `aegis down`. Structured logging via `tracing`, health checks, and machine-readable `--output <text|table|json|yaml>` modes make AEGIS friendlier to both human operators and automation pipelines, while explicit stack commands reduce drift in routine local operations.
 
 ### Building blocks
 
@@ -128,7 +130,7 @@ Interactive and streaming workflows remain text-first. For the current command s
 Start here if you are new:
 
 - [Getting Started](https://docs.100monkeys.ai/docs/getting-started)
-- [Architecture Overview](https://docs.100monkeys.ai/docs/architecture)
+- [Execution Engine Architecture](https://docs.100monkeys.ai/docs/architecture/execution-engine)
 - [Security Model](https://docs.100monkeys.ai/docs/concepts/security-model)
 
 Use these when you are ready to configure and build:
