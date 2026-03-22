@@ -102,6 +102,7 @@ spec:
   node:
     id: my-node-001
     type: edge
+  max_execution_list_limit: 1000
   llm_providers:
     - name: local
       type: ollama
@@ -114,6 +115,11 @@ spec:
   llm_selection:
     strategy: prefer-local
     default_provider: local
+  temporal:
+    address: temporal:7233
+    namespace: default
+    task_queue: aegis-agents
+    max_connection_retries: 30
 ```
 
 See the [Node Config Reference](https://docs.100monkeys.ai/docs/reference/node-config) for all fields.

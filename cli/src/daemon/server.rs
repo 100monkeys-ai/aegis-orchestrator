@@ -109,6 +109,10 @@ fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     }
 }
 
+fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
+    raw_value.unwrap_or(30).max(1)
+}
+
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
     // Daemonize on Unix
     // NOTE: We skip internal daemonization because calling fork() (via daemonize)
@@ -665,7 +669,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let temporal_namespace = temporal_config.namespace.clone();
     let temporal_task_queue = temporal_config.task_queue.clone();
-    let temporal_connection_max_retries: i32 = temporal_config.max_connection_retries.unwrap_or(30);
+    let temporal_connection_max_retries =
+        temporal_connection_max_retries(temporal_config.max_connection_retries);
     println!("Initializing Temporal Client (Address: {temporal_address})...");
 
     // Create shared containers for the concrete Temporal client and the workflow engine port.
@@ -2339,7 +2344,6 @@ struct ListExecutionsQuery {
 /// large pages. The effective limit is configurable via NodeConfig to
 /// allow tuning based on deployment capacity and client requirements. If
 /// not explicitly configured, a safe default of 1000 is used.
-
 async fn list_executions_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
@@ -3193,6 +3197,8 @@ async fn list_smcp_tools_handler(
 
 #[cfg(test)]
 mod tests {
+    use super::temporal_connection_max_retries;
+
     #[test]
     fn test_create_router_returns_router() {
         // This is a smoke test to ensure create_router compiles and can be called
@@ -3201,5 +3207,13 @@ mod tests {
 
         let assertion_marker = "router_module_compiles";
         assert_eq!(assertion_marker, "router_module_compiles");
+    }
+
+    #[test]
+    fn temporal_connection_max_retries_clamps_to_minimum_of_one() {
+        assert_eq!(temporal_connection_max_retries(None), 30);
+        assert_eq!(temporal_connection_max_retries(Some(0)), 1);
+        assert_eq!(temporal_connection_max_retries(Some(-4)), 1);
+        assert_eq!(temporal_connection_max_retries(Some(7)), 7);
     }
 }

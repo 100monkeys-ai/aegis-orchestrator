@@ -46,6 +46,10 @@ spec:
     max_retries: 3
     retry_delay_ms: 1000
 
+  # Maximum number of executions returned by a single `list_executions` request.
+  # Defaults to 1000 if omitted.
+  # max_execution_list_limit: 1000
+
   runtime:
     # bootstrap_script: "assets/bootstrap.py"  # Optional (default)
     # default_isolation: "inherit"             # Optional (default: inherit)
@@ -89,6 +93,7 @@ spec:
   #   worker_secret: "env:TEMPORAL_WORKER_SECRET"    # Worker callback auth secret
   #   namespace: "default"                 # Temporal namespace
   #   task_queue: "aegis-agents"           # Temporal task queue
+  #   max_connection_retries: 30           # Temporal client connection retries
 
   # cortex:
   #   grpc_url: "http://cortex:50052"      # Cortex gRPC service URL

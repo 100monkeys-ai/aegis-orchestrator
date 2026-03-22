@@ -1158,6 +1158,7 @@ impl ConfigWizard {
     worker_secret: "env:TEMPORAL_WORKER_SECRET"
     namespace: "default"
     task_queue: "aegis-agents"
+    max_connection_retries: 30
 "#
         } else {
             ""
@@ -1270,6 +1271,7 @@ spec:
       vram_gb: {vram_gb}
 
   image_tag: "{image_tag}"
+  max_execution_list_limit: 1000
 {llm_section}
 {builtin_dispatchers_section}
   runtime:

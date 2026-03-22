@@ -50,7 +50,10 @@ spec:
     tags:
       - "development"
       - "team-alpha"
-  
+
+  # Optional: Override the AEGIS-owned image tag used by `aegis update`.
+  # image_tag: "0.1.0-pre-alpha"
+
   # --------------------------------------------------------------------------
   # LLM Providers (BYOLLM)
   # --------------------------------------------------------------------------
@@ -98,7 +101,7 @@ spec:
     # Example 3: Anthropic Claude
     - name: "anthropic"
       type: "anthropic"
-      # Endpoint is implicit for Anthropic (https://api.anthropic.com/v1)
+      endpoint: "https://api.anthropic.com/v1"
       enabled: true
       api_key: "env:ANTHROPIC_API_KEY"
       models:
@@ -128,6 +131,13 @@ spec:
     # Retry configuration
     max_retries: 3
     retry_delay_ms: 1000  # Initial delay, doubles on each retry (exponential backoff)
+
+  # --------------------------------------------------------------------------
+  # Execution Limits
+  # --------------------------------------------------------------------------
+  # Maximum number of executions returned by a single `list_executions` request.
+  # Defaults to 1000 if omitted.
+  # max_execution_list_limit: 1000
   
   # --------------------------------------------------------------------------
   # Runtime Configuration (Optional)
@@ -197,25 +207,28 @@ spec:
   # Network Configuration
   # --------------------------------------------------------------------------
   network:
-    # Network bind address (e.g. "0.0.0.0" or "127.0.0.1")
-    # bind_address: "0.0.0.0"
-    # port: 8088
+    # Optional: Central orchestrator endpoint for edge nodes
+    # orchestrator_endpoint: "wss://orchestrator.aegis.example.com"
 
-    # Optional: Central orchestrator endpoint for multi-node coordination
-    # Leave unset for standalone mode
-    # orchestrator_endpoint: "https://orchestrator.aegis.example.com"
-    
-    # Optional: API key for authenticating with orchestrator
-    # api_key: "env:AEGIS_API_KEY"
-    
-    # Optional: Heartbeat interval (seconds)
-    # heartbeat_interval_seconds: 30
-    
-    # Optional: Proxy configuration
-    # http_proxy: "http://proxy.example.com:8088"
-    # https_proxy: "http://proxy.example.com:8088"
-    # no_proxy: "localhost,127.0.0.1,.local"
-  
+    # Heartbeat interval in seconds
+    heartbeat_interval_seconds: 30
+
+    # Network bind address
+    bind_address: "0.0.0.0"
+
+    # HTTP API port
+    port: 8088
+
+    # gRPC API port
+    grpc_port: 50051
+
+    # TLS configuration
+    tls:
+      enabled: true
+      cert_path: "/etc/aegis/tls/node.crt"
+      key_path: "/etc/aegis/tls/node.key"
+      ca_path: "/etc/aegis/tls/ca.crt"
+
   # --------------------------------------------------------------------------
   # Observability
   # --------------------------------------------------------------------------
@@ -255,17 +268,10 @@ spec:
       enabled: true
       port: 9091
       path: "/metrics"
-    
+
     tracing:
       # Enable distributed tracing
       enabled: false
-  
-  # --------------------------------------------------------------------------
-  # AgentSkills API (Optional)
-  # --------------------------------------------------------------------------
-  # External registry for fetching advanced agent capabilities.
-  # agent_skills:
-  #   endpoint: "https://agentskills.io/api"
 
   # --------------------------------------------------------------------------
   # Storage (Optional)
@@ -273,34 +279,73 @@ spec:
   # Distributed storage for agent file system volumes
   # See: ADR-032 Unified Storage via SeaweedFS
   storage:
-    # Backend: "seaweedfs" (distributed) or "local_host" (single-node)
-    # Default: "local_host" (no distributed storage)
-    backend: "local_host"
-    
+    # Backend: "seaweedfs" (default), "local_host", or "opendal"
+    backend: "seaweedfs"
+
+    # Optional NFS server port (default: 2049)
+    nfs_port: 2049
+
     # SeaweedFS configuration (production multi-node deployments)
-    # Requires SeaweedFS Filer + PostgreSQL
-    # seaweedfs:
-    #   filer_url: "http://seaweedfs-filer:8888"  # Filer endpoint
-    #   mount_point: "/var/lib/aegis/storage"     # Host mount location
-    #   
-    #   # Volume defaults
-    #   default_ttl_hours: 24                       # Ephemeral volume lifetime
-    #   default_size_limit_mb: 1000                 # 1GB default quota
-    #   max_size_limit_mb: 10000                    # 10GB maximum quota
-    #   
-    #   # Garbage collection
-    #   gc_interval_minutes: 60                     # Check for expired volumes
-    #   
-    #   # S3 gateway (optional, for external access)
-    #   # s3_endpoint: "http://seaweedfs-s3:8333"
-    #   # s3_region: "us-east-1"
-    
+    seaweedfs:
+      filer_url: "http://seaweedfs-filer:8888"
+      mount_point: "/var/lib/aegis/storage"
+      default_ttl_hours: 24
+      default_size_limit_mb: 1000
+      max_size_limit_mb: 10000
+      gc_interval_minutes: 60
+      s3_endpoint: "http://seaweedfs-s3:8333"
+      s3_region: "us-east-1"
+
     # Local filesystem configuration (development/single-node)
-    local:
-      base_path: "/var/lib/aegis/local-volumes"  # Volume storage directory
-      default_ttl_hours: 24                        # Ephemeral volume lifetime
-      default_size_limit_mb: 1000                  # 1GB default quota
-      max_size_limit_mb: 10000                     # 10GB maximum quota
+    local_host:
+      mount_point: "/var/lib/aegis/local-host-volumes"
+
+    # OpenDAL storage configuration
+    opendal:
+      provider: "memory"
+      options:
+        region: "us-east-1"
+
+  # --------------------------------------------------------------------------
+  # MCP Tool Servers (Optional)
+  # --------------------------------------------------------------------------
+  # mcp_servers:
+  #   - name: "filesystem"
+  #     enabled: true
+  #     executable: "/usr/local/bin/fs-mcp"
+  #     args: ["--root", "/data"]
+  #     capabilities:
+  #       - name: "fs.read"
+  #         skip_judge: true
+  #     credentials:
+  #       API_KEY: "env:FILESYSTEM_MCP_API_KEY"
+  #     health_check:
+  #       interval_seconds: 30
+  #       timeout_seconds: 5
+  #       method: "http"
+  #     resource_limits:
+  #       cpu_millicores: 250
+  #       memory_mb: 256
+  #     environment:
+  #       LOG_LEVEL: "info"
+
+  # --------------------------------------------------------------------------
+  # Built-In Dispatchers (Optional)
+  # --------------------------------------------------------------------------
+  # builtin_dispatchers:
+  #   - name: "cmd.run"
+  #     description: "Run local shell commands"
+  #     enabled: true
+  #     capabilities:
+  #       - name: "cmd.run"
+
+  # --------------------------------------------------------------------------
+  # Registry Credentials (Optional)
+  # --------------------------------------------------------------------------
+  # registry_credentials:
+  #   - registry: "ghcr.io"
+  #     username: "my-user"
+  #     password: "env:GHCR_PASSWORD"
 
   # --------------------------------------------------------------------------
   # Database Configuration (Optional)
@@ -333,6 +378,9 @@ spec:
   #   namespace: "default"
   #   # Temporal task queue (default: "aegis-agents")
   #   task_queue: "aegis-agents"
+  #   # Maximum number of connection retries when establishing the Temporal client.
+  #   # Defaults to 30 retries if omitted.
+  #   max_connection_retries: 30
 
   # --------------------------------------------------------------------------
   # Cortex Memory Service (Optional)
@@ -345,13 +393,38 @@ spec:
   #   grpc_url: "http://cortex:50052"
 
   # --------------------------------------------------------------------------
+  # Secrets Management (Optional)
+  # --------------------------------------------------------------------------
+  # secrets:
+  #   backend:
+  #     address: "https://secrets.internal:8200"
+  #     auth_method: "approle"
+  #     approle:
+  #       role_id: "env:OPENBAO_ROLE_ID"
+  #       secret_id_env_var: "OPENBAO_SECRET_ID"
+  #     namespace: "aegis-system"
+  #     tls:
+  #       ca_cert: "/etc/ssl/certs/ca.pem"
+  #       client_cert: "/etc/ssl/certs/client.pem"
+  #       client_key: "/etc/ssl/private/client.key"
+
+  # --------------------------------------------------------------------------
+  # SMCP Security (Optional)
+  # --------------------------------------------------------------------------
+  # smcp:
+  #   private_key_path: "/etc/aegis/smcp/private.pem"
+  #   public_key_path: "/etc/aegis/smcp/public.pem"
+  #   issuer: "aegis-orchestrator"
+  #   audiences: ["aegis-runtime"]
+  #   token_ttl_seconds: 3600
+
+  # --------------------------------------------------------------------------
   # Cluster / Multi-Node Topology (Optional)
   # --------------------------------------------------------------------------
   # Configures the Controller-Worker cluster topology (ADR-059).
   # Controllers manage routing and registration; workers run agent executions.
   # See: aegis-docs/docs/deployment/multi-node
   cluster:
-    # Enable cluster functionality on this node
     enabled: true
 
     # Role of this node in the cluster:
@@ -360,35 +433,70 @@ spec:
     # - hybrid: Both controller and worker duties (default).
     role: "hybrid"
 
-    # Port for the NodeClusterService gRPC server (default: 50056)
-    cluster_grpc_port: 50056
-
-    # Controller-specific settings
+    # Controller endpoint (required when this node acts as a worker)
     controller:
-      # Public endpoint of the cluster controller (required for workers)
       endpoint: "https://aegis-controller.example.com"
-      
-      # Secret token for initial node-to-controller authentication (Step 0)
-      # Usually passed via environment variable.
       token: "env:AEGIS_CLUSTER_TOKEN"
 
-    # Worker-specific settings (routing hints)
-    worker:
-      # Optional: Override reported gRPC address (e.g., if behind a NAT/proxy)
-      # grpc_address_override: "worker-1.internal:50056"
-      
-      # Optional: Static capability tags (merged with hardware auto-discovery)
-      # tags: ["gpu:a100", "region:us-west"]
+    # Port for the NodeClusterService gRPC server
+    cluster_grpc_port: 50056
+    peers:
+      - "https://aegis-controller-1.example.com"
+      - "https://aegis-controller-2.example.com"
+    node_keypair_path: "/var/lib/aegis/node_keypair"
+    heartbeat_interval_secs: 30
+    token_refresh_margin_secs: 120
 
     # Cluster-level security (mTLS recommended for inter-node gRPC)
     tls:
-      # Path to CA certificate for verifying other nodes
+      enabled: true
+      cert_path: "/etc/aegis/certs/node.crt"
+      key_path: "/etc/aegis/certs/node.key"
       ca_cert: "/etc/aegis/certs/ca.crt"
-      
-      # Path to this node's certificate for mTLS
-      client_cert: "/etc/aegis/certs/node.crt"
-      
-      # Path to this node's private key for mTLS
-      client_key: "/etc/aegis/certs/node.key"
 
+  # --------------------------------------------------------------------------
+  # Node Access Policy and Protocol Security
+  # --------------------------------------------------------------------------
+  # security_contexts:
+  #   - name: "research-safe"
+  #     description: "Read-only tools and safe network access"
+  #     capabilities:
+  #       - tool_pattern: "fs.read"
+  #         path_allowlist:
+  #           - "/workspace"
+  #     deny_list:
+  #       - "cmd.rm"
+  #
+  # iam:
+  #   realms:
+  #     - slug: "aegis-system"
+  #       issuer_url: "https://auth.example.com/realms/aegis-system"
+  #       jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
+  #       audience: "aegis-orchestrator"
+  #       kind: "system"
+  #   jwks_cache_ttl_seconds: 300
+  #   claims:
+  #     zaru_tier: "zaru_tier"
+  #     aegis_role: "aegis_role"
+  #
+  # grpc_auth:
+  #   enabled: true
+  #   exempt_methods:
+  #     - "/aegis.orchestrator.v1.Health/Check"
+  #
+  # smcp_gateway:
+  #   url: "http://aegis-smcp-gateway:50055"
 
+  # --------------------------------------------------------------------------
+  # AgentSkills API (Optional)
+  # --------------------------------------------------------------------------
+  # External registry for fetching advanced agent capabilities.
+  # agent_skills:
+  #   endpoint: "https://agentskills.io/api"
+
+  # --------------------------------------------------------------------------
+  # Execution Limits (Optional)
+  # --------------------------------------------------------------------------
+  # Maximum number of executions returned by a single `list_executions` request.
+  # Defaults to 1000 if omitted.
+  # max_execution_list_limit: 1000

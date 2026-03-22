@@ -221,8 +221,7 @@ impl ValidationService {
             .await?;
 
         // Poll for completion with configurable timeout and interval.
-        let max_attempts =
-            ((timeout_seconds as f64 * 1000.0) / poll_interval_ms as f64).ceil() as u64;
+        let max_attempts = calculate_max_attempts(timeout_seconds, poll_interval_ms)?;
         let mut attempts = 0;
 
         loop {
@@ -274,6 +273,15 @@ impl ValidationService {
     ) -> Result<MultiJudgeConsensus> {
         compute_consensus_for_strategy(results, config)
     }
+}
+
+fn calculate_max_attempts(timeout_seconds: u64, poll_interval_ms: u64) -> Result<u64> {
+    if poll_interval_ms == 0 {
+        return Err(anyhow!("poll_interval_ms must be greater than 0"));
+    }
+
+    let timeout_ms = timeout_seconds.saturating_mul(1000);
+    Ok(timeout_ms.saturating_add(poll_interval_ms - 1) / poll_interval_ms)
 }
 
 // ── Consensus helpers (free functions so validators can reuse them) ───────────
@@ -906,4 +914,24 @@ pub fn build_validation_pipeline(
     }
 
     ValidationPipeline::new(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::calculate_max_attempts;
+
+    #[test]
+    fn calculate_max_attempts_rejects_zero_poll_interval() {
+        let err = calculate_max_attempts(30, 0).expect_err("zero interval should fail");
+        assert!(err
+            .to_string()
+            .contains("poll_interval_ms must be greater than 0"));
+    }
+
+    #[test]
+    fn calculate_max_attempts_rounds_up() {
+        assert_eq!(calculate_max_attempts(1, 1000).unwrap(), 1);
+        assert_eq!(calculate_max_attempts(1, 600).unwrap(), 2);
+        assert_eq!(calculate_max_attempts(5, 2000).unwrap(), 3);
+    }
 }

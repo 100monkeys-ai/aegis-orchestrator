@@ -488,6 +488,7 @@ mod tests {
                 smcp_gateway: None,
                 image_tag: None,
                 agent_skills: None,
+                max_execution_list_limit: None,
             },
         };
 
