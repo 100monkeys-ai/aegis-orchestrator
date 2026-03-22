@@ -28,11 +28,9 @@ AEGIS Orchestrator is the layer that manages agent lifecycle, workflow execution
 curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
 ```
 
-That installer bootstraps system dependencies, Docker, the Rust toolchain, the `aegis` CLI, and then brings the local stack online. Re-running it is intended to be idempotent.
-
 That installer installs the `aegis` CLI from a pinned GitHub release, installs local prerequisites such as Docker when needed, and then runs `aegis up --tag <pinned-version>` to bring the local stack online. Re-running it is intended to be idempotent.
 
-If you prefer to build the CLI yourself instead of using the installer:
+If you prefer to install the CLI from source yourself instead of using the installer:
 
 ```bash
 cargo install aegis-orchestrator
