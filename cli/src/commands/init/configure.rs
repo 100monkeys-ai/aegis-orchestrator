@@ -1588,6 +1588,8 @@ mod tests {
                 anthropic_smart_model: "claude-sonnet-4-5".to_string(),
                 anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
+                // Use Gemini's OpenAI-compatible endpoint by default; this is intentional
+                // and allows treating Gemini as an OpenAI-style provider.
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
                 gemini_api_key: String::new(),
