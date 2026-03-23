@@ -4155,8 +4155,7 @@ spec:
             crate::domain::execution::TrajectoryStep {
                 tool_name: "aegis.schema.validate".to_string(),
                 arguments_json:
-                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
-                        .to_string(),
+                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#.to_string(),
                 status: "completed".to_string(),
                 result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
                 error: None,
