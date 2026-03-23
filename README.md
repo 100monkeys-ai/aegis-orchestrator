@@ -25,7 +25,7 @@ AEGIS Orchestrator is the layer that manages agent lifecycle, workflow execution
 ### 1. Install the CLI
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
+curl -fsSL https://get.100monkeys.ai | bash
 ```
 
 That installer installs the `aegis` CLI from a pinned GitHub release, installs local prerequisites such as Docker when needed, and then runs `aegis up --tag <pinned-version>` to bring the local stack online. Re-running it is intended to be idempotent.

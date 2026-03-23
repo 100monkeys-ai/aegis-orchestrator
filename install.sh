@@ -8,7 +8,7 @@
 # with the pinned version to bring the full local stack online.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/100monkeys-ai/aegis-orchestrator/main/install.sh | bash
+#   curl -fsSL https://get.100monkeys.ai | bash
 #   # or
 #   chmod +x install.sh && ./install.sh
 
