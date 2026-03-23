@@ -257,6 +257,31 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         }
     }
 
+    async fn find_tenant_id_by_execution(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT tenant_id
+            FROM workflow_executions
+            WHERE id = $1
+            "#,
+        )
+        .bind(id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        row.map(|row| {
+            let tenant_id: String = row.get("tenant_id");
+            TenantId::from_string(&tenant_id).map_err(|e| {
+                RepositoryError::Database(format!("Invalid tenant_id '{tenant_id}': {e}"))
+            })
+        })
+        .transpose()
+    }
+
     async fn find_active_for_tenant(
         &self,
         tenant_id: &TenantId,

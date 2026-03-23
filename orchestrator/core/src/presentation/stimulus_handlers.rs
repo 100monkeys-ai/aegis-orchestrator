@@ -74,6 +74,10 @@ fn stimulus_error_response(e: StimulusError) -> (StatusCode, axum::Json<serde_js
     (status, Json(body))
 }
 
+fn workflow_execution_logs_location(workflow_execution_id: &str) -> String {
+    format!("/v1/workflows/executions/{workflow_execution_id}/logs")
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Handlers
 // ──────────────────────────────────────────────────────────────────────────────
@@ -110,7 +114,7 @@ pub async fn ingest_stimulus_handler(
 
     match stimulus_service.ingest(stimulus).await {
         Ok(resp) => {
-            let location = format!("/v1/workflow-executions/{}", resp.workflow_execution_id);
+            let location = workflow_execution_logs_location(&resp.workflow_execution_id);
             let mut response_headers = HeaderMap::new();
             if let Ok(loc_val) = location.parse() {
                 response_headers.insert(axum::http::header::LOCATION, loc_val);
@@ -173,7 +177,7 @@ pub async fn webhook_handler(
 
     match stimulus_service.ingest(stimulus).await {
         Ok(resp) => {
-            let location = format!("/v1/workflow-executions/{}", resp.workflow_execution_id);
+            let location = workflow_execution_logs_location(&resp.workflow_execution_id);
             let mut response_headers = HeaderMap::new();
             if let Ok(loc_val) = location.parse() {
                 response_headers.insert(axum::http::header::LOCATION, loc_val);
@@ -421,7 +425,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response.headers().get(LOCATION).unwrap(),
-            "/v1/workflow-executions/wf-exec-123"
+            "/v1/workflows/executions/wf-exec-123/logs"
         );
 
         let body = response_json(response).await;
@@ -534,7 +538,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(
             response.headers().get(LOCATION).unwrap(),
-            "/v1/workflow-executions/wf-exec-999"
+            "/v1/workflows/executions/wf-exec-999/logs"
         );
 
         let captured = stub.captured();
