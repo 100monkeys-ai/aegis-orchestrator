@@ -27,7 +27,7 @@ use crate::application::execution::ExecutionService;
 use crate::application::ports::ExternalWebToolPort;
 use crate::application::schema_registry::SchemaRegistry;
 use crate::domain::events::{MCPToolEvent, ViolationType};
-use crate::domain::execution::{Execution, ExecutionInput};
+use crate::domain::execution::{ExecutionInput, TrajectoryStep};
 use crate::domain::mcp::{
     MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
 };
@@ -267,43 +267,25 @@ impl ToolInvocationService {
 
     fn build_tool_audit_history(
         execution_id: crate::domain::execution::ExecutionId,
-        execution: Option<&Execution>,
+        iteration_number: u8,
+        tool_audit_history: &[TrajectoryStep],
     ) -> Value {
-        let Some(execution) = execution else {
-            return serde_json::json!({
-                "execution_id": execution_id.to_string(),
-                "available": false,
-                "iteration_number": null,
-                "tool_calls": [],
-                "latest_schema_get": null,
-                "latest_schema_validate": null,
-                "schema_get_evidence": null,
-                "schema_validate_evidence": null,
-            });
-        };
-
-        let current_iteration = execution.current_iteration();
-        let tool_calls: Vec<Value> = current_iteration
-            .and_then(|iter| iter.trajectory.as_ref())
-            .map(|trajectory| {
-                trajectory
-                    .iter()
-                    .map(|step| {
-                        serde_json::json!({
-                            "tool_name": step.tool_name,
-                            "arguments": Self::parse_json_or_string(&step.arguments_json),
-                            "status": step.status,
-                            "result": step
-                                .result_json
-                                .as_deref()
-                                .map(Self::parse_json_or_string)
-                                .unwrap_or(Value::Null),
-                            "error": step.error,
-                        })
-                    })
-                    .collect()
+        let tool_calls: Vec<Value> = tool_audit_history
+            .iter()
+            .map(|step| {
+                serde_json::json!({
+                    "tool_name": step.tool_name,
+                    "arguments": Self::parse_json_or_string(&step.arguments_json),
+                    "status": step.status,
+                    "result": step
+                        .result_json
+                        .as_deref()
+                        .map(Self::parse_json_or_string)
+                        .unwrap_or(Value::Null),
+                    "error": step.error,
+                })
             })
-            .unwrap_or_default();
+            .collect();
 
         let latest_schema_validate = tool_calls
             .iter()
@@ -321,9 +303,9 @@ impl ToolInvocationService {
         let schema_validate_evidence = latest_schema_validate.clone();
 
         serde_json::json!({
-            "execution_id": execution.id.to_string(),
+            "execution_id": execution_id.to_string(),
             "available": true,
-            "iteration_number": current_iteration.map(|iter| iter.number),
+            "iteration_number": iteration_number,
             "tool_calls": tool_calls,
             "latest_schema_get": latest_schema_get,
             "latest_schema_validate": latest_schema_validate,
@@ -334,7 +316,6 @@ impl ToolInvocationService {
 
     fn build_semantic_judge_payload(
         execution_id: crate::domain::execution::ExecutionId,
-        execution: Option<&Execution>,
         task: String,
         tool_name: &str,
         arguments: &Value,
@@ -342,15 +323,19 @@ impl ToolInvocationService {
         worker_mounts: Vec<String>,
         criteria: &str,
         validation_context: &str,
+        iteration_number: u8,
+        tool_audit_history: &[TrajectoryStep],
     ) -> Value {
         let semantic_input = serde_json::to_string_pretty(&serde_json::json!({
             "tool": tool_name,
             "arguments": arguments,
         }))
         .unwrap_or_default();
-        let tool_audit_history = Self::build_tool_audit_history(execution_id, execution);
+        let tool_audit_history =
+            Self::build_tool_audit_history(execution_id, iteration_number, tool_audit_history);
 
         serde_json::json!({
+            "execution_id": execution_id.to_string(),
             "task": task,
             "proposed_tool_call": {
                 "name": tool_name,
@@ -529,6 +514,8 @@ impl ToolInvocationService {
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
+        iteration_number: u8,
+        tool_audit_history: Vec<TrajectoryStep>,
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
@@ -663,16 +650,10 @@ impl ToolInvocationService {
                             .map(|ctx| ctx.mount_point.to_string_lossy().to_string())
                             .collect::<Vec<String>>();
 
-                        let execution = self
-                            .execution_service
-                            .get_execution(execution_id)
-                            .await
-                            .ok();
                         let input = ExecutionInput {
                             intent: None,
                             payload: Self::build_semantic_judge_payload(
                                 execution_id,
-                                execution.as_ref(),
                                 execution_objective,
                                 &tool_name,
                                 &args,
@@ -680,6 +661,8 @@ impl ToolInvocationService {
                                 worker_mounts,
                                 criteria,
                                 "semantic_judge_pre_execution_inner_loop",
+                                iteration_number,
+                                &tool_audit_history,
                             ),
                         };
 
@@ -1427,7 +1410,13 @@ impl ToolInvocationService {
         }
         if tool_name == "aegis.workflow.create" {
             let result = self
-                .invoke_aegis_workflow_create_tool(&args, execution_id, *agent_id)
+                .invoke_aegis_workflow_create_tool(
+                    &args,
+                    execution_id,
+                    *agent_id,
+                    iteration_number,
+                    &tool_audit_history,
+                )
                 .await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
@@ -3078,6 +3067,8 @@ impl ToolInvocationService {
         args: &Value,
         execution_id: crate::domain::execution::ExecutionId,
         agent_id: AgentId,
+        iteration_number: u8,
+        tool_audit_history: &[TrajectoryStep],
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
@@ -3143,12 +3134,6 @@ impl ToolInvocationService {
                     "Workflow registration use case not configured".to_string(),
                 )
             })?;
-        let execution = self
-            .execution_service
-            .get_execution(execution_id)
-            .await
-            .ok();
-        let tool_audit_history = Self::build_tool_audit_history(execution_id, execution.as_ref());
 
         let judge_names: Vec<String> = args
             .get("judge_agents")
@@ -3208,7 +3193,12 @@ impl ToolInvocationService {
                 "state_count": workflow.spec.states.len(),
                 "force": force,
                 "task_context": task_context,
-                "tool_audit_history": tool_audit_history,
+                "iteration_number": iteration_number,
+                "tool_audit_history": Self::build_tool_audit_history(
+                    execution_id,
+                    iteration_number,
+                    tool_audit_history,
+                ),
             })),
         };
 
@@ -4098,47 +4088,28 @@ spec:
 
     #[test]
     fn build_tool_audit_history_includes_schema_validate_and_get_evidence() {
-        let workflow = build_test_workflow("audit-history");
         let execution_id = ExecutionId::new();
-        let mut execution = Execution::new(
-            AgentId::new(),
-            ExecutionInput {
-                intent: Some("generate workflow".to_string()),
-                payload: serde_json::json!({}),
+        let tool_audit_history = vec![
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.get".to_string(),
+                arguments_json: r#"{"key":"workflow/manifest/v1"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"ok":true}"#.to_string()),
+                error: None,
             },
-            3,
-        );
-        execution.id = execution_id;
-        execution.start();
-        execution
-            .start_iteration("workflow authoring".to_string())
-            .unwrap();
-        execution
-            .store_iteration_trajectory(
-                1,
-                vec![
-                    crate::domain::execution::TrajectoryStep {
-                        tool_name: "aegis.schema.get".to_string(),
-                        arguments_json: r#"{"key":"workflow/manifest/v1"}"#.to_string(),
-                        status: "completed".to_string(),
-                        result_json: Some(r#"{"ok":true}"#.to_string()),
-                        error: None,
-                    },
-                    crate::domain::execution::TrajectoryStep {
-                        tool_name: "aegis.schema.validate".to_string(),
-                        arguments_json:
-                            r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
-                                .to_string(),
-                        status: "completed".to_string(),
-                        result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
-                        error: None,
-                    },
-                ],
-            )
-            .unwrap();
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.validate".to_string(),
+                arguments_json:
+                    r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
+                        .to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                error: None,
+            },
+        ];
 
         let audit_history =
-            ToolInvocationService::build_tool_audit_history(execution_id, Some(&execution));
+            ToolInvocationService::build_tool_audit_history(execution_id, 1, &tool_audit_history);
 
         assert_eq!(audit_history["execution_id"], execution_id.to_string());
         assert_eq!(audit_history["available"], true);
@@ -4168,50 +4139,32 @@ spec:
             audit_history["schema_validate_evidence"]["result"]["valid"],
             true
         );
-        assert_eq!(workflow.metadata.name, "audit-history");
     }
 
     #[test]
     fn build_semantic_judge_payload_includes_tool_audit_history() {
         let execution_id = ExecutionId::new();
-        let mut execution = Execution::new(
-            AgentId::new(),
-            ExecutionInput {
-                intent: Some("create agent".to_string()),
-                payload: serde_json::json!({}),
+        let tool_audit_history = vec![
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.get".to_string(),
+                arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"ok":true}"#.to_string()),
+                error: None,
             },
-            3,
-        );
-        execution.id = execution_id;
-        execution.start();
-        execution.start_iteration("authoring".to_string()).unwrap();
-        execution
-            .store_iteration_trajectory(
-                1,
-                vec![
-                    crate::domain::execution::TrajectoryStep {
-                        tool_name: "aegis.schema.get".to_string(),
-                        arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
-                        status: "completed".to_string(),
-                        result_json: Some(r#"{"ok":true}"#.to_string()),
-                        error: None,
-                    },
-                    crate::domain::execution::TrajectoryStep {
-                        tool_name: "aegis.schema.validate".to_string(),
-                        arguments_json:
-                            r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
-                                .to_string(),
-                        status: "completed".to_string(),
-                        result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
-                        error: None,
-                    },
-                ],
-            )
-            .unwrap();
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.validate".to_string(),
+                arguments_json:
+                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
+                        .to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                error: None,
+            },
+        ];
 
         let payload = ToolInvocationService::build_semantic_judge_payload(
             execution_id,
-            Some(&execution),
             "Create an agent".to_string(),
             "aegis.agent.create",
             &serde_json::json!({
@@ -4224,6 +4177,8 @@ spec:
             vec!["/workspace".to_string()],
             "use the workflow-required sequence",
             "semantic_judge_pre_execution_inner_loop",
+            1,
+            &tool_audit_history,
         );
 
         assert_eq!(
