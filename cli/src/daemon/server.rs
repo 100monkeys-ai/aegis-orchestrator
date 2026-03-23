@@ -778,12 +778,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 let tool_server =
                     aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
 
-                // Prevent silent overwrites when multiple MCP servers share the same ID.
-                if servers_lock.contains_key(&tool_server.id) {
+                // Prevent silent overwrites when multiple MCP servers share the same
+                // logical identity. Use the configured name (stable identifier) rather
+                // than the randomly generated ToolServer ID for duplicate detection.
+                if servers_lock
+                    .values()
+                    .any(|existing| existing.name == srv_cfg.name)
+                {
                     return Err(anyhow::anyhow!(
-                        "Duplicate MCP server ID '{}' detected in configuration. \
-                         MCP server IDs must be unique.",
-                        tool_server.id
+                        "Duplicate MCP server name '{}' detected in configuration. \
+                         MCP server names must be unique.",
+                        srv_cfg.name
                     ));
                 }
 
