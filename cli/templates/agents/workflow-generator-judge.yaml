@@ -58,6 +58,17 @@ spec:
       - deployability and validity
       - objective alignment
 
+      TRANSITION SAFETY RUBRIC — enforce these rules explicitly when score-based validator routing is present:
+      - If a state mixes `on_success` with any `score_above`, `score_below`, or `score_and_confidence_above`
+        transition, treat that as an ambiguous routing defect and reduce `transition_safety` materially.
+      - If a validator or judge state uses a score-thresholded success path without an explicit `score_below`
+        branch for the low-score path, treat that as an ambiguous routing defect and reduce both
+        `transition_safety` and overall `score` materially.
+      - Do not give full credit when the manifest relies on transition ordering to distinguish
+        "successful but below threshold" from "successful and acceptable".
+      - When this defect appears, name the offending state and recommend replacing the generic success
+        fallback with an explicit `score_below` transition.
+
       Return JSON only:
       {
         "score": 0.0-1.0,

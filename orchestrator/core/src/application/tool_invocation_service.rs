@@ -17,7 +17,9 @@ use crate::domain::dispatch::DispatchAction;
 use crate::domain::fsal::AegisFSAL;
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
-use crate::domain::workflow::{ConsensusConfig, ConsensusStrategy, WorkflowValidator};
+use crate::domain::workflow::{
+    ConsensusConfig, ConsensusStrategy, TransitionCondition, Workflow, WorkflowValidator,
+};
 use crate::domain::{validation::ValidationRequest, workflow::ConfidenceWeighting};
 use crate::infrastructure::smcp::middleware::SmcpMiddleware;
 use crate::infrastructure::tool_router::ToolRouter;
@@ -3273,6 +3275,21 @@ impl ToolInvocationService {
             })));
         }
 
+        let semantic_guard_violations =
+            collect_thresholded_transition_semantic_violations(&workflow);
+        if !semantic_guard_violations.is_empty() {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.create",
+                "deterministic_validation": {"passed": true},
+                "semantic_validation": {
+                    "passed": false,
+                    "error": "Thresholded validator states must use explicit score-based routing. Use `score_below` for low-score outcomes and do not mix `on_success` with `score_*` transitions in the same state.",
+                    "violations": semantic_guard_violations,
+                },
+                "deployed": false
+            })));
+        }
+
         let validation_service = self.validation_service.as_ref().ok_or_else(|| {
             SmcpSessionError::SignatureVerificationFailed(
                 "Workflow semantic validation service not configured".to_string(),
@@ -3327,10 +3344,11 @@ impl ToolInvocationService {
         }
 
         let criteria = if task_context.is_empty() {
-            "Evaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness.".to_string()
+            "Evaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness. Thresholded validator states must use explicit score-based routing: require `score_below` for low-score outcomes, and reject any state that mixes `on_success` with `score_*` transitions."
+                .to_string()
         } else {
             format!(
-                "Task Context:\n{task_context}\n\nEvaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness."
+                "Task Context:\n{task_context}\n\nEvaluate this workflow manifest for correctness, transition safety, DDD alignment, and production readiness. Thresholded validator states must use explicit score-based routing: require `score_below` for low-score outcomes, and reject any state that mixes `on_success` with `score_*` transitions."
             )
         };
 
@@ -3500,6 +3518,58 @@ fn sanitize_segment(input: &str) -> String {
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn collect_thresholded_transition_semantic_violations(workflow: &Workflow) -> Vec<String> {
+    workflow
+        .spec
+        .states
+        .iter()
+        .flat_map(|(state_name, state)| {
+            let has_thresholded_score_transition = state
+                .transitions
+                .iter()
+                .any(|transition| is_thresholded_score_transition(&transition.condition));
+            if !has_thresholded_score_transition {
+                return Vec::new();
+            }
+
+            let has_on_success = state
+                .transitions
+                .iter()
+                .any(|transition| matches!(transition.condition, TransitionCondition::OnSuccess));
+            let has_score_below = state
+                .transitions
+                .iter()
+                .any(|transition| matches!(transition.condition, TransitionCondition::ScoreBelow { .. }));
+
+            let mut violations = Vec::new();
+            if has_on_success {
+                violations.push(format!(
+                    "State '{}' mixes `on_success` with score-based transitions; low-score success paths must be explicit.",
+                    state_name
+                ));
+            }
+            if !has_score_below {
+                violations.push(format!(
+                    "State '{}' uses score-based transitions but has no explicit `score_below` branch for low-score outcomes.",
+                    state_name
+                ));
+            }
+
+            violations
+        })
+        .collect()
+}
+
+fn is_thresholded_score_transition(condition: &TransitionCondition) -> bool {
+    matches!(
+        condition,
+        TransitionCondition::ScoreAbove { .. }
+            | TransitionCondition::ScoreBelow { .. }
+            | TransitionCondition::ScoreBetween { .. }
+            | TransitionCondition::ScoreAndConfidenceAbove { .. }
+    )
 }
 
 #[cfg(test)]
@@ -4106,6 +4176,42 @@ spec:
             .expect("test workflow manifest should parse")
     }
 
+    fn thresholded_validator_manifest_yaml(name: &str, validation_transitions: &str) -> String {
+        format!(
+            r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  initial_state: VALIDATE
+  states:
+    VALIDATE:
+      kind: Agent
+      agent: validator
+      input: "{{{{workflow.task}}}}"
+      transitions:
+{validation_transitions}
+    SUCCESS:
+      kind: System
+      command: echo "success"
+      transitions: []
+    PARTIAL_PASS:
+      kind: System
+      command: echo "partial"
+      transitions: []
+    VALIDATION_FAILED:
+      kind: System
+      command: echo "failed"
+      transitions: []
+    VALIDATION_ERROR:
+      kind: System
+      command: echo "error"
+      transitions: []
+"#
+        )
+    }
+
     #[tokio::test]
     async fn test_invoke_tool_no_session() {
         let repo = Arc::new(InMemorySmcpSessionRepository::new());
@@ -4234,6 +4340,125 @@ spec:
         assert_eq!(payload["tool"], "aegis.workflow.validate");
         assert_eq!(payload["valid"], true);
         assert_eq!(payload["workflow"]["name"], "validate-me");
+    }
+
+    #[test]
+    fn thresholded_transition_semantic_guard_allows_explicit_score_below() {
+        let workflow = WorkflowParser::parse_yaml(&thresholded_validator_manifest_yaml(
+            "explicit-score-below",
+            r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: score_below
+          threshold: 0.6
+          target: VALIDATION_FAILED
+        - condition: on_failure
+          target: VALIDATION_ERROR"#,
+        ))
+        .expect("workflow should parse");
+
+        let violations = collect_thresholded_transition_semantic_violations(&workflow);
+
+        assert!(
+            violations.is_empty(),
+            "expected explicit low-score routing to pass, got {violations:?}"
+        );
+    }
+
+    #[test]
+    fn thresholded_transition_semantic_guard_rejects_missing_score_below() {
+        let workflow = WorkflowParser::parse_yaml(&thresholded_validator_manifest_yaml(
+            "missing-score-below",
+            r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: on_failure
+          target: VALIDATION_ERROR"#,
+        ))
+        .expect("workflow should parse");
+
+        let violations = collect_thresholded_transition_semantic_violations(&workflow);
+
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0].contains("has no explicit `score_below` branch"));
+    }
+
+    #[tokio::test]
+    async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_success_fallback() {
+        let registry: Arc<dyn crate::domain::mcp::ToolRegistry> =
+            Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+        let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+        let middleware = Arc::new(SmcpMiddleware::new());
+        let repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let security_context_repo = Arc::new(
+            crate::infrastructure::security_context::InMemorySecurityContextRepository::new(),
+        );
+        let (fsal, volume_registry) = test_fsal_deps();
+
+        let service = ToolInvocationService::new(
+            repo,
+            security_context_repo,
+            middleware,
+            router,
+            fsal,
+            volume_registry,
+            Arc::new(TestAgentLifecycleService),
+            Arc::new(TestExecutionService),
+            Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+            Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+            None,
+        );
+
+        let result = service
+            .invoke_aegis_workflow_create_tool(
+                &serde_json::json!({
+                    "manifest_yaml": thresholded_validator_manifest_yaml(
+                        "ambiguous-threshold-routing",
+                        r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: on_success
+          target: VALIDATION_FAILED
+        - condition: on_failure
+          target: VALIDATION_ERROR"#
+                    ),
+                }),
+                ExecutionId::new(),
+                AgentId::new(),
+                1,
+                &[],
+            )
+            .await
+            .expect("workflow create should return a result");
+
+        let ToolInvocationResult::Direct(payload) = result else {
+            panic!("expected direct payload");
+        };
+
+        assert_eq!(payload["tool"], "aegis.workflow.create");
+        assert_eq!(payload["deterministic_validation"]["passed"], true);
+        assert_eq!(payload["semantic_validation"]["passed"], false);
+        assert_eq!(payload["deployed"], false);
+        let violations = payload["semantic_validation"]["violations"]
+            .as_array()
+            .expect("violations should be an array");
+        assert_eq!(violations.len(), 2);
+        assert!(violations.iter().any(|violation| violation
+            .as_str()
+            .is_some_and(|text| text.contains("mixes `on_success` with score-based transitions"))));
+        assert!(violations.iter().any(|violation| violation
+            .as_str()
+            .is_some_and(|text| text.contains("has no explicit `score_below` branch"))));
     }
 
     #[test]

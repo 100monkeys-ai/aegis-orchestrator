@@ -32,6 +32,13 @@ spec:
          - Ensure state transitions are explicit and safe.
          - Ensure all referenced states and volumes are declared.
          - Favor clear state names and deterministic transitions.
+         - For validator or judge states that use score-based routing, emit explicit threshold branches.
+         - When score thresholds govern routing, use `score_above`, `score_below`, or `score_and_confidence_above`
+           for every success-path outcome instead of relying on generic fallbacks.
+         - Never mix `on_success` with any `score_*` transition in the same state.
+         - If a validator has a thresholded success path, it must also define an explicit `score_below`
+           transition for the low-score path.
+         - Transition meaning must never depend on YAML ordering.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
       4. Call `aegis.schema.validate` with {"kind": "workflow", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
