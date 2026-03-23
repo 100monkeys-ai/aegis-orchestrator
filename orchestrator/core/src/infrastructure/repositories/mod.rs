@@ -490,6 +490,16 @@ impl crate::domain::repository::WorkflowExecutionRepository
             .cloned())
     }
 
+    async fn find_tenant_id_by_execution(
+        &self,
+        id: crate::domain::execution::ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        Ok(executions.iter().find_map(|(tenant_id, tenant_execs)| {
+            tenant_execs.contains_key(&id).then(|| tenant_id.clone())
+        }))
+    }
+
     async fn find_active_for_tenant(
         &self,
         tenant_id: &TenantId,

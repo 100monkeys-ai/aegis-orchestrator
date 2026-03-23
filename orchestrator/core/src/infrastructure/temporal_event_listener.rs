@@ -55,6 +55,10 @@
 //! - **Layer:** Infrastructure Layer
 //! - **Purpose:** Implements internal responsibilities for temporal event listener
 
+use crate::application::complete_workflow_execution::{
+    CompleteWorkflowExecutionRequest, CompleteWorkflowExecutionUseCase, CompletionStatus,
+    StandardCompleteWorkflowExecutionUseCase,
+};
 use crate::domain::events::WorkflowEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::repository::WorkflowExecutionRepository;
@@ -343,6 +347,81 @@ impl TemporalEventListener {
         Ok(())
     }
 
+    async fn persist_workflow_event(
+        &self,
+        execution_id: ExecutionId,
+        temporal_sequence_number: i64,
+        event_type: String,
+        raw_payload: &TemporalEventPayload,
+        iteration_number: Option<u8>,
+    ) -> Result<()> {
+        self.execution_repository
+            .append_event(
+                execution_id,
+                temporal_sequence_number,
+                event_type,
+                serde_json::to_value(raw_payload)?,
+                iteration_number,
+            )
+            .await
+            .context("Failed to persist execution event")?;
+
+        Ok(())
+    }
+
+    async fn reconcile_terminal_workflow_event(
+        &self,
+        execution_id: ExecutionId,
+        payload: &TemporalEventPayload,
+        domain_event: &WorkflowEvent,
+    ) -> Result<()> {
+        let tenant_id = self
+            .execution_repository
+            .find_tenant_id_by_execution(execution_id)
+            .await
+            .context("Failed to resolve workflow execution tenant")?
+            .ok_or_else(|| anyhow!("Workflow execution not found: {}", execution_id.0))?;
+
+        let completion_request = match domain_event {
+            WorkflowEvent::WorkflowExecutionCompleted { .. } => CompleteWorkflowExecutionRequest {
+                execution_id: execution_id.to_string(),
+                status: CompletionStatus::Success,
+                final_blackboard: payload.final_blackboard.clone(),
+                error_reason: None,
+                artifacts: payload
+                    .artifacts
+                    .as_ref()
+                    .map(|artifacts| serde_json::json!(artifacts)),
+            },
+            WorkflowEvent::WorkflowExecutionFailed { reason, .. } => {
+                CompleteWorkflowExecutionRequest {
+                    execution_id: execution_id.to_string(),
+                    status: CompletionStatus::Failed,
+                    final_blackboard: payload.final_blackboard.clone(),
+                    error_reason: Some(reason.clone()),
+                    artifacts: None,
+                }
+            }
+            WorkflowEvent::WorkflowExecutionCancelled { .. } => CompleteWorkflowExecutionRequest {
+                execution_id: execution_id.to_string(),
+                status: CompletionStatus::Cancelled,
+                final_blackboard: payload.final_blackboard.clone(),
+                error_reason: None,
+                artifacts: None,
+            },
+            _ => unreachable!("non-terminal workflow event passed to terminal reconciler"),
+        };
+
+        StandardCompleteWorkflowExecutionUseCase::new(
+            self.execution_repository.clone(),
+            self.event_bus.clone(),
+        )
+        .complete_execution_for_tenant(&tenant_id, completion_request)
+        .await?;
+
+        Ok(())
+    }
+
     /// Process incoming event from Temporal worker
     ///
     /// # Arguments
@@ -445,19 +524,25 @@ impl TemporalEventListener {
         };
 
         // Step 2: Persist event to the repository for event sourcing
-        self.execution_repository
-            .append_event(
-                execution_id_obj,
-                payload.temporal_sequence_number,
-                payload.event_type.clone(),
-                serde_json::to_value(&payload)?,
-                payload.iteration_number,
-            )
-            .await
-            .context("Failed to persist execution event")?;
+        self.persist_workflow_event(
+            execution_id_obj,
+            payload.temporal_sequence_number,
+            payload.event_type.clone(),
+            &payload,
+            payload.iteration_number,
+        )
+        .await?;
 
-        // Step 3: Publish to event bus
-        self.event_bus.publish_workflow_event(domain_event.clone());
+        // Step 3: Reconcile terminal state before publishing, otherwise publish directly.
+        match &domain_event {
+            WorkflowEvent::WorkflowExecutionCompleted { .. }
+            | WorkflowEvent::WorkflowExecutionFailed { .. }
+            | WorkflowEvent::WorkflowExecutionCancelled { .. } => {
+                self.reconcile_terminal_workflow_event(execution_id_obj, &payload, &domain_event)
+                    .await?;
+            }
+            _ => self.event_bus.publish_workflow_event(domain_event.clone()),
+        }
 
         // Step 4: Return execution ID for response
         Ok(execution_id_obj.0.to_string())
@@ -470,9 +555,16 @@ mod tests {
     use crate::domain::events::{ExecutionEvent, WorkflowEvent};
     use crate::domain::execution::ExecutionId;
     use crate::domain::repository::{RepositoryError, WorkflowExecutionRepository};
+    use crate::domain::tenant::TenantId;
+    use crate::domain::workflow::{
+        StateKind, StateName, TransitionCondition, TransitionRule, Workflow, WorkflowExecution,
+        WorkflowMetadata, WorkflowSpec, WorkflowState,
+    };
     use crate::infrastructure::event_bus::DomainEvent;
     use crate::infrastructure::repositories::InMemoryWorkflowExecutionRepository;
     use async_trait::async_trait;
+    use serde_json::json;
+    use std::collections::HashMap;
 
     #[test]
     fn test_map_workflow_execution_started() {
@@ -625,6 +717,13 @@ mod tests {
             &self,
             _id: ExecutionId,
         ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn find_tenant_id_by_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Option<TenantId>, RepositoryError> {
             Ok(None)
         }
 
@@ -802,5 +901,115 @@ mod tests {
             .to_string()
             .contains("Failed to persist execution event"));
         assert!(receiver.try_recv().is_err());
+    }
+
+    fn build_test_workflow(name: &str) -> Workflow {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo start".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![TransitionRule {
+                    condition: TransitionCondition::Always,
+                    target: StateName::new("END").unwrap(),
+                    feedback: None,
+                }],
+                timeout: None,
+            },
+        );
+        states.insert(
+            StateName::new("END").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo end".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+
+        Workflow::new(
+            WorkflowMetadata {
+                name: name.to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                volumes: vec![],
+            },
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_handle_terminal_event_updates_persisted_status_for_non_local_tenant() {
+        let tenant_id = TenantId::from_string("tenant-blue").unwrap();
+        let workflow = build_test_workflow("listener-complete");
+        let execution_id = ExecutionId::new();
+        let execution = WorkflowExecution::new(&workflow, execution_id, json!({"task": "ship"}));
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        repo.save_for_tenant(&tenant_id, &execution).await.unwrap();
+
+        let event_bus = Arc::new(EventBus::new(16));
+        let listener = TemporalEventListener::new(event_bus.clone(), repo.clone());
+        let mut receiver = event_bus.subscribe();
+
+        let payload = TemporalEventPayload {
+            event_type: "WorkflowExecutionCompleted".to_string(),
+            execution_id: execution_id.to_string(),
+            temporal_sequence_number: 100,
+            workflow_id: Some(workflow.id.to_string()),
+            state_name: None,
+            output: None,
+            error: None,
+            iteration_number: None,
+            final_blackboard: Some(json!({"result": "done"})),
+            artifacts: Some(vec!["report.md".to_string()]),
+            agent_id: None,
+            code_diff: None,
+            timestamp: "2026-02-19T12:00:00Z".to_string(),
+        };
+
+        listener.handle_event(payload).await.unwrap();
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.status,
+            crate::domain::execution::ExecutionStatus::Completed
+        );
+        assert_eq!(saved.blackboard.get("result"), Some(&json!("done")));
+        assert!(
+            repo.find_by_id(execution_id).await.unwrap().is_none(),
+            "default tenant lookup should not be used for non-local executions"
+        );
+
+        match receiver.recv().await.unwrap() {
+            DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionCompleted {
+                execution_id: published_id,
+                final_blackboard,
+                artifacts,
+                ..
+            }) => {
+                assert_eq!(published_id, execution_id);
+                assert_eq!(final_blackboard.get("result"), Some(&json!("done")));
+                assert_eq!(artifacts, Some(json!(["report.md"])));
+            }
+            other => panic!("expected workflow completion event, got {other:?}"),
+        }
     }
 }

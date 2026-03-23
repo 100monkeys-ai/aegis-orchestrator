@@ -7,6 +7,7 @@
 //! database-level failure instead of a silent mismatch.
 
 use aegis_orchestrator_core::domain::execution::ExecutionId;
+use aegis_orchestrator_core::domain::execution::ExecutionStatus;
 use aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{
@@ -210,4 +211,117 @@ async fn workflow_execution_repository_persists_expected_temporal_columns() {
     assert_eq!(blackboard, serde_json::json!({}));
     assert_eq!(state_outputs, serde_json::json!({}));
     assert_eq!(state_history, serde_json::json!(["START"]));
+}
+
+#[tokio::test]
+async fn workflow_execution_repository_resolves_tenant_and_persists_terminal_status() {
+    let Some(pool) = connect_test_pool().await else {
+        eprintln!(
+            "Skipping workflow execution repository contract test: DATABASE_URL/AEGIS_DATABASE_URL not set or unreachable"
+        );
+        return;
+    };
+
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE workflows (
+            id UUID PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to create temp workflows table");
+
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE workflow_executions (
+            id UUID PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            workflow_id UUID NOT NULL,
+            temporal_workflow_id TEXT NOT NULL,
+            temporal_run_id TEXT NOT NULL,
+            input_params JSONB NOT NULL,
+            status TEXT NOT NULL,
+            current_state TEXT NOT NULL,
+            blackboard JSONB NOT NULL,
+            state_outputs JSONB NOT NULL,
+            state_history JSONB NOT NULL,
+            started_at TIMESTAMPTZ NOT NULL,
+            last_transition_at TIMESTAMPTZ NOT NULL,
+            completed_at TIMESTAMPTZ
+        )
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to create temp workflow_executions table");
+
+    let tenant_id = TenantId::from_string("tenant-green").unwrap();
+    let workflow = build_workflow("terminal-persistence");
+    let mut execution = WorkflowExecution::new(
+        &workflow,
+        ExecutionId::new(),
+        serde_json::json!({ "topic": "copy" }),
+    );
+
+    sqlx::query(
+        r#"
+        INSERT INTO workflows (id, tenant_id, name)
+        VALUES ($1, $2, $3)
+        "#,
+    )
+    .bind(workflow.id.0)
+    .bind(tenant_id.as_str())
+    .bind(&workflow.metadata.name)
+    .execute(&pool)
+    .await
+    .expect("Failed to seed temp workflows table");
+
+    let repo = PostgresWorkflowExecutionRepository::new(pool.clone());
+    repo.save_for_tenant(&tenant_id, &execution)
+        .await
+        .expect("Initial workflow execution save should succeed");
+
+    let resolved_tenant = repo
+        .find_tenant_id_by_execution(execution.id)
+        .await
+        .expect("Tenant lookup should succeed")
+        .expect("Tenant should be found for persisted execution");
+    assert_eq!(resolved_tenant, tenant_id);
+
+    execution.status = ExecutionStatus::Completed;
+    execution
+        .blackboard
+        .set("result", serde_json::json!("done"));
+
+    repo.save_for_tenant(&tenant_id, &execution)
+        .await
+        .expect("Terminal workflow execution save should succeed");
+
+    let row = sqlx::query(
+        r#"
+        SELECT status, blackboard, completed_at
+        FROM workflow_executions
+        WHERE id = $1
+        "#,
+    )
+    .bind(execution.id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("Persisted workflow execution row not found");
+
+    let status: String = row.get("status");
+    let blackboard: serde_json::Value = row.get("blackboard");
+    let completed_at: Option<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>> =
+        row.get("completed_at");
+
+    assert_eq!(status, "completed");
+    assert_eq!(blackboard.get("result"), Some(&serde_json::json!("done")));
+    assert!(
+        completed_at.is_some(),
+        "completed_at should be set for terminal rows"
+    );
 }

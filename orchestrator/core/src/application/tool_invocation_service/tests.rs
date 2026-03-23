@@ -1,0 +1,1743 @@
+use super::workflows::{collect_thresholded_transition_semantic_violations, sanitize_segment};
+use super::*;
+use crate::application::nfs_gateway::NfsVolumeRegistry;
+use crate::domain::events::StorageEvent;
+use crate::domain::execution::ExecutionId;
+use crate::domain::fsal::{AegisFSAL, EventPublisher};
+use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
+use crate::domain::security_context::SecurityContext;
+use crate::domain::smcp_session::SmcpSession;
+use crate::infrastructure::repositories::InMemoryVolumeRepository;
+use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
+use crate::infrastructure::storage::LocalHostStorageProvider;
+use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
+use async_trait::async_trait;
+
+struct NoOpEventPublisher;
+
+#[async_trait]
+impl EventPublisher for NoOpEventPublisher {
+    async fn publish_storage_event(&self, _event: StorageEvent) {}
+}
+
+/// Create test FSAL dependencies and empty NFS volume registry.
+fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
+    let storage_root = std::env::temp_dir().join("aegis-tool-invocation-tests");
+    let storage = Arc::new(
+        LocalHostStorageProvider::new(&storage_root)
+            .expect("failed to initialize LocalHostStorageProvider for tests"),
+    );
+    let vol_repo = Arc::new(InMemoryVolumeRepository::new());
+    let publisher = Arc::new(NoOpEventPublisher);
+    let fsal = Arc::new(AegisFSAL::new(
+        storage,
+        vol_repo,
+        Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+        publisher,
+    ));
+    let registry = NfsVolumeRegistry::new();
+    (fsal, registry)
+}
+
+fn make_fake_token(agent_id: AgentId) -> String {
+    use base64::Engine;
+    let claims = serde_json::json!({"agent_id": agent_id.0.to_string()});
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(serde_json::to_vec(&claims).unwrap_or_default());
+    format!("eyJhbGciOiJSUzI1NiJ9.{}.sig", payload)
+}
+
+struct DummyEnvelope {
+    valid: bool,
+    token: String,
+}
+
+impl DummyEnvelope {
+    fn for_agent(valid: bool, agent_id: AgentId) -> Self {
+        Self {
+            valid,
+            token: make_fake_token(agent_id),
+        }
+    }
+}
+
+impl EnvelopeVerifier for DummyEnvelope {
+    fn security_token(&self) -> &str {
+        &self.token
+    }
+
+    fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+        if self.valid {
+            Ok(())
+        } else {
+            Err(SmcpSessionError::SignatureVerificationFailed(
+                "invalid sig".to_string(),
+            ))
+        }
+    }
+    fn extract_tool_name(&self) -> Option<String> {
+        Some("test_tool".to_string())
+    }
+    fn extract_arguments(&self) -> Option<Value> {
+        Some(serde_json::json!({}))
+    }
+}
+
+use crate::domain::agent::{Agent, AgentManifest, AgentStatus};
+use crate::domain::events::ExecutionEvent;
+use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus, Iteration};
+use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
+use crate::domain::workflow::WorkflowExecutionEventRecord;
+use crate::infrastructure::event_bus::DomainEvent;
+use crate::infrastructure::repositories::{
+    InMemoryWorkflowExecutionRepository, InMemoryWorkflowRepository,
+};
+use futures::Stream;
+use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::RwLock;
+use tokio::sync::Mutex;
+
+fn test_agent_with_tools(tools: &[&str]) -> Agent {
+    let manifest_yaml = format!(
+        r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    isolation: inherit
+    model: smart
+  tools:
+{}
+"#,
+        tools
+            .iter()
+            .map(|tool| format!("    - {tool}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+    let manifest: AgentManifest = serde_yaml::from_str(&manifest_yaml).unwrap();
+    Agent {
+        id: AgentId::new(),
+        name: manifest.metadata.name.clone(),
+        manifest,
+        status: AgentStatus::Active,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    }
+}
+
+struct TestAgentLifecycleService;
+#[async_trait]
+impl AgentLifecycleService for TestAgentLifecycleService {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> Result<AgentId> {
+        self.deploy_agent(manifest, force).await
+    }
+
+    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
+        anyhow::bail!("TestAgentLifecycleService::deploy_agent not exercised in this test")
+    }
+
+    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+        self.get_agent(id).await
+    }
+
+    async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+        anyhow::bail!("TestAgentLifecycleService::get_agent not exercised in this test")
+    }
+
+    async fn update_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> Result<()> {
+        self.update_agent(id, manifest).await
+    }
+
+    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+        anyhow::bail!("TestAgentLifecycleService::update_agent not exercised in this test")
+    }
+
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
+        self.delete_agent(id).await
+    }
+
+    async fn delete_agent(&self, _: AgentId) -> Result<()> {
+        anyhow::bail!("TestAgentLifecycleService::delete_agent not exercised in this test")
+    }
+
+    async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+        self.list_agents().await
+    }
+
+    async fn list_agents(&self) -> Result<Vec<Agent>> {
+        anyhow::bail!("TestAgentLifecycleService::list_agents not exercised in this test")
+    }
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent(name).await
+    }
+
+    async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
+        anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
+    }
+}
+
+struct FilteringAgentLifecycleService {
+    agent: Agent,
+}
+
+#[async_trait]
+impl AgentLifecycleService for FilteringAgentLifecycleService {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> Result<AgentId> {
+        self.deploy_agent(manifest, force).await
+    }
+
+    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
+        anyhow::bail!("FilteringAgentLifecycleService::deploy_agent not exercised in this test")
+    }
+
+    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+        self.get_agent(id).await
+    }
+
+    async fn get_agent(&self, id: AgentId) -> Result<Agent> {
+        if id == self.agent.id {
+            Ok(self.agent.clone())
+        } else {
+            anyhow::bail!("agent not found")
+        }
+    }
+
+    async fn update_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> Result<()> {
+        self.update_agent(id, manifest).await
+    }
+
+    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+        anyhow::bail!("FilteringAgentLifecycleService::update_agent not exercised in this test")
+    }
+
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
+        self.delete_agent(id).await
+    }
+
+    async fn delete_agent(&self, _: AgentId) -> Result<()> {
+        anyhow::bail!("FilteringAgentLifecycleService::delete_agent not exercised in this test")
+    }
+
+    async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+        self.list_agents().await
+    }
+
+    async fn list_agents(&self) -> Result<Vec<Agent>> {
+        Ok(vec![self.agent.clone()])
+    }
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent(name).await
+    }
+
+    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+        Ok((name == self.agent.name).then_some(self.agent.id))
+    }
+}
+
+struct TestExecutionService;
+#[async_trait]
+impl ExecutionService for TestExecutionService {
+    async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+        anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
+    }
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("TestExecutionService::start_child_execution not exercised in this test")
+    }
+    async fn get_execution(&self, _: ExecutionId) -> Result<Execution> {
+        anyhow::bail!("TestExecutionService::get_execution not exercised in this test")
+    }
+    async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+        anyhow::bail!("TestExecutionService::get_iterations not exercised in this test")
+    }
+    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("TestExecutionService::cancel_execution not exercised in this test")
+    }
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("TestExecutionService::stream_execution not exercised in this test")
+    }
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("TestExecutionService::stream_agent_events not exercised in this test")
+    }
+    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+        anyhow::bail!("TestExecutionService::list_executions not exercised in this test")
+    }
+    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("TestExecutionService::delete_execution not exercised in this test")
+    }
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("TestExecutionService::record_llm_interaction not exercised in this test")
+    }
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!("TestExecutionService::store_iteration_trajectory not exercised in this test")
+    }
+}
+
+struct LogsTestExecutionService {
+    execution: Execution,
+}
+
+#[async_trait]
+impl ExecutionService for LogsTestExecutionService {
+    async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+        anyhow::bail!("LogsTestExecutionService::start_execution not exercised in this test")
+    }
+
+    async fn start_child_execution(
+        &self,
+        _: AgentId,
+        _: ExecutionInput,
+        _: ExecutionId,
+    ) -> Result<ExecutionId> {
+        anyhow::bail!("LogsTestExecutionService::start_child_execution not exercised in this test")
+    }
+
+    async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+        if self.execution.id == id {
+            Ok(self.execution.clone())
+        } else {
+            anyhow::bail!("execution not found")
+        }
+    }
+
+    async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+        anyhow::bail!("LogsTestExecutionService::get_iterations not exercised in this test")
+    }
+
+    async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("LogsTestExecutionService::cancel_execution not exercised in this test")
+    }
+
+    async fn stream_execution(
+        &self,
+        _: ExecutionId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+        anyhow::bail!("LogsTestExecutionService::stream_execution not exercised in this test")
+    }
+
+    async fn stream_agent_events(
+        &self,
+        _: AgentId,
+    ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+        anyhow::bail!("LogsTestExecutionService::stream_agent_events not exercised in this test")
+    }
+
+    async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+        anyhow::bail!("LogsTestExecutionService::list_executions not exercised in this test")
+    }
+
+    async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+        anyhow::bail!("LogsTestExecutionService::delete_execution not exercised in this test")
+    }
+
+    async fn record_llm_interaction(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: crate::domain::execution::LlmInteraction,
+    ) -> Result<()> {
+        anyhow::bail!("LogsTestExecutionService::record_llm_interaction not exercised in this test")
+    }
+
+    async fn store_iteration_trajectory(
+        &self,
+        _: ExecutionId,
+        _: u8,
+        _: Vec<crate::domain::execution::TrajectoryStep>,
+    ) -> Result<()> {
+        anyhow::bail!(
+            "LogsTestExecutionService::store_iteration_trajectory not exercised in this test"
+        )
+    }
+}
+
+#[derive(Default)]
+struct StubWorkflowExecutionRepository {
+    events: RwLock<HashMap<ExecutionId, Vec<WorkflowExecutionEventRecord>>>,
+}
+
+impl StubWorkflowExecutionRepository {
+    fn with_events(execution_id: ExecutionId, events: Vec<WorkflowExecutionEventRecord>) -> Self {
+        let mut by_execution = HashMap::new();
+        by_execution.insert(execution_id, events);
+        Self {
+            events: RwLock::new(by_execution),
+        }
+    }
+}
+
+#[async_trait]
+impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
+    async fn save_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution: &crate::domain::workflow::WorkflowExecution,
+    ) -> Result<(), crate::domain::repository::RepositoryError> {
+        Ok(())
+    }
+
+    async fn find_by_id_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: ExecutionId,
+    ) -> Result<
+        Option<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(None)
+    }
+
+    async fn find_active_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+    ) -> Result<
+        Vec<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn find_by_workflow_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: crate::domain::workflow::WorkflowId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn list_paginated_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<
+        Vec<crate::domain::workflow::WorkflowExecution>,
+        crate::domain::repository::RepositoryError,
+    > {
+        Ok(vec![])
+    }
+
+    async fn update_temporal_linkage_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _execution_id: ExecutionId,
+        _temporal_workflow_id: &str,
+        _temporal_run_id: &str,
+    ) -> Result<(), crate::domain::repository::RepositoryError> {
+        Ok(())
+    }
+
+    async fn append_event(
+        &self,
+        execution_id: ExecutionId,
+        temporal_sequence_number: i64,
+        event_type: String,
+        payload: serde_json::Value,
+        iteration_number: Option<u8>,
+    ) -> Result<(), crate::domain::repository::RepositoryError> {
+        let mut events = self.events.write().unwrap();
+        events
+            .entry(execution_id)
+            .or_default()
+            .push(WorkflowExecutionEventRecord {
+                sequence: temporal_sequence_number,
+                event_type,
+                state_name: None,
+                iteration_number,
+                payload,
+                recorded_at: chrono::Utc::now(),
+            });
+        Ok(())
+    }
+
+    async fn find_events_by_execution(
+        &self,
+        id: ExecutionId,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<WorkflowExecutionEventRecord>, crate::domain::repository::RepositoryError> {
+        let events = self
+            .events
+            .read()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default();
+        Ok(events.into_iter().skip(offset).take(limit).collect())
+    }
+}
+
+#[derive(Default)]
+struct TestStartWorkflowExecutionUseCase {
+    last_request:
+        Mutex<Option<crate::application::start_workflow_execution::StartWorkflowExecutionRequest>>,
+}
+
+#[async_trait]
+impl StartWorkflowExecutionUseCase for TestStartWorkflowExecutionUseCase {
+    async fn start_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        mut request: crate::application::start_workflow_execution::StartWorkflowExecutionRequest,
+    ) -> Result<crate::application::start_workflow_execution::StartedWorkflowExecution> {
+        request.tenant_id = Some(tenant_id.clone());
+        *self.last_request.lock().await = Some(request.clone());
+
+        Ok(
+            crate::application::start_workflow_execution::StartedWorkflowExecution {
+                execution_id: ExecutionId::new().to_string(),
+                workflow_id: request.workflow_id,
+                temporal_run_id: "temporal-run-id".to_string(),
+                status: "started".to_string(),
+                started_at: chrono::Utc::now(),
+            },
+        )
+    }
+}
+
+fn test_workflow_manifest_yaml(name: &str) -> String {
+    format!(
+        r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: Agent
+      agent: builder
+      input: "{{{{workflow.task}}}}"
+      transitions:
+        - condition: always
+          target: END
+    END:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#
+    )
+}
+
+fn build_test_workflow(name: &str) -> crate::domain::workflow::Workflow {
+    WorkflowParser::parse_yaml(&test_workflow_manifest_yaml(name))
+        .expect("test workflow manifest should parse")
+}
+
+fn thresholded_validator_manifest_yaml(name: &str, validation_transitions: &str) -> String {
+    format!(
+        r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  initial_state: VALIDATE
+  states:
+    VALIDATE:
+      kind: Agent
+      agent: validator
+      input: "{{{{workflow.task}}}}"
+      transitions:
+{validation_transitions}
+    SUCCESS:
+      kind: System
+      command: echo "success"
+      transitions: []
+    PARTIAL_PASS:
+      kind: System
+      command: echo "partial"
+      transitions: []
+    VALIDATION_FAILED:
+      kind: System
+      command: echo "failed"
+      transitions: []
+    VALIDATION_ERROR:
+      kind: System
+      command: echo "error"
+      transitions: []
+"#
+    )
+}
+
+#[tokio::test]
+async fn test_invoke_tool_no_session() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+    let agent_id = AgentId::new();
+    let envelope = DummyEnvelope::for_agent(true, agent_id);
+
+    let result = service.invoke_tool(&envelope).await;
+    assert!(matches!(result, Err(SmcpSessionError::SessionInactive(_))));
+}
+
+#[tokio::test]
+async fn test_invoke_tool_bad_signature() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let agent_id = AgentId::new();
+    let exec_id = ExecutionId::new();
+
+    let context = SecurityContext {
+        name: "test".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
+    let session_token = make_fake_token(agent_id);
+    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
+    let _ = repo.save(session).await;
+
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+    let envelope = DummyEnvelope::for_agent(false, agent_id);
+
+    let result = service.invoke_tool(&envelope).await;
+    assert!(matches!(
+        result,
+        Err(SmcpSessionError::SignatureVerificationFailed(_))
+    ));
+}
+
+#[tokio::test]
+async fn workflow_validate_tool_returns_success_for_valid_manifest() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let result = service
+        .invoke_aegis_workflow_validate_tool(&serde_json::json!({
+            "manifest_yaml": test_workflow_manifest_yaml("validate-me"),
+        }))
+        .await
+        .expect("workflow validate should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.workflow.validate");
+    assert_eq!(payload["valid"], true);
+    assert_eq!(payload["workflow"]["name"], "validate-me");
+}
+
+#[test]
+fn thresholded_transition_semantic_guard_allows_explicit_score_below() {
+    let workflow = WorkflowParser::parse_yaml(&thresholded_validator_manifest_yaml(
+        "explicit-score-below",
+        r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: score_below
+          threshold: 0.6
+          target: VALIDATION_FAILED
+        - condition: on_failure
+          target: VALIDATION_ERROR"#,
+    ))
+    .expect("workflow should parse");
+
+    let violations = collect_thresholded_transition_semantic_violations(&workflow);
+
+    assert!(
+        violations.is_empty(),
+        "expected explicit low-score routing to pass, got {violations:?}"
+    );
+}
+
+#[test]
+fn thresholded_transition_semantic_guard_rejects_missing_score_below() {
+    let workflow = WorkflowParser::parse_yaml(&thresholded_validator_manifest_yaml(
+        "missing-score-below",
+        r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: on_failure
+          target: VALIDATION_ERROR"#,
+    ))
+    .expect("workflow should parse");
+
+    let violations = collect_thresholded_transition_semantic_violations(&workflow);
+
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("has no explicit `score_below` branch"));
+}
+
+#[tokio::test]
+async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_success_fallback() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let result = service
+        .invoke_aegis_workflow_create_tool(
+            &serde_json::json!({
+                "manifest_yaml": thresholded_validator_manifest_yaml(
+                    "ambiguous-threshold-routing",
+                    r#"        - condition: score_and_confidence_above
+          threshold: 0.8
+          target: SUCCESS
+        - condition: score_above
+          threshold: 0.6
+          target: PARTIAL_PASS
+        - condition: on_success
+          target: VALIDATION_FAILED
+        - condition: on_failure
+          target: VALIDATION_ERROR"#
+                ),
+            }),
+            ExecutionId::new(),
+            AgentId::new(),
+            1,
+            &[],
+        )
+        .await
+        .expect("workflow create should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.workflow.create");
+    assert_eq!(payload["deterministic_validation"]["passed"], true);
+    assert_eq!(payload["semantic_validation"]["passed"], false);
+    assert_eq!(payload["deployed"], false);
+    let violations = payload["semantic_validation"]["violations"]
+        .as_array()
+        .expect("violations should be an array");
+    assert_eq!(violations.len(), 2);
+    assert!(violations.iter().any(|violation| violation
+        .as_str()
+        .is_some_and(|text| text.contains("mixes `on_success` with score-based transitions"))));
+    assert!(violations.iter().any(|violation| violation
+        .as_str()
+        .is_some_and(|text| text.contains("has no explicit `score_below` branch"))));
+}
+
+#[test]
+fn build_tool_audit_history_includes_schema_validate_and_get_evidence() {
+    let execution_id = ExecutionId::new();
+    let tool_audit_history = vec![
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.get".to_string(),
+                arguments_json: r#"{"key":"workflow/manifest/v1"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(
+                    r#"{"title":"Workflow Manifest","type":"object","properties":{"states":{"type":"array"}}}"#
+                        .to_string(),
+                ),
+                error: None,
+            },
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.validate".to_string(),
+                arguments_json:
+                    r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1\nkind: Workflow"}"#
+                        .to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                error: None,
+            },
+        ];
+
+    let audit_history =
+        ToolInvocationService::build_tool_audit_history(execution_id, 1, &tool_audit_history);
+
+    assert_eq!(audit_history["execution_id"], execution_id.to_string());
+    assert_eq!(audit_history["available"], true);
+    assert_eq!(audit_history["iteration_number"], 1);
+    assert_eq!(audit_history["tool_calls"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        audit_history["tool_calls"][0]["tool_name"],
+        "aegis.schema.get"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][0]["arguments_summary"]["key"],
+        "workflow/manifest/v1"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][0]["result_summary"]["schema_key"],
+        "workflow/manifest/v1"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][0]["result_summary"]["result_kind"],
+        "schema"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][1]["tool_name"],
+        "aegis.schema.validate"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][1]["arguments_summary"]["kind"],
+        "workflow"
+    );
+    assert_eq!(
+        audit_history["tool_calls"][1]["arguments_summary"]["manifest_present"],
+        true
+    );
+    assert_eq!(
+        audit_history["tool_calls"][1]["result_summary"]["valid"],
+        true
+    );
+    assert_eq!(
+        audit_history["latest_schema_get"]["tool_name"],
+        "aegis.schema.get"
+    );
+    assert_eq!(
+        audit_history["latest_schema_validate"]["tool_name"],
+        "aegis.schema.validate"
+    );
+    assert!(audit_history.get("schema_get_evidence").is_none());
+    assert!(audit_history.get("schema_validate_evidence").is_none());
+}
+
+#[test]
+fn build_semantic_judge_payload_includes_tool_audit_history() {
+    let execution_id = ExecutionId::new();
+    let tool_audit_history = vec![
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.get".to_string(),
+                arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(
+                    r#"{"title":"Agent Manifest","type":"object","properties":{"metadata":{"type":"object"}}}"#
+                        .to_string(),
+                ),
+                error: None,
+            },
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.validate".to_string(),
+                arguments_json:
+                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1\nkind: Agent"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                error: None,
+            },
+        ];
+
+    let payload = ToolInvocationService::build_semantic_judge_payload(
+        execution_id,
+        "Create an agent".to_string(),
+        "aegis.agent.create",
+        &serde_json::json!({
+            "manifest_yaml": "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: copy-refiner\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      refine copy\n"
+        }),
+        vec![
+            "aegis.schema.get".to_string(),
+            "aegis.schema.validate".to_string(),
+        ],
+        vec!["/workspace".to_string()],
+        "use the workflow-required sequence",
+        "semantic_judge_pre_execution_inner_loop",
+        1,
+        &tool_audit_history,
+    );
+
+    assert_eq!(
+        payload["validation_context"],
+        "semantic_judge_pre_execution_inner_loop"
+    );
+    assert_eq!(payload["proposed_tool_call"]["name"], "aegis.agent.create");
+    assert!(payload.get("output").is_none());
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"][0]["arguments_summary"]["key"],
+        "agent/manifest/v1"
+    );
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["schema_key"],
+        "agent/manifest/v1"
+    );
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["result_kind"],
+        "schema"
+    );
+    assert_eq!(
+        payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
+        "aegis.schema.validate"
+    );
+    assert!(payload["tool_audit_history"]
+        .get("schema_get_evidence")
+        .is_none());
+}
+
+#[test]
+fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
+    let execution_id = ExecutionId::new();
+    let huge_schema_body = "x".repeat(50_000);
+    let huge_manifest = format!(
+            "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
+            "y".repeat(50_000)
+        );
+    let tool_audit_history = vec![
+        crate::domain::execution::TrajectoryStep {
+            tool_name: "aegis.schema.get".to_string(),
+            arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
+            status: "completed".to_string(),
+            result_json: Some(format!(
+                r#"{{"title":"Huge Schema","type":"object","description":"{}"}}"#,
+                huge_schema_body
+            )),
+            error: None,
+        },
+        crate::domain::execution::TrajectoryStep {
+            tool_name: "aegis.schema.validate".to_string(),
+            arguments_json: serde_json::json!({
+                "kind": "agent",
+                "manifest_yaml": huge_manifest.clone(),
+            })
+            .to_string(),
+            status: "completed".to_string(),
+            result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+            error: None,
+        },
+    ];
+
+    let payload = ToolInvocationService::build_semantic_judge_payload(
+        execution_id,
+        "Create an agent".to_string(),
+        "aegis.agent.create",
+        &serde_json::json!({
+            "manifest_yaml": huge_manifest,
+        }),
+        vec![
+            "aegis.schema.get".to_string(),
+            "aegis.schema.validate".to_string(),
+        ],
+        vec!["/workspace".to_string()],
+        "use the workflow-required sequence",
+        "semantic_judge_pre_execution_inner_loop",
+        1,
+        &tool_audit_history,
+    );
+
+    let serialized = serde_json::to_string(&payload).expect("payload should serialize");
+    assert!(
+        serialized.len() < 15_000,
+        "payload too large: {}",
+        serialized.len()
+    );
+    assert!(!serialized.contains(&"x".repeat(1024)));
+    assert!(!serialized.contains(&"y".repeat(1024)));
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["schema_key"],
+        "agent/manifest/v1"
+    );
+    assert_eq!(
+        payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["result_kind"],
+        "schema"
+    );
+}
+
+#[tokio::test]
+async fn workflow_run_tool_forwards_blackboard() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution(start_use_case.clone());
+
+    let result = service
+        .invoke_aegis_workflow_run_tool(&serde_json::json!({
+            "name": "run-me",
+            "input": { "job": "demo" },
+            "blackboard": { "priority": "high" },
+        }))
+        .await
+        .expect("workflow run should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.workflow.run");
+    assert_eq!(payload["status"], "started");
+
+    let request = start_use_case
+        .last_request
+        .lock()
+        .await
+        .clone()
+        .expect("workflow run should record the request");
+    assert_eq!(
+        request.blackboard,
+        Some(serde_json::json!({ "priority": "high" }))
+    );
+}
+
+#[tokio::test]
+async fn workflow_execution_tools_list_and_get() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+    let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+    let tenant_id = TenantId::local_default();
+    let workflow = build_test_workflow("execution-list");
+
+    workflow_repo
+        .save_for_tenant(&tenant_id, &workflow)
+        .await
+        .expect("workflow should save");
+
+    let mut execution = crate::domain::workflow::WorkflowExecution::new(
+        &workflow,
+        ExecutionId::new(),
+        serde_json::json!({ "task": "demo" }),
+    );
+    execution
+        .blackboard
+        .set("priority".to_string(), serde_json::json!("high"));
+    workflow_execution_repo
+        .save_for_tenant(&tenant_id, &execution)
+        .await
+        .expect("workflow execution should save");
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_repository(workflow_repo)
+    .with_workflow_execution_repo(workflow_execution_repo);
+
+    let list_result = service
+        .invoke_aegis_workflow_execution_list_tool(&serde_json::json!({
+            "workflow_id": workflow.id.to_string(),
+        }))
+        .await
+        .expect("workflow execution list should return a result");
+    let ToolInvocationResult::Direct(list_payload) = list_result else {
+        panic!("expected direct list payload");
+    };
+    assert_eq!(list_payload["tool"], "aegis.workflow.executions.list");
+    assert_eq!(list_payload["count"], 1);
+    assert_eq!(
+        list_payload["executions"][0]["execution_id"],
+        execution.id.to_string()
+    );
+
+    let get_result = service
+        .invoke_aegis_workflow_execution_get_tool(&serde_json::json!({
+            "execution_id": execution.id.to_string(),
+        }))
+        .await
+        .expect("workflow execution get should return a result");
+    let ToolInvocationResult::Direct(get_payload) = get_result else {
+        panic!("expected direct get payload");
+    };
+    assert_eq!(get_payload["tool"], "aegis.workflow.executions.get");
+    assert_eq!(
+        get_payload["execution"]["execution_id"],
+        execution.id.to_string()
+    );
+    assert_eq!(get_payload["execution"]["blackboard"]["priority"], "high");
+}
+
+#[tokio::test]
+async fn task_logs_tool_returns_paginated_execution_events() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let agent_id = AgentId::new();
+    let mut execution = Execution::new(
+        agent_id,
+        ExecutionInput {
+            intent: None,
+            payload: serde_json::json!({"task":"demo"}),
+        },
+        3,
+    );
+    execution.status = ExecutionStatus::Running;
+
+    let workflow_execution_repo = Arc::new(StubWorkflowExecutionRepository::with_events(
+        execution.id,
+        vec![
+            WorkflowExecutionEventRecord {
+                sequence: 1,
+                event_type: "ExecutionStarted".to_string(),
+                state_name: None,
+                iteration_number: None,
+                payload: serde_json::json!({"message":"started"}),
+                recorded_at: chrono::Utc::now(),
+            },
+            WorkflowExecutionEventRecord {
+                sequence: 2,
+                event_type: "ConsoleOutput".to_string(),
+                state_name: None,
+                iteration_number: Some(1),
+                payload: serde_json::json!({"stream":"stdout","content":"hello"}),
+                recorded_at: chrono::Utc::now(),
+            },
+            WorkflowExecutionEventRecord {
+                sequence: 3,
+                event_type: "IterationCompleted".to_string(),
+                state_name: None,
+                iteration_number: Some(1),
+                payload: serde_json::json!({"result":"ok"}),
+                recorded_at: chrono::Utc::now(),
+            },
+        ],
+    ));
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(LogsTestExecutionService {
+            execution: execution.clone(),
+        }),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution_repo(workflow_execution_repo);
+
+    let result = service
+        .invoke_aegis_task_logs_tool(&serde_json::json!({
+            "execution_id": execution.id.to_string(),
+            "limit": 500,
+            "offset": 1,
+        }))
+        .await
+        .expect("task logs should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct task logs payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.task.logs");
+    assert_eq!(payload["execution_id"], execution.id.to_string());
+    assert_eq!(payload["agent_id"], agent_id.0.to_string());
+    assert_eq!(payload["status"], "running");
+    assert_eq!(payload["limit"], 200);
+    assert_eq!(payload["offset"], 1);
+    assert_eq!(payload["total"], 2);
+    assert_eq!(payload["events"].as_array().unwrap().len(), 2);
+    assert_eq!(payload["events"][0]["sequence"], 2);
+}
+
+#[tokio::test]
+async fn task_logs_tool_returns_execution_fetch_error() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let missing_execution = Execution::new(
+        AgentId::new(),
+        ExecutionInput {
+            intent: None,
+            payload: serde_json::json!({}),
+        },
+        1,
+    );
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(LogsTestExecutionService {
+            execution: missing_execution,
+        }),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution_repo(Arc::new(StubWorkflowExecutionRepository::default()));
+
+    let result = service
+        .invoke_aegis_task_logs_tool(&serde_json::json!({
+            "execution_id": ExecutionId::new().to_string(),
+        }))
+        .await
+        .expect("task logs should return direct error payload");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct task logs error payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.task.logs");
+    assert!(payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to fetch execution"));
+}
+
+#[tokio::test]
+async fn test_invoke_tool_execution_modes() {
+    use crate::domain::mcp::{
+        ExecutionMode, ResourceLimits, ToolServer, ToolServerId, ToolServerStatus,
+    };
+    use std::path::PathBuf;
+
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let agent_id = AgentId::new();
+    let exec_id = ExecutionId::new();
+
+    use crate::domain::security_context::Capability;
+    let context = SecurityContext {
+        name: "test".to_string(),
+        description: "".to_string(),
+        capabilities: vec![
+            Capability {
+                tool_pattern: "test_tool".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            },
+            Capability {
+                tool_pattern: "test_tool_remote".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            },
+        ],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
+    let session_token = make_fake_token(agent_id);
+    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
+    let _ = repo.save(session).await;
+
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers.clone(), vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router.clone(),
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    // 1. Local Tool
+    let local_server = ToolServer {
+        id: ToolServerId::new(),
+        name: "local-fs-tool".to_string(),
+        execution_mode: ExecutionMode::Local,
+        executable_path: PathBuf::from("/bin/true"),
+        args: vec![],
+        capabilities: vec!["test_tool".to_string()],
+        skip_judge_tools: std::collections::HashSet::new(),
+        status: ToolServerStatus::Running,
+        process_id: None,
+        health_check_interval: std::time::Duration::from_secs(30),
+        last_health_check: None,
+        credentials: std::collections::HashMap::new(),
+        resource_limits: ResourceLimits {
+            max_memory_mb: None,
+            max_cpu_shares: None,
+        },
+        started_at: None,
+        stopped_at: None,
+    };
+
+    router.add_server(local_server).await.unwrap();
+
+    let envelope = DummyEnvelope::for_agent(true, agent_id); // extracts "test_tool"
+    let result = service.invoke_tool(&envelope).await.unwrap();
+
+    let exec_mode = result
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(exec_mode, "local_fsal");
+
+    // 2. Remote Tool
+    let remote_server = ToolServer {
+        id: ToolServerId::new(),
+        name: "remote-web-tool".to_string(),
+        execution_mode: ExecutionMode::Remote,
+        executable_path: PathBuf::from("/bin/true"),
+        args: vec![],
+        capabilities: vec!["test_tool_remote".to_string()],
+        skip_judge_tools: std::collections::HashSet::new(),
+        status: ToolServerStatus::Running,
+        process_id: None,
+        health_check_interval: std::time::Duration::from_secs(30),
+        last_health_check: None,
+        credentials: std::collections::HashMap::new(),
+        resource_limits: ResourceLimits {
+            max_memory_mb: None,
+            max_cpu_shares: None,
+        },
+        started_at: None,
+        stopped_at: None,
+    };
+    router.add_server(remote_server).await.unwrap();
+
+    struct DummyRemoteEnvelope {
+        valid: bool,
+        token: String,
+    }
+    impl EnvelopeVerifier for DummyRemoteEnvelope {
+        fn security_token(&self) -> &str {
+            &self.token
+        }
+
+        fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
+            if self.valid {
+                Ok(())
+            } else {
+                Err(SmcpSessionError::SignatureVerificationFailed("".into()))
+            }
+        }
+        fn extract_tool_name(&self) -> Option<String> {
+            Some("test_tool_remote".to_string())
+        }
+        fn extract_arguments(&self) -> Option<Value> {
+            Some(serde_json::json!({}))
+        }
+    }
+
+    let remote_envelope = DummyRemoteEnvelope {
+        valid: true,
+        token: make_fake_token(agent_id),
+    };
+    let result = service.invoke_tool(&remote_envelope).await.unwrap();
+
+    let exec_mode = result
+        .get("execution_mode")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    assert_eq!(exec_mode, "remote_jsonrpc");
+}
+
+#[tokio::test]
+async fn get_available_tools_returns_builtin_dispatcher_metadata() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(
+        registry,
+        servers,
+        vec![BuiltinDispatcherConfig {
+            name: "fs.read".to_string(),
+            description: "Read files from the workspace".to_string(),
+            enabled: true,
+            capabilities: vec![CapabilityConfig {
+                name: "fs.read".to_string(),
+                skip_judge: true,
+            }],
+        }],
+    ));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let tools = service.get_available_tools().await.unwrap();
+    let fs_read = tools.iter().find(|tool| tool.name == "fs.read").unwrap();
+
+    assert_eq!(fs_read.description, "Read files from the workspace");
+    assert_eq!(
+        fs_read.input_schema["required"],
+        serde_json::json!(["path"])
+    );
+}
+
+#[tokio::test]
+async fn get_available_tools_for_context_filters_disallowed_tools() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(
+        registry,
+        servers,
+        vec![
+            BuiltinDispatcherConfig {
+                name: "fs.read".to_string(),
+                description: "Read files".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "fs.read".to_string(),
+                    skip_judge: true,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "cmd.run".to_string(),
+                description: "Run commands".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "cmd.run".to_string(),
+                    skip_judge: false,
+                }],
+            },
+        ],
+    ));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    security_context_repo
+        .save(crate::domain::security_context::SecurityContext {
+            name: "zaru-free".to_string(),
+            description: "Free tier".to_string(),
+            capabilities: vec![crate::domain::security_context::Capability {
+                tool_pattern: "fs.read".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                rate_limit: None,
+                max_response_size: None,
+            }],
+            deny_list: vec!["cmd.run".to_string()],
+            metadata: crate::domain::security_context::SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        })
+        .await
+        .unwrap();
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let tools = service
+        .get_available_tools_for_context("zaru-free")
+        .await
+        .unwrap();
+
+    assert!(tools.iter().any(|tool| tool.name == "fs.read"));
+    assert!(!tools.iter().any(|tool| tool.name == "cmd.run"));
+}
+
+#[tokio::test]
+async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(
+        registry,
+        servers,
+        vec![
+            BuiltinDispatcherConfig {
+                name: "fs.read".to_string(),
+                description: "Read files".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "fs.read".to_string(),
+                    skip_judge: true,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "cmd.run".to_string(),
+                description: "Run commands".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "cmd.run".to_string(),
+                    skip_judge: false,
+                }],
+            },
+        ],
+    ));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let agent = test_agent_with_tools(&["fs.read"]);
+    let agent_id = agent.id;
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(FilteringAgentLifecycleService { agent }),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let tools = service
+        .get_available_tools_for_agent(agent_id)
+        .await
+        .unwrap();
+
+    assert!(tools.iter().any(|tool| tool.name == "fs.read"));
+    assert!(!tools.iter().any(|tool| tool.name == "cmd.run"));
+}
+
+#[test]
+fn sanitize_segment_handles_empty_and_whitespace() {
+    assert_eq!(sanitize_segment(""), "unversioned");
+    assert_eq!(sanitize_segment("   "), "unversioned");
+}
+
+#[test]
+fn sanitize_segment_blocks_traversal_patterns() {
+    assert_eq!(sanitize_segment("."), "unversioned");
+    assert_eq!(sanitize_segment(".."), "unversioned");
+    assert_eq!(sanitize_segment("..hidden"), "unversioned");
+    assert_eq!(sanitize_segment("hidden.."), "unversioned");
+    assert_eq!(sanitize_segment("a..b"), "unversioned");
+    assert_eq!(sanitize_segment("version..1"), "unversioned");
+}
+
+#[test]
+fn sanitize_segment_replaces_special_characters() {
+    assert_eq!(sanitize_segment("foo/bar"), "foo_bar");
+    assert_eq!(sanitize_segment("foo\\bar"), "foo_bar");
+    assert_eq!(sanitize_segment("foo:bar"), "foo_bar");
+    assert_eq!(sanitize_segment("foo bar"), "foo_bar");
+    assert_eq!(sanitize_segment("name@domain.com"), "name_domain.com");
+}
+
+#[test]
+fn sanitize_segment_preserves_safe_mixed_alphanumeric() {
+    assert_eq!(sanitize_segment("validName-123"), "validName-123");
+    assert_eq!(sanitize_segment("v1.2.3-beta_01"), "v1.2.3-beta_01");
+}

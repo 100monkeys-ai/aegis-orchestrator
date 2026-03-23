@@ -304,6 +304,17 @@ pub trait WorkflowExecutionRepository: Send + Sync {
             .await
     }
 
+    /// Resolve the owning tenant for a workflow execution by ID.
+    async fn find_tenant_id_by_execution(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError> {
+        Ok(self
+            .find_by_id(id)
+            .await?
+            .map(|_| TenantId::local_default()))
+    }
+
     /// Find active workflow executions
     async fn find_active(
         &self,

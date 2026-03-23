@@ -1200,4 +1200,29 @@ mod tests {
             "stream should terminate after task completion"
         );
     }
+
+    #[tokio::test]
+    async fn invoke_tool_returns_failed_precondition_when_tool_service_is_missing() {
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let err = service
+            .invoke_tool(Request::new(InvokeToolRequest {
+                security_token: String::new(),
+                signature: String::new(),
+                inner_mcp: Vec::new(),
+            }))
+            .await
+            .expect_err("invoke_tool should reject missing tool service");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            err.message(),
+            "SMCP tool invocation service is not configured"
+        );
+    }
 }

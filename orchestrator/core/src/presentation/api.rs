@@ -737,3 +737,178 @@ async fn dispatch_gateway(
         Err(e) => Json(json!({ "error": e.to_string() })),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use axum::extract::{Query, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use serde_json::json;
+    use std::pin::Pin;
+    use tokio_stream::Stream;
+
+    use crate::presentation::webhook_guard::EnvWebhookSecretProvider;
+
+    struct NoopExecutionService;
+
+    #[async_trait]
+    impl ExecutionService for NoopExecutionService {
+        async fn start_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+        ) -> Result<crate::domain::execution::ExecutionId> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn start_child_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _parent_execution_id: crate::domain::execution::ExecutionId,
+        ) -> Result<crate::domain::execution::ExecutionId> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn get_execution(
+            &self,
+            _id: crate::domain::execution::ExecutionId,
+        ) -> Result<crate::domain::execution::Execution> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn get_iterations(
+            &self,
+            _exec_id: crate::domain::execution::ExecutionId,
+        ) -> Result<Vec<crate::domain::execution::Iteration>> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn cancel_execution(&self, _id: crate::domain::execution::ExecutionId) -> Result<()> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn stream_execution(
+            &self,
+            _id: crate::domain::execution::ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<crate::domain::events::ExecutionEvent>> + Send>>>
+        {
+            Ok(Box::pin(tokio_stream::empty()))
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _id: AgentId,
+        ) -> Result<
+            Pin<
+                Box<
+                    dyn Stream<Item = Result<crate::infrastructure::event_bus::DomainEvent>> + Send,
+                >,
+            >,
+        > {
+            Ok(Box::pin(tokio_stream::empty()))
+        }
+
+        async fn list_executions(
+            &self,
+            _agent_id: Option<AgentId>,
+            _limit: usize,
+        ) -> Result<Vec<crate::domain::execution::Execution>> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn delete_execution(&self, _id: crate::domain::execution::ExecutionId) -> Result<()> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _execution_id: crate::domain::execution::ExecutionId,
+            _iteration: u8,
+            _interaction: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _execution_id: crate::domain::execution::ExecutionId,
+            _iteration: u8,
+            _trajectory: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+    }
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            execution_service: Arc::new(NoopExecutionService),
+            human_input_service: Arc::new(crate::infrastructure::HumanInputService::new()),
+            inner_loop_service: None,
+            stimulus_service: None,
+            webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+            tool_invocation_service: None,
+            attestation_service: None,
+            workflow_execution_repo: None,
+            event_bus: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn smcp_tool_invoke_returns_service_unavailable_when_tool_service_is_missing() {
+        let response = smcp_tool_invoke(
+            State(test_state()),
+            Json(SmcpToolInvokeRequest {
+                security_token: "token".to_string(),
+                signature: "sig".to_string(),
+                payload: json!({
+                    "jsonrpc": "2.0",
+                    "method": "fs.read",
+                    "params": { "path": "/tmp/test.txt" }
+                }),
+            }),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "SMCP tool invocation service not wired in this configuration"
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn smcp_tools_list_returns_service_unavailable_when_tool_service_is_missing() {
+        let response = smcp_tools_list(
+            State(test_state()),
+            Query(SmcpToolsQuery::default()),
+            axum::http::HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "error": "SMCP tool discovery service not wired in this configuration"
+            })
+        );
+    }
+}

@@ -1,0 +1,346 @@
+use super::*;
+
+impl ToolInvocationService {
+    pub(super) async fn invoke_aegis_agent_create_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.agent.create requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.create",
+                    "validated": false,
+                    "deployed": false,
+                    "errors": [format!("Agent manifest parse/validation failed: {}", e)]
+                })));
+            }
+        };
+
+        match self
+            .agent_lifecycle
+            .deploy_agent(manifest.clone(), force)
+            .await
+        {
+            Ok(agent_id) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "agents",
+                        &manifest.metadata.name,
+                        &manifest.metadata.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Agent deployed but failed to persist manifest: {e}"
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.create",
+                    "validated": true,
+                    "deployed": true,
+                    "agent_id": agent_id.0.to_string(),
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "force": force,
+                    "manifest_yaml": manifest_yaml,
+                    "manifest_path": persisted_path
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.create",
+                "validated": true,
+                "deployed": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [format!("Agent deployment failed: {}", e)]
+            }))),
+        }
+    }
+
+    pub(super) async fn invoke_aegis_agent_list_tool(
+        &self,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let agents = self.agent_lifecycle.list_agents().await.map_err(|e| {
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
+        })?;
+
+        let entries: Vec<serde_json::Value> = agents
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "id": a.id.0.to_string(),
+                    "name": a.name,
+                    "version": a.manifest.metadata.version,
+                    "status": format!("{:?}", a.status).to_lowercase(),
+                    "labels": a.manifest.metadata.labels,
+                })
+            })
+            .collect();
+
+        Ok(ToolInvocationResult::Direct(serde_json::json!({
+            "tool": "aegis.agent.list",
+            "count": entries.len(),
+            "agents": entries
+        })))
+    }
+
+    pub(super) async fn invoke_aegis_agent_delete_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let agent_id_str = args
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.agent.delete requires 'agent_id' string".to_string(),
+                )
+            })?;
+
+        let agent_id =
+            crate::domain::agent::AgentId(uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
+            })?);
+
+        match self.agent_lifecycle.delete_agent(agent_id).await {
+            Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.delete",
+                "deleted": true,
+                "agent_id": agent_id_str
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.delete",
+                "deleted": false,
+                "error": format!("Failed to delete agent: {e}")
+            }))),
+        }
+    }
+
+    pub(super) async fn invoke_aegis_agent_generate_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.agent.generate requires 'input' string".to_string(),
+            )
+        })?;
+
+        let agent_id = match self
+            .agent_lifecycle
+            .lookup_agent("agent-creator-agent")
+            .await
+        {
+            Ok(Some(id)) => id,
+            _ => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.generate",
+                    "error": "Generator agent 'agent-creator-agent' not found"
+                })));
+            }
+        };
+
+        match self
+            .execution_service
+            .start_execution(
+                agent_id,
+                crate::domain::execution::ExecutionInput {
+                    intent: Some(input.to_string()),
+                    payload: serde_json::Value::String(input.to_string()),
+                },
+            )
+            .await
+        {
+            Ok(exec_id) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.generate",
+                "execution_id": exec_id.to_string(),
+                "status": "started"
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.generate",
+                "error": format!("Failed to start generation: {e}")
+            }))),
+        }
+    }
+
+    pub(super) async fn invoke_aegis_agent_update_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let manifest_yaml = args
+            .get("manifest_yaml")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::SignatureVerificationFailed(
+                    "aegis.agent.update requires 'manifest_yaml' string".to_string(),
+                )
+            })?;
+
+        let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let manifest = match AgentManifestParser::parse_yaml(manifest_yaml) {
+            Ok(m) => m,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": false,
+                    "updated": false,
+                    "error": format!("Manifest parsing failed: {}", e)
+                })));
+            }
+        };
+
+        if let Err(e) = manifest.validate() {
+            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": false,
+                "updated": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "error": format!("Schema validation failed: {}", e)
+            })));
+        }
+
+        let existing_agent = match self
+            .agent_lifecycle
+            .lookup_agent_for_tenant(&tenant_id, &manifest.metadata.name)
+            .await
+        {
+            Ok(Some(id)) => self
+                .agent_lifecycle
+                .get_agent_for_tenant(&tenant_id, id)
+                .await
+                .ok(),
+            _ => None,
+        };
+
+        let agent_id = match &existing_agent {
+            Some(a) => a.id,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": true,
+                    "updated": false,
+                    "name": manifest.metadata.name,
+                    "error": "Agent not found"
+                })));
+            }
+        };
+
+        // Version check if force=false
+        if !force {
+            if let Some(existing) = existing_agent {
+                if existing.manifest.metadata.version == manifest.metadata.version {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.update",
+                        "validated": true,
+                        "updated": false,
+                        "name": manifest.metadata.name,
+                        "version": manifest.metadata.version,
+                        "error": format!("Agent '{}' with version '{}' already exists. Create a new version or use 'force' to overwrite.", manifest.metadata.name, manifest.metadata.version)
+                    })));
+                }
+            }
+        }
+
+        match self
+            .agent_lifecycle
+            .update_agent_for_tenant(&tenant_id, agent_id, manifest.clone())
+            .await
+        {
+            Ok(_) => {
+                let persisted_path = self
+                    .persist_generated_manifest(
+                        "agents",
+                        &manifest.metadata.name,
+                        &manifest.metadata.version,
+                        manifest_yaml,
+                    )
+                    .map_err(|e| {
+                        SmcpSessionError::SignatureVerificationFailed(format!(
+                            "Agent updated but failed to persist manifest: {e}"
+                        ))
+                    })?;
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.update",
+                    "validated": true,
+                    "updated": true,
+                    "name": manifest.metadata.name,
+                    "version": manifest.metadata.version,
+                    "agent_id": agent_id.0.to_string(),
+                    "manifest_yaml": manifest_yaml,
+                    "manifest_path": persisted_path,
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.update",
+                "validated": true,
+                "updated": false,
+                "name": manifest.metadata.name,
+                "version": manifest.metadata.version,
+                "errors": [format!("Agent update failed: {}", e)]
+            }))),
+        }
+    }
+
+    pub(super) async fn invoke_aegis_agent_export_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.agent.export requires 'name' string".to_string(),
+            )
+        })?;
+
+        let agent_id = match self
+            .agent_lifecycle
+            .lookup_agent_for_tenant(&tenant_id, name)
+            .await
+        {
+            Ok(Some(id)) => id,
+            _ => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    crate::domain::agent::AgentId(uuid)
+                } else {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.export",
+                        "error": "Agent not found or invalid UUID"
+                    })));
+                }
+            }
+        };
+
+        match self
+            .agent_lifecycle
+            .get_agent_for_tenant(&tenant_id, agent_id)
+            .await
+        {
+            Ok(agent) => {
+                let yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.export",
+                    "name": agent.name,
+                    "manifest_yaml": yaml
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.export",
+                "error": format!("Failed to get agent: {}", e)
+            }))),
+        }
+    }
+}
