@@ -28,6 +28,56 @@ async fn connect_test_pool() -> Option<PgPool> {
         .ok()
 }
 
+async fn setup_temp_tables(pool: &PgPool) {
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS workflows (
+            id UUID PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            description TEXT,
+            yaml_source TEXT NOT NULL,
+            domain_json JSONB NOT NULL,
+            temporal_def_json JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CONSTRAINT workflows_tenant_name_version_unique UNIQUE (tenant_id, name, version)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to create temp workflows table");
+
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE IF NOT EXISTS workflow_definitions (
+            workflow_id UUID PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            definition JSONB NOT NULL,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            version TEXT NOT NULL,
+            definition_hash TEXT NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to create temp workflow_definitions table");
+
+    sqlx::query(
+        r#"
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_temp_workflow_definitions_tenant_name_version
+        ON workflow_definitions (tenant_id, name, version)
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to create temp workflow_definitions unique index");
+}
+
 fn build_workflow_with_description(name: &str, description: Option<&str>) -> Workflow {
     let mut states = HashMap::new();
     states.insert(
@@ -92,53 +142,7 @@ async fn workflow_repository_force_redeploy_keeps_workflow_tables_on_same_id() {
         return;
     };
 
-    sqlx::query(
-        r#"
-        CREATE TEMP TABLE workflows (
-            id UUID PRIMARY KEY,
-            tenant_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            version TEXT NOT NULL,
-            description TEXT,
-            yaml_source TEXT NOT NULL,
-            domain_json JSONB NOT NULL,
-            temporal_def_json JSONB NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            CONSTRAINT workflows_tenant_name_version_unique UNIQUE (tenant_id, name, version)
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("Failed to create temp workflows table");
-
-    sqlx::query(
-        r#"
-        CREATE TEMP TABLE workflow_definitions (
-            workflow_id UUID PRIMARY KEY,
-            tenant_id TEXT NOT NULL,
-            name TEXT NOT NULL,
-            definition JSONB NOT NULL,
-            registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            version TEXT NOT NULL,
-            definition_hash TEXT NOT NULL
-        )
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("Failed to create temp workflow_definitions table");
-
-    sqlx::query(
-        r#"
-        CREATE UNIQUE INDEX idx_temp_workflow_definitions_tenant_name_version
-        ON workflow_definitions (tenant_id, name, version)
-        "#,
-    )
-    .execute(&pool)
-    .await
-    .expect("Failed to create temp workflow_definitions unique index");
+    setup_temp_tables(&pool).await;
 
     let tenant_id = TenantId::local_default();
     let original = build_workflow("copy-generator");
@@ -207,10 +211,12 @@ async fn workflow_repository_force_redeploy_can_clear_description() {
     let pool = match connect_test_pool().await {
         Some(pool) => pool,
         None => {
-            eprintln!("Skipping test: AEGIS_DATABASE_URL not set");
+            eprintln!("Skipping test: AEGIS_DATABASE_URL or DATABASE_URL not set");
             return;
         }
     };
+
+    setup_temp_tables(&pool).await;
 
     let tenant_id = TenantId::new("test-tenant-clear-description").unwrap();
     let repo = PostgresWorkflowRepository::new_with_pool(pool.clone());

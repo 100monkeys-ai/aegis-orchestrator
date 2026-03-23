@@ -348,6 +348,10 @@ impl ConfigWizard {
             anthropic_smart_model: "claude-sonnet-4-5".to_string(),
             anthropic_judge_model: "claude-sonnet-4-5".to_string(),
             enable_gemini: false,
+            // Use Gemini's OpenAI-compatible endpoint by default. This mirrors the
+            // default used in the test fixtures and is intentional so that
+            // Gemini can be treated as an OpenAI-style provider; update both places
+            // together if this default ever changes.
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_api_key: String::new(),
             gemini_smart_model: "gemini-2.5-flash".to_string(),
