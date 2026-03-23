@@ -43,6 +43,9 @@ use crate::infrastructure::smcp_gateway_proto::{
 use crate::infrastructure::workflow_parser::WorkflowParser;
 
 const JUDGE_POLL_INTERVAL_MS: u64 = 500;
+const COMPACT_JSON_INLINE_LIMIT: usize = 256;
+const COMPACT_STRING_PREVIEW_LIMIT: usize = 96;
+const COMPACT_ERROR_PREVIEW_LIMIT: usize = 3;
 
 pub enum ToolInvocationResult {
     Direct(Value),
@@ -265,6 +268,175 @@ impl ToolInvocationService {
         serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
     }
 
+    fn compact_string_preview(value: &str, limit: usize) -> Value {
+        if value.len() <= limit {
+            Value::String(value.to_string())
+        } else {
+            let preview: String = value.chars().take(limit).collect();
+            Value::String(format!("{preview}...<truncated>"))
+        }
+    }
+
+    fn compact_json_value(value: &Value) -> Value {
+        match value {
+            Value::Null | Value::Bool(_) | Value::Number(_) => value.clone(),
+            Value::String(value) => {
+                Self::compact_string_preview(value, COMPACT_STRING_PREVIEW_LIMIT)
+            }
+            Value::Array(items) => {
+                let serialized_len = serde_json::to_string(value).unwrap_or_default().len();
+                if serialized_len <= COMPACT_JSON_INLINE_LIMIT {
+                    value.clone()
+                } else {
+                    serde_json::json!({
+                        "kind": "array",
+                        "length": items.len(),
+                        "items": items
+                            .iter()
+                            .take(3)
+                            .map(Self::compact_json_value)
+                            .collect::<Vec<_>>()
+                    })
+                }
+            }
+            Value::Object(map) => {
+                let serialized_len = serde_json::to_string(value).unwrap_or_default().len();
+                if serialized_len <= COMPACT_JSON_INLINE_LIMIT {
+                    value.clone()
+                } else {
+                    let mut keys = map.keys().cloned().collect::<Vec<String>>();
+                    keys.sort();
+                    serde_json::json!({
+                        "kind": "object",
+                        "key_count": map.len(),
+                        "keys": keys.into_iter().take(8).collect::<Vec<_>>()
+                    })
+                }
+            }
+        }
+    }
+
+    fn compact_tool_arguments(tool_name: &str, arguments: &Value) -> Value {
+        match tool_name {
+            "aegis.schema.get" => serde_json::json!({
+                "key": arguments.get("key").and_then(Value::as_str).unwrap_or("unknown"),
+            }),
+            "aegis.schema.validate" => {
+                let manifest_yaml = arguments
+                    .get("manifest_yaml")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+
+                serde_json::json!({
+                    "kind": arguments.get("kind").and_then(Value::as_str).unwrap_or("unknown"),
+                    "manifest_present": !manifest_yaml.is_empty(),
+                    "manifest_bytes": manifest_yaml.len(),
+                })
+            }
+            "aegis.agent.create"
+            | "aegis.agent.update"
+            | "aegis.workflow.create"
+            | "aegis.workflow.update" => {
+                let manifest_yaml = arguments
+                    .get("manifest_yaml")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let mut compact = serde_json::Map::new();
+
+                for key in [
+                    "force",
+                    "judge_agents",
+                    "min_score",
+                    "min_confidence",
+                    "task_context",
+                ] {
+                    if let Some(value) = arguments.get(key) {
+                        compact.insert(key.to_string(), Self::compact_json_value(value));
+                    }
+                }
+
+                compact.insert(
+                    "manifest_summary".to_string(),
+                    serde_json::json!({
+                        "present": !manifest_yaml.is_empty(),
+                        "bytes": manifest_yaml.len(),
+                        "preview": Self::compact_string_preview(
+                            manifest_yaml,
+                            COMPACT_STRING_PREVIEW_LIMIT
+                        ),
+                    }),
+                );
+
+                Value::Object(compact)
+            }
+            _ => Self::compact_json_value(arguments),
+        }
+    }
+
+    fn compact_tool_result(tool_name: &str, arguments: &Value, result: Option<&Value>) -> Value {
+        let Some(result) = result else {
+            return Value::Null;
+        };
+
+        match tool_name {
+            "aegis.schema.get" => {
+                let schema_key = arguments
+                    .get("key")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+
+                if let Some(error) = result.get("error").and_then(Value::as_str) {
+                    return serde_json::json!({
+                        "result_kind": "error",
+                        "schema_key": schema_key,
+                        "error": Self::compact_string_preview(error, COMPACT_STRING_PREVIEW_LIMIT),
+                        "supported_keys": result.get("supported_keys").cloned(),
+                    });
+                }
+
+                serde_json::json!({
+                    "result_kind": "schema",
+                    "schema_key": schema_key,
+                    "schema_id": result.get("$id").and_then(Value::as_str),
+                    "title": result.get("title").and_then(Value::as_str),
+                    "schema_type": result.get("type").and_then(Value::as_str),
+                    "property_count": result.get("properties").and_then(Value::as_object).map(|m| m.len()),
+                    "definition_count": result.get("definitions").and_then(Value::as_object).map(|m| m.len()),
+                })
+            }
+            "aegis.schema.validate" => {
+                let errors = result
+                    .get("errors")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                serde_json::json!({
+                    "valid": result.get("valid").and_then(Value::as_bool).unwrap_or(false),
+                    "errors_count": errors.len(),
+                    "errors": errors
+                        .into_iter()
+                        .take(COMPACT_ERROR_PREVIEW_LIMIT)
+                        .map(|error| Self::compact_json_value(&error))
+                        .collect::<Vec<_>>(),
+                })
+            }
+            _ => Self::compact_json_value(result),
+        }
+    }
+
+    fn compact_tool_call(step: &TrajectoryStep) -> Value {
+        let arguments = Self::parse_json_or_string(&step.arguments_json);
+        let result = step.result_json.as_deref().map(Self::parse_json_or_string);
+
+        serde_json::json!({
+            "tool_name": step.tool_name,
+            "arguments_summary": Self::compact_tool_arguments(&step.tool_name, &arguments),
+            "status": step.status,
+            "result_summary": Self::compact_tool_result(&step.tool_name, &arguments, result.as_ref()),
+            "error": step.error.as_ref().map(|error| Self::compact_string_preview(error, COMPACT_STRING_PREVIEW_LIMIT)),
+        })
+    }
+
     fn build_tool_audit_history(
         execution_id: crate::domain::execution::ExecutionId,
         iteration_number: u8,
@@ -272,19 +444,7 @@ impl ToolInvocationService {
     ) -> Value {
         let tool_calls: Vec<Value> = tool_audit_history
             .iter()
-            .map(|step| {
-                serde_json::json!({
-                    "tool_name": step.tool_name,
-                    "arguments": Self::parse_json_or_string(&step.arguments_json),
-                    "status": step.status,
-                    "result": step
-                        .result_json
-                        .as_deref()
-                        .map(Self::parse_json_or_string)
-                        .unwrap_or(Value::Null),
-                    "error": step.error,
-                })
-            })
+            .map(Self::compact_tool_call)
             .collect();
 
         let latest_schema_validate = tool_calls
@@ -299,8 +459,6 @@ impl ToolInvocationService {
             .rev()
             .find(|step| step.get("tool_name").and_then(|v| v.as_str()) == Some("aegis.schema.get"))
             .cloned();
-        let schema_get_evidence = latest_schema_get.clone();
-        let schema_validate_evidence = latest_schema_validate.clone();
 
         serde_json::json!({
             "execution_id": execution_id.to_string(),
@@ -309,8 +467,6 @@ impl ToolInvocationService {
             "tool_calls": tool_calls,
             "latest_schema_get": latest_schema_get,
             "latest_schema_validate": latest_schema_validate,
-            "schema_get_evidence": schema_get_evidence,
-            "schema_validate_evidence": schema_validate_evidence,
         })
     }
 
@@ -326,11 +482,6 @@ impl ToolInvocationService {
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
     ) -> Value {
-        let semantic_input = serde_json::to_string_pretty(&serde_json::json!({
-            "tool": tool_name,
-            "arguments": arguments,
-        }))
-        .unwrap_or_default();
         let tool_audit_history =
             Self::build_tool_audit_history(execution_id, iteration_number, tool_audit_history);
 
@@ -339,12 +490,11 @@ impl ToolInvocationService {
             "task": task,
             "proposed_tool_call": {
                 "name": tool_name,
-                "arguments": arguments,
+                "arguments": Self::compact_tool_arguments(tool_name, arguments),
             },
             "available_tools": available_tools,
             "worker_mounts": worker_mounts,
             "tool_audit_history": tool_audit_history,
-            "output": semantic_input,
             "criteria": criteria,
             "validation_context": validation_context,
         })
@@ -4094,13 +4244,16 @@ spec:
                 tool_name: "aegis.schema.get".to_string(),
                 arguments_json: r#"{"key":"workflow/manifest/v1"}"#.to_string(),
                 status: "completed".to_string(),
-                result_json: Some(r#"{"ok":true}"#.to_string()),
+                result_json: Some(
+                    r#"{"title":"Workflow Manifest","type":"object","properties":{"states":{"type":"array"}}}"#
+                        .to_string(),
+                ),
                 error: None,
             },
             crate::domain::execution::TrajectoryStep {
                 tool_name: "aegis.schema.validate".to_string(),
                 arguments_json:
-                    r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#
+                    r#"{"kind":"workflow","manifest_yaml":"apiVersion: 100monkeys.ai/v1\nkind: Workflow"}"#
                         .to_string(),
                 status: "completed".to_string(),
                 result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
@@ -4120,8 +4273,32 @@ spec:
             "aegis.schema.get"
         );
         assert_eq!(
+            audit_history["tool_calls"][0]["arguments_summary"]["key"],
+            "workflow/manifest/v1"
+        );
+        assert_eq!(
+            audit_history["tool_calls"][0]["result_summary"]["schema_key"],
+            "workflow/manifest/v1"
+        );
+        assert_eq!(
+            audit_history["tool_calls"][0]["result_summary"]["result_kind"],
+            "schema"
+        );
+        assert_eq!(
             audit_history["tool_calls"][1]["tool_name"],
             "aegis.schema.validate"
+        );
+        assert_eq!(
+            audit_history["tool_calls"][1]["arguments_summary"]["kind"],
+            "workflow"
+        );
+        assert_eq!(
+            audit_history["tool_calls"][1]["arguments_summary"]["manifest_present"],
+            true
+        );
+        assert_eq!(
+            audit_history["tool_calls"][1]["result_summary"]["valid"],
+            true
         );
         assert_eq!(
             audit_history["latest_schema_get"]["tool_name"],
@@ -4131,14 +4308,8 @@ spec:
             audit_history["latest_schema_validate"]["tool_name"],
             "aegis.schema.validate"
         );
-        assert_eq!(
-            audit_history["schema_get_evidence"]["tool_name"],
-            "aegis.schema.get"
-        );
-        assert_eq!(
-            audit_history["schema_validate_evidence"]["result"]["valid"],
-            true
-        );
+        assert!(audit_history.get("schema_get_evidence").is_none());
+        assert!(audit_history.get("schema_validate_evidence").is_none());
     }
 
     #[test]
@@ -4149,13 +4320,16 @@ spec:
                 tool_name: "aegis.schema.get".to_string(),
                 arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
                 status: "completed".to_string(),
-                result_json: Some(r#"{"ok":true}"#.to_string()),
+                result_json: Some(
+                    r#"{"title":"Agent Manifest","type":"object","properties":{"metadata":{"type":"object"}}}"#
+                        .to_string(),
+                ),
                 error: None,
             },
             crate::domain::execution::TrajectoryStep {
                 tool_name: "aegis.schema.validate".to_string(),
                 arguments_json:
-                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1"}"#.to_string(),
+                    r#"{"kind":"agent","manifest_yaml":"apiVersion: 100monkeys.ai/v1\nkind: Agent"}"#.to_string(),
                 status: "completed".to_string(),
                 result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
                 error: None,
@@ -4185,6 +4359,7 @@ spec:
             "semantic_judge_pre_execution_inner_loop"
         );
         assert_eq!(payload["proposed_tool_call"]["name"], "aegis.agent.create");
+        assert!(payload.get("output").is_none());
         assert_eq!(
             payload["tool_audit_history"]["tool_calls"]
                 .as_array()
@@ -4193,12 +4368,91 @@ spec:
             2
         );
         assert_eq!(
+            payload["tool_audit_history"]["tool_calls"][0]["arguments_summary"]["key"],
+            "agent/manifest/v1"
+        );
+        assert_eq!(
+            payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["schema_key"],
+            "agent/manifest/v1"
+        );
+        assert_eq!(
+            payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["result_kind"],
+            "schema"
+        );
+        assert_eq!(
             payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
             "aegis.schema.validate"
         );
+        assert!(payload["tool_audit_history"]
+            .get("schema_get_evidence")
+            .is_none());
+    }
+
+    #[test]
+    fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
+        let execution_id = ExecutionId::new();
+        let huge_schema_body = "x".repeat(50_000);
+        let huge_manifest = format!(
+            "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
+            "y".repeat(50_000)
+        );
+        let tool_audit_history = vec![
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.get".to_string(),
+                arguments_json: r#"{"key":"agent/manifest/v1"}"#.to_string(),
+                status: "completed".to_string(),
+                result_json: Some(format!(
+                    r#"{{"title":"Huge Schema","type":"object","description":"{}"}}"#,
+                    huge_schema_body
+                )),
+                error: None,
+            },
+            crate::domain::execution::TrajectoryStep {
+                tool_name: "aegis.schema.validate".to_string(),
+                arguments_json: serde_json::json!({
+                    "kind": "agent",
+                    "manifest_yaml": huge_manifest.clone(),
+                })
+                .to_string(),
+                status: "completed".to_string(),
+                result_json: Some(r#"{"valid":true,"errors":[]}"#.to_string()),
+                error: None,
+            },
+        ];
+
+        let payload = ToolInvocationService::build_semantic_judge_payload(
+            execution_id,
+            "Create an agent".to_string(),
+            "aegis.agent.create",
+            &serde_json::json!({
+                "manifest_yaml": huge_manifest,
+            }),
+            vec![
+                "aegis.schema.get".to_string(),
+                "aegis.schema.validate".to_string(),
+            ],
+            vec!["/workspace".to_string()],
+            "use the workflow-required sequence",
+            "semantic_judge_pre_execution_inner_loop",
+            1,
+            &tool_audit_history,
+        );
+
+        let serialized = serde_json::to_string(&payload).expect("payload should serialize");
+        assert!(
+            serialized.len() < 15_000,
+            "payload too large: {}",
+            serialized.len()
+        );
+        assert!(!serialized.contains(&"x".repeat(1024)));
+        assert!(!serialized.contains(&"y".repeat(1024)));
         assert_eq!(
-            payload["tool_audit_history"]["schema_get_evidence"]["tool_name"],
-            "aegis.schema.get"
+            payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["schema_key"],
+            "agent/manifest/v1"
+        );
+        assert_eq!(
+            payload["tool_audit_history"]["tool_calls"][0]["result_summary"]["result_kind"],
+            "schema"
         );
     }
 
