@@ -338,8 +338,13 @@ mod tests {
         );
         assert!(
             WORKFLOW_CREATOR_AGENT_TEMPLATE
-                .contains("Skipping, reordering, or collapsing steps 1–4 is a policy violation"),
+                .contains("Skipping, reordering, or collapsing steps 1–5 is a policy violation"),
             "workflow creator template should reject shortcutting the required workflow"
+        );
+        assert!(
+            WORKFLOW_CREATOR_AGENT_TEMPLATE
+                .contains("Always run workflow validation before any create or update call"),
+            "workflow creator template should require workflow validation before deployment"
         );
     }
 
@@ -380,9 +385,9 @@ mod tests {
         );
         assert!(
             WORKFLOW_GENERATOR_JUDGE_TEMPLATE.contains(
-                "A deployment call without a prior `aegis.schema.get` and `aegis.schema.validate` in the same run"
+                "A deployment call without a prior `aegis.schema.get`, `aegis.schema.validate`, and `aegis.workflow.validate` in the same run"
             ),
-            "judge template should treat a missing schema sequence as a hard process failure"
+            "judge template should treat a missing workflow validation sequence as a hard process failure"
         );
     }
 
