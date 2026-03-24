@@ -314,9 +314,13 @@ impl Workflow {
 
     /// Return all judge-agent references used anywhere in the workflow.
     ///
-    /// Includes state-level semantic judges, pre-execution validators, and
-    /// parallel-output judges. Names are deduplicated and sorted to keep
-    /// dependency checks deterministic.
+    /// This returns a single, deduplicated list of agent identifiers drawn from:
+    /// - state-level semantic judges (`judges` on `StateKind::Agent`),
+    /// - pre-execution validators (`pre_execution_validator` on `StateKind::Agent`),
+    /// - judges for parallel outputs (`judges_for_parallel` on `StateKind::ParallelAgents`).
+    ///
+    /// The different judge roles are *not* distinguished in the result; callers only
+    /// get the unique set of agent IDs, sorted to keep dependency checks deterministic.
     pub fn referenced_judge_agents(&self) -> Vec<String> {
         let mut judge_names = BTreeSet::new();
 
@@ -632,7 +636,10 @@ pub enum StateKind {
         #[serde(default)]
         max_iterations: Option<u32>,
 
-        /// Optional judge agent ID for pre-execution semantic tool validation (ADR-049 Pillar 1)
+        /// Optional judge agent ID used as a **pre-execution** semantic tool validator
+        /// (ADR-049 Pillar 1). This runs before tool calls are executed to validate the
+        /// proposed tool usage and is distinct from `judges`, which evaluate iteration
+        /// outputs after execution in the inner refinement loop.
         #[serde(default)]
         pre_execution_validator: Option<String>,
     },

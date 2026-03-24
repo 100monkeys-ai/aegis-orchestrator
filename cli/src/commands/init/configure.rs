@@ -348,6 +348,10 @@ impl ConfigWizard {
             anthropic_smart_model: "claude-sonnet-4-5".to_string(),
             anthropic_judge_model: "claude-sonnet-4-5".to_string(),
             enable_gemini: false,
+            // Use Gemini's OpenAI-compatible endpoint by default. This mirrors the
+            // default used in the test fixtures and is intentional so that
+            // Gemini can be treated as an OpenAI-style provider; update both places
+            // together if this default ever changes.
             gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             gemini_api_key: String::new(),
             gemini_smart_model: "gemini-2.5-flash".to_string(),
@@ -1272,7 +1276,7 @@ spec:
       vram_gb: {vram_gb}
 
   image_tag: "{image_tag}"
-  max_execution_list_limit: 1000
+  max_execution_list_limit: {max_execution_list_limit}
 {llm_section}
 {builtin_dispatchers_section}
   runtime:
@@ -1310,6 +1314,7 @@ spec:
             temporal_section = temporal_section,
             storage_section = storage_section,
             smcp_gateway_section = smcp_gateway_section,
+            max_execution_list_limit = crate::daemon::server::DEFAULT_MAX_EXECUTION_LIST_LIMIT,
         )
     }
 
@@ -1588,6 +1593,8 @@ mod tests {
                 anthropic_smart_model: "claude-sonnet-4-5".to_string(),
                 anthropic_judge_model: "claude-sonnet-4-5".to_string(),
                 enable_gemini: false,
+                // Use Gemini's OpenAI-compatible endpoint by default; this is intentional
+                // and allows treating Gemini as an OpenAI-style provider.
                 gemini_endpoint: "https://generativelanguage.googleapis.com/v1beta/openai"
                     .to_string(),
                 gemini_api_key: String::new(),
