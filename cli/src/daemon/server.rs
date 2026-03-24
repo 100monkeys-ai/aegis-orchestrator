@@ -700,12 +700,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     println!("Initializing Docker runtime...");
 
-    // Resolve orchestrator URL (supports env:VAR_NAME syntax via resolve_env_value)
-    let orchestrator_url =
+    // Resolve the orchestrator URL, supporting `env:VAR_NAME` syntax and a shared default.
+    fn resolve_orchestrator_url(config: &NodeConfigManifest) -> String {
         resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
             DEFAULT_ORCHESTRATOR_URL.to_string()
-        });
+        })
+    }
+
+    // Resolve orchestrator URL (supports env:VAR_NAME syntax via resolve_env_value)
+    let orchestrator_url = resolve_orchestrator_url(&config);
 
     // Resolve NFS server host (supports env:VAR_NAME syntax) - ADR-036
     // Note: The Docker daemon relies on this to mount volumes from the host environment.
@@ -1157,6 +1161,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             if srv_cfg.enabled {
                 let tool_server =
                     aegis_orchestrator_core::domain::mcp::ToolServer::from_config(srv_cfg);
+
+                // Prevent silent overwrites when multiple MCP servers share the same
+                // logical identity. Use the configured name (stable identifier) rather
+                // than the randomly generated ToolServer ID for duplicate detection.
+                if servers_lock
+                    .values()
+                    .any(|existing| existing.name == srv_cfg.name)
+                {
+                    return Err(anyhow::anyhow!(
+                        "Duplicate MCP server name '{}' detected in configuration. \
+                         MCP server names must be unique.",
+                        srv_cfg.name
+                    ));
+                }
+
                 servers_lock.insert(tool_server.id, tool_server);
             }
         }
@@ -2964,6 +2983,12 @@ struct ListExecutionsQuery {
     limit: Option<usize>,
 }
 
+/// Default maximum number of executions that can be returned by a single
+/// `list_executions` request when `max_execution_list_limit` is not
+/// explicitly configured. This value should remain consistent with the
+/// default used in configuration rendering.
+pub const DEFAULT_MAX_EXECUTION_LIST_LIMIT: usize = 1000;
+
 /// Maximum number of executions that can be returned by a single
 /// `list_executions` request. This upper bound protects the daemon from
 /// excessive memory usage and response sizes when clients request very
@@ -2979,7 +3004,11 @@ async fn list_executions_handler(
 
     // Determine the maximum allowed page size from configuration, with a
     // backward-compatible default of 1000 if not set.
-    let max_limit = state.config.spec.max_execution_list_limit.unwrap_or(1000);
+    let max_limit = state
+        .config
+        .spec
+        .max_execution_list_limit
+        .unwrap_or(DEFAULT_MAX_EXECUTION_LIST_LIMIT);
 
     let limit = query.limit.unwrap_or(20).min(max_limit);
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
