@@ -109,11 +109,10 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
 }
 
 fn resolve_stack_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
-    let base_dir = config_path
+    config_path
         .and_then(|config| config.parent().map(|parent| parent.to_path_buf()))
         .or_else(|| dirs_next::home_dir().map(|home| home.join(".aegis")))
-        .unwrap_or_else(|| std::path::PathBuf::from(".aegis"));
-    base_dir
+        .unwrap_or_else(|| std::path::PathBuf::from(".aegis"))
 }
 
 pub fn resolve_templates_root(config_path: Option<&std::path::PathBuf>) -> std::path::PathBuf {
@@ -241,6 +240,12 @@ async fn deploy_builtin_workflow(
     force: bool,
 ) -> Result<()> {
     if !force && client.describe_workflow(name).await.is_ok() {
+        println!(
+            "  {} Reusing existing built-in workflow '{}' without verifying version; \
+             use --force to redeploy from the bundled template if needed.",
+            "→".dimmed(),
+            name.cyan(),
+        );
         return Ok(());
     }
 

@@ -527,8 +527,8 @@ impl AegisRuntime for AegisRuntimeService {
                 validation_req,
                 judge_configs,
                 consensus_config,
-                DEFAULT_VALIDATION_TIMEOUT_SECS, // 60 second timeout
-                DEFAULT_VALIDATION_POLL_INTERVAL_MS, // 500ms poll interval
+                DEFAULT_VALIDATION_TIMEOUT_SECS, // 300 second timeout
+                DEFAULT_VALIDATION_POLL_INTERVAL_MS, // 1000ms poll interval
             )
             .await
         {
@@ -1094,7 +1094,8 @@ pub struct GrpcServerConfig {
         Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
     pub cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
     pub run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
-    pub agent_service: Arc<dyn AgentLifecycleService>,
+    pub agent_service: Option<Arc<dyn AgentLifecycleService>>,
+    pub stimulus_service: Option<Arc<StimulusService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1116,7 +1117,13 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
         service = service.with_container_step_runner(uc);
     }
 
-    service = service.with_agent_service(config.agent_service);
+    if let Some(stimulus) = config.stimulus_service {
+        service = service.with_stimulus(stimulus);
+    }
+
+    if let Some(agent_service) = config.agent_service {
+        service = service.with_agent_service(agent_service);
+    }
 
     let server = service.into_server();
 

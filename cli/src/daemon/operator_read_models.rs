@@ -122,7 +122,12 @@ impl OperatorReadModelStore {
     }
 }
 
-pub fn storage_violation_view(event: &StorageEvent) -> StorageViolationView {
+/// Build a `StorageViolationView` from a `StorageEvent` that represents a storage *violation*.
+///
+/// Callers must ensure that only violation variants of `StorageEvent` (e.g. policy
+/// violations or blocked path traversal attempts) are passed to this function. Benign
+/// audit events such as file reads/writes should be handled by a separate view type.
+pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationView {
     match event {
         StorageEvent::PathTraversalBlocked {
             execution_id,
