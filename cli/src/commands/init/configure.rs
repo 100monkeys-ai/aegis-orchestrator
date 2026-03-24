@@ -1276,7 +1276,7 @@ spec:
       vram_gb: {vram_gb}
 
   image_tag: "{image_tag}"
-  max_execution_list_limit: 1000
+  max_execution_list_limit: {max_execution_list_limit}
 {llm_section}
 {builtin_dispatchers_section}
   runtime:
@@ -1314,6 +1314,7 @@ spec:
             temporal_section = temporal_section,
             storage_section = storage_section,
             smcp_gateway_section = smcp_gateway_section,
+            max_execution_list_limit = crate::daemon::server::DEFAULT_MAX_EXECUTION_LIST_LIMIT,
         )
     }
 

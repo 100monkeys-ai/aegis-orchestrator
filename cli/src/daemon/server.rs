@@ -345,7 +345,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     println!("Initializing Docker runtime...");
 
     // Resolve the orchestrator URL, supporting `env:VAR_NAME` syntax and a shared default.
-    fn resolve_orchestrator_url(config: &Config) -> String {
+    fn resolve_orchestrator_url(config: &NodeConfigManifest) -> String {
         resolve_env_value(&config.spec.runtime.orchestrator_url).unwrap_or_else(|e| {
             tracing::warn!("Failed to resolve orchestrator URL: {}. Using default.", e);
             DEFAULT_ORCHESTRATOR_URL.to_string()
@@ -2361,7 +2361,7 @@ struct ListExecutionsQuery {
 /// `list_executions` request when `max_execution_list_limit` is not
 /// explicitly configured. This value should remain consistent with the
 /// default used in configuration rendering.
-const DEFAULT_MAX_EXECUTION_LIST_LIMIT: usize = 1000;
+pub const DEFAULT_MAX_EXECUTION_LIST_LIMIT: usize = 1000;
 
 /// Maximum number of executions that can be returned by a single
 /// `list_executions` request. This upper bound protects the daemon from
