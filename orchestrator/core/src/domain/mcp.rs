@@ -668,8 +668,9 @@ impl ToolInputContract {
             "aegis.workflow.validate" => &["manifest_yaml"],
             "aegis.workflow.create" | "aegis.workflow.update" => &["manifest_yaml"],
             "aegis.workflow.export" | "aegis.workflow.delete" | "aegis.workflow.run" => &["name"],
-            "aegis.workflow.logs" => &["execution_id"],
-            "aegis.workflow.executions.get" => &["execution_id"],
+            "aegis.workflow.logs" | "aegis.workflow.status" | "aegis.workflow.executions.get" => {
+                &["execution_id"]
+            }
             "aegis.task.status" | "aegis.task.logs" | "aegis.task.cancel" | "aegis.task.remove" => {
                 &["execution_id"]
             }
@@ -841,6 +842,27 @@ mod tests {
 
         assert!(ToolInputContract::validate(
             "aegis.task.logs",
+            &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn test_tool_input_contract_requires_execution_id_for_workflow_status() {
+        assert_eq!(
+            ToolInputContract::required_fields("aegis.workflow.status"),
+            &["execution_id"]
+        );
+
+        let validation = ToolInputContract::validate("aegis.workflow.status", &json!({}));
+        assert!(validation.is_err());
+        assert_eq!(
+            validation.unwrap_err(),
+            "required field 'execution_id' is missing or null for tool 'aegis.workflow.status'"
+        );
+
+        assert!(ToolInputContract::validate(
+            "aegis.workflow.status",
             &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
         )
         .is_ok());

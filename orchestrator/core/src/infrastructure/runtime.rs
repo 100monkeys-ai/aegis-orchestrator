@@ -44,8 +44,8 @@ use bollard::container::LogOutput;
 use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, Mount, MountTypeEnum};
 use bollard::query_parameters::{
-    CreateContainerOptions, PruneImagesOptions, RemoveContainerOptions, StartContainerOptions,
-    StatsOptions, UploadToContainerOptions,
+    CreateContainerOptions, ListContainersOptionsBuilder, PruneImagesOptions,
+    RemoveContainerOptions, StartContainerOptions, StatsOptions, UploadToContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -56,6 +56,22 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+const AEGIS_CONTAINER_KIND_AGENT: &str = "agent";
+const AEGIS_CONTAINER_KIND_LABEL: &str = "aegis.container_kind";
+const AEGIS_EXECUTION_ID_LABEL: &str = "aegis.execution_id";
+const AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL: &str = "aegis.keep_container_on_failure";
+const AEGIS_MANAGED_LABEL: &str = "aegis.managed";
+const AEGIS_RUNTIME_LABEL: &str = "aegis.runtime";
+const AEGIS_RUNTIME_KIND_DOCKER: &str = "docker";
+
+#[derive(Debug, Clone)]
+pub struct ManagedAgentContainer {
+    pub id: String,
+    pub execution_id: Option<String>,
+    pub debug_retain: bool,
+    pub state: Option<String>,
+}
 
 pub struct DockerRuntime {
     docker: Docker,
@@ -199,6 +215,54 @@ impl DockerRuntime {
         Ok(())
     }
 
+    pub async fn list_managed_agent_containers(
+        &self,
+    ) -> Result<Vec<ManagedAgentContainer>, RuntimeError> {
+        let mut filters = std::collections::HashMap::new();
+        filters.insert(
+            "label".to_string(),
+            vec![
+                format!("{AEGIS_MANAGED_LABEL}=true"),
+                format!("{AEGIS_RUNTIME_LABEL}={AEGIS_RUNTIME_KIND_DOCKER}"),
+                format!("{AEGIS_CONTAINER_KIND_LABEL}={AEGIS_CONTAINER_KIND_AGENT}"),
+            ],
+        );
+
+        let containers = self
+            .docker
+            .list_containers(Some(
+                ListContainersOptionsBuilder::new()
+                    .all(true)
+                    .filters(&filters)
+                    .build(),
+            ))
+            .await
+            .map_err(|e| {
+                RuntimeError::SpawnFailed(format!("Failed to list managed containers: {e}"))
+            })?;
+
+        Ok(containers
+            .into_iter()
+            .filter_map(|container| {
+                let id = container.id?;
+                let labels = container.labels.unwrap_or_default();
+                let execution_id = labels.get(AEGIS_EXECUTION_ID_LABEL).cloned();
+                let debug_retain = labels
+                    .get(AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL)
+                    .map(|value| value.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                let state = container.state.map(|state| state.to_string());
+
+                Some(ManagedAgentContainer {
+                    id,
+                    execution_id,
+                    debug_retain,
+                    state,
+                })
+            })
+            .collect())
+    }
+
     /// Verify Docker daemon is accessible
     pub async fn healthcheck(&self) -> Result<(), RuntimeError> {
         self.docker.ping().await.map_err(|e| {
@@ -278,6 +342,39 @@ impl DockerRuntime {
         ));
 
         lines.join("\n")
+    }
+
+    fn managed_container_labels(config: &RuntimeConfig) -> HashMap<String, String> {
+        HashMap::from([
+            (AEGIS_MANAGED_LABEL.to_string(), "true".to_string()),
+            (
+                AEGIS_RUNTIME_LABEL.to_string(),
+                AEGIS_RUNTIME_KIND_DOCKER.to_string(),
+            ),
+            (
+                AEGIS_CONTAINER_KIND_LABEL.to_string(),
+                AEGIS_CONTAINER_KIND_AGENT.to_string(),
+            ),
+            (
+                AEGIS_EXECUTION_ID_LABEL.to_string(),
+                config.execution_id.to_string(),
+            ),
+            (
+                AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL.to_string(),
+                config.keep_container_on_failure.to_string(),
+            ),
+        ])
+    }
+
+    async fn cleanup_spawned_container(&self, container_id: &str) {
+        let cleanup_id = InstanceId::new(container_id.to_string());
+        if let Err(error) = AgentRuntime::terminate(self, &cleanup_id).await {
+            warn!(
+                container_id = container_id,
+                error = %error,
+                "Failed to clean up spawned container after setup failure"
+            );
+        }
     }
 
     async fn get_container_stats(&self, id: &str) -> Option<(f64, u64, u64)> {
@@ -553,6 +650,7 @@ impl AgentRuntime for DockerRuntime {
             attach_stderr: Some(true),
             cmd: Some(cmd),
             env: Some(env_vars),
+            labels: Some(Self::managed_container_labels(&config)),
             host_config: Some(host_config),
             ..Default::default()
         };
@@ -571,10 +669,16 @@ impl AgentRuntime for DockerRuntime {
             .await
             .insert(id.clone(), config.keep_container_on_failure);
 
-        self.docker
+        if let Err(e) = self
+            .docker
             .start_container(&id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| RuntimeError::SpawnFailed(format!("Failed to start container: {e}")))?;
+        {
+            self.cleanup_spawned_container(&id).await;
+            return Err(RuntimeError::SpawnFailed(format!(
+                "Failed to start container: {e}"
+            )));
+        }
 
         info!("Spawned agent container: {}", id);
 
@@ -597,7 +701,10 @@ impl AgentRuntime for DockerRuntime {
                 container_id = &id,
                 "Copying bootstrap script into container"
             );
-            self.copy_bootstrap_to_container(&id).await?;
+            if let Err(error) = self.copy_bootstrap_to_container(&id).await {
+                self.cleanup_spawned_container(&id).await;
+                return Err(error);
+            }
         }
 
         Ok(InstanceId::new(id))
@@ -797,7 +904,14 @@ impl AgentRuntime for DockerRuntime {
 
 #[cfg(test)]
 mod tests {
-    use super::DockerRuntime;
+    use super::{
+        DockerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,
+        AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL, AEGIS_MANAGED_LABEL, AEGIS_RUNTIME_LABEL,
+    };
+    use crate::domain::agent::{ExecutionStrategy, ImagePullPolicy};
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::runtime::{ResourceLimits, RuntimeConfig};
+    use std::collections::HashMap;
 
     #[test]
     fn bootstrap_stdout_is_labeled_as_model_authored_analysis() {
@@ -839,6 +953,48 @@ mod tests {
             "{formatted}"
         );
         assert!(formatted.contains("errors:"), "{formatted}");
+    }
+
+    #[test]
+    fn managed_container_labels_include_execution_and_failure_metadata() {
+        let config = RuntimeConfig {
+            language: "python".to_string(),
+            version: "3.12".to_string(),
+            isolation: "docker".to_string(),
+            env: HashMap::new(),
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            resources: ResourceLimits {
+                cpu_millis: None,
+                memory_bytes: None,
+                disk_bytes: None,
+                timeout_seconds: None,
+            },
+            execution: ExecutionStrategy::default(),
+            volumes: Vec::new(),
+            container_uid: 1000,
+            container_gid: 1000,
+            keep_container_on_failure: true,
+            image: "python:3.12".to_string(),
+            bootstrap_path: None,
+            execution_id: ExecutionId::new(),
+        };
+
+        let labels = DockerRuntime::managed_container_labels(&config);
+
+        assert_eq!(labels.get(AEGIS_MANAGED_LABEL), Some(&"true".to_string()));
+        assert_eq!(labels.get(AEGIS_RUNTIME_LABEL), Some(&"docker".to_string()));
+        assert_eq!(
+            labels.get(AEGIS_CONTAINER_KIND_LABEL),
+            Some(&"agent".to_string())
+        );
+        assert_eq!(
+            labels.get(AEGIS_EXECUTION_ID_LABEL),
+            Some(&config.execution_id.to_string())
+        );
+        assert_eq!(
+            labels.get(AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL),
+            Some(&"true".to_string())
+        );
     }
 }
 // Private helper methods for DockerRuntime

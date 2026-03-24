@@ -261,6 +261,34 @@ impl ToolInvocationService {
             return Err(SmcpSessionError::PolicyViolation(violation));
         }
 
+        if !Self::context_allows_tool_name(&security_context.name, &tool_name) {
+            let violation = PolicyViolation::ToolExplicitlyDenied {
+                tool_name: tool_name.clone(),
+            };
+            self.event_bus
+                .publish_mcp_event(MCPToolEvent::PolicyViolation {
+                    execution_id,
+                    agent_id: *agent_id,
+                    tool_name: tool_name.clone(),
+                    violation_type: ViolationType::ToolExplicitlyDenied,
+                    details: format!(
+                        "Tool '{tool_name}' is not available in security context '{}'",
+                        security_context.name
+                    ),
+                    blocked_at: Utc::now(),
+                });
+            self.publish_invocation_failed(
+                invocation_id,
+                execution_id,
+                *agent_id,
+                format!(
+                    "Policy violation: tool '{tool_name}' is not available in security context '{}'",
+                    security_context.name
+                ),
+            );
+            return Err(SmcpSessionError::PolicyViolation(violation));
+        }
+
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
         // If the agent manifest specifies an inner-loop semantic validation step,
         // execute it BEFORE the tool call is dispatched to external systems.
@@ -681,6 +709,32 @@ impl ToolInvocationService {
         }
         if tool_name == "aegis.workflow.executions.get" {
             let result = self.invoke_aegis_workflow_execution_get_tool(&args).await;
+            match &result {
+                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    value,
+                    started_at,
+                ),
+                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    &serde_json::json!({"status":"dispatch_required"}),
+                    started_at,
+                ),
+                Err(e) => self.publish_invocation_failed(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    e.to_string(),
+                ),
+            }
+            return result;
+        }
+        if tool_name == "aegis.workflow.status" {
+            let result = self.invoke_aegis_workflow_status_tool(&args).await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                     invocation_id,

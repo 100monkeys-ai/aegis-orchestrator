@@ -25,6 +25,7 @@ use clap::Subcommand;
 use colored::Colorize;
 use serde::Serialize;
 use std::path::PathBuf;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::commands::builtins;
@@ -74,6 +75,10 @@ pub enum WorkflowCommand {
         /// Follow execution logs
         #[arg(long, short = 'f')]
         follow: bool,
+
+        /// Wait for execution to complete
+        #[arg(long, short = 'w')]
+        wait: bool,
     },
 
     /// List all registered workflows
@@ -111,6 +116,10 @@ pub enum WorkflowCommand {
         /// Show verbose output (execution metadata, resolved agent IDs, etc.)
         #[arg(long, short = 'v')]
         verbose: bool,
+
+        /// Only show workflow failures
+        #[arg(long)]
+        errors_only: bool,
     },
 
     /// Delete a workflow from registry
@@ -135,6 +144,38 @@ pub enum WorkflowCommand {
         follow: bool,
     },
 
+    /// Check workflow execution status
+    Status {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
+    },
+
+    /// Send human input to a paused workflow execution
+    Signal {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
+
+        /// Response payload to send to the waiting Human state
+        #[arg(long, short = 'r', value_name = "TEXT")]
+        response: String,
+    },
+
+    /// Cancel a workflow execution
+    Cancel {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
+    },
+
+    /// Remove a workflow execution
+    Remove {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
+    },
+
     /// Manage workflow executions
     Executions {
         #[command(subcommand)]
@@ -150,13 +191,21 @@ pub enum ExecutionsCommand {
         #[arg(long, default_value = "20")]
         limit: usize,
 
-        /// Filter by workflow UUID
-        #[arg(long, value_name = "UUID")]
-        workflow_id: Option<Uuid>,
+        /// Filter by workflow name or UUID
+        #[arg(long, value_name = "NAME_OR_UUID")]
+        workflow: Option<String>,
 
         /// Show detailed information (current state, timestamps)
         #[arg(long, short = 'l')]
         long: bool,
+    },
+
+    /// Get workflow execution details
+    #[command(alias = "status")]
+    Get {
+        /// Execution ID
+        #[arg(value_name = "EXECUTION_ID")]
+        execution_id: Uuid,
     },
 }
 
@@ -178,6 +227,7 @@ pub async fn handle_command(
             params,
             blackboard,
             follow,
+            wait,
         } => {
             run_workflow(
                 WorkflowRunRequest {
@@ -186,6 +236,7 @@ pub async fn handle_command(
                     params,
                     blackboard,
                     follow,
+                    wait,
                 },
                 host,
                 port,
@@ -204,11 +255,21 @@ pub async fn handle_command(
             follow,
             transitions,
             verbose,
+            errors_only,
         } => {
             if output_format.is_structured() {
                 structured_output_unsupported("aegis workflow logs", output_format)
             } else {
-                stream_workflow_logs(execution_id, follow, transitions, verbose, host, port).await
+                stream_workflow_logs(
+                    execution_id,
+                    follow,
+                    transitions,
+                    verbose,
+                    errors_only,
+                    host,
+                    port,
+                )
+                .await
             }
         }
         WorkflowCommand::Delete { name, yes } => {
@@ -228,6 +289,19 @@ pub async fn handle_command(
         WorkflowCommand::Executions { command } => {
             handle_executions_command(command, host, port, output_format).await
         }
+        WorkflowCommand::Status { execution_id } => {
+            get_workflow_execution(execution_id, host, port, output_format).await
+        }
+        WorkflowCommand::Signal {
+            execution_id,
+            response,
+        } => signal_workflow_execution(execution_id, response, host, port, output_format).await,
+        WorkflowCommand::Cancel { execution_id } => {
+            cancel_workflow_execution(execution_id, host, port, output_format).await
+        }
+        WorkflowCommand::Remove { execution_id } => {
+            remove_workflow_execution(execution_id, host, port, output_format).await
+        }
     }
 }
 
@@ -240,9 +314,12 @@ async fn handle_executions_command(
     match command {
         ExecutionsCommand::List {
             limit,
-            workflow_id,
+            workflow,
             long,
-        } => list_workflow_executions(limit, workflow_id, long, host, port, output_format).await,
+        } => list_workflow_executions(limit, workflow, long, host, port, output_format).await,
+        ExecutionsCommand::Get { execution_id } => {
+            get_workflow_execution(execution_id, host, port, output_format).await
+        }
     }
 }
 
@@ -274,6 +351,9 @@ struct WorkflowRunOutput {
     name: String,
     execution_id: Uuid,
     follow: bool,
+    wait: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_execution: Option<crate::daemon::client::WorkflowExecutionInfo>,
 }
 
 struct WorkflowRunRequest {
@@ -282,6 +362,7 @@ struct WorkflowRunRequest {
     params: Vec<String>,
     blackboard: Option<String>,
     follow: bool,
+    wait: bool,
 }
 
 #[derive(Serialize)]
@@ -293,12 +374,18 @@ struct WorkflowListOutput {
 #[derive(Serialize)]
 struct WorkflowExecutionsOutput {
     count: usize,
-    executions: Vec<serde_json::Value>,
+    executions: Vec<crate::daemon::client::WorkflowExecutionInfo>,
 }
 
 #[derive(Serialize)]
 struct WorkflowDeleteOutput {
     name: String,
+    status: &'static str,
+}
+
+#[derive(Serialize)]
+struct WorkflowExecutionMutationOutput {
+    execution_id: Uuid,
     status: &'static str,
 }
 
@@ -520,9 +607,38 @@ async fn run_workflow(
         println!("{}", "📡 Streaming logs...".cyan());
         println!();
         client
-            .stream_workflow_logs(execution_id)
+            .stream_workflow_logs(
+                execution_id,
+                crate::daemon::client::WorkflowLogOptions {
+                    transitions_only: false,
+                    errors_only: false,
+                    verbose: false,
+                },
+            )
             .await
             .context("Failed to stream logs")?;
+    } else if request.wait {
+        if !output_format.is_structured() {
+            println!(
+                "{}",
+                format!("✓ Workflow execution started: {execution_id}").green()
+            );
+            println!("Waiting for completion...");
+        }
+        let final_execution =
+            wait_for_workflow_execution_completion(execution_id, &client, output_format).await?;
+        if output_format.is_structured() {
+            return render_serialized(
+                output_format,
+                &WorkflowRunOutput {
+                    name: request.name,
+                    execution_id,
+                    follow: request.follow,
+                    wait: request.wait,
+                    final_execution: Some(final_execution),
+                },
+            );
+        }
     } else if output_format.is_structured() {
         return render_serialized(
             output_format,
@@ -530,6 +646,8 @@ async fn run_workflow(
                 name: request.name,
                 execution_id,
                 follow: request.follow,
+                wait: request.wait,
+                final_execution: None,
             },
         );
     }
@@ -576,6 +694,35 @@ async fn parse_optional_object_input(
     }
 
     Ok(Some(parsed))
+}
+
+async fn wait_for_workflow_execution_completion(
+    execution_id: Uuid,
+    client: &DaemonClient,
+    output_format: OutputFormat,
+) -> Result<crate::daemon::client::WorkflowExecutionInfo> {
+    const MAX_POLLS: u32 = 300;
+    const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+    for _ in 0..MAX_POLLS {
+        let execution = client.get_workflow_execution(execution_id).await?;
+        let normalized = execution.status.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "completed" | "failed" | "cancelled" | "canceled" | "timed_out"
+        ) {
+            if !output_format.is_structured() {
+                println!(
+                    "Workflow execution {} finished with status: {}",
+                    execution.execution_id, execution.status
+                );
+            }
+            return Ok(execution);
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+
+    anyhow::bail!("Timed out waiting for workflow execution {execution_id} to finish");
 }
 
 fn parse_json_or_yaml(input: &str) -> Result<serde_json::Value> {
@@ -649,7 +796,16 @@ async fn generate_workflow(
         .context("Failed to start workflow generation execution")?;
 
     if follow {
-        client.stream_workflow_logs(execution_id).await?;
+        client
+            .stream_workflow_logs(
+                execution_id,
+                crate::daemon::client::WorkflowLogOptions {
+                    transitions_only: false,
+                    errors_only: false,
+                    verbose: false,
+                },
+            )
+            .await?;
     } else if output_format.is_structured() {
         return render_serialized(
             output_format,
@@ -779,7 +935,7 @@ async fn list_workflows(
 /// List recent workflow executions
 async fn list_workflow_executions(
     limit: usize,
-    workflow_id: Option<Uuid>,
+    workflow: Option<String>,
     long: bool,
     host: &str,
     port: u16,
@@ -799,6 +955,14 @@ async fn list_workflow_executions(
     }
 
     let client = DaemonClient::new(host, port)?;
+    let workflow_id = match workflow {
+        Some(ref raw) if Uuid::parse_str(raw).is_ok() => Some(Uuid::parse_str(raw)?),
+        Some(raw) => client
+            .lookup_workflow(&raw)
+            .await
+            .with_context(|| format!("Failed to resolve workflow '{raw}'"))?,
+        None => None,
+    };
     let executions = client
         .list_workflow_executions(limit, workflow_id)
         .await
@@ -826,14 +990,8 @@ async fn list_workflow_executions(
     println!();
 
     for execution in executions {
-        let execution_id = execution
-            .get("execution_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let status = execution
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
+        let execution_id = execution.execution_id;
+        let status = execution.status.as_str();
         let status_display = match status {
             "running" => status.green(),
             "completed" => status.cyan(),
@@ -844,22 +1002,30 @@ async fn list_workflow_executions(
 
         if long {
             println!("{}", format!("• {execution_id}").bold());
-            if let Some(wid) = execution.get("workflow_id").and_then(|v| v.as_str()) {
-                println!("  Workflow:     {wid}");
-            }
+            let workflow_name = execution.workflow_name.as_deref().unwrap_or("unknown");
+            println!(
+                "  Workflow:     {} ({})",
+                workflow_name, execution.workflow_id
+            );
             println!("  Status:       {status_display}");
-            if let Some(state) = execution.get("current_state").and_then(|v| v.as_str()) {
+            if let Some(state) = execution.current_state.as_deref() {
                 println!("  State:        {state}");
             }
-            if let Some(started) = execution.get("started_at").and_then(|v| v.as_str()) {
+            if let Some(started) = execution.started_at.as_deref() {
                 println!("  Started:      {started}");
             }
-            if let Some(updated) = execution.get("last_transition_at").and_then(|v| v.as_str()) {
+            if let Some(updated) = execution.last_transition_at.as_deref() {
                 println!("  Last updated: {updated}");
             }
             println!();
         } else {
-            println!("• {}  [{}]", execution_id.green(), status_display);
+            let workflow_name = execution.workflow_name.as_deref().unwrap_or("unknown");
+            println!(
+                "• {}  [{}]  {}",
+                execution_id.to_string().green(),
+                status_display,
+                workflow_name
+            );
         }
     }
 
@@ -911,6 +1077,7 @@ async fn stream_workflow_logs(
     follow: bool,
     transitions_only: bool,
     verbose: bool,
+    errors_only: bool,
     host: &str,
     port: u16,
 ) -> Result<()> {
@@ -933,27 +1100,176 @@ async fn stream_workflow_logs(
     if transitions_only {
         println!("   Filter:       State transitions only");
     }
+    if errors_only {
+        println!("   Filter:       Errors only");
+    }
     if verbose {
         println!("   Mode:         Verbose");
     }
     println!();
 
     let client = DaemonClient::new(host, port)?;
+    let options = crate::daemon::client::WorkflowLogOptions {
+        transitions_only,
+        errors_only,
+        verbose,
+    };
 
     if follow {
         client
-            .stream_workflow_logs(execution_id)
+            .stream_workflow_logs(execution_id, options)
             .await
             .context("Failed to stream logs")?;
     } else {
-        // Fetch logs once
         let logs = client
-            .get_workflow_logs(execution_id)
+            .get_workflow_logs(execution_id, options)
             .await
             .context("Failed to get logs")?;
-        println!("{logs}");
+        for event in logs {
+            print!(
+                "{}",
+                crate::daemon::client::format_workflow_log_event(&event, verbose)
+            );
+        }
     }
 
+    Ok(())
+}
+
+async fn get_workflow_execution(
+    execution_id: Uuid,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let daemon_status = check_daemon_running(host, port).await;
+    match daemon_status {
+        Ok(DaemonStatus::Running { .. }) => {}
+        _ => {
+            println!(
+                "{}",
+                "Workflow execution status requires the daemon to be running.".red()
+            );
+            println!("Run 'aegis daemon start' to start the daemon.");
+            return Ok(());
+        }
+    }
+
+    let client = DaemonClient::new(host, port)?;
+    let execution = client
+        .get_workflow_execution(execution_id)
+        .await
+        .context("Failed to get workflow execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(output_format, &execution);
+    }
+
+    println!("Workflow execution {execution_id}");
+    println!(
+        "  Workflow: {} ({})",
+        execution.workflow_name.as_deref().unwrap_or("unknown"),
+        execution.workflow_id
+    );
+    println!("  Status: {}", execution.status);
+    if let Some(state) = execution.current_state.as_deref() {
+        println!("  State: {state}");
+    }
+    if let Some(started_at) = execution.started_at.as_deref() {
+        println!("  Started: {started_at}");
+    }
+    if let Some(updated_at) = execution.last_transition_at.as_deref() {
+        println!("  Updated: {updated_at}");
+    }
+
+    Ok(())
+}
+
+async fn signal_workflow_execution(
+    execution_id: Uuid,
+    response: String,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let client = DaemonClient::new(host, port)?;
+    client
+        .signal_workflow_execution(execution_id, &response)
+        .await
+        .context("Failed to signal workflow execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &WorkflowExecutionMutationOutput {
+                execution_id,
+                status: "signalled",
+            },
+        );
+    }
+
+    println!(
+        "{}",
+        format!("✓ Workflow execution {execution_id} signalled").green()
+    );
+    Ok(())
+}
+
+async fn cancel_workflow_execution(
+    execution_id: Uuid,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let client = DaemonClient::new(host, port)?;
+    client
+        .cancel_workflow_execution(execution_id)
+        .await
+        .context("Failed to cancel workflow execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &WorkflowExecutionMutationOutput {
+                execution_id,
+                status: "cancelled",
+            },
+        );
+    }
+
+    println!(
+        "{}",
+        format!("✓ Workflow execution {execution_id} cancelled").green()
+    );
+    Ok(())
+}
+
+async fn remove_workflow_execution(
+    execution_id: Uuid,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let client = DaemonClient::new(host, port)?;
+    client
+        .remove_workflow_execution(execution_id)
+        .await
+        .context("Failed to remove workflow execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &WorkflowExecutionMutationOutput {
+                execution_id,
+                status: "removed",
+            },
+        );
+    }
+
+    println!(
+        "{}",
+        format!("✓ Workflow execution {execution_id} removed").green()
+    );
     Ok(())
 }
 

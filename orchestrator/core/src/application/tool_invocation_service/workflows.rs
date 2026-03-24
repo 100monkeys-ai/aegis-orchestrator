@@ -302,6 +302,25 @@ impl ToolInvocationService {
         }
     }
 
+    pub(super) async fn invoke_aegis_workflow_status_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let result = self.invoke_aegis_workflow_execution_get_tool(args).await?;
+        Ok(match result {
+            ToolInvocationResult::Direct(payload) => {
+                let mut payload = payload;
+                if let Some(tool) = payload.get_mut("tool") {
+                    *tool = serde_json::Value::String("aegis.workflow.status".to_string());
+                }
+                ToolInvocationResult::Direct(payload)
+            }
+            ToolInvocationResult::DispatchRequired(action) => {
+                ToolInvocationResult::DispatchRequired(action)
+            }
+        })
+    }
+
     pub(super) async fn invoke_aegis_workflow_generate_tool(
         &self,
         args: &Value,

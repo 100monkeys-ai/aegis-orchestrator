@@ -342,6 +342,21 @@ impl DaemonClient {
 
         Ok(Some(lookup_response.id))
     }
+
+    pub async fn lookup_workflow(&self, name: &str) -> Result<Option<Uuid>> {
+        let workflows = self.list_workflows().await?;
+        Ok(workflows.iter().find_map(|workflow| {
+            let workflow_name = workflow.get("name")?.as_str()?;
+            if workflow_name == name {
+                workflow
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|raw| Uuid::parse_str(raw).ok())
+            } else {
+                None
+            }
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -360,6 +375,63 @@ pub struct AgentInfo {
     pub version: String,
     pub description: String,
     pub status: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowExecutionInfo {
+    pub execution_id: Uuid,
+    pub workflow_id: Uuid,
+    #[serde(default)]
+    pub workflow_name: Option<String>,
+    pub status: String,
+    #[serde(default)]
+    pub current_state: Option<String>,
+    #[serde(default)]
+    pub started_at: Option<String>,
+    #[serde(default)]
+    pub last_transition_at: Option<String>,
+    #[serde(default)]
+    pub temporal_workflow_id: Option<String>,
+    #[serde(default)]
+    pub temporal_run_id: Option<String>,
+    #[serde(default)]
+    pub blackboard: Option<Value>,
+    #[serde(default)]
+    pub state_outputs: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WorkflowLogEvent {
+    pub execution_id: Uuid,
+    #[serde(default)]
+    pub workflow_id: Option<Uuid>,
+    #[serde(default)]
+    pub workflow_name: Option<String>,
+    pub event_type: String,
+    pub message: String,
+    #[serde(default)]
+    pub state_name: Option<String>,
+    #[serde(default)]
+    pub iteration_number: Option<u8>,
+    pub timestamp: String,
+    #[serde(default)]
+    pub details: Value,
+    #[serde(default)]
+    pub temporal_workflow_id: Option<String>,
+    #[serde(default)]
+    pub temporal_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowLogOptions {
+    pub transitions_only: bool,
+    pub errors_only: bool,
+    pub verbose: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WorkflowLogsResponse {
+    events: Vec<WorkflowLogEvent>,
 }
 
 async fn stream_correlated_events(
@@ -386,6 +458,104 @@ async fn stream_correlated_events(
     }
 
     Ok(())
+}
+
+async fn stream_workflow_events(
+    response: reqwest::Response,
+    options: WorkflowLogOptions,
+) -> Result<()> {
+    let mut stream = response.bytes_stream();
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("Failed to read workflow event stream chunk")?;
+        let text = String::from_utf8_lossy(&chunk);
+
+        for line in text.lines() {
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if let Ok(event) = serde_json::from_str::<WorkflowLogEvent>(json_str) {
+                    if should_skip_workflow_event(&event, options) {
+                        continue;
+                    }
+                    print!("{}", format_workflow_log_event(&event, options.verbose));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn should_skip_workflow_event(event: &WorkflowLogEvent, options: WorkflowLogOptions) -> bool {
+    (options.transitions_only && !is_transition_workflow_event(event))
+        || (options.errors_only && !is_error_workflow_event(event))
+}
+
+fn is_transition_workflow_event(event: &WorkflowLogEvent) -> bool {
+    matches!(
+        canonical_event_type(&event.event_type).as_str(),
+        "workflow_execution_started"
+            | "workflow_state_entered"
+            | "workflow_state_exited"
+            | "workflow_execution_completed"
+            | "workflow_execution_failed"
+            | "workflow_execution_cancelled"
+    )
+}
+
+fn is_error_workflow_event(event: &WorkflowLogEvent) -> bool {
+    matches!(
+        canonical_event_type(&event.event_type).as_str(),
+        "workflow_iteration_failed" | "workflow_execution_failed"
+    )
+}
+
+pub(crate) fn format_workflow_log_event(event: &WorkflowLogEvent, verbose: bool) -> String {
+    let mut output = format!("[{}] {}", event.timestamp, event.message);
+
+    if let Some(iteration) = event.iteration_number {
+        output.push_str(&format!(" (iteration {iteration})"));
+    }
+
+    if !verbose {
+        output.push('\n');
+        return output;
+    }
+
+    output.push('\n');
+    if let Some(workflow_name) = &event.workflow_name {
+        output.push_str(&format!("  Workflow:   {workflow_name}\n"));
+    }
+    if let Some(workflow_id) = event.workflow_id {
+        output.push_str(&format!("  Workflow ID: {workflow_id}\n"));
+    }
+    output.push_str(&format!(
+        "  Event:      {}\n",
+        canonical_event_type(&event.event_type)
+    ));
+    if let Some(state_name) = &event.state_name {
+        output.push_str(&format!("  State:      {state_name}\n"));
+    }
+    if let Some(iteration) = event.iteration_number {
+        output.push_str(&format!("  Iteration:  {iteration}\n"));
+    }
+    if let Some(temporal_workflow_id) = &event.temporal_workflow_id {
+        output.push_str(&format!("  Temporal workflow: {temporal_workflow_id}\n"));
+    }
+    if let Some(temporal_run_id) = &event.temporal_run_id {
+        output.push_str(&format!("  Temporal run:      {temporal_run_id}\n"));
+    }
+    if event.details != Value::Null && !event.details.is_null() {
+        let rendered = serde_json::to_string_pretty(&event.details)
+            .unwrap_or_else(|_| event.details.to_string());
+        output.push_str("  Details:\n");
+        for line in rendered.lines() {
+            output.push_str("    ");
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+
+    output
 }
 
 fn is_error_event(event: &CorrelatedActivityEvent) -> bool {
@@ -681,7 +851,7 @@ impl DaemonClient {
         &self,
         limit: usize,
         workflow_id: Option<uuid::Uuid>,
-    ) -> Result<Vec<serde_json::Value>> {
+    ) -> Result<Vec<WorkflowExecutionInfo>> {
         let mut url = format!("{}/v1/workflows/executions?limit={}", self.base_url, limit);
         if let Some(wid) = workflow_id {
             url.push_str(&format!("&workflow_id={wid}"));
@@ -699,7 +869,7 @@ impl DaemonClient {
             anyhow::bail!("Failed to list workflow executions: {error_text}");
         }
 
-        let executions: Vec<serde_json::Value> = response
+        let executions: Vec<WorkflowExecutionInfo> = response
             .json()
             .await
             .context("Failed to parse workflow executions response")?;
@@ -746,36 +916,121 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Stream workflow execution logs
-    pub async fn stream_workflow_logs(&self, execution_id: Uuid) -> Result<()> {
+    pub async fn get_workflow_execution(
+        &self,
+        execution_id: Uuid,
+    ) -> Result<WorkflowExecutionInfo> {
         let response = self
             .client
             .get(format!(
-                "{}/v1/workflows/executions/{}/logs",
+                "{}/v1/workflows/executions/{}",
                 self.base_url, execution_id
             ))
             .send()
             .await
-            .context("Failed to connect to log stream")?;
+            .context("Failed to get workflow execution")?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to stream logs: {error_text}");
+            anyhow::bail!("Failed to get workflow execution: {error_text}");
         }
 
-        let mut stream = response.bytes_stream();
+        response
+            .json()
+            .await
+            .context("Failed to parse workflow execution response")
+    }
 
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.context("Failed to read log chunk")?;
-            let text = String::from_utf8_lossy(&chunk);
-            print!("{text}");
+    pub async fn signal_workflow_execution(
+        &self,
+        execution_id: Uuid,
+        response_text: &str,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/workflows/executions/{}/signal",
+                self.base_url, execution_id
+            ))
+            .json(&serde_json::json!({ "response": response_text }))
+            .send()
+            .await
+            .context("Failed to signal workflow execution")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to signal workflow execution: {error_text}");
         }
 
         Ok(())
     }
 
-    /// Get workflow execution logs (non-streaming)
-    pub async fn get_workflow_logs(&self, execution_id: Uuid) -> Result<String> {
+    pub async fn cancel_workflow_execution(&self, execution_id: Uuid) -> Result<()> {
+        let response = self
+            .client
+            .post(format!(
+                "{}/v1/workflows/executions/{}/cancel",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to cancel workflow execution")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to cancel workflow execution: {error_text}");
+        }
+
+        Ok(())
+    }
+
+    pub async fn remove_workflow_execution(&self, execution_id: Uuid) -> Result<()> {
+        let response = self
+            .client
+            .delete(format!(
+                "{}/v1/workflows/executions/{}",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to remove workflow execution")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to remove workflow execution: {error_text}");
+        }
+
+        Ok(())
+    }
+
+    pub async fn stream_workflow_logs(
+        &self,
+        execution_id: Uuid,
+        options: WorkflowLogOptions,
+    ) -> Result<()> {
+        let response = self
+            .client
+            .get(format!(
+                "{}/v1/workflows/executions/{}/logs/stream",
+                self.base_url, execution_id
+            ))
+            .send()
+            .await
+            .context("Failed to connect to workflow log stream")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to stream workflow logs: {error_text}");
+        }
+
+        stream_workflow_events(response, options).await
+    }
+
+    pub async fn get_workflow_logs(
+        &self,
+        execution_id: Uuid,
+        options: WorkflowLogOptions,
+    ) -> Result<Vec<WorkflowLogEvent>> {
         let response = self
             .client
             .get(format!(
@@ -784,16 +1039,23 @@ impl DaemonClient {
             ))
             .send()
             .await
-            .context("Failed to get logs")?;
+            .context("Failed to get workflow logs")?;
 
         if !response.status().is_success() {
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Failed to get logs: {error_text}");
+            anyhow::bail!("Failed to get workflow logs: {error_text}");
         }
 
-        let logs = response.text().await.context("Failed to read logs")?;
+        let payload: WorkflowLogsResponse = response
+            .json()
+            .await
+            .context("Failed to parse workflow logs response")?;
 
-        Ok(logs)
+        Ok(payload
+            .events
+            .into_iter()
+            .filter(|event| !should_skip_workflow_event(event, options))
+            .collect())
     }
 }
 

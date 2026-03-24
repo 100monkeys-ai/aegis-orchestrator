@@ -132,6 +132,32 @@ pub struct ToolRouter {
 }
 
 impl ToolRouter {
+    fn is_supported_builtin_workflow_tool(tool_name: &str) -> bool {
+        matches!(
+            tool_name,
+            "aegis.workflow.create"
+                | "aegis.workflow.list"
+                | "aegis.workflow.validate"
+                | "aegis.workflow.update"
+                | "aegis.workflow.export"
+                | "aegis.workflow.delete"
+                | "aegis.workflow.run"
+                | "aegis.workflow.executions.list"
+                | "aegis.workflow.executions.get"
+                | "aegis.workflow.status"
+                | "aegis.workflow.generate"
+                | "aegis.workflow.logs"
+        )
+    }
+
+    fn should_advertise_builtin_tool(tool_name: &str) -> bool {
+        if tool_name.starts_with("aegis.workflow.") {
+            return Self::is_supported_builtin_workflow_tool(tool_name);
+        }
+
+        true
+    }
+
     pub fn new(
         registry: Arc<dyn ToolRegistry>,
         servers: Arc<RwLock<HashMap<ToolServerId, ToolServer>>>,
@@ -288,6 +314,10 @@ impl ToolRouter {
 
         for dispatcher in &self.builtin_dispatchers {
             for cap in &dispatcher.capabilities {
+                if !Self::should_advertise_builtin_tool(&cap.name) {
+                    continue;
+                }
+
                 let schema = match cap.name.as_str() {
                     "cmd.run" => json!({
                         "type": "object",
@@ -621,7 +651,7 @@ impl ToolRouter {
                             },
                             "workflow_id": {
                                 "type": "string",
-                                "description": "Optional workflow UUID filter."
+                                "description": "Optional workflow UUID or workflow name filter."
                             },
                             "tenant_id": {
                                 "type": "string",
@@ -630,6 +660,20 @@ impl ToolRouter {
                         }
                     }),
                     "aegis.workflow.executions.get" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to inspect."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.workflow.status" => json!({
                         "type": "object",
                         "properties": {
                             "execution_id": {
@@ -1283,6 +1327,15 @@ mod tests {
                     skip_judge: true,
                 }],
             },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.status".to_string(),
+                description: "Inspect workflow execution state".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.status".to_string(),
+                    skip_judge: true,
+                }],
+            },
         ];
 
         let router = ToolRouter::new(registry, servers, builtins);
@@ -1329,5 +1382,66 @@ mod tests {
             task_logs_schema["properties"]["offset"]["default"],
             json!(0)
         );
+
+        let workflow_status_tool = tools.iter().find(|t| t.name == "aegis.workflow.status");
+        assert!(
+            workflow_status_tool.is_some(),
+            "expected aegis.workflow.status tool"
+        );
+        let workflow_status_schema = &workflow_status_tool.unwrap().input_schema;
+        assert_eq!(
+            workflow_status_schema["required"][0].as_str(),
+            Some("execution_id"),
+            "execution_id must be required for aegis.workflow.status"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_tools_skips_unimplemented_workflow_builtins() {
+        let registry = Arc::new(InMemoryToolRegistry::new());
+        let servers = Arc::new(RwLock::new(HashMap::new()));
+
+        let builtins = vec![
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.cancel".to_string(),
+                description: "Cancel workflow executions".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.cancel".to_string(),
+                    skip_judge: false,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.signal".to_string(),
+                description: "Signal workflow executions".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.signal".to_string(),
+                    skip_judge: false,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.status".to_string(),
+                description: "Inspect workflow execution state".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.status".to_string(),
+                    skip_judge: true,
+                }],
+            },
+        ];
+
+        let router = ToolRouter::new(registry, servers, builtins);
+        let tools = router.list_tools().await.unwrap();
+
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.status"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.cancel"));
+        assert!(!tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.signal"));
     }
 }

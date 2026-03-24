@@ -28,7 +28,7 @@ use axum::{
 
 const DEFAULT_ORCHESTRATOR_URL: &str = "http://localhost:8088";
 use futures::StreamExt;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -39,13 +39,22 @@ type RepositoryTuple = (
     Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository>,
 );
 use sqlx::postgres::PgPool;
+use sqlx::Row;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::signal;
+use tonic::transport::Channel;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use super::{remove_pid_file, write_pid_file};
+use aegis_orchestrator_core::domain::events::WorkflowEvent;
+use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution as TemporalWorkflowExecution;
+use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::{
+    workflow_service_client::WorkflowServiceClient, DeleteWorkflowExecutionRequest,
+    RequestCancelWorkflowExecutionRequest,
+};
+use aegis_orchestrator_core::runtime::AgentRuntime;
 use aegis_orchestrator_core::{
     application::{
         agent::AgentLifecycleService,
@@ -63,11 +72,12 @@ use aegis_orchestrator_core::{
     domain::{
         agent::AgentId,
         cluster::{NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole},
-        execution::ExecutionId,
         execution::ExecutionInput,
+        execution::{ExecutionId, ExecutionStatus},
         iam::{IdentityKind, IdentityProvider, UserIdentity},
         node_config::{resolve_env_value, NodeConfigManifest},
         repository::AgentRepository,
+        runtime::InstanceId,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
         tenant::TenantId,
@@ -80,7 +90,7 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::DockerRuntime,
+        runtime::{DockerRuntime, ManagedAgentContainer},
         temporal_client::TemporalClient,
         TemporalEventListener, TemporalEventPayload,
     },
@@ -204,6 +214,90 @@ struct LimitQuery {
 
 fn bounded_limit(limit: Option<usize>, default: usize, maximum: usize) -> usize {
     limit.unwrap_or(default).min(maximum).max(1)
+}
+
+fn managed_container_reap_reason(
+    container: &ManagedAgentContainer,
+    execution_status: Option<ExecutionStatus>,
+) -> Option<&'static str> {
+    if container.debug_retain {
+        return None;
+    }
+
+    match execution_status {
+        None => Some("missing_execution_record"),
+        Some(ExecutionStatus::Running) if container.state.as_deref() == Some("running") => None,
+        Some(ExecutionStatus::Running) => Some("container_not_running"),
+        Some(_) => Some("execution_not_running"),
+    }
+}
+
+async fn cleanup_orphaned_agent_containers(
+    runtime: Arc<DockerRuntime>,
+    execution_repo: Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
+) -> Result<usize> {
+    let containers = runtime.list_managed_agent_containers().await?;
+    let mut reaped = 0usize;
+
+    for container in containers {
+        if container.debug_retain {
+            continue;
+        }
+
+        let execution_status = match container.execution_id.as_deref() {
+            Some(raw_execution_id) => match ExecutionId::from_string(raw_execution_id) {
+                Ok(execution_id) => match execution_repo.find_by_id(execution_id).await {
+                    Ok(Some(execution)) => Some(execution.status),
+                    Ok(None) => None,
+                    Err(error) => {
+                        warn!(
+                            container_id = %container.id,
+                            execution_id = raw_execution_id,
+                            error = %error,
+                            "Failed to look up execution for managed container; skipping"
+                        );
+                        continue;
+                    }
+                },
+                Err(error) => {
+                    warn!(
+                        container_id = %container.id,
+                        execution_id = raw_execution_id,
+                        error = %error,
+                        "Managed container has invalid execution_id label; treating as orphan"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        let Some(reason) = managed_container_reap_reason(&container, execution_status) else {
+            continue;
+        };
+
+        let instance_id = InstanceId::new(container.id.clone());
+        info!(
+            container_id = %container.id,
+            execution_id = container.execution_id.as_deref().unwrap_or("missing"),
+            container_state = container.state.as_deref().unwrap_or("unknown"),
+            reason,
+            "Reaping orphaned managed agent container"
+        );
+
+        if let Err(error) = runtime.terminate(&instance_id).await {
+            warn!(
+                container_id = %container.id,
+                error = %error,
+                "Failed to reap orphaned managed agent container"
+            );
+            continue;
+        }
+
+        reaped += 1;
+    }
+
+    Ok(reaped)
 }
 
 fn cluster_role_to_string(role: &NodeRole) -> String {
@@ -779,6 +873,34 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     });
     println!("✓ Volume cleanup background task spawned (interval: 5 minutes)");
+
+    let agent_container_reaper_runtime = runtime.clone();
+    let agent_container_reaper_execution_repo = execution_repo.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        loop {
+            interval.tick().await;
+            match cleanup_orphaned_agent_containers(
+                agent_container_reaper_runtime.clone(),
+                agent_container_reaper_execution_repo.clone(),
+            )
+            .await
+            {
+                Ok(count) => {
+                    if count > 0 {
+                        tracing::info!(
+                            "Agent container cleanup: {} orphaned container(s) deleted",
+                            count
+                        );
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Agent container cleanup failed: {}", e);
+                }
+            }
+        }
+    });
+    println!("✓ Agent container cleanup background task spawned (interval: 5 minutes)");
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
     println!("Initializing Storage Event Persister...");
@@ -2345,15 +2467,23 @@ fn create_router(
         )
         .route(
             "/v1/workflows/executions/{execution_id}",
-            get(get_workflow_execution_handler),
+            get(get_workflow_execution_handler).delete(remove_workflow_execution_handler),
         )
         .route(
             "/v1/workflows/executions/{execution_id}/logs",
+            get(get_workflow_logs_handler),
+        )
+        .route(
+            "/v1/workflows/executions/{execution_id}/logs/stream",
             get(stream_workflow_logs_handler),
         )
         .route(
             "/v1/workflows/executions/{execution_id}/signal",
             post(signal_workflow_execution_handler),
+        )
+        .route(
+            "/v1/workflows/executions/{execution_id}/cancel",
+            post(cancel_workflow_execution_handler),
         )
         .route("/v1/temporal-events", post(temporal_events_handler))
         .route("/v1/human-approvals", get(list_pending_approvals_handler))
@@ -3156,19 +3286,40 @@ async fn list_workflow_executions_handler(
         .get("offset")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    let workflow_id = params
+        .get("workflow_id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+        .map(aegis_orchestrator_core::domain::workflow::WorkflowId);
 
-    match state
-        .workflow_execution_repo
-        .list_paginated_for_tenant(&tenant_id, limit, offset)
-        .await
-    {
+    let repo_result = if let Some(workflow_id) = workflow_id {
+        state
+            .workflow_execution_repo
+            .find_by_workflow_for_tenant(&tenant_id, workflow_id, limit, offset)
+            .await
+    } else {
+        state
+            .workflow_execution_repo
+            .list_paginated_for_tenant(&tenant_id, limit, offset)
+            .await
+    };
+
+    match repo_result {
         Ok(executions) => {
+            let workflow_ids: Vec<_> = executions
+                .iter()
+                .map(|execution| execution.workflow_id)
+                .collect();
+            let workflow_name_map =
+                workflow_name_map_for_ids(state.workflow_repo.clone(), &tenant_id, &workflow_ids)
+                    .await;
             let list: Vec<serde_json::Value> = executions
                 .iter()
                 .map(|e| {
+                    let workflow_name = workflow_name_map.get(&e.workflow_id.0).cloned();
                     serde_json::json!({
                         "execution_id": e.id.0,
                         "workflow_id": e.workflow_id.0,
+                        "workflow_name": workflow_name,
                         "status": format!("{:?}", e.status).to_lowercase(),
                         "current_state": e.current_state.as_str(),
                         "started_at": e.started_at,
@@ -3254,12 +3405,12 @@ async fn get_workflow_execution_handler(
     Path(execution_id): Path<Uuid>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match state
+    let execution = match state
         .workflow_execution_repo
         .find_by_id_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(Some(_)) => {}
+        Ok(Some(execution)) => execution,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -3274,73 +3425,408 @@ async fn get_workflow_execution_handler(
             )
                 .into_response();
         }
-    }
-
-    let guard = state.temporal_client_container.read().await;
-    let client = match guard.as_ref() {
-        Some(c) => c.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "error": "Temporal client not yet connected"
-                })),
-            )
-                .into_response();
-        }
     };
-    drop(guard);
 
-    match client
-        .get_workflow_history(execution_id.to_string(), None)
+    let workflow_name = match state
+        .workflow_repo
+        .find_by_id_for_tenant(&tenant_id, execution.workflow_id)
         .await
     {
-        Ok(history) => {
-            let event_count = history.len();
-            let status = if let Some(last) = history.last() {
-                let event_label = format!("{:?}", last.event_type());
-                if event_label.contains("Completed") {
-                    "completed"
-                } else if event_label.contains("Failed") {
-                    "failed"
-                } else if event_label.contains("TimedOut") {
-                    "timed_out"
-                } else if event_label.contains("Terminated") || event_label.contains("Cancelled") {
-                    "cancelled"
-                } else {
-                    "running"
-                }
-            } else {
-                "pending"
-            };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "execution_id": execution_id.to_string(),
-                    "status": status,
-                    "event_count": event_count,
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("NOT_FOUND") || msg.contains("not found") {
-                return (
-                    StatusCode::NOT_FOUND,
-                    Json(serde_json::json!({
-                        "error": "Workflow execution not found"
-                    })),
-                )
-                    .into_response();
+        Ok(Some(workflow)) => Some(workflow.metadata.name),
+        _ => None,
+    };
+
+    let temporal_linkage =
+        match workflow_execution_temporal_linkage(&state.config, execution_id).await {
+            Ok(linkage) => linkage,
+            Err(error) => {
+                tracing::warn!(
+                    "Failed to load workflow execution linkage for {}: {}",
+                    execution_id,
+                    error
+                );
+                None
             }
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": msg })),
-            )
-                .into_response()
+        };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "execution_id": execution.id.0,
+            "workflow_id": execution.workflow_id.0,
+            "workflow_name": workflow_name,
+            "status": format!("{:?}", execution.status).to_lowercase(),
+            "current_state": execution.current_state.as_str(),
+            "started_at": execution.started_at,
+            "last_transition_at": execution.last_transition_at,
+            "blackboard": execution.blackboard.to_json(),
+            "state_outputs": execution.state_outputs,
+            "temporal_workflow_id": temporal_linkage.as_ref().map(|linkage| linkage.temporal_workflow_id.clone()),
+            "temporal_run_id": temporal_linkage.as_ref().map(|linkage| linkage.temporal_run_id.clone()),
+        })),
+    )
+        .into_response()
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct WorkflowLogEventView {
+    execution_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow_name: Option<String>,
+    event_type: String,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    state_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    iteration_number: Option<u8>,
+    timestamp: String,
+    details: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_workflow_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temporal_run_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct WorkflowExecutionTemporalLinkage {
+    temporal_workflow_id: String,
+    temporal_run_id: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct WorkflowLogQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+async fn workflow_name_map_for_ids(
+    workflow_repo: Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowRepository>,
+    tenant_id: &TenantId,
+    workflow_ids: &[aegis_orchestrator_core::domain::workflow::WorkflowId],
+) -> HashMap<Uuid, String> {
+    let mut map = HashMap::new();
+    for workflow_id in workflow_ids {
+        if map.contains_key(&workflow_id.0) {
+            continue;
+        }
+        if let Ok(Some(workflow)) = workflow_repo
+            .find_by_id_for_tenant(tenant_id, *workflow_id)
+            .await
+        {
+            map.insert(workflow_id.0, workflow.metadata.name);
         }
     }
+    map
+}
+
+fn workflow_event_message(event: &WorkflowEvent) -> String {
+    match event {
+        WorkflowEvent::WorkflowExecutionStarted { .. } => "Workflow execution started".to_string(),
+        WorkflowEvent::WorkflowStateEntered { state_name, .. } => {
+            format!("Entered workflow state {state_name}")
+        }
+        WorkflowEvent::WorkflowStateExited { state_name, .. } => {
+            format!("Exited workflow state {state_name}")
+        }
+        WorkflowEvent::WorkflowIterationStarted {
+            iteration_number, ..
+        } => format!("Workflow iteration {iteration_number} started"),
+        WorkflowEvent::WorkflowIterationCompleted {
+            iteration_number, ..
+        } => format!("Workflow iteration {iteration_number} completed"),
+        WorkflowEvent::WorkflowIterationFailed {
+            iteration_number,
+            error,
+            ..
+        } => format!("Workflow iteration {iteration_number} failed: {error}"),
+        WorkflowEvent::WorkflowExecutionCompleted { .. } => {
+            "Workflow execution completed".to_string()
+        }
+        WorkflowEvent::WorkflowExecutionFailed { reason, .. } => {
+            format!("Workflow execution failed: {reason}")
+        }
+        WorkflowEvent::WorkflowExecutionCancelled { .. } => {
+            "Workflow execution cancelled".to_string()
+        }
+        WorkflowEvent::WorkflowRegistered { name, .. } => {
+            format!("Workflow {name} registered")
+        }
+    }
+}
+
+fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
+    match event {
+        WorkflowEvent::WorkflowRegistered { .. } => "WorkflowRegistered",
+        WorkflowEvent::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
+        WorkflowEvent::WorkflowStateEntered { .. } => "WorkflowStateEntered",
+        WorkflowEvent::WorkflowStateExited { .. } => "WorkflowStateExited",
+        WorkflowEvent::WorkflowIterationStarted { .. } => "WorkflowIterationStarted",
+        WorkflowEvent::WorkflowIterationCompleted { .. } => "WorkflowIterationCompleted",
+        WorkflowEvent::WorkflowIterationFailed { .. } => "WorkflowIterationFailed",
+        WorkflowEvent::WorkflowExecutionCompleted { .. } => "WorkflowExecutionCompleted",
+        WorkflowEvent::WorkflowExecutionFailed { .. } => "WorkflowExecutionFailed",
+        WorkflowEvent::WorkflowExecutionCancelled { .. } => "WorkflowExecutionCancelled",
+    }
+}
+
+fn workflow_event_view_from_domain(
+    event: &WorkflowEvent,
+    workflow_name: Option<String>,
+    workflow_id: Option<Uuid>,
+    temporal_linkage: Option<&WorkflowExecutionTemporalLinkage>,
+) -> WorkflowLogEventView {
+    let (execution_id, state_name, iteration_number, timestamp, details) = match event {
+        WorkflowEvent::WorkflowRegistered { registered_at, .. } => (
+            Uuid::nil(),
+            None,
+            None,
+            registered_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowExecutionStarted {
+            execution_id,
+            started_at,
+            ..
+        } => (
+            execution_id.0,
+            None,
+            None,
+            started_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowStateEntered {
+            execution_id,
+            state_name,
+            entered_at,
+        } => (
+            execution_id.0,
+            Some(state_name.clone()),
+            None,
+            entered_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowStateExited {
+            execution_id,
+            state_name,
+            exited_at,
+            ..
+        } => (
+            execution_id.0,
+            Some(state_name.clone()),
+            None,
+            exited_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowIterationStarted {
+            execution_id,
+            iteration_number,
+            started_at,
+        } => (
+            execution_id.0,
+            None,
+            Some(*iteration_number),
+            started_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowIterationCompleted {
+            execution_id,
+            iteration_number,
+            completed_at,
+            ..
+        } => (
+            execution_id.0,
+            None,
+            Some(*iteration_number),
+            completed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowIterationFailed {
+            execution_id,
+            iteration_number,
+            failed_at,
+            ..
+        } => (
+            execution_id.0,
+            None,
+            Some(*iteration_number),
+            failed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowExecutionCompleted {
+            execution_id,
+            completed_at,
+            ..
+        } => (
+            execution_id.0,
+            None,
+            None,
+            completed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowExecutionFailed {
+            execution_id,
+            failed_at,
+            ..
+        } => (
+            execution_id.0,
+            None,
+            None,
+            failed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowExecutionCancelled {
+            execution_id,
+            cancelled_at,
+        } => (
+            execution_id.0,
+            None,
+            None,
+            cancelled_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+    };
+
+    WorkflowLogEventView {
+        execution_id,
+        workflow_id,
+        workflow_name,
+        event_type: workflow_event_type_name(event).to_string(),
+        message: workflow_event_message(event),
+        state_name,
+        iteration_number,
+        timestamp,
+        details,
+        temporal_workflow_id: temporal_linkage.map(|linkage| linkage.temporal_workflow_id.clone()),
+        temporal_run_id: temporal_linkage.map(|linkage| linkage.temporal_run_id.clone()),
+    }
+}
+
+fn workflow_log_event_from_payload(
+    execution_id: ExecutionId,
+    workflow_id: Uuid,
+    workflow_name: Option<String>,
+    payload: TemporalEventPayload,
+    temporal_linkage: Option<&WorkflowExecutionTemporalLinkage>,
+) -> WorkflowLogEventView {
+    let event_type = payload.event_type.clone();
+    let message = match event_type.as_str() {
+        "WorkflowExecutionStarted" => "Workflow execution started".to_string(),
+        "WorkflowStateEntered" => payload
+            .state_name
+            .as_ref()
+            .map(|name| format!("Entered workflow state {name}"))
+            .unwrap_or_else(|| "Entered workflow state".to_string()),
+        "WorkflowStateExited" => payload
+            .state_name
+            .as_ref()
+            .map(|name| format!("Exited workflow state {name}"))
+            .unwrap_or_else(|| "Exited workflow state".to_string()),
+        "WorkflowIterationStarted" => payload
+            .iteration_number
+            .map(|iteration| format!("Workflow iteration {iteration} started"))
+            .unwrap_or_else(|| "Workflow iteration started".to_string()),
+        "WorkflowIterationCompleted" => payload
+            .iteration_number
+            .map(|iteration| format!("Workflow iteration {iteration} completed"))
+            .unwrap_or_else(|| "Workflow iteration completed".to_string()),
+        "WorkflowIterationFailed" => match (payload.iteration_number, payload.error.as_deref()) {
+            (Some(iteration), Some(error)) => {
+                format!("Workflow iteration {iteration} failed: {error}")
+            }
+            (Some(iteration), None) => format!("Workflow iteration {iteration} failed"),
+            _ => "Workflow iteration failed".to_string(),
+        },
+        "WorkflowExecutionCompleted" => "Workflow execution completed".to_string(),
+        "WorkflowExecutionFailed" => payload
+            .error
+            .as_ref()
+            .map(|error| format!("Workflow execution failed: {error}"))
+            .unwrap_or_else(|| "Workflow execution failed".to_string()),
+        "WorkflowExecutionCancelled" => "Workflow execution cancelled".to_string(),
+        _ => event_type.clone(),
+    };
+
+    WorkflowLogEventView {
+        execution_id: execution_id.0,
+        workflow_id: Some(workflow_id),
+        workflow_name,
+        event_type,
+        message,
+        state_name: payload.state_name.clone(),
+        iteration_number: payload.iteration_number,
+        timestamp: payload.timestamp.clone(),
+        details: serde_json::to_value(&payload).unwrap_or(serde_json::Value::Null),
+        temporal_workflow_id: temporal_linkage.map(|linkage| linkage.temporal_workflow_id.clone()),
+        temporal_run_id: temporal_linkage.map(|linkage| linkage.temporal_run_id.clone()),
+    }
+}
+
+async fn workflow_execution_temporal_linkage(
+    config: &NodeConfigManifest,
+    execution_id: Uuid,
+) -> Result<Option<WorkflowExecutionTemporalLinkage>> {
+    let Some(database) = config.spec.database.as_ref() else {
+        return Ok(None);
+    };
+    let database_url = resolve_env_value(&database.url)
+        .with_context(|| "Failed to resolve database URL for workflow execution linkage")?;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .context("Failed to connect to PostgreSQL for workflow execution linkage")?;
+
+    let row = sqlx::query(
+        r#"
+        SELECT temporal_workflow_id, temporal_run_id
+        FROM workflow_executions
+        WHERE id = $1
+        "#,
+    )
+    .bind(execution_id)
+    .fetch_optional(&pool)
+    .await
+    .context("Failed to query workflow execution linkage")?;
+
+    Ok(row.map(|row| WorkflowExecutionTemporalLinkage {
+        temporal_workflow_id: row.get("temporal_workflow_id"),
+        temporal_run_id: row.get("temporal_run_id"),
+    }))
+}
+
+async fn connect_temporal_workflow_client(
+    config: &NodeConfigManifest,
+) -> Result<WorkflowServiceClient<Channel>> {
+    let temporal = config
+        .spec
+        .temporal
+        .as_ref()
+        .context("Temporal configuration is not available")?;
+    let address = resolve_env_value(&temporal.address).unwrap_or_else(|_| temporal.address.clone());
+    let endpoint = if address.contains("://") {
+        address
+    } else {
+        format!("http://{address}")
+    };
+    let channel = Channel::from_shared(endpoint)
+        .context("Invalid Temporal address")?
+        .connect()
+        .await
+        .context("Failed to connect to Temporal server")?;
+    Ok(WorkflowServiceClient::new(channel))
+}
+
+fn temporal_namespace(config: &NodeConfigManifest) -> Result<String> {
+    let temporal = config
+        .spec
+        .temporal
+        .as_ref()
+        .context("Temporal configuration is not available")?;
+    Ok(resolve_env_value(&temporal.namespace).unwrap_or_else(|_| temporal.namespace.clone()))
 }
 
 #[derive(serde::Deserialize)]
@@ -3402,62 +3888,316 @@ async fn signal_workflow_execution_handler(
     }
 }
 
-/// GET /v1/workflows/executions/:execution_id/logs - Stream workflow logs
-/// GET /v1/workflows/executions/:execution_id/logs - Stream workflow logs
-async fn stream_workflow_logs_handler(
+/// GET /v1/workflows/executions/:execution_id/logs - List workflow log events
+async fn get_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
+    Query(params): Query<WorkflowLogQuery>,
 ) -> impl IntoResponse {
-    use std::fmt::Write;
-
-    // Get Temporal Client
-    let client_opt = state.temporal_client_container.read().await;
-    let client = match &*client_opt {
-        Some(c) => c,
-        None => {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let execution_id = ExecutionId(execution_id);
+    let execution = match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, execution_id)
+        .await
+    {
+        Ok(Some(execution)) => execution,
+        Ok(None) => {
             return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Temporal client not available".to_string(),
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "workflow execution not found"})),
             )
+                .into_response();
+        }
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
         }
     };
 
-    // Fetch history
-    // Note: This returns existing history. A dedicated loop (for example with
-    // wait-for-new-event semantics) is required for live streaming.
-    match client
-        .get_workflow_history(execution_id.to_string(), None)
+    let workflow_name = match state
+        .workflow_repo
+        .find_by_id_for_tenant(&tenant_id, execution.workflow_id)
         .await
     {
-        Ok(history) => {
-            let mut output = String::new();
-            for event in history {
-                // Approximate timestamp formatting
-                let timestamp = event
-                    .event_time
-                    .map(|t| {
-                        let secs = t.seconds;
-                        let nanos = t.nanos;
-                        if let Some(dt) = chrono::DateTime::from_timestamp(secs, nanos as u32) {
-                            dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
-                        } else {
-                            "Unknown Time".to_string()
-                        }
-                    })
-                    .unwrap_or_else(|| "Unknown Time".to_string());
+        Ok(Some(workflow)) => Some(workflow.metadata.name),
+        _ => None,
+    };
+    let temporal_linkage = workflow_execution_temporal_linkage(&state.config, execution.id.0)
+        .await
+        .ok()
+        .flatten();
+    let limit = params.limit.unwrap_or(100);
+    let offset = params.offset.unwrap_or(0);
 
-                let event_type = event.event_type(); // Enum
+    match state
+        .workflow_execution_repo
+        .find_events_by_execution(execution.id, limit, offset)
+        .await
+    {
+        Ok(events) => {
+            let transformed: Vec<WorkflowLogEventView> = events
+                .into_iter()
+                .map(|record| {
+                    let payload = serde_json::from_value::<TemporalEventPayload>(record.payload)
+                        .unwrap_or(TemporalEventPayload {
+                            event_type: record.event_type.clone(),
+                            execution_id: execution.id.to_string(),
+                            temporal_sequence_number: record.sequence,
+                            workflow_id: Some(execution.workflow_id.to_string()),
+                            state_name: record.state_name.clone(),
+                            output: None,
+                            error: None,
+                            iteration_number: record.iteration_number,
+                            final_blackboard: None,
+                            artifacts: None,
+                            agent_id: None,
+                            code_diff: None,
+                            timestamp: record.recorded_at.to_rfc3339(),
+                        });
+                    workflow_log_event_from_payload(
+                        execution.id,
+                        execution.workflow_id.0,
+                        workflow_name.clone(),
+                        payload,
+                        temporal_linkage.as_ref(),
+                    )
+                })
+                .collect();
 
-                let _ = writeln!(output, "[{timestamp}] {event_type:?}");
-
-                // Event type is currently sufficient for a concise log view.
-            }
-            (StatusCode::OK, output)
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "execution_id": execution.id.0,
+                    "events": transformed,
+                    "count": transformed.len(),
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
         }
-        Err(e) => (
+        Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to get workflow logs: {e}"),
-        ),
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// GET /v1/workflows/executions/:execution_id/logs/stream - Stream workflow log events
+async fn stream_workflow_logs_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(execution_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let mk_sse = |stream: std::pin::Pin<
+        Box<
+            dyn futures::Stream<
+                    Item = std::result::Result<axum::response::sse::Event, anyhow::Error>,
+                > + Send,
+        >,
+    >| { Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()) };
+
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let execution_id = ExecutionId(execution_id);
+    let execution = match state
+        .workflow_execution_repo
+        .find_by_id_for_tenant(&tenant_id, execution_id)
+        .await
+    {
+        Ok(Some(execution)) => execution,
+        _ => {
+            let stream = async_stream::stream! {
+                yield Ok::<_, anyhow::Error>(Event::default().data(
+                    serde_json::json!({"error": "workflow execution not found"}).to_string()
+                ));
+            };
+            return mk_sse(Box::pin(stream));
+        }
+    };
+
+    let workflow_name = match state
+        .workflow_repo
+        .find_by_id_for_tenant(&tenant_id, execution.workflow_id)
+        .await
+    {
+        Ok(Some(workflow)) => Some(workflow.metadata.name),
+        _ => None,
+    };
+    let temporal_linkage = workflow_execution_temporal_linkage(&state.config, execution.id.0)
+        .await
+        .ok()
+        .flatten();
+    let event_bus = state.event_bus.clone();
+    let stream = async_stream::stream! {
+        let mut receiver = event_bus.subscribe_workflow_execution(execution.id);
+        loop {
+            match receiver.recv().await {
+                Ok(event) => {
+                    let payload = serde_json::to_string(&workflow_event_view_from_domain(
+                        &event,
+                        workflow_name.clone(),
+                        Some(execution.workflow_id.0),
+                        temporal_linkage.as_ref(),
+                    ))?;
+                    let terminal = matches!(
+                        event,
+                        WorkflowEvent::WorkflowExecutionCompleted { .. }
+                            | WorkflowEvent::WorkflowExecutionFailed { .. }
+                            | WorkflowEvent::WorkflowExecutionCancelled { .. }
+                    );
+                    yield Ok::<_, anyhow::Error>(Event::default().data(payload));
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Closed) => break,
+                Err(_) => continue,
+            }
+        }
+    };
+
+    mk_sse(Box::pin(stream))
+}
+
+async fn cancel_workflow_execution_handler(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let namespace = match temporal_namespace(&state.config) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    match connect_temporal_workflow_client(&state.config).await {
+        Ok(mut client) => {
+            let request = RequestCancelWorkflowExecutionRequest {
+                namespace,
+                workflow_execution: Some(TemporalWorkflowExecution {
+                    workflow_id: execution_id.to_string(),
+                    run_id: String::new(),
+                }),
+                identity: "aegis-daemon".to_string(),
+                request_id: Uuid::new_v4().to_string(),
+                first_execution_run_id: String::new(),
+                reason: "Cancelled by aegis workflow cancel".to_string(),
+                links: Vec::new(),
+            };
+            match client.request_cancel_workflow_execution(request).await {
+                Ok(_) => (
+                    StatusCode::ACCEPTED,
+                    Json(serde_json::json!({
+                        "status": "cancel_requested",
+                        "execution_id": execution_id
+                    })),
+                )
+                    .into_response(),
+                Err(error) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(error) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn remove_workflow_execution_handler(
+    State(state): State<Arc<AppState>>,
+    Path(execution_id): Path<Uuid>,
+) -> impl IntoResponse {
+    let namespace = match temporal_namespace(&state.config) {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": error.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let temporal_result = match connect_temporal_workflow_client(&state.config).await {
+        Ok(mut client) => {
+            let request = DeleteWorkflowExecutionRequest {
+                namespace,
+                workflow_execution: Some(TemporalWorkflowExecution {
+                    workflow_id: execution_id.to_string(),
+                    run_id: String::new(),
+                }),
+            };
+            client.delete_workflow_execution(request).await.map(|_| ())
+        }
+        Err(error) => Err(tonic::Status::unavailable(error.to_string())),
+    };
+
+    if let Err(error) = temporal_result {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+            .into_response();
+    }
+
+    let db_cleanup = if let Some(database) = &state.config.spec.database {
+        let database_url = match resolve_env_value(&database.url) {
+            Ok(url) => url,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        match sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await
+        {
+            Ok(pool) => sqlx::query("DELETE FROM workflow_executions WHERE id = $1")
+                .bind(execution_id)
+                .execute(&pool)
+                .await
+                .map(|_| ()),
+            Err(error) => Err(sqlx::Error::Configuration(Box::new(error))),
+        }
+    } else {
+        Ok(())
+    };
+
+    match db_cleanup {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "removed",
+                "execution_id": execution_id
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": format!("Workflow execution deleted in Temporal but local cleanup failed: {error}")
+            })),
+        )
+            .into_response(),
     }
 }
 
@@ -3693,7 +4433,12 @@ async fn list_smcp_tools_handler(
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_generated_artifacts_root, temporal_connection_max_retries};
+    use super::{
+        managed_container_reap_reason, resolve_generated_artifacts_root,
+        temporal_connection_max_retries,
+    };
+    use aegis_orchestrator_core::domain::execution::ExecutionStatus;
+    use aegis_orchestrator_core::infrastructure::runtime::ManagedAgentContainer;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -3744,5 +4489,64 @@ mod tests {
         assert_eq!(resolved, stack_dir.join("generated"));
 
         let _ = fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn managed_container_reap_reason_skips_debug_retained_containers() {
+        let container = ManagedAgentContainer {
+            id: "container-1".to_string(),
+            execution_id: Some("00000000-0000-0000-0000-000000000001".to_string()),
+            debug_retain: true,
+            state: Some("running".to_string()),
+        };
+
+        assert_eq!(
+            managed_container_reap_reason(&container, Some(ExecutionStatus::Running)),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_container_reap_reason_keeps_running_executions_with_running_containers() {
+        let container = ManagedAgentContainer {
+            id: "container-2".to_string(),
+            execution_id: Some("00000000-0000-0000-0000-000000000002".to_string()),
+            debug_retain: false,
+            state: Some("running".to_string()),
+        };
+
+        assert_eq!(
+            managed_container_reap_reason(&container, Some(ExecutionStatus::Running)),
+            None
+        );
+    }
+
+    #[test]
+    fn managed_container_reap_reason_reaps_completed_or_missing_executions() {
+        let running_container = ManagedAgentContainer {
+            id: "container-3".to_string(),
+            execution_id: Some("00000000-0000-0000-0000-000000000003".to_string()),
+            debug_retain: false,
+            state: Some("running".to_string()),
+        };
+        let exited_container = ManagedAgentContainer {
+            id: "container-4".to_string(),
+            execution_id: Some("00000000-0000-0000-0000-000000000004".to_string()),
+            debug_retain: false,
+            state: Some("exited".to_string()),
+        };
+
+        assert_eq!(
+            managed_container_reap_reason(&running_container, Some(ExecutionStatus::Completed)),
+            Some("execution_not_running")
+        );
+        assert_eq!(
+            managed_container_reap_reason(&exited_container, Some(ExecutionStatus::Running)),
+            Some("container_not_running")
+        );
+        assert_eq!(
+            managed_container_reap_reason(&running_container, None),
+            Some("missing_execution_record")
+        );
     }
 }

@@ -1301,6 +1301,21 @@ async fn workflow_execution_tools_list_and_get() {
         execution.id.to_string()
     );
     assert_eq!(get_payload["execution"]["blackboard"]["priority"], "high");
+
+    let status_result = service
+        .invoke_aegis_workflow_status_tool(&serde_json::json!({
+            "execution_id": execution.id.to_string(),
+        }))
+        .await
+        .expect("workflow status should return a result");
+    let ToolInvocationResult::Direct(status_payload) = status_result else {
+        panic!("expected direct status payload");
+    };
+    assert_eq!(status_payload["tool"], "aegis.workflow.status");
+    assert_eq!(
+        status_payload["execution"]["execution_id"],
+        execution.id.to_string()
+    );
 }
 
 #[tokio::test]
@@ -1733,6 +1748,170 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
 
     assert!(tools.iter().any(|tool| tool.name == "fs.read"));
     assert!(!tools.iter().any(|tool| tool.name == "cmd.run"));
+}
+
+#[tokio::test]
+async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_low_trust_tiers() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(
+        registry,
+        servers,
+        vec![
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.status".to_string(),
+                description: "Inspect workflow execution state".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.status".to_string(),
+                    skip_judge: true,
+                }],
+            },
+            BuiltinDispatcherConfig {
+                name: "aegis.workflow.delete".to_string(),
+                description: "Delete workflow definitions".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.delete".to_string(),
+                    skip_judge: false,
+                }],
+            },
+        ],
+    ));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    security_context_repo
+        .save(crate::domain::security_context::SecurityContext {
+            name: "zaru-pro".to_string(),
+            description: "Pro tier".to_string(),
+            capabilities: vec![
+                crate::domain::security_context::Capability {
+                    tool_pattern: "aegis.workflow.status".to_string(),
+                    path_allowlist: None,
+                    command_allowlist: None,
+                    subcommand_allowlist: None,
+                    domain_allowlist: None,
+                    rate_limit: None,
+                    max_response_size: None,
+                },
+                crate::domain::security_context::Capability {
+                    tool_pattern: "aegis.workflow.delete".to_string(),
+                    path_allowlist: None,
+                    command_allowlist: None,
+                    subcommand_allowlist: None,
+                    domain_allowlist: None,
+                    rate_limit: None,
+                    max_response_size: None,
+                },
+            ],
+            deny_list: vec![],
+            metadata: crate::domain::security_context::SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        })
+        .await
+        .unwrap();
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let tools = service
+        .get_available_tools_for_context("zaru-pro")
+        .await
+        .unwrap();
+
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.status"));
+    assert!(!tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.delete"));
+}
+
+#[tokio::test]
+async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_tiers() {
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let agent = test_agent_with_tools(&["aegis.workflow.delete"]);
+    let agent_id = agent.id;
+    let exec_id = ExecutionId::new();
+
+    let context = SecurityContext {
+        name: "zaru-free".to_string(),
+        description: "Free tier".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "aegis.workflow.delete".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            rate_limit: None,
+            max_response_size: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
+    let session_token = make_fake_token(agent_id);
+    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
+    repo.save(session).await.unwrap();
+
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(FilteringAgentLifecycleService { agent }),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let result = service
+        .invoke_tool_internal(
+            &agent_id,
+            exec_id,
+            1,
+            vec![],
+            "aegis.workflow.delete".to_string(),
+            serde_json::json!({ "name": "cleanup-me" }),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(SmcpSessionError::PolicyViolation(
+            crate::domain::mcp::PolicyViolation::ToolExplicitlyDenied { .. }
+        ))
+    ));
 }
 
 #[tokio::test]

@@ -460,14 +460,23 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             .start_container(&container_id, None::<StartContainerOptions>)
             .await
         {
-            // Best-effort cleanup: explicitly drop the future (cannot await in error path).
-            std::mem::drop(self.docker.remove_container(
-                &container_id,
-                Some(RemoveContainerOptions {
-                    force: true,
-                    ..Default::default()
-                }),
-            ));
+            if let Err(cleanup_error) = self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                warn!(
+                    container_id = %container_id,
+                    error = %cleanup_error,
+                    "Failed to remove container after start failure"
+                );
+            }
             let error = ContainerStepError::DockerError(format!("start_container: {e}"));
             self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
             return Err(error);

@@ -38,6 +38,7 @@ use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeErr
 use crate::domain::validation::{ValidationContext, ValidationPipeline, ValidationResults};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -159,6 +160,8 @@ impl Supervisor {
             "Starting supervisor loop with timeout enforcement"
         );
 
+        let current_instance = Arc::new(Mutex::new(None));
+
         // Wrap the entire loop in an overall deadline
         match tokio::time::timeout(
             overall_timeout,
@@ -170,6 +173,7 @@ impl Supervisor {
                 cancellation_token,
                 per_iteration_timeout,
                 validation_pipeline,
+                current_instance.clone(),
             ),
         )
         .await
@@ -180,6 +184,15 @@ impl Supervisor {
                     timeout_seconds = overall_timeout_secs,
                     "Execution timed out — overall deadline exceeded"
                 );
+                if let Some(instance_id) = current_instance.lock().await.take() {
+                    if let Err(error) = self.runtime.terminate(&instance_id).await {
+                        warn!(
+                            instance_id = %instance_id.as_str(),
+                            error = %error,
+                            "Failed to terminate instance after overall timeout"
+                        );
+                    }
+                }
                 Err(RuntimeError::TimedOut(overall_timeout_secs))
             }
         }
@@ -197,6 +210,7 @@ impl Supervisor {
         cancellation_token: CancellationToken,
         per_iteration_timeout: Duration,
         validation_pipeline: Option<Arc<ValidationPipeline>>,
+        current_instance: Arc<Mutex<Option<InstanceId>>>,
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
@@ -240,6 +254,7 @@ impl Supervisor {
 
             let instance_id = match self.runtime.spawn(current_config).await {
                 Ok(id) => {
+                    *current_instance.lock().await = Some(id.clone());
                     observer.on_instance_spawned(attempts as u8, &id).await;
                     id
                 }
@@ -281,8 +296,10 @@ impl Supervisor {
                 _ = cancellation_token.cancelled() => {
                     info!(iteration = attempts, "Execution cancelled during iteration");
                     // Terminate the instance before returning
-                    let _ = self.runtime.terminate(&instance_id).await;
-                    observer.on_instance_terminated(attempts as u8, &instance_id).await;
+                    if let Some(instance_id) = current_instance.lock().await.take() {
+                        let _ = self.runtime.terminate(&instance_id).await;
+                        observer.on_instance_terminated(attempts as u8, &instance_id).await;
+                    }
                     return Err(RuntimeError::Cancelled);
                 }
             };
@@ -294,6 +311,11 @@ impl Supervisor {
                 true
             };
 
+            if !should_terminate {
+                // Preserve the failed container for debugging, but stop tracking it as active.
+                let _ = current_instance.lock().await.take();
+            }
+
             if should_terminate {
                 let terminate_result = self.runtime.terminate(&instance_id).await;
                 if let Err(e) = terminate_result {
@@ -303,6 +325,7 @@ impl Supervisor {
                         e
                     );
                 } else {
+                    let _ = current_instance.lock().await.take();
                     observer
                         .on_instance_terminated(attempts as u8, &instance_id)
                         .await;
@@ -883,6 +906,10 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), RuntimeError::TimedOut(1)));
+
+        let terminate_calls = runtime.terminate_calls.lock().await;
+        assert_eq!(terminate_calls.len(), 1);
+        assert_eq!(terminate_calls[0].as_str(), "instance-0");
     }
 
     #[tokio::test]
