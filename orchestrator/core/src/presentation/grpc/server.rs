@@ -329,15 +329,15 @@ impl AegisRuntime for AegisRuntimeService {
                                                 break;
                                             }
                                             None => {
-                                                if !terminal_sent
-                                                    && send_persisted_terminal_event(
+                                                if !terminal_sent {
+                                                    let _ = send_persisted_terminal_event(
                                                         &*execution_service,
                                                         &tenant_id,
                                                         execution_id,
                                                         &tx_clone,
                                                     )
-                                                    .await
-                                                {}
+                                                    .await;
+                                                }
                                                 break;
                                             }
                                         }
