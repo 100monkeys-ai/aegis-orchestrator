@@ -211,7 +211,9 @@ async fn workflow_repository_force_redeploy_can_clear_description() {
     let pool = match connect_test_pool().await {
         Some(pool) => pool,
         None => {
-            eprintln!("Skipping test: AEGIS_DATABASE_URL or DATABASE_URL not set");
+            eprintln!(
+                "Skipping test: AEGIS_DATABASE_URL or DATABASE_URL not set or unreachable"
+            );
             return;
         }
     };
