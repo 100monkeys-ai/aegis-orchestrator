@@ -121,6 +121,18 @@ pub trait ExecutionService: Send + Sync {
     /// Returns an error if the execution does not exist.
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution>;
 
+    /// Retrieve the current state of an execution by tenant and ID.
+    ///
+    /// Default implementation falls back to [`ExecutionService::get_execution`]
+    /// for callers that do not require tenant scoping.
+    async fn get_execution_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Execution> {
+        self.get_execution(id).await
+    }
+
     /// Return all [`Iteration`]s for a given execution in order.
     ///
     /// # Errors
@@ -1832,6 +1844,14 @@ impl ExecutionService for StandardExecutionService {
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
         self.get_execution_for_tenant(&TenantId::local_default(), id)
             .await
+    }
+
+    async fn get_execution_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        id: ExecutionId,
+    ) -> Result<Execution> {
+        StandardExecutionService::get_execution_for_tenant(self, tenant_id, id).await
     }
 
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {

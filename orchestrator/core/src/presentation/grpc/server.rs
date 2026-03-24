@@ -20,7 +20,7 @@ use crate::application::run_container_step::RunContainerStepUseCase;
 use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
-use crate::domain::execution::ExecutionInput;
+use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus};
 use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::tenant::TenantId;
 
@@ -28,6 +28,7 @@ const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_JUDGE_WEIGHT: f64 = 1.0;
 const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 300;
 const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
+const EXECUTION_TERMINAL_POLL_INTERVAL_MS: u64 = 250;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
@@ -285,35 +286,73 @@ impl AegisRuntime for AegisRuntimeService {
                     match execution_service.stream_execution(execution_id).await {
                         Ok(mut stream) => {
                             use futures::StreamExt;
-                            while let Some(event_result) = stream.next().await {
-                                match event_result {
-                                    Ok(domain_event) => {
-                                        // Convert domain event to protobuf event
-                                        if let Some(pb_event) = convert_domain_event_to_proto(
-                                            domain_event,
-                                            execution_id,
-                                        ) {
-                                            if tx_clone.send(Ok(pb_event)).await.is_err() {
-                                                break; // Client disconnected
+                            let mut terminal_sent = false;
+                            let mut terminal_poll =
+                                tokio::time::interval(std::time::Duration::from_millis(
+                                    EXECUTION_TERMINAL_POLL_INTERVAL_MS,
+                                ));
+
+                            loop {
+                                tokio::select! {
+                                    event_result = stream.next() => {
+                                        match event_result {
+                                            Some(Ok(domain_event)) => {
+                                                // Convert domain event to protobuf event
+                                                if let Some(pb_event) = convert_domain_event_to_proto(
+                                                    domain_event,
+                                                    execution_id,
+                                                ) {
+                                                    terminal_sent = is_terminal_proto_event(&pb_event);
+                                                    if tx_clone.send(Ok(pb_event)).await.is_err() {
+                                                        break; // Client disconnected
+                                                    }
+                                                    if terminal_sent {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Some(Err(e)) => {
+                                                let _ = tx_clone
+                                                    .send(Ok(ExecutionEvent {
+                                                        event: Some(
+                                                            execution_event::Event::ExecutionFailed(
+                                                                ExecutionFailed {
+                                                                    execution_id: execution_id.to_string(),
+                                                                    reason: e.to_string(),
+                                                                    total_iterations: 0,
+                                                                    failed_at: Utc::now().to_rfc3339(),
+                                                                },
+                                                            ),
+                                                        ),
+                                                    }))
+                                                    .await;
+                                                break;
+                                            }
+                                            None => {
+                                                if !terminal_sent
+                                                    && send_persisted_terminal_event(
+                                                        &*execution_service,
+                                                        &tenant_id,
+                                                        execution_id,
+                                                        &tx_clone,
+                                                    )
+                                                    .await
+                                                {}
+                                                break;
                                             }
                                         }
                                     }
-                                    Err(e) => {
-                                        let _ = tx_clone
-                                            .send(Ok(ExecutionEvent {
-                                                event: Some(
-                                                    execution_event::Event::ExecutionFailed(
-                                                        ExecutionFailed {
-                                                            execution_id: execution_id.to_string(),
-                                                            reason: e.to_string(),
-                                                            total_iterations: 0,
-                                                            failed_at: Utc::now().to_rfc3339(),
-                                                        },
-                                                    ),
-                                                ),
-                                            }))
-                                            .await;
-                                        break;
+                                    _ = terminal_poll.tick(), if !terminal_sent => {
+                                        if send_persisted_terminal_event(
+                                            &*execution_service,
+                                            &tenant_id,
+                                            execution_id,
+                                            &tx_clone,
+                                        )
+                                        .await
+                                        {
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -977,6 +1016,72 @@ fn convert_domain_event_to_proto(
     }
 }
 
+fn persisted_execution_to_proto(execution: &Execution) -> Option<ExecutionEvent> {
+    match execution.status {
+        ExecutionStatus::Completed => Some(ExecutionEvent {
+            event: Some(execution_event::Event::ExecutionCompleted(
+                ExecutionCompleted {
+                    execution_id: execution.id.to_string(),
+                    final_output: execution
+                        .iterations()
+                        .last()
+                        .and_then(|iteration| iteration.output.clone())
+                        .unwrap_or_default(),
+                    total_iterations: execution.total_attempts() as u32,
+                    completed_at: execution
+                        .ended_at
+                        .unwrap_or(execution.started_at)
+                        .to_rfc3339(),
+                },
+            )),
+        }),
+        ExecutionStatus::Failed => Some(ExecutionEvent {
+            event: Some(execution_event::Event::ExecutionFailed(ExecutionFailed {
+                execution_id: execution.id.to_string(),
+                reason: execution
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Execution failed".to_string()),
+                total_iterations: execution.total_attempts() as u32,
+                failed_at: execution
+                    .ended_at
+                    .unwrap_or(execution.started_at)
+                    .to_rfc3339(),
+            })),
+        }),
+        _ => None,
+    }
+}
+
+fn is_terminal_proto_event(event: &ExecutionEvent) -> bool {
+    matches!(
+        event.event,
+        Some(execution_event::Event::ExecutionCompleted(_))
+            | Some(execution_event::Event::ExecutionFailed(_))
+    )
+}
+
+async fn send_persisted_terminal_event(
+    execution_service: &dyn ExecutionService,
+    tenant_id: &TenantId,
+    execution_id: crate::domain::execution::ExecutionId,
+    tx: &mpsc::Sender<Result<ExecutionEvent, Status>>,
+) -> bool {
+    match execution_service
+        .get_execution_for_tenant(tenant_id, execution_id)
+        .await
+    {
+        Ok(execution) if execution.is_completed() => {
+            if let Some(pb_event) = persisted_execution_to_proto(&execution) {
+                return tx.send(Ok(pb_event)).await.is_ok();
+            }
+            false
+        }
+        Ok(_) => false,
+        Err(_) => false,
+    }
+}
+
 #[derive(Clone)]
 pub struct GrpcServerConfig {
     pub addr: std::net::SocketAddr,
@@ -1030,19 +1135,22 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 mod tests {
     use super::*;
     use crate::domain::events::ExecutionEvent as DomainExecutionEvent;
-    use crate::domain::execution::{Execution, ExecutionId, ExecutionInput};
+    use crate::domain::execution::{Execution, ExecutionId, ExecutionInput, ExecutionStatus};
     use crate::infrastructure::event_bus::{DomainEvent, EventBus};
     use anyhow::{anyhow, Result};
     use async_trait::async_trait;
     use chrono::Utc;
     use futures::Stream;
     use std::pin::Pin;
+    use std::sync::Mutex;
     use tokio::time::{timeout, Duration};
     use tokio_stream::StreamExt;
 
     struct TestExecutionService {
         execution_id: ExecutionId,
         stream_events: Vec<DomainExecutionEvent>,
+        persisted_execution: Option<Execution>,
+        tenant_lookups: Mutex<Vec<String>>,
     }
 
     #[async_trait]
@@ -1068,6 +1176,23 @@ mod tests {
 
         async fn get_execution(&self, _id: ExecutionId) -> Result<Execution> {
             Err(anyhow!("get_execution not used in grpc server tests"))
+        }
+
+        async fn get_execution_for_tenant(
+            &self,
+            tenant_id: &TenantId,
+            id: ExecutionId,
+        ) -> Result<Execution> {
+            self.tenant_lookups
+                .lock()
+                .expect("tenant_lookups mutex poisoned")
+                .push(tenant_id.to_string());
+
+            match &self.persisted_execution {
+                Some(execution) if execution.id == id => Ok(execution.clone()),
+                Some(_) => Err(anyhow!("unexpected execution id")),
+                None => Err(anyhow!("persisted execution not configured")),
+            }
         }
 
         async fn get_iterations(
@@ -1154,6 +1279,8 @@ mod tests {
                 total_iterations: 1,
                 completed_at: Utc::now(),
             }],
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
         });
         let validation_service = test_validation_service(execution_service.clone());
         let service = AegisRuntimeService::new(execution_service, validation_service);
@@ -1202,10 +1329,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_agent_emits_persisted_terminal_event_when_stream_misses_completion() {
+        let execution_id = ExecutionId::new();
+        let agent_id = AgentId::new();
+        let persisted_execution = Execution {
+            id: execution_id,
+            agent_id,
+            status: ExecutionStatus::Completed,
+            iterations: Vec::new(),
+            max_iterations: 10,
+            input: ExecutionInput {
+                intent: Some("generate workflow".to_string()),
+                payload: serde_json::Value::Null,
+            },
+            started_at: Utc::now(),
+            ended_at: Some(Utc::now()),
+            error: None,
+            hierarchy: crate::domain::execution::ExecutionHierarchy::root(execution_id),
+            container_uid: 1000,
+            container_gid: 1000,
+        };
+        let execution_service = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: Vec::new(),
+            persisted_execution: Some(persisted_execution),
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service.clone(), validation_service);
+
+        let response = service
+            .execute_agent(Request::new(ExecuteAgentRequest {
+                agent_id: agent_id.0.to_string(),
+                input: "generate workflow".to_string(),
+                context_json: String::new(),
+                parent_execution_id: None,
+                workflow_execution_id: None,
+                security_policy: None,
+            }))
+            .await
+            .expect("execute_agent should succeed");
+
+        let mut stream = response.into_inner();
+
+        let started = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("started event should arrive before timeout")
+            .expect("stream should emit execution started event")
+            .expect("started event should be Ok");
+        assert!(matches!(
+            started.event,
+            Some(execution_event::Event::ExecutionStarted(_))
+        ));
+
+        let completed = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("persisted terminal event should arrive before timeout")
+            .expect("stream should emit synthesized terminal event")
+            .expect("terminal event should be Ok");
+        assert!(matches!(
+            completed.event,
+            Some(execution_event::Event::ExecutionCompleted(_))
+        ));
+
+        let tenant_lookups = execution_service
+            .tenant_lookups
+            .lock()
+            .expect("tenant_lookups mutex poisoned")
+            .clone();
+        assert!(
+            !tenant_lookups.is_empty(),
+            "persisted fallback should query execution state"
+        );
+
+        let end = timeout(Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should close after synthesized terminal event");
+        assert!(
+            end.is_none(),
+            "stream should terminate after fallback terminal"
+        );
+    }
+
+    #[tokio::test]
     async fn invoke_tool_returns_failed_precondition_when_tool_service_is_missing() {
         let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
             execution_id: ExecutionId::new(),
             stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
         });
         let validation_service = test_validation_service(execution_service.clone());
         let service = AegisRuntimeService::new(execution_service, validation_service);
