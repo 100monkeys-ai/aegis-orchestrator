@@ -27,6 +27,7 @@ use tracing::warn;
 pub mod client;
 #[cfg(unix)]
 pub mod install;
+pub mod operator_read_models;
 pub mod server;
 
 pub use client::DaemonClient;

@@ -24,6 +24,8 @@ spec:
       Do not call any workflow deployment tool until the full sequence below has completed successfully
       for the exact manifest you intend to deploy. If any prerequisite step is missing, fails, or
       returns invalid output, stop and return errors instead of trying to deploy anyway.
+      Schema validation is necessary, but it is not sufficient to prove deployability.
+      Always run workflow validation before any create or update call.
 
       REQUIRED WORKFLOW — follow this order on every workflow creation or update request:
       1. If updating an existing workflow, call `aegis.workflow.export` with {"name": "<workflow_name>"} to retrieve the current manifest.
@@ -42,8 +44,10 @@ spec:
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
       4. Call `aegis.schema.validate` with {"kind": "workflow", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
-         and re-validate before proceeding.
-      5. Only after step 4 returns valid:true for the exact YAML you will submit, call
+         and re-validate before proceeding. Treat this as a shape check only.
+      5. Call `aegis.workflow.validate` with {"manifest_yaml": "<validated yaml>"} and confirm the deterministic
+         validation passes. If it fails, repair the manifest and re-run steps 3–5 before any deployment attempt.
+      6. Only after steps 4 and 5 return success for the exact YAML you will submit, call
          `aegis.workflow.create` (or `aegis.workflow.update` if it's a simple update without complex re-validation) with:
          {
            "manifest_yaml": "<validated yaml>",
@@ -62,15 +66,17 @@ spec:
          partially composed manifest, or a manifest that has not been schema-validated in the current run.
          Do not treat the deployment call as a way to discover schema or dependency problems.
          Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
-      Skipping, reordering, or collapsing steps 1–4 is a policy violation and will cause judge rejection.
+      Skipping, reordering, or collapsing steps 1–5 is a policy violation and will cause judge rejection.
 
       When a workflow references judge agents, resolve them first and verify each name exists before
       deployment. If a required judge agent is missing, stop and report the missing dependency rather
       than substituting a placeholder or proceeding with deployment.
 
-      If validation fails, repair the manifest and re-run steps 2–4 before any deployment attempt.
+      If validation fails, repair the manifest and re-run steps 2–5 before any deployment attempt.
       If `aegis.workflow.create` succeeds but a later runtime issue occurs, preserve the returned
       manifest and surface the runtime error rather than re-deploying a stale draft.
+      For bounded refinement in workflow design, prefer `Agent` state `judges` plus `max_iterations`
+      inside a single state. Do not express iterative refinement as workflow graph cycles.
       Return JSON only:
       {
         "workflow": {

@@ -28,6 +28,7 @@ use axum::{
 
 const DEFAULT_ORCHESTRATOR_URL: &str = "http://localhost:8088";
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 // Type alias for repository tuple to avoid clippy "very complex type" lint
@@ -61,6 +62,7 @@ use aegis_orchestrator_core::{
     },
     domain::{
         agent::AgentId,
+        cluster::{NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole},
         execution::ExecutionId,
         execution::ExecutionInput,
         iam::{IdentityKind, IdentityProvider, UserIdentity},
@@ -82,6 +84,14 @@ use aegis_orchestrator_core::{
         temporal_client::TemporalClient,
         TemporalEventListener, TemporalEventPayload,
     },
+};
+
+use aegis_orchestrator_core::domain::repository::StorageEventRepository;
+use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
+
+use super::operator_read_models::{
+    storage_violation_view, OperatorReadModelStore, SecurityIncidentView, StimulusView,
+    StorageViolationView,
 };
 
 fn default_local_host_mount_point() -> String {
@@ -109,6 +119,254 @@ fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
 
 fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
     raw_value.unwrap_or(30).max(1)
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterNodeView {
+    node_id: String,
+    role: String,
+    status: String,
+    grpc_address: String,
+    gpu_count: u32,
+    vram_gb: u32,
+    cpu_cores: u32,
+    available_memory_gb: u32,
+    supported_runtimes: Vec<String>,
+    tags: Vec<String>,
+    last_heartbeat_at: chrono::DateTime<chrono::Utc>,
+    registered_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterStatusView {
+    source: String,
+    controller_node_id: Option<String>,
+    total_nodes: usize,
+    active_nodes: usize,
+    draining_nodes: usize,
+    unhealthy_nodes: usize,
+    nodes: Vec<ClusterNodeView>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SwarmMessageView {
+    from: String,
+    to: String,
+    payload_bytes: usize,
+    sent_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SwarmLockView {
+    resource_id: String,
+    held_by: String,
+    acquired_at: chrono::DateTime<chrono::Utc>,
+    expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct SwarmView {
+    swarm_id: String,
+    parent_agent_id: String,
+    member_ids: Vec<String>,
+    member_count: usize,
+    status: String,
+    created_at: chrono::DateTime<chrono::Utc>,
+    lock_count: usize,
+    recent_message_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct DashboardSummaryView {
+    generated_at: chrono::DateTime<chrono::Utc>,
+    uptime_seconds: u64,
+    cluster: ClusterStatusView,
+    swarm_count: usize,
+    stimulus_count: usize,
+    security_incident_count: usize,
+    storage_violation_count: usize,
+    recent_execution_count: usize,
+    recent_workflow_execution_count: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct HealthView {
+    status: String,
+    mode: String,
+    uptime_seconds: u64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, Default)]
+struct LimitQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+fn bounded_limit(limit: Option<usize>, default: usize, maximum: usize) -> usize {
+    limit.unwrap_or(default).min(maximum).max(1)
+}
+
+fn cluster_role_to_string(role: &NodeRole) -> String {
+    format!("{role:?}").to_lowercase()
+}
+
+fn node_status_to_string(status: NodePeerStatus) -> String {
+    format!("{status:?}").to_lowercase()
+}
+
+fn cluster_node_view(peer: &NodePeer) -> ClusterNodeView {
+    ClusterNodeView {
+        node_id: peer.node_id.0.to_string(),
+        role: cluster_role_to_string(&peer.role),
+        status: node_status_to_string(peer.status),
+        grpc_address: peer.grpc_address.clone(),
+        gpu_count: peer.capabilities.gpu_count,
+        vram_gb: peer.capabilities.vram_gb,
+        cpu_cores: peer.capabilities.cpu_cores,
+        available_memory_gb: peer.capabilities.available_memory_gb,
+        supported_runtimes: peer.capabilities.supported_runtimes.clone(),
+        tags: peer.capabilities.tags.clone(),
+        last_heartbeat_at: peer.last_heartbeat_at,
+        registered_at: peer.registered_at,
+    }
+}
+
+fn fallback_cluster_node(config: &NodeConfigManifest) -> NodePeer {
+    let node_id =
+        uuid::Uuid::parse_str(&config.spec.node.id).unwrap_or_else(|_| uuid::Uuid::new_v4());
+    let role = config
+        .spec
+        .cluster
+        .as_ref()
+        .map(|cluster| cluster.role)
+        .unwrap_or_default();
+    let (gpu_count, vram_gb, cpu_cores, available_memory_gb, tags) = config
+        .spec
+        .node
+        .resources
+        .as_ref()
+        .map(|resources| {
+            (
+                resources.gpu_count,
+                resources.vram_gb,
+                resources.cpu_cores,
+                resources.memory_gb,
+                config.spec.node.tags.clone(),
+            )
+        })
+        .unwrap_or((0, 0, 0, 0, config.spec.node.tags.clone()));
+    let grpc_address = config
+        .spec
+        .cluster
+        .as_ref()
+        .and_then(|cluster| {
+            cluster
+                .controller
+                .as_ref()
+                .map(|controller| controller.endpoint.clone())
+        })
+        .unwrap_or_else(|| {
+            config
+                .spec
+                .network
+                .as_ref()
+                .map(|network| {
+                    format!(
+                        "{}:{}",
+                        network.bind_address,
+                        config
+                            .spec
+                            .cluster
+                            .as_ref()
+                            .map(|cluster| cluster.cluster_grpc_port)
+                            .unwrap_or(0)
+                    )
+                })
+                .unwrap_or_else(|| {
+                    format!(
+                        "127.0.0.1:{}",
+                        config
+                            .spec
+                            .cluster
+                            .as_ref()
+                            .map(|cluster| cluster.cluster_grpc_port)
+                            .unwrap_or(0)
+                    )
+                })
+        });
+
+    NodePeer {
+        node_id: NodeId(node_id),
+        role,
+        public_key: Vec::new(),
+        capabilities: aegis_orchestrator_core::domain::cluster::NodeCapabilityAdvertisement {
+            gpu_count,
+            vram_gb,
+            cpu_cores,
+            available_memory_gb,
+            supported_runtimes: vec![],
+            tags,
+        },
+        grpc_address,
+        status: NodePeerStatus::Active,
+        last_heartbeat_at: chrono::Utc::now(),
+        registered_at: chrono::Utc::now(),
+    }
+}
+
+async fn cluster_status_view(state: &AppState) -> ClusterStatusView {
+    let nodes = load_cluster_nodes(state).await;
+    let active_nodes = nodes.iter().filter(|node| node.status == "active").count();
+    let draining_nodes = nodes
+        .iter()
+        .filter(|node| node.status == "draining")
+        .count();
+    let unhealthy_nodes = nodes
+        .iter()
+        .filter(|node| node.status == "unhealthy")
+        .count();
+
+    ClusterStatusView {
+        source: if state.cluster_repo.is_some() {
+            "cluster_repository".to_string()
+        } else {
+            "local_fallback".to_string()
+        },
+        controller_node_id: nodes
+            .iter()
+            .find(|node| node.role == "controller")
+            .or_else(|| nodes.first())
+            .map(|node| node.node_id.clone()),
+        total_nodes: nodes.len(),
+        active_nodes,
+        draining_nodes,
+        unhealthy_nodes,
+        nodes,
+    }
+}
+
+async fn load_cluster_nodes(state: &AppState) -> Vec<ClusterNodeView> {
+    if let Some(repo) = &state.cluster_repo {
+        let mut peers = Vec::new();
+        for status in [
+            NodePeerStatus::Active,
+            NodePeerStatus::Draining,
+            NodePeerStatus::Unhealthy,
+        ] {
+            if let Ok(mut items) = repo.list_peers_by_status(status).await {
+                peers.append(&mut items);
+            }
+        }
+
+        let mut seen = HashSet::new();
+        peers
+            .into_iter()
+            .filter(|peer| seen.insert(peer.node_id))
+            .map(|peer| cluster_node_view(&peer))
+            .collect()
+    } else {
+        vec![cluster_node_view(&fallback_cluster_node(&state.config))]
+    }
 }
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
@@ -322,7 +580,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             )
         };
 
+    let cluster_repo: Option<Arc<dyn NodeClusterRepository>> = None;
+
     let event_bus = Arc::new(EventBus::new(100));
+    let operator_read_model = OperatorReadModelStore::spawn_collector(event_bus.clone());
+    let swarm_service = Arc::new(StandardSwarmService::new());
     let iam_service: Option<Arc<dyn IdentityProvider>> = config.spec.iam.as_ref().map(|iam| {
         Arc::new(StandardIamService::new(iam, event_bus.clone())) as Arc<dyn IdentityProvider>
     });
@@ -533,7 +795,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let storage_event_persister = Arc::new(
         aegis_orchestrator_core::application::storage_event_persister::StorageEventPersister::new(
-            storage_event_repo,
+            storage_event_repo.clone(),
             event_bus.clone(),
         ),
     );
@@ -1674,11 +1936,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
+        execution_repo: execution_repo.clone(),
         correlated_activity_stream_service: Arc::new(CorrelatedActivityStreamService::new(
             event_bus.clone(),
             execution_repo.clone(),
             Some(workflow_execution_repo.clone()),
         )),
+        cluster_repo: cluster_repo.clone(),
         event_bus: event_bus.clone(),
         inner_loop_service: inner_loop_service.clone(),
         human_input_service: human_input_service.clone(),
@@ -1688,8 +1952,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_repo: workflow_repo.clone(),
         workflow_execution_repo: workflow_execution_repo.clone(),
         temporal_client_container: temporal_client_container.clone(),
+        storage_event_repo: storage_event_repo.clone(),
         tool_invocation_service: tool_invocation_service.clone(),
         attestation_service: attestation_service.clone(),
+        swarm_service: swarm_service.clone(),
+        operator_read_model: operator_read_model.clone(),
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };
@@ -2019,6 +2286,8 @@ fn create_router(
 ) -> Router {
     let router = Router::new()
         .route("/health", get(health_handler))
+        .route("/health/live", get(health_handler))
+        .route("/health/ready", get(readiness_handler))
         .route("/v1/agents/{agent_id}/execute", post(execute_agent_handler))
         .route("/v1/executions/{execution_id}", get(get_execution_handler))
         .route(
@@ -2103,6 +2372,21 @@ fn create_router(
         .route("/v1/smcp/attest", post(attest_smcp_handler))
         .route("/v1/smcp/invoke", post(invoke_smcp_handler))
         .route("/v1/smcp/tools", get(list_smcp_tools_handler))
+        .route("/v1/cluster/status", get(cluster_status_handler))
+        .route("/v1/cluster/nodes", get(cluster_nodes_handler))
+        .route("/v1/swarms", get(list_swarms_handler))
+        .route("/v1/swarms/{swarm_id}", get(get_swarm_handler))
+        .route("/v1/stimuli", get(list_stimuli_handler))
+        .route("/v1/stimuli/{stimulus_id}", get(get_stimulus_handler))
+        .route(
+            "/v1/security/incidents",
+            get(list_security_incidents_handler),
+        )
+        .route(
+            "/v1/storage/violations",
+            get(list_storage_violations_handler),
+        )
+        .route("/v1/dashboard/summary", get(dashboard_summary_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
@@ -2120,7 +2404,9 @@ fn create_router(
 struct AppState {
     agent_service: Arc<StandardAgentLifecycleService>,
     execution_service: Arc<StandardExecutionService>,
+    execution_repo: Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
     correlated_activity_stream_service: Arc<CorrelatedActivityStreamService>,
+    cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
     event_bus: Arc<EventBus>,
     inner_loop_service:
         Arc<aegis_orchestrator_core::application::inner_loop_service::InnerLoopService>,
@@ -2136,20 +2422,230 @@ struct AppState {
             Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
         >,
     >,
+    storage_event_repo: Arc<dyn StorageEventRepository>,
     tool_invocation_service:
         Arc<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService>,
     attestation_service:
         Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
+    swarm_service: Arc<StandardSwarmService>,
+    operator_read_model: Arc<OperatorReadModelStore>,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
 
 // HTTP handlers
-async fn health_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+async fn health_handler(State(state): State<Arc<AppState>>) -> Json<HealthView> {
+    Json(HealthView {
+        status: "healthy".to_string(),
+        mode: "live".to_string(),
+        uptime_seconds: state.start_time.elapsed().as_secs(),
+    })
+}
+
+async fn readiness_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let temporal_ready = if state.config.spec.temporal.is_some() {
+        state.temporal_client_container.read().await.is_some()
+    } else {
+        true
+    };
+
+    let database_ready = state.config.spec.database.is_none() || state.cluster_repo.is_some();
+
     Json(serde_json::json!({
-        "status": "healthy",
+        "status": if temporal_ready && database_ready { "ready" } else { "degraded" },
         "uptime_seconds": state.start_time.elapsed().as_secs(),
+        "dependencies": {
+            "database": database_ready,
+            "temporal": temporal_ready,
+            "cluster_repository": state.cluster_repo.is_some(),
+        }
     }))
+}
+
+async fn cluster_status_handler(State(state): State<Arc<AppState>>) -> Json<ClusterStatusView> {
+    Json(cluster_status_view(&state).await)
+}
+
+async fn cluster_nodes_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Json<serde_json::Value> {
+    let nodes = load_cluster_nodes(&state).await;
+    let limit = bounded_limit(query.limit, nodes.len().max(1), 500);
+    Json(serde_json::json!({
+        "source": if state.cluster_repo.is_some() { "cluster_repository" } else { "local_fallback" },
+        "items": nodes.into_iter().take(limit).collect::<Vec<_>>(),
+    }))
+}
+
+async fn list_swarms_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Json<serde_json::Value> {
+    let swarms = state.swarm_service.list_swarms().await;
+    let limit = bounded_limit(query.limit, swarms.len().max(1), 500);
+    let mut items = Vec::new();
+    for swarm in swarms.into_iter().take(limit) {
+        let messages = state.swarm_service.messages_for_swarm(swarm.id).await;
+        let locks = state.swarm_service.locks_for_swarm(swarm.id).await;
+        items.push(SwarmView {
+            swarm_id: swarm.id.0.to_string(),
+            parent_agent_id: swarm.parent_agent_id.0.to_string(),
+            member_ids: swarm
+                .member_ids()
+                .into_iter()
+                .map(|id| id.0.to_string())
+                .collect(),
+            member_count: swarm.member_ids().len(),
+            status: format!("{:?}", swarm.status).to_lowercase(),
+            created_at: swarm.created_at,
+            lock_count: locks.len(),
+            recent_message_count: messages.len(),
+        });
+    }
+
+    Json(serde_json::json!({ "items": items }))
+}
+
+async fn get_swarm_handler(
+    State(state): State<Arc<AppState>>,
+    Path(swarm_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let swarm_id = aegis_orchestrator_swarm::domain::SwarmId(swarm_id);
+    match state.swarm_service.get_swarm(swarm_id).await {
+        Some(swarm) => {
+            let messages = state.swarm_service.messages_for_swarm(swarm_id).await;
+            let locks = state.swarm_service.locks_for_swarm(swarm_id).await;
+            let view = SwarmView {
+                swarm_id: swarm.id.0.to_string(),
+                parent_agent_id: swarm.parent_agent_id.0.to_string(),
+                member_ids: swarm
+                    .member_ids()
+                    .into_iter()
+                    .map(|id| id.0.to_string())
+                    .collect(),
+                member_count: swarm.member_ids().len(),
+                status: format!("{:?}", swarm.status).to_lowercase(),
+                created_at: swarm.created_at,
+                lock_count: locks.len(),
+                recent_message_count: messages.len(),
+            };
+            Json(serde_json::json!({
+                "swarm": view,
+                "locks": locks.into_iter().map(|lock| SwarmLockView {
+                    resource_id: lock.resource_id,
+                    held_by: lock.held_by.0.to_string(),
+                    acquired_at: lock.acquired_at,
+                    expires_at: lock.expires_at,
+                }).collect::<Vec<_>>(),
+                "recent_messages": messages.into_iter().map(|message| SwarmMessageView {
+                    from: message.from.0.to_string(),
+                    to: message.to.0.to_string(),
+                    payload_bytes: message.payload.len(),
+                    sent_at: message.sent_at,
+                }).collect::<Vec<_>>(),
+            }))
+        }
+        None => Json(serde_json::json!({"error": "swarm not found"})),
+    }
+}
+
+async fn list_stimuli_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Json<serde_json::Value> {
+    let stimuli = state.operator_read_model.list_stimuli().await;
+    let limit = bounded_limit(query.limit, stimuli.len().max(1), 500);
+    Json(serde_json::json!({
+        "items": stimuli.into_iter().take(limit).collect::<Vec<StimulusView>>(),
+    }))
+}
+
+async fn get_stimulus_handler(
+    State(state): State<Arc<AppState>>,
+    Path(stimulus_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    match state
+        .operator_read_model
+        .get_stimulus(aegis_orchestrator_core::domain::stimulus::StimulusId(
+            stimulus_id,
+        ))
+        .await
+    {
+        Some(stimulus) => Json(serde_json::json!({ "stimulus": stimulus })),
+        None => Json(serde_json::json!({"error": "stimulus not found"})),
+    }
+}
+
+async fn list_security_incidents_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Json<serde_json::Value> {
+    let incidents = state.operator_read_model.list_security_incidents().await;
+    let limit = bounded_limit(query.limit, incidents.len().max(1), 500);
+    Json(serde_json::json!({
+        "items": incidents.into_iter().take(limit).collect::<Vec<SecurityIncidentView>>(),
+    }))
+}
+
+async fn list_storage_violations_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LimitQuery>,
+) -> Json<serde_json::Value> {
+    let violations = match state.storage_event_repo.find_violations(None).await {
+        Ok(events) => events
+            .into_iter()
+            .map(|event| storage_violation_view(&event))
+            .collect::<Vec<StorageViolationView>>(),
+        Err(e) => {
+            return Json(serde_json::json!({
+                "error": e.to_string(),
+                "items": Vec::<StorageViolationView>::new(),
+            }));
+        }
+    };
+    let limit = bounded_limit(query.limit, violations.len().max(1), 500);
+    Json(serde_json::json!({
+        "items": violations.into_iter().take(limit).collect::<Vec<StorageViolationView>>(),
+    }))
+}
+
+async fn dashboard_summary_handler(
+    State(state): State<Arc<AppState>>,
+) -> Json<DashboardSummaryView> {
+    let cluster = cluster_status_view(&state).await;
+    let swarms = state.swarm_service.list_swarms().await;
+    let stimuli = state.operator_read_model.list_stimuli().await;
+    let security_incidents = state.operator_read_model.list_security_incidents().await;
+
+    let storage_violation_count = match state.storage_event_repo.find_violations(None).await {
+        Ok(events) => events.len(),
+        Err(_) => 0,
+    };
+    let recent_execution_count = state
+        .execution_repo
+        .find_recent_for_tenant(&TenantId::local_default(), 25)
+        .await
+        .map(|items| items.len())
+        .unwrap_or_default();
+    let recent_workflow_execution_count = state
+        .workflow_execution_repo
+        .list_paginated_for_tenant(&TenantId::local_default(), 25, 0)
+        .await
+        .map(|items| items.len())
+        .unwrap_or_default();
+
+    Json(DashboardSummaryView {
+        generated_at: chrono::Utc::now(),
+        uptime_seconds: state.start_time.elapsed().as_secs(),
+        cluster,
+        swarm_count: swarms.len(),
+        stimulus_count: stimuli.len(),
+        security_incident_count: security_incidents.len(),
+        storage_violation_count,
+        recent_execution_count,
+        recent_workflow_execution_count,
+    })
 }
 
 #[derive(serde::Deserialize, Default)]

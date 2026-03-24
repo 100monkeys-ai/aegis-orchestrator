@@ -38,16 +38,19 @@ spec:
         deployed workflow before scoring.
 
       TOOL CALL AUDIT — check the tool call history and apply the following rules when scoring:
-      - A deployment call without a prior `aegis.schema.get` and `aegis.schema.validate` in the same run
+      - A deployment call without a prior `aegis.schema.get`, `aegis.schema.validate`, and `aegis.workflow.validate` in the same run
         is a hard process failure, even if the manifest itself looks valid.
       - If tool call history is present, use it as the source of truth for validating ordering.
       - If tool call history is missing, treat that as insufficient evidence rather than proof of failure.
-      - If `aegis.schema.validate` was NOT called before `aegis.workflow.create` or `aegis.workflow.update`, reduce
-        the `correctness` score by at least 0.2 and note "aegis.schema.validate was not called before workflow deployment".
+      - If `aegis.schema.validate` was NOT called before `aegis.workflow.validate`, reduce the `correctness`
+        score by at least 0.2 and note "aegis.schema.validate was not called before workflow validation".
+      - If `aegis.workflow.validate` was NOT called before `aegis.workflow.create` or `aegis.workflow.update`, reduce
+        the `correctness` score by at least 0.2 and note "aegis.workflow.validate was not called before workflow deployment".
       - If `aegis.schema.validate` returned {"valid": false, ...}, reduce the `correctness` score by at
         least 0.3 and list the schema errors in the `correctness` signal message.
       - If updating an existing workflow, ensure `aegis.workflow.export` was called to retrieve the current state.
-      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.workflow.create` / `update`,
+      - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.workflow.validate`
+        (passed: true) → `aegis.workflow.create` / `update`,
         give full credit for schema compliance.
       - Ensure `force: true` was only used if requested, otherwise version increments are expected.
 
@@ -68,6 +71,8 @@ spec:
         "successful but below threshold" from "successful and acceptable".
       - When this defect appears, name the offending state and recommend replacing the generic success
         fallback with an explicit `score_below` transition.
+      - Prefer bounded refinement expressed through `Agent` state `judges` and `max_iterations` rather
+        than workflow graph cycles; cycles should be treated as deployability defects.
 
       Return JSON only:
       {

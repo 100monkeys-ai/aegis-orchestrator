@@ -50,6 +50,7 @@ use bollard::query_parameters::{
 use bollard::Docker;
 use chrono::Utc;
 use futures::StreamExt;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -211,6 +212,72 @@ impl DockerRuntime {
             ))
         })?;
         Ok(())
+    }
+
+    fn format_bootstrap_stdout_for_log(content: &str) -> String {
+        fn indent_block(block: &str, indent: &str) -> String {
+            block
+                .lines()
+                .map(|line| format!("{indent}{line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let trimmed = content.trim();
+        let parsed = serde_json::from_str::<Value>(trimmed).ok();
+
+        let Some(Value::Object(map)) = parsed else {
+            return format!("Bootstrap final response (model-authored analysis): {trimmed}");
+        };
+
+        let mut lines = vec!["Bootstrap final response (model-authored analysis):".to_string()];
+
+        if let Some(reasoning) = map
+            .get("reasoning")
+            .or_else(|| map.get("analysis"))
+            .and_then(|value| value.as_str())
+        {
+            lines.push("  model_reasoning:".to_string());
+            lines.push(indent_block(reasoning, "    "));
+        }
+
+        if let Some(validation) = map.get("deterministic_validation") {
+            lines.push("  deterministic_validation:".to_string());
+            if let Some(error) = validation.get("error").and_then(|value| value.as_str()) {
+                lines.push(format!("    error: {error}"));
+            }
+            lines.push(indent_block(
+                &serde_json::to_string_pretty(validation)
+                    .unwrap_or_else(|_| validation.to_string()),
+                "    ",
+            ));
+        }
+
+        if let Some(errors) = map.get("errors") {
+            lines.push("  errors:".to_string());
+            lines.push(indent_block(
+                &serde_json::to_string_pretty(errors).unwrap_or_else(|_| errors.to_string()),
+                "    ",
+            ));
+        }
+
+        if let Some(semantic_validation) = map.get("semantic_validation") {
+            lines.push("  semantic_validation:".to_string());
+            lines.push(indent_block(
+                &serde_json::to_string_pretty(semantic_validation)
+                    .unwrap_or_else(|_| semantic_validation.to_string()),
+                "    ",
+            ));
+        }
+
+        lines.push("  raw_model_response:".to_string());
+        lines.push(indent_block(
+            &serde_json::to_string_pretty(&Value::Object(map))
+                .unwrap_or_else(|_| trimmed.to_string()),
+            "    ",
+        ));
+
+        lines.join("\n")
     }
 
     async fn get_container_stats(&self, id: &str) -> Option<(f64, u64, u64)> {
@@ -609,8 +676,8 @@ impl AgentRuntime for DockerRuntime {
                         debug!(
                             container_id = container_id,
                             stream = "stdout",
-                            "Bootstrap output: {}",
-                            content
+                            "{}",
+                            Self::format_bootstrap_stdout_for_log(&content)
                         );
                         stdout_logs.push(content);
                     }
@@ -725,6 +792,53 @@ impl AgentRuntime for DockerRuntime {
             memory_usage_mb: mem,
             cpu_usage_percent: cpu,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DockerRuntime;
+
+    #[test]
+    fn bootstrap_stdout_is_labeled_as_model_authored_analysis() {
+        let formatted = DockerRuntime::format_bootstrap_stdout_for_log(
+            "The workflow is fine, but I think it should be rewritten.",
+        );
+
+        assert!(
+            formatted.starts_with("Bootstrap final response (model-authored analysis):"),
+            "{formatted}"
+        );
+        assert!(formatted.contains("I think it should be rewritten."));
+    }
+
+    #[test]
+    fn bootstrap_stdout_preserves_exact_deterministic_error_from_model_json() {
+        let formatted = DockerRuntime::format_bootstrap_stdout_for_log(
+            r#"{
+  "errors": [
+    "Workflow cycle validation failed: Workflow execution error: Circular reference detected in workflow"
+  ],
+  "reasoning": "This is a model-authored analysis of the failure."
+}"#,
+        );
+
+        assert!(
+            formatted.contains("Bootstrap final response (model-authored analysis):"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains(
+                "Workflow cycle validation failed: Workflow execution error: Circular reference detected in workflow"
+            ),
+            "{formatted}"
+        );
+        assert!(formatted.contains("model_reasoning:"), "{formatted}");
+        assert!(
+            formatted.contains("This is a model-authored analysis of the failure."),
+            "{formatted}"
+        );
+        assert!(formatted.contains("errors:"), "{formatted}");
     }
 }
 // Private helper methods for DockerRuntime

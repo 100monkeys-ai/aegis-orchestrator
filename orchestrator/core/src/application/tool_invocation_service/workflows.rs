@@ -550,6 +550,10 @@ impl ToolInvocationService {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.update",
                     "updated": false,
+                    "deterministic_validation": {
+                        "passed": false,
+                        "error": format!("Workflow parser validation failed: {}", e),
+                    },
                     "error": format!("Workflow parser validation failed: {}", e),
                 })));
             }
@@ -559,6 +563,10 @@ impl ToolInvocationService {
             return Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.update",
                 "updated": false,
+                "deterministic_validation": {
+                    "passed": false,
+                    "error": format!("Workflow cycle validation failed: {}", e),
+                },
                 "error": format!("Workflow cycle validation failed: {}", e),
             })));
         }
@@ -568,6 +576,7 @@ impl ToolInvocationService {
             None => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.update",
+                    "deterministic_validation": { "passed": true },
                     "error": "Workflow repository not configured"
                 })));
             }
@@ -582,6 +591,7 @@ impl ToolInvocationService {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.update",
                     "updated": false,
+                    "deterministic_validation": { "passed": true },
                     "error": "Workflow not found"
                 })));
             }
@@ -592,6 +602,7 @@ impl ToolInvocationService {
             None => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.update",
+                    "deterministic_validation": { "passed": true },
                     "error": "Workflow registration use case not configured"
                 })));
             }
@@ -617,6 +628,7 @@ impl ToolInvocationService {
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
                     "tool": "aegis.workflow.update",
                     "updated": true,
+                    "deterministic_validation": { "passed": true },
                     "name": meta.name,
                     "workflow_id": meta.workflow_id,
                     "manifest_yaml": manifest_yaml,
@@ -626,6 +638,7 @@ impl ToolInvocationService {
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.update",
                 "updated": false,
+                "deterministic_validation": { "passed": true },
                 "error": format!("Workflow update failed: {}", e)
             }))),
         }

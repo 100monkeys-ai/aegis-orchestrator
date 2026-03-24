@@ -582,6 +582,34 @@ spec:
     )
 }
 
+fn cyclic_workflow_manifest_yaml(name: &str) -> String {
+    format!(
+        r#"apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: {name}
+  version: "1.0.0"
+spec:
+  initial_state: FIRST
+  states:
+    FIRST:
+      kind: Agent
+      agent: builder
+      input: "{{{{workflow.task}}}}"
+      transitions:
+        - condition: always
+          target: SECOND
+    SECOND:
+      kind: Agent
+      agent: builder
+      input: "{{{{workflow.task}}}}"
+      transitions:
+        - condition: always
+          target: FIRST
+"#
+    )
+}
+
 fn build_test_workflow(name: &str) -> crate::domain::workflow::Workflow {
     WorkflowParser::parse_yaml(&test_workflow_manifest_yaml(name))
         .expect("test workflow manifest should parse")
@@ -744,7 +772,61 @@ async fn workflow_validate_tool_returns_success_for_valid_manifest() {
 
     assert_eq!(payload["tool"], "aegis.workflow.validate");
     assert_eq!(payload["valid"], true);
+    assert_eq!(payload["deterministic_validation"]["passed"], true);
     assert_eq!(payload["workflow"]["name"], "validate-me");
+}
+
+#[tokio::test]
+async fn workflow_update_tool_returns_failure_with_deterministic_validation_details_for_cycle() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let result = service
+        .invoke_aegis_workflow_update_tool(
+            &serde_json::json!({
+                "manifest_yaml": cyclic_workflow_manifest_yaml("cycle-update"),
+            }),
+            ExecutionId::new(),
+            AgentId::new(),
+        )
+        .await
+        .expect("workflow update should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.workflow.update");
+    assert_eq!(payload["updated"], false);
+    assert_eq!(payload["deterministic_validation"]["passed"], false);
+    assert_eq!(
+        payload["deterministic_validation"]["error"],
+        "Workflow cycle validation failed: Workflow execution error: Circular reference detected in workflow"
+    );
+    assert_eq!(
+        payload["error"],
+        payload["deterministic_validation"]["error"]
+    );
 }
 
 #[test]

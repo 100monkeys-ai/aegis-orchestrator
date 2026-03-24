@@ -8,6 +8,7 @@ version = "0.14.0-pre-alpha"
 dependencies = [
  "aegis-orchestrator-core",
  "aegis-orchestrator-sdk",
+ "aegis-orchestrator-swarm",
  "anyhow",
  "async-stream",
  "axum 0.8.8",

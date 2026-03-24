@@ -72,6 +72,28 @@ impl StandardSwarmService {
         state.swarms.get(&swarm_id).cloned()
     }
 
+    pub async fn list_swarms(&self) -> Vec<Swarm> {
+        let state = self.state.read().await;
+        let mut swarms: Vec<Swarm> = state.swarms.values().cloned().collect();
+        swarms.sort_by_key(|swarm| swarm.created_at);
+        swarms
+    }
+
+    pub async fn locks_for_swarm(&self, swarm_id: SwarmId) -> Vec<ResourceLock> {
+        let state = self.state.read().await;
+        let Some(swarm) = state.swarms.get(&swarm_id) else {
+            return Vec::new();
+        };
+
+        let member_ids = swarm.member_ids();
+        state
+            .locks
+            .values()
+            .filter(|lock| member_ids.contains(&lock.held_by))
+            .cloned()
+            .collect()
+    }
+
     fn cleanup_expired_locks(state: &mut SwarmState) {
         let now = Utc::now();
         let expired_resources: Vec<String> = state
