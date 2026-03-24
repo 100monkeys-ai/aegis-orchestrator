@@ -1152,7 +1152,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
 
     // Shared tool servers state
-    let tool_servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let tool_servers = Arc::new(tokio::sync::RwLock::new(
+        std::collections::HashMap::<
+            aegis_orchestrator_core::domain::mcp::ToolServerId,
+            aegis_orchestrator_core::domain::mcp::ToolServer,
+        >::new(),
+    ));
 
     // Load configured servers from NodeConfig
     if let Some(mcp_configs) = &config.spec.mcp_servers {
