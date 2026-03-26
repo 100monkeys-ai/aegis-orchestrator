@@ -100,7 +100,7 @@ use aegis_orchestrator_core::domain::repository::StorageEventRepository;
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
 
 use super::operator_read_models::{
-    storage_violation_view, OperatorReadModelStore, SecurityIncidentView, StimulusView,
+    storage_violation_event_view, OperatorReadModelStore, SecurityIncidentView, StimulusView,
     StorageViolationView,
 };
 
@@ -2207,7 +2207,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 tool_invocation_service: Some(tool_invocation_service),
                 cortex_client,
                 run_container_step_use_case: Some(run_container_step_use_case),
-                agent_service: agent_service_for_grpc,
+                agent_service: Some(agent_service_for_grpc),
+                // GrpcServerConfig now accepts an optional StimulusService, making
+                // stimulus routing configurable per callsite. In the CLI daemon it remains
+                // disabled (None) because StandardStimulusService requires a WorkflowRegistry
+                // (the routing table for stimulus-to-workflow dispatch) that is not set up
+                // here. To enable ingest_stimulus in the daemon, construct a WorkflowRegistry,
+                // build a StandardStimulusService, and pass it as Some(...).
+                stimulus_service: None,
             },
         )
         .await
@@ -2964,7 +2971,7 @@ async fn list_storage_violations_handler(
     let violations = match state.storage_event_repo.find_violations(None).await {
         Ok(events) => events
             .into_iter()
-            .map(|event| storage_violation_view(&event))
+            .map(|event| storage_violation_event_view(&event))
             .collect::<Vec<StorageViolationView>>(),
         Err(e) => {
             return Json(serde_json::json!({
