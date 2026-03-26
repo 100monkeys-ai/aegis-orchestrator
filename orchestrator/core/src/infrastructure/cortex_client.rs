@@ -30,19 +30,19 @@ use async_trait::async_trait;
 use tonic::transport::Channel;
 use tonic::Status;
 
-use crate::infrastructure::aegis_runtime_proto::{
-    aegis_runtime_client::AegisRuntimeClient, QueryCortexRequest, QueryCortexResponse,
-    StoreCortexPatternRequest, StoreCortexPatternResponse, StoreTrajectoryPatternRequest,
+use crate::infrastructure::aegis_cortex_proto::{
+    cortex_service_client::CortexServiceClient, QueryPatternsRequest, QueryPatternsResponse,
+    StorePatternRequest, StorePatternResponse, StoreTrajectoryPatternRequest,
     StoreTrajectoryPatternResponse,
 };
 
-/// Thin wrapper around `AegisRuntimeClient` that exposes only the Cortex RPCs.
+/// Thin wrapper around `CortexServiceClient` that exposes Cortex RPCs.
 ///
-/// `AegisRuntimeClient<Channel>` is `Clone` — cloning is cheap and re-uses the
+/// `CortexServiceClient<Channel>` is `Clone` — cloning is cheap and re-uses the
 /// same underlying HTTP/2 connection pool managed by the `Channel`.
 #[derive(Debug, Clone)]
 pub struct CortexGrpcClient {
-    client: AegisRuntimeClient<Channel>,
+    client: CortexServiceClient<Channel>,
 }
 
 impl CortexGrpcClient {
@@ -51,27 +51,27 @@ impl CortexGrpcClient {
     /// Returns an error if the endpoint URL is malformed or the initial
     /// connection setup fails.
     pub async fn new(url: String) -> Result<Self, tonic::transport::Error> {
-        let client = AegisRuntimeClient::connect(url).await?;
+        let client = CortexServiceClient::connect(url).await?;
         Ok(Self { client })
     }
 
-    /// Forward a `QueryCortexPatterns` RPC to the Cortex service.
+    /// Forward a `QueryPatterns` RPC to the Cortex service.
     pub async fn query_patterns(
         &self,
-        request: QueryCortexRequest,
-    ) -> Result<QueryCortexResponse, Status> {
+        request: QueryPatternsRequest,
+    ) -> Result<QueryPatternsResponse, Status> {
         let mut client = self.client.clone();
-        let response = client.query_cortex_patterns(request).await?;
+        let response = client.query_patterns(request).await?;
         Ok(response.into_inner())
     }
 
-    /// Forward a `StoreCortexPattern` RPC to the Cortex service.
+    /// Forward a `StorePattern` RPC to the Cortex service.
     pub async fn store_pattern(
         &self,
-        request: StoreCortexPatternRequest,
-    ) -> Result<StoreCortexPatternResponse, Status> {
+        request: StorePatternRequest,
+    ) -> Result<StorePatternResponse, Status> {
         let mut client = self.client.clone();
-        let response = client.store_cortex_pattern(request).await?;
+        let response = client.store_pattern(request).await?;
         Ok(response.into_inner())
     }
 
@@ -98,7 +98,7 @@ impl CortexPatternPort for CortexGrpcClient {
                 .steps
                 .into_iter()
                 .map(
-                    |s| crate::infrastructure::aegis_runtime_proto::TrajectoryStep {
+                    |s| crate::infrastructure::aegis_cortex_proto::TrajectoryStep {
                         tool_name: s.tool_name,
                         arguments_json: s.arguments_json,
                     },

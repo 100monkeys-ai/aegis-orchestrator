@@ -2749,7 +2749,7 @@ async fn list_cortex_patterns_handler(
     };
 
     let request =
-        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+        aegis_orchestrator_core::infrastructure::aegis_cortex_proto::QueryPatternsRequest {
             error_signature: params.q.clone().unwrap_or_default(),
             error_type: None,
             limit: Some(params.limit.unwrap_or(100) as u32),
@@ -2805,7 +2805,7 @@ async fn get_cortex_skills_handler(State(state): State<Arc<AppState>>) -> impl I
     };
 
     let request =
-        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+        aegis_orchestrator_core::infrastructure::aegis_cortex_proto::QueryPatternsRequest {
             error_signature: String::new(),
             error_type: None,
             limit: Some(500),
@@ -2887,7 +2887,7 @@ async fn get_cortex_metrics_handler(State(state): State<Arc<AppState>>) -> impl 
     };
 
     let request =
-        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+        aegis_orchestrator_core::infrastructure::aegis_cortex_proto::QueryPatternsRequest {
             error_signature: String::new(),
             error_type: None,
             limit: Some(1000),

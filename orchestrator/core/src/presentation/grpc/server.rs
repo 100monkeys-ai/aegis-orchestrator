@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 //! gRPC Server Implementation for AEGIS Runtime
-//! Exposes ExecuteAgent, ExecuteSystemCommand, ValidateWithJudges, QueryCortexPatterns, StoreCortexPattern
+//! Exposes ExecuteAgent, ExecuteSystemCommand, ValidateWithJudges
 //!
 //! # Architecture
 //!
@@ -556,69 +556,6 @@ impl AegisRuntime for AegisRuntimeService {
                 }))
             }
             Err(e) => Err(Status::internal(format!("Validation failed: {e}"))),
-        }
-    }
-
-    /// Query Cortex for patterns based on error signature or embedding similarity.
-    /// Forwards the call to the standalone `aegis-cortex` service when configured;
-    /// returns an empty result set in memoryless mode (no warning per ADR-042).
-    async fn query_cortex_patterns(
-        &self,
-        request: Request<QueryCortexRequest>,
-    ) -> Result<Response<QueryCortexResponse>, Status> {
-        let _identity = self
-            .authorize(&request, "/aegis.v1.AegisRuntime/QueryCortexPatterns")
-            .await?;
-        let req = request.into_inner();
-
-        match &self.cortex_client {
-            Some(client) => client.query_patterns(req).await.map(Response::new),
-            None => Ok(Response::new(QueryCortexResponse { patterns: vec![] })),
-        }
-    }
-
-    /// Store a learned pattern in Cortex with automatic deduplication.
-    /// Forwards the call to the standalone `aegis-cortex` service when configured;
-    /// returns a no-op response in memoryless mode (no warning per ADR-042).
-    async fn store_cortex_pattern(
-        &self,
-        request: Request<StoreCortexPatternRequest>,
-    ) -> Result<Response<StoreCortexPatternResponse>, Status> {
-        let _identity = self
-            .authorize(&request, "/aegis.v1.AegisRuntime/StoreCortexPattern")
-            .await?;
-        let req = request.into_inner();
-
-        match &self.cortex_client {
-            Some(client) => client.store_pattern(req).await.map(Response::new),
-            None => Ok(Response::new(StoreCortexPatternResponse {
-                pattern_id: String::new(),
-                deduplicated: false,
-                new_frequency: 0,
-            })),
-        }
-    }
-
-    /// Store a learned trajectory pattern in Cortex (ADR-049).
-    async fn store_trajectory_pattern(
-        &self,
-        request: Request<StoreTrajectoryPatternRequest>,
-    ) -> Result<Response<StoreTrajectoryPatternResponse>, Status> {
-        let _identity = self
-            .authorize(&request, "/aegis.v1.AegisRuntime/StoreTrajectoryPattern")
-            .await?;
-        let req = request.into_inner();
-
-        match &self.cortex_client {
-            Some(client) => client
-                .store_trajectory_pattern(req)
-                .await
-                .map(Response::new),
-            None => Ok(Response::new(StoreTrajectoryPatternResponse {
-                trajectory_id: String::new(),
-                new_weight: 0.0,
-                deduplicated: false,
-            })),
         }
     }
 

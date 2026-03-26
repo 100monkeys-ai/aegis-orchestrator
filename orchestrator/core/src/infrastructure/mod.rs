@@ -28,13 +28,15 @@
 //! | [`temporal_client`] | Temporal.io workflow client (deferred) | ADR-022 |
 //! | [`human_input_service`] | Suspends execution pending human response | ADR-015 |
 
-//! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server + cortex client | ADR-042 |
+//! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server | ADR-042 |
+//! | [`aegis_cortex_proto`] | Generated `aegis.cortex.v1` types for Cortex service | ADR-042 |
 //! | [`smcp_gateway_proto`] | Generated `aegis.smcp_gateway.v1` gRPC types | ADR-053 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 //! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
 
 pub mod aegis_cluster_proto;
+pub mod aegis_cortex_proto;
 pub mod aegis_remote_storage_proto;
 pub mod aegis_runtime_proto;
 pub mod agent_manifest_parser;
