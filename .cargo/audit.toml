@@ -1,0 +1,8 @@
+# Cargo audit configuration
+# See: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+
+[advisories]
+# RUSTSEC-2023-0071: rsa timing sidechannel (Marvin Attack)
+# This is a transitive dependency via sqlx-mysql. We only use PostgreSQL,
+# so this crate is never exercised. No fix is available upstream.
+ignore = ["RUSTSEC-2023-0071"]
