@@ -417,6 +417,35 @@ pub enum WorkflowEvent {
         execution_id: ExecutionId,
         cancelled_at: DateTime<Utc>,
     },
+    /// A workflow state triggered a child workflow execution (ADR-065)
+    SubworkflowTriggered {
+        /// Parent execution that initiated the child
+        parent_execution_id: ExecutionId,
+        /// Child execution that was started
+        child_execution_id: ExecutionId,
+        /// The child workflow being invoked
+        child_workflow_id: crate::domain::workflow::WorkflowId,
+        /// Whether the parent is waiting (blocking) or continuing (fire_and_forget)
+        mode: String,
+        /// State name in the parent workflow that triggered the child
+        parent_state_name: String,
+        triggered_at: DateTime<Utc>,
+    },
+    /// A blocking child workflow completed and its result was written to the parent blackboard (ADR-065)
+    SubworkflowCompleted {
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        /// Blackboard key under which the child result was stored
+        result_key: String,
+        completed_at: DateTime<Utc>,
+    },
+    /// A child workflow failed (ADR-065)
+    SubworkflowFailed {
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 /// Cortex pattern weight change events (BC-5 Cortex / Learning & Memory Context).
@@ -618,6 +647,8 @@ pub enum MCPToolEvent {
 
     InvocationStarted {
         invocation_id: crate::domain::mcp::ToolInvocationId,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
         server_id: crate::domain::mcp::ToolServerId,
         tool_name: String,
         started_at: DateTime<Utc>,

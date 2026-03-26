@@ -518,6 +518,9 @@ impl AgentRuntime for DockerRuntime {
         let mut host_config = bollard::models::HostConfig {
             mounts: None, // Will be set below if volumes are specified (ADR-036: NFS volume mounts)
             network_mode: self.network_mode.clone(), // Optional Docker network (None = default)
+            // ADR-027: Allow containers to reach host services (LLM APIs, orchestrator proxy) via
+            // host.docker.internal (required on macOS/Windows; Linux uses host-gateway mapping)
+            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
             ..Default::default()
         };
 

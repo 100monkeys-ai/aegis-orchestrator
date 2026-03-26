@@ -42,6 +42,50 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// RAII guard that ensures a spawned container is terminated even if the
+/// surrounding code panics or takes an unexpected error path.  Create one
+/// right after `runtime.spawn()` succeeds; call [`ContainerGuard::defuse`]
+/// before an intentional termination (or when keeping a container for
+/// debugging) so the guard does not double-terminate.
+struct ContainerGuard {
+    inner: Option<(Arc<dyn AgentRuntime>, InstanceId)>,
+}
+
+impl ContainerGuard {
+    fn new(runtime: Arc<dyn AgentRuntime>, instance_id: InstanceId) -> Self {
+        Self {
+            inner: Some((runtime, instance_id)),
+        }
+    }
+
+    /// Disarm the guard so it will **not** terminate the container on drop.
+    fn defuse(&mut self) {
+        self.inner.take();
+    }
+}
+
+impl Drop for ContainerGuard {
+    fn drop(&mut self) {
+        if let Some((runtime, instance_id)) = self.inner.take() {
+            warn!(
+                instance_id = %instance_id.as_str(),
+                "ContainerGuard dropping — terminating leaked container"
+            );
+            // We may be dropping from a non-async context (e.g. panic unwind),
+            // so spawn a blocking-compatible task to perform the cleanup.
+            tokio::spawn(async move {
+                if let Err(e) = runtime.terminate(&instance_id).await {
+                    warn!(
+                        instance_id = %instance_id.as_str(),
+                        error = %e,
+                        "ContainerGuard failed to terminate leaked container"
+                    );
+                }
+            });
+        }
+    }
+}
+
 use async_trait::async_trait;
 
 /// Parse human-readable duration strings like "30s", "5m", "1h"
@@ -273,6 +317,12 @@ impl Supervisor {
                 }
             };
 
+            // RAII guard: if we panic or hit an unexpected error path between
+            // here and the explicit terminate/retain below, this guard ensures
+            // the container is cleaned up.
+            let mut container_guard =
+                ContainerGuard::new(self.runtime.clone(), instance_id.clone());
+
             let task_input = TaskInput {
                 prompt: original_intent.clone(),
                 context: execution_context.clone(),
@@ -295,6 +345,8 @@ impl Supervisor {
                 }
                 _ = cancellation_token.cancelled() => {
                     info!(iteration = attempts, "Execution cancelled during iteration");
+                    // Defuse the guard — we terminate explicitly here.
+                    container_guard.defuse();
                     // Terminate the instance before returning
                     if let Some(instance_id) = current_instance.lock().await.take() {
                         let _ = self.runtime.terminate(&instance_id).await;
@@ -313,10 +365,14 @@ impl Supervisor {
 
             if !should_terminate {
                 // Preserve the failed container for debugging, but stop tracking it as active.
+                // Defuse the guard so it does not terminate the debug container.
+                container_guard.defuse();
                 let _ = current_instance.lock().await.take();
             }
 
             if should_terminate {
+                // Defuse the guard — we are about to terminate explicitly.
+                container_guard.defuse();
                 let terminate_result = self.runtime.terminate(&instance_id).await;
                 if let Err(e) = terminate_result {
                     warn!(

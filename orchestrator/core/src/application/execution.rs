@@ -275,10 +275,15 @@ impl StandardExecutionService {
         tenant_id: &TenantId,
         parent_execution_id: ExecutionId,
         child_execution_id: ExecutionId,
-        parent_agent: &crate::domain::agent::Agent,
     ) -> Result<Vec<VolumeMount>> {
-        let declared_volumes = &parent_agent.manifest.spec.volumes;
-        if declared_volumes.is_empty() {
+        // Look up actually-provisioned volumes for the parent execution (not the
+        // agent manifest declarations, which may be absent for dynamically created
+        // volumes).
+        let parent_volumes = self
+            .volume_service
+            .list_volumes_by_ownership(&VolumeOwnership::execution(parent_execution_id))
+            .await?;
+        if parent_volumes.is_empty() {
             return Ok(Vec::new());
         }
 
@@ -300,54 +305,25 @@ impl StandardExecutionService {
             ));
         }
 
-        let parent_volumes = self
-            .volume_service
-            .list_volumes_by_ownership(&VolumeOwnership::execution(parent_execution_id))
-            .await?;
-        if parent_volumes.is_empty() {
-            return Err(anyhow!(
-                "Judge execution {} requires inherited worker volumes, but parent execution {} has no provisioned volumes to inherit",
-                child_execution_id,
-                parent_execution_id
-            ));
-        }
-
-        let volumes_by_name = parent_volumes
-            .into_iter()
-            .map(|volume| (volume.name.clone(), volume))
-            .collect::<std::collections::HashMap<_, _>>();
         let mount_contexts_by_volume_id = parent_mount_contexts
             .into_iter()
             .map(|ctx| (ctx.volume_id, ctx))
             .collect::<std::collections::HashMap<_, _>>();
 
-        let mut borrowed = Vec::with_capacity(declared_volumes.len());
-        for spec in declared_volumes {
-            if !Self::is_workspace_mount(&spec.mount_path) {
-                return Err(anyhow!(
-                    "Invalid inherited mount path '{}': all mounts must be /workspace or /workspace/*",
-                    spec.mount_path
-                ));
-            }
-
-            let source_volume = volumes_by_name.get(&spec.name).cloned().ok_or_else(|| {
-                anyhow!(
-                    "Judge execution {} requires inherited worker volume '{}', but parent execution {} did not provision it",
-                    child_execution_id,
-                    spec.name,
-                    parent_execution_id
-                )
-            })?;
-            let parent_ctx = mount_contexts_by_volume_id
-                .get(&source_volume.id)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Judge execution {} requires inherited worker volume '{}', but parent execution {} did not register it with the NFS gateway",
-                        child_execution_id,
-                        spec.name,
+        let mut borrowed = Vec::with_capacity(parent_volumes.len());
+        for source_volume in &parent_volumes {
+            let parent_ctx = match mount_contexts_by_volume_id.get(&source_volume.id) {
+                Some(ctx) => ctx,
+                None => {
+                    tracing::warn!(
+                        "Skipping inherited volume '{}' ({}): no NFS mount context registered for parent execution {}",
+                        source_volume.name,
+                        source_volume.id,
                         parent_execution_id
-                    )
-                })?;
+                    );
+                    continue;
+                }
+            };
 
             let mount_path = parent_ctx.mount_point.to_string_lossy().to_string();
             if !Self::is_workspace_mount(&mount_path) {
@@ -359,9 +335,13 @@ impl StandardExecutionService {
 
             borrowed.push((
                 VolumeId::new(),
-                source_volume,
+                source_volume.clone(),
                 parent_ctx.mount_point.clone(),
             ));
+        }
+
+        if borrowed.is_empty() {
+            return Ok(Vec::new());
         }
 
         let read_policy = FilesystemPolicy {
@@ -898,11 +878,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn judge_fails_fast_when_parent_declares_volumes_but_inheritance_is_unavailable() {
+    async fn judge_fails_fast_when_parent_has_provisioned_volumes_but_no_nfs_gateway() {
         let tenant_id = CoreTenantId::local_default();
         let parent_agent = make_agent("worker", None, Some("/workspace/project"));
         let judge_agent = make_agent("judge", Some("judge"), None);
         let parent_execution = make_parent_execution(parent_agent.id);
+
+        // Create a provisioned volume owned by the parent execution so the
+        // new provisioned-volume-driven path does NOT exit early.
+        let mut parent_volume = Volume::new(
+            "workspace".to_string(),
+            tenant_id.clone(),
+            StorageClass::persistent(),
+            VolumeBackend::HostPath {
+                path: PathBuf::from("/tmp/worker-volume"),
+            },
+            1024 * 1024,
+            VolumeOwnership::execution(parent_execution.id),
+        )
+        .unwrap();
+        parent_volume.mark_available().unwrap();
 
         let agent_repo = Arc::new(InMemoryAgentRepository::new());
         agent_repo
@@ -922,10 +917,12 @@ mod tests {
 
         let runtime = Arc::new(TestRuntime::default());
         let supervisor = Arc::new(Supervisor::new(runtime));
+        // No NFS gateway configured, but provisioned volumes exist →
+        // should fail with "NFS gateway is not configured".
         let service = StandardExecutionService::new(
             agent_repo,
             Arc::new(TestVolumeService {
-                volumes: HashMap::new(),
+                volumes: HashMap::from([(parent_volume.id, parent_volume)]),
             }),
             supervisor,
             execution_repo.clone(),
@@ -945,9 +942,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("requires inherited worker volumes"));
+        assert!(
+            err.to_string().contains("NFS gateway is not configured"),
+            "expected NFS gateway error, got: {err}"
+        );
         let executions = execution_repo
             .find_recent_for_tenant(&tenant_id, 10)
             .await
@@ -1926,11 +1924,6 @@ impl ExecutionService for StandardExecutionService {
             .agent_service
             .get_agent_for_tenant(&tenant_id, agent_id)
             .await?;
-        let parent_agent = self
-            .agent_service
-            .get_agent_for_tenant(&tenant_id, parent.agent_id)
-            .await?;
-
         // 3. Prepare input (render judge's prompt template).
         let prepared_input = self.prepare_execution_input(input, &agent)?;
 
@@ -2057,12 +2050,149 @@ impl ExecutionService for StandardExecutionService {
                     &tenant_id,
                     parent_execution_id,
                     child_execution_id,
-                    &parent_agent,
                 )
                 .await?
             } else {
                 Vec::new()
             }
+        };
+
+        // Provision the judge's own declared volumes from its manifest (mirrors start_execution logic).
+        let own_volume_mounts = if !agent.manifest.spec.volumes.is_empty() {
+            tracing::info!(
+                "Creating volumes for child execution {}",
+                child_execution_id.0
+            );
+
+            let storage_config = self
+                .config
+                .spec
+                .storage
+                .as_ref()
+                .ok_or_else(|| anyhow!("Storage configuration not found in node config"))?;
+
+            let volumes = self
+                .volume_service
+                .create_volumes_for_execution(
+                    child_execution_id,
+                    tenant_id.clone(),
+                    &agent.manifest.spec.volumes,
+                    &storage_config.backend,
+                )
+                .await?;
+
+            tracing::info!(
+                "Successfully created {} own volume(s) for child execution",
+                volumes.len()
+            );
+
+            volumes
+                .iter()
+                .map(|volume| {
+                    let spec = agent
+                        .manifest
+                        .spec
+                        .volumes
+                        .iter()
+                        .find(|s| s.name == volume.name)
+                        .expect("Volume spec not found for created volume");
+
+                    let access_mode = match spec.access_mode.as_str() {
+                        "read-only" => AccessMode::ReadOnly,
+                        _ => AccessMode::ReadWrite,
+                    };
+
+                    volume.to_mount(PathBuf::from(&spec.mount_path), access_mode)
+                })
+                .collect::<Vec<VolumeMount>>()
+        } else {
+            Vec::new()
+        };
+
+        // Validate own volume mount paths (must be under /workspace, no overlaps with each other
+        // or with inherited mounts).
+        if !own_volume_mounts.is_empty() {
+            let inherited_paths: Vec<String> = judge_inherited_mounts
+                .iter()
+                .map(|m| m.mount_point.to_string_lossy().to_string())
+                .collect();
+
+            for mount in &own_volume_mounts {
+                let path = mount.mount_point.to_string_lossy().to_string();
+                if !(path == "/workspace" || path.starts_with("/workspace/")) {
+                    return Err(anyhow!(
+                        "Invalid mount path '{path}': all mounts must be /workspace or /workspace/*"
+                    ));
+                }
+                // Own volumes must not overlap with inherited mount paths.
+                for inh in &inherited_paths {
+                    let a = path.trim_end_matches('/');
+                    let b = inh.trim_end_matches('/');
+                    if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+                    {
+                        return Err(anyhow!(
+                            "Child execution own mount '{}' overlaps with inherited mount '{}'",
+                            path,
+                            inh
+                        ));
+                    }
+                }
+            }
+
+            // Check own mounts for mutual overlaps (skip /workspace root).
+            let mut own_paths: Vec<String> = own_volume_mounts
+                .iter()
+                .map(|m| m.mount_point.to_string_lossy().to_string())
+                .collect();
+            own_paths.sort();
+            for i in 0..own_paths.len() {
+                for j in (i + 1)..own_paths.len() {
+                    let a = own_paths[i].trim_end_matches('/');
+                    let b = own_paths[j].trim_end_matches('/');
+                    if a == "/workspace" || b == "/workspace" {
+                        continue;
+                    }
+                    if a == b || a.starts_with(&format!("{b}/")) || b.starts_with(&format!("{a}/"))
+                    {
+                        return Err(anyhow!(
+                            "Overlapping mount paths are not allowed: '{}' and '{}'",
+                            own_paths[i],
+                            own_paths[j]
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Register own volumes with the NFS gateway (ADR-036).
+        if let Some(ref gw) = self.nfs_gateway {
+            for mount in &own_volume_mounts {
+                let policy = FilesystemPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                };
+                gw.register_volume(
+                    mount.volume_id,
+                    child_execution_id,
+                    1000, // container_uid
+                    1000, // container_gid
+                    policy,
+                    mount.mount_point.clone(),
+                );
+                tracing::info!(
+                    "Registered own volume {} with NFS gateway for child execution {}",
+                    mount.volume_id,
+                    child_execution_id
+                );
+            }
+        }
+
+        // Merge inherited mounts and own mounts. Inherited mounts take precedence for
+        // overlapping paths (validated above to not overlap, so this is a simple concat).
+        let all_volumes = {
+            let mut merged = judge_inherited_mounts.clone();
+            merged.extend(own_volume_mounts);
+            merged
         };
 
         let runtime_config = crate::domain::runtime::RuntimeConfig {
@@ -2085,7 +2215,7 @@ impl ExecutionService for StandardExecutionService {
             image_pull_policy: agent.manifest.spec.runtime.image_pull_policy,
             resources,
             execution: agent.manifest.spec.execution.clone().unwrap_or_default(),
-            volumes: judge_inherited_mounts.clone(),
+            volumes: all_volumes,
             container_uid: 1000,
             container_gid: 1000,
             keep_container_on_failure: std::env::var("AEGIS_KEEP_CONTAINER")

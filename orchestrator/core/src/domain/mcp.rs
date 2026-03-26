@@ -425,6 +425,8 @@ impl ToolInvocation {
 
         Ok(MCPToolEvent::InvocationStarted {
             invocation_id: self.id,
+            execution_id: self.execution_id,
+            agent_id: self.agent_id,
             server_id: self.server_id,
             tool_name: self.tool_name.clone(),
             started_at: self.started_at.unwrap(),

@@ -882,8 +882,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let agent_container_reaper_execution_repo = execution_repo.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        // First tick fires immediately — clean up any orphans left from a prior crash.
+        let mut first_run = true;
         loop {
             interval.tick().await;
+            if first_run {
+                tracing::info!("Running startup orphan container cleanup");
+                first_run = false;
+            }
             match cleanup_orphaned_agent_containers(
                 agent_container_reaper_runtime.clone(),
                 agent_container_reaper_execution_repo.clone(),
@@ -2914,19 +2920,20 @@ async fn stream_events_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
+    let verbose = params.get("verbose").map(|v| v == "true").unwrap_or(false);
     let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
     let _tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let activity_service = state.correlated_activity_stream_service.clone();
 
     let stream = async_stream::stream! {
         if follow {
-            let mut activity_stream = activity_service.stream_execution_activity(exec_id).await?;
+            let mut activity_stream = activity_service.stream_execution_activity(exec_id, verbose).await?;
             while let Some(activity) = activity_stream.next().await {
                 let payload = serde_json::to_string(&activity?)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
         } else {
-            for activity in activity_service.execution_history(exec_id).await? {
+            for activity in activity_service.execution_history(exec_id, verbose).await? {
                 let payload = serde_json::to_string(&activity)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
@@ -2943,19 +2950,20 @@ async fn stream_agent_events_handler(
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
+    let verbose = params.get("verbose").map(|v| v == "true").unwrap_or(false);
     let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
     let _tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let activity_service = state.correlated_activity_stream_service.clone();
 
     let stream = async_stream::stream! {
         if follow {
-            let mut activity_stream = activity_service.stream_agent_activity(aid).await?;
+            let mut activity_stream = activity_service.stream_agent_activity(aid, verbose).await?;
             while let Some(activity) = activity_stream.next().await {
                 let payload = serde_json::to_string(&activity?)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
         } else {
-            for activity in activity_service.agent_history(aid).await? {
+            for activity in activity_service.agent_history(aid, verbose).await? {
                 let payload = serde_json::to_string(&activity)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
@@ -3588,6 +3596,26 @@ fn workflow_event_message(event: &WorkflowEvent) -> String {
         WorkflowEvent::WorkflowRegistered { name, .. } => {
             format!("Workflow {name} registered")
         }
+        WorkflowEvent::SubworkflowTriggered {
+            child_workflow_id,
+            mode,
+            parent_state_name,
+            ..
+        } => format!(
+            "Subworkflow {child_workflow_id} triggered from state {parent_state_name} (mode: {mode})"
+        ),
+        WorkflowEvent::SubworkflowCompleted {
+            child_execution_id,
+            result_key,
+            ..
+        } => format!(
+            "Subworkflow execution {child_execution_id} completed (result_key: {result_key})"
+        ),
+        WorkflowEvent::SubworkflowFailed {
+            child_execution_id,
+            reason,
+            ..
+        } => format!("Subworkflow execution {child_execution_id} failed: {reason}"),
     }
 }
 
@@ -3603,6 +3631,9 @@ fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
         WorkflowEvent::WorkflowExecutionCompleted { .. } => "WorkflowExecutionCompleted",
         WorkflowEvent::WorkflowExecutionFailed { .. } => "WorkflowExecutionFailed",
         WorkflowEvent::WorkflowExecutionCancelled { .. } => "WorkflowExecutionCancelled",
+        WorkflowEvent::SubworkflowTriggered { .. } => "SubworkflowTriggered",
+        WorkflowEvent::SubworkflowCompleted { .. } => "SubworkflowCompleted",
+        WorkflowEvent::SubworkflowFailed { .. } => "SubworkflowFailed",
     }
 }
 
@@ -3719,6 +3750,40 @@ fn workflow_event_view_from_domain(
             None,
             None,
             cancelled_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::SubworkflowTriggered {
+            parent_execution_id,
+            triggered_at,
+            parent_state_name,
+            ..
+        } => (
+            parent_execution_id.0,
+            Some(parent_state_name.clone()),
+            None,
+            triggered_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::SubworkflowCompleted {
+            parent_execution_id,
+            completed_at,
+            ..
+        } => (
+            parent_execution_id.0,
+            None,
+            None,
+            completed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::SubworkflowFailed {
+            parent_execution_id,
+            failed_at,
+            ..
+        } => (
+            parent_execution_id.0,
+            None,
+            None,
+            failed_at.to_rfc3339(),
             serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
         ),
     };

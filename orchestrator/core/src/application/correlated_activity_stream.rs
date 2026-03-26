@@ -40,34 +40,73 @@ impl CorrelatedActivityStreamService {
     pub async fn stream_execution_activity(
         &self,
         execution_id: ExecutionId,
+        verbose: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
-        let history = self.execution_history(execution_id).await?;
-        let receiver = self.event_bus.subscribe_execution_domain(execution_id);
+        let history = self.execution_history(execution_id, verbose).await?;
 
-        let live = futures::stream::unfold(receiver, |mut receiver| async move {
-            match receiver.recv().await {
-                Ok(event) => Some((Ok(normalize_domain_event(&event, None)), receiver)),
-                Err(EventBusError::Closed) => None,
-                Err(e) => Some((Err(anyhow!("Event bus error: {e}")), receiver)),
-            }
-        });
+        if verbose {
+            // In verbose mode, subscribe to the global event bus so we also see
+            // system-level events that have no execution_id (e.g. MCP server lifecycle).
+            let receiver = self.event_bus.subscribe();
+            let live = futures::stream::unfold(
+                (receiver, execution_id),
+                |(mut receiver, exec_id)| async move {
+                    loop {
+                        match receiver.recv().await {
+                            Ok(event) => {
+                                // Include events that match this execution OR have no execution_id
+                                // (system-level events visible only in verbose mode).
+                                let event_exec_id = event.execution_id();
+                                if event_exec_id == Some(exec_id) || event_exec_id.is_none() {
+                                    return Some((
+                                        Ok(normalize_domain_event(&event, None)),
+                                        (receiver, exec_id),
+                                    ));
+                                }
+                                continue;
+                            }
+                            Err(EventBusError::Closed) => return None,
+                            Err(e) => {
+                                return Some((
+                                    Err(anyhow!("Event bus error: {e}")),
+                                    (receiver, exec_id),
+                                ))
+                            }
+                        }
+                    }
+                },
+            );
 
-        let history_stream = futures::stream::iter(history.into_iter().map(Ok));
-        Ok(Box::pin(history_stream.chain(live)))
+            let history_stream = futures::stream::iter(history.into_iter().map(Ok));
+            Ok(Box::pin(history_stream.chain(live)))
+        } else {
+            let receiver = self.event_bus.subscribe_execution_domain(execution_id);
+            let live = futures::stream::unfold(receiver, |mut receiver| async move {
+                match receiver.recv().await {
+                    Ok(event) => Some((Ok(normalize_domain_event(&event, None)), receiver)),
+                    Err(EventBusError::Closed) => None,
+                    Err(e) => Some((Err(anyhow!("Event bus error: {e}")), receiver)),
+                }
+            });
+
+            let history_stream = futures::stream::iter(history.into_iter().map(Ok));
+            Ok(Box::pin(history_stream.chain(live)))
+        }
     }
 
     pub async fn stream_agent_activity(
         &self,
         agent_id: AgentId,
+        verbose: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
-        let history = self.agent_history(agent_id).await?;
+        let history = self.agent_history(agent_id, verbose).await?;
         let repository = Arc::clone(&self.execution_repository);
         let cache = Arc::new(RwLock::new(HashMap::<ExecutionId, AgentId>::new()));
         let receiver = self.event_bus.subscribe();
 
         let live = futures::stream::unfold(
-            (receiver, repository, cache),
-            move |(mut receiver, repository, cache)| async move {
+            (receiver, repository, cache, verbose),
+            move |(mut receiver, repository, cache, verbose)| async move {
                 loop {
                     match receiver.recv().await {
                         Ok(event) => {
@@ -75,11 +114,27 @@ impl CorrelatedActivityStreamService {
                                 Ok(Some(resolved_agent_id)) if resolved_agent_id == agent_id => {
                                     let normalized =
                                         normalize_domain_event(&event, Some(resolved_agent_id));
-                                    return Some((Ok(normalized), (receiver, repository, cache)));
+                                    return Some((
+                                        Ok(normalized),
+                                        (receiver, repository, cache, verbose),
+                                    ));
+                                }
+                                Ok(None) if verbose => {
+                                    // In verbose mode, emit unresolvable events (system-level
+                                    // events with no agent_id) with agent_id: None so they are
+                                    // visible to the caller.
+                                    let normalized = normalize_domain_event(&event, None);
+                                    return Some((
+                                        Ok(normalized),
+                                        (receiver, repository, cache, verbose),
+                                    ));
                                 }
                                 Ok(_) => continue,
                                 Err(error) => {
-                                    return Some((Err(error), (receiver, repository, cache)));
+                                    return Some((
+                                        Err(error),
+                                        (receiver, repository, cache, verbose),
+                                    ));
                                 }
                             }
                         }
@@ -87,7 +142,7 @@ impl CorrelatedActivityStreamService {
                         Err(error) => {
                             return Some((
                                 Err(anyhow!("Event bus error: {error}")),
-                                (receiver, repository, cache),
+                                (receiver, repository, cache, verbose),
                             ));
                         }
                     }
@@ -102,6 +157,7 @@ impl CorrelatedActivityStreamService {
     pub async fn execution_history(
         &self,
         execution_id: ExecutionId,
+        _verbose: bool,
     ) -> Result<Vec<CorrelatedActivityEvent>> {
         let mut history = Vec::new();
 
@@ -122,7 +178,11 @@ impl CorrelatedActivityStreamService {
         Ok(history)
     }
 
-    pub async fn agent_history(&self, agent_id: AgentId) -> Result<Vec<CorrelatedActivityEvent>> {
+    pub async fn agent_history(
+        &self,
+        agent_id: AgentId,
+        _verbose: bool,
+    ) -> Result<Vec<CorrelatedActivityEvent>> {
         let executions = self
             .execution_repository
             .find_by_agent(agent_id, 50)
@@ -670,7 +730,7 @@ mod tests {
         let service = CorrelatedActivityStreamService::new(event_bus.clone(), repository, None);
         let execution_id = execution.id;
         let mut stream = service
-            .stream_execution_activity(execution_id)
+            .stream_execution_activity(execution_id, false)
             .await
             .unwrap();
 
@@ -724,7 +784,10 @@ mod tests {
             repository,
             Some(Arc::new(EmptyWorkflowExecutionRepository)),
         );
-        let mut stream = service.stream_agent_activity(agent_id).await.unwrap();
+        let mut stream = service
+            .stream_agent_activity(agent_id, false)
+            .await
+            .unwrap();
 
         let _ = stream.next().await.unwrap().unwrap();
 

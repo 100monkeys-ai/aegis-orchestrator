@@ -23,12 +23,16 @@ impl ToolInvocationService {
     pub(super) fn publish_invocation_started(
         &self,
         invocation_id: ToolInvocationId,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
         server_id: ToolServerId,
         tool_name: &str,
     ) {
         self.event_bus
             .publish_mcp_event(MCPToolEvent::InvocationStarted {
                 invocation_id,
+                execution_id,
+                agent_id,
                 server_id,
                 tool_name: tool_name.to_string(),
                 started_at: Utc::now(),

@@ -174,6 +174,20 @@ pub enum StateKindYaml {
         steps: Vec<crate::domain::workflow::ContainerRunConfig>,
         completion: crate::domain::workflow::ParallelCompletionStrategy,
     },
+    /// Invoke a child workflow — blocking or fire-and-forget (ADR-065)
+    #[serde(rename = "Subworkflow")]
+    Subworkflow {
+        /// The workflow to invoke (name or UUID)
+        workflow_id: String,
+        /// Execution mode: "blocking" or "fire_and_forget"
+        mode: String,
+        /// Blackboard key for child result (required for blocking, forbidden for fire_and_forget)
+        #[serde(default)]
+        result_key: Option<String>,
+        /// Optional Handlebars input template
+        #[serde(default)]
+        input: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -488,6 +502,28 @@ impl WorkflowParser {
             StateKindYaml::ParallelContainerRun { steps, completion } => {
                 StateKind::ParallelContainerRun { steps, completion }
             }
+            StateKindYaml::Subworkflow {
+                workflow_id,
+                mode,
+                result_key,
+                input,
+            } => {
+                let mode = match mode.as_str() {
+                    "blocking" => crate::domain::workflow::SubworkflowMode::Blocking,
+                    "fire_and_forget" => crate::domain::workflow::SubworkflowMode::FireAndForget,
+                    other => {
+                        return Err(WorkflowParseError::ValidationError(format!(
+                            "Invalid subworkflow mode '{other}': expected 'blocking' or 'fire_and_forget'"
+                        )));
+                    }
+                };
+                StateKind::Subworkflow {
+                    workflow_id,
+                    mode,
+                    result_key,
+                    input,
+                }
+            }
         })
     }
 
@@ -699,6 +735,22 @@ impl WorkflowParser {
                     completion: *completion,
                 }
             }
+            StateKind::Subworkflow {
+                workflow_id,
+                mode,
+                result_key,
+                input,
+            } => StateKindYaml::Subworkflow {
+                workflow_id: workflow_id.clone(),
+                mode: match mode {
+                    crate::domain::workflow::SubworkflowMode::Blocking => "blocking".to_string(),
+                    crate::domain::workflow::SubworkflowMode::FireAndForget => {
+                        "fire_and_forget".to_string()
+                    }
+                },
+                result_key: result_key.clone(),
+                input: input.clone(),
+            },
         }
     }
 
@@ -1122,5 +1174,60 @@ spec:
             err_str.contains("undeclared-volume"),
             "Error message should mention the undeclared volume name, got: {err_str}"
         );
+    }
+
+    #[test]
+    fn test_subworkflow_round_trip() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: parent-workflow
+  version: "1.0.0"
+spec:
+  initial_state: TRIGGER_CHILD
+  states:
+    TRIGGER_CHILD:
+      kind: Subworkflow
+      workflow_id: child-workflow
+      mode: blocking
+      result_key: child_output
+      input: "{{workflow.context.task}}"
+      transitions:
+        - condition: on_success
+          target: DONE
+    DONE:
+      kind: System
+      command: "echo done"
+      transitions: []
+"#;
+        let workflow = WorkflowParser::parse_yaml(yaml).expect("Should parse Subworkflow YAML");
+        assert_eq!(workflow.metadata.name, "parent-workflow");
+
+        // Verify Subworkflow state
+        let state = workflow
+            .spec
+            .states
+            .get(&crate::domain::workflow::StateName::new("TRIGGER_CHILD").unwrap())
+            .expect("TRIGGER_CHILD state should exist");
+        match &state.kind {
+            StateKind::Subworkflow {
+                workflow_id,
+                mode,
+                result_key,
+                input,
+            } => {
+                assert_eq!(workflow_id, "child-workflow");
+                assert_eq!(*mode, crate::domain::workflow::SubworkflowMode::Blocking);
+                assert_eq!(result_key.as_deref(), Some("child_output"));
+                assert_eq!(input.as_deref(), Some("{{workflow.context.task}}"));
+            }
+            other => panic!("Expected Subworkflow, got {:?}", other),
+        }
+
+        // Round-trip: convert back to YAML and re-parse
+        let yaml_out = WorkflowParser::to_yaml(&workflow).expect("Should serialize to YAML");
+        let reparsed = WorkflowParser::parse_yaml(&yaml_out).expect("Should re-parse from YAML");
+        assert_eq!(reparsed.metadata.name, "parent-workflow");
     }
 }
