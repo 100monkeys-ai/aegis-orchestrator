@@ -27,43 +27,14 @@
 //! See ADR-032 (Unified Storage via SeaweedFS), ADR-036 (NFS Server Gateway),
 //! AGENTS.md §Volume, AGENTS.md §StorageClass.
 
-use crate::domain::execution::ExecutionId;
-pub use crate::domain::tenant::TenantId;
+pub use crate::domain::shared_kernel::{TenantId, VolumeId};
+
+use crate::domain::shared_kernel::ExecutionId;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
-
-// ============================================================================
-// Value Objects
-// ============================================================================
-
-/// Unique identifier for a volume
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct VolumeId(pub Uuid);
-
-impl VolumeId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-impl Default for VolumeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for VolumeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Storage classification for volume lifecycle management
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

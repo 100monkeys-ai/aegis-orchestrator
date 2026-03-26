@@ -22,7 +22,7 @@
 //! 3. Command allowlist (for `cmd.run`)
 //! 4. Domain allowlist (for `web.*` / `web-search.*` tools)
 
-use crate::domain::mcp::PolicyViolation;
+use super::PolicyViolation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;

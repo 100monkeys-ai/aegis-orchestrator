@@ -10,7 +10,7 @@
 //!
 //! See AGENTS.md §Swarm Coordination Context.
 
-use aegis_orchestrator_core::domain::agent::AgentId;
+use aegis_orchestrator_core::domain::shared_kernel::AgentId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -109,4 +109,31 @@ pub struct MessageEnvelope {
     pub to: AgentId,
     pub payload: Vec<u8>,
     pub sent_at: DateTime<Utc>,
+}
+
+/// Specification for spawning a child agent within a swarm.
+///
+/// This is the Swarm context's local representation of a child agent request,
+/// forming an Anti-Corruption Layer between BC-6 (Swarm Coordination) and
+/// BC-1 (Agent Lifecycle). The caller converts an `AgentManifest` into this
+/// type before invoking swarm operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmChildSpec {
+    /// Human-readable name for the child agent
+    pub name: String,
+    /// Runtime language (e.g., "python", "node")
+    pub language: String,
+    /// Runtime language version (e.g., "3.11")
+    pub version: String,
+    /// Optional resource constraints
+    pub resource_limits: Option<SwarmResourceLimits>,
+}
+
+/// Resource limits for a swarm child agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SwarmResourceLimits {
+    /// CPU quota in millicores
+    pub cpu: u32,
+    /// Memory limit string (e.g., "512Mi")
+    pub memory: String,
 }

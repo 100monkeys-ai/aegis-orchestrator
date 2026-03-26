@@ -12,41 +12,11 @@
 //! [`crate::application::stimulus::StimulusService`] owns the routing
 //! pipeline and workflow dispatch.
 
+pub use crate::domain::shared_kernel::StimulusId;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use uuid::Uuid;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// StimulusId
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Opaque UUID identifier for a single stimulus ingestion.
-/// Used for idempotency deduplication, audit correlation, and event linking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct StimulusId(pub Uuid);
-
-impl StimulusId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_string(s: &str) -> anyhow::Result<Self> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-impl std::fmt::Display for StimulusId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Default for StimulusId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // StimulusSource

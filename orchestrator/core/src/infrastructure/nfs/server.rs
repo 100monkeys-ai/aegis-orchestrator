@@ -49,8 +49,7 @@
 //! - **Purpose:** Implements internal responsibilities for server
 
 use crate::domain::execution::ExecutionId;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
-use crate::domain::policy::FilesystemPolicy;
+use crate::domain::fsal::{AegisFSAL, AegisFileHandle, FsalAccessPolicy};
 use crate::domain::volume::VolumeId;
 use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstring, nfstime3, specdata3};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -73,7 +72,7 @@ pub struct NfsVolumeContext {
     pub volume_id: VolumeId,
     pub container_uid: u32,
     pub container_gid: u32,
-    pub policy: FilesystemPolicy,
+    pub policy: FsalAccessPolicy,
     /// Volume mount point in the agent container (e.g. `/workspace`).
     /// Used by FSAL tools to strip the container-absolute prefix from paths
     /// before forwarding to AegisFSAL (which operates on volume-relative paths).
@@ -441,7 +440,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                     volume_id: VolumeId::new(),
                     container_uid: 1000,
                     container_gid: 1000,
-                    policy: FilesystemPolicy::default(),
+                    policy: FsalAccessPolicy::default(),
                     mount_point: PathBuf::from("/workspace"),
                 });
 

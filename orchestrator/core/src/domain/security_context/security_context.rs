@@ -29,10 +29,47 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::path::PathBuf;
+use std::time::Duration;
 
 use super::capability::Capability;
-use crate::domain::mcp::PolicyViolation;
 use crate::domain::tenant::TenantId;
+
+/// Describes why a tool invocation was rejected by security policy evaluation.
+///
+/// Part of the Security Context bounded context (BC-4). Returned by
+/// [`SecurityContext::evaluate`] and [`Capability::permits`] when a tool call
+/// violates the configured security constraints.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyViolation {
+    ToolNotAllowed {
+        tool_name: String,
+        allowed_tools: Vec<String>,
+    },
+    ToolExplicitlyDenied {
+        tool_name: String,
+    },
+    RateLimitExceeded {
+        max_calls: u32,
+        current_calls: u32,
+    },
+    PathOutsideBoundary {
+        path: PathBuf,
+        allowed_paths: Vec<PathBuf>,
+    },
+    PathTraversalAttempt {
+        path: PathBuf,
+    },
+    DomainNotAllowed {
+        domain: String,
+        allowed_domains: Vec<String>,
+    },
+    MissingRequiredArgument(String),
+    TimeoutExceeded {
+        tool_name: String,
+        max_duration: Duration,
+    },
+}
 
 /// Audit metadata for a [`SecurityContext`] record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

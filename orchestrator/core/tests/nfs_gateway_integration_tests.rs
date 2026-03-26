@@ -20,9 +20,8 @@ use aegis_orchestrator_core::application::nfs_gateway::{EventBusPublisher, NfsGa
 use aegis_orchestrator_core::domain::events::StorageEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::fsal::{
-    AegisFSAL, AegisFileHandle, BorrowedVolumeAccess, EventPublisher, FsalError,
+    AegisFSAL, AegisFileHandle, BorrowedVolumeAccess, EventPublisher, FsalAccessPolicy, FsalError,
 };
-use aegis_orchestrator_core::domain::policy::FilesystemPolicy;
 use aegis_orchestrator_core::domain::repository::{RepositoryError, VolumeRepository};
 use aegis_orchestrator_core::domain::storage::{
     DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
@@ -305,7 +304,7 @@ async fn test_fsal_mode_validation() {
     let volume_id =
         create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/*".to_string()],
         write: vec![], // Read-only policy
     };
@@ -365,7 +364,7 @@ async fn test_fsal_path_traversal_prevention() {
     let volume_id =
         create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
     };
@@ -424,7 +423,7 @@ async fn test_fsal_policy_enforcement() {
         create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
     // Policy: Only allow /workspace/data/* files
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/data/*".to_string()],
         write: vec!["/workspace/data/*".to_string()],
     };
@@ -484,7 +483,7 @@ async fn test_fsal_audit_events() {
     let volume_id =
         create_attached_test_volume(&volume_repository, execution_id, 1024 * 1024).await;
 
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
     };
@@ -540,7 +539,7 @@ async fn test_fsal_quota_enforcement() {
     let execution_id = ExecutionId::new();
     let volume_id = create_attached_test_volume(&volume_repository, execution_id, 1024).await;
 
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/*".to_string()],
         write: vec!["/workspace/*".to_string()],
     };
@@ -640,14 +639,14 @@ async fn test_gateway_borrowed_volume_alias_allows_judge_read_only_access() {
         judge_execution_id,
         1000,
         1000,
-        FilesystemPolicy {
+        FsalAccessPolicy {
             read: vec!["/workspace/**".to_string()],
             write: vec![],
         },
         "/workspace".into(),
     );
 
-    let policy = FilesystemPolicy {
+    let policy = FsalAccessPolicy {
         read: vec!["/workspace/**".to_string()],
         write: vec![],
     };
@@ -706,7 +705,7 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
         judge_execution_id,
         1000,
         1000,
-        FilesystemPolicy {
+        FsalAccessPolicy {
             read: vec!["/workspace/**".to_string()],
             write: vec![],
         },
@@ -723,7 +722,7 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
         .read(
             &handle,
             "/workspace/review.txt",
-            &FilesystemPolicy {
+            &FsalAccessPolicy {
                 read: vec!["/workspace/**".to_string()],
                 write: vec![],
             },

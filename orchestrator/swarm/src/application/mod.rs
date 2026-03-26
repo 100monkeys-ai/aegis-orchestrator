@@ -9,8 +9,9 @@
 //! | [`LockToken`] | Handle returned by `acquire_lock`; must be passed to `release_lock` |
 //! | [`SwarmService`] | Application service trait for swarm lifecycle and coordination |
 
+use crate::domain::swarm::SwarmChildSpec;
 use crate::domain::SwarmId;
-use aegis_orchestrator_core::domain::agent::{AgentId, AgentManifest};
+use aegis_orchestrator_core::domain::shared_kernel::AgentId;
 use anyhow::Result;
 use async_trait::async_trait;
 
@@ -35,8 +36,8 @@ pub trait SwarmService: Send + Sync {
     /// Spawn a child agent within the current swarm.
     ///
     /// Child agents inherit the parent's security context unless explicitly
-    /// overridden in `manifest`.
-    async fn spawn_child(&self, parent_id: AgentId, manifest: AgentManifest) -> Result<AgentId>;
+    /// overridden in `spec`.
+    async fn spawn_child(&self, parent_id: AgentId, spec: SwarmChildSpec) -> Result<AgentId>;
 
     /// Send an opaque `payload` from one agent to another.
     ///

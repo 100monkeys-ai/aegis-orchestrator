@@ -9,8 +9,6 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use uuid::Uuid;
-
 /// Conversation message exchanged in the inner loop (ADR-038).
 ///
 /// Defined in the domain layer so it can be referenced by both `AgentMessage`/`OrchestratorMessage`
@@ -34,16 +32,7 @@ pub struct ToolCall {
     pub arguments: Value,
 }
 
-/// Unique identifier for a dispatch request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct DispatchId(pub Uuid);
-
-impl DispatchId {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
+pub use crate::domain::shared_kernel::DispatchId;
 
 /// Dispatch action vocabulary (extensible enum).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

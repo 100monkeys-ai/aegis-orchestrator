@@ -24,8 +24,10 @@
 //!
 //! See Also: ADR-027 (Docker Runtime), ADR-036 (NFS Server Gateway)
 
-use crate::domain::agent::ImagePullPolicy;
-use crate::domain::execution::ExecutionId;
+use crate::domain::shared_kernel::{ExecutionId, ImagePullPolicy};
+// Conformist: BC-2 (Execution) conforms to BC-7 (Storage Gateway) volume model.
+// The infrastructure layer (DockerRuntime) accesses VolumeMount fields including
+// AccessMode enum variants, so a full ACL wrapper is not cost-effective here.
 use crate::domain::volume::VolumeMount;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -340,7 +342,43 @@ pub trait AgentRuntime: Send + Sync {
 // Container Step Runner (ADR-050)
 // ============================================================================
 
-use crate::domain::workflow::{ContainerResources, ContainerVolumeMount, StateName};
+use crate::domain::workflow::StateName;
+use schemars::JsonSchema;
+use std::time::Duration;
+
+/// Volume mount configuration for container step execution.
+///
+/// Defines how a named volume is mounted inside a workflow container step.
+/// Part of the Execution bounded context (BC-2) runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContainerVolumeMount {
+    /// Volume name (references a workflow-level or execution-level volume)
+    pub name: String,
+    /// Absolute path inside the container where the volume appears
+    pub mount_path: String,
+    /// Whether the volume is mounted read-only (default: false)
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+/// Resource constraints for container step execution.
+///
+/// Configures CPU, memory, and timeout limits for workflow container steps.
+/// Part of the Execution bounded context (BC-2) runtime configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ContainerResources {
+    /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
+    #[serde(default)]
+    pub cpu: Option<u32>,
+    /// Memory limit as a string (e.g., "512Mi", "2Gi")
+    #[serde(default)]
+    pub memory: Option<String>,
+    /// Hard wall-clock timeout for the entire container execution
+    #[serde(default)]
+    #[serde(with = "humantime_serde")]
+    #[schemars(with = "Option<String>")]
+    pub timeout: Option<Duration>,
+}
 
 /// Configuration for a single deterministic CI/CD container step (ADR-050).
 ///

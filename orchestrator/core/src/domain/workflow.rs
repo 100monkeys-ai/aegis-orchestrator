@@ -30,6 +30,8 @@
 //! - Enforce FSM invariants in constructors and transitions, not in callers.
 //! - Avoid transport, persistence, or runtime-specific concerns in the domain model.
 
+pub use crate::domain::shared_kernel::WorkflowId;
+
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
 use crate::domain::tenant::TenantId;
@@ -38,41 +40,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
-use uuid::Uuid;
-
-// ============================================================================
-// Value Objects: Identifiers
-// ============================================================================
-
-/// Unique identifier for a Workflow definition
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct WorkflowId(pub Uuid);
-
-impl WorkflowId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_uuid(uuid: Uuid) -> Self {
-        Self(uuid)
-    }
-
-    pub fn as_uuid(&self) -> Uuid {
-        self.0
-    }
-}
-
-impl Default for WorkflowId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for WorkflowId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Unique name for a state within a workflow (e.g., "GENERATE", "VALIDATE")
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -552,41 +519,9 @@ pub struct WorkflowState {
 
 // ─── CI/CD Container Value Objects (ADR-050) ─────────────────────────────────
 
-/// Volume mount binding for a ContainerRun step
-///
-/// Binds a workflow-level volume into a CI/CD container at a specific path.
-/// Volumes are always accessed via the NFS Server Gateway (ADR-036) — never
-/// via direct bind mounts.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ContainerVolumeMount {
-    /// Volume name (references a workflow-level or execution-level volume)
-    pub name: String,
-
-    /// Absolute path inside the container where the volume appears
-    pub mount_path: String,
-
-    /// Whether the volume is mounted read-only (default: false)
-    #[serde(default)]
-    pub read_only: bool,
-}
-
-/// Resource limits for a ContainerRun step
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ContainerResources {
-    /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
-    #[serde(default)]
-    pub cpu: Option<u32>,
-
-    /// Memory limit as a string (e.g., "512Mi", "2Gi")
-    #[serde(default)]
-    pub memory: Option<String>,
-
-    /// Hard wall-clock timeout for the entire container execution
-    #[serde(default)]
-    #[serde(with = "humantime_serde")]
-    #[schemars(with = "Option<String>")]
-    pub timeout: Option<Duration>,
-}
+// ContainerVolumeMount and ContainerResources are owned by BC-2 (Execution/Runtime)
+// and re-exported here for backward compatibility with existing consumers.
+pub use crate::domain::runtime::{ContainerResources, ContainerVolumeMount};
 
 /// Retry configuration for a ContainerRun step
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

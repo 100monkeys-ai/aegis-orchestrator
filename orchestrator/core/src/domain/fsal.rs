@@ -30,6 +30,39 @@ use crate::domain::{
     storage::{DirEntry, FileAttributes, OpenMode, StorageError, StorageProvider},
     volume::{Volume, VolumeId, VolumeStatus},
 };
+
+/// Transport-agnostic access policy for FSAL operations.
+///
+/// This is the FSAL's local representation of filesystem access constraints,
+/// forming an Anti-Corruption Layer between BC-7 (Storage Gateway) and
+/// BC-4 (Security Policy). The application layer converts
+/// [`crate::domain::policy::FilesystemPolicy`] into this type before
+/// passing it to FSAL methods.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FsalAccessPolicy {
+    /// Path patterns the agent may **read** from mounted volumes.
+    pub read: Vec<String>,
+    /// Path patterns the agent may **write** to mounted volumes.
+    pub write: Vec<String>,
+}
+
+impl Default for FsalAccessPolicy {
+    fn default() -> Self {
+        Self {
+            read: vec!["/workspace/**".to_string()],
+            write: vec!["/workspace/**".to_string()],
+        }
+    }
+}
+
+impl From<FilesystemPolicy> for FsalAccessPolicy {
+    fn from(policy: FilesystemPolicy) -> Self {
+        Self {
+            read: policy.read,
+            write: policy.write,
+        }
+    }
+}
 use async_trait::async_trait;
 use chrono::Utc;
 use parking_lot::RwLock;
@@ -308,7 +341,7 @@ impl AegisFSAL {
     }
 
     /// Enforce filesystem policy for read operation
-    fn enforce_read_policy(&self, policy: &FilesystemPolicy, path: &str) -> Result<(), FsalError> {
+    fn enforce_read_policy(&self, policy: &FsalAccessPolicy, path: &str) -> Result<(), FsalError> {
         // Check if path matches any read allowlist pattern
         let allowed = policy.read.iter().any(|pattern| {
             // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
@@ -337,7 +370,7 @@ impl AegisFSAL {
     }
 
     /// Enforce filesystem policy for write operation
-    fn enforce_write_policy(&self, policy: &FilesystemPolicy, path: &str) -> Result<(), FsalError> {
+    fn enforce_write_policy(&self, policy: &FsalAccessPolicy, path: &str) -> Result<(), FsalError> {
         // Check if path matches any write allowlist pattern
         let allowed = policy.write.iter().any(|pattern| {
             // Wildcard matching: support both "/path/*" (single level) and "/path/**" (recursive)
@@ -403,7 +436,7 @@ impl AegisFSAL {
         &self,
         handle: &AegisFileHandle,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, FsalError> {
@@ -454,7 +487,7 @@ impl AegisFSAL {
         &self,
         handle: &AegisFileHandle,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
         offset: u64,
         data: &[u8],
     ) -> Result<usize, FsalError> {
@@ -533,7 +566,7 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<AegisFileHandle, FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -605,7 +638,7 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<Vec<DirEntry>, FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -643,7 +676,7 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -680,7 +713,7 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -717,7 +750,7 @@ impl AegisFSAL {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -755,7 +788,7 @@ impl AegisFSAL {
         volume_id: VolumeId,
         from_path: &str,
         to_path: &str,
-        policy: &FilesystemPolicy,
+        policy: &FsalAccessPolicy,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;

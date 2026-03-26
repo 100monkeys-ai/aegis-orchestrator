@@ -19,42 +19,11 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
 
-use crate::domain::execution::ExecutionId;
+pub use crate::domain::shared_kernel::NodeId;
+
 pub use crate::domain::node_config::NodeRole;
-use crate::domain::stimulus::StimulusId;
+use crate::domain::shared_kernel::{ExecutionId, StimulusId, TenantId};
 use base64::Engine;
-// ... existing code ...
-use crate::domain::volume::TenantId;
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Identifiers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Unique stable node identifier (UUIDv4 recommended)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub Uuid);
-
-impl NodeId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-impl std::fmt::Display for NodeId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl Default for NodeId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Unique cluster identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

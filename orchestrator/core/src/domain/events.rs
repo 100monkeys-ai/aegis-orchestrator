@@ -31,12 +31,12 @@
 //! The EventBus is currently **in-memory only** (tokio broadcast channel). Persistent
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
-use crate::domain::agent::{AgentId, AgentManifest, ImagePullPolicy};
-use crate::domain::dispatch::DispatchId;
-use crate::domain::execution::{CodeDiff, ExecutionId, IterationError};
+use crate::domain::agent::AgentManifest;
+use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
-use crate::domain::volume::{StorageClass, VolumeId};
+use crate::domain::shared_kernel::{AgentId, DispatchId, ExecutionId, ImagePullPolicy, VolumeId};
+use crate::domain::volume::StorageClass;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

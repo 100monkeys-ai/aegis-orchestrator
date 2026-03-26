@@ -161,37 +161,11 @@ pub enum InvocationStatus {
     Failed,    // Error occurred
 }
 
-/// Policy violation types
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PolicyViolation {
-    ToolNotAllowed {
-        tool_name: String,
-        allowed_tools: Vec<String>,
-    },
-    ToolExplicitlyDenied {
-        tool_name: String,
-    },
-    RateLimitExceeded {
-        max_calls: u32,
-        current_calls: u32,
-    },
-    PathOutsideBoundary {
-        path: PathBuf,
-        allowed_paths: Vec<PathBuf>,
-    },
-    PathTraversalAttempt {
-        path: PathBuf,
-    },
-    DomainNotAllowed {
-        domain: String,
-        allowed_domains: Vec<String>,
-    },
-    MissingRequiredArgument(String),
-    TimeoutExceeded {
-        tool_name: String,
-        max_duration: Duration,
-    },
-}
+/// Re-export from the canonical owner (BC-4 Security Context).
+/// Kept here so that existing `use crate::domain::mcp::PolicyViolation` paths
+/// continue to compile. New code should import from
+/// `crate::domain::security_context::PolicyViolation` instead.
+pub use crate::domain::security_context::PolicyViolation;
 
 #[derive(Debug, Clone)]
 pub enum DomainError {

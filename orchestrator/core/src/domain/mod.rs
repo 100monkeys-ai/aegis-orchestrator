@@ -29,6 +29,7 @@
 //! | [`path_sanitizer`] | BC-7 Storage Gateway | Path canonicalization and traversal-rejection |
 //! | [`mcp`] | BC-12 SMCP / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
 //! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
+//! | [`shared_kernel`] | Shared Kernel | Cross-context identity types — DDD Shared Kernel pattern |
 //! | [`env_guard`] | Cross-cutting | Environment variable isolation guard for execution contexts |
 //! | [`events`] | Cross-cutting | All domain events — single catalog used by the event bus (ADR-030) |
 //! | [`repository`] | Cross-cutting | Repository traits for all aggregate roots |
@@ -56,6 +57,7 @@ pub mod runtime;
 pub mod runtime_registry;
 pub mod secrets;
 pub mod security_context;
+pub mod shared_kernel;
 pub mod smcp_session;
 pub mod smcp_session_repository;
 pub mod stimulus;

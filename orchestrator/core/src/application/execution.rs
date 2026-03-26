@@ -48,8 +48,8 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{
     Execution, ExecutionError, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
 };
+use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::node_config::resolve_env_value;
-use crate::domain::policy::FilesystemPolicy;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
 use crate::domain::supervisor::{Supervisor, SupervisorObserver};
@@ -344,7 +344,7 @@ impl StandardExecutionService {
             return Ok(Vec::new());
         }
 
-        let read_policy = FilesystemPolicy {
+        let read_policy = FsalAccessPolicy {
             read: vec!["/*".to_string()],
             write: vec![],
         };
@@ -802,7 +802,7 @@ mod tests {
             parent_execution.id,
             1000,
             1000,
-            FilesystemPolicy {
+            FsalAccessPolicy {
                 read: vec!["/*".to_string()],
                 write: vec!["/*".to_string()],
             },
@@ -1611,7 +1611,7 @@ impl ExecutionService for StandardExecutionService {
         // This populates the in-memory volume_registry so the NFS server can authorize requests.
         if let Some(ref gw) = self.nfs_gateway {
             for mount in &volume_mounts {
-                let policy = FilesystemPolicy {
+                let policy = FsalAccessPolicy {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };
@@ -2254,7 +2254,7 @@ impl ExecutionService for StandardExecutionService {
         // Register own volumes with the NFS gateway (ADR-036).
         if let Some(ref gw) = self.nfs_gateway {
             for mount in &own_volume_mounts {
-                let policy = FilesystemPolicy {
+                let policy = FsalAccessPolicy {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };

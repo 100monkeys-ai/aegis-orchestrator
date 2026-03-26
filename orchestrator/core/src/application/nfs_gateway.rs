@@ -20,8 +20,7 @@ use crate::application::storage_router::StorageRouter;
 use crate::domain::{
     events::StorageEvent,
     execution::ExecutionId,
-    fsal::{AegisFSAL, BorrowedVolumeAccess, EventPublisher},
-    policy::FilesystemPolicy,
+    fsal::{AegisFSAL, BorrowedVolumeAccess, EventPublisher, FsalAccessPolicy},
     repository::VolumeRepository,
     storage::StorageProvider,
     volume::{Volume, VolumeId},
@@ -81,7 +80,7 @@ impl NfsVolumeRegistry {
         execution_id: ExecutionId,
         container_uid: u32,
         container_gid: u32,
-        policy: FilesystemPolicy,
+        policy: FsalAccessPolicy,
         mount_point: PathBuf,
     ) {
         let context = NfsVolumeContext {
@@ -377,7 +376,7 @@ impl NfsGatewayService {
         execution_id: ExecutionId,
         container_uid: u32,
         container_gid: u32,
-        policy: FilesystemPolicy,
+        policy: FsalAccessPolicy,
         mount_point: PathBuf,
     ) {
         self.volume_registry.register(

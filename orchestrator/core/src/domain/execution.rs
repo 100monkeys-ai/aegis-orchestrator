@@ -33,7 +33,6 @@ use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 // ============================================================================
 // Execution Hierarchy (Recursive Execution Tracking)
@@ -128,30 +127,7 @@ impl ExecutionHierarchy {
 // Execution Entity
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ExecutionId(pub Uuid);
-
-impl ExecutionId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_string(s: &str) -> std::result::Result<Self, uuid::Error> {
-        uuid::Uuid::parse_str(s).map(Self)
-    }
-}
-
-impl Default for ExecutionId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for ExecutionId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+pub use crate::domain::shared_kernel::ExecutionId;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Execution {

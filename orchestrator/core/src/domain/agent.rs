@@ -44,54 +44,12 @@
 //!
 //! See AGENTS.md §Agent Domain ubiquitous language.
 
+pub use crate::domain::shared_kernel::{AgentId, ImagePullPolicy};
+
 use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
-
-/// Image pull policy strategy
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
-#[serde(rename_all = "PascalCase")]
-pub enum ImagePullPolicy {
-    /// Always pull from registry, even if cached locally
-    Always,
-    /// Use local cache if available; pull only if missing
-    #[serde(rename = "IfNotPresent")]
-    #[default]
-    IfNotPresent,
-    /// Never pull; use only cached images (fail if missing)
-    Never,
-}
-
-impl std::fmt::Display for ImagePullPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ImagePullPolicy::Always => write!(f, "Always"),
-            ImagePullPolicy::IfNotPresent => write!(f, "IfNotPresent"),
-            ImagePullPolicy::Never => write!(f, "Never"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct AgentId(pub Uuid);
-
-impl AgentId {
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-
-    pub fn from_string(s: &str) -> Result<Self, uuid::Error> {
-        Ok(Self(Uuid::parse_str(s)?))
-    }
-}
-
-impl Default for AgentId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {

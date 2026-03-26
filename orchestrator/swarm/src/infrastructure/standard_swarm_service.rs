@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: AGPL-3.0
 
 use crate::application::{LockToken, SwarmService};
+use crate::domain::swarm::SwarmChildSpec;
 use crate::domain::{
     CancellationReason, MessageEnvelope, ResourceLock, Swarm, SwarmId, SwarmStatus,
 };
-use aegis_orchestrator_core::domain::agent::{AgentId, AgentManifest};
+use aegis_orchestrator_core::domain::shared_kernel::AgentId;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::{Duration, Utc};
@@ -139,7 +140,7 @@ impl SwarmService for StandardSwarmService {
         Ok(swarm_id)
     }
 
-    async fn spawn_child(&self, parent_id: AgentId, _manifest: AgentManifest) -> Result<AgentId> {
+    async fn spawn_child(&self, parent_id: AgentId, _spec: SwarmChildSpec) -> Result<AgentId> {
         let mut state = self.state.write().await;
         let swarm_id = Self::swarm_for_agent(&state, parent_id)?;
         let child_id = {
@@ -219,49 +220,17 @@ impl SwarmService for StandardSwarmService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aegis_orchestrator_core::domain::agent::{
-        AgentSpec, ManifestMetadata, ResourceLimits, RuntimeConfig, SecurityConfig,
-    };
+    use crate::domain::swarm::{SwarmChildSpec, SwarmResourceLimits};
 
-    fn test_manifest() -> AgentManifest {
-        AgentManifest {
-            api_version: "100monkeys.ai/v1".to_string(),
-            kind: "Agent".to_string(),
-            metadata: ManifestMetadata {
-                name: "child-agent".to_string(),
-                version: "1.0.0".to_string(),
-                description: None,
-                labels: Default::default(),
-                annotations: Default::default(),
-            },
-            spec: AgentSpec {
-                runtime: RuntimeConfig {
-                    language: Some("python".to_string()),
-                    version: Some("3.11".to_string()),
-                    image: None,
-                    image_pull_policy: Default::default(),
-                    isolation: "docker".to_string(),
-                    model: "default".to_string(),
-                },
-                task: None,
-                context: vec![],
-                execution: None,
-                security: Some(SecurityConfig {
-                    network: Default::default(),
-                    filesystem: Default::default(),
-                    resources: ResourceLimits {
-                        cpu: 1000,
-                        memory: "512Mi".to_string(),
-                        disk: "1Gi".to_string(),
-                        timeout: Some("60s".to_string()),
-                    },
-                }),
-                schedule: None,
-                tools: vec![],
-                env: Default::default(),
-                volumes: vec![],
-                advanced: None,
-            },
+    fn test_child_spec() -> SwarmChildSpec {
+        SwarmChildSpec {
+            name: "child-agent".to_string(),
+            language: "python".to_string(),
+            version: "3.11".to_string(),
+            resource_limits: Some(SwarmResourceLimits {
+                cpu: 1000,
+                memory: "512Mi".to_string(),
+            }),
         }
     }
 
@@ -270,7 +239,10 @@ mod tests {
         let service = StandardSwarmService::new();
         let parent = AgentId::new();
         let swarm_id = service.create_swarm(parent).await.unwrap();
-        let child = service.spawn_child(parent, test_manifest()).await.unwrap();
+        let child = service
+            .spawn_child(parent, test_child_spec())
+            .await
+            .unwrap();
 
         service
             .send_message(parent, child, b"hello".to_vec())
@@ -300,7 +272,10 @@ mod tests {
         let service = StandardSwarmService::new();
         let parent = AgentId::new();
         let swarm_id = service.create_swarm(parent).await.unwrap();
-        let child = service.spawn_child(parent, test_manifest()).await.unwrap();
+        let child = service
+            .spawn_child(parent, test_child_spec())
+            .await
+            .unwrap();
 
         service
             .cancel_swarm(swarm_id, CancellationReason::Manual)
