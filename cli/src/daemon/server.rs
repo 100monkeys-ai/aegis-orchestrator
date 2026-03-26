@@ -882,8 +882,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let agent_container_reaper_execution_repo = execution_repo.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        // First tick fires immediately — clean up any orphans left from a prior crash.
+        let mut first_run = true;
         loop {
             interval.tick().await;
+            if first_run {
+                tracing::info!("Running startup orphan container cleanup");
+                first_run = false;
+            }
             match cleanup_orphaned_agent_containers(
                 agent_container_reaper_runtime.clone(),
                 agent_container_reaper_execution_repo.clone(),
