@@ -128,8 +128,9 @@ impl OperatorReadModelStore {
 /// `PathTraversalBlocked`, `FilesystemPolicyViolation`, `QuotaExceeded`, and
 /// `UnauthorizedVolumeAccess`. Benign audit variants (`FileOpened`, `FileRead`,
 /// `FileWritten`, etc.) must never be passed; doing so will panic at runtime.
-/// Callers should obtain events via [`StorageEventRepository::find_violations`], which
-/// already filters to these violation variants.
+/// Callers must ensure only these violation variants are passed (for example,
+/// by using `StorageEventRepository::find_violations`, which already filters to
+/// these four variants).
 pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationView {
     match event {
         StorageEvent::PathTraversalBlocked {
