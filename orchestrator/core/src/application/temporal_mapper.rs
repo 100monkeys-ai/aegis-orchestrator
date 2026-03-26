@@ -136,6 +136,23 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub parallel_container_completion: Option<String>,
 
+    // ── Subworkflow-specific (ADR-065) ──────────────────────────────
+    /// Child workflow identifier (name or UUID)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subworkflow_id: Option<String>,
+
+    /// Execution mode: "blocking" or "fire_and_forget"
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subworkflow_mode: Option<String>,
+
+    /// Blackboard key for child result (blocking mode only)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subworkflow_result_key: Option<String>,
+
+    /// Optional Handlebars input template for the child workflow
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subworkflow_input: Option<String>,
+
     // Transitions
     pub transitions: Vec<TemporalTransitionRule>,
 }
@@ -296,6 +313,10 @@ impl TemporalWorkflowMapper {
                     container_run_shell: None,
                     parallel_container_steps: None,
                     parallel_container_completion: None,
+                    subworkflow_id: None,
+                    subworkflow_mode: None,
+                    subworkflow_result_key: None,
+                    subworkflow_input: None,
                     transitions,
                 })
             }
@@ -334,6 +355,10 @@ impl TemporalWorkflowMapper {
                 container_run_shell: None,
                 parallel_container_steps: None,
                 parallel_container_completion: None,
+                subworkflow_id: None,
+                subworkflow_mode: None,
+                subworkflow_result_key: None,
+                subworkflow_input: None,
                 transitions,
             }),
 
@@ -370,6 +395,10 @@ impl TemporalWorkflowMapper {
                 container_run_shell: None,
                 parallel_container_steps: None,
                 parallel_container_completion: None,
+                subworkflow_id: None,
+                subworkflow_mode: None,
+                subworkflow_result_key: None,
+                subworkflow_input: None,
                 transitions,
             }),
 
@@ -439,6 +468,10 @@ impl TemporalWorkflowMapper {
                     container_run_shell: None,
                     parallel_container_steps: None,
                     parallel_container_completion: None,
+                    subworkflow_id: None,
+                    subworkflow_mode: None,
+                    subworkflow_result_key: None,
+                    subworkflow_input: None,
                     transitions,
                 })
             }
@@ -500,6 +533,10 @@ impl TemporalWorkflowMapper {
                     container_run_shell: Some(*shell),
                     parallel_container_steps: None,
                     parallel_container_completion: None,
+                    subworkflow_id: None,
+                    subworkflow_mode: None,
+                    subworkflow_result_key: None,
+                    subworkflow_input: None,
                     transitions,
                 })
             }
@@ -544,6 +581,66 @@ impl TemporalWorkflowMapper {
                         serde_json::to_value(steps).unwrap_or(serde_json::json!([])),
                     ),
                     parallel_container_completion: Some(completion_str),
+                    subworkflow_id: None,
+                    subworkflow_mode: None,
+                    subworkflow_result_key: None,
+                    subworkflow_input: None,
+                    transitions,
+                })
+            }
+
+            StateKind::Subworkflow {
+                workflow_id,
+                mode,
+                result_key,
+                input,
+            } => {
+                let mode_str = match mode {
+                    crate::domain::workflow::SubworkflowMode::Blocking => "blocking",
+                    crate::domain::workflow::SubworkflowMode::FireAndForget => "fire_and_forget",
+                };
+                Ok(TemporalWorkflowState {
+                    kind: "Subworkflow".to_string(),
+                    // Agent fields
+                    agent: None,
+                    input: None,
+                    isolation: None,
+                    timeout: state.timeout.map(|d| format!("{}s", d.as_secs())),
+                    judges: None,
+                    max_iterations: None,
+                    pre_execution_validator: None,
+                    // System fields
+                    command: None,
+                    env: None,
+                    workdir: None,
+                    // Human fields
+                    prompt: None,
+                    default_response: None,
+                    // ParallelAgents fields
+                    agents: None,
+                    consensus: None,
+                    judges_for_parallel: None,
+                    // ContainerRun fields
+                    container_run_name: None,
+                    container_run_image: None,
+                    container_run_image_pull_policy: None,
+                    container_run_command: None,
+                    container_run_env: None,
+                    container_run_workdir: None,
+                    container_run_volumes: None,
+                    container_run_resources: None,
+                    container_run_registry_credentials: None,
+                    container_run_retry: None,
+                    container_run_shell: None,
+                    // ParallelContainerRun fields
+                    parallel_container_steps: None,
+                    parallel_container_completion: None,
+                    // Subworkflow fields (ADR-065)
+                    subworkflow_id: Some(workflow_id.clone()),
+                    subworkflow_mode: Some(mode_str.to_string()),
+                    subworkflow_result_key: result_key.clone(),
+                    subworkflow_input: input.clone(),
+                    // Transitions
                     transitions,
                 })
             }
@@ -798,6 +895,17 @@ impl TemporalWorkflowMapper {
                 }
                 StateKind::Human { .. } => {
                     // Human states have no Handlebars templates to validate.
+                }
+                StateKind::Subworkflow { input, .. } => {
+                    if let Some(tmpl) = input {
+                        handlebars
+                            .render_template(tmpl, &serde_json::json!({}))
+                            .with_context(|| {
+                                format!(
+                                    "Invalid template in Subworkflow state {state_name} input: {tmpl}"
+                                )
+                            })?;
+                    }
                 }
             }
         }

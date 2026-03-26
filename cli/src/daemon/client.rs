@@ -199,6 +199,9 @@ impl DaemonClient {
         } else {
             url.push_str("?follow=false");
         }
+        if verbose {
+            url.push_str("&verbose=true");
+        }
 
         let response = self
             .client
@@ -227,6 +230,9 @@ impl DaemonClient {
             url.push_str("?follow=true");
         } else {
             url.push_str("?follow=false");
+        }
+        if verbose {
+            url.push_str("&verbose=true");
         }
 
         let response = self

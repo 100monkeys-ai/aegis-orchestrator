@@ -515,6 +515,18 @@ impl TemporalEventListener {
             | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
             | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
+            WorkflowEvent::SubworkflowTriggered {
+                parent_execution_id,
+                ..
+            }
+            | WorkflowEvent::SubworkflowCompleted {
+                parent_execution_id,
+                ..
+            }
+            | WorkflowEvent::SubworkflowFailed {
+                parent_execution_id,
+                ..
+            } => *parent_execution_id,
             WorkflowEvent::WorkflowRegistered { .. } => {
                 return Err(anyhow!(
                     "WorkflowRegistered event unexpectedly reached execution-scoped handling; \

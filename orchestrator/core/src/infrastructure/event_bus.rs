@@ -150,6 +150,18 @@ impl DomainEvent {
                 | WorkflowEvent::WorkflowExecutionCompleted { execution_id, .. }
                 | WorkflowEvent::WorkflowExecutionFailed { execution_id, .. }
                 | WorkflowEvent::WorkflowExecutionCancelled { execution_id, .. } => *execution_id,
+                WorkflowEvent::SubworkflowTriggered {
+                    parent_execution_id,
+                    ..
+                }
+                | WorkflowEvent::SubworkflowCompleted {
+                    parent_execution_id,
+                    ..
+                }
+                | WorkflowEvent::SubworkflowFailed {
+                    parent_execution_id,
+                    ..
+                } => *parent_execution_id,
                 WorkflowEvent::WorkflowRegistered { .. } => return None,
             }),
             DomainEvent::Learning(event) => Some(match event {
@@ -182,6 +194,7 @@ impl DomainEvent {
             }),
             DomainEvent::MCP(event) => match event {
                 MCPToolEvent::InvocationRequested { execution_id, .. }
+                | MCPToolEvent::InvocationStarted { execution_id, .. }
                 | MCPToolEvent::InvocationCompleted { execution_id, .. }
                 | MCPToolEvent::InvocationFailed { execution_id, .. }
                 | MCPToolEvent::PolicyViolation { execution_id, .. } => Some(*execution_id),
@@ -189,8 +202,7 @@ impl DomainEvent {
                 | MCPToolEvent::ServerStarted { .. }
                 | MCPToolEvent::ServerStopped { .. }
                 | MCPToolEvent::ServerFailed { .. }
-                | MCPToolEvent::ServerUnhealthy { .. }
-                | MCPToolEvent::InvocationStarted { .. } => None,
+                | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
             DomainEvent::Smcp(event) => match event {
                 SmcpEvent::AttestationCompleted { execution_id, .. }
@@ -265,6 +277,7 @@ impl DomainEvent {
             }),
             DomainEvent::MCP(event) => match event {
                 MCPToolEvent::InvocationRequested { agent_id, .. }
+                | MCPToolEvent::InvocationStarted { agent_id, .. }
                 | MCPToolEvent::InvocationCompleted { agent_id, .. }
                 | MCPToolEvent::InvocationFailed { agent_id, .. }
                 | MCPToolEvent::PolicyViolation { agent_id, .. } => Some(*agent_id),
@@ -272,8 +285,7 @@ impl DomainEvent {
                 | MCPToolEvent::ServerStarted { .. }
                 | MCPToolEvent::ServerStopped { .. }
                 | MCPToolEvent::ServerFailed { .. }
-                | MCPToolEvent::ServerUnhealthy { .. }
-                | MCPToolEvent::InvocationStarted { .. } => None,
+                | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
             DomainEvent::Smcp(event) => Some(match event {
                 SmcpEvent::AttestationCompleted { agent_id, .. }
@@ -338,6 +350,9 @@ impl DomainEvent {
                 WorkflowEvent::WorkflowExecutionCompleted { completed_at, .. } => *completed_at,
                 WorkflowEvent::WorkflowExecutionFailed { failed_at, .. } => *failed_at,
                 WorkflowEvent::WorkflowExecutionCancelled { cancelled_at, .. } => *cancelled_at,
+                WorkflowEvent::SubworkflowTriggered { triggered_at, .. } => *triggered_at,
+                WorkflowEvent::SubworkflowCompleted { completed_at, .. } => *completed_at,
+                WorkflowEvent::SubworkflowFailed { failed_at, .. } => *failed_at,
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { discovered_at, .. } => *discovered_at,
@@ -474,6 +489,9 @@ impl DomainEvent {
                 WorkflowEvent::WorkflowExecutionCompleted { .. } => "workflow_execution_completed",
                 WorkflowEvent::WorkflowExecutionFailed { .. } => "workflow_execution_failed",
                 WorkflowEvent::WorkflowExecutionCancelled { .. } => "workflow_execution_cancelled",
+                WorkflowEvent::SubworkflowTriggered { .. } => "subworkflow_triggered",
+                WorkflowEvent::SubworkflowCompleted { .. } => "subworkflow_completed",
+                WorkflowEvent::SubworkflowFailed { .. } => "subworkflow_failed",
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { .. } => "pattern_discovered",

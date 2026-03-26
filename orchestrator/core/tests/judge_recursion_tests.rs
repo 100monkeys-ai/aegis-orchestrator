@@ -115,9 +115,13 @@ fn test_meta_monkey_judge_hierarchy_chain() {
     assert!(l2_exec.can_spawn_child());
 
     // L3 meta-meta-judge spawned by the L2 judge (maximum allowed depth).
-    let l3_exec =
-        Execution::new_child(AgentId::new(), make_input("meta-meta-judge L3"), 1, &l2_exec)
-            .expect("L3 meta-meta-judge should be spawnable from depth 2");
+    let l3_exec = Execution::new_child(
+        AgentId::new(),
+        make_input("meta-meta-judge L3"),
+        1,
+        &l2_exec,
+    )
+    .expect("L3 meta-meta-judge should be spawnable from depth 2");
     let l3_id = l3_exec.id;
     assert_eq!(l3_exec.depth(), 3);
     assert_eq!(l3_exec.depth(), MAX_RECURSIVE_DEPTH);

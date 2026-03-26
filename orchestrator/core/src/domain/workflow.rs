@@ -271,6 +271,40 @@ impl Workflow {
                         }
                     }
                 }
+                StateKind::Subworkflow {
+                    workflow_id,
+                    mode,
+                    result_key,
+                    ..
+                } => {
+                    if workflow_id.trim().is_empty() {
+                        return Err(WorkflowError::InvalidSubworkflowState {
+                            state: state_name.clone(),
+                            detail: "Subworkflow.workflow_id cannot be empty".to_string(),
+                        });
+                    }
+                    match mode {
+                        SubworkflowMode::Blocking => {
+                            if result_key.is_none() {
+                                return Err(WorkflowError::InvalidSubworkflowState {
+                                    state: state_name.clone(),
+                                    detail: "Subworkflow in blocking mode requires a result_key"
+                                        .to_string(),
+                                });
+                            }
+                        }
+                        SubworkflowMode::FireAndForget => {
+                            if result_key.is_some() {
+                                return Err(WorkflowError::InvalidSubworkflowState {
+                                    state: state_name.clone(),
+                                    detail:
+                                        "Subworkflow in fire_and_forget mode must not specify result_key"
+                                            .to_string(),
+                                });
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -611,6 +645,16 @@ pub enum ParallelCompletionStrategy {
     BestEffort,
 }
 
+/// Execution mode for a subworkflow invocation (ADR-065)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SubworkflowMode {
+    /// Parent waits for child workflow to complete before continuing
+    Blocking,
+    /// Parent continues immediately; child runs independently
+    FireAndForget,
+}
+
 /// State kind determines how the state is executed
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "PascalCase")]
@@ -741,6 +785,27 @@ pub enum StateKind {
 
         /// How to aggregate the individual step results into a state outcome
         completion: ParallelCompletionStrategy,
+    },
+
+    /// Invoke another workflow as a child execution (ADR-065)
+    ///
+    /// In `Blocking` mode the parent waits for the child to complete and writes
+    /// the child result to `parent.blackboard[result_key]`. In `FireAndForget`
+    /// mode the parent continues immediately and `result_key` must be `None`.
+    Subworkflow {
+        /// The workflow to invoke (name or UUID)
+        workflow_id: String,
+
+        /// Execution mode: blocking (wait) or fire-and-forget (continue)
+        mode: SubworkflowMode,
+
+        /// Blackboard key where child result is stored (required for blocking, forbidden for fire-and-forget)
+        #[serde(default)]
+        result_key: Option<String>,
+
+        /// Optional input template (Handlebars) evaluated against the parent blackboard
+        #[serde(default)]
+        input: Option<String>,
     },
 }
 
@@ -1222,6 +1287,9 @@ pub enum WorkflowError {
 
     #[error("Invalid container state configuration in state '{state}': {detail}")]
     InvalidContainerState { state: StateName, detail: String },
+
+    #[error("Invalid subworkflow state configuration in state '{state}': {detail}")]
+    InvalidSubworkflowState { state: StateName, detail: String },
 }
 
 // ============================================================================
@@ -1651,5 +1719,147 @@ mod tests {
             result,
             Err(WorkflowError::InvalidContainerState { .. })
         ));
+    }
+
+    #[test]
+    fn test_subworkflow_blocking_requires_result_key() {
+        let metadata = WorkflowMetadata {
+            name: "test-subworkflow".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TRIGGER").unwrap(),
+            WorkflowState {
+                kind: StateKind::Subworkflow {
+                    workflow_id: "child-workflow".to_string(),
+                    mode: SubworkflowMode::Blocking,
+                    result_key: None, // Missing — should fail
+                    input: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TRIGGER").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+        let result = Workflow::new(metadata, spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("result_key"),
+            "Expected result_key error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_subworkflow_fire_and_forget_rejects_result_key() {
+        let metadata = WorkflowMetadata {
+            name: "test-subworkflow-faf".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TRIGGER").unwrap(),
+            WorkflowState {
+                kind: StateKind::Subworkflow {
+                    workflow_id: "child-workflow".to_string(),
+                    mode: SubworkflowMode::FireAndForget,
+                    result_key: Some("should_fail".to_string()), // Present — should fail
+                    input: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TRIGGER").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+        let result = Workflow::new(metadata, spec);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("must not specify result_key"),
+            "Expected rejection error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_subworkflow_valid_blocking() {
+        let metadata = WorkflowMetadata {
+            name: "test-subworkflow-ok".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TRIGGER").unwrap(),
+            WorkflowState {
+                kind: StateKind::Subworkflow {
+                    workflow_id: "child-workflow".to_string(),
+                    mode: SubworkflowMode::Blocking,
+                    result_key: Some("child_result".to_string()),
+                    input: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TRIGGER").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+        let result = Workflow::new(metadata, spec);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_subworkflow_valid_fire_and_forget() {
+        let metadata = WorkflowMetadata {
+            name: "test-subworkflow-faf-ok".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        };
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("TRIGGER").unwrap(),
+            WorkflowState {
+                kind: StateKind::Subworkflow {
+                    workflow_id: "child-workflow".to_string(),
+                    mode: SubworkflowMode::FireAndForget,
+                    result_key: None,
+                    input: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("TRIGGER").unwrap(),
+            context: HashMap::new(),
+            states,
+            volumes: vec![],
+        };
+        let result = Workflow::new(metadata, spec);
+        assert!(result.is_ok());
     }
 }

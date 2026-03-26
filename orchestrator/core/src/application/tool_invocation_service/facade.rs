@@ -1231,7 +1231,13 @@ impl ToolInvocationService {
 
         let server_id = match self.tool_router.route_tool(execution_id, &tool_name).await {
             Ok(id) => {
-                self.publish_invocation_started(invocation_id, id, &tool_name);
+                self.publish_invocation_started(
+                    invocation_id,
+                    execution_id,
+                    *agent_id,
+                    id,
+                    &tool_name,
+                );
                 id
             }
             Err(routing_err) => {
