@@ -546,6 +546,11 @@ CREATE TABLE cluster_nodes (
     last_heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     registered_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     
+    -- Node Registry (ADR-061)
+    hostname            TEXT        NOT NULL DEFAULT '',
+    software_version    TEXT        NOT NULL DEFAULT '',
+    metadata            JSONB       NOT NULL DEFAULT '{}',
+
     -- Config Tracking
     current_config_version TEXT
 );
@@ -590,3 +595,24 @@ CREATE TABLE stimulus_idempotency (
 );
 
 CREATE INDEX idx_stimulus_idempotency_processed_at ON stimulus_idempotency (processed_at);
+
+-- -----------------------------------------------------------------------------
+-- Hierarchical Configuration Layers (ADR-060)
+-- Precedence: global < tenant < node; local YAML overrides all (not stored here)
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS config_layers (
+    id              UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+    scope           TEXT        NOT NULL,
+    scope_key       TEXT        NOT NULL DEFAULT '',
+    config_type     TEXT        NOT NULL DEFAULT 'aegis-config',
+    config_payload  JSONB       NOT NULL DEFAULT '{}',
+    config_version  TEXT        NOT NULL DEFAULT '',
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT config_layers_scope_check CHECK (scope IN ('global', 'tenant', 'node')),
+    CONSTRAINT config_layers_type_check CHECK (config_type IN ('aegis-config', 'runtime-registry')),
+    UNIQUE (scope, scope_key, config_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_config_layers_scope ON config_layers (scope, scope_key);
+CREATE INDEX IF NOT EXISTS idx_config_layers_type ON config_layers (config_type);

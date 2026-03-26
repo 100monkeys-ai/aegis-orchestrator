@@ -4,16 +4,21 @@
 //!
 //! Simple load balancing across healthy worker nodes.
 
+use crate::domain::cluster::NodePeerStatus;
 use crate::domain::cluster::{
-    NodeRouter, NodeCluster, NodeCapabilityAdvertisement, ExecutionRoute,
-    NodeRouterError, NodePeer,
+    ExecutionRoute, NodeCapabilityAdvertisement, NodeCluster, NodePeer, NodeRouter, NodeRouterError,
 };
 use crate::domain::node_config::NodeRole;
-use crate::domain::cluster::NodePeerStatus;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub struct RoundRobinNodeRouter {
     pub counter: AtomicUsize,
+}
+
+impl Default for RoundRobinNodeRouter {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl RoundRobinNodeRouter {
@@ -34,22 +39,24 @@ impl NodeRouter for RoundRobinNodeRouter {
             .peers
             .values()
             .filter(|p| {
-                p.status == NodePeerStatus::Active &&
-                (p.role == NodeRole::Worker || p.role == NodeRole::Hybrid) &&
-                p.capabilities.satisfies(required)
+                p.status == NodePeerStatus::Active
+                    && (p.role == NodeRole::Worker || p.role == NodeRole::Hybrid)
+                    && p.capabilities.satisfies(required)
             })
             .collect();
 
         if candidates.is_empty() {
             let any_healthy = cluster.peers.values().any(|p| {
-                p.status == NodePeerStatus::Active &&
-                (p.role == NodeRole::Worker || p.role == NodeRole::Hybrid)
+                p.status == NodePeerStatus::Active
+                    && (p.role == NodeRole::Worker || p.role == NodeRole::Hybrid)
             });
 
             return if !any_healthy {
                 Err(NodeRouterError::NoHealthyWorkers)
             } else {
-                Err(NodeRouterError::NoCapableWorkers { required: required.clone() })
+                Err(NodeRouterError::NoCapableWorkers {
+                    required: required.clone(),
+                })
             };
         }
 

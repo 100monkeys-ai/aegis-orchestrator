@@ -29,6 +29,7 @@ pub mod client;
 pub mod install;
 pub mod operator_read_models;
 pub mod server;
+pub mod worker_lifecycle;
 
 pub use client::DaemonClient;
 pub use server::start_daemon;

@@ -582,6 +582,11 @@ impl SecretsManager {
         }
     }
 
+    /// Returns a reference-counted handle to the underlying `SecretStore`.
+    pub fn secret_store(&self) -> Arc<dyn SecretStore> {
+        self.store.clone()
+    }
+
     fn cache_key(engine: &str, path: &str) -> String {
         format!("{engine}/{path}")
     }

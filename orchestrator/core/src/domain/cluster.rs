@@ -158,7 +158,7 @@ pub struct NodePeer {
     pub registered_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodePeerStatus {
     Active,
     Draining,
@@ -387,6 +387,12 @@ pub trait NodeClusterRepository: Send + Sync {
     async fn deregister(&self, node_id: &NodeId, reason: &str) -> anyhow::Result<()>;
     async fn get_config_version(&self, node_id: &NodeId) -> anyhow::Result<Option<String>>;
     async fn record_config_version(&self, node_id: &NodeId, hash: &str) -> anyhow::Result<()>;
+    async fn list_all_peers(&self) -> anyhow::Result<Vec<NodePeer>>;
+    async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>>;
+    async fn find_registered_node(
+        &self,
+        node_id: &NodeId,
+    ) -> anyhow::Result<Option<RegisteredNode>>;
 }
 
 /// Multi-node stimulus idempotency store (fulfills ADR-021 Phase 2 deferral).
@@ -422,4 +428,142 @@ pub trait NodeChallengeRepository: Send + Sync {
     async fn save_challenge(&self, challenge: &NodeChallenge) -> anyhow::Result<()>;
     async fn get_challenge(&self, challenge_id: &Uuid) -> anyhow::Result<Option<NodeChallenge>>;
     async fn delete_challenge(&self, challenge_id: &Uuid) -> anyhow::Result<()>;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Hierarchical Configuration (ADR-060)
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigScope {
+    Global,
+    Tenant,
+    Node,
+}
+
+impl std::fmt::Display for ConfigScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Global => write!(f, "global"),
+            Self::Tenant => write!(f, "tenant"),
+            Self::Node => write!(f, "node"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConfigType {
+    AegisConfig,
+    RuntimeRegistry,
+}
+
+impl std::fmt::Display for ConfigType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AegisConfig => write!(f, "aegis-config"),
+            Self::RuntimeRegistry => write!(f, "runtime-registry"),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConfigSnapshot {
+    pub scope: ConfigScope,
+    pub scope_key: String,
+    pub config_type: ConfigType,
+    pub payload: serde_json::Value,
+    pub version: String,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MergedConfig {
+    pub payload: serde_json::Value,
+    pub version: String,
+}
+
+/// Repository for hierarchical configuration layers
+#[async_trait::async_trait]
+pub trait ConfigLayerRepository: Send + Sync {
+    /// Get a specific config layer
+    async fn get_layer(
+        &self,
+        scope: &ConfigScope,
+        scope_key: &str,
+        config_type: &ConfigType,
+    ) -> anyhow::Result<Option<ConfigSnapshot>>;
+
+    /// Upsert a config layer (compute version hash automatically)
+    async fn upsert_layer(
+        &self,
+        scope: &ConfigScope,
+        scope_key: &str,
+        config_type: &ConfigType,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<ConfigSnapshot>;
+
+    /// Get merged config for a node: global < tenant < node precedence
+    async fn get_merged_config(
+        &self,
+        node_id: &NodeId,
+        tenant_id: Option<&str>,
+        config_type: &ConfigType,
+    ) -> anyhow::Result<MergedConfig>;
+
+    /// List all layers for a given config type
+    async fn list_layers(&self, config_type: &ConfigType) -> anyhow::Result<Vec<ConfigSnapshot>>;
+}
+
+// === Node Registry (ADR-061) ===
+
+/// Enriched node record for configuration assignment and registry queries.
+/// Extends NodePeer with additional metadata for operational management.
+#[derive(Debug, Clone)]
+pub struct RegisteredNode {
+    pub node_id: NodeId,
+    pub hostname: String,
+    pub role: NodeRole,
+    pub status: NodePeerStatus,
+    pub capabilities: NodeCapabilityAdvertisement,
+    pub grpc_address: String,
+    pub software_version: String,
+    pub metadata: HashMap<String, String>,
+    pub config_version: Option<String>,
+    pub last_heartbeat_at: DateTime<Utc>,
+    pub registered_at: DateTime<Utc>,
+}
+
+impl RegisteredNode {
+    /// Create from an existing NodePeer with additional registry metadata
+    pub fn from_peer(
+        peer: &NodePeer,
+        hostname: String,
+        software_version: String,
+        metadata: HashMap<String, String>,
+        config_version: Option<String>,
+    ) -> Self {
+        Self {
+            node_id: peer.node_id,
+            hostname,
+            role: peer.role,
+            status: peer.status,
+            capabilities: peer.capabilities.clone(),
+            grpc_address: peer.grpc_address.clone(),
+            software_version,
+            metadata,
+            config_version,
+            last_heartbeat_at: peer.last_heartbeat_at,
+            registered_at: peer.registered_at,
+        }
+    }
+
+    /// Check if node is healthy and eligible for work routing
+    pub fn is_active(&self) -> bool {
+        self.status == NodePeerStatus::Active
+    }
+
+    /// Check if node is intentionally excluded from new work
+    pub fn is_draining(&self) -> bool {
+        self.status == NodePeerStatus::Draining
+    }
 }

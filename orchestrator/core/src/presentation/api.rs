@@ -134,6 +134,9 @@ pub fn app(
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
         .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        // Health endpoints (ADR-062)
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .layer(middleware::from_fn(tenant_context_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
@@ -187,9 +190,22 @@ pub fn app_with_inner_loop(
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
         .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        // Health endpoints (ADR-062)
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         .layer(middleware::from_fn(tenant_context_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
+}
+
+/// Liveness probe — always returns 200 if the process is running.
+async fn health_live() -> impl IntoResponse {
+    Json(json!({"status": "ok"}))
+}
+
+/// Readiness probe — returns 200 when the service is ready to accept traffic.
+async fn health_ready() -> impl IntoResponse {
+    Json(json!({"status": "ready"}))
 }
 
 #[derive(serde::Deserialize)]

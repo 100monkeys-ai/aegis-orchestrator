@@ -955,7 +955,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let nfs_gateway = Arc::new(
         aegis_orchestrator_core::application::nfs_gateway::NfsGatewayService::new(
-            storage_provider,
+            storage_provider.clone(),
             volume_repo,
             event_publisher,
             Some(nfs_bind_port),
@@ -2222,6 +2222,306 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             tracing::error!(error = %e, "gRPC server failed");
         }
     });
+
+    // ─── Cluster gRPC server (ADR-059) ─────────────────────────────────────
+    // When clustering is enabled, start a second gRPC server on the dedicated
+    // cluster port (default 50056) that exposes the inter-node
+    // NodeClusterService (attestation, heartbeat, execution routing, etc.).
+    if config.spec.cluster.as_ref().is_some_and(|c| c.enabled) {
+        let cluster_grpc_port = config
+            .spec
+            .cluster
+            .as_ref()
+            .map(|c| c.cluster_grpc_port)
+            .unwrap_or(50056);
+
+        let cluster_addr_str = format!("{bind_addr}:{cluster_grpc_port}");
+        let cluster_addr: std::net::SocketAddr = cluster_addr_str
+            .parse()
+            .with_context(|| format!("Failed to parse cluster gRPC address: {cluster_addr_str}"))?;
+
+        let controller_node_id = {
+            let id_str = &config.spec.node.id;
+            aegis_orchestrator_core::domain::cluster::NodeId(
+                uuid::Uuid::parse_str(id_str).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            )
+        };
+
+        // The cluster repositories require a PostgreSQL pool. When a pool is
+        // available we construct production Pg-backed repos; otherwise we log a
+        // warning and skip – clustering without persistence is unsupported.
+        if let Some(ref pool) = db_pool {
+            use aegis_orchestrator_core::infrastructure::cluster::{
+                NodeClusterServiceHandler, PgConfigLayerRepository, PgNodeChallengeRepository,
+                PgNodeClusterRepository, RoundRobinNodeRouter,
+            };
+            use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
+
+            let cluster_repo: Arc<dyn NodeClusterRepository> =
+                Arc::new(PgNodeClusterRepository::new(pool.clone()));
+            let challenge_repo: Arc<
+                dyn aegis_orchestrator_core::domain::cluster::NodeChallengeRepository,
+            > = Arc::new(PgNodeChallengeRepository::new(pool.clone()));
+
+            let secret_store = secrets_manager.secret_store();
+
+            let attest_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::AttestNodeUseCase::new(
+                    challenge_repo.clone(),
+                ),
+            );
+            let challenge_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::ChallengeNodeUseCase::new(
+                    challenge_repo.clone(),
+                    cluster_repo.clone(),
+                    secret_store,
+                ),
+            );
+            let register_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::RegisterNodeUseCase::new(
+                    cluster_repo.clone(),
+                    controller_node_id,
+                ),
+            );
+            let heartbeat_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::HeartbeatUseCase::new(
+                    cluster_repo.clone(),
+                ),
+            );
+            let router: Arc<dyn aegis_orchestrator_core::domain::cluster::NodeRouter> =
+                Arc::new(RoundRobinNodeRouter::new());
+            let route_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::RouteExecutionUseCase::new(
+                    cluster_repo.clone(),
+                    router,
+                    controller_node_id,
+                ),
+            );
+            let forward_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::ForwardExecutionUseCase::new(
+                    execution_service.clone(),
+                ),
+            );
+
+            let config_layer_repo: Arc<
+                dyn aegis_orchestrator_core::domain::cluster::ConfigLayerRepository,
+            > = Arc::new(PgConfigLayerRepository::new(Arc::new(pool.clone())));
+
+            let sync_config_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::SyncConfigUseCase::new(
+                    config_layer_repo.clone(),
+                    cluster_repo.clone(),
+                ),
+            );
+            let push_config_uc = Arc::new(
+                aegis_orchestrator_core::application::cluster::PushConfigUseCase::new(
+                    config_layer_repo,
+                ),
+            );
+
+            let handler = NodeClusterServiceHandler::new(
+                attest_uc,
+                challenge_uc,
+                register_uc,
+                heartbeat_uc,
+                route_uc,
+                forward_uc,
+                sync_config_uc,
+                push_config_uc,
+                cluster_repo.clone(),
+            );
+
+            // Remote storage gRPC handler (ADR-064)
+            use aegis_orchestrator_core::infrastructure::aegis_remote_storage_proto::remote_storage_service_server::RemoteStorageServiceServer;
+            use aegis_orchestrator_core::infrastructure::storage::RemoteStorageServiceHandler;
+
+            let storage_handler =
+                RemoteStorageServiceHandler::new(storage_provider.clone(), cluster_repo);
+
+            tokio::spawn(async move {
+                tracing::info!(address = %cluster_addr, "Starting cluster gRPC server on port {cluster_grpc_port}");
+                if let Err(e) = tonic::transport::Server::builder()
+                    .add_service(NodeClusterServiceServer::new(handler))
+                    .add_service(RemoteStorageServiceServer::new(storage_handler))
+                    .serve(cluster_addr)
+                    .await
+                {
+                    tracing::error!(error = %e, "Cluster gRPC server failed");
+                }
+            });
+        } else {
+            tracing::warn!(
+                "Cluster mode enabled but no database configured; \
+                 skipping cluster gRPC server (PostgreSQL is required for cluster state)"
+            );
+        }
+    }
+
+    // ─── Worker lifecycle task (ADR-059) ─────────────────────────────────────
+    // When the node's cluster role is Worker or Hybrid AND a controller
+    // endpoint is configured, spawn a background task that performs
+    // attestation, registration, heartbeat loop, and graceful deregistration.
+    if let Some(ref cluster_config) = config.spec.cluster {
+        if cluster_config.enabled {
+            let role = &cluster_config.role;
+            if matches!(role, NodeRole::Worker | NodeRole::Hybrid) {
+                if let Some(ref controller) = cluster_config.controller {
+                    let worker_node_id = {
+                        let id_str = &config.spec.node.id;
+                        aegis_orchestrator_core::domain::cluster::NodeId(
+                            uuid::Uuid::parse_str(id_str).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+                        )
+                    };
+
+                    // Load Ed25519 signing key from the configured keypair path
+                    let keypair_path = &cluster_config.node_keypair_path;
+                    match tokio::fs::read(keypair_path).await {
+                        Ok(key_bytes) => {
+                            // Node keypair is stored as raw 32-byte Ed25519 seed
+                            // (written by `aegis node init` via `SigningKey::to_bytes()`).
+                            let key_result: Result<ed25519_dalek::SigningKey, anyhow::Error> =
+                                if key_bytes.len() == 32 {
+                                    let seed: [u8; 32] = key_bytes[..32].try_into().unwrap();
+                                    Ok(ed25519_dalek::SigningKey::from_bytes(&seed))
+                                } else {
+                                    Err(anyhow::anyhow!(
+                                        "Expected 32-byte Ed25519 seed, got {} bytes",
+                                        key_bytes.len()
+                                    ))
+                                };
+                            match key_result {
+                                Ok(signing_key) => {
+                                    let signing_key = std::sync::Arc::new(signing_key);
+
+                                    let proto_role = match role {
+                                        NodeRole::Controller => {
+                                            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::Controller
+                                                as i32
+                                        }
+                                        NodeRole::Worker => {
+                                            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::Worker
+                                                as i32
+                                        }
+                                        NodeRole::Hybrid => {
+                                            aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeRole::Hybrid
+                                                as i32
+                                        }
+                                    };
+
+                                    let capabilities =
+                                        aegis_orchestrator_core::infrastructure::aegis_cluster_proto::NodeCapabilities {
+                                            gpu_count: config
+                                                .spec
+                                                .node
+                                                .resources
+                                                .as_ref()
+                                                .map(|r| r.gpu_count)
+                                                .unwrap_or(0),
+                                            vram_gb: config
+                                                .spec
+                                                .node
+                                                .resources
+                                                .as_ref()
+                                                .map(|r| r.vram_gb)
+                                                .unwrap_or(0),
+                                            cpu_cores: config
+                                                .spec
+                                                .node
+                                                .resources
+                                                .as_ref()
+                                                .map(|r| r.cpu_cores)
+                                                .unwrap_or(0),
+                                            available_memory_gb: config
+                                                .spec
+                                                .node
+                                                .resources
+                                                .as_ref()
+                                                .map(|r| r.memory_gb)
+                                                .unwrap_or(0),
+                                            supported_runtimes: vec!["docker".to_string()],
+                                            tags: config.spec.node.tags.clone(),
+                                        };
+
+                                    let grpc_address = format!(
+                                        "{}:{}",
+                                        bind_addr,
+                                        config
+                                            .spec
+                                            .network
+                                            .as_ref()
+                                            .map(|n| n.grpc_port)
+                                            .unwrap_or(50051)
+                                    );
+
+                                    let heartbeat_interval = std::time::Duration::from_secs(
+                                        cluster_config.heartbeat_interval_secs,
+                                    );
+                                    let token_refresh_margin = std::time::Duration::from_secs(
+                                        cluster_config.token_refresh_margin_secs,
+                                    );
+
+                                    let client =
+                                        aegis_orchestrator_core::infrastructure::cluster::NodeClusterClient::new(
+                                            controller.endpoint.clone(),
+                                            signing_key.clone(),
+                                            worker_node_id,
+                                        );
+
+                                    let lifecycle = super::worker_lifecycle::WorkerLifecycle::new(
+                                        client,
+                                        worker_node_id,
+                                        proto_role,
+                                        capabilities,
+                                        grpc_address,
+                                        heartbeat_interval,
+                                        token_refresh_margin,
+                                        signing_key,
+                                    );
+
+                                    let (shutdown_tx, shutdown_rx) =
+                                        tokio::sync::watch::channel(false);
+
+                                    tokio::spawn(async move {
+                                        tracing::info!("Starting worker lifecycle background task");
+                                        if let Err(e) = lifecycle.run(shutdown_rx).await {
+                                            tracing::error!(
+                                                error = %e,
+                                                "Worker lifecycle task failed"
+                                            );
+                                        }
+                                    });
+
+                                    // The shutdown sender is dropped when the daemon exits,
+                                    // which will trigger the watch::changed() branch in the
+                                    // heartbeat loop.
+                                    std::mem::drop(shutdown_tx);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        error = %e,
+                                        path = %keypair_path.display(),
+                                        "Failed to load node keypair; skipping worker lifecycle"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                path = %keypair_path.display(),
+                                "Failed to read node keypair file; skipping worker lifecycle"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::info!(
+                        "Worker/Hybrid role but no controller endpoint configured; \
+                         skipping worker lifecycle (standalone mode)"
+                    );
+                }
+            }
+        }
+    }
 
     let addr = format!("{bind_addr}:{final_port}");
     debug!(address = %addr, "Binding to address");

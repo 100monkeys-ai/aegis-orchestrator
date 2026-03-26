@@ -12,6 +12,7 @@
 
 pub mod local_host_provider;
 pub mod opendal_provider;
+pub mod remote_storage_server;
 pub mod seaweedfs;
 
 use crate::domain::storage::{
@@ -20,6 +21,7 @@ use crate::domain::storage::{
 
 pub use local_host_provider::LocalHostStorageProvider;
 pub use opendal_provider::OpenDalStorageProvider;
+pub use remote_storage_server::RemoteStorageServiceHandler;
 pub use seaweedfs::SeaweedFSAdapter;
 pub mod smcp_provider;
 use opendal::Operator;
