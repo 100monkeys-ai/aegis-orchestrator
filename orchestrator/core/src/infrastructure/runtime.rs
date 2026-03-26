@@ -625,9 +625,21 @@ impl AgentRuntime for DockerRuntime {
             platform: String::new(),
         };
 
+        // Filter env vars to prevent orchestrator-internal variables from leaking
+        let (filtered_env, blocked_vars) = crate::domain::env_guard::filter_env_vars(&config.env);
+        if !blocked_vars.is_empty() {
+            warn!(
+                execution_id = %config.execution_id,
+                blocked = ?blocked_vars,
+                "Blocked orchestrator-internal env vars from agent container"
+            );
+        }
+
         // Convert map to "KEY=VALUE" strings
-        let mut env_vars: Vec<String> =
-            config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        let mut env_vars: Vec<String> = filtered_env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
 
         // Add orchestrator URL for agent bootstrap script to call LLM proxy
         env_vars.push(format!("AEGIS_ORCHESTRATOR_URL={}", self.orchestrator_url));

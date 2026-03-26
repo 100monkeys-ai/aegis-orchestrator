@@ -723,7 +723,10 @@ mod tests {
         let calls = starter.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].workflow_id, workflow_id.0.to_string());
-        assert_eq!(calls[0].tenant_id.as_ref().unwrap().as_str(), "local");
+        assert_eq!(
+            calls[0].tenant_id.as_ref().unwrap().as_str(),
+            crate::domain::tenant::CONSUMER_SLUG
+        );
         assert_eq!(calls[0].input["stimulus_content"], stimulus.content);
         assert_eq!(calls[0].input["stimulus_source"], "github");
         assert_eq!(calls[0].input["headers"]["x-github-event"], "issues");

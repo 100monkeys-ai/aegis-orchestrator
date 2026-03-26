@@ -29,6 +29,7 @@
 //! | [`path_sanitizer`] | BC-7 Storage Gateway | Path canonicalization and traversal-rejection |
 //! | [`mcp`] | BC-12 SMCP / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
 //! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
+//! | [`env_guard`] | Cross-cutting | Environment variable isolation guard for execution contexts |
 //! | [`events`] | Cross-cutting | All domain events — single catalog used by the event bus (ADR-030) |
 //! | [`repository`] | Cross-cutting | Repository traits for all aggregate roots |
 //! | [`validation`] | BC-2 Execution | `ValidationConfig`, gradient validation types (ADR-017) |
@@ -40,6 +41,7 @@
 pub mod agent;
 pub mod cluster;
 pub mod dispatch;
+pub mod env_guard;
 pub mod events;
 pub mod execution;
 pub mod fsal;
@@ -59,6 +61,7 @@ pub mod smcp_session_repository;
 pub mod stimulus;
 pub mod storage;
 pub mod supervisor;
+pub mod tenancy;
 pub mod tenant;
 pub mod validation;
 pub mod volume;

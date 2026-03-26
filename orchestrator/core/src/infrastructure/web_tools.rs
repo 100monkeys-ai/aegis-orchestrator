@@ -8,7 +8,9 @@ use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::smcp_session::SmcpSessionError;
 use async_trait::async_trait;
 use std::time::Duration;
-use tracing::info;
+use tracing::{debug, info};
+
+use super::log_sanitizer::sanitize_url;
 
 #[derive(Debug, Clone, Default)]
 pub struct ReqwestWebToolAdapter;
@@ -89,7 +91,8 @@ fn build_duckduckgo_url(query: &str, _max_results: u32) -> String {
 }
 
 async fn perform_search(url: &str) -> Result<Vec<serde_json::Value>, String> {
-    info!("Searching at: {}", url);
+    info!("Web search requested");
+    debug!("Searching at: {}", sanitize_url(url));
 
     let client = reqwest::Client::builder()
         .user_agent("AEGIS Orchestrator WebSearch/1.0")
@@ -163,7 +166,8 @@ async fn perform_fetch(
     timeout: Duration,
     follow_redirects: bool,
 ) -> Result<(u16, bool, String), String> {
-    info!("Fetching: {}", url);
+    info!("Web fetch requested");
+    debug!("Fetching: {}", sanitize_url(url));
 
     let client = reqwest::Client::builder()
         .user_agent("AEGIS Orchestrator WebFetch/1.0")

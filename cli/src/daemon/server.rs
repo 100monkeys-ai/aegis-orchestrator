@@ -44,7 +44,7 @@ use std::path::PathBuf;
 use tokio::net::TcpListener;
 use tokio::signal;
 use tonic::transport::Channel;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{remove_pid_file, write_pid_file};
@@ -120,10 +120,13 @@ fn resolve_generated_artifacts_root(config_path: Option<PathBuf>) -> PathBuf {
 
 fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     match identity.map(|identity| &identity.identity_kind) {
+        Some(IdentityKind::ConsumerUser { .. }) => TenantId::consumer(),
         Some(IdentityKind::TenantUser { tenant_slug }) => {
-            TenantId::from_string(tenant_slug).unwrap_or_else(|_| TenantId::local_default())
+            TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
         }
-        _ => TenantId::local_default(),
+        Some(IdentityKind::Operator { .. }) => TenantId::system(),
+        Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
+        None => TenantId::default(),
     }
 }
 
@@ -209,6 +212,12 @@ struct HealthView {
 #[derive(Debug, Clone, serde::Deserialize, Default)]
 struct LimitQuery {
     #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct CortexQueryParams {
+    q: Option<String>,
     limit: Option<usize>,
 }
 
@@ -484,7 +493,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     info!("AEGIS daemon starting (PID: {})", pid);
     // Load configuration
-    println!("Loading configuration...");
+    info!("Loading configuration...");
     let config = NodeConfigManifest::load_or_default(config_path.clone())
         .context("Failed to load configuration")?;
 
@@ -536,10 +545,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             version,
         )
         .context("Failed to initialize metrics")?;
-        println!(
-            "✓ Metrics exporter initialized on port {}",
-            metrics_cfg.port
-        );
+        info!(port = metrics_cfg.port, "Metrics exporter initialized");
     }
 
     if let Some(smcp_gateway) = &config.spec.smcp_gateway {
@@ -552,12 +558,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     if config.spec.llm_providers.is_empty() {
-        tracing::warn!("Started with NO LLM providers configured. Agent execution will fail!");
-        println!("WARNING: No LLM providers configured. Agents will fail to generate text.");
-        println!("         Please check your config file or ensure one is discovered.");
+        warn!("No LLM providers configured. Agents will fail to generate text. Please check your config file or ensure one is discovered.");
     }
 
-    println!("Configuration loaded. Initializing services...");
+    info!("Configuration loaded. Initializing services...");
 
     // Initialize repositories — resolve database URL from config (spec.database)
     let database_url: Option<String> =
@@ -584,14 +588,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Store pool separately for later volume repo initialization
     let db_pool: Option<PgPool> = if let Some(url) = database_url.as_ref() {
-        println!("Initializing repositories with PostgreSQL: {url}");
+        info!(url = %url, "Initializing repositories with PostgreSQL");
         match sqlx::postgres::PgPoolOptions::new()
             .max_connections(db_max_connections)
             .connect(url)
             .await
         {
             Ok(db_pool) => {
-                println!("Connected to PostgreSQL.");
+                info!("Connected to PostgreSQL");
 
                 // Check migration status
                 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
@@ -613,18 +617,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     Err(_) => 0,
                 };
 
-                println!("INFO: Database has {applied_count}/{total_known} applied migrations.");
+                info!(
+                    applied = applied_count,
+                    total = total_known,
+                    "Database migration status"
+                );
 
                 if applied_count < total_known {
-                    println!("Applying pending migrations...");
+                    info!("Applying pending migrations...");
                     match MIGRATOR.run(&db_pool).await {
-                        Ok(_) => println!("SUCCESS: Database migrations applied."),
+                        Ok(_) => info!("Database migrations applied successfully"),
                         Err(e) => {
                             return Err(anyhow::anyhow!("Failed to apply migrations: {e}"));
                         }
                     }
                 } else {
-                    println!("INFO: Database is up to date.");
+                    info!("Database is up to date");
                 }
 
                 Some(db_pool)
@@ -636,11 +644,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     ));
                 }
 
-                tracing::error!(
-                    "Failed to connect to PostgreSQL: {}. Falling back to InMemory.",
-                    e
-                );
-                println!("ERROR: Failed to connect to PostgreSQL: {e}. Falling back to InMemory.");
+                error!(error = %e, "Failed to connect to PostgreSQL, falling back to InMemory");
                 None
             }
         }
@@ -651,7 +655,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ));
         }
 
-        println!("No database configured (spec.database omitted). Using InMemory repositories.");
+        info!("No database configured (spec.database omitted), using InMemory repositories");
         None
     };
 
@@ -693,12 +697,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         anyhow::bail!("Production nodes must configure at least one IAM realm");
     }
 
-    println!("Initializing LLM registry...");
+    info!("Initializing LLM registry...");
     let llm_registry = Arc::new(
         ProviderRegistry::from_config(&config).context("Failed to initialize LLM providers")?,
     );
 
-    println!("Initializing Docker runtime...");
+    info!("Initializing Docker runtime...");
 
     // Resolve the orchestrator URL, supporting `env:VAR_NAME` syntax and a shared default.
     fn resolve_orchestrator_url(config: &NodeConfigManifest) -> String {
@@ -765,18 +769,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     if config.spec.runtime.default_isolation == "docker" {
         runtime.healthcheck().await
             .context("Docker healthcheck failed. Docker isolation is configured but Docker daemon is not accessible.")?;
-        println!("✓ Docker runtime connected and healthy.");
+        info!("Docker runtime connected and healthy");
     } else {
-        println!(
-            "Docker runtime initialized (healthcheck skipped - isolation mode: {}).",
-            config.spec.runtime.default_isolation
+        info!(
+            isolation_mode = %config.spec.runtime.default_isolation,
+            "Docker runtime initialized (healthcheck skipped)"
         );
     }
 
     let supervisor = Arc::new(Supervisor::new(runtime.clone()));
 
     // Initialize volume service (with SeaweedFS or fallback to local)
-    println!("Initializing volume service...");
+    info!("Initializing volume service...");
     let storage_config = config
         .spec
         .storage
@@ -798,7 +802,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         if let Some(db_pool) = db_pool.as_ref() {
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_volume::PostgresVolumeRepository::new(db_pool.clone()))
         } else {
-            println!("WARNING: Volume persistence disabled (no database pool available)");
+            warn!("Volume persistence disabled (no database pool available)");
             return Err(anyhow::anyhow!(
                 "Database connection required for volume management"
             ));
@@ -852,10 +856,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )?,
     );
 
-    println!(
-        "✓ Volume service initialized (mode: {})",
-        storage_config.backend
-    );
+    info!(mode = %storage_config.backend, "Volume service initialized");
 
     // Spawn TTL cleanup background task for ephemeral volumes
     let volume_service_cleanup = volume_service.clone();
@@ -876,7 +877,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     });
-    println!("✓ Volume cleanup background task spawned (interval: 5 minutes)");
+    info!("Volume cleanup background task spawned (interval: 5 minutes)");
 
     let agent_container_reaper_runtime = runtime.clone();
     let agent_container_reaper_execution_repo = execution_repo.clone();
@@ -910,16 +911,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
     });
-    println!("✓ Agent container cleanup background task spawned (interval: 5 minutes)");
+    info!("Agent container cleanup background task spawned (interval: 5 minutes)");
 
     // Initialize Storage Event Persister for audit trail (ADR-036)
-    println!("Initializing Storage Event Persister...");
+    info!("Initializing Storage Event Persister...");
     let storage_event_repo: Arc<
         dyn aegis_orchestrator_core::domain::repository::StorageEventRepository,
     > = if let Some(db_pool) = db_pool.as_ref() {
         Arc::new(aegis_orchestrator_core::infrastructure::repositories::postgres_storage_event::PostgresStorageEventRepository::new(db_pool.clone()))
     } else {
-        println!("WARNING: Storage event persistence disabled (no database pool available)");
+        warn!("Storage event persistence disabled (no database pool available)");
         Arc::new(
                 aegis_orchestrator_core::infrastructure::repositories::InMemoryStorageEventRepository::new(),
             )
@@ -934,10 +935,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Start background task for event persistence
     let _persister_handle = storage_event_persister.start();
-    println!("✓ Storage Event Persister started (audit trail enabled)");
+    info!("Storage Event Persister started (audit trail enabled)");
 
     // Initialize NFS Server Gateway (ADR-036)
-    println!("Initializing NFS Server Gateway...");
+    info!("Initializing NFS Server Gateway...");
     let nfs_bind_port = config
         .spec
         .storage
@@ -963,16 +964,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     // Start NFS server and await successful startup before continuing
     if let Err(e) = nfs_gateway.start_server().await {
-        tracing::error!(
-            "CRITICAL: NFS Server Gateway failed to start: {}. This is a fatal error.",
-            e
-        );
-        // Log to stderr to ensure visibility
-        eprintln!("FATAL: NFS Server Gateway failed: {e}");
+        error!(error = %e, "NFS Server Gateway failed to start, this is a fatal error");
         // Allow shutdown of daemon via signal
         std::process::exit(1);
     }
-    println!("✓ NFS Server Gateway started on port {nfs_bind_port} (ADR-036)");
+    info!(port = nfs_bind_port, "NFS Server Gateway started");
 
     let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
 
@@ -980,7 +976,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let registry_path = &config.spec.runtime.runtime_registry_path;
     let runtime_registry = match StandardRuntimeRegistry::from_file(registry_path) {
         Ok(registry) => {
-            println!("✓ StandardRuntime registry loaded from '{registry_path}' (ADR-043)");
+            info!(path = %registry_path, "StandardRuntime registry loaded");
             Arc::new(registry)
         }
         Err(e) => {
@@ -1052,7 +1048,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tracing::info!("NFS deregistration listener started (ADR-036)");
     }
 
-    println!("Initializing workflow engine...");
+    info!("Initializing workflow engine...");
 
     // Initialize Temporal Client — read from config (spec.temporal)
     let temporal_required = config.spec.temporal.is_some();
@@ -1065,7 +1061,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let temporal_task_queue = temporal_config.task_queue.clone();
     let temporal_connection_max_retries =
         temporal_connection_max_retries(temporal_config.max_connection_retries);
-    println!("Initializing Temporal Client (Address: {temporal_address})...");
+    info!(address = %temporal_address, "Initializing Temporal Client");
 
     // Create shared containers for the concrete Temporal client and the workflow engine port.
     let temporal_client_container: Arc<
@@ -1104,7 +1100,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .await
             {
                 Ok(client) => {
-                    println!("Temporal Client connected successfully.");
+                    tracing::info!("Temporal Client connected successfully");
                     return Ok(Arc::new(client));
                 }
                 Err(e) => {
@@ -1118,11 +1114,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     }
 
                     if retries % 5 == 0 {
-                        println!(
-                            "Still verifying Temporal connection... ({retries}/{max_retries})"
+                        tracing::info!(
+                            attempt = retries,
+                            max_retries = max_retries,
+                            "Still verifying Temporal connection"
                         );
                     }
-                    tracing::debug!("Failed to connect to Temporal: {}. Retrying in 2s...", e);
+                    tracing::debug!(error = %e, "Failed to connect to Temporal, retrying in 2s");
                     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 }
             }
@@ -1150,7 +1148,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     // Initialize SMCP / Tool Routing Services (now hoisted for ExecutionService dependency)
-    println!("Initializing SMCP & Tool Routing services...");
+    info!("Initializing SMCP & Tool Routing services...");
 
     let smcp_middleware =
         Arc::new(aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
@@ -1892,7 +1890,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_execution_repo.clone(),
     ));
 
-    println!("Temporal event listener initialized.");
+    info!("Temporal event listener initialized");
 
     let register_workflow_use_case = Arc::new(StandardRegisterWorkflowUseCase::new(
         workflow_repo.clone(),
@@ -1909,7 +1907,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ));
 
     // --- Initialize SMCP / Tool Routing Services ---
-    println!("Configuring SMCP & Tool Routing repositories and services...");
+    info!("Configuring SMCP & Tool Routing repositories and services...");
 
     // Repositories
     let security_context_repo: Arc<
@@ -2022,7 +2020,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             container_step_runner,
         ),
     );
-    println!("✓ Container step runner initialized (ADR-050).");
+    info!("Container step runner initialized");
 
     let tool_manager = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolServerManager::new(
@@ -2070,10 +2068,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_generated_manifests_root(generated_artifacts_root.clone())
         .with_node_config_path(config_path.clone()),
     );
-    println!(
-        "Generated manifests will be written to: {}",
-        generated_artifacts_root.display()
-    );
+    info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
 
     let inner_loop_service = Arc::new(
         aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
@@ -2107,11 +2102,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         attestation_service: attestation_service.clone(),
         swarm_service: swarm_service.clone(),
         operator_read_model: operator_read_model.clone(),
+        cortex_client: cortex_client.clone(),
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };
 
-    println!("Building router...");
+    info!("Building router...");
     // Build HTTP router
     let app = create_router(Arc::new(app_state), iam_service.clone());
 
@@ -2200,8 +2196,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     tokio::spawn(async move {
-        tracing::info!("Starting gRPC server on {}", grpc_addr);
-        println!("Starting gRPC server on {grpc_addr}");
+        tracing::info!(address = %grpc_addr, "Starting gRPC server");
         if let Err(e) = aegis_orchestrator_core::presentation::grpc::server::start_grpc_server(
             aegis_orchestrator_core::presentation::grpc::server::GrpcServerConfig {
                 addr: grpc_addr,
@@ -2217,19 +2212,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         )
         .await
         {
-            tracing::error!("gRPC server failed: {}", e);
-            eprintln!("gRPC server failed: {e}");
+            tracing::error!(error = %e, "gRPC server failed");
         }
     });
 
     let addr = format!("{bind_addr}:{final_port}");
-    println!("Binding to {addr}...");
+    debug!(address = %addr, "Binding to address");
     let listener = TcpListener::bind(&addr)
         .await
         .with_context(|| format!("Failed to bind to {addr}"))?;
 
-    info!("Daemon listening on {}", addr);
-    println!("Daemon listening on {addr}");
+    info!(address = %addr, "Daemon listening");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -2429,6 +2422,220 @@ async fn temporal_events_handler(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Cortex REST handlers
+// ---------------------------------------------------------------------------
+
+async fn list_cortex_patterns_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<CortexQueryParams>,
+) -> impl IntoResponse {
+    let Some(ref cortex_client) = state.cortex_client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "cortex_not_configured",
+                "message": "Cortex gRPC service is not configured; orchestrator running in memoryless mode"
+            })),
+        )
+            .into_response();
+    };
+
+    let request =
+        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+            error_signature: params.q.clone().unwrap_or_default(),
+            error_type: None,
+            limit: Some(params.limit.unwrap_or(100) as u32),
+            min_success_score: None,
+            tenant_id: String::new(),
+        };
+
+    match cortex_client.query_patterns(request).await {
+        Ok(response) => {
+            let patterns: Vec<serde_json::Value> = response
+                .patterns
+                .into_iter()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id,
+                        "error_signature_hash": p.error_signature_hash,
+                        "error_type": p.error_type,
+                        "error_message": p.error_message,
+                        "solution_approach": p.solution_approach,
+                        "solution_code": p.solution_code,
+                        "frequency": p.frequency,
+                        "success_count": p.success_count,
+                        "total_count": p.total_count,
+                        "success_score": p.success_score,
+                        "created_at": p.created_at,
+                        "last_used_at": p.last_used_at,
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "items": patterns })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query cortex patterns");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("cortex_query_failed: {e}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_cortex_skills_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(ref cortex_client) = state.cortex_client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "cortex_not_configured",
+                "message": "Cortex gRPC service is not configured; orchestrator running in memoryless mode"
+            })),
+        )
+            .into_response();
+    };
+
+    let request =
+        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+            error_signature: String::new(),
+            error_type: None,
+            limit: Some(500),
+            min_success_score: None,
+            tenant_id: String::new(),
+        };
+
+    match cortex_client.query_patterns(request).await {
+        Ok(response) => {
+            let mut skill_map: std::collections::HashMap<String, serde_json::Value> =
+                std::collections::HashMap::new();
+            for p in &response.patterns {
+                let category = if p.error_type.is_empty() {
+                    "general"
+                } else {
+                    &p.error_type
+                };
+                let entry = skill_map.entry(category.to_string()).or_insert_with(|| {
+                    serde_json::json!({
+                        "id": category,
+                        "name": category,
+                        "description": format!("Learned patterns for {category} errors"),
+                        "category": category,
+                        "level": "intermediate",
+                        "patternCount": 0u64,
+                        "usageCount": 0u64,
+                        "successRate": 0.0f64,
+                    })
+                });
+                if let Some(obj) = entry.as_object_mut() {
+                    let count = obj
+                        .get("patternCount")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0)
+                        + 1;
+                    obj.insert("patternCount".to_string(), serde_json::json!(count));
+                    let usage = obj.get("usageCount").and_then(|v| v.as_u64()).unwrap_or(0)
+                        + p.frequency as u64;
+                    obj.insert("usageCount".to_string(), serde_json::json!(usage));
+                    let total = p.total_count.max(1) as f64;
+                    let rate = (p.success_count as f64 / total) * 100.0;
+                    let prev_rate = obj
+                        .get("successRate")
+                        .and_then(|v| v.as_f64())
+                        .unwrap_or(0.0);
+                    obj.insert(
+                        "successRate".to_string(),
+                        serde_json::json!((prev_rate + rate) / 2.0),
+                    );
+                    if count >= 5 {
+                        obj.insert("level".to_string(), serde_json::json!("advanced"));
+                    }
+                }
+            }
+            let skills: Vec<serde_json::Value> = skill_map.into_values().collect();
+            Json(serde_json::json!({ "items": skills })).into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query cortex skills");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("cortex_query_failed: {e}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
+async fn get_cortex_metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let Some(ref cortex_client) = state.cortex_client else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "cortex_not_configured",
+                "message": "Cortex gRPC service is not configured; orchestrator running in memoryless mode"
+            })),
+        )
+            .into_response();
+    };
+
+    let request =
+        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::QueryCortexRequest {
+            error_signature: String::new(),
+            error_type: None,
+            limit: Some(1000),
+            min_success_score: None,
+            tenant_id: String::new(),
+        };
+
+    match cortex_client.query_patterns(request).await {
+        Ok(response) => {
+            let total_patterns = response.patterns.len();
+            let total_frequency: u64 = response.patterns.iter().map(|p| p.frequency as u64).sum();
+            let avg_success: f64 = if total_patterns > 0 {
+                response
+                    .patterns
+                    .iter()
+                    .map(|p| p.success_score as f64)
+                    .sum::<f64>()
+                    / total_patterns as f64
+            } else {
+                0.0
+            };
+
+            let mut error_types: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for p in &response.patterns {
+                if !p.error_type.is_empty() {
+                    error_types.insert(p.error_type.clone());
+                }
+            }
+
+            Json(serde_json::json!({
+                "totalPatterns": total_patterns,
+                "totalSkills": error_types.len(),
+                "avgSuccessRate": (avg_success * 100.0).round() / 100.0,
+                "totalFrequency": total_frequency,
+                "patternsThisWeek": 0,
+                "growthRate": 0,
+                "firstAttemptSuccessRate": 0,
+                "averageIterations": 0,
+                "learningVelocity": 0,
+                "mostUsedSkills": error_types.into_iter().take(5).collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to query cortex metrics");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("cortex_query_failed: {e}") })),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Create the HTTP router with all routes
 fn create_router(
     app_state: Arc<AppState>,
@@ -2545,6 +2752,9 @@ fn create_router(
             get(list_storage_violations_handler),
         )
         .route("/v1/dashboard/summary", get(dashboard_summary_handler))
+        .route("/v1/cortex/patterns", get(list_cortex_patterns_handler))
+        .route("/v1/cortex/skills", get(get_cortex_skills_handler))
+        .route("/v1/cortex/metrics", get(get_cortex_metrics_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
@@ -2587,6 +2797,7 @@ struct AppState {
         Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
     swarm_service: Arc<StandardSwarmService>,
     operator_read_model: Arc<OperatorReadModelStore>,
+    cortex_client: Option<Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>>,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
@@ -2782,13 +2993,13 @@ async fn dashboard_summary_handler(
     };
     let recent_execution_count = state
         .execution_repo
-        .find_recent_for_tenant(&TenantId::local_default(), 25)
+        .find_recent_for_tenant(&TenantId::default(), 25)
         .await
         .map(|items| items.len())
         .unwrap_or_default();
     let recent_workflow_execution_count = state
         .workflow_execution_repo
-        .list_paginated_for_tenant(&TenantId::local_default(), 25, 0)
+        .list_paginated_for_tenant(&TenantId::default(), 25, 0)
         .await
         .map(|items| items.len())
         .unwrap_or_default();
@@ -4405,12 +4616,19 @@ pub struct HttpAttestationRequest {
     pub user_id: Option<String>,
     pub workload_id: Option<String>,
     pub zaru_tier: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 async fn attest_smcp_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
+    let tenant_id = request
+        .tenant_id
+        .as_deref()
+        .and_then(|s| aegis_orchestrator_core::domain::tenant::TenantId::from_realm_slug(s).ok())
+        .unwrap_or_else(aegis_orchestrator_core::domain::tenant::TenantId::consumer);
+
     let internal_req =
         aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
             agent_id: request.agent_id.clone(),
@@ -4422,6 +4640,7 @@ async fn attest_smcp_handler(
             user_id: request.user_id.clone(),
             workload_id: request.workload_id.clone(),
             zaru_tier: request.zaru_tier.clone(),
+            tenant_id,
         };
 
     match state.attestation_service.attest(internal_req).await {

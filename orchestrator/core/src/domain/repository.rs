@@ -39,6 +39,7 @@
 
 use crate::domain::agent::{Agent, AgentId};
 use crate::domain::execution::{Execution, ExecutionId};
+use crate::domain::tenancy::Tenant;
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::{Volume, VolumeId, VolumeOwnership};
 use crate::domain::workflow::{Workflow, WorkflowId};
@@ -309,10 +310,7 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         &self,
         id: ExecutionId,
     ) -> Result<Option<TenantId>, RepositoryError> {
-        Ok(self
-            .find_by_id(id)
-            .await?
-            .map(|_| TenantId::local_default()))
+        Ok(self.find_by_id(id).await?.map(|we| we.tenant_id))
     }
 
     /// Find active workflow executions
@@ -445,6 +443,33 @@ pub trait StorageEventRepository: Send + Sync {
         &self,
         execution_id: Option<ExecutionId>,
     ) -> Result<Vec<crate::domain::events::StorageEvent>, RepositoryError>;
+}
+
+/// Repository interface for Tenant aggregates (ADR-056)
+#[async_trait]
+pub trait TenantRepository: Send + Sync {
+    /// Find an active tenant by slug
+    async fn find_by_slug(&self, slug: &TenantId) -> Result<Option<Tenant>, RepositoryError>;
+
+    /// Find all active tenants
+    async fn find_all_active(&self) -> Result<Vec<Tenant>, RepositoryError>;
+
+    /// Insert a new tenant
+    async fn insert(&self, tenant: &Tenant) -> Result<(), RepositoryError>;
+
+    /// Update tenant status (active/suspended/deleted)
+    async fn update_status(
+        &self,
+        slug: &TenantId,
+        status: &crate::domain::tenancy::TenantStatus,
+    ) -> Result<(), RepositoryError>;
+
+    /// Update tenant quotas
+    async fn update_quotas(
+        &self,
+        slug: &TenantId,
+        quotas: &crate::domain::tenancy::TenantQuotas,
+    ) -> Result<(), RepositoryError>;
 }
 
 /// Repository errors

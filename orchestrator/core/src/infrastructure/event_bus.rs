@@ -63,7 +63,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::events::{
     AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
     LearningEvent, MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
-    ValidationEvent, VolumeEvent, WorkflowEvent,
+    TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -88,6 +88,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Iam(_) => "iam",
         DomainEvent::Secrets(_) => "secrets",
         DomainEvent::ContainerRun(_) => "container_run",
+        DomainEvent::Tenant(_) => "tenant",
     }
 }
 
@@ -115,12 +116,17 @@ pub enum DomainEvent {
     Secrets(SecretEvent),
     /// BC-3 CI/CD container step lifecycle events (ADR-050)
     ContainerRun(ContainerRunEvent),
+    /// Tenant lifecycle and audit events (ADR-056)
+    Tenant(TenantEvent),
 }
 
 impl DomainEvent {
     pub fn execution_id(&self) -> Option<ExecutionId> {
         match self {
-            DomainEvent::AgentLifecycle(_) | DomainEvent::Stimulus(_) | DomainEvent::Iam(_) => None,
+            DomainEvent::AgentLifecycle(_)
+            | DomainEvent::Stimulus(_)
+            | DomainEvent::Iam(_)
+            | DomainEvent::Tenant(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -265,7 +271,10 @@ impl DomainEvent {
                     | ValidationEvent::MultiJudgeConsensus { agent_id, .. } => *agent_id,
                 },
             }),
-            DomainEvent::Workflow(_) | DomainEvent::Volume(_) | DomainEvent::Storage(_) => None,
+            DomainEvent::Workflow(_)
+            | DomainEvent::Volume(_)
+            | DomainEvent::Storage(_)
+            | DomainEvent::Tenant(_) => None,
             DomainEvent::Learning(event) => Some(match event {
                 LearningEvent::PatternDiscovered { agent_id, .. }
                 | LearningEvent::PatternReinforced { agent_id, .. }
@@ -444,6 +453,13 @@ impl DomainEvent {
                     *aggregated_at
                 }
             },
+            DomainEvent::Tenant(event) => match event {
+                TenantEvent::TenantProvisioned { provisioned_at, .. } => *provisioned_at,
+                TenantEvent::TenantSuspended { suspended_at, .. } => *suspended_at,
+                TenantEvent::TenantSoftDeleted { deleted_at, .. } => *deleted_at,
+                TenantEvent::AdminCrossTenantAccess { accessed_at, .. } => *accessed_at,
+                TenantEvent::TenantQuotaExceeded { exceeded_at, .. } => *exceeded_at,
+            },
         }
     }
 
@@ -579,6 +595,13 @@ impl DomainEvent {
                     "parallel_container_run_aggregated"
                 }
             },
+            DomainEvent::Tenant(event) => match event {
+                TenantEvent::TenantProvisioned { .. } => "tenant_provisioned",
+                TenantEvent::TenantSuspended { .. } => "tenant_suspended",
+                TenantEvent::TenantSoftDeleted { .. } => "tenant_soft_deleted",
+                TenantEvent::AdminCrossTenantAccess { .. } => "admin_cross_tenant_access",
+                TenantEvent::TenantQuotaExceeded { .. } => "tenant_quota_exceeded",
+            },
         }
     }
 
@@ -598,6 +621,7 @@ impl DomainEvent {
             DomainEvent::Iam(_) => "iam",
             DomainEvent::Secrets(_) => "secrets",
             DomainEvent::ContainerRun(_) => "container_run",
+            DomainEvent::Tenant(_) => "tenant",
         }
     }
 
@@ -686,6 +710,7 @@ impl DomainEvent {
             DomainEvent::Iam(_) => Some("identity"),
             DomainEvent::Secrets(_) => Some("secrets"),
             DomainEvent::ContainerRun(_) => Some("container"),
+            DomainEvent::Tenant(_) => Some("tenant"),
         }
     }
 }
@@ -775,6 +800,11 @@ impl EventBus {
     /// Publish a secrets management event (BC-11 ADR-034)
     pub fn publish_secret_event(&self, event: SecretEvent) {
         self.publish(DomainEvent::Secrets(event));
+    }
+
+    /// Publish a tenant lifecycle event (ADR-056)
+    pub fn publish_tenant_event(&self, event: TenantEvent) {
+        self.publish(DomainEvent::Tenant(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1131,6 +1161,7 @@ impl AgentEventReceiver {
             DomainEvent::Iam(_) => false,             // IAM events are system-wide, not per-agent
             DomainEvent::Secrets(_) => false, // Secrets events are system-wide, not per-agent
             DomainEvent::ContainerRun(_) => false, // ContainerRun events are keyed by execution_id, not agent_id
+            DomainEvent::Tenant(_) => false,       // Tenant events are system-wide, not per-agent
         }
     }
 }

@@ -13,6 +13,7 @@
 //! | [`webhook_guard`] | HTTP | HMAC-SHA256 extractor for webhook requests (ADR-021) |
 //! | [`stimulus_handlers`] | HTTP | `POST /v1/stimuli` and `POST /v1/webhooks/{source}` handlers (ADR-021) |
 //! | [`keycloak_auth`] | HTTP | IAM/OIDC JWT auth middleware for HTTP endpoints (ADR-041) |
+//! | [`tenant_middleware`] | HTTP | TenantContext extraction middleware (ADR-056) |
 //! | [`metrics_middleware`] | HTTP | Prometheus metrics tracking (ADR-058) |
 
 pub mod api;
@@ -20,4 +21,5 @@ pub mod grpc;
 pub mod keycloak_auth;
 pub mod metrics_middleware;
 pub mod stimulus_handlers;
+pub mod tenant_middleware;
 pub mod webhook_guard;

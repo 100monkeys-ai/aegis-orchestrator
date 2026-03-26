@@ -172,6 +172,17 @@ impl ContainerStepRunner for DockerContainerStepRunner {
             None => Ok(None),
             Some(s) if s.starts_with("env:") => {
                 let var_name = s.strip_prefix("env:").unwrap();
+
+                // Validate that the env var reference doesn't target orchestrator-internal vars
+                if let Err(reason) = crate::domain::env_guard::validate_env_ref(var_name) {
+                    let error = ContainerStepError::ImagePullFailed {
+                        image: config.image.clone(),
+                        error: reason,
+                    };
+                    self.publish_failed_event(&config, Self::failure_reason_for_error(&error));
+                    return Err(error);
+                }
+
                 let resolved =
                     (|| -> Result<bollard::auth::DockerCredentials, ContainerStepError> {
                         let raw = std::env::var(var_name).map_err(|_| {
@@ -396,7 +407,20 @@ impl ContainerStepRunner for DockerContainerStepRunner {
         // ─── 4. Build env vars ────────────────────────────────────────────────
         // Intentionally does NOT inject AEGIS_ORCHESTRATOR_URL or any bootstrap
         // env vars — this is a deterministic CI/CD step, not an agent iteration.
-        let env_strings: Vec<String> = config.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        // Filter env vars to prevent orchestrator-internal variables from leaking.
+        let (filtered_env, blocked_vars) = crate::domain::env_guard::filter_env_vars(&config.env);
+        if !blocked_vars.is_empty() {
+            warn!(
+                execution_id = %config.execution_id,
+                step_name = %config.name,
+                blocked = ?blocked_vars,
+                "Blocked orchestrator-internal env vars from container step"
+            );
+        }
+        let env_strings: Vec<String> = filtered_env
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
 
         // ─── 5. Resolve command ───────────────────────────────────────────────
         // Shell wrapping (sh -c) is applied upstream in RunContainerStepUseCase

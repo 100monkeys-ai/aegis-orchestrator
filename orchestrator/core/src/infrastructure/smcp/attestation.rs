@@ -19,6 +19,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::domain::tenant::TenantId;
+
 /// The agent's initial attestation message sent to the orchestrator.
 ///
 /// Contains the ephemeral Ed25519 public key generated for this execution.
@@ -56,6 +58,12 @@ pub struct AttestationRequest {
     pub workload_id: Option<String>,
     /// Optional upstream Zaru tier string used to derive the security context.
     pub zaru_tier: Option<String>,
+    /// Tenant identity of the requesting principal (ADR-056).
+    ///
+    /// Used to enforce SecurityContext name ownership: `zaru-*` contexts require
+    /// a consumer tenant, `tenant-{slug}-*` contexts require the matching
+    /// enterprise tenant, and `aegis-system-*` contexts require the system tenant.
+    pub tenant_id: TenantId,
 }
 
 /// The orchestrator's response to a successful attestation handshake.

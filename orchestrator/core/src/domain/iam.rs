@@ -167,6 +167,11 @@ impl AegisRole {
         }
     }
 
+    /// Returns `true` if this role has full administrative privileges.
+    pub fn is_admin(&self) -> bool {
+        matches!(self, AegisRole::Admin)
+    }
+
     /// Convert to the canonical claim string representation.
     pub fn as_claim_str(&self) -> &'static str {
         match self {

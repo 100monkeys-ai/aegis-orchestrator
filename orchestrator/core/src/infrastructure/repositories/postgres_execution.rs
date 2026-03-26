@@ -238,6 +238,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             Ok(Some(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 iterations,
                 max_iterations: max_iterations_u8,
@@ -346,6 +347,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             executions.push(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 iterations,
                 max_iterations: max_iterations_u8,
@@ -451,6 +453,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             executions.push(Execution {
                 id: ExecutionId(id),
                 agent_id: AgentId(agent_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 iterations,
                 max_iterations: max_iterations_u8,

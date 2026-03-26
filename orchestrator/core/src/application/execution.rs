@@ -243,7 +243,7 @@ impl StandardExecutionService {
             .get("tenant_id")
             .and_then(|v| v.as_str())
             .or_else(|| payload.get("tenant").and_then(|v| v.as_str()))
-            .unwrap_or("local");
+            .unwrap_or(crate::domain::tenant::CONSUMER_SLUG);
         TenantId::from_string(tenant).map_err(|e| anyhow!("Invalid tenant_id '{tenant}': {e}"))
     }
 
@@ -748,7 +748,7 @@ mod tests {
             agent_id,
             ExecutionInput {
                 intent: Some("parent".to_string()),
-                payload: serde_json::json!({ "tenant_id": "local" }),
+                payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
             },
             1,
         )
@@ -847,7 +847,7 @@ mod tests {
                 judge_agent.id,
                 ExecutionInput {
                     intent: Some("judge".to_string()),
-                    payload: serde_json::json!({ "tenant_id": "local" }),
+                    payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                 },
                 parent_execution.id,
             )
@@ -935,7 +935,7 @@ mod tests {
                 judge_agent.id,
                 ExecutionInput {
                     intent: Some("judge".to_string()),
-                    payload: serde_json::json!({ "tenant_id": "local" }),
+                    payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                 },
                 parent_execution.id,
             )
@@ -984,6 +984,81 @@ mod tests {
         assert_eq!(
             overrides.get("metadata"),
             Some(&serde_json::json!({ "owner": "100monkeys" }))
+        );
+    }
+
+    #[test]
+    fn resolve_tenant_from_payload_extracts_tenant_id() {
+        let payload = serde_json::json!({ "tenant_id": "acme-corp" });
+        let tenant = StandardExecutionService::resolve_tenant_from_payload(&payload).unwrap();
+        assert_eq!(tenant.as_str(), "acme-corp");
+    }
+
+    #[test]
+    fn resolve_tenant_from_payload_defaults_to_consumer_when_missing() {
+        let payload = serde_json::json!({ "task": "run" });
+        let tenant = StandardExecutionService::resolve_tenant_from_payload(&payload).unwrap();
+        assert_eq!(tenant, CoreTenantId::consumer());
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_child_spawn_is_rejected() {
+        let tenant_id = CoreTenantId::consumer();
+        let parent_agent = make_agent("parent-worker", None, None);
+        let child_agent = make_agent("child-worker", None, None);
+
+        // Parent execution belongs to zaru-consumer
+        let parent_execution = make_parent_execution(parent_agent.id);
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &parent_agent)
+            .await
+            .unwrap();
+        agent_repo
+            .save_for_tenant(&tenant_id, &child_agent)
+            .await
+            .unwrap();
+
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+        execution_repo
+            .save_for_tenant(&tenant_id, &parent_execution)
+            .await
+            .unwrap();
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        });
+
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo,
+            event_bus,
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        );
+
+        // Attempt child spawn with a different tenant
+        let err = service
+            .start_child_execution(
+                child_agent.id,
+                ExecutionInput {
+                    intent: Some("child-task".to_string()),
+                    payload: serde_json::json!({ "tenant_id": "other-tenant" }),
+                },
+                parent_execution.id,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("Cross-tenant spawn forbidden"),
+            "expected cross-tenant error, got: {err}"
         );
     }
 }
@@ -1909,7 +1984,19 @@ impl ExecutionService for StandardExecutionService {
             .find_by_id(parent_execution_id)
             .await?
             .ok_or_else(|| anyhow!("Parent execution {parent_execution_id} not found"))?;
-        let tenant_id = Self::resolve_tenant_from_input(&parent.input)?;
+        let parent_tenant_id = Self::resolve_tenant_from_input(&parent.input)?;
+        let child_tenant_id = Self::resolve_tenant_from_input(&input)?;
+
+        // Cross-tenant spawn check (ADR-056 Phase 3): child executions must
+        // belong to the same tenant as their parent.
+        if parent_tenant_id != child_tenant_id {
+            return Err(anyhow!(
+                "Cross-tenant spawn forbidden: parent tenant '{}' != child tenant '{}'",
+                parent_tenant_id.as_str(),
+                child_tenant_id.as_str()
+            ));
+        }
+        let tenant_id = parent_tenant_id;
 
         if !parent.can_spawn_child() {
             return Err(anyhow!(
@@ -2286,6 +2373,7 @@ impl ExecutionService for StandardExecutionService {
             .insert(child_execution_id, cancellation_token.clone());
         let tokens_map = self.cancellation_tokens.clone();
         let cortex_client = self.cortex_client.clone();
+        let tenant_id_for_task = tenant_id.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -2303,10 +2391,13 @@ impl ExecutionService for StandardExecutionService {
 
             match result {
                 Ok(final_output) => {
-                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
+                        .await
+                    {
                         exec.complete();
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
 
                         StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
@@ -2320,10 +2411,13 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
-                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
+                        .await
+                    {
                         exec.fail(format!("Execution timed out after {timeout_secs} seconds"));
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionTimedOut {
                             execution_id: child_execution_id,
                             agent_id,
@@ -2334,11 +2428,14 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(RuntimeError::Cancelled) => {
-                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
+                        .await
+                    {
                         if exec.status != ExecutionStatus::Cancelled {
                             exec.status = ExecutionStatus::Cancelled;
                             exec.ended_at = Some(Utc::now());
-                            let _ = repository.save(&exec).await;
+                            let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
                             event_bus.publish_execution_event(ExecutionEvent::ExecutionCancelled {
                                 execution_id: child_execution_id,
                                 agent_id,
@@ -2349,10 +2446,13 @@ impl ExecutionService for StandardExecutionService {
                     }
                 }
                 Err(e) => {
-                    if let Ok(Some(mut exec)) = repository.find_by_id(child_execution_id).await {
+                    if let Ok(Some(mut exec)) = repository
+                        .find_by_id_for_tenant(&tenant_id_for_task, child_execution_id)
+                        .await
+                    {
                         exec.fail(e.to_string());
                         let total_iterations = exec.iterations().len() as u8;
-                        let _ = repository.save(&exec).await;
+                        let _ = repository.save_for_tenant(&tenant_id_for_task, &exec).await;
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionFailed {
                             execution_id: child_execution_id,
                             agent_id,

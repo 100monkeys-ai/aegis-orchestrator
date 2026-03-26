@@ -44,6 +44,7 @@
 //!
 //! See AGENTS.md §Agent Domain ubiquitous language.
 
+use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,8 @@ impl Default for AgentId {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
+    #[serde(default)]
+    pub tenant_id: TenantId,
     pub name: String,
     pub manifest: AgentManifest,
     pub status: AgentStatus,
@@ -837,6 +840,7 @@ impl Agent {
         let now = Utc::now();
         Self {
             id: AgentId::new(),
+            tenant_id: TenantId::default(),
             name: manifest.metadata.name.clone(),
             manifest,
             status: AgentStatus::Active,

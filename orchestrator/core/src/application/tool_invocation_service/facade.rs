@@ -7,7 +7,7 @@ impl ToolInvocationService {
             .get("tenant_id")
             .and_then(|v| v.as_str())
             .or_else(|| args.get("tenant").and_then(|v| v.as_str()))
-            .unwrap_or("local");
+            .unwrap_or(crate::domain::tenant::CONSUMER_SLUG);
 
         TenantId::from_string(tenant).map_err(|e| {
             SmcpSessionError::InvalidArguments(format!("invalid tenant identifier '{tenant}': {e}"))
@@ -1046,7 +1046,7 @@ impl ToolInvocationService {
             return result;
         }
         if tool_name == "aegis.agent.list" {
-            let result = self.invoke_aegis_agent_list_tool().await;
+            let result = self.invoke_aegis_agent_list_tool(&args).await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                     invocation_id,
@@ -1072,7 +1072,7 @@ impl ToolInvocationService {
             return result;
         }
         if tool_name == "aegis.workflow.list" {
-            let result = self.invoke_aegis_workflow_list_tool().await;
+            let result = self.invoke_aegis_workflow_list_tool(&args).await;
             match &result {
                 Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                     invocation_id,

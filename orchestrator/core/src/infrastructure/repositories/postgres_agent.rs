@@ -132,6 +132,7 @@ impl AgentRepository for PostgresAgentRepository {
 
             Ok(Some(Agent {
                 id: AgentId(id),
+                tenant_id: tenant_id.clone(),
                 name,
                 manifest,
                 status,
@@ -183,6 +184,7 @@ impl AgentRepository for PostgresAgentRepository {
 
             Ok(Some(Agent {
                 id: AgentId(id),
+                tenant_id: tenant_id.clone(),
                 name,
                 manifest,
                 status,
@@ -234,6 +236,7 @@ impl AgentRepository for PostgresAgentRepository {
 
             agents.push(Agent {
                 id: AgentId(id),
+                tenant_id: tenant_id.clone(),
                 name,
                 manifest,
                 status,

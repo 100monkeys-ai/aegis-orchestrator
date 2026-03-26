@@ -385,6 +385,7 @@ mod tests {
             attestation_service: None,
             workflow_execution_repo: None,
             event_bus: None,
+            tenant_repo: None,
         })
     }
 

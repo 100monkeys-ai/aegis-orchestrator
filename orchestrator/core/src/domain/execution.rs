@@ -29,6 +29,7 @@
 //! See ADR-005 (Iterative Execution Strategy), AGENTS.md §Execution Context.
 
 use crate::domain::agent::AgentId;
+use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -156,6 +157,8 @@ impl std::fmt::Display for ExecutionId {
 pub struct Execution {
     pub id: ExecutionId,
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub tenant_id: TenantId,
     pub status: ExecutionStatus,
     pub iterations: Vec<Iteration>,
     pub max_iterations: u8,
@@ -279,6 +282,11 @@ pub enum ExecutionError {
     PromptRenderFailed(String),
     #[error("Failed to extract user input from execution payload: {0}")]
     InvalidExecutionInput(String),
+    #[error("Cross-tenant spawn forbidden: parent tenant '{parent_tenant}' cannot spawn child in tenant '{child_tenant}'")]
+    CrossTenantSpawnForbidden {
+        parent_tenant: String,
+        child_tenant: String,
+    },
 }
 
 impl Execution {
@@ -287,6 +295,7 @@ impl Execution {
         Self {
             id,
             agent_id,
+            tenant_id: TenantId::default(),
             status: ExecutionStatus::Pending,
             iterations: Vec::new(),
             max_iterations,
@@ -314,6 +323,7 @@ impl Execution {
         Ok(Self {
             id: child_id,
             agent_id,
+            tenant_id: parent.tenant_id.clone(),
             status: ExecutionStatus::Pending,
             iterations: Vec::new(),
             max_iterations,
@@ -474,6 +484,8 @@ impl Execution {
 pub struct ExecutionInfo {
     pub id: ExecutionId,
     pub agent_id: AgentId,
+    #[serde(default)]
+    pub tenant_id: TenantId,
     pub status: ExecutionStatus,
     pub started_at: DateTime<Utc>,
     pub ended_at: Option<DateTime<Utc>>,
@@ -485,6 +497,7 @@ impl From<Execution> for ExecutionInfo {
         Self {
             id: exec.id,
             agent_id: exec.agent_id,
+            tenant_id: exec.tenant_id,
             status: exec.status,
             started_at: exec.started_at,
             ended_at: exec.ended_at,

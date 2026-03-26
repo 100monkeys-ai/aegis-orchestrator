@@ -37,7 +37,7 @@ impl ToolInvocationService {
             }
         };
 
-        match repo.delete(workflow_id).await {
+        match repo.delete_for_tenant(&tenant_id, workflow_id).await {
             Ok(_) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.workflow.delete",
                 "deleted": true,
@@ -407,7 +407,8 @@ impl ToolInvocationService {
             }
         };
 
-        let execution = match repo.find_by_id(exec_id).await {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let execution = match repo.find_by_id_for_tenant(&tenant_id, exec_id).await {
             Ok(Some(e)) => e,
             Ok(None) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -449,7 +450,9 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_workflow_list_tool(
         &self,
+        args: &Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
         let repo = match &self.workflow_repository {
             Some(repo) => repo,
             None => {
@@ -460,14 +463,9 @@ impl ToolInvocationService {
             }
         };
 
-        let workflows = repo
-            .list_all_for_tenant(&TenantId::local_default())
-            .await
-            .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Failed to list workflows: {e}"
-                ))
-            })?;
+        let workflows = repo.list_all_for_tenant(&tenant_id).await.map_err(|e| {
+            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list workflows: {e}"))
+        })?;
 
         let entries: Vec<serde_json::Value> = workflows
             .iter()

@@ -181,6 +181,7 @@ impl ToolInvocationService {
                     subcommand,
                     args: cli_args,
                     fsal_mounts,
+                    tenant_id: String::new(),
                 }))
                 .await
                 .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
@@ -199,6 +200,7 @@ impl ToolInvocationService {
                 workflow_name: tool_name.to_string(),
                 input_json: args.to_string(),
                 zaru_user_token: String::new(),
+                tenant_id: String::new(),
             }))
             .await
             .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?

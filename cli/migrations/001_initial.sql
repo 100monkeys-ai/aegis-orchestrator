@@ -12,6 +12,41 @@ DROP TABLE IF EXISTS workflow_executions CASCADE;
 DROP TABLE IF EXISTS workflows CASCADE;
 DROP TABLE IF EXISTS executions CASCADE;
 DROP TABLE IF EXISTS agents CASCADE;
+DROP TABLE IF EXISTS volumes CASCADE;
+DROP TABLE IF EXISTS workflow_definitions CASCADE;
+DROP TABLE IF EXISTS tenants CASCADE;
+
+-- -----------------------------------------------------------------------------
+-- Tenants Table
+-- Multi-tenant isolation: every domain entity belongs to exactly one tenant
+-- ADR-056: Multi-Tenant Architecture Phase 1
+-- -----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS tenants (
+    slug            VARCHAR(63)  PRIMARY KEY,
+    display_name    VARCHAR(255) NOT NULL,
+    status          VARCHAR(32)  NOT NULL DEFAULT 'active',
+    tier            VARCHAR(32)  NOT NULL DEFAULT 'enterprise',
+    keycloak_realm  VARCHAR(255) NOT NULL,
+    openbao_namespace VARCHAR(255) NOT NULL,
+    max_concurrent_executions  INTEGER NOT NULL DEFAULT 50,
+    max_agents                 INTEGER NOT NULL DEFAULT 500,
+    max_storage_gb             NUMERIC(10, 2) NOT NULL DEFAULT 100.0,
+    created_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    deleted_at      TIMESTAMPTZ  NULL,
+    CONSTRAINT tenants_slug_format CHECK (slug ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT tenants_status_check CHECK (status IN ('active', 'suspended', 'deleted')),
+    CONSTRAINT tenants_tier_check CHECK (tier IN ('consumer', 'enterprise', 'system'))
+);
+
+CREATE INDEX idx_tenants_status ON tenants(status);
+
+-- Seed tenants
+INSERT INTO tenants (slug, display_name, tier, keycloak_realm, openbao_namespace)
+VALUES
+    ('zaru-consumer', 'Zaru Consumer Pool', 'consumer', 'zaru-consumer', 'tenant-zaru-consumer/'),
+    ('aegis-system',  'AEGIS Platform',     'system',   'aegis-system',  'tenant-aegis-system/')
+ON CONFLICT (slug) DO NOTHING;
 
 -- -----------------------------------------------------------------------------
 -- Workflows Table
@@ -41,7 +76,8 @@ CREATE TABLE workflows (
     CONSTRAINT workflows_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT workflows_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT workflows_tenant_name_version_unique UNIQUE (tenant_id, name, version),
-    CONSTRAINT workflows_version_format CHECK (version ~ '^\d+\.\d+\.\d+$')
+    CONSTRAINT workflows_version_format CHECK (version ~ '^\d+\.\d+\.\d+$'),
+    CONSTRAINT workflows_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_workflows_tenant_name ON workflows(tenant_id, name);
@@ -101,7 +137,8 @@ CREATE TABLE workflow_executions (
     -- Validation
     CONSTRAINT workflow_executions_status_check CHECK (
         status IN ('running', 'completed', 'failed', 'cancelled', 'timed_out', 'pending')
-    )
+    ),
+    CONSTRAINT workflow_executions_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_workflow_executions_workflow_id ON workflow_executions(workflow_id);
@@ -177,11 +214,13 @@ CREATE TABLE agents (
     CONSTRAINT agents_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT agents_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT agents_tenant_name_unique UNIQUE (tenant_id, name),
-    CONSTRAINT agents_status_check CHECK (status IN ('active', 'paused', 'archived'))
+    CONSTRAINT agents_status_check CHECK (status IN ('active', 'paused', 'archived')),
+    CONSTRAINT agents_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_agents_tenant_name ON agents(tenant_id, name);
 CREATE INDEX idx_agents_status ON agents(status);
+CREATE INDEX idx_agents_tenant_status ON agents(tenant_id, status);
 CREATE INDEX idx_agents_created_at ON agents(created_at DESC);
 
 -- Trigger to update updated_at
@@ -237,7 +276,8 @@ CREATE TABLE executions (
     -- Validation
     CONSTRAINT executions_status_check CHECK (
         status IN ('pending', 'running', 'completed', 'failed', 'cancelled')
-    )
+    ),
+    CONSTRAINT executions_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
 CREATE INDEX idx_executions_agent_id ON executions(agent_id);
@@ -271,7 +311,8 @@ CREATE TABLE workflow_definitions (
     version TEXT NOT NULL DEFAULT '0.0.1',
     definition_hash TEXT NOT NULL,
     
-    CONSTRAINT workflow_definitions_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+    CONSTRAINT workflow_definitions_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT workflow_definitions_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX idx_workflow_definitions_tenant_name_version
@@ -323,6 +364,7 @@ ORDER BY success_rate_percent DESC;
 -- Comments
 -- =============================================================================
 
+COMMENT ON TABLE tenants IS 'Multi-tenant isolation roots; every domain entity references exactly one tenant (ADR-056)';
 COMMENT ON TABLE workflows IS 'Registered workflow definitions in AEGIS YAML format';
 COMMENT ON TABLE workflow_executions IS 'Links to Temporal workflow runs with AEGIS metadata';
 COMMENT ON TABLE agents IS 'Agent manifest definitions from MANIFEST_SPEC_V1';
@@ -351,8 +393,9 @@ COMMENT ON COLUMN executions.parent_execution_id IS 'Parent execution ID for chi
 DO $$
 BEGIN
     RAISE NOTICE 'AEGIS Temporal Era Schema Migration Complete';
-    RAISE NOTICE 'Created tables: workflows, workflow_executions, agents, executions, workflow_definitions';
+    RAISE NOTICE 'Created tables: tenants, workflows, workflow_executions, agents, executions, workflow_definitions';
     RAISE NOTICE 'Created views: active_workflow_executions, agent_success_rates';
+    RAISE NOTICE 'Seeded tenants: zaru-consumer, aegis-system';
 END $$;
 
 -- AEGIS Unified Storage Layer Database Schema
@@ -391,7 +434,8 @@ CREATE TABLE volumes (
     
     -- Constraints
     CONSTRAINT volumes_size_limit_positive CHECK (size_limit_bytes > 0),
-    CONSTRAINT volumes_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$')
+    CONSTRAINT volumes_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT volumes_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
     -- Note: Volume names are logical labels, NOT globally unique.
     -- Multiple executions can have volumes with the same name but different volume_ids.
     -- Uniqueness is enforced by: id (PRIMARY KEY).

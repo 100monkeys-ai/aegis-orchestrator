@@ -41,6 +41,7 @@ use crate::application::ports::{AttestationTokenClaims, SecurityTokenIssuerPort,
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::security_context::validate_context_ownership;
 use crate::domain::smcp_session::SmcpSession;
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::infrastructure::smcp::attestation::{
@@ -128,6 +129,17 @@ impl AttestationService for AttestationServiceImpl {
 
         // 1. Resolve agent identity and applicable security context.
         let context_name = self.resolve_security_context_name(&request)?;
+
+        // 1b. Enforce tenant ownership of the SecurityContext name (ADR-056 Phase 5).
+        validate_context_ownership(&context_name, &request.tenant_id).map_err(|msg| {
+            tracing::warn!(
+                context_name = %context_name,
+                tenant_id = %request.tenant_id,
+                "SecurityContext ownership violation: {msg}"
+            );
+            anyhow::anyhow!("SecurityContext ownership violation: {msg}")
+        })?;
+
         let security_context = self
             .security_context_repo
             .find_by_name(&context_name)
@@ -217,6 +229,7 @@ mod tests {
     use super::*;
     use crate::domain::security_context::capability::Capability;
     use crate::domain::security_context::{SecurityContext, SecurityContextMetadata};
+    use crate::domain::tenant::TenantId;
     use crate::infrastructure::security_context::InMemorySecurityContextRepository;
     use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
     use crate::infrastructure::smcp::signature::SecurityTokenVerifier;
@@ -280,6 +293,7 @@ mod tests {
                 user_id: Some("user-123".to_string()),
                 workload_id: Some("librechat-session-42".to_string()),
                 zaru_tier: Some("pro".to_string()),
+                tenant_id: TenantId::consumer(),
             })
             .await
             .unwrap();
@@ -321,9 +335,153 @@ mod tests {
                 user_id: Some("user-456".to_string()),
                 workload_id: Some("librechat-session-99".to_string()),
                 zaru_tier: Some("enterprise".to_string()),
+                tenant_id: TenantId::consumer(),
             })
             .await;
 
         assert!(response.is_err());
+    }
+
+    #[tokio::test]
+    async fn attest_rejects_zaru_context_for_non_consumer_tenant() {
+        let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+        security_context_repo
+            .save(test_context("zaru-pro"))
+            .await
+            .unwrap();
+        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let issuer =
+            Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
+        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let response = service
+            .attest(AttestationRequest {
+                agent_id: None,
+                execution_id: None,
+                container_id: None,
+                public_key_pem: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                security_context: Some("zaru-pro".to_string()),
+                principal_subject: None,
+                user_id: None,
+                workload_id: None,
+                zaru_tier: None,
+                tenant_id: TenantId::system(),
+            })
+            .await;
+
+        assert!(response.is_err());
+        let err_msg = response.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ownership violation"),
+            "Expected ownership violation error, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_rejects_legacy_bare_context_name() {
+        let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+        security_context_repo
+            .save(test_context("research-safe"))
+            .await
+            .unwrap();
+        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let issuer =
+            Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
+        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let response = service
+            .attest(AttestationRequest {
+                agent_id: None,
+                execution_id: None,
+                container_id: None,
+                public_key_pem: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                security_context: Some("research-safe".to_string()),
+                principal_subject: None,
+                user_id: None,
+                workload_id: None,
+                zaru_tier: None,
+                tenant_id: TenantId::consumer(),
+            })
+            .await;
+
+        assert!(response.is_err());
+        let err_msg = response.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("tenant-namespaced naming convention"),
+            "Expected legacy name rejection, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_rejects_tenant_context_for_wrong_tenant() {
+        let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+        security_context_repo
+            .save(test_context("tenant-acme-corp-research"))
+            .await
+            .unwrap();
+        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let issuer =
+            Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
+        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+
+        // Use a different tenant slug
+        let wrong_tenant = TenantId::from_realm_slug("other-corp").unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let response = service
+            .attest(AttestationRequest {
+                agent_id: None,
+                execution_id: None,
+                container_id: None,
+                public_key_pem: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                security_context: Some("tenant-acme-corp-research".to_string()),
+                principal_subject: None,
+                user_id: None,
+                workload_id: None,
+                zaru_tier: None,
+                tenant_id: wrong_tenant,
+            })
+            .await;
+
+        assert!(response.is_err());
+        let err_msg = response.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("ownership violation"),
+            "Expected ownership violation, got: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn attest_accepts_tenant_context_for_correct_tenant() {
+        let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
+        security_context_repo
+            .save(test_context("tenant-acme-corp-research"))
+            .await
+            .unwrap();
+        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let issuer =
+            Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
+        let service =
+            AttestationServiceImpl::new(security_context_repo, smcp_session_repo.clone(), issuer);
+
+        let correct_tenant = TenantId::from_realm_slug("acme-corp").unwrap();
+        let signing_key = SigningKey::from_bytes(&[9u8; 32]);
+        let response = service
+            .attest(AttestationRequest {
+                agent_id: None,
+                execution_id: None,
+                container_id: None,
+                public_key_pem: STANDARD.encode(signing_key.verifying_key().as_bytes()),
+                security_context: Some("tenant-acme-corp-research".to_string()),
+                principal_subject: None,
+                user_id: None,
+                workload_id: None,
+                zaru_tier: None,
+                tenant_id: correct_tenant,
+            })
+            .await;
+
+        assert!(response.is_ok());
     }
 }

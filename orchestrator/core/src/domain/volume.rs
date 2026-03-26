@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn test_tenant_id_default() {
         let tenant = TenantId::default();
-        assert_eq!(tenant.as_str(), "local");
+        assert_eq!(tenant.as_str(), crate::domain::tenant::CONSUMER_SLUG);
     }
 
     #[test]

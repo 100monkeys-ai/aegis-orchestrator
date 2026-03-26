@@ -32,6 +32,7 @@ use serde_json::Value;
 
 use super::capability::Capability;
 use crate::domain::mcp::PolicyViolation;
+use crate::domain::tenant::TenantId;
 
 /// Audit metadata for a [`SecurityContext`] record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -125,6 +126,78 @@ impl SecurityContext {
                 .collect(),
         })
     }
+
+    /// Validate that the given tenant is allowed to use this SecurityContext (ADR-056).
+    ///
+    /// SecurityContext names must follow tenant-namespaced conventions:
+    /// - `zaru-*` — only for consumer realm principals (`zaru-consumer` tenant)
+    /// - `tenant-{slug}-*` — only for the matching enterprise tenant
+    /// - `aegis-system-*` — only for system realm principals
+    /// - Legacy bare names (no recognised prefix) are rejected outright.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable error string describing the ownership violation.
+    pub fn validate_tenant_ownership(&self, tenant_id: &TenantId) -> Result<(), String> {
+        validate_context_ownership(&self.name, tenant_id)
+    }
+}
+
+/// Validate that a SecurityContext name is owned by the given tenant (ADR-056).
+///
+/// This is a free function so it can be called before the `SecurityContext` is
+/// loaded from the repository (e.g. to fail fast on obviously-wrong names).
+///
+/// # Rules
+///
+/// 1. `zaru-*` → requires `tenant_id.is_consumer()`
+/// 2. `tenant-{slug}-*` → requires context name starts with `tenant-{tenant_id}-`
+/// 3. `aegis-system-*` → requires `tenant_id.is_system()`
+/// 4. Any other prefix → rejected as a legacy bare name
+pub fn validate_context_ownership(context_name: &str, tenant_id: &TenantId) -> Result<(), String> {
+    if context_name.starts_with("zaru-") {
+        if !tenant_id.is_consumer() {
+            return Err(format!(
+                "SecurityContext '{}' uses the 'zaru-' prefix which is reserved for consumer \
+                 realm principals, but the requesting tenant is '{}'",
+                context_name,
+                tenant_id.as_str()
+            ));
+        }
+        return Ok(());
+    }
+
+    if context_name.starts_with("tenant-") {
+        let expected_prefix = format!("tenant-{}-", tenant_id.as_str());
+        if !context_name.starts_with(&expected_prefix) {
+            return Err(format!(
+                "SecurityContext '{}' uses the 'tenant-' prefix but does not match the \
+                 requesting tenant '{}'; expected prefix '{}'",
+                context_name,
+                tenant_id.as_str(),
+                expected_prefix,
+            ));
+        }
+        return Ok(());
+    }
+
+    if context_name.starts_with("aegis-system-") {
+        if !tenant_id.is_system() {
+            return Err(format!(
+                "SecurityContext '{}' uses the 'aegis-system-' prefix which is reserved for \
+                 system realm principals, but the requesting tenant is '{}'",
+                context_name,
+                tenant_id.as_str()
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "SecurityContext '{}' does not follow the required tenant-namespaced naming convention. \
+         Context names must start with 'zaru-', 'tenant-{{slug}}-', or 'aegis-system-'",
+        context_name
+    ))
 }
 
 #[cfg(test)]
@@ -203,6 +276,46 @@ mod tests {
             ctx.evaluate("fs.delete", &json!({"path": "/workspace/test.txt"})),
             Err(PolicyViolation::ToolExplicitlyDenied { .. })
         ));
+    }
+
+    #[test]
+    fn test_validate_context_ownership_zaru_consumer() {
+        let tenant = TenantId::consumer();
+        assert!(validate_context_ownership("zaru-free", &tenant).is_ok());
+        assert!(validate_context_ownership("zaru-pro", &tenant).is_ok());
+    }
+
+    #[test]
+    fn test_validate_context_ownership_zaru_rejects_non_consumer() {
+        let tenant = TenantId::system();
+        assert!(validate_context_ownership("zaru-free", &tenant).is_err());
+        let enterprise = TenantId::from_realm_slug("acme").unwrap();
+        assert!(validate_context_ownership("zaru-pro", &enterprise).is_err());
+    }
+
+    #[test]
+    fn test_validate_context_ownership_tenant_prefix_matching() {
+        let tenant = TenantId::from_realm_slug("acme-corp").unwrap();
+        assert!(validate_context_ownership("tenant-acme-corp-research", &tenant).is_ok());
+        assert!(validate_context_ownership("tenant-acme-corp-deploy", &tenant).is_ok());
+        // Wrong tenant
+        let other = TenantId::from_realm_slug("other-corp").unwrap();
+        assert!(validate_context_ownership("tenant-acme-corp-research", &other).is_err());
+    }
+
+    #[test]
+    fn test_validate_context_ownership_aegis_system() {
+        let system = TenantId::system();
+        assert!(validate_context_ownership("aegis-system-internal", &system).is_ok());
+        let consumer = TenantId::consumer();
+        assert!(validate_context_ownership("aegis-system-internal", &consumer).is_err());
+    }
+
+    #[test]
+    fn test_validate_context_ownership_rejects_legacy_bare_names() {
+        let consumer = TenantId::consumer();
+        assert!(validate_context_ownership("research-safe", &consumer).is_err());
+        assert!(validate_context_ownership("coder-unrestricted", &consumer).is_err());
     }
 
     #[test]

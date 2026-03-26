@@ -243,6 +243,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             Ok(Some(WorkflowExecution {
                 id: ExecutionId(id),
                 workflow_id: WorkflowId(workflow_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 current_state: StateName::new(&current_state_str)
                     .unwrap_or_else(|_| StateName::new("start").unwrap()),
@@ -337,6 +338,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             executions.push(WorkflowExecution {
                 id: ExecutionId(id),
                 workflow_id: WorkflowId(workflow_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 current_state: StateName::new(&current_state_str)
                     .unwrap_or_else(|_| StateName::new("start").unwrap()),
@@ -417,6 +419,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             executions.push(WorkflowExecution {
                 id: ExecutionId(id),
                 workflow_id: WorkflowId(workflow_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 current_state: StateName::new(&current_state_str)
                     .unwrap_or_else(|_| StateName::new("start").unwrap()),
@@ -590,6 +593,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             executions.push(WorkflowExecution {
                 id: ExecutionId(id),
                 workflow_id: WorkflowId(workflow_id),
+                tenant_id: tenant_id.clone(),
                 status,
                 current_state: StateName::new(&current_state_str)
                     .unwrap_or_else(|_| StateName::new("start").unwrap()),

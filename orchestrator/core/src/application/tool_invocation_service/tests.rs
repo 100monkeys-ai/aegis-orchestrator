@@ -124,6 +124,7 @@ spec:
     let manifest: AgentManifest = serde_yaml::from_str(&manifest_yaml).unwrap();
     Agent {
         id: AgentId::new(),
+        tenant_id: crate::domain::tenant::TenantId::default(),
         name: manifest.metadata.name.clone(),
         manifest,
         status: AgentStatus::Active,

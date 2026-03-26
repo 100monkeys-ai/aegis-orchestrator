@@ -32,6 +32,7 @@
 
 use crate::domain::agent::ImagePullPolicy;
 use crate::domain::execution::{ExecutionId, ExecutionStatus};
+use crate::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -121,6 +122,8 @@ impl std::fmt::Display for StateName {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Workflow {
     pub id: WorkflowId,
+    #[serde(default)]
+    pub tenant_id: TenantId,
     pub metadata: WorkflowMetadata,
     pub spec: WorkflowSpec,
     pub created_at: DateTime<Utc>,
@@ -340,6 +343,7 @@ impl Workflow {
 
         Ok(Self {
             id: WorkflowId::new(),
+            tenant_id: TenantId::default(),
             metadata,
             spec,
             created_at: Utc::now(),
@@ -1154,6 +1158,10 @@ pub struct WorkflowExecution {
     /// Workflow being executed
     pub workflow_id: WorkflowId,
 
+    /// Tenant that owns this execution
+    #[serde(default)]
+    pub tenant_id: TenantId,
+
     /// Execution status
     pub status: ExecutionStatus,
 
@@ -1185,6 +1193,7 @@ impl WorkflowExecution {
         Self {
             id,
             workflow_id: workflow.id,
+            tenant_id: TenantId::default(),
             status: ExecutionStatus::Running,
             current_state: initial_state,
             blackboard: Blackboard::new(),
@@ -1485,6 +1494,7 @@ mod tests {
 
         let workflow = Workflow {
             id: WorkflowId::new(),
+            tenant_id: TenantId::default(),
             metadata: WorkflowMetadata {
                 name: "test".to_string(),
                 version: Some("1.0.0".to_string()),

@@ -24,6 +24,7 @@
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
 //! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
 //! | [`SecretEvent`] | BC-11 Secrets & Identity | Secret access, dynamic credential generation, and access denial audit (ADR-034) |
+//! | [`TenantEvent`] | Multi-Tenant | Tenant lifecycle, audit, and quota events (ADR-056) |
 //!
 //! ## Phase 2 Note
 //!
@@ -1014,6 +1015,45 @@ pub enum SecretEvent {
         reason: String,
         access_context: AccessContext,
         denied_at: DateTime<Utc>,
+    },
+}
+
+/// Tenant lifecycle and audit events (ADR-056)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TenantEvent {
+    /// New tenant provisioned (Keycloak realm + OpenBao namespace + DB record)
+    TenantProvisioned {
+        tenant_slug: String,
+        tier: String,
+        keycloak_realm: String,
+        openbao_namespace: String,
+        provisioned_at: DateTime<Utc>,
+    },
+    /// Tenant suspended by operator
+    TenantSuspended {
+        tenant_slug: String,
+        reason: String,
+        suspended_at: DateTime<Utc>,
+    },
+    /// Tenant soft-deleted (30-day retention)
+    TenantSoftDeleted {
+        tenant_slug: String,
+        deleted_at: DateTime<Utc>,
+    },
+    /// Admin accessed another tenant's data via X-Aegis-Tenant header
+    AdminCrossTenantAccess {
+        admin_sub: String,
+        source_tenant: String,
+        target_tenant: String,
+        accessed_at: DateTime<Utc>,
+    },
+    /// Tenant quota exceeded
+    TenantQuotaExceeded {
+        tenant_slug: String,
+        quota_kind: String,
+        current: u64,
+        limit: u64,
+        exceeded_at: DateTime<Utc>,
     },
 }
 

@@ -12,6 +12,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio_stream::StreamExt;
+use tracing::info;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::domain::events::CorrelatedActivityEvent;
@@ -482,7 +483,12 @@ async fn stream_workflow_events(
                     if should_skip_workflow_event(&event, options) {
                         continue;
                     }
-                    print!("{}", format_workflow_log_event(&event, options.verbose));
+                    info!(
+                        execution_id = %event.execution_id,
+                        event_type = %event.event_type,
+                        "{}",
+                        format_workflow_log_event(&event, options.verbose).trim_end()
+                    );
                 }
             }
         }
@@ -623,7 +629,12 @@ fn extract_iteration_error_message(event: &CorrelatedActivityEvent) -> String {
 }
 
 fn print_event(event: &CorrelatedActivityEvent, verbose: bool) {
-    println!("{}", format_event(event, verbose));
+    info!(
+        event_type = %event.event_type,
+        category = %event.category,
+        "{}",
+        format_event(event, verbose)
+    );
 }
 
 fn format_event(event: &CorrelatedActivityEvent, verbose: bool) -> String {

@@ -51,6 +51,7 @@
 pub mod postgres_agent;
 pub mod postgres_execution;
 pub mod postgres_storage_event;
+pub mod postgres_tenant;
 pub mod postgres_volume;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;

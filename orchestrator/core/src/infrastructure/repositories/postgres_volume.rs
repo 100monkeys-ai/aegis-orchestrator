@@ -314,7 +314,7 @@ mod tests {
         let volume = Volume {
             id: VolumeId::new(),
             name: "workspace".to_string(),
-            tenant_id: TenantId::local_default(),
+            tenant_id: TenantId::default(),
             storage_class: StorageClass::ephemeral_hours(1),
             backend: VolumeBackend::HostPath {
                 path: "/aegis/volumes/local/workspace".into(),
@@ -341,7 +341,7 @@ mod tests {
 
         assert_eq!(loaded.id, volume.id);
         assert_eq!(loaded.name, volume.name);
-        assert_eq!(loaded.tenant_id, TenantId::local_default());
+        assert_eq!(loaded.tenant_id, TenantId::default());
         assert_eq!(loaded.backend, volume.backend);
         assert_eq!(loaded.ownership, volume.ownership);
     }

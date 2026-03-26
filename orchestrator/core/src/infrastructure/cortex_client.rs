@@ -105,6 +105,7 @@ impl CortexPatternPort for CortexGrpcClient {
                 )
                 .collect(),
             success_score: request.success_score,
+            tenant_id: String::new(),
         };
 
         CortexGrpcClient::store_trajectory_pattern(self, proto_request)

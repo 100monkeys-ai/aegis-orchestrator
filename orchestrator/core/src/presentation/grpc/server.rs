@@ -72,10 +72,13 @@ pub struct AegisRuntimeService {
 impl AegisRuntimeService {
     fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
         match identity.map(|identity| &identity.identity_kind) {
+            Some(IdentityKind::ConsumerUser { .. }) => TenantId::consumer(),
             Some(IdentityKind::TenantUser { tenant_slug }) => {
-                TenantId::from_string(tenant_slug).unwrap_or_else(|_| TenantId::local_default())
+                TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
             }
-            _ => TenantId::local_default(),
+            Some(IdentityKind::Operator { .. }) => TenantId::system(),
+            Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
+            None => TenantId::default(),
         }
     }
 
@@ -643,6 +646,9 @@ impl AegisRuntime for AegisRuntimeService {
             user_id: None,
             workload_id: None,
             zaru_tier: None,
+            // gRPC attestation is used by agent containers which run under the
+            // system tenant (orchestrator-managed workloads).
+            tenant_id: crate::domain::tenant::TenantId::system(),
         };
 
         match attestation_service.attest(attestation_req).await {
@@ -1293,6 +1299,7 @@ mod tests {
                 parent_execution_id: None,
                 workflow_execution_id: None,
                 security_policy: None,
+                tenant_id: String::new(),
             }))
             .await
             .expect("execute_agent should succeed");
@@ -1335,6 +1342,7 @@ mod tests {
         let persisted_execution = Execution {
             id: execution_id,
             agent_id,
+            tenant_id: crate::domain::tenant::TenantId::default(),
             status: ExecutionStatus::Completed,
             iterations: Vec::new(),
             max_iterations: 10,
@@ -1366,6 +1374,7 @@ mod tests {
                 parent_execution_id: None,
                 workflow_execution_id: None,
                 security_policy: None,
+                tenant_id: String::new(),
             }))
             .await
             .expect("execute_agent should succeed");

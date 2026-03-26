@@ -32,19 +32,23 @@ use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
-use crate::domain::repository::WorkflowExecutionRepository;
+use crate::domain::iam::{IdentityKind, UserIdentity};
+use crate::domain::repository::{TenantRepository, WorkflowExecutionRepository};
 use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::tenancy::{Tenant, TenantStatus, TenantTier};
+use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::presentation::metrics_middleware::metrics_middleware;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
+use crate::presentation::tenant_middleware::tenant_context_middleware;
 use crate::presentation::webhook_guard::{
     EnvWebhookSecretProvider, WebhookHmacState, WebhookSecretProvider,
 };
 use axum::{
     extract::{FromRef, Path, Query, State},
     middleware,
-    response::{IntoResponse, Sse},
-    routing::{get, post},
+    response::{IntoResponse, Response, Sse},
+    routing::{delete, get, post},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -71,6 +75,8 @@ pub struct AppState {
     pub workflow_execution_repo: Option<Arc<dyn WorkflowExecutionRepository>>,
     /// Event bus for workflow SSE streaming (ADR-030). Optional until wired.
     pub event_bus: Option<Arc<EventBus>>,
+    /// Tenant repository for admin tenant management (ADR-056). Optional until wired.
+    pub tenant_repo: Option<Arc<dyn TenantRepository>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -96,6 +102,7 @@ pub fn app(
         attestation_service: None,
         workflow_execution_repo: None,
         event_bus: None,
+        tenant_repo: None,
     });
 
     Router::new()
@@ -122,6 +129,12 @@ pub fn app(
             "/v1/workflows/executions/:id/logs/stream",
             get(stream_workflow_execution_logs),
         )
+        // Admin tenant management (ADR-056)
+        .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/admin/tenants", get(list_tenants))
+        .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
+        .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        .layer(middleware::from_fn(tenant_context_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
 }
@@ -144,6 +157,7 @@ pub fn app_with_inner_loop(
         attestation_service: None,
         workflow_execution_repo: None,
         event_bus: None,
+        tenant_repo: None,
     });
 
     Router::new()
@@ -168,6 +182,12 @@ pub fn app_with_inner_loop(
             "/v1/workflows/executions/:id/logs/stream",
             get(stream_workflow_execution_logs),
         )
+        // Admin tenant management (ADR-056)
+        .route("/v1/admin/tenants", post(create_tenant))
+        .route("/v1/admin/tenants", get(list_tenants))
+        .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
+        .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        .layer(middleware::from_fn(tenant_context_middleware))
         .layer(middleware::from_fn(metrics_middleware))
         .with_state(state)
 }
@@ -508,6 +528,10 @@ pub struct SmcpAttestationRequest {
     pub workload_id: Option<String>,
     /// Optional Zaru tier string used to derive the security context.
     pub zaru_tier: Option<String>,
+    /// Tenant slug identifying the requesting principal's tenant (ADR-056).
+    ///
+    /// When omitted, defaults to the consumer tenant (`zaru-consumer`).
+    pub tenant_id: Option<String>,
 }
 
 /// Handle SMCP attestation handshake (ADR-035 §4.1).
@@ -532,6 +556,12 @@ async fn smcp_attestation(
         }
     };
 
+    let tenant_id = payload
+        .tenant_id
+        .as_deref()
+        .and_then(|s| TenantId::from_realm_slug(s).ok())
+        .unwrap_or_else(TenantId::consumer);
+
     let request = crate::infrastructure::smcp::attestation::AttestationRequest {
         agent_id: payload.agent_id,
         execution_id: payload.execution_id,
@@ -542,6 +572,7 @@ async fn smcp_attestation(
         user_id: payload.user_id,
         workload_id: payload.workload_id,
         zaru_tier: payload.zaru_tier,
+        tenant_id,
     };
 
     match attestation_service.attest(request).await {
@@ -738,6 +769,267 @@ async fn dispatch_gateway(
     }
 }
 
+// ============================================================================
+// Admin Tenant Management Endpoints (ADR-056)
+// ============================================================================
+
+/// Guard that checks the request identity is an admin operator.
+/// Returns the `UserIdentity` on success, or an error response on failure.
+#[allow(clippy::result_large_err)]
+fn require_admin(extensions: &axum::http::Extensions) -> Result<UserIdentity, Response> {
+    let identity = extensions.get::<UserIdentity>().cloned().ok_or_else(|| {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "Authentication required"})),
+        )
+            .into_response()
+    })?;
+
+    match &identity.identity_kind {
+        IdentityKind::Operator { aegis_role } if aegis_role.is_admin() => Ok(identity),
+        _ => Err((
+            axum::http::StatusCode::FORBIDDEN,
+            Json(json!({"error": "Admin role required"})),
+        )
+            .into_response()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+pub struct CreateTenantRequest {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default = "default_tier")]
+    pub tier: String,
+}
+
+fn default_tier() -> String {
+    "enterprise".to_string()
+}
+
+/// `POST /v1/admin/tenants` — create a new tenant
+async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: CreateTenantRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let slug = match TenantId::from_realm_slug(&payload.slug) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let tier = match payload.tier.as_str() {
+        "consumer" => TenantTier::Consumer,
+        "enterprise" => TenantTier::Enterprise,
+        "system" => TenantTier::System,
+        other => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tier: {other}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let keycloak_realm = format!("tenant-{}", payload.slug);
+    let openbao_namespace = format!("tenant/{}", payload.slug);
+
+    let tenant = Tenant::new(
+        slug,
+        payload.display_name,
+        tier,
+        keycloak_realm,
+        openbao_namespace,
+    );
+
+    match repo.insert(&tenant).await {
+        Ok(()) => (
+            axum::http::StatusCode::CREATED,
+            Json(serde_json::to_value(&tenant).unwrap_or(json!({"status": "created"}))),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/admin/tenants` — list all active tenants
+async fn list_tenants(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.find_all_active().await {
+        Ok(tenants) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "tenants": tenants,
+                "count": tenants.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/admin/tenants/:slug/suspend` — suspend a tenant
+async fn suspend_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = match TenantId::from_realm_slug(&slug) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo
+        .update_status(&tenant_id, &TenantStatus::Suspended)
+        .await
+    {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "suspended", "slug": slug})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/admin/tenants/:slug` — soft-delete a tenant
+async fn soft_delete_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = match TenantId::from_realm_slug(&slug) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.update_status(&tenant_id, &TenantStatus::Deleted).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "deleted", "slug": slug})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -854,6 +1146,7 @@ mod tests {
             attestation_service: None,
             workflow_execution_repo: None,
             event_bus: None,
+            tenant_repo: None,
         })
     }
 
