@@ -2213,8 +2213,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 cortex_client,
                 run_container_step_use_case: Some(run_container_step_use_case),
                 agent_service: Some(agent_service_for_grpc),
-                // StimulusService is not wired in the daemon; the ingest_stimulus RPC
-                // is intentionally disabled here. Wire a real service when needed.
+                // StimulusService is intentionally not wired in the CLI daemon.
+                // StandardStimulusService requires a WorkflowRegistry (the routing table
+                // used for stimulus-to-workflow dispatch), which is not set up here.
+                // To enable ingest_stimulus in the daemon, construct a WorkflowRegistry,
+                // then build a StandardStimulusService and pass it as Some(...).
                 stimulus_service: None,
             },
         )

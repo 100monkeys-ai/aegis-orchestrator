@@ -122,12 +122,14 @@ impl OperatorReadModelStore {
     }
 }
 
-/// Build a `StorageViolationView` from a security-related `StorageEvent`.
+/// Build a `StorageViolationView` from a `StorageEvent` that represents a storage *violation*.
 ///
-/// This function supports `StorageEvent` variants that represent storage policy
-/// violations as well as security-relevant audit events (for example, blocked path
-/// traversals or filesystem policy violations). Callers may pass any `StorageEvent`
-/// variant that is explicitly handled by this function's `match` expression.
+/// Only the four true-violation variants of `StorageEvent` are handled:
+/// `PathTraversalBlocked`, `FilesystemPolicyViolation`, `QuotaExceeded`, and
+/// `UnauthorizedVolumeAccess`. Benign audit variants (`FileOpened`, `FileRead`,
+/// `FileWritten`, etc.) must never be passed; doing so will panic at runtime.
+/// Callers should obtain events via [`StorageEventRepository::find_violations`], which
+/// already filters to these violation variants.
 pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationView {
     match event {
         StorageEvent::PathTraversalBlocked {
@@ -189,108 +191,9 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             details: "Unauthorized volume access was blocked".to_string(),
             occurred_at: *attempted_at,
         },
-        StorageEvent::FileOpened {
-            execution_id,
-            volume_id,
-            path,
-            open_mode,
-            opened_at,
-        } => StorageViolationView {
-            category: "file_opened".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some(open_mode.clone()),
-            details: "File open audit event".to_string(),
-            occurred_at: *opened_at,
-        },
-        StorageEvent::FileRead {
-            execution_id,
-            volume_id,
-            path,
-            read_at,
-            ..
-        } => StorageViolationView {
-            category: "file_read".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("read".to_string()),
-            details: "File read audit event".to_string(),
-            occurred_at: *read_at,
-        },
-        StorageEvent::FileWritten {
-            execution_id,
-            volume_id,
-            path,
-            written_at,
-            ..
-        } => StorageViolationView {
-            category: "file_written".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("write".to_string()),
-            details: "File write audit event".to_string(),
-            occurred_at: *written_at,
-        },
-        StorageEvent::FileClosed {
-            execution_id,
-            volume_id,
-            path,
-            closed_at,
-        } => StorageViolationView {
-            category: "file_closed".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("close".to_string()),
-            details: "File close audit event".to_string(),
-            occurred_at: *closed_at,
-        },
-        StorageEvent::DirectoryListed {
-            execution_id,
-            volume_id,
-            path,
-            listed_at,
-            ..
-        } => StorageViolationView {
-            category: "directory_listed".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("list".to_string()),
-            details: "Directory listing audit event".to_string(),
-            occurred_at: *listed_at,
-        },
-        StorageEvent::FileCreated {
-            execution_id,
-            volume_id,
-            path,
-            created_at,
-        } => StorageViolationView {
-            category: "file_created".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("create".to_string()),
-            details: "File creation audit event".to_string(),
-            occurred_at: *created_at,
-        },
-        StorageEvent::FileDeleted {
-            execution_id,
-            volume_id,
-            path,
-            deleted_at,
-        } => StorageViolationView {
-            category: "file_deleted".to_string(),
-            execution_id: execution_id.0.to_string(),
-            volume_id: Some(volume_id.0.to_string()),
-            path: Some(path.clone()),
-            operation: Some("delete".to_string()),
-            details: "File deletion audit event".to_string(),
-            occurred_at: *deleted_at,
-        },
+        other => unreachable!(
+            "storage_violation_event_view called with a non-violation StorageEvent: {other:?}"
+        ),
     }
 }
 
