@@ -2213,6 +2213,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 cortex_client,
                 run_container_step_use_case: Some(run_container_step_use_case),
                 agent_service: Some(agent_service_for_grpc),
+                // StimulusService is not wired in the daemon; the ingest_stimulus RPC
+                // is intentionally disabled here. Wire a real service when needed.
                 stimulus_service: None,
             },
         )

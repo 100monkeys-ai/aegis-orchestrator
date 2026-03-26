@@ -1095,7 +1095,7 @@ pub struct GrpcServerConfig {
     pub cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
     pub run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
     pub agent_service: Option<Arc<dyn AgentLifecycleService>>,
-    pub stimulus_service: Option<Arc<StimulusService>>,
+    pub stimulus_service: Option<Arc<dyn StimulusService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
