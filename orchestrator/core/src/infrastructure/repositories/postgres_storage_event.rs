@@ -506,7 +506,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
                 FROM storage_events
                 WHERE execution_id = $1
-                  AND event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'UnauthorizedVolumeAccess')
+                  AND event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'QuotaExceeded', 'UnauthorizedVolumeAccess')
                 ORDER BY timestamp DESC
                 "#,
             )
@@ -518,7 +518,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 r#"
                 SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
                 FROM storage_events
-                WHERE event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'UnauthorizedVolumeAccess')
+                WHERE event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'QuotaExceeded', 'UnauthorizedVolumeAccess')
                 ORDER BY timestamp DESC
                 LIMIT 100
                 "#,
