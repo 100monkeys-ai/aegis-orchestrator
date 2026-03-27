@@ -23,6 +23,19 @@ use super::gemini::GeminiAdapter;
 use super::ollama::OllamaAdapter;
 use super::openai::OpenAIAdapter;
 
+/// Indicates whether an API key is platform-managed or user-provided (BYOK).
+///
+/// Used by the inner loop to decide whether to enforce LLM rate limits:
+/// BYOK users consume their own provider quota, so platform rate limits
+/// for `LlmCall` and `LlmToken` are skipped (ADR-072).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApiKeySource {
+    /// Key resolved from an environment variable or node config (platform-provided).
+    Platform,
+    /// Key provided directly by the user (Bring Your Own Key).
+    User,
+}
+
 /// Maximum exponent for exponential backoff, preventing `u64` overflow in delay calculations.
 /// For example, with `retry_delay_ms = 1000` (1 second), 2^16 × 1 s ≈ 18 hours; the
 /// actual upper bound on backoff duration still depends on the configured base delay.
@@ -47,6 +60,9 @@ pub struct ProviderRegistry {
     providers: HashMap<String, Arc<dyn LLMProvider>>,
     /// Fallback adapter resolved at construction time; used when primary exhausts retries.
     fallback_provider: Option<(String, Arc<dyn LLMProvider>)>,
+    /// alias → raw `api_key` value from the provider config (before env resolution).
+    /// Used to determine [`ApiKeySource`] for BYOK exemption (ADR-072).
+    raw_api_keys: HashMap<String, Option<String>>,
     max_retries: u32,
     retry_delay_ms: u64,
 }
@@ -147,6 +163,7 @@ impl ProviderRegistry {
 
         // ── Phase 2: build one per-model adapter per winning alias ─────────────────────
         let mut alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
+        let mut raw_api_keys: HashMap<String, Option<String>> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -161,6 +178,7 @@ impl ProviderRegistry {
                         match Self::create_adapter(provider_config, winner_model) {
                             Ok(adapter) => {
                                 alias_map.insert(alias.clone(), (winner_model.clone(), adapter));
+                                raw_api_keys.insert(alias.clone(), provider_config.api_key.clone());
                             }
                             Err(e) => {
                                 warn!(
@@ -192,6 +210,7 @@ impl ProviderRegistry {
             alias_map,
             providers,
             fallback_provider,
+            raw_api_keys,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
         })
@@ -393,6 +412,23 @@ impl ProviderRegistry {
     /// Check if a model alias exists
     pub fn has_alias(&self, alias: &str) -> bool {
         self.alias_map.contains_key(alias)
+    }
+
+    /// Determine whether the API key for a given model alias is platform-managed
+    /// or user-provided (BYOK).
+    ///
+    /// Heuristic:
+    /// - `None` (no key configured, e.g. local Ollama) → `Platform`
+    /// - Starts with `"env:"` → `Platform` (resolved from an environment variable)
+    /// - Any other literal value → `User` (directly configured BYOK)
+    ///
+    /// BYOK users are exempt from `LlmCall` and `LlmToken` rate limits (ADR-072)
+    /// because they consume their own provider quota.
+    pub fn key_source_for_alias(&self, alias: &str) -> ApiKeySource {
+        match self.raw_api_keys.get(alias) {
+            Some(Some(key)) if !key.starts_with("env:") => ApiKeySource::User,
+            _ => ApiKeySource::Platform,
+        }
     }
 }
 

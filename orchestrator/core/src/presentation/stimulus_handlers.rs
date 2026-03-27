@@ -387,6 +387,7 @@ mod tests {
             event_bus: None,
             tenant_repo: None,
             smcp_session_repo: None,
+            rate_limit_override_repo: None,
         })
     }
 

@@ -12,10 +12,12 @@
 
 pub mod burst_enforcer;
 pub mod composite_enforcer;
+pub mod override_repository;
 pub mod policy_resolver;
 pub mod postgres_enforcer;
 
 pub use burst_enforcer::GovernorBurstEnforcer;
 pub use composite_enforcer::CompositeRateLimitEnforcer;
+pub use override_repository::RateLimitOverrideRepository;
 pub use policy_resolver::HierarchicalPolicyResolver;
 pub use postgres_enforcer::PostgresWindowEnforcer;

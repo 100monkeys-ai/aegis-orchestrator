@@ -40,6 +40,9 @@ use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::domain::tenancy::{Tenant, TenantStatus, TenantTier};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
+use crate::infrastructure::rate_limit::override_repository::{
+    CreateOverrideRequest, RateLimitOverrideRepository,
+};
 use crate::presentation::metrics_middleware::metrics_middleware;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
 use crate::presentation::tenant_middleware::tenant_context_middleware;
@@ -81,6 +84,8 @@ pub struct AppState {
     pub tenant_repo: Option<Arc<dyn TenantRepository>>,
     /// SMCP session repository for token-based auth on SSE streams (ADR-035). Optional until wired.
     pub smcp_session_repo: Option<Arc<dyn SmcpSessionRepository>>,
+    /// Rate-limit override repository for admin CRUD (ADR-072). Optional until wired.
+    pub rate_limit_override_repo: Option<Arc<RateLimitOverrideRepository>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -108,6 +113,7 @@ pub fn app(
         event_bus: None,
         tenant_repo: None,
         smcp_session_repo: None,
+        rate_limit_override_repo: None,
     });
 
     Router::new()
@@ -139,6 +145,16 @@ pub fn app(
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
         .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        // Admin rate-limit override management (ADR-072)
+        .route(
+            "/v1/admin/rate-limits/overrides",
+            get(list_rate_limit_overrides).post(upsert_rate_limit_override),
+        )
+        .route(
+            "/v1/admin/rate-limits/overrides/:id",
+            delete(delete_rate_limit_override),
+        )
+        .route("/v1/admin/rate-limits/usage", get(get_rate_limit_usage))
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -167,6 +183,7 @@ pub fn app_with_inner_loop(
         event_bus: None,
         tenant_repo: None,
         smcp_session_repo: None,
+        rate_limit_override_repo: None,
     });
 
     Router::new()
@@ -196,6 +213,16 @@ pub fn app_with_inner_loop(
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
         .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        // Admin rate-limit override management (ADR-072)
+        .route(
+            "/v1/admin/rate-limits/overrides",
+            get(list_rate_limit_overrides).post(upsert_rate_limit_override),
+        )
+        .route(
+            "/v1/admin/rate-limits/overrides/:id",
+            delete(delete_rate_limit_override),
+        )
+        .route("/v1/admin/rate-limits/usage", get(get_rate_limit_usage))
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -1143,6 +1170,208 @@ async fn soft_delete_tenant(
     }
 }
 
+// ============================================================================
+// Admin Rate-Limit Override Endpoints (ADR-072)
+// ============================================================================
+
+/// Query parameters for `GET /v1/admin/rate-limits/overrides`.
+#[derive(Debug, serde::Deserialize)]
+pub struct ListOverridesParams {
+    pub tenant_id: Option<String>,
+    pub user_id: Option<String>,
+}
+
+/// Query parameters for `GET /v1/admin/rate-limits/usage`.
+#[derive(Debug, serde::Deserialize)]
+pub struct UsageParams {
+    pub scope_type: String,
+    pub scope_id: String,
+}
+
+/// `GET /v1/admin/rate-limits/overrides` — list rate-limit overrides
+async fn list_rate_limit_overrides(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListOverridesParams>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo
+        .list(params.tenant_id.as_deref(), params.user_id.as_deref())
+        .await
+    {
+        Ok(overrides) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "overrides": overrides,
+                "count": overrides.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/admin/rate-limits/overrides` — create or update a rate-limit override
+async fn upsert_rate_limit_override(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: CreateOverrideRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate: exactly one of tenant_id or user_id must be set (matches DB constraint)
+    if payload.tenant_id.is_some() == payload.user_id.is_some() {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "Exactly one of tenant_id or user_id must be provided"})),
+        )
+            .into_response();
+    }
+
+    match repo.upsert(&payload).await {
+        Ok(row) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&row).unwrap_or(json!({"status": "upserted"}))),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/admin/rate-limits/overrides/:id` — delete a rate-limit override
+async fn delete_rate_limit_override(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.delete(id).await {
+        Ok(true) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "deleted", "id": id.to_string()})),
+        )
+            .into_response(),
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Override not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/admin/rate-limits/usage` — get current rate-limit counter usage
+async fn get_rate_limit_usage(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<UsageParams>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.get_usage(&params.scope_type, &params.scope_id).await {
+        Ok(rows) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "usage": rows,
+                "count": rows.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,6 +1490,7 @@ mod tests {
             event_bus: None,
             tenant_repo: None,
             smcp_session_repo: None,
+            rate_limit_override_repo: None,
         })
     }
 

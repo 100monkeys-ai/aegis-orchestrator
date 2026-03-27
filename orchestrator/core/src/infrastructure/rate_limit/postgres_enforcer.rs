@@ -185,4 +185,16 @@ impl PostgresWindowEnforcer {
 
         Ok(result)
     }
+
+    /// Delete expired counter rows. A counter is expired when its window_start
+    /// is older than the largest window duration (monthly = 30 days) plus a buffer.
+    pub async fn cleanup_expired_counters(&self) -> Result<u64, sqlx::Error> {
+        let cutoff = Utc::now() - Duration::days(35); // monthly (30d) + 5d buffer
+        let result = sqlx::query("DELETE FROM rate_limit_counters WHERE window_start < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
 }

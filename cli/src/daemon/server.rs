@@ -49,6 +49,7 @@ use uuid::Uuid;
 
 use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::events::WorkflowEvent;
+use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::common::v1::WorkflowExecution as TemporalWorkflowExecution;
 use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::workflowservice::v1::{
     workflow_service_client::WorkflowServiceClient, DeleteWorkflowExecutionRequest,
@@ -88,6 +89,10 @@ use aegis_orchestrator_core::{
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
+        rate_limit::{
+            CompositeRateLimitEnforcer, GovernorBurstEnforcer, HierarchicalPolicyResolver,
+            PostgresWindowEnforcer,
+        },
         repositories::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
@@ -1153,11 +1158,57 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    // Rate Limiting Infrastructure (ADR-072)
+    #[allow(clippy::type_complexity)]
+    let (rate_limit_enforcer, rate_limit_resolver): (
+        Option<Arc<dyn RateLimitEnforcer>>,
+        Option<Arc<dyn RateLimitPolicyResolver>>,
+    ) = if let Some(ref pool) = db_pool {
+        let burst = Arc::new(GovernorBurstEnforcer::new());
+        let postgres = Arc::new(PostgresWindowEnforcer::new(pool.clone()));
+        let enforcer: Arc<dyn RateLimitEnforcer> =
+            Arc::new(CompositeRateLimitEnforcer::new(burst, postgres));
+        let resolver: Arc<dyn RateLimitPolicyResolver> =
+            Arc::new(HierarchicalPolicyResolver::new(pool.clone()));
+        info!("Rate limiting enabled (ADR-072)");
+        (Some(enforcer), Some(resolver))
+    } else {
+        info!("Rate limiting disabled (no database connection)");
+        (None, None)
+    };
+
+    // Rate limit counter cleanup task (ADR-072)
+    if let Some(ref pool) = db_pool {
+        let cleanup_pool = pool.clone();
+        tokio::spawn(async move {
+            let enforcer = PostgresWindowEnforcer::new(cleanup_pool);
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // hourly
+            loop {
+                interval.tick().await;
+                match enforcer.cleanup_expired_counters().await {
+                    Ok(deleted) => {
+                        if deleted > 0 {
+                            tracing::info!(deleted, "rate limit counter cleanup completed");
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "rate limit counter cleanup failed");
+                    }
+                }
+            }
+        });
+        info!("Rate limit counter cleanup background task spawned (interval: 1 hour)");
+    }
+
     // Initialize SMCP / Tool Routing Services (now hoisted for ExecutionService dependency)
     info!("Initializing SMCP & Tool Routing services...");
 
-    let smcp_middleware =
-        Arc::new(aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::new());
+    let smcp_middleware = Arc::new(
+        aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::with_rate_limiting(
+            rate_limit_enforcer.clone(),
+            rate_limit_resolver.clone(),
+        ),
+    );
     let tool_registry =
         Arc::new(aegis_orchestrator_core::infrastructure::tool_router::InMemoryToolRegistry::new());
 
@@ -1876,6 +1927,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_service_builder = execution_service_builder.with_cortex_client(c_client);
     }
 
+    if let (Some(ref enforcer), Some(ref resolver)) = (&rate_limit_enforcer, &rate_limit_resolver) {
+        execution_service_builder =
+            execution_service_builder.with_rate_limiting(enforcer.clone(), resolver.clone());
+    }
+
     let execution_service = Arc::new(execution_service_builder);
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
     execution_service.set_child_execution_service(execution_service.clone());
@@ -1905,12 +1961,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         agent_service.clone(),
     ));
 
-    let start_workflow_execution_use_case = Arc::new(StandardStartWorkflowExecutionUseCase::new(
-        workflow_repo.clone(),
-        workflow_execution_repo.clone(),
-        workflow_engine_container.clone(),
-        event_bus.clone(),
-    ));
+    let start_workflow_execution_use_case = {
+        let mut uc = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo.clone(),
+            workflow_execution_repo.clone(),
+            workflow_engine_container.clone(),
+            event_bus.clone(),
+        );
+        if let (Some(ref enforcer), Some(ref resolver)) =
+            (&rate_limit_enforcer, &rate_limit_resolver)
+        {
+            uc = uc.with_rate_limiting(enforcer.clone(), resolver.clone());
+        }
+        Arc::new(uc)
+    };
 
     // --- Initialize SMCP / Tool Routing Services ---
     info!("Configuring SMCP & Tool Routing repositories and services...");
@@ -2076,13 +2140,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
 
-    let inner_loop_service = Arc::new(
-        aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
-            tool_invocation_service.clone(),
-            execution_service.clone(),
-            llm_registry,
-        ),
-    );
+    let inner_loop_service = {
+        let mut ils =
+            aegis_orchestrator_core::application::inner_loop_service::InnerLoopService::new(
+                tool_invocation_service.clone(),
+                execution_service.clone(),
+                llm_registry,
+            );
+        if let (Some(ref enforcer), Some(ref resolver)) =
+            (&rate_limit_enforcer, &rate_limit_resolver)
+        {
+            ils = ils.with_rate_limiting(enforcer.clone(), resolver.clone());
+        }
+        Arc::new(ils)
+    };
 
     let app_state = AppState {
         agent_service: agent_service.clone(),
@@ -2109,6 +2180,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         swarm_service: swarm_service.clone(),
         operator_read_model: operator_read_model.clone(),
         cortex_client: cortex_client.clone(),
+        rate_limit_override_repo: db_pool.as_ref().map(|pool| {
+            Arc::new(aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository::new(pool.clone()))
+        }),
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };
@@ -3385,6 +3459,19 @@ fn create_router(
         .route("/v1/cortex/patterns", get(list_cortex_patterns_handler))
         .route("/v1/cortex/skills", get(get_cortex_skills_handler))
         .route("/v1/cortex/metrics", get(get_cortex_metrics_handler))
+        // Admin rate-limit override management (ADR-072)
+        .route(
+            "/v1/admin/rate-limits/overrides",
+            get(list_rate_limit_overrides_handler).post(upsert_rate_limit_override_handler),
+        )
+        .route(
+            "/v1/admin/rate-limits/overrides/{id}",
+            axum::routing::delete(delete_rate_limit_override_handler),
+        )
+        .route(
+            "/v1/admin/rate-limits/usage",
+            get(get_rate_limit_usage_handler),
+        )
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
@@ -3428,6 +3515,9 @@ struct AppState {
     swarm_service: Arc<StandardSwarmService>,
     operator_read_model: Arc<OperatorReadModelStore>,
     cortex_client: Option<Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>>,
+    rate_limit_override_repo: Option<
+        Arc<aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository>,
+    >,
     config: NodeConfigManifest,
     start_time: std::time::Instant,
 }
@@ -5378,6 +5468,167 @@ async fn list_smcp_tools_handler(
             Json(serde_json::json!({
                 "error": error.to_string(),
             })),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Admin Rate-Limit Override Handlers (ADR-072)
+// ============================================================================
+
+#[derive(Debug, serde::Deserialize)]
+struct ListOverridesQuery {
+    tenant_id: Option<String>,
+    user_id: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct UsageQuery {
+    scope_type: String,
+    scope_id: String,
+}
+
+async fn list_rate_limit_overrides_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListOverridesQuery>,
+) -> axum::response::Response {
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo
+        .list(params.tenant_id.as_deref(), params.user_id.as_deref())
+        .await
+    {
+        Ok(overrides) => {
+            let count = overrides.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "overrides": overrides,
+                    "count": count,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn upsert_rate_limit_override_handler(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<aegis_orchestrator_core::infrastructure::rate_limit::override_repository::CreateOverrideRequest>,
+) -> axum::response::Response {
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate: exactly one of tenant_id or user_id must be set (matches DB constraint)
+    if payload.tenant_id.is_some() == payload.user_id.is_some() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "Exactly one of tenant_id or user_id must be provided"})),
+        )
+            .into_response();
+    }
+
+    match repo.upsert(&payload).await {
+        Ok(row) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(&row).unwrap_or(serde_json::json!({"status": "upserted"}))),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_rate_limit_override_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<uuid::Uuid>,
+) -> axum::response::Response {
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.delete(id).await {
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({"status": "deleted", "id": id.to_string()})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Override not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_rate_limit_usage_handler(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<UsageQuery>,
+) -> axum::response::Response {
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.get_usage(&params.scope_type, &params.scope_id).await {
+        Ok(rows) => {
+            let count = rows.len();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "usage": rows,
+                    "count": count,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
     }
