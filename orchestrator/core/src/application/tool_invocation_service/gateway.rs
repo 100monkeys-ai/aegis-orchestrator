@@ -6,7 +6,7 @@ impl ToolInvocationService {
     }
 
     pub(super) fn context_allows_tool_name(security_context_name: &str, tool_name: &str) -> bool {
-        if matches!(security_context_name, "zaru-free" | "zaru-pro")
+        if matches!(security_context_name, "zaru-free")
             && Self::is_low_trust_workflow_tool(tool_name)
         {
             return false;

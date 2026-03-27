@@ -121,6 +121,7 @@ pub enum IdentityKind {
 pub enum ZaruTier {
     Free,
     Pro,
+    Business,
     Enterprise,
 }
 
@@ -130,6 +131,7 @@ impl ZaruTier {
         match self {
             ZaruTier::Free => "zaru-free",
             ZaruTier::Pro => "zaru-pro",
+            ZaruTier::Business => "zaru-business",
             ZaruTier::Enterprise => "zaru-enterprise",
         }
     }
@@ -139,6 +141,7 @@ impl ZaruTier {
         match value {
             "free" => Some(ZaruTier::Free),
             "pro" => Some(ZaruTier::Pro),
+            "business" => Some(ZaruTier::Business),
             "enterprise" => Some(ZaruTier::Enterprise),
             _ => None,
         }
@@ -293,6 +296,10 @@ mod tests {
         assert_eq!(ZaruTier::Free.to_security_context_name(), "zaru-free");
         assert_eq!(ZaruTier::Pro.to_security_context_name(), "zaru-pro");
         assert_eq!(
+            ZaruTier::Business.to_security_context_name(),
+            "zaru-business"
+        );
+        assert_eq!(
             ZaruTier::Enterprise.to_security_context_name(),
             "zaru-enterprise"
         );
@@ -302,6 +309,7 @@ mod tests {
     fn zaru_tier_from_claim() {
         assert_eq!(ZaruTier::from_claim("free"), Some(ZaruTier::Free));
         assert_eq!(ZaruTier::from_claim("pro"), Some(ZaruTier::Pro));
+        assert_eq!(ZaruTier::from_claim("business"), Some(ZaruTier::Business));
         assert_eq!(
             ZaruTier::from_claim("enterprise"),
             Some(ZaruTier::Enterprise)

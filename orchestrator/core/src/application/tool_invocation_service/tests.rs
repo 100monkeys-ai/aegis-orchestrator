@@ -1785,8 +1785,8 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     security_context_repo
         .save(crate::domain::security_context::SecurityContext {
-            name: "zaru-pro".to_string(),
-            description: "Pro tier".to_string(),
+            name: "zaru-free".to_string(),
+            description: "Free tier".to_string(),
             capabilities: vec![
                 crate::domain::security_context::Capability {
                     tool_pattern: "aegis.workflow.status".to_string(),
@@ -1832,7 +1832,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
     );
 
     let tools = service
-        .get_available_tools_for_context("zaru-pro")
+        .get_available_tools_for_context("zaru-free")
         .await
         .unwrap();
 
