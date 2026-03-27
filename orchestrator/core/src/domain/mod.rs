@@ -52,6 +52,7 @@ pub mod mcp;
 pub mod node_config;
 pub mod path_sanitizer;
 pub mod policy;
+pub mod rate_limit;
 pub mod repository;
 pub mod runtime;
 pub mod runtime_registry;

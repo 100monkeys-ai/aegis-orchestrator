@@ -100,7 +100,7 @@ impl ToolInvocationService {
 
     pub async fn invoke_tool(
         &self,
-        envelope: &impl EnvelopeVerifier,
+        envelope: &(impl EnvelopeVerifier + Send + Sync),
     ) -> Result<Value, SmcpSessionError> {
         // 1. Look up the active session by the opaque security_token string.
         //    This avoids relying on unverified JWT payload content to route the request;
@@ -121,7 +121,8 @@ impl ToolInvocationService {
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
             .smcp_middleware
-            .verify_and_unwrap(&mut session, envelope)?;
+            .verify_and_unwrap(&mut session, envelope)
+            .await?;
         let tool_name = envelope
             .extract_tool_name()
             .ok_or(SmcpSessionError::MalformedPayload(

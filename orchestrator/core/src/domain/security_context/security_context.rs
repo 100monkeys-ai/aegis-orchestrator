@@ -50,8 +50,11 @@ pub enum PolicyViolation {
         tool_name: String,
     },
     RateLimitExceeded {
-        max_calls: u32,
-        current_calls: u32,
+        resource_type: String,
+        bucket: String,
+        limit: u64,
+        current: u64,
+        retry_after_seconds: u64,
     },
     PathOutsideBoundary {
         path: PathBuf,

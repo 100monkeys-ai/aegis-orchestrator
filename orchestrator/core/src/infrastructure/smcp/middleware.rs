@@ -18,23 +18,45 @@
 //!
 //! This component sits between the agent ingress (HTTP/gRPC) handler and the
 //! `ToolRouter`. It must be invoked for **every** tool call, without exception.
+use std::sync::Arc;
+
 use serde_json::Value;
 use tracing::{info, warn};
 
 use crate::domain::mcp::PolicyViolation;
+use crate::domain::rate_limit::{
+    RateLimitEnforcer, RateLimitPolicyResolver, RateLimitResourceType, RateLimitScope,
+};
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSession, SmcpSessionError};
 
 /// Orchestrator middleware that verifies and unwraps incoming SMCP envelopes.
 ///
-/// Stateless: all session state lives in the `SmcpSession` passed per invocation.
-/// A singleton instance should be created at startup and shared across request
-/// handlers.
-pub struct SmcpMiddleware;
+/// Holds optional rate-limit collaborators. When both `rate_limit_enforcer` and
+/// `rate_limit_resolver` are `Some`, the middleware performs an ADR-072 rate limit
+/// check after the `SecurityContext` policy evaluation succeeds.
+pub struct SmcpMiddleware {
+    rate_limit_enforcer: Option<Arc<dyn RateLimitEnforcer>>,
+    rate_limit_resolver: Option<Arc<dyn RateLimitPolicyResolver>>,
+}
 
 impl SmcpMiddleware {
-    /// Create a new middleware instance.
+    /// Create a new middleware instance without rate limiting.
     pub fn new() -> Self {
-        Self
+        Self {
+            rate_limit_enforcer: None,
+            rate_limit_resolver: None,
+        }
+    }
+
+    /// Create a new middleware instance with optional rate limiting support.
+    pub fn with_rate_limiting(
+        rate_limit_enforcer: Option<Arc<dyn RateLimitEnforcer>>,
+        rate_limit_resolver: Option<Arc<dyn RateLimitPolicyResolver>>,
+    ) -> Self {
+        Self {
+            rate_limit_enforcer,
+            rate_limit_resolver,
+        }
     }
 
     /// Verify the envelope against the given session and extract the inner MCP arguments.
@@ -42,6 +64,10 @@ impl SmcpMiddleware {
     /// This is the **single choke-point** through which all MCP tool calls must pass.
     /// Calls [`crate::domain::smcp_session::SmcpSession::evaluate_call`] which enforces
     /// session status, TTL, Ed25519 signature, and `SecurityContext` policy in order.
+    ///
+    /// When rate limiting is configured, an additional ADR-072 rate limit check is
+    /// performed after the policy evaluation succeeds. If the rate limit is exceeded,
+    /// a `PolicyViolation::RateLimitExceeded` error is returned.
     ///
     /// On success, returns the parsed arguments `Value` to be forwarded to the tool server.
     ///
@@ -56,16 +82,42 @@ impl SmcpMiddleware {
     /// The returned `Value` contains only the tool arguments stripped of the SMCP
     /// wrapper. The `security_token` and `signature` fields are never forwarded to
     /// the tool server, preserving credential isolation (ADR-033).
-    pub fn verify_and_unwrap(
+    pub async fn verify_and_unwrap(
         &self,
         session: &mut SmcpSession,
-        envelope: &impl EnvelopeVerifier,
+        envelope: &(impl EnvelopeVerifier + Send + Sync),
     ) -> Result<Value, SmcpSessionError> {
         info!("Verifying SMCP envelope for session {}", session.id);
 
         match session.evaluate_call(envelope) {
             Ok(()) => {
                 info!("SMCP envelope verified successfully");
+
+                // ADR-072: Rate limit check after policy evaluation succeeds.
+                if let (Some(enforcer), Some(resolver)) =
+                    (&self.rate_limit_enforcer, &self.rate_limit_resolver)
+                {
+                    let tool_name = envelope
+                        .extract_tool_name()
+                        .unwrap_or_else(|| "unknown".to_string());
+
+                    if let Err(violation) =
+                        check_rate_limit(&tool_name, enforcer.as_ref(), session, resolver.as_ref())
+                            .await
+                    {
+                        warn!(
+                            "Rate limit exceeded for tool '{}': {:?}",
+                            tool_name, violation
+                        );
+                        metrics::counter!(
+                            "aegis_smcp_policy_violations_total",
+                            "violation_type" => "rate_limit_exceeded"
+                        )
+                        .increment(1);
+                        return Err(SmcpSessionError::PolicyViolation(violation));
+                    }
+                }
+
                 if let Some(args) = envelope.extract_arguments() {
                     Ok(args)
                 } else {
@@ -108,6 +160,84 @@ impl SmcpMiddleware {
             }
         }
     }
+}
+
+/// Check rate limits for an SMCP tool call (ADR-072).
+///
+/// Resolves the effective policy for the tool's resource type, then checks and
+/// increments the counter. Returns `Ok(())` if the call is within limits.
+async fn check_rate_limit(
+    tool_name: &str,
+    enforcer: &dyn RateLimitEnforcer,
+    session: &SmcpSession,
+    resolver: &dyn RateLimitPolicyResolver,
+) -> Result<(), PolicyViolation> {
+    use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+
+    let resource_type = RateLimitResourceType::SmcpToolCall {
+        tool_pattern: tool_name.to_string(),
+    };
+
+    // Build a minimal UserIdentity from the session metadata for policy resolution.
+    let user_id = session
+        .user_id
+        .clone()
+        .unwrap_or_else(|| session.agent_id.to_string());
+    let tier = session
+        .zaru_tier
+        .as_deref()
+        .and_then(|t| {
+            serde_json::from_value::<ZaruTier>(serde_json::Value::String(t.to_string())).ok()
+        })
+        .unwrap_or(ZaruTier::Free);
+    let identity = UserIdentity {
+        sub: user_id.clone(),
+        realm_slug: "zaru-consumer".to_string(),
+        email: None,
+        identity_kind: IdentityKind::ConsumerUser { zaru_tier: tier },
+    };
+
+    // Use a default tenant for now; in production the session would carry the tenant.
+    let tenant_id = crate::domain::tenant::TenantId::consumer();
+
+    let policy = resolver
+        .resolve_policy(&identity, &tenant_id, &resource_type)
+        .await
+        .map_err(|_e| PolicyViolation::RateLimitExceeded {
+            resource_type: format!("{:?}", resource_type),
+            bucket: "unknown".into(),
+            limit: 0,
+            current: 0,
+            retry_after_seconds: 60,
+        })?;
+
+    let scope = RateLimitScope::User { user_id };
+
+    let decision = enforcer
+        .check_and_increment(&scope, &policy, 1)
+        .await
+        .map_err(|_e| PolicyViolation::RateLimitExceeded {
+            resource_type: format!("{:?}", policy.resource_type),
+            bucket: "unknown".into(),
+            limit: 0,
+            current: 0,
+            retry_after_seconds: 60,
+        })?;
+
+    if !decision.allowed {
+        return Err(PolicyViolation::RateLimitExceeded {
+            resource_type: format!("{:?}", policy.resource_type),
+            bucket: decision
+                .exhausted_bucket
+                .map(|b| format!("{b:?}"))
+                .unwrap_or_default(),
+            limit: decision.remaining.values().next().copied().unwrap_or(0),
+            current: 0,
+            retry_after_seconds: decision.retry_after_seconds.unwrap_or(60),
+        });
+    }
+
+    Ok(())
 }
 
 impl Default for SmcpMiddleware {
@@ -195,8 +325,8 @@ mod tests {
         )
     }
 
-    #[test]
-    fn verify_and_unwrap_returns_only_inner_arguments() {
+    #[tokio::test]
+    async fn verify_and_unwrap_returns_only_inner_arguments() {
         let middleware = SmcpMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
@@ -210,6 +340,7 @@ mod tests {
 
         let args = middleware
             .verify_and_unwrap(&mut session, &envelope)
+            .await
             .unwrap();
 
         assert_eq!(
@@ -223,8 +354,8 @@ mod tests {
         assert!(args.get("signature").is_none());
     }
 
-    #[test]
-    fn verify_and_unwrap_propagates_signature_failures() {
+    #[tokio::test]
+    async fn verify_and_unwrap_propagates_signature_failures() {
         let middleware = SmcpMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
@@ -237,6 +368,7 @@ mod tests {
 
         let error = middleware
             .verify_and_unwrap(&mut session, &envelope)
+            .await
             .unwrap_err();
 
         assert_eq!(
@@ -245,8 +377,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_and_unwrap_rejects_missing_arguments_as_malformed_payload() {
+    #[tokio::test]
+    async fn verify_and_unwrap_rejects_missing_arguments_as_malformed_payload() {
         let middleware = SmcpMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
@@ -257,6 +389,7 @@ mod tests {
 
         let error = middleware
             .verify_and_unwrap(&mut session, &envelope)
+            .await
             .unwrap_err();
 
         assert_eq!(
@@ -265,8 +398,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn verify_and_unwrap_propagates_policy_violations() {
+    #[tokio::test]
+    async fn verify_and_unwrap_propagates_policy_violations() {
         let middleware = SmcpMiddleware::new();
         let mut session = session_with_context(denied_context());
         let envelope = DummyEnvelope {
@@ -277,6 +410,7 @@ mod tests {
 
         let error = middleware
             .verify_and_unwrap(&mut session, &envelope)
+            .await
             .unwrap_err();
 
         assert_eq!(

@@ -334,12 +334,15 @@ impl ToolInvocationService {
                 format!("Tool '{tool_name}' is explicitly denied"),
             ),
             PolicyViolation::RateLimitExceeded {
-                max_calls,
-                current_calls,
+                resource_type,
+                bucket,
+                limit,
+                current,
+                retry_after_seconds,
             } => (
                 ViolationType::RateLimitExceeded,
                 format!(
-                    "Rate limit exceeded: current_calls={current_calls}, max_calls={max_calls}"
+                    "Rate limit exceeded: resource={resource_type}, bucket={bucket}, limit={limit}, current={current}, retry_after={retry_after_seconds}s"
                 ),
             ),
             PolicyViolation::PathOutsideBoundary {

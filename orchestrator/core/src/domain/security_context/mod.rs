@@ -30,3 +30,9 @@ pub use repository::SecurityContextRepository;
 pub use security_context::{
     validate_context_ownership, PolicyViolation, SecurityContext, SecurityContextMetadata,
 };
+
+pub use crate::domain::rate_limit::{
+    RateLimitBucket, RateLimitDecision, RateLimitEnforcer, RateLimitError, RateLimitPolicy,
+    RateLimitPolicyResolver, RateLimitPolicySource, RateLimitResourceType, RateLimitScope,
+    RateLimitWindow,
+};

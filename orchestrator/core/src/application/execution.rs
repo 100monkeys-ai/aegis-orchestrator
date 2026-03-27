@@ -226,6 +226,10 @@ pub struct StandardExecutionService {
     tool_router: Option<Arc<crate::infrastructure::tool_router::ToolRouter>>,
     /// Optional Cortex integration port to upload learned trajectories (ADR-049).
     cortex_client: Option<Arc<dyn CortexPatternPort>>,
+    /// Optional rate limit enforcer for checking execution quotas (ADR-072).
+    rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
+    /// Optional rate limit policy resolver for resolving tier/tenant/user policies (ADR-072).
+    rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
 }
 
 impl StandardExecutionService {
@@ -479,6 +483,8 @@ impl StandardExecutionService {
             child_executor: std::sync::OnceLock::new(),
             tool_router: None,
             cortex_client: None,
+            rate_limit_enforcer: None,
+            rate_limit_resolver: None,
         }
     }
 
@@ -526,6 +532,17 @@ impl StandardExecutionService {
     /// Attach a Cortex port for Trajectory Consolidation (ADR-049).
     pub fn with_cortex_client(mut self, cortex_client: Arc<dyn CortexPatternPort>) -> Self {
         self.cortex_client = Some(cortex_client);
+        self
+    }
+
+    /// Attach rate limiting enforcement for agent execution quotas (ADR-072).
+    pub fn with_rate_limiting(
+        mut self,
+        enforcer: Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>,
+        resolver: Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>,
+    ) -> Self {
+        self.rate_limit_enforcer = Some(enforcer);
+        self.rate_limit_resolver = Some(resolver);
         self
     }
 }
@@ -1386,6 +1403,69 @@ impl ExecutionService for StandardExecutionService {
         input: ExecutionInput,
     ) -> Result<ExecutionId> {
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
+
+        // 0. Rate limit check (ADR-072): enforce AgentExecution quota at tenant scope
+        if let (Some(enforcer), Some(resolver)) =
+            (&self.rate_limit_enforcer, &self.rate_limit_resolver)
+        {
+            use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
+
+            let scope = RateLimitScope::Tenant {
+                tenant_id: tenant_id.clone(),
+            };
+
+            // Build a default identity for tenant-scoped resolution (user identity not
+            // available at this layer — tier defaults apply via the resolver).
+            let default_identity = crate::domain::iam::UserIdentity {
+                sub: "tenant-scope".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                    tenant_slug: tenant_id.as_str().to_string(),
+                },
+            };
+
+            let resource_type = RateLimitResourceType::AgentExecution;
+
+            match resolver
+                .resolve_policy(&default_identity, &tenant_id, &resource_type)
+                .await
+            {
+                Ok(policy) => match enforcer.check_and_increment(&scope, &policy, 1).await {
+                    Ok(decision) if !decision.allowed => {
+                        let retry_hint = decision
+                            .retry_after_seconds
+                            .map(|s| format!(", retry after {s}s"))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            tenant_id = %tenant_id.as_str(),
+                            agent_id = %agent_id,
+                            bucket = ?decision.exhausted_bucket,
+                            "Rate limit exceeded for AgentExecution"
+                        );
+                        anyhow::bail!(
+                            "Rate limit exceeded for agent execution (tenant: {}){retry_hint}",
+                            tenant_id.as_str()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tenant_id = %tenant_id.as_str(),
+                            error = %e,
+                            "Rate limit enforcement error (allowing execution)"
+                        );
+                    }
+                    Ok(_) => {} // allowed
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id.as_str(),
+                        error = %e,
+                        "Rate limit policy resolution failed (allowing execution)"
+                    );
+                }
+            }
+        }
 
         // 1. Fetch Agent
         let agent = self

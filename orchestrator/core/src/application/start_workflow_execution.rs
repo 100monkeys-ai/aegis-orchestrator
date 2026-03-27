@@ -101,6 +101,10 @@ pub struct StandardStartWorkflowExecutionUseCase {
     execution_repository: Arc<dyn WorkflowExecutionRepository>,
     workflow_engine: Arc<tokio::sync::RwLock<Option<Arc<dyn WorkflowEnginePort>>>>,
     event_bus: Arc<EventBus>,
+    /// Optional rate limit enforcer for checking workflow execution quotas (ADR-072).
+    rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
+    /// Optional rate limit policy resolver (ADR-072).
+    rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
 }
 
 impl StandardStartWorkflowExecutionUseCase {
@@ -125,7 +129,20 @@ impl StandardStartWorkflowExecutionUseCase {
             execution_repository,
             workflow_engine,
             event_bus,
+            rate_limit_enforcer: None,
+            rate_limit_resolver: None,
         }
+    }
+
+    /// Attach rate limiting enforcement for workflow execution quotas (ADR-072).
+    pub fn with_rate_limiting(
+        mut self,
+        enforcer: Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>,
+        resolver: Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>,
+    ) -> Self {
+        self.rate_limit_enforcer = Some(enforcer);
+        self.rate_limit_resolver = Some(resolver);
+        self
     }
 
     fn normalize_blackboard(
@@ -159,6 +176,69 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         request: StartWorkflowExecutionRequest,
     ) -> Result<StartedWorkflowExecution> {
         let normalized_blackboard = Self::normalize_blackboard(request.blackboard.clone())?;
+
+        // Step 0: Rate limit check (ADR-072): enforce WorkflowExecution quota at tenant scope
+        if let (Some(enforcer), Some(resolver)) =
+            (&self.rate_limit_enforcer, &self.rate_limit_resolver)
+        {
+            use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
+
+            let scope = RateLimitScope::Tenant {
+                tenant_id: tenant_id.clone(),
+            };
+
+            // Build a default identity for tenant-scoped resolution (user identity not
+            // available at this layer — tier defaults apply via the resolver).
+            let default_identity = crate::domain::iam::UserIdentity {
+                sub: "tenant-scope".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                    tenant_slug: tenant_id.as_str().to_string(),
+                },
+            };
+
+            let resource_type = RateLimitResourceType::WorkflowExecution;
+
+            match resolver
+                .resolve_policy(&default_identity, tenant_id, &resource_type)
+                .await
+            {
+                Ok(policy) => match enforcer.check_and_increment(&scope, &policy, 1).await {
+                    Ok(decision) if !decision.allowed => {
+                        let retry_hint = decision
+                            .retry_after_seconds
+                            .map(|s| format!(", retry after {s}s"))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            tenant_id = %tenant_id.as_str(),
+                            workflow_id = %request.workflow_id,
+                            bucket = ?decision.exhausted_bucket,
+                            "Rate limit exceeded for WorkflowExecution"
+                        );
+                        anyhow::bail!(
+                            "Rate limit exceeded for workflow execution (tenant: {}){retry_hint}",
+                            tenant_id.as_str()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            tenant_id = %tenant_id.as_str(),
+                            error = %e,
+                            "Rate limit enforcement error (allowing workflow execution)"
+                        );
+                    }
+                    Ok(_) => {} // allowed
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        tenant_id = %tenant_id.as_str(),
+                        error = %e,
+                        "Rate limit policy resolution failed (allowing workflow execution)"
+                    );
+                }
+            }
+        }
 
         // Step 1: Load workflow from repository
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {

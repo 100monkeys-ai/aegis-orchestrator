@@ -33,6 +33,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
 use crate::domain::iam::{IdentityKind, UserIdentity};
+use crate::domain::mcp::PolicyViolation;
 use crate::domain::repository::{TenantRepository, WorkflowExecutionRepository};
 use crate::domain::smcp_session::SmcpSessionError;
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
@@ -691,6 +692,12 @@ pub struct SmcpToolInvokeRequest {
     pub signature: String,
     /// Inner MCP payload (tool name + arguments).
     pub payload: serde_json::Value,
+    /// SMCP protocol version (e.g. "smcp/1.0"); included in canonical signed message.
+    #[serde(default)]
+    pub protocol: Option<String>,
+    /// ISO-8601 timestamp; included in canonical signed message.
+    #[serde(default)]
+    pub timestamp: Option<String>,
 }
 
 /// Handle SMCP tool invocation (ADR-033 §3).
@@ -719,11 +726,11 @@ async fn smcp_tool_invoke(
 
     let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
     let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
-        protocol: None,
+        protocol: req.protocol,
         security_token: req.security_token,
         signature: req.signature,
         inner_mcp,
-        timestamp: None,
+        timestamp: req.timestamp,
     };
 
     match tool_svc.invoke_tool(&envelope).await {
@@ -732,37 +739,54 @@ async fn smcp_tool_invoke(
             // Map domain errors to HTTP status + MCP JSON-RPC error codes (ADR-055).
             // Callers receive a standard `{"jsonrpc":"2.0","error":{"code":N,"message":"..."}}` body
             // so MCP clients can handle them uniformly regardless of transport.
-            let (http_status, rpc_code) = match &e {
+            let (http_status, rpc_code, retry_after) = match &e {
                 SmcpSessionError::SessionExpired
                 | SmcpSessionError::SignatureVerificationFailed(_) => {
-                    (axum::http::StatusCode::UNAUTHORIZED, -32000_i32)
+                    (axum::http::StatusCode::UNAUTHORIZED, -32000_i32, None)
                 }
+                SmcpSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+                    retry_after_seconds,
+                    ..
+                }) => (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    -32005_i32,
+                    Some(*retry_after_seconds),
+                ),
                 SmcpSessionError::PolicyViolation(_) | SmcpSessionError::SessionInactive(_) => {
-                    (axum::http::StatusCode::FORBIDDEN, -32000_i32)
+                    (axum::http::StatusCode::FORBIDDEN, -32000_i32, None)
                 }
                 SmcpSessionError::MalformedPayload(_)
                 | SmcpSessionError::ReplayProtectionFailed(_) => {
-                    (axum::http::StatusCode::BAD_REQUEST, -32600_i32)
+                    (axum::http::StatusCode::BAD_REQUEST, -32600_i32, None)
                 }
-                SmcpSessionError::InvalidArguments(_) => {
-                    (axum::http::StatusCode::UNPROCESSABLE_ENTITY, -32602_i32)
-                }
-                SmcpSessionError::JudgeTimeout(_) | SmcpSessionError::InternalError(_) => {
-                    (axum::http::StatusCode::INTERNAL_SERVER_ERROR, -32603_i32)
-                }
+                SmcpSessionError::InvalidArguments(_) => (
+                    axum::http::StatusCode::UNPROCESSABLE_ENTITY,
+                    -32602_i32,
+                    None,
+                ),
+                SmcpSessionError::JudgeTimeout(_) | SmcpSessionError::InternalError(_) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    -32603_i32,
+                    None,
+                ),
             };
-            (
-                http_status,
-                Json(json!({
-                    "jsonrpc": "2.0",
-                    "error": {
-                        "code": rpc_code,
-                        "message": e.to_string(),
-                        "data": null
-                    }
-                })),
-            )
-                .into_response()
+            let body = Json(json!({
+                "jsonrpc": "2.0",
+                "error": {
+                    "code": rpc_code,
+                    "message": e.to_string(),
+                    "data": null
+                }
+            }));
+            let mut response = (http_status, body).into_response();
+            if let Some(secs) = retry_after {
+                if let Ok(val) = axum::http::HeaderValue::from_str(&secs.to_string()) {
+                    response
+                        .headers_mut()
+                        .insert(axum::http::header::RETRY_AFTER, val);
+                }
+            }
+            response
         }
     }
 }
@@ -1252,6 +1276,8 @@ mod tests {
                     "method": "fs.read",
                     "params": { "path": "/tmp/test.txt" }
                 }),
+                protocol: None,
+                timestamp: None,
             }),
         )
         .await

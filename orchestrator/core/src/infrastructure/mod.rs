@@ -54,6 +54,7 @@ pub mod llm;
 pub mod log_sanitizer;
 pub mod nfs;
 pub mod prompt_template_engine;
+pub mod rate_limit;
 pub mod repositories;
 pub mod runtime;
 pub mod secrets_manager;

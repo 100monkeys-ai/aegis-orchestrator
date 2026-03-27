@@ -85,6 +85,10 @@ pub struct InnerLoopService {
     execution_service: Arc<dyn ExecutionService>,
     provider_registry: Arc<ProviderRegistry>,
     active_executions: RwLock<HashMap<String, ExecutionContext>>,
+    /// Optional rate limit enforcer for LLM call/token quotas (ADR-072).
+    rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
+    /// Optional rate limit policy resolver (ADR-072).
+    rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
 }
 
 impl InnerLoopService {
@@ -98,7 +102,20 @@ impl InnerLoopService {
             execution_service,
             provider_registry,
             active_executions: RwLock::new(HashMap::new()),
+            rate_limit_enforcer: None,
+            rate_limit_resolver: None,
         }
+    }
+
+    /// Attach rate limiting enforcement for LLM call and token quotas (ADR-072).
+    pub fn with_rate_limiting(
+        mut self,
+        enforcer: Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>,
+        resolver: Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>,
+    ) -> Self {
+        self.rate_limit_enforcer = Some(enforcer);
+        self.rate_limit_resolver = Some(resolver);
+        self
     }
 
     pub async fn handle_agent_message(
@@ -544,12 +561,128 @@ impl InnerLoopService {
 
         let options = GenerationOptions::default();
 
+        // Rate limit check: LlmCall (ADR-072)
+        // Use a tenant-scoped key derived from the model alias as a best-effort scope.
+        // Full user-identity-based scoping requires propagating UserIdentity through the
+        // inner loop, which is tracked as future work.
+        if let (Some(enforcer), Some(resolver)) =
+            (&self.rate_limit_enforcer, &self.rate_limit_resolver)
+        {
+            use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
+
+            // TODO: Propagate actual UserIdentity through the inner loop so we can
+            // resolve per-user policies. For now, use a synthetic tenant-scoped identity.
+            let default_identity = crate::domain::iam::UserIdentity {
+                sub: "inner-loop".to_string(),
+                realm_slug: "aegis-system".to_string(),
+                email: None,
+                identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                    tenant_slug: "aegis-system".to_string(),
+                },
+            };
+            let tenant_id = crate::domain::tenant::TenantId::local_default();
+            let scope = RateLimitScope::Tenant {
+                tenant_id: tenant_id.clone(),
+            };
+            let resource_type = RateLimitResourceType::LlmCall;
+
+            match resolver
+                .resolve_policy(&default_identity, &tenant_id, &resource_type)
+                .await
+            {
+                Ok(policy) => match enforcer.check_and_increment(&scope, &policy, 1).await {
+                    Ok(decision) if !decision.allowed => {
+                        let retry_hint = decision
+                            .retry_after_seconds
+                            .map(|s| format!(", retry after {s}s"))
+                            .unwrap_or_default();
+                        tracing::warn!(
+                            model_alias = %model_alias,
+                            bucket = ?decision.exhausted_bucket,
+                            "Rate limit exceeded for LlmCall"
+                        );
+                        anyhow::bail!("Rate limit exceeded for LLM calls{retry_hint}");
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Rate limit enforcement error for LlmCall (allowing call)"
+                        );
+                    }
+                    Ok(_) => {} // allowed
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Rate limit policy resolution failed for LlmCall (allowing call)"
+                    );
+                }
+            }
+
+            // TODO: BYOK exemption — when provider key source tracking is available,
+            // check if the model_alias resolves to a provider with user-supplied keys
+            // and skip rate limiting for BYOK users.
+        }
+
         match self
             .provider_registry
             .generate_chat(model_alias, &chat_messages, &schemas, &options)
             .await
         {
-            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => Ok(LlmOutput::FinalText(r.text)),
+            Ok(crate::domain::llm::ChatResponse::FinalText(r)) => {
+                // Post-call rate limit: LlmToken (ADR-072)
+                if let (Some(enforcer), Some(resolver)) =
+                    (&self.rate_limit_enforcer, &self.rate_limit_resolver)
+                {
+                    use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
+
+                    let tenant_id = crate::domain::tenant::TenantId::local_default();
+                    let scope = RateLimitScope::Tenant {
+                        tenant_id: tenant_id.clone(),
+                    };
+                    let default_identity = crate::domain::iam::UserIdentity {
+                        sub: "inner-loop".to_string(),
+                        realm_slug: "aegis-system".to_string(),
+                        email: None,
+                        identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                            tenant_slug: "aegis-system".to_string(),
+                        },
+                    };
+                    let resource_type = RateLimitResourceType::LlmToken;
+                    let token_cost = u64::from(r.usage.total_tokens);
+
+                    if token_cost > 0 {
+                        match resolver
+                            .resolve_policy(&default_identity, &tenant_id, &resource_type)
+                            .await
+                        {
+                            Ok(policy) => {
+                                if let Err(e) = enforcer
+                                    .check_and_increment(&scope, &policy, token_cost)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %e,
+                                        tokens = token_cost,
+                                        "Rate limit enforcement error for LlmToken"
+                                    );
+                                }
+                                // Note: we do not reject the already-completed response for
+                                // token overage — the tokens have already been consumed.
+                                // The next LlmCall check will catch the overage.
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "Rate limit policy resolution failed for LlmToken"
+                                );
+                            }
+                        }
+                    }
+                }
+
+                Ok(LlmOutput::FinalText(r.text))
+            }
             Ok(crate::domain::llm::ChatResponse::ToolCalls(calls)) => {
                 let tool_calls = calls
                     .into_iter()

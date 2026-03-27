@@ -544,8 +544,11 @@ impl ToolPolicy {
         // 3. Rate limit check
         if current_call_count >= self.max_calls_per_execution {
             return Err(PolicyViolation::RateLimitExceeded {
-                max_calls: self.max_calls_per_execution,
-                current_calls: current_call_count,
+                resource_type: "SmcpToolCall".to_string(),
+                bucket: "per_execution".to_string(),
+                limit: self.max_calls_per_execution as u64,
+                current: current_call_count as u64,
+                retry_after_seconds: 0,
             });
         }
 
