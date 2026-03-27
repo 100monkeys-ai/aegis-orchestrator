@@ -38,7 +38,7 @@ use crate::domain::tenant::TenantId;
 /// Describes why a tool invocation was rejected by security policy evaluation.
 ///
 /// Part of the Security Context bounded context (BC-4). Returned by
-/// [`SecurityContext::evaluate`] and [`Capability::permits`] when a tool call
+/// [`SecurityContext::evaluate`] and [`Capability::allows`] when a tool call
 /// violates the configured security constraints.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PolicyViolation {
