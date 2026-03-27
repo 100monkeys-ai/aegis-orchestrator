@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use crate::domain::cluster::{ClusterEvent, NodeClusterRepository, NodePeerStatus};
+use crate::domain::cluster::{
+    ClusterEvent, ClusterSummaryStatus, NodeClusterRepository, NodePeerStatus,
+};
 use crate::infrastructure::event_bus::EventBus;
 
 pub struct HealthSweeper {
@@ -104,6 +106,38 @@ impl HealthSweeper {
                 "Health sweeper transitioned stale nodes to unhealthy"
             );
         }
+
+        // Peer count gauges by status
+        let counts = self.cluster_repo.count_by_status().await?;
+        let active = counts.get(&NodePeerStatus::Active).copied().unwrap_or(0);
+        let draining = counts.get(&NodePeerStatus::Draining).copied().unwrap_or(0);
+        let unhealthy = counts.get(&NodePeerStatus::Unhealthy).copied().unwrap_or(0);
+
+        metrics::gauge!("aegis_cluster_peers", "status" => "active").set(active as f64);
+        metrics::gauge!("aegis_cluster_peers", "status" => "draining").set(draining as f64);
+        metrics::gauge!("aegis_cluster_peers", "status" => "unhealthy").set(unhealthy as f64);
+
+        // Heartbeat freshness histogram
+        let now_fresh = Utc::now();
+        for peer in &active_peers {
+            let age = now_fresh.signed_duration_since(peer.last_heartbeat_at);
+            metrics::histogram!("aegis_cluster_heartbeat_age_seconds")
+                .record(age.num_milliseconds().max(0) as f64 / 1000.0);
+        }
+
+        // Cluster summary status gauge
+        let summary = ClusterSummaryStatus::from_counts(active, draining, unhealthy);
+        for variant in &["healthy", "degraded", "critical"] {
+            let val = match (variant, &summary) {
+                (&"healthy", ClusterSummaryStatus::Healthy) => 1.0,
+                (&"degraded", ClusterSummaryStatus::Degraded) => 1.0,
+                (&"critical", ClusterSummaryStatus::Critical) => 1.0,
+                _ => 0.0,
+            };
+            metrics::gauge!("aegis_cluster_health_status", "status" => variant.to_string())
+                .set(val);
+        }
+
         Ok(())
     }
 }
