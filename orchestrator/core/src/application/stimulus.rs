@@ -373,6 +373,8 @@ impl StandardStimulusService {
 #[async_trait]
 impl StimulusService for StandardStimulusService {
     async fn ingest(&self, stimulus: Stimulus) -> Result<StimulusIngestResponse, StimulusError> {
+        let start = std::time::Instant::now();
+
         // ── 1. Idempotency check ──────────────────────────────────────────────
         if let Some(original_id) = self.check_idempotency(&stimulus).await {
             debug!(
@@ -380,6 +382,8 @@ impl StimulusService for StandardStimulusService {
                 idempotency_key = ?stimulus.idempotency_key,
                 "Duplicate stimulus rejected by idempotency cache"
             );
+            metrics::counter!("aegis_stimuli_rejected_total", "reason" => "idempotent_duplicate")
+                .increment(1);
             return Err(StimulusError::IdempotentDuplicate { original_id });
         }
 
@@ -398,6 +402,8 @@ impl StimulusService for StandardStimulusService {
                 confidence,
                 threshold,
             }) => {
+                metrics::counter!("aegis_stimuli_rejected_total", "reason" => "low_confidence")
+                    .increment(1);
                 self.event_bus
                     .publish_stimulus_event(StimulusEvent::StimulusRejected {
                         stimulus_id: stimulus.id,
@@ -412,6 +418,17 @@ impl StimulusService for StandardStimulusService {
                 });
             }
             Err(e) => {
+                let reason = match &e {
+                    StimulusError::NoRouterConfigured { .. } => "no_router_configured",
+                    StimulusError::RouterAgentFailed(_) => "router_agent_failed",
+                    StimulusError::ClassificationParseError(_) => "classification_parse_error",
+                    StimulusError::UnknownWorkflow { .. } => "unknown_workflow",
+                    StimulusError::WorkflowError(_) => "workflow_error",
+                    // Already handled above, but be exhaustive
+                    StimulusError::LowConfidence { .. } => "low_confidence",
+                    StimulusError::IdempotentDuplicate { .. } => "idempotent_duplicate",
+                };
+                metrics::counter!("aegis_stimuli_rejected_total", "reason" => reason).increment(1);
                 self.event_bus
                     .publish_stimulus_event(StimulusEvent::ClassificationFailed {
                         stimulus_id: stimulus.id,
@@ -439,7 +456,22 @@ impl StimulusService for StandardStimulusService {
             .start_workflow_use_case
             .start_execution(workflow_request)
             .await
-            .map_err(StimulusError::WorkflowError)?;
+            .map_err(|e| {
+                metrics::counter!("aegis_stimuli_rejected_total", "reason" => "workflow_error")
+                    .increment(1);
+                StimulusError::WorkflowError(e)
+            })?;
+
+        // ── Prometheus metrics (ADR-058, BC-8) ───────────────────────────────
+        let source_str = stimulus.source.name();
+        let mode_str = match decision.mode {
+            RoutingMode::Deterministic => "deterministic",
+            RoutingMode::LlmClassified => "llm_classified",
+        };
+        metrics::counter!("aegis_stimuli_ingested_total", "source" => source_str, "routing_mode" => mode_str)
+            .increment(1);
+        metrics::histogram!("aegis_stimulus_routing_duration_seconds", "routing_mode" => mode_str)
+            .record(start.elapsed().as_secs_f64());
 
         // ── 5. Register idempotency key ───────────────────────────────────────
         self.record_idempotency(&stimulus);

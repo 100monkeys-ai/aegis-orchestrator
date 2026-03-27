@@ -65,6 +65,8 @@ impl StandardSwarmService {
         state
             .locks
             .retain(|_, lock| !member_ids.contains(&lock.held_by));
+        metrics::gauge!("aegis_swarms_active").decrement(1);
+        metrics::counter!("aegis_swarm_cascade_cancellations_total").increment(1);
         Ok(())
     }
 
@@ -102,11 +104,15 @@ impl StandardSwarmService {
             .iter()
             .filter_map(|(resource, lock)| (lock.expires_at <= now).then_some(resource.clone()))
             .collect();
+        let expired_count = expired_resources.len() as u64;
         for resource in expired_resources {
             state.locks.remove(&resource);
             state
                 .tokens
                 .retain(|_, held_resource| held_resource != &resource);
+        }
+        if expired_count > 0 {
+            metrics::counter!("aegis_swarm_lock_expirations_total").increment(expired_count);
         }
     }
 
@@ -137,19 +143,33 @@ impl SwarmService for StandardSwarmService {
         let swarm_id = swarm.id;
         state.agent_to_swarm.insert(parent_id, swarm_id);
         state.swarms.insert(swarm_id, swarm);
+        metrics::gauge!("aegis_swarms_active").increment(1);
         Ok(swarm_id)
     }
 
     async fn spawn_child(&self, parent_id: AgentId, _spec: SwarmChildSpec) -> Result<AgentId> {
         let mut state = self.state.write().await;
-        let swarm_id = Self::swarm_for_agent(&state, parent_id)?;
+        let swarm_id = match Self::swarm_for_agent(&state, parent_id) {
+            Ok(id) => id,
+            Err(e) => {
+                metrics::counter!("aegis_swarm_child_spawns_total", "result" => "rejected")
+                    .increment(1);
+                return Err(e);
+            }
+        };
         let child_id = {
-            let swarm = state
-                .swarms
-                .get_mut(&swarm_id)
-                .ok_or_else(|| anyhow!("swarm {swarm_id:?} not found"))?;
+            let swarm = match state.swarms.get_mut(&swarm_id) {
+                Some(s) => s,
+                None => {
+                    metrics::counter!("aegis_swarm_child_spawns_total", "result" => "rejected")
+                        .increment(1);
+                    bail!("swarm {swarm_id:?} not found");
+                }
+            };
 
             if swarm.status != SwarmStatus::Active {
+                metrics::counter!("aegis_swarm_child_spawns_total", "result" => "rejected")
+                    .increment(1);
                 bail!("swarm {swarm_id:?} is not active");
             }
 
@@ -158,6 +178,7 @@ impl SwarmService for StandardSwarmService {
             child_id
         };
         state.agent_to_swarm.insert(child_id, swarm_id);
+        metrics::counter!("aegis_swarm_child_spawns_total", "result" => "success").increment(1);
         Ok(child_id)
     }
 
@@ -184,6 +205,7 @@ impl SwarmService for StandardSwarmService {
         Self::cleanup_expired_locks(&mut state);
 
         if state.locks.contains_key(resource) {
+            metrics::counter!("aegis_swarm_lock_contentions_total").increment(1);
             bail!("resource lock already held: {resource}");
         }
 

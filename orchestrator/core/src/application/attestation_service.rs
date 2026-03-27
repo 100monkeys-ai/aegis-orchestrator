@@ -125,6 +125,16 @@ impl AttestationServiceImpl {
 #[async_trait]
 impl AttestationService for AttestationServiceImpl {
     async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse> {
+        let result = self.attest_inner(request).await;
+        if result.is_err() {
+            metrics::counter!("aegis_smcp_attestations_total", "result" => "failure").increment(1);
+        }
+        result
+    }
+}
+
+impl AttestationServiceImpl {
+    async fn attest_inner(&self, request: AttestationRequest) -> Result<AttestationResponse> {
         let (agent_id, execution_id) = self.resolve_ids(&request)?;
 
         // 1. Resolve agent identity and applicable security context.
@@ -195,7 +205,11 @@ impl AttestationService for AttestationServiceImpl {
             "Issued SMCP session during attestation"
         );
 
-        // 5. Return Response
+        // 5. Emit metrics (ADR-058 BC-4)
+        metrics::counter!("aegis_smcp_attestations_total", "result" => "success").increment(1);
+        metrics::gauge!("aegis_smcp_sessions_active").increment(1.0);
+
+        // 6. Return Response
         Ok(AttestationResponse {
             security_token: token,
         })

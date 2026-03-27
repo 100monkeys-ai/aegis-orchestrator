@@ -200,6 +200,16 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         };
         self.event_bus.publish_workflow_event(event);
 
+        // Step 6b: Record Prometheus metrics (ADR-058, BC-3)
+        let metrics_status = match request.status {
+            CompletionStatus::Success => "completed",
+            CompletionStatus::Failed => "failed",
+            CompletionStatus::Cancelled => "cancelled",
+        };
+        metrics::counter!("aegis_workflow_executions_total", "status" => metrics_status)
+            .increment(1);
+        metrics::gauge!("aegis_workflow_executions_active").decrement(1.0);
+
         // Step 7: If execution had failures/refinements, trigger Cortex learning
         // This would be handled by event subscribers in a separate service
         // (Pattern learning is event-driven, not synchronous)

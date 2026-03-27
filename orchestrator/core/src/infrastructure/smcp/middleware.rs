@@ -21,6 +21,7 @@
 use serde_json::Value;
 use tracing::{info, warn};
 
+use crate::domain::mcp::PolicyViolation;
 use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSession, SmcpSessionError};
 
 /// Orchestrator middleware that verifies and unwraps incoming SMCP envelopes.
@@ -73,9 +74,37 @@ impl SmcpMiddleware {
                     ))
                 }
             }
-            Err(e) => {
+            Err(ref e) => {
                 warn!("SMCP envelope verification failed: {}", e);
-                Err(e)
+
+                // Emit ADR-058 BC-4 metrics for specific failure categories.
+                match e {
+                    SmcpSessionError::SignatureVerificationFailed(_) => {
+                        metrics::counter!("aegis_smcp_signature_failures_total").increment(1);
+                    }
+                    SmcpSessionError::PolicyViolation(violation) => {
+                        let violation_type = match violation {
+                            PolicyViolation::ToolNotAllowed { .. } => "tool_not_allowed",
+                            PolicyViolation::ToolExplicitlyDenied { .. } => {
+                                "tool_explicitly_denied"
+                            }
+                            PolicyViolation::RateLimitExceeded { .. } => "rate_limit_exceeded",
+                            PolicyViolation::PathOutsideBoundary { .. } => "path_outside_boundary",
+                            PolicyViolation::PathTraversalAttempt { .. } => {
+                                "path_traversal_attempt"
+                            }
+                            PolicyViolation::DomainNotAllowed { .. } => "domain_not_allowed",
+                            PolicyViolation::MissingRequiredArgument(_) => {
+                                "missing_required_argument"
+                            }
+                            PolicyViolation::TimeoutExceeded { .. } => "timeout_exceeded",
+                        };
+                        metrics::counter!("aegis_smcp_policy_violations_total", "violation_type" => violation_type).increment(1);
+                    }
+                    _ => {}
+                }
+
+                Err(e.clone())
             }
         }
     }

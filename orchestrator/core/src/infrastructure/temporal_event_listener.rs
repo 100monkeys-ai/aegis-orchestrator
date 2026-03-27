@@ -205,6 +205,16 @@ impl TemporalEventMapper {
                     .clone()
                     .ok_or_else(|| anyhow!("state_name required for WorkflowStateEntered event"))?;
 
+                // Record state transition metric (ADR-058, BC-3).
+                // The entered event does not carry the previous state, so we record
+                // "unknown" as `from_kind` and the entered state as `to_kind`.
+                metrics::counter!(
+                    "aegis_workflow_state_transitions_total",
+                    "from_kind" => "unknown",
+                    "to_kind" => state_name.clone(),
+                )
+                .increment(1);
+
                 Ok(WorkflowEvent::WorkflowStateEntered {
                     execution_id,
                     state_name,

@@ -309,6 +309,33 @@ impl AegisFsalAdapter {
             },
         }
     }
+
+    /// Record security-related metrics for FSAL errors.
+    ///
+    /// Inspects the error variant and increments the appropriate security counter:
+    /// - `PathSanitization` (from `PathSanitizerError::PathTraversal`) -> `aegis_nfs_path_traversal_blocked_total`
+    /// - `PolicyViolation` -> `aegis_nfs_policy_violations_total`
+    /// - `UnauthorizedAccess` -> `aegis_nfs_unauthorized_access_attempts_total`
+    #[allow(dead_code)] // TODO(BC-7): wire into NFS error paths
+    fn record_fsal_security_metrics(e: &crate::domain::fsal::FsalError) {
+        use crate::domain::fsal::FsalError;
+        match e {
+            FsalError::PathSanitization(ref inner) => {
+                use crate::domain::path_sanitizer::PathSanitizerError;
+                if matches!(inner, PathSanitizerError::PathTraversal(_)) {
+                    metrics::counter!("aegis_nfs_path_traversal_blocked_total").increment(1);
+                }
+                metrics::counter!("aegis_nfs_policy_violations_total").increment(1);
+            }
+            FsalError::PolicyViolation(_) => {
+                metrics::counter!("aegis_nfs_policy_violations_total").increment(1);
+            }
+            FsalError::UnauthorizedAccess { .. } => {
+                metrics::counter!("aegis_nfs_unauthorized_access_attempts_total").increment(1);
+            }
+            _ => {}
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -327,245 +354,276 @@ impl NFSFileSystem for AegisFsalAdapter {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsserve::nfs::nfsstat3> {
-        let name =
-            std::str::from_utf8(filename).map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_INVAL)?;
+        let start = std::time::Instant::now();
+        let result: Result<fileid3, nfsserve::nfs::nfsstat3> = async {
+            let name = std::str::from_utf8(filename)
+                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_INVAL)?;
 
-        debug!("NFS LOOKUP: dirid={}, filename={}", dirid, name);
+            debug!("NFS LOOKUP: dirid={}, filename={}", dirid, name);
 
-        // Handle virtual root (dirid = 1)
-        let (parent_handle, parent_path) = if dirid == 1 {
-            (
-                AegisFileHandle::new(
-                    crate::domain::execution::ExecutionId(uuid::Uuid::nil()),
-                    VolumeId(uuid::Uuid::nil()),
-                    "/",
-                ),
-                "/".to_string(),
-            )
-        } else {
-            self.decode_handle(dirid).map_err(|e| {
-                warn!("Invalid parent handle: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
-            })?
-        };
+            // Handle virtual root (dirid = 1)
+            let (parent_handle, parent_path) = if dirid == 1 {
+                (
+                    AegisFileHandle::new(
+                        crate::domain::execution::ExecutionId(uuid::Uuid::nil()),
+                        VolumeId(uuid::Uuid::nil()),
+                        "/",
+                    ),
+                    "/".to_string(),
+                )
+            } else {
+                self.decode_handle(dirid).map_err(|e| {
+                    warn!("Invalid parent handle: {}", e);
+                    nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE
+                })?
+            };
 
-        // If parent is a structural directory (identified by nil volume ID)
-        if parent_handle.volume_id.0.is_nil() {
-            let path_parts: Vec<&str> = parent_path.split('/').filter(|s| !s.is_empty()).collect();
+            // If parent is a structural directory (identified by nil volume ID)
+            if parent_handle.volume_id.0.is_nil() {
+                let path_parts: Vec<&str> =
+                    parent_path.split('/').filter(|s| !s.is_empty()).collect();
 
-            // Expected path: /aegis/volumes/{tenant_id}/{volume_id}
-            // Navigate down to depth 3: /aegis/volumes/{tenant_id}
-            if path_parts.len() < 3 {
-                let synthetic_path = if parent_path == "/" {
-                    format!("/{name}")
-                } else {
-                    format!("{parent_path}/{name}")
-                };
+                // Expected path: /aegis/volumes/{tenant_id}/{volume_id}
+                // Navigate down to depth 3: /aegis/volumes/{tenant_id}
+                if path_parts.len() < 3 {
+                    let synthetic_path = if parent_path == "/" {
+                        format!("/{name}")
+                    } else {
+                        format!("{parent_path}/{name}")
+                    };
 
-                let dummy_exec = crate::domain::execution::ExecutionId(uuid::Uuid::nil());
-                let dummy_vol = VolumeId(uuid::Uuid::nil());
-                let handle = AegisFileHandle::new(dummy_exec, dummy_vol, &synthetic_path);
+                    let dummy_exec = crate::domain::execution::ExecutionId(uuid::Uuid::nil());
+                    let dummy_vol = VolumeId(uuid::Uuid::nil());
+                    let handle = AegisFileHandle::new(dummy_exec, dummy_vol, &synthetic_path);
 
-                let fileid = self
-                    .encode_handle(&handle, synthetic_path)
-                    .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
-                return Ok(fileid);
+                    let fileid = self
+                        .encode_handle(&handle, synthetic_path)
+                        .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+                    return Ok(fileid);
+                }
+
+                // At depth 3, the child name is {volume_id}
+                if path_parts.len() == 3 {
+                    let volume_id_str = name;
+                    let volume_id =
+                        uuid::Uuid::parse_str(volume_id_str)
+                            .map(VolumeId)
+                            .map_err(|_| {
+                                warn!("Invalid volume ID format in lookup: {}", volume_id_str);
+                                nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
+                            })?;
+
+                    // Retrieve context ensuring it exists
+                    let context = self.get_context(volume_id)?;
+
+                    // Now we have a real volume! Create the proper root handle for it.
+                    let child_path = "/".to_string();
+                    let root_handle =
+                        AegisFileHandle::new(context.execution_id, volume_id, &child_path);
+                    let fileid = self
+                        .encode_handle(&root_handle, child_path)
+                        .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+
+                    return Ok(fileid);
+                }
             }
 
-            // At depth 3, the child name is {volume_id}
-            if path_parts.len() == 3 {
-                let volume_id_str = name;
-                let volume_id =
-                    uuid::Uuid::parse_str(volume_id_str)
-                        .map(VolumeId)
-                        .map_err(|_| {
-                            warn!("Invalid volume ID format in lookup: {}", volume_id_str);
-                            nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
-                        })?;
+            // We are inside a real volume.
+            // Get context to ensure volume is valid
+            let _context = self.get_context(parent_handle.volume_id)?;
 
-                // Retrieve context ensuring it exists
-                let context = self.get_context(volume_id)?;
+            // Lookup via FSAL (for paths inside the volume)
+            let child_handle = self
+                .fsal
+                .lookup(&parent_handle, &parent_path, name)
+                .await
+                .map_err(|e| {
+                    warn!("FSAL lookup failed: {}", e);
+                    nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
+                })?;
 
-                // Now we have a real volume! Create the proper root handle for it.
-                let child_path = "/".to_string();
-                let root_handle =
-                    AegisFileHandle::new(context.execution_id, volume_id, &child_path);
-                let fileid = self
-                    .encode_handle(&root_handle, child_path)
-                    .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)?;
+            // Build child path relative to volume root
+            let child_path = if parent_path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{parent_path}/{name}")
+            };
 
-                return Ok(fileid);
+            // Encode child handle with path
+            self.encode_handle(&child_handle, child_path)
+                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)
+        }
+        .await;
+
+        match &result {
+            Ok(_) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "lookup", "result" => "success").increment(1);
+                metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "lookup").record(start.elapsed().as_secs_f64());
+            }
+            Err(_) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "lookup", "result" => "error").increment(1);
             }
         }
-
-        // We are inside a real volume.
-        // Get context to ensure volume is valid
-        let _context = self.get_context(parent_handle.volume_id)?;
-
-        // Lookup via FSAL (for paths inside the volume)
-        let child_handle = self
-            .fsal
-            .lookup(&parent_handle, &parent_path, name)
-            .await
-            .map_err(|e| {
-                warn!("FSAL lookup failed: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
-            })?;
-
-        // Build child path relative to volume root
-        let child_path = if parent_path == "/" {
-            format!("/{name}")
-        } else {
-            format!("{parent_path}/{name}")
-        };
-
-        // Encode child handle with path
-        self.encode_handle(&child_handle, child_path)
-            .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_SERVERFAULT)
+        result
     }
 
     async fn getattr(&self, id: fileid3) -> Result<fattr3, nfsserve::nfs::nfsstat3> {
-        debug!("NFS GETATTR: id={}", id);
-        // For root directory (dirid=1)
-        if id == 1 {
-            // Use defaults
-            let default_context = self
-                .volume_registry
-                .read()
-                .values()
-                .next()
-                .cloned()
-                .unwrap_or_else(|| NfsVolumeContext {
-                    execution_id: ExecutionId::new(),
-                    volume_id: VolumeId::new(),
-                    container_uid: 1000,
-                    container_gid: 1000,
-                    policy: FsalAccessPolicy::default(),
-                    mount_point: PathBuf::from("/workspace"),
+        let start = std::time::Instant::now();
+        let result: Result<fattr3, nfsserve::nfs::nfsstat3> = async {
+            debug!("NFS GETATTR: id={}", id);
+            // For root directory (dirid=1)
+            if id == 1 {
+                // Use defaults
+                let default_context = self
+                    .volume_registry
+                    .read()
+                    .values()
+                    .next()
+                    .cloned()
+                    .unwrap_or_else(|| NfsVolumeContext {
+                        execution_id: ExecutionId::new(),
+                        volume_id: VolumeId::new(),
+                        container_uid: 1000,
+                        container_gid: 1000,
+                        policy: FsalAccessPolicy::default(),
+                        mount_point: PathBuf::from("/workspace"),
+                    });
+
+                return Ok(fattr3 {
+                    ftype: ftype3::NF3DIR,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: default_context.container_uid,
+                    gid: default_context.container_gid,
+                    size: 4096,
+                    used: 4096,
+                    rdev: specdata3 {
+                        specdata1: 0,
+                        specdata2: 0,
+                    },
+                    fsid: 0,
+                    fileid: 1,
+                    atime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    mtime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    ctime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
                 });
+            }
 
-            return Ok(fattr3 {
-                ftype: ftype3::NF3DIR,
-                mode: 0o755,
-                nlink: 2,
-                uid: default_context.container_uid,
-                gid: default_context.container_gid,
-                size: 4096,
-                used: 4096,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: 1,
-                atime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                mtime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                ctime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-            });
+            // Decode handle to get path and volume
+            let (handle, path) = self
+                .decode_handle(id)
+                .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
+
+            // Handle synthetic attributes for structural synthetic directories (identified by nil volume ID)
+            if handle.volume_id.0.is_nil() {
+                // Return synthetic directory attributes
+                return Ok(fattr3 {
+                    ftype: ftype3::NF3DIR,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: 1000,
+                    gid: 1000,
+                    size: 4096,
+                    used: 4096,
+                    rdev: specdata3 {
+                        specdata1: 0,
+                        specdata2: 0,
+                    },
+                    fsid: 0,
+                    fileid: id,
+                    atime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    mtime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    ctime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                });
+            }
+
+            // Get context for this volume
+            let context = self.get_context(handle.volume_id)?;
+
+            // For the volume root path "/", return synthetic directory attributes.
+            // The volume's existence is already proven by the DB authorization in the FSAL.
+            // SeaweedFS may not yet have the directory (it's created lazily on first write),
+            // so avoid the stat call here — same pattern as for structural dirs above.
+            if path == "/" {
+                return Ok(fattr3 {
+                    ftype: ftype3::NF3DIR,
+                    mode: 0o755,
+                    nlink: 2,
+                    uid: context.container_uid,
+                    gid: context.container_gid,
+                    size: 4096,
+                    used: 4096,
+                    rdev: specdata3 {
+                        specdata1: 0,
+                        specdata2: 0,
+                    },
+                    fsid: 0,
+                    fileid: id,
+                    atime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    mtime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                    ctime: nfstime3 {
+                        seconds: 0,
+                        nseconds: 0,
+                    },
+                });
+            }
+
+            // Get attributes via FSAL (with UID/GID squashing)
+            let attrs = self
+                .fsal
+                .getattr(
+                    context.execution_id,
+                    context.volume_id,
+                    &path,
+                    context.container_uid,
+                    context.container_gid,
+                )
+                .await
+                .map_err(|e| {
+                    warn!("FSAL getattr failed: {}", e);
+                    nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
+                })?;
+
+            let mut nfs_attrs = self.convert_attrs(attrs, handle.volume_id);
+            nfs_attrs.fileid = id;
+            Ok(nfs_attrs)
         }
+        .await;
 
-        // Decode handle to get path and volume
-        let (handle, path) = self
-            .decode_handle(id)
-            .map_err(|_| nfsserve::nfs::nfsstat3::NFS3ERR_BADHANDLE)?;
-
-        // Handle synthetic attributes for structural synthetic directories (identified by nil volume ID)
-        if handle.volume_id.0.is_nil() {
-            // Return synthetic directory attributes
-            return Ok(fattr3 {
-                ftype: ftype3::NF3DIR,
-                mode: 0o755,
-                nlink: 2,
-                uid: 1000,
-                gid: 1000,
-                size: 4096,
-                used: 4096,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: id,
-                atime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                mtime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                ctime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-            });
+        match &result {
+            Ok(_) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "getattr", "result" => "success").increment(1);
+                metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "getattr").record(start.elapsed().as_secs_f64());
+            }
+            Err(_) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "getattr", "result" => "error").increment(1);
+            }
         }
-
-        // Get context for this volume
-        let context = self.get_context(handle.volume_id)?;
-
-        // For the volume root path "/", return synthetic directory attributes.
-        // The volume's existence is already proven by the DB authorization in the FSAL.
-        // SeaweedFS may not yet have the directory (it's created lazily on first write),
-        // so avoid the stat call here — same pattern as for structural dirs above.
-        if path == "/" {
-            return Ok(fattr3 {
-                ftype: ftype3::NF3DIR,
-                mode: 0o755,
-                nlink: 2,
-                uid: context.container_uid,
-                gid: context.container_gid,
-                size: 4096,
-                used: 4096,
-                rdev: specdata3 {
-                    specdata1: 0,
-                    specdata2: 0,
-                },
-                fsid: 0,
-                fileid: id,
-                atime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                mtime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-                ctime: nfstime3 {
-                    seconds: 0,
-                    nseconds: 0,
-                },
-            });
-        }
-
-        // Get attributes via FSAL (with UID/GID squashing)
-        let attrs = self
-            .fsal
-            .getattr(
-                context.execution_id,
-                context.volume_id,
-                &path,
-                context.container_uid,
-                context.container_gid,
-            )
-            .await
-            .map_err(|e| {
-                warn!("FSAL getattr failed: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_NOENT
-            })?;
-
-        let mut nfs_attrs = self.convert_attrs(attrs, handle.volume_id);
-        nfs_attrs.fileid = id;
-        Ok(nfs_attrs)
+        result
     }
 
     async fn read(
@@ -574,6 +632,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsserve::nfs::nfsstat3> {
+        let start = std::time::Instant::now();
         debug!("NFS READ: id={}, offset={}, count={}", id, offset, count);
 
         let (handle, path) = self
@@ -582,17 +641,26 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         let context = self.get_context(handle.volume_id)?;
 
-        let data = self
+        match self
             .fsal
             .read(&handle, &path, &context.policy, offset, count as usize)
             .await
-            .map_err(|e| {
+        {
+            Ok(data) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "read", "result" => "success").increment(1);
+                metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "read")
+                    .record(start.elapsed().as_secs_f64());
+                metrics::counter!("aegis_nfs_bytes_read_total").increment(data.len() as u64);
+                let eof = data.len() < count as usize;
+                Ok((data, eof))
+            }
+            Err(e) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "read", "result" => "error").increment(1);
+                AegisFsalAdapter::record_fsal_security_metrics(&e);
                 error!("FSAL read failed: {}", e);
-                nfsserve::nfs::nfsstat3::NFS3ERR_IO
-            })?;
-
-        let eof = data.len() < count as usize;
-        Ok((data, eof))
+                Err(nfsserve::nfs::nfsstat3::NFS3ERR_IO)
+            }
+        }
     }
 
     async fn write(
@@ -601,12 +669,9 @@ impl NFSFileSystem for AegisFsalAdapter {
         offset: u64,
         data: &[u8],
     ) -> Result<fattr3, nfsserve::nfs::nfsstat3> {
-        debug!(
-            "NFS WRITE: id={}, offset={}, len={}",
-            id,
-            offset,
-            data.len()
-        );
+        let start = std::time::Instant::now();
+        let data_len = data.len();
+        debug!("NFS WRITE: id={}, offset={}, len={}", id, offset, data_len);
 
         let (handle, path) = self
             .decode_handle(id)
@@ -619,6 +684,8 @@ impl NFSFileSystem for AegisFsalAdapter {
             .write(&handle, &path, &context.policy, offset, data)
             .await
             .map_err(|e| {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "write", "result" => "error").increment(1);
+                AegisFsalAdapter::record_fsal_security_metrics(&e);
                 error!("FSAL write failed: {}", e);
                 // Map FSAL errors to appropriate NFS status codes
                 match e {
@@ -641,6 +708,11 @@ impl NFSFileSystem for AegisFsalAdapter {
                 }
             })?;
 
+        metrics::counter!("aegis_nfs_operations_total", "operation" => "write", "result" => "success").increment(1);
+        metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "write")
+            .record(start.elapsed().as_secs_f64());
+        metrics::counter!("aegis_nfs_bytes_written_total").increment(data_len as u64);
+
         // Return updated file attributes after write
         self.getattr(id).await
     }
@@ -651,6 +723,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         start_after: fileid3,
         max_entries: usize,
     ) -> Result<vfs::ReadDirResult, nfsserve::nfs::nfsstat3> {
+        let start = std::time::Instant::now();
         debug!(
             "NFS READDIR: dirid={}, start_after={}, max={}",
             dirid, start_after, max_entries
@@ -674,9 +747,15 @@ impl NFSFileSystem for AegisFsalAdapter {
             )
             .await
             .map_err(|e| {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "readdir", "result" => "error").increment(1);
+                AegisFsalAdapter::record_fsal_security_metrics(&e);
                 error!("FSAL readdir failed: {}", e);
                 nfsserve::nfs::nfsstat3::NFS3ERR_IO
             })?;
+
+        metrics::counter!("aegis_nfs_operations_total", "operation" => "readdir", "result" => "success").increment(1);
+        metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "readdir")
+            .record(start.elapsed().as_secs_f64());
 
         // Convert to NFS format
         let mut nfs_entries = Vec::new();
@@ -718,6 +797,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         filename: &filename3,
         _attr: nfsserve::nfs::sattr3,
     ) -> Result<(fileid3, fattr3), nfsserve::nfs::nfsstat3> {
+        let start = std::time::Instant::now();
         debug!("NFS CREATE: dirid={}, filename={:?}", dirid, filename);
         // Decode parent directory handle
         let (parent_handle, parent_path) = self
@@ -749,9 +829,15 @@ impl NFSFileSystem for AegisFsalAdapter {
             )
             .await
             .map_err(|e| {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "create", "result" => "error").increment(1);
+                AegisFsalAdapter::record_fsal_security_metrics(&e);
                 error!("FSAL create failed: {}", e);
                 nfsserve::nfs::nfsstat3::NFS3ERR_IO
             })?;
+
+        metrics::counter!("aegis_nfs_operations_total", "operation" => "create", "result" => "success").increment(1);
+        metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "create")
+            .record(start.elapsed().as_secs_f64());
 
         // Register and return fileid with attributes
         let fileid = self
@@ -782,6 +868,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsserve::nfs::nfsstat3> {
+        let start = std::time::Instant::now();
         debug!("NFS MKDIR: dirid={}, dirname={:?}", dirid, dirname);
         // Decode parent directory handle
         let (parent_handle, parent_path) = self
@@ -812,9 +899,15 @@ impl NFSFileSystem for AegisFsalAdapter {
             )
             .await
             .map_err(|e| {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "create", "result" => "error").increment(1);
+                AegisFsalAdapter::record_fsal_security_metrics(&e);
                 error!("FSAL mkdir failed: {}", e);
                 nfsserve::nfs::nfsstat3::NFS3ERR_IO
             })?;
+
+        metrics::counter!("aegis_nfs_operations_total", "operation" => "create", "result" => "success").increment(1);
+        metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "create")
+            .record(start.elapsed().as_secs_f64());
 
         // Create a handle for the new directory
         let handle = crate::domain::fsal::AegisFileHandle::new(
@@ -836,6 +929,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<(), nfsserve::nfs::nfsstat3> {
+        let start = std::time::Instant::now();
         debug!("NFS REMOVE: dirid={}, filename={:?}", dirid, filename);
         // Decode parent directory handle
         let (parent_handle, parent_path) = self
@@ -857,7 +951,7 @@ impl NFSFileSystem for AegisFsalAdapter {
         };
 
         // Try to delete as file first, then as directory if file deletion fails
-        match self
+        let result = match self
             .fsal
             .delete_file(
                 context.execution_id,
@@ -868,7 +962,7 @@ impl NFSFileSystem for AegisFsalAdapter {
             .await
         {
             Ok(_) => Ok(()),
-            Err(_) => {
+            Err(file_err) => {
                 // If file deletion fails, try directory deletion
                 self.fsal
                     .delete_directory(
@@ -879,11 +973,24 @@ impl NFSFileSystem for AegisFsalAdapter {
                     )
                     .await
                     .map_err(|e| {
+                        AegisFsalAdapter::record_fsal_security_metrics(&file_err);
+                        AegisFsalAdapter::record_fsal_security_metrics(&e);
                         error!("FSAL remove failed: {}", e);
                         nfsserve::nfs::nfsstat3::NFS3ERR_IO
                     })
             }
+        };
+
+        match &result {
+            Ok(()) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "delete", "result" => "success").increment(1);
+                metrics::histogram!("aegis_nfs_operation_duration_seconds", "operation" => "delete").record(start.elapsed().as_secs_f64());
+            }
+            Err(_) => {
+                metrics::counter!("aegis_nfs_operations_total", "operation" => "delete", "result" => "error").increment(1);
+            }
         }
+        result
     }
 
     async fn rename(

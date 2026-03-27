@@ -263,6 +263,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             },
         );
 
+        // Step 8: Record Prometheus metrics (ADR-058, BC-3)
+        metrics::counter!("aegis_workflow_executions_total", "status" => "started").increment(1);
+        metrics::gauge!("aegis_workflow_executions_active").increment(1.0);
+
         Ok(StartedWorkflowExecution {
             execution_id: execution_id.0.to_string(),
             workflow_id,

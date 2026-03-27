@@ -387,11 +387,13 @@ impl NfsGatewayService {
             policy,
             mount_point,
         );
+        metrics::gauge!("aegis_volumes_active").increment(1.0);
     }
 
     /// Deregister a volume from the NFS server
     pub fn deregister_volume(&self, volume_id: VolumeId) {
         self.volume_registry.deregister(volume_id);
+        metrics::gauge!("aegis_volumes_active").decrement(1.0);
     }
 
     /// Get the volume registry (for introspection/testing)

@@ -16,8 +16,8 @@ use std::net::SocketAddr;
 /// Binds an HTTP listener to the specified port and registers initial node metadata.
 pub fn init_metrics(
     port: u16,
-    _node_id: &str,
-    _node_name: &str,
+    node_id: &str,
+    node_name: &str,
     region: Option<&str>,
     version: &str,
 ) -> anyhow::Result<()> {
@@ -40,6 +40,8 @@ pub fn init_metrics(
     // Register node metadata gauge
     metrics::gauge!(
         "aegis_node_info",
+        "node_id" => node_id.to_string(),
+        "name" => node_name.to_string(),
         "region" => region.unwrap_or("unknown").to_string(),
         "version" => version.to_string()
     )

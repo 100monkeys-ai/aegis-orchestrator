@@ -75,6 +75,8 @@ impl SmcpSessionRepository for InMemorySmcpSessionRepository {
                 && session.status == crate::domain::smcp_session::SessionStatus::Active
             {
                 session.revoke(reason.clone());
+                // ADR-058 BC-4: decrement active session gauge on revocation.
+                metrics::gauge!("aegis_smcp_sessions_active").decrement(1.0);
             }
         }
         Ok(())
