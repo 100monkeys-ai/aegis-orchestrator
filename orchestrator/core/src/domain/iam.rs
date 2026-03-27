@@ -79,7 +79,7 @@ pub struct OidcClient {
 /// OAuth2 grant type for OIDC clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrantType {
-    /// Control Plane UI, LibreChat
+    /// Control Plane UI, Zaru Client
     AuthorizationCodePkce,
     /// SDK clients, CI/CD pipelines
     ClientCredentials,

@@ -305,7 +305,7 @@ mod tests {
                 security_context: Some("zaru-pro".to_string()),
                 principal_subject: Some("user-123".to_string()),
                 user_id: Some("user-123".to_string()),
-                workload_id: Some("librechat-session-42".to_string()),
+                workload_id: Some("zaru-session-42".to_string()),
                 zaru_tier: Some("pro".to_string()),
                 tenant_id: TenantId::consumer(),
             })
@@ -325,7 +325,7 @@ mod tests {
         assert_eq!(saved_session.user_id.as_deref(), Some("user-123"));
         assert_eq!(
             saved_session.workload_id.as_deref(),
-            Some("librechat-session-42")
+            Some("zaru-session-42")
         );
         assert_eq!(saved_session.zaru_tier.as_deref(), Some("pro"));
     }
@@ -347,7 +347,7 @@ mod tests {
                 security_context: Some("zaru-enterprise".to_string()),
                 principal_subject: Some("user-456".to_string()),
                 user_id: Some("user-456".to_string()),
-                workload_id: Some("librechat-session-99".to_string()),
+                workload_id: Some("zaru-session-99".to_string()),
                 zaru_tier: Some("enterprise".to_string()),
                 tenant_id: TenantId::consumer(),
             })
