@@ -4600,6 +4600,12 @@ async fn get_workflow_logs_handler(
                             artifacts: None,
                             agent_id: None,
                             code_diff: None,
+                            parent_execution_id: None,
+                            child_execution_id: None,
+                            child_workflow_id: None,
+                            mode: None,
+                            result_key: None,
+                            parent_state_name: None,
                             timestamp: record.recorded_at.to_rfc3339(),
                         });
                     workflow_log_event_from_payload(

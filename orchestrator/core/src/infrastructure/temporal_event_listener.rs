@@ -120,6 +120,30 @@ pub struct TemporalEventPayload {
     /// Code diff / reasoning (optional, for refinement)
     pub code_diff: Option<serde_json::Value>,
 
+    /// Parent execution ID for subworkflow events (ADR-065)
+    #[serde(default)]
+    pub parent_execution_id: Option<String>,
+
+    /// Child execution ID for subworkflow events (ADR-065)
+    #[serde(default)]
+    pub child_execution_id: Option<String>,
+
+    /// Child workflow ID for subworkflow events (ADR-065)
+    #[serde(default)]
+    pub child_workflow_id: Option<String>,
+
+    /// Subworkflow mode: "blocking" or "fire_and_forget" (ADR-065)
+    #[serde(default)]
+    pub mode: Option<String>,
+
+    /// Result key for SubworkflowCompleted events (ADR-065)
+    #[serde(default)]
+    pub result_key: Option<String>,
+
+    /// Parent state name for SubworkflowTriggered events (ADR-065)
+    #[serde(default)]
+    pub parent_state_name: Option<String>,
+
     /// Event timestamp
     pub timestamp: String,
 }
@@ -281,6 +305,77 @@ impl TemporalEventMapper {
                 execution_id,
                 cancelled_at: timestamp,
             }),
+
+            "SubworkflowTriggered" => {
+                let parent_execution_id = ExecutionId(Uuid::parse_str(&payload.execution_id)?);
+                let child_execution_id = ExecutionId(Uuid::parse_str(
+                    payload.child_execution_id.as_deref().ok_or_else(|| {
+                        anyhow!("SubworkflowTriggered missing child_execution_id")
+                    })?,
+                )?);
+                let child_workflow_id = WorkflowId(Uuid::parse_str(
+                    payload
+                        .child_workflow_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("SubworkflowTriggered missing child_workflow_id"))?,
+                )?);
+                let mode = payload
+                    .mode
+                    .clone()
+                    .unwrap_or_else(|| "blocking".to_string());
+                let parent_state_name = payload
+                    .parent_state_name
+                    .clone()
+                    .or_else(|| payload.state_name.clone())
+                    .unwrap_or_default();
+
+                Ok(WorkflowEvent::SubworkflowTriggered {
+                    parent_execution_id,
+                    child_execution_id,
+                    child_workflow_id,
+                    mode,
+                    parent_state_name,
+                    triggered_at: timestamp,
+                })
+            }
+
+            "SubworkflowCompleted" => {
+                let parent_execution_id = ExecutionId(Uuid::parse_str(&payload.execution_id)?);
+                let child_execution_id = ExecutionId(Uuid::parse_str(
+                    payload.child_execution_id.as_deref().ok_or_else(|| {
+                        anyhow!("SubworkflowCompleted missing child_execution_id")
+                    })?,
+                )?);
+                let result_key = payload.result_key.clone().unwrap_or_default();
+
+                Ok(WorkflowEvent::SubworkflowCompleted {
+                    parent_execution_id,
+                    child_execution_id,
+                    result_key,
+                    completed_at: timestamp,
+                })
+            }
+
+            "SubworkflowFailed" => {
+                let parent_execution_id = ExecutionId(Uuid::parse_str(&payload.execution_id)?);
+                let child_execution_id = ExecutionId(Uuid::parse_str(
+                    payload
+                        .child_execution_id
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("SubworkflowFailed missing child_execution_id"))?,
+                )?);
+                let reason = payload
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown child workflow failure".to_string());
+
+                Ok(WorkflowEvent::SubworkflowFailed {
+                    parent_execution_id,
+                    child_execution_id,
+                    reason,
+                    failed_at: timestamp,
+                })
+            }
 
             _ => Err(anyhow!("Unknown event_type: {}", payload.event_type)),
         }
@@ -593,6 +688,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -625,6 +726,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -647,6 +754,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -669,6 +782,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -691,6 +810,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -831,6 +956,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -867,6 +998,12 @@ mod tests {
             artifacts: None,
             agent_id: Some("123e4567-e89b-12d3-a456-426614174000".to_string()),
             code_diff: Some(serde_json::json!("updated prompt")),
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -905,6 +1042,12 @@ mod tests {
             artifacts: None,
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
@@ -990,6 +1133,12 @@ mod tests {
             artifacts: Some(vec!["report.md".to_string()]),
             agent_id: None,
             code_diff: None,
+            parent_execution_id: None,
+            child_execution_id: None,
+            child_workflow_id: None,
+            mode: None,
+            result_key: None,
+            parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
         };
 
