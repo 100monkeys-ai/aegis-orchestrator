@@ -134,6 +134,46 @@ pub enum NodePeerStatus {
     Unhealthy,
 }
 
+/// Cluster-level health rollup per ADR-062.
+///
+/// - `Healthy`: all registered peers are Active.
+/// - `Degraded`: at least one peer is Unhealthy or Draining, but more than half are Active.
+/// - `Critical`: half or more peers are non-Active, or zero nodes registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClusterSummaryStatus {
+    Healthy,
+    Degraded,
+    Critical,
+}
+
+impl ClusterSummaryStatus {
+    /// Compute from peer status counts.
+    pub fn from_counts(active: usize, draining: usize, unhealthy: usize) -> Self {
+        let total = active + draining + unhealthy;
+        if total == 0 {
+            return Self::Critical;
+        }
+        if draining == 0 && unhealthy == 0 {
+            return Self::Healthy;
+        }
+        if active * 2 > total {
+            Self::Degraded
+        } else {
+            Self::Critical
+        }
+    }
+}
+
+impl std::fmt::Display for ClusterSummaryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Healthy => write!(f, "healthy"),
+            Self::Degraded => write!(f, "degraded"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
 // ──────────────────────────────────────────────────────────────────────────────
 // Value Objects
 // ──────────────────────────────────────────────────────────────────────────────

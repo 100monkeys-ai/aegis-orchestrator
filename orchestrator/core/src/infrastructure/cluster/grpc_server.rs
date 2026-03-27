@@ -458,31 +458,38 @@ impl NodeClusterService for NodeClusterServiceHandler {
             .authenticate_node(request.into_inner().envelope)
             .await?;
 
-        // Determine which status to filter by; default to Active if no filter provided
-        let status_filter = inner
-            .filter_status
-            .first()
-            .map(
-                |s| match crate::infrastructure::aegis_cluster_proto::NodeStatus::try_from(*s) {
-                    Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Active) => {
-                        NodePeerStatus::Active
-                    }
-                    Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Draining) => {
-                        NodePeerStatus::Draining
-                    }
-                    Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Unhealthy) => {
-                        NodePeerStatus::Unhealthy
-                    }
-                    _ => NodePeerStatus::Active,
-                },
-            )
-            .unwrap_or(NodePeerStatus::Active);
-
-        let peers = self
-            .cluster_repo
-            .list_peers_by_status(status_filter)
-            .await
-            .map_err(|e| Status::internal(e.to_string()))?;
+        // When no filter is provided, return ALL peers (Active + Draining + Unhealthy).
+        // When filter_status has values, return only peers matching those statuses.
+        let peers = if inner.filter_status.is_empty() {
+            self.cluster_repo
+                .list_all_peers()
+                .await
+                .map_err(|e| Status::internal(e.to_string()))?
+        } else {
+            let mut collected = Vec::new();
+            for s in &inner.filter_status {
+                let domain_status =
+                    match crate::infrastructure::aegis_cluster_proto::NodeStatus::try_from(*s) {
+                        Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Active) => {
+                            NodePeerStatus::Active
+                        }
+                        Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Draining) => {
+                            NodePeerStatus::Draining
+                        }
+                        Ok(crate::infrastructure::aegis_cluster_proto::NodeStatus::Unhealthy) => {
+                            NodePeerStatus::Unhealthy
+                        }
+                        _ => continue,
+                    };
+                let batch = self
+                    .cluster_repo
+                    .list_peers_by_status(domain_status)
+                    .await
+                    .map_err(|e| Status::internal(e.to_string()))?;
+                collected.extend(batch);
+            }
+            collected
+        };
 
         let nodes = peers
             .into_iter()

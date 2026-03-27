@@ -71,7 +71,9 @@ use aegis_orchestrator_core::{
     },
     domain::{
         agent::AgentId,
-        cluster::{NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole},
+        cluster::{
+            ClusterSummaryStatus, NodeClusterRepository, NodeId, NodePeer, NodePeerStatus, NodeRole,
+        },
         execution::ExecutionInput,
         execution::{ExecutionId, ExecutionStatus},
         iam::{IdentityKind, IdentityProvider, UserIdentity},
@@ -158,6 +160,7 @@ struct ClusterStatusView {
     active_nodes: usize,
     draining_nodes: usize,
     unhealthy_nodes: usize,
+    cluster_health: String,
     nodes: Vec<ClusterNodeView>,
 }
 
@@ -429,6 +432,8 @@ async fn cluster_status_view(state: &AppState) -> ClusterStatusView {
         .filter(|node| node.status == "unhealthy")
         .count();
 
+    let health = ClusterSummaryStatus::from_counts(active_nodes, draining_nodes, unhealthy_nodes);
+
     ClusterStatusView {
         source: if state.cluster_repo.is_some() {
             "cluster_repository".to_string()
@@ -444,6 +449,7 @@ async fn cluster_status_view(state: &AppState) -> ClusterStatusView {
         active_nodes,
         draining_nodes,
         unhealthy_nodes,
+        cluster_health: health.to_string(),
         nodes,
     }
 }
@@ -2335,6 +2341,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             use aegis_orchestrator_core::infrastructure::aegis_remote_storage_proto::remote_storage_service_server::RemoteStorageServiceServer;
             use aegis_orchestrator_core::infrastructure::storage::RemoteStorageServiceHandler;
 
+            let health_sweeper_repo = cluster_repo.clone();
+
             let storage_handler =
                 RemoteStorageServiceHandler::new(storage_provider.clone(), cluster_repo);
 
@@ -2349,6 +2357,26 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     tracing::error!(error = %e, "Cluster gRPC server failed");
                 }
             });
+
+            // ADR-062: Spawn health sweeper for stale heartbeat detection
+            {
+                let sweeper =
+                    aegis_orchestrator_core::application::cluster::HealthSweeper::with_defaults(
+                        health_sweeper_repo,
+                        event_bus.clone(),
+                    );
+                let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+                tokio::spawn(async move {
+                    sweeper.run(shutdown_rx).await;
+                });
+                // Deliberately forget the sender so the channel stays open for the
+                // lifetime of the process; the sweeper loop exits when the process
+                // terminates.
+                std::mem::forget(shutdown_tx);
+                tracing::info!(
+                    "ADR-062: Health sweeper started (stale_threshold=90s, sweep_interval=30s)"
+                );
+            }
         } else {
             tracing::warn!(
                 "Cluster mode enabled but no database configured; \

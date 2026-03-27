@@ -46,6 +46,27 @@ impl RouteExecutionUseCase {
             .list_peers_by_status(NodePeerStatus::Active)
             .await?;
 
+        // ADR-062: Defensive freshness re-evaluation at routing time.
+        // Even if the DB says "Active", reject peers whose last heartbeat
+        // is staler than 2x the heartbeat interval (60s).
+        let now = chrono::Utc::now();
+        let peers: Vec<_> = peers
+            .into_iter()
+            .filter(|p| {
+                let staleness = now.signed_duration_since(p.last_heartbeat_at);
+                if staleness.num_seconds() > 60 {
+                    tracing::warn!(
+                        node_id = %p.node_id,
+                        staleness_secs = staleness.num_seconds(),
+                        "ADR-062: excluding stale peer from routing despite Active status"
+                    );
+                    false
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         let mut cluster = NodeCluster::new(self.controller_node_id);
         for peer in peers {
             cluster.register_peer(peer).map_err(|e| anyhow!(e))?;

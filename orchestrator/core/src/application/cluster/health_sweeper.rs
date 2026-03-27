@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use crate::domain::cluster::{NodeClusterRepository, NodePeerStatus};
+use crate::domain::cluster::{ClusterEvent, NodeClusterRepository, NodePeerStatus};
+use crate::infrastructure::event_bus::EventBus;
 
 pub struct HealthSweeper {
     cluster_repo: Arc<dyn NodeClusterRepository>,
+    event_bus: Arc<EventBus>,
     stale_threshold: Duration,
     sweep_interval: Duration,
 }
@@ -21,20 +23,26 @@ pub struct HealthSweeper {
 impl HealthSweeper {
     pub fn new(
         cluster_repo: Arc<dyn NodeClusterRepository>,
+        event_bus: Arc<EventBus>,
         stale_threshold: Duration,
         sweep_interval: Duration,
     ) -> Self {
         Self {
             cluster_repo,
+            event_bus,
             stale_threshold,
             sweep_interval,
         }
     }
 
     /// Default sweeper: stale after 90s (3x 30s heartbeat), sweep every 30s
-    pub fn with_defaults(cluster_repo: Arc<dyn NodeClusterRepository>) -> Self {
+    pub fn with_defaults(
+        cluster_repo: Arc<dyn NodeClusterRepository>,
+        event_bus: Arc<EventBus>,
+    ) -> Self {
         Self::new(
             cluster_repo,
+            event_bus,
             Duration::from_secs(90),
             Duration::from_secs(30),
         )
@@ -78,11 +86,19 @@ impl HealthSweeper {
                     "Marking stale node as unhealthy"
                 );
                 self.cluster_repo.mark_unhealthy(&peer.node_id).await?;
+                self.event_bus
+                    .publish_cluster_event(ClusterEvent::NodeUnhealthy {
+                        node_id: peer.node_id,
+                        last_seen: peer.last_heartbeat_at,
+                        marked_at: now,
+                    });
                 transitioned += 1;
             }
         }
 
         if transitioned > 0 {
+            metrics::counter!("aegis_health_sweeper_transitions_total")
+                .increment(transitioned as u64);
             tracing::info!(
                 count = transitioned,
                 "Health sweeper transitioned stale nodes to unhealthy"

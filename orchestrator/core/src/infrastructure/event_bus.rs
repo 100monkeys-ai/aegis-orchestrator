@@ -60,6 +60,7 @@
 // Phase 2: Add persistent event store for replay capability
 
 use crate::domain::agent::AgentId;
+use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
     LearningEvent, MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
@@ -89,6 +90,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Secrets(_) => "secrets",
         DomainEvent::ContainerRun(_) => "container_run",
         DomainEvent::Tenant(_) => "tenant",
+        DomainEvent::Cluster(_) => "cluster",
     }
 }
 
@@ -118,6 +120,8 @@ pub enum DomainEvent {
     ContainerRun(ContainerRunEvent),
     /// Tenant lifecycle and audit events (ADR-056)
     Tenant(TenantEvent),
+    /// BC-16 Cluster topology and node lifecycle events (ADR-059)
+    Cluster(ClusterEvent),
 }
 
 impl DomainEvent {
@@ -239,6 +243,14 @@ impl DomainEvent {
                     *execution_id
                 }
             }),
+            DomainEvent::Cluster(event) => match event {
+                ClusterEvent::ExecutionForwarded { execution_id, .. } => Some(*execution_id),
+                ClusterEvent::NodeAttested { .. }
+                | ClusterEvent::NodeRegistered { .. }
+                | ClusterEvent::NodeDeregistered { .. }
+                | ClusterEvent::NodeUnhealthy { .. }
+                | ClusterEvent::ClusterConfigPushed { .. } => None,
+            },
         }
     }
 
@@ -313,7 +325,7 @@ impl DomainEvent {
                 | SecretEvent::LeaseRevoked { access_context, .. }
                 | SecretEvent::SecretAccessDenied { access_context, .. } => access_context.agent_id,
             },
-            DomainEvent::ContainerRun(_) => None,
+            DomainEvent::ContainerRun(_) | DomainEvent::Cluster(_) => None,
         }
     }
 
@@ -460,6 +472,16 @@ impl DomainEvent {
                 TenantEvent::AdminCrossTenantAccess { accessed_at, .. } => *accessed_at,
                 TenantEvent::TenantQuotaExceeded { exceeded_at, .. } => *exceeded_at,
             },
+            DomainEvent::Cluster(event) => match event {
+                ClusterEvent::NodeAttested { attested_at, .. } => *attested_at,
+                ClusterEvent::NodeRegistered { registered_at, .. } => *registered_at,
+                ClusterEvent::NodeDeregistered {
+                    deregistered_at, ..
+                } => *deregistered_at,
+                ClusterEvent::NodeUnhealthy { marked_at, .. } => *marked_at,
+                ClusterEvent::ExecutionForwarded { forwarded_at, .. } => *forwarded_at,
+                ClusterEvent::ClusterConfigPushed { pushed_at, .. } => *pushed_at,
+            },
         }
     }
 
@@ -602,6 +624,14 @@ impl DomainEvent {
                 TenantEvent::AdminCrossTenantAccess { .. } => "admin_cross_tenant_access",
                 TenantEvent::TenantQuotaExceeded { .. } => "tenant_quota_exceeded",
             },
+            DomainEvent::Cluster(event) => match event {
+                ClusterEvent::NodeAttested { .. } => "node_attested",
+                ClusterEvent::NodeRegistered { .. } => "node_registered",
+                ClusterEvent::NodeDeregistered { .. } => "node_deregistered",
+                ClusterEvent::NodeUnhealthy { .. } => "node_unhealthy",
+                ClusterEvent::ExecutionForwarded { .. } => "execution_forwarded",
+                ClusterEvent::ClusterConfigPushed { .. } => "cluster_config_pushed",
+            },
         }
     }
 
@@ -622,6 +652,7 @@ impl DomainEvent {
             DomainEvent::Secrets(_) => "secrets",
             DomainEvent::ContainerRun(_) => "container_run",
             DomainEvent::Tenant(_) => "tenant",
+            DomainEvent::Cluster(_) => "cluster",
         }
     }
 
@@ -711,6 +742,7 @@ impl DomainEvent {
             DomainEvent::Secrets(_) => Some("secrets"),
             DomainEvent::ContainerRun(_) => Some("container"),
             DomainEvent::Tenant(_) => Some("tenant"),
+            DomainEvent::Cluster(_) => Some("cluster"),
         }
     }
 }
@@ -805,6 +837,11 @@ impl EventBus {
     /// Publish a tenant lifecycle event (ADR-056)
     pub fn publish_tenant_event(&self, event: TenantEvent) {
         self.publish(DomainEvent::Tenant(event));
+    }
+
+    /// Publish a cluster topology/node lifecycle event (BC-16 ADR-059)
+    pub fn publish_cluster_event(&self, event: ClusterEvent) {
+        self.publish(DomainEvent::Cluster(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1162,6 +1199,7 @@ impl AgentEventReceiver {
             DomainEvent::Secrets(_) => false, // Secrets events are system-wide, not per-agent
             DomainEvent::ContainerRun(_) => false, // ContainerRun events are keyed by execution_id, not agent_id
             DomainEvent::Tenant(_) => false,       // Tenant events are system-wide, not per-agent
+            DomainEvent::Cluster(_) => false,      // Cluster events are system-wide, not per-agent
         }
     }
 }

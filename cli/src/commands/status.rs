@@ -180,7 +180,7 @@ async fn run_cluster_status(
             port.to_string().cyan()
         );
         println!(
-            "{} Heartbeat freshness is unavailable here because ListPeers does not expose last-heartbeat timestamps.",
+            "{} Heartbeat freshness is derived from each node's last_heartbeat_at timestamp.",
             "ℹ".cyan()
         );
     }
@@ -204,6 +204,15 @@ async fn run_cluster_status(
         let role = format!("{:?}", node.role());
         let node_id = node.node_id;
         let grpc_address = node.grpc_address;
+        let last_hb = node.last_heartbeat_at.as_ref().map(|ts| {
+            chrono::DateTime::from_timestamp(ts.seconds, ts.nanos as u32)
+                .map(|dt| {
+                    let ago = chrono::Utc::now().signed_duration_since(dt);
+                    format!("{}s ago", ago.num_seconds())
+                })
+                .unwrap_or_else(|| "invalid".to_string())
+        });
+
         let orchestrator = match probe_health_endpoint(&health_host, port).await {
             Ok(HealthEndpointStatus::Healthy { .. }) => "healthy".to_string(),
             Ok(HealthEndpointStatus::Unhealthy { .. }) => {
@@ -226,6 +235,7 @@ async fn run_cluster_status(
             cluster_status,
             orchestrator_status: orchestrator,
             grpc_address,
+            last_heartbeat_at: last_hb,
         });
     }
 
@@ -241,22 +251,24 @@ async fn run_cluster_status(
     } else {
         println!();
         println!(
-            "{:<36} {:<12} {:<14} {:<16} {}",
+            "{:<36} {:<12} {:<14} {:<16} {:<12} {}",
             "NODE ID".bold(),
             "ROLE".bold(),
             "CLUSTER".bold(),
             "ORCHESTRATOR".bold(),
+            "HEARTBEAT".bold(),
             "ADDRESS".bold()
         );
-        println!("{}", "-".repeat(98));
+        println!("{}", "-".repeat(110));
 
         for row in rows {
             println!(
-                "{:<36} {:<12} {:<14} {:<16} {}",
+                "{:<36} {:<12} {:<14} {:<16} {:<12} {}",
                 row.node_id.dimmed(),
                 row.role,
                 render_cluster_state_label(&row.cluster_status),
                 render_orchestrator_health_label(&row.orchestrator_status),
+                row.last_heartbeat_at.as_deref().unwrap_or("n/a"),
                 row.grpc_address.cyan()
             );
         }
@@ -552,6 +564,7 @@ struct ClusterStatusRow {
     cluster_status: String,
     orchestrator_status: String,
     grpc_address: String,
+    last_heartbeat_at: Option<String>,
 }
 
 #[derive(Debug)]
