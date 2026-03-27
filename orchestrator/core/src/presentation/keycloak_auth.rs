@@ -12,6 +12,7 @@
 //! auth mechanisms):
 //! - `/health` — health check
 //! - `/v1/dispatch-gateway/*` — Dispatch Protocol (container ↔ orchestrator)
+//! - `/v1/executions/*` — execution SSE stream (uses SMCP SecurityToken)
 //! - `/v1/smcp/attest` — SMCP attestation handshake
 //! - `/v1/smcp/invoke` — SMCP tool invocation (uses SecurityToken)
 //! - `/v1/smcp/tools` — SMCP tool discovery metadata
@@ -33,6 +34,7 @@ use tracing::warn;
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
     "/v1/dispatch-gateway",
+    "/v1/executions",
     "/v1/smcp/attest",
     "/v1/smcp/invoke",
     "/v1/smcp/tools",
@@ -123,6 +125,8 @@ mod tests {
     fn exempt_paths_recognized() {
         assert!(is_exempt("/health"));
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
+        assert!(is_exempt("/v1/executions"));
+        assert!(is_exempt("/v1/executions/some-id/stream"));
         assert!(is_exempt("/v1/smcp/attest"));
         assert!(is_exempt("/v1/smcp/invoke"));
         assert!(is_exempt("/v1/smcp/tools"));
@@ -134,7 +138,6 @@ mod tests {
     fn non_exempt_paths_require_auth() {
         assert!(!is_exempt("/v1/stimuli"));
         assert!(!is_exempt("/v1/agents"));
-        assert!(!is_exempt("/v1/executions"));
         assert!(!is_exempt("/api/v1/status"));
     }
 }

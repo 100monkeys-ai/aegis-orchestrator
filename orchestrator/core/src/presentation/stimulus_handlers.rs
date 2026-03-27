@@ -386,6 +386,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
+            smcp_session_repo: None,
         })
     }
 

@@ -35,6 +35,7 @@ use crate::domain::execution::ExecutionInput;
 use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::repository::{TenantRepository, WorkflowExecutionRepository};
 use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::domain::tenancy::{Tenant, TenantStatus, TenantTier};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
@@ -77,6 +78,8 @@ pub struct AppState {
     pub event_bus: Option<Arc<EventBus>>,
     /// Tenant repository for admin tenant management (ADR-056). Optional until wired.
     pub tenant_repo: Option<Arc<dyn TenantRepository>>,
+    /// SMCP session repository for token-based auth on SSE streams (ADR-035). Optional until wired.
+    pub smcp_session_repo: Option<Arc<dyn SmcpSessionRepository>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -103,6 +106,7 @@ pub fn app(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
+        smcp_session_repo: None,
     });
 
     Router::new()
@@ -161,6 +165,7 @@ pub fn app_with_inner_loop(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
+        smcp_session_repo: None,
     });
 
     Router::new()
@@ -246,10 +251,74 @@ async fn start_execution(
     }
 }
 
+/// Query parameters for the SSE stream endpoint.
+/// The `token` parameter supports browser EventSource clients that cannot set headers.
+#[derive(serde::Deserialize, Default)]
+struct StreamExecutionQuery {
+    token: Option<String>,
+}
+
 async fn stream_execution(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
+    Query(query): Query<StreamExecutionQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // --- SMCP token authentication ---
+    // Extract token from Authorization header or query parameter (for EventSource clients).
+    let token = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "))
+        .map(|t| t.to_string())
+        .or(query.token);
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Missing SMCP security token"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Validate the token against active SMCP sessions.
+    let session_repo = match &state.smcp_session_repo {
+        Some(repo) => repo,
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "SMCP session repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match session_repo.find_active_by_security_token(&token).await {
+        Ok(Some(_session)) => {
+            // Token is valid — session is active.
+            // TODO: optionally validate execution belongs to session.agent_id()
+        }
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                Json(json!({"error": "Invalid or expired SMCP security token"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to validate SMCP session token for SSE stream");
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "Session validation failed"})),
+            )
+                .into_response();
+        }
+    }
+
+    // --- Execution ID parsing ---
     let execution_id = match uuid::Uuid::parse_str(&id) {
         Ok(uid) => crate::domain::execution::ExecutionId(uid),
         Err(_) => {
@@ -259,7 +328,9 @@ async fn stream_execution(
                 tokio_stream::wrappers::ReceiverStream::new(tokio::sync::mpsc::channel(1).1)
                     .map(Ok::<_, axum::Error>),
             );
-            return Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default());
+            return Sse::new(stream)
+                .keep_alive(axum::response::sse::KeepAlive::default())
+                .into_response();
         }
     };
 
@@ -282,7 +353,9 @@ async fn stream_execution(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 // ============================================================================
@@ -1163,6 +1236,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
+            smcp_session_repo: None,
         })
     }
 
