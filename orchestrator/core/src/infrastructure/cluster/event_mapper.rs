@@ -197,10 +197,12 @@ pub fn domain_to_proto(event: DomainEvent) -> Option<ExecutionEvent> {
             })),
         }),
 
-        // InstanceSpawned/InstanceTerminated and Validation are not relevant
-        // for the cluster forwarding stream — skip them.
+        // InstanceSpawned/InstanceTerminated, child execution events, and Validation
+        // are not relevant for the cluster forwarding stream — skip them.
         DomainEvent::InstanceSpawned { .. }
         | DomainEvent::InstanceTerminated { .. }
+        | DomainEvent::ChildExecutionSpawned { .. }
+        | DomainEvent::ChildExecutionCompleted { .. }
         | DomainEvent::Validation(_) => None,
     }
 }

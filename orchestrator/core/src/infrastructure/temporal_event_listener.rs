@@ -590,6 +590,10 @@ impl TemporalEventListener {
                 iteration_number,
                 code_diff,
                 applied_at,
+                cortex_pattern_id: None,
+                cortex_pattern_category: None,
+                cortex_success_score: None,
+                cortex_solution_approach: None,
             };
 
             self.persist_and_publish_execution_event(

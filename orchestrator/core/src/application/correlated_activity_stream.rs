@@ -319,6 +319,10 @@ fn execution_to_history(execution: &Execution) -> Vec<CorrelatedActivityEvent> {
                     iteration_number: iteration.number,
                     code_diff: code_diff.clone(),
                     applied_at: iteration.ended_at.unwrap_or(iteration.started_at),
+                    cortex_pattern_id: None,
+                    cortex_pattern_category: None,
+                    cortex_success_score: None,
+                    cortex_solution_approach: None,
                 }),
                 None,
             ));
@@ -839,6 +843,10 @@ mod tests {
                     diff: "+ fix".to_string(),
                 },
                 applied_at: Utc::now(),
+                cortex_pattern_id: None,
+                cortex_pattern_category: None,
+                cortex_success_score: None,
+                cortex_solution_approach: None,
             }),
             None,
         );

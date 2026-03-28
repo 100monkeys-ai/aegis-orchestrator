@@ -149,7 +149,9 @@ impl DomainEvent {
                 | ExecutionEvent::ConsoleOutput { execution_id, .. }
                 | ExecutionEvent::LlmInteraction { execution_id, .. }
                 | ExecutionEvent::InstanceSpawned { execution_id, .. }
-                | ExecutionEvent::InstanceTerminated { execution_id, .. } => *execution_id,
+                | ExecutionEvent::InstanceTerminated { execution_id, .. }
+                | ExecutionEvent::ChildExecutionSpawned { execution_id, .. }
+                | ExecutionEvent::ChildExecutionCompleted { execution_id, .. } => *execution_id,
                 ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { execution_id, .. }
                     | ValidationEvent::MultiJudgeConsensus { execution_id, .. } => *execution_id,
@@ -282,7 +284,9 @@ impl DomainEvent {
                 | ExecutionEvent::ConsoleOutput { agent_id, .. }
                 | ExecutionEvent::LlmInteraction { agent_id, .. }
                 | ExecutionEvent::InstanceSpawned { agent_id, .. }
-                | ExecutionEvent::InstanceTerminated { agent_id, .. } => *agent_id,
+                | ExecutionEvent::InstanceTerminated { agent_id, .. }
+                | ExecutionEvent::ChildExecutionSpawned { agent_id, .. }
+                | ExecutionEvent::ChildExecutionCompleted { agent_id, .. } => *agent_id,
                 ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. }
                     | ValidationEvent::MultiJudgeConsensus { agent_id, .. } => *agent_id,
@@ -360,6 +364,8 @@ impl DomainEvent {
                 ExecutionEvent::LlmInteraction { timestamp, .. } => *timestamp,
                 ExecutionEvent::InstanceSpawned { spawned_at, .. } => *spawned_at,
                 ExecutionEvent::InstanceTerminated { terminated_at, .. } => *terminated_at,
+                ExecutionEvent::ChildExecutionSpawned { spawned_at, .. } => *spawned_at,
+                ExecutionEvent::ChildExecutionCompleted { completed_at, .. } => *completed_at,
                 ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { validated_at, .. } => {
                         *validated_at
@@ -520,6 +526,8 @@ impl DomainEvent {
                 ExecutionEvent::LlmInteraction { .. } => "llm_interaction",
                 ExecutionEvent::InstanceSpawned { .. } => "instance_spawned",
                 ExecutionEvent::InstanceTerminated { .. } => "instance_terminated",
+                ExecutionEvent::ChildExecutionSpawned { .. } => "child_execution_spawned",
+                ExecutionEvent::ChildExecutionCompleted { .. } => "child_execution_completed",
                 ExecutionEvent::Validation(validation) => match validation {
                     ValidationEvent::GradientValidationPerformed { .. } => {
                         "gradient_validation_performed"
@@ -709,7 +717,9 @@ impl DomainEvent {
                 | ExecutionEvent::ExecutionCompleted { .. }
                 | ExecutionEvent::ExecutionFailed { .. }
                 | ExecutionEvent::ExecutionCancelled { .. }
-                | ExecutionEvent::ExecutionTimedOut { .. } => None,
+                | ExecutionEvent::ExecutionTimedOut { .. }
+                | ExecutionEvent::ChildExecutionSpawned { .. }
+                | ExecutionEvent::ChildExecutionCompleted { .. } => None,
             },
             DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
                 iteration_number,
@@ -746,6 +756,8 @@ impl DomainEvent {
                 ExecutionEvent::LlmInteraction { .. } => "llm",
                 ExecutionEvent::InstanceSpawned { .. }
                 | ExecutionEvent::InstanceTerminated { .. } => "runtime",
+                ExecutionEvent::ChildExecutionSpawned { .. }
+                | ExecutionEvent::ChildExecutionCompleted { .. } => "execution",
             }),
             DomainEvent::Workflow(_) => Some("workflow"),
             DomainEvent::Learning(_) => Some("learning"),
@@ -1064,6 +1076,12 @@ impl ExecutionEventReceiver {
             ExecutionEvent::ExecutionTimedOut { execution_id, .. } => {
                 execution_id == &self.execution_id
             }
+            ExecutionEvent::ChildExecutionSpawned { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
+            ExecutionEvent::ChildExecutionCompleted { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
             ExecutionEvent::Validation(e) => match e {
                 ValidationEvent::GradientValidationPerformed { execution_id, .. } => {
                     execution_id == &self.execution_id
@@ -1174,6 +1192,12 @@ impl AgentEventReceiver {
                 ExecutionEvent::InstanceSpawned { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::InstanceTerminated { agent_id, .. } => agent_id == &self.agent_id,
                 ExecutionEvent::ExecutionTimedOut { agent_id, .. } => agent_id == &self.agent_id,
+                ExecutionEvent::ChildExecutionSpawned { agent_id, .. } => {
+                    agent_id == &self.agent_id
+                }
+                ExecutionEvent::ChildExecutionCompleted { agent_id, .. } => {
+                    agent_id == &self.agent_id
+                }
                 ExecutionEvent::Validation(v) => match v {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. } => {
                         agent_id == &self.agent_id
