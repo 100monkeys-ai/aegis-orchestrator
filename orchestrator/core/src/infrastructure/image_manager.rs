@@ -14,7 +14,7 @@
 //! | 2 (future)  | OpenBao dynamic | `OpenBaoCredentialResolver` — wires vault path per registry |
 //!
 //! The `credential_resolver` field on [`StandardDockerImageManager`] is the integration
-//! point; swapping the resolver for Phase 2 requires no structural changes to `DockerRuntime`.
+//! point; swapping the resolver for Phase 2 requires no structural changes to `ContainerRuntime`.
 //!
 //! See ADR-045 (Container Registry & Image Management), ADR-034 (OpenBao Secrets).
 
@@ -79,8 +79,8 @@ impl CredentialResolver for NodeConfigCredentialResolver {
 
 /// Manages Docker image availability: pull-policy enforcement and cache checks.
 ///
-/// Extracted from inline `DockerRuntime::spawn()` logic to enable independent
-/// testing and Phase 2 credential injection. `DockerRuntime` calls
+/// Extracted from inline `ContainerRuntime::spawn()` logic to enable independent
+/// testing and Phase 2 credential injection. `ContainerRuntime` calls
 /// [`DockerImageManager::ensure_image`] in `spawn()` (ADR-045).
 #[async_trait]
 pub trait DockerImageManager: Send + Sync {
@@ -97,7 +97,7 @@ pub trait DockerImageManager: Send + Sync {
     ///
     /// `credentials_override` — when `Some`, bypasses the node-config
     /// [`CredentialResolver`] and uses the supplied credentials directly.
-    /// Used by [`crate::infrastructure::container_step_runner::DockerContainerStepRunner`]
+    /// Used by [`crate::infrastructure::container_step_runner::ContainerStepRunnerImpl`]
     /// when per-step registry credentials are resolved from OpenBao (ADR-050).
     async fn ensure_image(
         &self,

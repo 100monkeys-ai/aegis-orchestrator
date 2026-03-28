@@ -1787,7 +1787,7 @@ impl ExecutionService for StandardExecutionService {
                 .advanced
                 .as_ref()
                 .and_then(|a| a.bootstrap_path.clone()),
-            // Attach execution_id so DockerRuntime can correlate image events (ADR-045).
+            // Attach execution_id so ContainerRuntime can correlate image events (ADR-045).
             execution_id,
         };
 

@@ -20,7 +20,7 @@
 
 use crate::domain::events::SecretEvent;
 use crate::domain::mcp::{CredentialRef, CredentialStoreType};
-use crate::domain::node_config::SecretBackendConfig;
+use crate::domain::node_config::{resolve_env_value, SecretBackendConfig};
 use crate::domain::secrets::{
     AccessContext, DomainDynamicSecret, SecretStore, SecretsError, SensitiveString,
 };
@@ -116,10 +116,13 @@ impl OpenBaoSecretStore {
             ))
         })?;
 
+        let role_id = resolve_env_value(&config.approle.role_id).map_err(|e| {
+            SecretsError::ConfigError(format!("Failed to resolve AppRole Role ID: {e}"))
+        })?;
+
         debug!("Authenticating with OpenBao AppRole...");
         let auth_response =
-            vaultrs::auth::approle::login(&client, "approle", &config.approle.role_id, &secret_id)
-                .await?;
+            vaultrs::auth::approle::login(&client, "approle", &role_id, &secret_id).await?;
 
         client.set_token(&auth_response.client_token);
         info!("Successfully authenticated with OpenBao AppRole");

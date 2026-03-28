@@ -12,7 +12,7 @@
 //!
 //! | Implementation | Phase | Location |
 //! |---|---|---|
-//! | `DockerRuntime` | Phase 1 (current) | `crate::infrastructure::runtime` |
+//! | `ContainerRuntime` | Phase 1 (current) | `crate::infrastructure::runtime` |
 //! | `FirecrackerRuntime` | Phase 2 (deferred) | `crate::infrastructure::runtime` |
 //!
 //! ## UID/GID Squashing (ADR-036)
@@ -26,7 +26,7 @@
 
 use crate::domain::shared_kernel::{ExecutionId, ImagePullPolicy};
 // Conformist: BC-2 (Execution) conforms to BC-7 (Storage Gateway) volume model.
-// The infrastructure layer (DockerRuntime) accesses VolumeMount fields including
+// The infrastructure layer (ContainerRuntime) accesses VolumeMount fields including
 // AccessMode enum variants, so a full ACL wrapper is not cost-effective here.
 use crate::domain::volume::VolumeMount;
 use async_trait::async_trait;
@@ -84,7 +84,7 @@ pub struct RuntimeConfig {
     /// `application/execution.rs` before constructing this config.
     /// For **CustomRuntime** this is the verbatim `spec.runtime.image` value from the manifest.
     ///
-    /// Always non-empty by the time `DockerRuntime::spawn()` is called (ADR-043, ADR-044).
+    /// Always non-empty by the time `ContainerRuntime::spawn()` is called (ADR-043, ADR-044).
     pub image: String,
     /// In-container path to the bootstrap script (ADR-044).
     ///
@@ -139,7 +139,7 @@ impl RuntimeConfig {
     ///
     /// This is the sole mechanism for resolving StandardRuntime images (ADR-043). The
     /// `application/execution.rs` layer calls this before constructing [`RuntimeConfig`];
-    /// by the time `DockerRuntime::spawn()` is invoked, `config.image` is always pre-set.
+    /// by the time `ContainerRuntime::spawn()` is invoked, `config.image` is always pre-set.
     ///
     /// # Errors
     ///
@@ -288,7 +288,7 @@ pub struct InstanceStatus {
 
 /// Core abstraction over isolated execution environments (BC-2 Execution Context).
 ///
-/// Implemented by `DockerRuntime` (Phase 1) in `crate::infrastructure::runtime` and
+/// Implemented by `ContainerRuntime` (Phase 1) in `crate::infrastructure::runtime` and
 /// by `FirecrackerRuntime` (Phase 2, not yet implemented).
 ///
 /// # Invariants

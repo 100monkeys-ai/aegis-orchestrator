@@ -74,7 +74,7 @@ pub enum PullSource {
     Downloaded,
 }
 
-/// Container image lifecycle events emitted by [`crate::infrastructure::runtime::DockerRuntime`]
+/// Container image lifecycle events emitted by [`crate::infrastructure::runtime::ContainerRuntime`]
 /// during the `spawn()` path (ADR-045).
 ///
 /// Published to the [`crate::infrastructure::event_bus::EventBus`] before/after every

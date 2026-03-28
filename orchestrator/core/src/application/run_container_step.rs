@@ -50,7 +50,7 @@ pub struct RunContainerStepOutput {
 
 /// Use case: run a single `ContainerRun` workflow state, applying retry logic.
 ///
-/// Event publishing is handled by [`crate::infrastructure::container_step_runner::DockerContainerStepRunner`]
+/// Event publishing is handled by [`crate::infrastructure::container_step_runner::ContainerStepRunnerImpl`]
 /// at the infrastructure layer. [`RunParallelContainerStepsUseCase`] holds its own `event_bus`
 /// for the aggregated parallel completion event.
 pub struct RunContainerStepUseCase {

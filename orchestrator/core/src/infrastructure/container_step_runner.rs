@@ -50,12 +50,12 @@ const STREAM_BYTES_CAP: usize = 1_048_576;
 
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
 /// Docker Engine API (bollard). Shares image management and NFS configuration
-/// with [`crate::infrastructure::runtime::DockerRuntime`].
+/// with [`crate::infrastructure::runtime::ContainerRuntime`].
 pub struct ContainerStepRunnerImpl {
     docker: Docker,
     image_manager: Arc<dyn DockerImageManager>,
     /// Explicit NFS server host used for volume mount options (addr=...).
-    /// Same semantics as `DockerRuntime::nfs_server_host` (ADR-036).
+    /// Same semantics as `ContainerRuntime::nfs_server_host` (ADR-036).
     nfs_server_host: Option<String>,
     nfs_port: u16,
     nfs_mountport: u16,
