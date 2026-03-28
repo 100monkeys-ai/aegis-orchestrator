@@ -1163,6 +1163,25 @@ impl SupervisorObserver for ExecutionMonitor {
                 error: iter_error,
                 failed_at: now,
             });
+
+        // Emit RefinementApplied to signal that a retry/refinement cycle is about to begin.
+        // code_diff is empty until the orchestrator tracks per-iteration diffs; Cortex fields
+        // will be populated once the Cortex gRPC interface returns pattern metadata.
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::RefinementApplied {
+                execution_id: self.execution_id,
+                agent_id: self.agent_id,
+                iteration_number: iteration,
+                code_diff: crate::domain::execution::CodeDiff {
+                    file_path: String::new(),
+                    diff: String::new(),
+                },
+                applied_at: now,
+                cortex_pattern_id: None,
+                cortex_pattern_category: None,
+                cortex_success_score: None,
+                cortex_solution_approach: None,
+            });
     }
 
     async fn on_instance_spawned(
@@ -2103,6 +2122,8 @@ impl ExecutionService for StandardExecutionService {
             .map(|e| e.max_retries as u8)
             .unwrap_or(3);
 
+        let parent_agent_id = parent.agent_id;
+
         let mut child_execution = crate::domain::execution::Execution::new_child(
             agent_id,
             prepared_input.clone(),
@@ -2111,6 +2132,16 @@ impl ExecutionService for StandardExecutionService {
         )
         .map_err(|e| anyhow!("Failed to create child execution: {e}"))?;
         let child_execution_id = child_execution.id;
+
+        self.event_bus
+            .publish_execution_event(ExecutionEvent::ChildExecutionSpawned {
+                execution_id: parent_execution_id,
+                agent_id: parent_agent_id,
+                parent_execution_id,
+                child_execution_id,
+                child_agent_id: agent_id,
+                spawned_at: Utc::now(),
+            });
 
         // 5. Build runtime config.
         let mut env = agent.manifest.spec.env.clone();
@@ -2454,6 +2485,8 @@ impl ExecutionService for StandardExecutionService {
         let tokens_map = self.cancellation_tokens.clone();
         let cortex_client = self.cortex_client.clone();
         let tenant_id_for_task = tenant_id.clone();
+        let parent_execution_id_for_task = parent_execution_id;
+        let parent_agent_id_for_task = parent_agent_id;
 
         tokio::spawn(async move {
             let result = supervisor
@@ -2481,12 +2514,21 @@ impl ExecutionService for StandardExecutionService {
 
                         StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
+                        let completed_at = Utc::now();
                         event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
                             execution_id: child_execution_id,
                             agent_id,
-                            final_output,
+                            final_output: final_output.clone(),
                             total_iterations,
-                            completed_at: Utc::now(),
+                            completed_at,
+                        });
+
+                        event_bus.publish_execution_event(ExecutionEvent::ChildExecutionCompleted {
+                            execution_id: parent_execution_id_for_task,
+                            agent_id: parent_agent_id_for_task,
+                            child_execution_id,
+                            outcome: final_output,
+                            completed_at,
                         });
                     }
                 }

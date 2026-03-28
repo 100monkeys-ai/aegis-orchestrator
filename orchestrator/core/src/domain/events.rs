@@ -291,6 +291,14 @@ pub enum ExecutionEvent {
         iteration_number: u8,
         code_diff: CodeDiff,
         applied_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cortex_pattern_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cortex_pattern_category: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cortex_success_score: Option<f64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cortex_solution_approach: Option<String>,
     },
     ExecutionCompleted {
         execution_id: ExecutionId,
@@ -355,6 +363,25 @@ pub enum ExecutionEvent {
         iteration_number: u8,
         instance_id: InstanceId,
         terminated_at: DateTime<Utc>,
+    },
+    /// A child execution was spawned by this execution (swarm coordination, ADR-039).
+    /// `execution_id` is the parent; `child_execution_id` is the spawned child.
+    ChildExecutionSpawned {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        parent_execution_id: ExecutionId,
+        child_execution_id: ExecutionId,
+        child_agent_id: AgentId,
+        spawned_at: DateTime<Utc>,
+    },
+    /// A child execution completed (swarm coordination, ADR-039).
+    /// `execution_id` is the parent; `child_execution_id` is the completed child.
+    ChildExecutionCompleted {
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        child_execution_id: ExecutionId,
+        outcome: String,
+        completed_at: DateTime<Utc>,
     },
     Validation(ValidationEvent),
 }
