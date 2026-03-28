@@ -441,7 +441,7 @@ impl ConfigWizard {
                 .default(defaults.log_level.clone())
                 .interact_text()?,
             docker_network: Input::new()
-                .with_prompt("AEGIS_DOCKER_NETWORK")
+                .with_prompt("AEGIS_CONTAINER_NETWORK")
                 .default(defaults.docker_network.clone())
                 .interact_text()?,
             orchestrator_url: Input::new()
@@ -1280,7 +1280,7 @@ spec:
 {llm_section}
 {builtin_dispatchers_section}
   runtime:
-    container_network_mode: "env:AEGIS_DOCKER_NETWORK"
+    container_network_mode: "env:AEGIS_CONTAINER_NETWORK"
     orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
     nfs_server_host: "env:AEGIS_NFS_HOST"
 
@@ -1415,7 +1415,7 @@ COMPOSE_PROFILES={profiles}
 KEYCLOAK_ADMIN_PASSWORD={keycloak_admin_password}
 
 # ─── AEGIS Runtime Networking ─────────────────────────────────────────────────
-AEGIS_DOCKER_NETWORK={docker_network}
+AEGIS_CONTAINER_NETWORK={docker_network}
 AEGIS_ORCHESTRATOR_URL={orchestrator_url}
 
 # NFS server host — set to the correct value for your platform:

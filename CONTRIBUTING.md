@@ -272,14 +272,24 @@ npm test
 
 ```rust
 #[tokio::test]
-async fn test_docker_runtime_spawn() {
-    let runtime = DockerRuntime::new("assets/bootstrap.py".to_string(), None, None, "http://localhost:8088".to_string(), None, 2049, 2049).unwrap();
+async fn test_container_runtime_spawn() {
+    let runtime = ContainerRuntime::new(ContainerRuntimeConfig {
+        bootstrap_script: "assets/bootstrap.py".to_string(),
+        socket_path: None,
+        network_mode: None,
+        orchestrator_url: "http://localhost:8088".to_string(),
+        nfs_server_host: None,
+        nfs_port: 2049,
+        nfs_mountport: 2049,
+        event_bus: event_bus.clone(),
+        credential_resolver: credential_resolver.clone(),
+    }).unwrap();
     let config = AgentConfig {
         name: "test-agent".to_string(),
         runtime: "python:3.11".to_string(),
         // ...
     };
-    
+
     let instance_id = runtime.spawn(config).await.unwrap();
     assert!(!instance_id.as_str().is_empty());
 }
