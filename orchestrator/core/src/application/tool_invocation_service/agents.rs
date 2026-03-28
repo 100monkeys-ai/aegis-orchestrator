@@ -356,4 +356,64 @@ impl ToolInvocationService {
             }))),
         }
     }
+
+    /// Handler for `aegis.agent.logs` — retrieves agent-level activity log snapshot.
+    pub(super) async fn invoke_aegis_agent_logs_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let agent_id_str = args
+            .get("agent_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.agent.logs requires 'agent_id' string".to_string(),
+                )
+            })?;
+
+        let agent_id = uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
+            SmcpSessionError::InvalidArguments(format!(
+                "aegis.agent.logs: invalid agent_id UUID: {e}"
+            ))
+        })?;
+
+        let limit: usize = args
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|n| (n as usize).min(200))
+            .unwrap_or(50);
+        let offset: usize = args
+            .get("offset")
+            .and_then(|v| v.as_u64())
+            .map(|n| n as usize)
+            .unwrap_or(0);
+
+        let port = match &self.agent_activity {
+            Some(p) => p,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.logs",
+                    "error": "Agent activity port not configured"
+                })));
+            }
+        };
+
+        match port.agent_logs_snapshot(agent_id, limit, offset).await {
+            Ok(events) => {
+                let total = events.len();
+                Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.logs",
+                    "agent_id": agent_id_str,
+                    "events": events,
+                    "total": total,
+                    "limit": limit,
+                    "offset": offset,
+                })))
+            }
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.agent.logs",
+                "error": format!("Failed to fetch agent logs: {e}")
+            }))),
+        }
+    }
 }

@@ -80,6 +80,13 @@ pub trait AgentRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError>;
 
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Agent>, RepositoryError>;
+
     async fn list_all_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -106,6 +113,16 @@ pub trait AgentRepository: Send + Sync {
     /// Find agent by name
     async fn find_by_name(&self, name: &str) -> Result<Option<Agent>, RepositoryError> {
         self.find_by_name_for_tenant(&TenantId::local_default(), name)
+            .await
+    }
+
+    /// Find agent by name and version
+    async fn find_by_name_and_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        self.find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
             .await
     }
 
@@ -211,6 +228,13 @@ pub trait WorkflowRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError>;
 
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError>;
+
     async fn list_all_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -237,6 +261,16 @@ pub trait WorkflowRepository: Send + Sync {
     /// Find workflow by name
     async fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, RepositoryError> {
         self.find_by_name_for_tenant(&TenantId::local_default(), name)
+            .await
+    }
+
+    /// Find workflow by name and version
+    async fn find_by_name_and_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
             .await
     }
 

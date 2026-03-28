@@ -130,4 +130,22 @@ pub trait AgentLifecycleService: Send + Sync {
         self.lookup_agent_for_tenant(&TenantId::local_default(), name)
             .await
     }
+
+    /// Resolve an agent name + version to its [`AgentId`], or `None` if not found.
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<AgentId>>;
+
+    /// Convenience wrapper calling [`lookup_agent_for_tenant_with_version`] with the local default tenant.
+    async fn lookup_agent_with_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent_for_tenant_with_version(&TenantId::local_default(), name, version)
+            .await
+    }
 }

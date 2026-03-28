@@ -120,10 +120,33 @@ impl AgentRepository for InMemoryAgentRepository {
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
-        Ok(agents
-            .get(tenant_id)
-            .and_then(|tenant_agents| tenant_agents.values().find(|a| a.name == name))
-            .cloned())
+        Ok(agents.get(tenant_id).and_then(|tenant_agents| {
+            tenant_agents
+                .values()
+                .filter(|a| a.name == name)
+                .max_by(|a, b| {
+                    a.manifest
+                        .metadata
+                        .version
+                        .cmp(&b.manifest.metadata.version)
+                })
+                .cloned()
+        }))
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        Ok(agents.get(tenant_id).and_then(|tenant_agents| {
+            tenant_agents
+                .values()
+                .find(|a| a.name == name && a.manifest.metadata.version == version)
+                .cloned()
+        }))
     }
 
     async fn list_all_for_tenant(
@@ -254,6 +277,23 @@ impl AgentLifecycleService for InMemoryAgentRepository {
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
+    }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        let agents = self.agents.read().unwrap();
+        let tenant_agents = match agents.get(tenant_id) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        Ok(tenant_agents
+            .values()
+            .find(|a| a.name == name && a.manifest.metadata.version == version)
+            .map(|a| a.id))
     }
 }
 
@@ -401,12 +441,28 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
-        Ok(workflows
-            .get(tenant_id)
-            .and_then(|tenant_workflows| {
-                tenant_workflows.values().find(|w| w.metadata.name == name)
-            })
-            .cloned())
+        Ok(workflows.get(tenant_id).and_then(|tenant_workflows| {
+            tenant_workflows
+                .values()
+                .filter(|w| w.metadata.name == name)
+                .max_by(|a, b| a.metadata.version.cmp(&b.metadata.version))
+                .cloned()
+        }))
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        Ok(workflows.get(tenant_id).and_then(|tenant_workflows| {
+            tenant_workflows
+                .values()
+                .find(|w| w.metadata.name == name && w.metadata.version.as_deref() == Some(version))
+                .cloned()
+        }))
     }
 
     async fn list_all_for_tenant(

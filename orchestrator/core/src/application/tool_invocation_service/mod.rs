@@ -21,7 +21,9 @@ use std::time::Instant;
 use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::application::nfs_gateway::NfsVolumeRegistry;
-use crate::application::ports::ExternalWebToolPort;
+use crate::application::ports::{
+    AgentActivityPort, ExternalWebToolPort, WorkflowExecutionControlPort,
+};
 use crate::application::register_workflow::RegisterWorkflowUseCase;
 use crate::application::schema_registry::SchemaRegistry;
 use crate::application::start_workflow_execution::StartWorkflowExecutionUseCase;
@@ -100,4 +102,8 @@ pub struct ToolInvocationService {
     smcp_gateway_url: Option<String>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
+    /// Optional port for workflow execution control (cancel, signal, remove).
+    workflow_execution_control: Option<Arc<dyn WorkflowExecutionControlPort>>,
+    /// Optional port for agent-level activity logs.
+    agent_activity: Option<Arc<dyn AgentActivityPort>>,
 }

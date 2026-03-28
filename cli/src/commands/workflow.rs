@@ -72,6 +72,10 @@ pub enum WorkflowCommand {
         #[arg(long, value_name = "DICT")]
         blackboard: Option<String>,
 
+        /// Target a specific workflow version (default: latest)
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+
         /// Follow execution logs
         #[arg(long, short = 'f')]
         follow: bool,
@@ -226,6 +230,7 @@ pub async fn handle_command(
             input,
             params,
             blackboard,
+            version,
             follow,
             wait,
         } => {
@@ -235,6 +240,7 @@ pub async fn handle_command(
                     input_json: input,
                     params,
                     blackboard,
+                    version,
                     follow,
                     wait,
                 },
@@ -361,6 +367,7 @@ struct WorkflowRunRequest {
     input_json: Option<String>,
     params: Vec<String>,
     blackboard: Option<String>,
+    version: Option<String>,
     follow: bool,
     wait: bool,
 }
@@ -599,6 +606,7 @@ async fn run_workflow(
             &request.name,
             serde_json::Value::Object(input_params),
             blackboard,
+            request.version.as_deref(),
         )
         .await
         .context("Failed to start workflow execution")?;
@@ -790,6 +798,7 @@ async fn generate_workflow(
             serde_json::json!({
                 "input": input
             }),
+            None,
             None,
         )
         .await

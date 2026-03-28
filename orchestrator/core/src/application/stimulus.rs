@@ -449,6 +449,7 @@ impl StimulusService for StandardStimulusService {
                 "headers":          stimulus.headers,
             }),
             blackboard: None,
+            version: None,
             tenant_id: Some(Self::tenant_id_for_stimulus(&stimulus)),
         };
 

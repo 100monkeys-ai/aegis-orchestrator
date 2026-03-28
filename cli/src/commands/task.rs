@@ -39,6 +39,10 @@ pub enum TaskCommand {
         #[arg(long, value_name = "DICT")]
         context: Option<String>,
 
+        /// Target a specific agent version (default: latest)
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+
         /// Wait for execution to complete
         #[arg(short, long)]
         wait: bool,
@@ -163,9 +167,22 @@ async fn handle_command_daemon(
             agent,
             input,
             context,
+            version,
             wait,
             follow,
-        } => execute_daemon(agent, input, context, wait, follow, client, output_format).await,
+        } => {
+            execute_daemon(
+                agent,
+                input,
+                context,
+                version,
+                wait,
+                follow,
+                client,
+                output_format,
+            )
+            .await
+        }
         TaskCommand::Status { execution_id } => {
             status_daemon(execution_id, client, output_format).await
         }
@@ -195,10 +212,12 @@ async fn handle_command_daemon(
 }
 
 // Implementations
+#[allow(clippy::too_many_arguments)]
 async fn execute_daemon(
     agent: String,
     input: Option<String>,
     context: Option<String>,
+    version: Option<String>,
     wait: bool,
     follow: bool,
     client: DaemonClient,
@@ -250,7 +269,7 @@ async fn execute_daemon(
     }
 
     let execution_id = client
-        .execute_agent(agent_id, input_data, context_overrides)
+        .execute_agent(agent_id, input_data, context_overrides, version.as_deref())
         .await?;
 
     if follow {

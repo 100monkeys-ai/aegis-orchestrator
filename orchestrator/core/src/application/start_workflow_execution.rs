@@ -45,6 +45,11 @@ pub struct StartWorkflowExecutionRequest {
     /// Rust does not mutate the blackboard during workflow execution.
     pub blackboard: Option<serde_json::Value>,
 
+    /// Optional version qualifier for workflow resolution. When set, the workflow is
+    /// looked up by name **and** version rather than name alone.
+    #[serde(default)]
+    pub version: Option<String>,
+
     #[serde(default)]
     pub tenant_id: Option<TenantId>,
 }
@@ -245,6 +250,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             let id = WorkflowId::from_uuid(uuid);
             self.workflow_repository
                 .find_by_id_for_tenant(tenant_id, id)
+                .await
+        } else if let Some(ref version) = request.version {
+            self.workflow_repository
+                .find_by_name_and_version_for_tenant(tenant_id, &request.workflow_id, version)
                 .await
         } else {
             self.workflow_repository
@@ -619,6 +628,7 @@ mod tests {
                     "judges": ["lint-judge", "security-judge"],
                     "validation_threshold": 0.85
                 })),
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -688,6 +698,7 @@ mod tests {
                 workflow_id: workflow.metadata.name.clone(),
                 input: json!({ "branch": "main" }),
                 blackboard: None,
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -722,6 +733,7 @@ mod tests {
                 workflow_id: workflow.metadata.name.clone(),
                 input: json!({ "target": "release" }),
                 blackboard: Some(json!(["not", "an", "object"])),
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -752,6 +764,7 @@ mod tests {
                 workflow_id: workflow.metadata.name.clone(),
                 input: json!({ "target": "release" }),
                 blackboard: Some(json!({ "input": "reserved" })),
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -780,6 +793,7 @@ mod tests {
                 workflow_id: workflow.id.to_string(),
                 input: json!({ "target": "release" }),
                 blackboard: None,
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -812,6 +826,7 @@ mod tests {
                 workflow_id: workflow.metadata.name.clone(),
                 input: json!({ "prompt": "ship it" }),
                 blackboard: None,
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await
@@ -876,6 +891,15 @@ mod tests {
                 Ok(None)
             }
 
+            async fn find_by_name_and_version_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                _name: &str,
+                _version: &str,
+            ) -> Result<Option<Workflow>, RepositoryError> {
+                Ok(None)
+            }
+
             async fn list_all_for_tenant(
                 &self,
                 _tenant_id: &TenantId,
@@ -912,6 +936,7 @@ mod tests {
                 workflow_id: "does-not-exist".to_string(),
                 input: json!({}),
                 blackboard: None,
+                version: None,
                 tenant_id: Some(TenantId::local_default()),
             })
             .await

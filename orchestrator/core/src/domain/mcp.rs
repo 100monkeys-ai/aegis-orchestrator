@@ -642,14 +642,17 @@ impl ToolInputContract {
             "aegis.execute" => &["prompt"],
             "aegis.agent.create" | "aegis.agent.update" => &["manifest_yaml"],
             "aegis.agent.export" => &["name"],
-            "aegis.agent.delete" | "aegis.task.execute" => &["agent_id"],
+            "aegis.agent.delete" | "aegis.task.execute" | "aegis.agent.logs" => &["agent_id"],
             "aegis.agent.generate" | "aegis.workflow.generate" => &["input"],
             "aegis.workflow.validate" => &["manifest_yaml"],
             "aegis.workflow.create" | "aegis.workflow.update" => &["manifest_yaml"],
             "aegis.workflow.export" | "aegis.workflow.delete" | "aegis.workflow.run" => &["name"],
-            "aegis.workflow.logs" | "aegis.workflow.status" | "aegis.workflow.executions.get" => {
-                &["execution_id"]
-            }
+            "aegis.workflow.logs"
+            | "aegis.workflow.status"
+            | "aegis.workflow.executions.get"
+            | "aegis.workflow.cancel"
+            | "aegis.workflow.remove" => &["execution_id"],
+            "aegis.workflow.signal" => &["execution_id", "response"],
             "aegis.task.status" | "aegis.task.logs" | "aegis.task.cancel" | "aegis.task.remove" => {
                 &["execution_id"]
             }

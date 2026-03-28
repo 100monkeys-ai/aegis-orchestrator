@@ -150,4 +150,18 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
     }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<AgentId>> {
+        let agent = self
+            .repository
+            .find_by_name_and_version_for_tenant(tenant_id, name, version)
+            .await
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
+        Ok(agent.map(|a| a.id))
+    }
 }

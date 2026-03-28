@@ -101,3 +101,40 @@ pub struct AttestationTokenClaims {
 pub trait SecurityTokenIssuerPort: Send + Sync {
     fn issue(&self, claims: &mut AttestationTokenClaims) -> anyhow::Result<String>;
 }
+
+/// Port for workflow execution control operations (cancel, signal, remove).
+///
+/// Infrastructure adapters implement this to interact with the workflow engine
+/// (e.g. Temporal) for lifecycle management of running workflow executions.
+#[async_trait]
+pub trait WorkflowExecutionControlPort: Send + Sync {
+    async fn cancel_workflow_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn signal_workflow_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        response: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    async fn remove_workflow_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Port for retrieving agent-level activity log snapshots.
+///
+/// Infrastructure adapters implement this to fetch agent event history
+/// from whatever storage backend is in use.
+#[async_trait]
+pub trait AgentActivityPort: Send + Sync {
+    async fn agent_logs_snapshot(
+        &self,
+        agent_id: uuid::Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
+}

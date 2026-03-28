@@ -116,6 +116,10 @@ impl ToolInvocationService {
 
         let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
         let blackboard = args.get("blackboard").cloned();
+        let version = args
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,
@@ -133,6 +137,7 @@ impl ToolInvocationService {
                     workflow_id: name.to_string(),
                     input,
                     blackboard,
+                    version,
                     tenant_id: Some(tenant_id.clone()),
                 },
             )
@@ -348,6 +353,7 @@ impl ToolInvocationService {
                     workflow_id: "builtin-workflow-generator".to_string(),
                     input: serde_json::json!({ "input": input }),
                     blackboard: None,
+                    version: None,
                     tenant_id: Some(tenant_id),
                 },
             )
@@ -446,6 +452,153 @@ impl ToolInvocationService {
             "limit": limit,
             "offset": offset,
         })))
+    }
+
+    /// Handler for `aegis.workflow.cancel` — cancels a running workflow execution.
+    pub(super) async fn invoke_aegis_workflow_cancel_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let exec_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.cancel requires 'execution_id' string".to_string(),
+                )
+            })?;
+
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.workflow.cancel: invalid execution_id UUID: {e}"
+                ))
+            })?,
+        );
+
+        let port = match &self.workflow_execution_control {
+            Some(p) => p,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.cancel",
+                    "error": "Workflow execution control port not configured"
+                })));
+            }
+        };
+
+        match port.cancel_workflow_execution(exec_id).await {
+            Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.cancel",
+                "cancelled": true,
+                "execution_id": exec_id_str
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.cancel",
+                "cancelled": false,
+                "error": format!("Failed to cancel workflow execution: {e}")
+            }))),
+        }
+    }
+
+    /// Handler for `aegis.workflow.signal` — sends human input to a paused workflow.
+    pub(super) async fn invoke_aegis_workflow_signal_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let exec_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.signal requires 'execution_id' string".to_string(),
+                )
+            })?;
+
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.workflow.signal: invalid execution_id UUID: {e}"
+                ))
+            })?,
+        );
+
+        let response = args
+            .get("response")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.signal requires 'response' string".to_string(),
+                )
+            })?;
+
+        let port = match &self.workflow_execution_control {
+            Some(p) => p,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.signal",
+                    "error": "Workflow execution control port not configured"
+                })));
+            }
+        };
+
+        match port.signal_workflow_execution(exec_id, response).await {
+            Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.signal",
+                "signalled": true,
+                "execution_id": exec_id_str
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.signal",
+                "signalled": false,
+                "error": format!("Failed to signal workflow execution: {e}")
+            }))),
+        }
+    }
+
+    /// Handler for `aegis.workflow.remove` — removes a workflow execution record.
+    pub(super) async fn invoke_aegis_workflow_remove_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let exec_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.remove requires 'execution_id' string".to_string(),
+                )
+            })?;
+
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.workflow.remove: invalid execution_id UUID: {e}"
+                ))
+            })?,
+        );
+
+        let port = match &self.workflow_execution_control {
+            Some(p) => p,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.remove",
+                    "error": "Workflow execution control port not configured"
+                })));
+            }
+        };
+
+        match port.remove_workflow_execution(exec_id).await {
+            Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.remove",
+                "removed": true,
+                "execution_id": exec_id_str
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.remove",
+                "removed": false,
+                "error": format!("Failed to remove workflow execution: {e}")
+            }))),
+        }
     }
 
     pub(super) async fn invoke_aegis_workflow_list_tool(

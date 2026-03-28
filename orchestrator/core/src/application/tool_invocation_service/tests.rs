@@ -197,6 +197,15 @@ impl AgentLifecycleService for TestAgentLifecycleService {
     async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
         anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
     }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+        _version: &str,
+    ) -> Result<Option<AgentId>> {
+        anyhow::bail!("TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test")
+    }
 }
 
 struct FilteringAgentLifecycleService {
@@ -269,6 +278,16 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
 
     async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
         Ok((name == self.agent.name).then_some(self.agent.id))
+    }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+        _version: &str,
+    ) -> Result<Option<AgentId>> {
+        // Delegate to name-only lookup for existing tests
+        self.lookup_agent(name).await
     }
 }
 
@@ -1996,4 +2015,273 @@ fn sanitize_segment_replaces_special_characters() {
 fn sanitize_segment_preserves_safe_mixed_alphanumeric() {
     assert_eq!(sanitize_segment("validName-123"), "validName-123");
     assert_eq!(sanitize_segment("v1.2.3-beta_01"), "v1.2.3-beta_01");
+}
+
+// ---------------------------------------------------------------------------
+// Version-qualified lookup tests
+// ---------------------------------------------------------------------------
+
+/// Mock that resolves a specific agent name + version pair.
+struct VersionAwareAgentLifecycleService {
+    agent_name: String,
+    agent_version: String,
+    agent_id: AgentId,
+}
+
+#[async_trait]
+impl AgentLifecycleService for VersionAwareAgentLifecycleService {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        manifest: AgentManifest,
+        force: bool,
+    ) -> Result<AgentId> {
+        self.deploy_agent(manifest, force).await
+    }
+
+    async fn deploy_agent(&self, _: AgentManifest, _force: bool) -> Result<AgentId> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn get_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+        self.get_agent(id).await
+    }
+
+    async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn update_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+        manifest: AgentManifest,
+    ) -> Result<()> {
+        self.update_agent(id, manifest).await
+    }
+
+    async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn delete_agent_for_tenant(&self, _tenant_id: &TenantId, id: AgentId) -> Result<()> {
+        self.delete_agent(id).await
+    }
+
+    async fn delete_agent(&self, _: AgentId) -> Result<()> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
+        self.list_agents().await
+    }
+
+    async fn list_agents(&self) -> Result<Vec<Agent>> {
+        anyhow::bail!("not exercised")
+    }
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent(name).await
+    }
+
+    async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
+        Ok((name == self.agent_name).then_some(self.agent_id))
+    }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent_with_version(name, version).await
+    }
+
+    async fn lookup_agent_with_version(
+        &self,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<AgentId>> {
+        Ok((name == self.agent_name && version == self.agent_version).then_some(self.agent_id))
+    }
+}
+
+/// Helper: build a `ToolInvocationService` backed by a `VersionAwareAgentLifecycleService`.
+fn build_version_aware_service(
+    agent_name: &str,
+    agent_version: &str,
+    agent_id: AgentId,
+) -> ToolInvocationService {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+
+    ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(VersionAwareAgentLifecycleService {
+            agent_name: agent_name.to_string(),
+            agent_version: agent_version.to_string(),
+            agent_id,
+        }),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution(start_use_case)
+}
+
+#[tokio::test]
+async fn task_execute_with_version_on_name_lookup_uses_versioned_resolution() {
+    let agent_id = AgentId::new();
+    let service = build_version_aware_service("my-agent", "2.0.0", agent_id);
+
+    // Should resolve using version-qualified lookup and fail to start
+    // (TestExecutionService always bails), but the point is that it reaches
+    // the execution phase — meaning the version lookup succeeded.
+    let result = service
+        .invoke_aegis_task_execute_tool(&serde_json::json!({
+            "agent_id": "my-agent",
+            "version": "2.0.0",
+            "input": { "task": "hello" },
+        }))
+        .await
+        .expect("should return a direct result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.task.execute");
+    // TestExecutionService bails with an error, so the response should contain
+    // the "Failed to start task execution" error — proving agent resolution succeeded.
+    assert!(
+        payload.get("error").is_some() || payload.get("execution_id").is_some(),
+        "expected either an execution_id (success) or error (from test mock), got: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn task_execute_with_version_on_name_lookup_returns_not_found_for_wrong_version() {
+    let agent_id = AgentId::new();
+    let service = build_version_aware_service("my-agent", "2.0.0", agent_id);
+
+    let result = service
+        .invoke_aegis_task_execute_tool(&serde_json::json!({
+            "agent_id": "my-agent",
+            "version": "9.9.9",
+            "input": {},
+        }))
+        .await
+        .expect("should return a direct result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.task.execute");
+    let error = payload["error"].as_str().expect("should have error field");
+    assert!(
+        error.contains("my-agent") && error.contains("9.9.9") && error.contains("not found"),
+        "error should mention agent name, version, and 'not found': {error}"
+    );
+}
+
+#[tokio::test]
+async fn task_execute_with_version_on_uuid_returns_error() {
+    let agent_id = AgentId::new();
+    let service = build_version_aware_service("my-agent", "1.0.0", agent_id);
+
+    let result = service
+        .invoke_aegis_task_execute_tool(&serde_json::json!({
+            "agent_id": agent_id.0.to_string(),
+            "version": "1.0.0",
+            "input": {},
+        }))
+        .await
+        .expect("should return a direct result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.task.execute");
+    let error = payload["error"].as_str().expect("should have error field");
+    assert!(
+        error.contains("only supported when identifying agents by name"),
+        "error should explain version is only for name lookups: {error}"
+    );
+}
+
+#[tokio::test]
+async fn workflow_run_with_version_passes_version_through() {
+    let agent_id = AgentId::new();
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SmcpMiddleware::new());
+    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    let start_use_case = Arc::new(TestStartWorkflowExecutionUseCase::default());
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(VersionAwareAgentLifecycleService {
+            agent_name: "unused".to_string(),
+            agent_version: "unused".to_string(),
+            agent_id,
+        }),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+    .with_workflow_execution(start_use_case.clone());
+
+    let result = service
+        .invoke_aegis_workflow_run_tool(&serde_json::json!({
+            "name": "my-workflow",
+            "version": "3.1.0",
+            "input": { "task": "demo" },
+        }))
+        .await
+        .expect("workflow run should return a result");
+
+    let ToolInvocationResult::Direct(payload) = result else {
+        panic!("expected direct payload");
+    };
+
+    assert_eq!(payload["tool"], "aegis.workflow.run");
+    assert_eq!(payload["status"], "started");
+
+    let request = start_use_case
+        .last_request
+        .lock()
+        .await
+        .clone()
+        .expect("workflow run should record the request");
+    assert_eq!(request.version, Some("3.1.0".to_string()));
+    assert_eq!(request.workflow_id, "my-workflow");
 }

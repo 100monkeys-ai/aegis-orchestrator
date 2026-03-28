@@ -118,7 +118,14 @@ impl SmcpMiddleware {
                     }
                 }
 
-                if let Some(args) = envelope.extract_arguments() {
+                if let Some(mut args) = envelope.extract_arguments() {
+                    // ADR-073: Strip operator-only parameters from consumer tier
+                    // contexts. Consumer security contexts (zaru-*) must not be
+                    // able to pass `force` or `version` to tool handlers — those
+                    // are operator-level overrides.
+                    if session.security_context.name.starts_with("zaru-") {
+                        strip_operator_only_params(&mut args);
+                    }
                     Ok(args)
                 } else {
                     Err(SmcpSessionError::MalformedPayload(
@@ -238,6 +245,30 @@ async fn check_rate_limit(
     }
 
     Ok(())
+}
+
+/// Parameters that are restricted to operator-tier security contexts (ADR-073).
+///
+/// Consumer contexts (`zaru-free`, `zaru-pro`, `zaru-business`, `zaru-enterprise`)
+/// must not be able to pass these to tool handlers. The middleware strips them
+/// from the arguments `Value` before returning to the caller.
+const OPERATOR_ONLY_PARAMS: &[&str] = &["force", "version"];
+
+/// Remove operator-only keys from a `serde_json::Value` arguments object.
+///
+/// Only operates on `Value::Object` maps; other `Value` variants are left untouched
+/// because tool arguments are always JSON objects per the MCP spec.
+fn strip_operator_only_params(args: &mut Value) {
+    if let Some(map) = args.as_object_mut() {
+        for key in OPERATOR_ONLY_PARAMS {
+            if map.remove(*key).is_some() {
+                info!(
+                    param = *key,
+                    "Stripped operator-only parameter from consumer tier tool call"
+                );
+            }
+        }
+    }
 }
 
 impl Default for SmcpMiddleware {
@@ -395,6 +426,159 @@ mod tests {
             error,
             SmcpSessionError::MalformedPayload("missing arguments".to_string())
         );
+    }
+
+    /// Build a consumer-tier SecurityContext (zaru-* prefix) that allows all tools.
+    fn consumer_context(tier: &str) -> SecurityContext {
+        SecurityContext {
+            name: format!("zaru-{tier}"),
+            description: format!("Zaru {tier} consumer context"),
+            capabilities: vec![Capability {
+                tool_pattern: "*".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+            }],
+            deny_list: vec![],
+            metadata: SecurityContextMetadata {
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                version: 1,
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn consumer_tier_strips_force_and_version_from_args() {
+        let middleware = SmcpMiddleware::new();
+        let mut session = session_with_context(consumer_context("free"));
+        let envelope = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("aegis.agent.deploy".to_string()),
+            arguments: Some(json!({
+                "agent_name": "my-agent",
+                "force": true,
+                "version": "1.2.3"
+            })),
+        };
+
+        let args = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .await
+            .unwrap();
+
+        assert!(
+            args.get("force").is_none(),
+            "force must be stripped for consumer tier"
+        );
+        assert!(
+            args.get("version").is_none(),
+            "version must be stripped for consumer tier"
+        );
+        assert_eq!(
+            args.get("agent_name").unwrap(),
+            "my-agent",
+            "non-operator params preserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn consumer_tier_strips_params_across_all_tiers() {
+        let middleware = SmcpMiddleware::new();
+        for tier in &["free", "pro", "business", "enterprise"] {
+            let mut session = session_with_context(consumer_context(tier));
+            let envelope = DummyEnvelope {
+                signature_result: Ok(()),
+                tool_name: Some("tool.run".to_string()),
+                arguments: Some(json!({
+                    "path": "/workspace",
+                    "version": "2.0.0",
+                    "force": false
+                })),
+            };
+
+            let args = middleware
+                .verify_and_unwrap(&mut session, &envelope)
+                .await
+                .unwrap();
+
+            assert!(
+                args.get("force").is_none(),
+                "force must be stripped for zaru-{tier}"
+            );
+            assert!(
+                args.get("version").is_none(),
+                "version must be stripped for zaru-{tier}"
+            );
+            assert!(
+                args.get("path").is_some(),
+                "path must be preserved for zaru-{tier}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn operator_tier_preserves_force_and_version() {
+        let middleware = SmcpMiddleware::new();
+        // Non-zaru context (operator tier)
+        let mut session = session_with_context(allow_all_context());
+        let envelope = DummyEnvelope {
+            signature_result: Ok(()),
+            tool_name: Some("aegis.agent.deploy".to_string()),
+            arguments: Some(json!({
+                "agent_name": "my-agent",
+                "force": true,
+                "version": "1.2.3"
+            })),
+        };
+
+        let args = middleware
+            .verify_and_unwrap(&mut session, &envelope)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            args.get("force").unwrap(),
+            true,
+            "force preserved for operator tier"
+        );
+        assert_eq!(
+            args.get("version").unwrap(),
+            "1.2.3",
+            "version preserved for operator tier"
+        );
+    }
+
+    #[test]
+    fn strip_operator_only_params_removes_correct_keys() {
+        let mut args = json!({
+            "name": "test",
+            "force": true,
+            "version": "1.0.0",
+            "extra": 42
+        });
+        strip_operator_only_params(&mut args);
+        assert!(args.get("force").is_none());
+        assert!(args.get("version").is_none());
+        assert_eq!(args.get("name").unwrap(), "test");
+        assert_eq!(args.get("extra").unwrap(), 42);
+    }
+
+    #[test]
+    fn strip_operator_only_params_noop_on_non_object() {
+        let mut args = json!("just a string");
+        strip_operator_only_params(&mut args);
+        assert_eq!(args, json!("just a string"));
+    }
+
+    #[test]
+    fn strip_operator_only_params_noop_when_keys_absent() {
+        let mut args = json!({"path": "/workspace", "name": "test"});
+        let expected = args.clone();
+        strip_operator_only_params(&mut args);
+        assert_eq!(args, expected);
     }
 
     #[tokio::test]

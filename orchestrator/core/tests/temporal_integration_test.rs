@@ -115,6 +115,17 @@ impl AgentLifecycleService for MockAgentServiceInt {
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
         )))
     }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+        _version: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        Ok(Some(AgentId(
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        )))
+    }
 }
 
 // Mock Repositories to ensure the tests compile perfectly without relying on Postgres bindings that may not be exported here.
@@ -154,6 +165,15 @@ impl WorkflowRepository for MockWorkflowRepo {
     }
 
     async fn find_by_name(&self, _n: &str) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+        _version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
 
@@ -224,6 +244,17 @@ impl WorkflowRepository for StaticWorkflowRepo {
 
     async fn find_by_name(&self, workflow_name: &str) -> Result<Option<Workflow>, RepositoryError> {
         Ok((self.workflow.metadata.name == workflow_name).then(|| self.workflow.clone()))
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok((self.workflow.metadata.name == name
+            && self.workflow.metadata.version.as_deref() == Some(version))
+        .then(|| self.workflow.clone()))
     }
 
     async fn list_all_for_tenant(
@@ -609,6 +640,7 @@ states:
         workflow_id: reg.workflow_id.clone(),
         input: serde_json::json!({"message": "hello testing"}),
         blackboard: None,
+        version: None,
         tenant_id: Some(TenantId::local_default()),
     };
 
@@ -642,6 +674,7 @@ async fn start_execution_surfaces_repository_save_failure_before_temporal_start(
             workflow_id: workflow.metadata.name.clone(),
             input: json!({"topic": "copy"}),
             blackboard: None,
+            version: None,
             tenant_id: Some(TenantId::local_default()),
         })
         .await

@@ -84,6 +84,7 @@ impl DaemonClient {
         agent_id: Uuid,
         input: serde_json::Value,
         context_overrides: Option<serde_json::Value>,
+        version: Option<&str>,
     ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct ExecuteRequest {
@@ -92,9 +93,14 @@ impl DaemonClient {
             context_overrides: Option<serde_json::Value>,
         }
 
+        let mut url = format!("{}/v1/agents/{}/execute", self.base_url, agent_id);
+        if let Some(ver) = version {
+            url.push_str(&format!("?version={ver}"));
+        }
+
         let response = self
             .client
-            .post(format!("{}/v1/agents/{}/execute", self.base_url, agent_id))
+            .post(url)
             .json(&ExecuteRequest {
                 input,
                 context_overrides,
@@ -802,6 +808,7 @@ impl DaemonClient {
         name: &str,
         input: serde_json::Value,
         blackboard: Option<serde_json::Value>,
+        version: Option<&str>,
     ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct RunRequest {
@@ -810,9 +817,14 @@ impl DaemonClient {
             blackboard: Option<serde_json::Value>,
         }
 
+        let mut url = format!("{}/v1/workflows/{}/run", self.base_url, name);
+        if let Some(ver) = version {
+            url.push_str(&format!("?version={ver}"));
+        }
+
         let response = self
             .client
-            .post(format!("{}/v1/workflows/{}/run", self.base_url, name))
+            .post(url)
             .json(&RunRequest { input, blackboard })
             .send()
             .await

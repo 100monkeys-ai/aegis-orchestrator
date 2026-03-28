@@ -365,6 +365,15 @@ mod tests {
                 uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
             )))
         }
+
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _tenant_id: &TenantId,
+            name: &str,
+            _version: &str,
+        ) -> anyhow::Result<Option<AgentId>> {
+            self.lookup_agent(name).await
+        }
     }
 
     fn test_agent_service() -> Arc<dyn AgentLifecycleService> {
@@ -483,6 +492,15 @@ spec:
         }
 
         async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
+            Ok(None)
+        }
+
+        async fn find_by_name_and_version_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+            _version: &str,
+        ) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
 

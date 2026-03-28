@@ -418,7 +418,7 @@ async fn generate_agent(
         );
     }
     let execution_id = client
-        .execute_agent(generator_id, serde_json::Value::String(input), None)
+        .execute_agent(generator_id, serde_json::Value::String(input), None, None)
         .await
         .context("Failed to start agent generation execution")?;
 

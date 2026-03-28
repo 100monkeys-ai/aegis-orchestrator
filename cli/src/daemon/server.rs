@@ -104,12 +104,160 @@ use aegis_orchestrator_core::{
 };
 
 use aegis_orchestrator_core::domain::repository::StorageEventRepository;
+use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
 
 use super::operator_read_models::{
     storage_violation_event_view, OperatorReadModelStore, SecurityIncidentView, StimulusView,
     StorageViolationView,
 };
+
+// ---------------------------------------------------------------------------
+// Port implementations for ToolInvocationService
+// ---------------------------------------------------------------------------
+
+/// Adapts the daemon's Temporal connectivity into the
+/// `WorkflowExecutionControlPort` expected by `ToolInvocationService`.
+struct DaemonWorkflowExecutionControl {
+    config: NodeConfigManifest,
+    temporal_client_container: Arc<
+        tokio::sync::RwLock<
+            Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
+        >,
+    >,
+}
+
+#[async_trait::async_trait]
+impl aegis_orchestrator_core::application::ports::WorkflowExecutionControlPort
+    for DaemonWorkflowExecutionControl
+{
+    async fn cancel_workflow_execution(
+        &self,
+        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let namespace = temporal_namespace(&self.config)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        let mut client = connect_temporal_workflow_client(&self.config)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        let request = RequestCancelWorkflowExecutionRequest {
+            namespace,
+            workflow_execution: Some(TemporalWorkflowExecution {
+                workflow_id: execution_id.0.to_string(),
+                run_id: String::new(),
+            }),
+            identity: "aegis-daemon".to_string(),
+            request_id: Uuid::new_v4().to_string(),
+            first_execution_run_id: String::new(),
+            reason: "Cancelled via aegis.workflow.cancel tool".to_string(),
+            links: Vec::new(),
+        };
+        client
+            .request_cancel_workflow_execution(request)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        Ok(())
+    }
+
+    async fn signal_workflow_execution(
+        &self,
+        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+        response: &str,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let guard = self.temporal_client_container.read().await;
+        let client = guard
+            .as_ref()
+            .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+                "Temporal client not yet connected".into()
+            })?
+            .clone();
+        drop(guard);
+        client
+            .send_human_signal(&execution_id.0.to_string(), response.to_string())
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        Ok(())
+    }
+
+    async fn remove_workflow_execution(
+        &self,
+        execution_id: aegis_orchestrator_core::domain::execution::ExecutionId,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let namespace = temporal_namespace(&self.config)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        let mut client = connect_temporal_workflow_client(&self.config)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        let request = DeleteWorkflowExecutionRequest {
+            namespace,
+            workflow_execution: Some(TemporalWorkflowExecution {
+                workflow_id: execution_id.0.to_string(),
+                run_id: String::new(),
+            }),
+        };
+        client
+            .delete_workflow_execution(request)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+
+        // Also clean up the database row if available
+        if let Some(database) = &self.config.spec.database {
+            if let Ok(database_url) = resolve_env_value(&database.url) {
+                if let Ok(pool) = sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(1)
+                    .connect(&database_url)
+                    .await
+                {
+                    let _ = sqlx::query("DELETE FROM workflow_executions WHERE id = $1")
+                        .bind(execution_id.0)
+                        .execute(&pool)
+                        .await;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Adapts the daemon's execution repository into the `AgentActivityPort`
+/// expected by `ToolInvocationService` for `aegis.agent.logs`.
+struct DaemonAgentActivity {
+    execution_repo: Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
+}
+
+#[async_trait::async_trait]
+impl aegis_orchestrator_core::application::ports::AgentActivityPort for DaemonAgentActivity {
+    async fn agent_logs_snapshot(
+        &self,
+        agent_id: uuid::Uuid,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+        let agent_id = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
+        let executions = self
+            .execution_repo
+            .find_by_agent(agent_id, limit + offset)
+            .await
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+
+        let entries: Vec<serde_json::Value> = executions
+            .iter()
+            .skip(offset)
+            .take(limit)
+            .map(|e| {
+                serde_json::json!({
+                    "execution_id": e.id.0.to_string(),
+                    "agent_id": e.agent_id.0.to_string(),
+                    "status": format!("{:?}", e.status).to_lowercase(),
+                    "started_at": e.started_at,
+                    "ended_at": e.ended_at,
+                    "iteration_count": e.iterations().len(),
+                })
+            })
+            .collect();
+        Ok(entries)
+    }
+}
 
 fn default_local_host_mount_point() -> String {
     if let Ok(path) = std::env::var("AEGIS_LOCAL_HOST_MOUNT_POINT") {
@@ -1828,6 +1976,83 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    // aegis.workflow operational tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.cancel")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.cancel".to_string(),
+                description: "Cancel a running workflow execution.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.cancel".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.signal")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.signal".to_string(),
+                description: "Send human input response to a paused workflow execution."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.signal".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.workflow.remove")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.workflow.remove".to_string(),
+                description: "Remove a workflow execution record.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.workflow.remove".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
+    // aegis.agent operational tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.agent.logs")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.agent.logs".to_string(),
+                description: "Retrieve agent-level activity log snapshot.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.agent.logs".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
     // aegis.system tools
     if !builtin_dispatchers
         .iter()
@@ -1983,9 +2208,47 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Repositories
     let security_context_repo: Arc<
         dyn aegis_orchestrator_core::domain::security_context::repository::SecurityContextRepository,
-    > = Arc::new(
-        aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new(),
-    );
+    > = {
+        let repo = aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new();
+
+        // Seed security contexts from aegis-config.yaml (ADR-071 §ZaruTier SecurityContext Definitions)
+        if let Some(definitions) = &config.spec.security_contexts {
+            for def in definitions {
+                let capabilities = def
+                    .capabilities
+                    .iter()
+                    .map(|cap| aegis_orchestrator_core::domain::security_context::Capability {
+                        tool_pattern: cap.tool_pattern.clone(),
+                        path_allowlist: cap.path_allowlist.as_ref().map(|paths| {
+                            paths.iter().map(std::path::PathBuf::from).collect()
+                        }),
+                        command_allowlist: cap.command_allowlist.clone(),
+                        subcommand_allowlist: None,
+                        domain_allowlist: cap.domain_allowlist.clone(),
+                        max_response_size: None,
+                    })
+                    .collect();
+
+                let context = aegis_orchestrator_core::domain::security_context::SecurityContext {
+                    name: def.name.clone(),
+                    description: def.description.clone(),
+                    capabilities,
+                    deny_list: def.deny_list.clone(),
+                    metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                        version: 1,
+                    },
+                };
+
+                repo.save(context).await?;
+                info!("Loaded security context: {}", def.name);
+            }
+            info!("Loaded {} security contexts from config", definitions.len());
+        }
+
+        Arc::new(repo)
+    };
 
     let smcp_session_repo: Arc<
         dyn aegis_orchestrator_core::domain::smcp_session_repository::SmcpSessionRepository,
@@ -2138,7 +2401,14 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_workflow_execution_repo(workflow_execution_repo.clone())
         .with_workflow_execution(start_workflow_execution_use_case.clone())
         .with_generated_manifests_root(generated_artifacts_root.clone())
-        .with_node_config_path(config_path.clone()),
+        .with_node_config_path(config_path.clone())
+        .with_workflow_execution_control(Arc::new(DaemonWorkflowExecutionControl {
+            config: config.clone(),
+            temporal_client_container: temporal_client_container.clone(),
+        }))
+        .with_agent_activity(Arc::new(DaemonAgentActivity {
+            execution_repo: execution_repo.clone(),
+        })),
     );
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
 
@@ -2380,6 +2650,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         domain_allowlist: None,
                         max_response_size: None,
                     },
+                    // Workflow operational tools
+                    Capability {
+                        tool_pattern: "aegis.workflow.logs".to_string(),
+                        path_allowlist: None,
+                        command_allowlist: None,
+                        subcommand_allowlist: None,
+                        domain_allowlist: None,
+                        max_response_size: None,
+                    },
+                    Capability {
+                        tool_pattern: "aegis.workflow.cancel".to_string(),
+                        path_allowlist: None,
+                        command_allowlist: None,
+                        subcommand_allowlist: None,
+                        domain_allowlist: None,
+                        max_response_size: None,
+                    },
+                    // Agent operational tools
+                    Capability {
+                        tool_pattern: "aegis.agent.logs".to_string(),
+                        path_allowlist: None,
+                        command_allowlist: None,
+                        subcommand_allowlist: None,
+                        domain_allowlist: None,
+                        max_response_size: None,
+                    },
+                    Capability {
+                        tool_pattern: "aegis.task.remove".to_string(),
+                        path_allowlist: None,
+                        command_allowlist: None,
+                        subcommand_allowlist: None,
+                        domain_allowlist: None,
+                        max_response_size: None,
+                    },
                     // Schema and system (read-only)
                     Capability {
                         tool_pattern: "aegis.schema.*".to_string(),
@@ -2401,6 +2705,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 deny_list: vec![
                     "aegis.workflow.delete".to_string(),
                     "aegis.agent.delete".to_string(),
+                    "aegis.workflow.remove".to_string(),
                 ],
                 metadata: SecurityContextMetadata {
                     created_at: chrono::Utc::now(),
@@ -2984,16 +3289,23 @@ struct RunWorkflowLegacyRequest {
     blackboard: Option<serde_json::Value>,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct RunWorkflowQuery {
+    version: Option<String>,
+}
+
 async fn run_workflow_legacy_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
+    Query(query): Query<RunWorkflowQuery>,
     Json(request): Json<RunWorkflowLegacyRequest>,
 ) -> impl IntoResponse {
     let req = StartWorkflowExecutionRequest {
         workflow_id: name,
         input: request.input,
         blackboard: request.blackboard,
+        version: query.version,
         tenant_id: Some(tenant_id_from_identity(
             identity.as_ref().map(|identity| &identity.0),
         )),
@@ -3701,13 +4013,49 @@ struct ExecuteRequest {
     context_overrides: Option<serde_json::Value>,
 }
 
+#[derive(serde::Deserialize, Default)]
+struct ExecuteAgentQuery {
+    version: Option<String>,
+}
+
 async fn execute_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
+    Query(query): Query<ExecuteAgentQuery>,
     Json(request): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+
+    // If a version query parameter is provided, verify the agent's manifest version matches
+    if let Some(ref requested_version) = query.version {
+        match state
+            .agent_service
+            .get_agent_for_tenant(&tenant_id, AgentId(agent_id))
+            .await
+        {
+            Ok(agent) => {
+                if agent.manifest.metadata.version != *requested_version {
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": format!(
+                                "Version mismatch: requested '{}' but agent has '{}'",
+                                requested_version, agent.manifest.metadata.version
+                            )
+                        })),
+                    );
+                }
+            }
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                );
+            }
+        }
+    }
+
     let payload = serde_json::json!({
         "input": request.input,
         "context_overrides": request.context_overrides,

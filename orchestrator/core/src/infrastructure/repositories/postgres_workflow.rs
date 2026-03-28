@@ -242,10 +242,44 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT domain_json
             FROM workflows
             WHERE tenant_id = $1 AND name = $2
+            ORDER BY version DESC
+            LIMIT 1
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Some(row) = row {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            Ok(Some(workflow))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE tenant_id = $1 AND name = $2 AND version = $3
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(name)
+        .bind(version)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;

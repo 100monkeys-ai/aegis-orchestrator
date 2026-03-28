@@ -147,6 +147,9 @@ impl ToolRouter {
                 | "aegis.workflow.status"
                 | "aegis.workflow.generate"
                 | "aegis.workflow.logs"
+                | "aegis.workflow.cancel"
+                | "aegis.workflow.signal"
+                | "aegis.workflow.remove"
         )
     }
 
@@ -561,6 +564,26 @@ impl ToolRouter {
                         },
                         "required": ["input"]
                     }),
+                    "aegis.agent.logs" => json!({
+                        "type": "object",
+                        "properties": {
+                            "agent_id": {
+                                "type": "string",
+                                "description": "UUID of the agent whose activity log should be retrieved."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum number of events to return.",
+                                "default": 50
+                            },
+                            "offset": {
+                                "type": "integer",
+                                "description": "Zero-based starting offset into the activity log.",
+                                "default": 0
+                            }
+                        },
+                        "required": ["agent_id"]
+                    }),
                     "aegis.workflow.list" => json!({
                         "type": "object",
                         "properties": {
@@ -628,6 +651,10 @@ impl ToolRouter {
                             "blackboard": {
                                 "type": "object",
                                 "description": "Optional blackboard overrides merged into the workflow execution before startup."
+                            },
+                            "version": {
+                                "type": "string",
+                                "description": "Optional semantic version of the workflow to execute. When omitted, the latest deployed version is used."
                             },
                             "tenant_id": {
                                 "type": "string",
@@ -697,6 +724,40 @@ impl ToolRouter {
                         },
                         "required": ["input"]
                     }),
+                    "aegis.workflow.cancel" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to cancel."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.workflow.signal" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to signal."
+                            },
+                            "response": {
+                                "type": "string",
+                                "description": "Human input response text to send to the paused workflow."
+                            }
+                        },
+                        "required": ["execution_id", "response"]
+                    }),
+                    "aegis.workflow.remove" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to remove."
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
                     "aegis.task.execute" => json!({
                         "type": "object",
                         "properties": {
@@ -707,6 +768,10 @@ impl ToolRouter {
                             "input": {
                                 "type": "object",
                                 "description": "Input data for the task."
+                            },
+                            "version": {
+                                "type": "string",
+                                "description": "Optional semantic version of the agent to execute. When omitted, the latest deployed version is used."
                             }
                         },
                         "required": ["agent_id"]
@@ -1401,7 +1466,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_tools_skips_unimplemented_workflow_builtins() {
+    async fn test_list_tools_advertises_implemented_workflow_builtins() {
         let registry = Arc::new(InMemoryToolRegistry::new());
         let servers = Arc::new(RwLock::new(HashMap::new()));
 
@@ -1425,6 +1490,15 @@ mod tests {
                 }],
             },
             BuiltinDispatcherConfig {
+                name: "aegis.workflow.remove".to_string(),
+                description: "Remove workflow executions".to_string(),
+                enabled: true,
+                capabilities: vec![CapabilityConfig {
+                    name: "aegis.workflow.remove".to_string(),
+                    skip_judge: false,
+                }],
+            },
+            BuiltinDispatcherConfig {
                 name: "aegis.workflow.status".to_string(),
                 description: "Inspect workflow execution state".to_string(),
                 enabled: true,
@@ -1441,11 +1515,14 @@ mod tests {
         assert!(tools
             .iter()
             .any(|tool| tool.name == "aegis.workflow.status"));
-        assert!(!tools
+        assert!(tools
             .iter()
             .any(|tool| tool.name == "aegis.workflow.cancel"));
-        assert!(!tools
+        assert!(tools
             .iter()
             .any(|tool| tool.name == "aegis.workflow.signal"));
+        assert!(tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.remove"));
     }
 }

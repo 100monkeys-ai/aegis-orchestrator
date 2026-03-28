@@ -151,14 +151,70 @@ impl AgentRepository for PostgresAgentRepository {
     ) -> Result<Option<Agent>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT 
+            SELECT
                 id, name, manifest_json, status, created_at, updated_at
             FROM agents
             WHERE tenant_id = $1 AND name = $2
+            ORDER BY version DESC
+            LIMIT 1
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Some(row) = row {
+            let id: uuid::Uuid = row.get("id");
+            let name: String = row.get("name");
+            let manifest_val: serde_json::Value = row.get("manifest_json");
+            let status_str: String = row.get("status");
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
+
+            let status = match status_str.as_str() {
+                "active" => AgentStatus::Active,
+                "paused" => AgentStatus::Paused,
+                "archived" => AgentStatus::Archived,
+                _ => AgentStatus::Active,
+            };
+
+            let manifest: AgentManifest = serde_json::from_value(manifest_val).map_err(|e| {
+                RepositoryError::Serialization(format!("Failed to deserialize manifest: {e}"))
+            })?;
+
+            Ok(Some(Agent {
+                id: AgentId(id),
+                tenant_id: tenant_id.clone(),
+                name,
+                manifest,
+                status,
+                created_at,
+                updated_at,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn find_by_name_and_version_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id, name, manifest_json, status, created_at, updated_at
+            FROM agents
+            WHERE tenant_id = $1 AND name = $2 AND version = $3
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(name)
+        .bind(version)
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;

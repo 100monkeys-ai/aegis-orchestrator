@@ -15,9 +15,36 @@ impl ToolInvocationService {
             })?;
 
         let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let version = args.get("version").and_then(|v| v.as_str());
 
         let agent_id = if let Ok(uuid) = uuid::Uuid::parse_str(agent_ref) {
+            if version.is_some() {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.task.execute",
+                    "error": "version parameter is only supported when identifying agents by name, not UUID"
+                })));
+            }
             crate::domain::agent::AgentId(uuid)
+        } else if let Some(ver) = version {
+            match self
+                .agent_lifecycle
+                .lookup_agent_with_version(agent_ref, ver)
+                .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.task.execute",
+                        "error": format!("Agent '{agent_ref}' version '{ver}' not found")
+                    })));
+                }
+                Err(e) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.task.execute",
+                        "error": format!("Agent '{agent_ref}' version '{ver}' not found: {e}")
+                    })));
+                }
+            }
         } else {
             match self.agent_lifecycle.lookup_agent(agent_ref).await {
                 Ok(Some(id)) => id,

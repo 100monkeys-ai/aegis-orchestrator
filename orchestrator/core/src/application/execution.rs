@@ -2523,13 +2523,15 @@ impl ExecutionService for StandardExecutionService {
                             completed_at,
                         });
 
-                        event_bus.publish_execution_event(ExecutionEvent::ChildExecutionCompleted {
-                            execution_id: parent_execution_id_for_task,
-                            agent_id: parent_agent_id_for_task,
-                            child_execution_id,
-                            outcome: final_output,
-                            completed_at,
-                        });
+                        event_bus.publish_execution_event(
+                            ExecutionEvent::ChildExecutionCompleted {
+                                execution_id: parent_execution_id_for_task,
+                                agent_id: parent_agent_id_for_task,
+                                child_execution_id,
+                                outcome: final_output,
+                                completed_at,
+                            },
+                        );
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
