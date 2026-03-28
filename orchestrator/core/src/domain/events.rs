@@ -25,6 +25,7 @@
 //! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
 //! | [`SecretEvent`] | BC-11 Secrets & Identity | Secret access, dynamic credential generation, and access denial audit (ADR-034) |
 //! | [`TenantEvent`] | Multi-Tenant | Tenant lifecycle, audit, and quota events (ADR-056) |
+//! | [`RateLimitEvent`] | Cross-cutting (ADR-072) | Rate limit rejection and warning threshold events |
 //!
 //! ## Phase 2 Note
 //!
@@ -1054,6 +1055,39 @@ pub enum TenantEvent {
         current: u64,
         limit: u64,
         exceeded_at: DateTime<Utc>,
+    },
+}
+
+/// Rate limit enforcement events (ADR-072).
+///
+/// Published by [`crate::infrastructure::rate_limit::CompositeRateLimitEnforcer`] when a
+/// request is rejected or when usage crosses the 80% warning threshold.
+/// Consumed by:
+/// - Alerting pipelines for real-time operator notification
+/// - Audit trail for compliance and forensic analysis
+/// - Cortex for usage pattern learning (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum RateLimitEvent {
+    /// Published when a rate limit check rejects a request.
+    Exceeded {
+        user_id: Option<String>,
+        tenant_id: Option<String>,
+        resource_type: String,
+        bucket: String,
+        limit: u64,
+        counter: u64,
+        timestamp: DateTime<Utc>,
+    },
+    /// Published when usage crosses 80% of a bucket limit.
+    Warning {
+        user_id: Option<String>,
+        tenant_id: Option<String>,
+        resource_type: String,
+        bucket: String,
+        limit: u64,
+        current: u64,
+        threshold_percent: u8,
+        timestamp: DateTime<Utc>,
     },
 }
 

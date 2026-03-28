@@ -1166,8 +1166,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     ) = if let Some(ref pool) = db_pool {
         let burst = Arc::new(GovernorBurstEnforcer::new());
         let postgres = Arc::new(PostgresWindowEnforcer::new(pool.clone()));
-        let enforcer: Arc<dyn RateLimitEnforcer> =
-            Arc::new(CompositeRateLimitEnforcer::new(burst, postgres));
+        let enforcer: Arc<dyn RateLimitEnforcer> = Arc::new(
+            CompositeRateLimitEnforcer::new(burst, postgres).with_event_bus(event_bus.clone()),
+        );
         let resolver: Arc<dyn RateLimitPolicyResolver> =
             Arc::new(HierarchicalPolicyResolver::new(pool.clone()));
         info!("Rate limiting enabled (ADR-072)");
@@ -2236,7 +2237,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                             command_allowlist: None,
                             subcommand_allowlist: None,
                             domain_allowlist: None,
-                            rate_limit: None,
                             max_response_size: None,
                         },
                     ],
@@ -2251,9 +2251,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             let _ = sec_repo.save(default_context).await;
 
             // Seed Zaru tier security contexts (BC-12, ADR-072)
-            use aegis_orchestrator_core::domain::security_context::capability::{
-                Capability, RateLimit,
-            };
+            use aegis_orchestrator_core::domain::security_context::capability::Capability;
             use aegis_orchestrator_core::domain::security_context::{
                 SecurityContext, SecurityContextMetadata,
             };
@@ -2271,10 +2269,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2283,10 +2277,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2295,10 +2285,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2307,10 +2293,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     // Web access
@@ -2320,10 +2302,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 20,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2332,10 +2310,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 20,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     // Command execution (rate-limited)
@@ -2345,10 +2319,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 30,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     // Task management
@@ -2358,10 +2328,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 10,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2370,10 +2336,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2382,10 +2344,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2394,10 +2352,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 60,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     // Workflow (read + run, no delete/create)
@@ -2407,10 +2361,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 30,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2419,10 +2369,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 30,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2431,10 +2377,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 5,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     // Schema and system (read-only)
@@ -2444,10 +2386,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 30,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                     Capability {
@@ -2456,10 +2394,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         command_allowlist: None,
                         subcommand_allowlist: None,
                         domain_allowlist: None,
-                        rate_limit: Some(RateLimit {
-                            calls: 10,
-                            per_seconds: 60,
-                        }),
                         max_response_size: None,
                     },
                 ],
@@ -2484,10 +2418,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     command_allowlist: None,
                     subcommand_allowlist: None,
                     domain_allowlist: None,
-                    rate_limit: Some(RateLimit {
-                        calls: 300,
-                        per_seconds: 60,
-                    }),
                     max_response_size: None,
                 }],
                 deny_list: vec![],
@@ -2509,7 +2439,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     command_allowlist: None,
                     subcommand_allowlist: None,
                     domain_allowlist: None,
-                    rate_limit: None,
                     max_response_size: None,
                 }],
                 deny_list: vec![],
@@ -2529,7 +2458,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     command_allowlist: None,
                     subcommand_allowlist: None,
                     domain_allowlist: None,
-                    rate_limit: None,
                     max_response_size: None,
                 }],
                 deny_list: vec![],

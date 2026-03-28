@@ -18,7 +18,9 @@ use crate::domain::dispatch::{
     AgentMessage, ConversationMessage, DispatchId, OrchestratorMessage, ToolCall,
 };
 use crate::domain::execution::{ExecutionId, TrajectoryStep};
+use crate::domain::iam::UserIdentity;
 use crate::domain::llm::{ChatMessage, GenerationOptions, ToolSchema};
+use crate::domain::tenant::TenantId;
 use crate::infrastructure::llm::registry::{ApiKeySource, ProviderRegistry};
 
 /// Maximum number of tool-call iterations before the inner loop is forcibly terminated.
@@ -78,6 +80,10 @@ struct ExecutionContext {
     pending_dispatch_id: Option<DispatchId>,
     pending_tool_call_id: Option<String>,
     trajectory: Vec<TrajectoryStep>,
+    /// Real user identity for per-user rate limiting (ADR-072 Step 2).
+    user_identity: Option<UserIdentity>,
+    /// Tenant identity for scoped rate limiting (ADR-072 Step 2).
+    tenant_id: Option<TenantId>,
 }
 
 pub struct InnerLoopService {
@@ -121,6 +127,17 @@ impl InnerLoopService {
     pub async fn handle_agent_message(
         &self,
         message: AgentMessage,
+    ) -> anyhow::Result<OrchestratorMessage> {
+        self.handle_agent_message_with_identity(message, None, None)
+            .await
+    }
+
+    /// Handle an agent message with optional caller identity for per-user rate limiting (ADR-072).
+    pub async fn handle_agent_message_with_identity(
+        &self,
+        message: AgentMessage,
+        user_identity: Option<UserIdentity>,
+        tenant_id: Option<TenantId>,
     ) -> anyhow::Result<OrchestratorMessage> {
         match message {
             AgentMessage::Generate {
@@ -172,6 +189,8 @@ impl InnerLoopService {
                         pending_dispatch_id: None,
                         pending_tool_call_id: None,
                         trajectory: Vec::new(),
+                        user_identity: user_identity.clone(),
+                        tenant_id: tenant_id.clone(),
                     },
                 );
 
@@ -275,7 +294,13 @@ impl InnerLoopService {
                 .collect();
 
             let llm_output = self
-                .call_llm(&ctx.model_alias, &ctx.conversation, &tool_schemas)
+                .call_llm(
+                    &ctx.model_alias,
+                    &ctx.conversation,
+                    &tool_schemas,
+                    ctx.user_identity.as_ref(),
+                    ctx.tenant_id.as_ref(),
+                )
                 .await?;
 
             match llm_output {
@@ -524,6 +549,8 @@ impl InnerLoopService {
         model_alias: &str,
         conversation: &[ConversationMessage],
         tool_schemas: &[Value],
+        user_identity: Option<&UserIdentity>,
+        tenant_id: Option<&TenantId>,
     ) -> anyhow::Result<LlmOutput> {
         let chat_messages: Vec<ChatMessage> = conversation
             .iter()
@@ -567,33 +594,47 @@ impl InnerLoopService {
             self.provider_registry.key_source_for_alias(model_alias) == ApiKeySource::User;
 
         // Rate limit check: LlmCall (ADR-072)
-        // Use a tenant-scoped key derived from the model alias as a best-effort scope.
-        // Full user-identity-based scoping requires propagating UserIdentity through the
-        // inner loop, which is tracked as future work.
+        // When real UserIdentity is available, enforce per-user quotas.
+        // Otherwise fall back to tenant-scoped enforcement.
         if !is_byok {
             if let (Some(enforcer), Some(resolver)) =
                 (&self.rate_limit_enforcer, &self.rate_limit_resolver)
             {
                 use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
 
-                // TODO: Propagate actual UserIdentity through the inner loop so we can
-                // resolve per-user policies. For now, use a synthetic tenant-scoped identity.
-                let default_identity = crate::domain::iam::UserIdentity {
-                    sub: "inner-loop".to_string(),
-                    realm_slug: "aegis-system".to_string(),
-                    email: None,
-                    identity_kind: crate::domain::iam::IdentityKind::TenantUser {
-                        tenant_slug: "aegis-system".to_string(),
-                    },
+                // Use real identity for per-user rate limiting when available (ADR-072 Step 2).
+                // Falls back to synthetic tenant-scoped identity for callers that don't
+                // have identity yet.
+                let fallback_identity;
+                let effective_identity = match user_identity {
+                    Some(id) => id,
+                    None => {
+                        fallback_identity = crate::domain::iam::UserIdentity {
+                            sub: "inner-loop".to_string(),
+                            realm_slug: "aegis-system".to_string(),
+                            email: None,
+                            identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                                tenant_slug: "aegis-system".to_string(),
+                            },
+                        };
+                        &fallback_identity
+                    }
                 };
-                let tenant_id = crate::domain::tenant::TenantId::local_default();
-                let scope = RateLimitScope::Tenant {
-                    tenant_id: tenant_id.clone(),
+                let effective_tenant_id =
+                    tenant_id.cloned().unwrap_or_else(TenantId::local_default);
+                let scope = if user_identity.is_some() {
+                    RateLimitScope::User {
+                        user_id: effective_identity.sub.clone(),
+                    }
+                } else {
+                    RateLimitScope::Tenant {
+                        tenant_id: effective_tenant_id.clone(),
+                    }
                 };
                 let resource_type = RateLimitResourceType::LlmCall;
 
                 match resolver
-                    .resolve_policy(&default_identity, &tenant_id, &resource_type)
+                    .resolve_policy(effective_identity, &effective_tenant_id, &resource_type)
                     .await
                 {
                     Ok(policy) => match enforcer.check_and_increment(&scope, &policy, 1).await {
@@ -646,24 +687,43 @@ impl InnerLoopService {
                     {
                         use crate::domain::rate_limit::{RateLimitResourceType, RateLimitScope};
 
-                        let tenant_id = crate::domain::tenant::TenantId::local_default();
-                        let scope = RateLimitScope::Tenant {
-                            tenant_id: tenant_id.clone(),
+                        // Use real identity for per-user token accounting when available (ADR-072 Step 2).
+                        let fallback_identity;
+                        let effective_identity = match user_identity {
+                            Some(id) => id,
+                            None => {
+                                fallback_identity = crate::domain::iam::UserIdentity {
+                                    sub: "inner-loop".to_string(),
+                                    realm_slug: "aegis-system".to_string(),
+                                    email: None,
+                                    identity_kind: crate::domain::iam::IdentityKind::TenantUser {
+                                        tenant_slug: "aegis-system".to_string(),
+                                    },
+                                };
+                                &fallback_identity
+                            }
                         };
-                        let default_identity = crate::domain::iam::UserIdentity {
-                            sub: "inner-loop".to_string(),
-                            realm_slug: "aegis-system".to_string(),
-                            email: None,
-                            identity_kind: crate::domain::iam::IdentityKind::TenantUser {
-                                tenant_slug: "aegis-system".to_string(),
-                            },
+                        let effective_tenant_id =
+                            tenant_id.cloned().unwrap_or_else(TenantId::local_default);
+                        let scope = if user_identity.is_some() {
+                            RateLimitScope::User {
+                                user_id: effective_identity.sub.clone(),
+                            }
+                        } else {
+                            RateLimitScope::Tenant {
+                                tenant_id: effective_tenant_id.clone(),
+                            }
                         };
                         let resource_type = RateLimitResourceType::LlmToken;
                         let token_cost = u64::from(r.usage.total_tokens);
 
                         if token_cost > 0 {
                             match resolver
-                                .resolve_policy(&default_identity, &tenant_id, &resource_type)
+                                .resolve_policy(
+                                    effective_identity,
+                                    &effective_tenant_id,
+                                    &resource_type,
+                                )
                                 .await
                             {
                                 Ok(policy) => {

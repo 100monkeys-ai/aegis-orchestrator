@@ -37,6 +37,7 @@
 //! | `ImageManagement` | BC-2 | ADR-045 |
 //! | `Iam` | BC-13 | ADR-041 |
 //! | `Secrets` | BC-11 | ADR-034 |
+//! | `RateLimit` | Cross-cutting | ADR-072 |
 //!
 //! # Code Quality Principles
 //!
@@ -63,8 +64,8 @@ use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
-    LearningEvent, MCPToolEvent, PolicyEvent, SecretEvent, SmcpEvent, StimulusEvent, StorageEvent,
-    TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+    LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SecretEvent, SmcpEvent,
+    StimulusEvent, StorageEvent, TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -91,6 +92,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::ContainerRun(_) => "container_run",
         DomainEvent::Tenant(_) => "tenant",
         DomainEvent::Cluster(_) => "cluster",
+        DomainEvent::RateLimit(_) => "rate_limit",
     }
 }
 
@@ -122,6 +124,8 @@ pub enum DomainEvent {
     Tenant(TenantEvent),
     /// BC-16 Cluster topology and node lifecycle events (ADR-059)
     Cluster(ClusterEvent),
+    /// Rate limit enforcement events (ADR-072)
+    RateLimit(RateLimitEvent),
 }
 
 impl DomainEvent {
@@ -130,7 +134,8 @@ impl DomainEvent {
             DomainEvent::AgentLifecycle(_)
             | DomainEvent::Stimulus(_)
             | DomainEvent::Iam(_)
-            | DomainEvent::Tenant(_) => None,
+            | DomainEvent::Tenant(_)
+            | DomainEvent::RateLimit(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -325,7 +330,9 @@ impl DomainEvent {
                 | SecretEvent::LeaseRevoked { access_context, .. }
                 | SecretEvent::SecretAccessDenied { access_context, .. } => access_context.agent_id,
             },
-            DomainEvent::ContainerRun(_) | DomainEvent::Cluster(_) => None,
+            DomainEvent::ContainerRun(_) | DomainEvent::Cluster(_) | DomainEvent::RateLimit(_) => {
+                None
+            }
         }
     }
 
@@ -482,6 +489,10 @@ impl DomainEvent {
                 ClusterEvent::ExecutionForwarded { forwarded_at, .. } => *forwarded_at,
                 ClusterEvent::ClusterConfigPushed { pushed_at, .. } => *pushed_at,
             },
+            DomainEvent::RateLimit(event) => match event {
+                RateLimitEvent::Exceeded { timestamp, .. }
+                | RateLimitEvent::Warning { timestamp, .. } => *timestamp,
+            },
         }
     }
 
@@ -632,6 +643,10 @@ impl DomainEvent {
                 ClusterEvent::ExecutionForwarded { .. } => "execution_forwarded",
                 ClusterEvent::ClusterConfigPushed { .. } => "cluster_config_pushed",
             },
+            DomainEvent::RateLimit(event) => match event {
+                RateLimitEvent::Exceeded { .. } => "rate_limit_exceeded",
+                RateLimitEvent::Warning { .. } => "rate_limit_warning",
+            },
         }
     }
 
@@ -653,6 +668,7 @@ impl DomainEvent {
             DomainEvent::ContainerRun(_) => "container_run",
             DomainEvent::Tenant(_) => "tenant",
             DomainEvent::Cluster(_) => "cluster",
+            DomainEvent::RateLimit(_) => "rate_limit",
         }
     }
 
@@ -743,6 +759,7 @@ impl DomainEvent {
             DomainEvent::ContainerRun(_) => Some("container"),
             DomainEvent::Tenant(_) => Some("tenant"),
             DomainEvent::Cluster(_) => Some("cluster"),
+            DomainEvent::RateLimit(_) => Some("rate_limit"),
         }
     }
 }
@@ -842,6 +859,11 @@ impl EventBus {
     /// Publish a cluster topology/node lifecycle event (BC-16 ADR-059)
     pub fn publish_cluster_event(&self, event: ClusterEvent) {
         self.publish(DomainEvent::Cluster(event));
+    }
+
+    /// Publish a rate limit enforcement event (ADR-072)
+    pub fn publish_rate_limit_event(&self, event: RateLimitEvent) {
+        self.publish(DomainEvent::RateLimit(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1201,6 +1223,7 @@ impl AgentEventReceiver {
             DomainEvent::ContainerRun(_) => false, // ContainerRun events are keyed by execution_id, not agent_id
             DomainEvent::Tenant(_) => false,       // Tenant events are system-wide, not per-agent
             DomainEvent::Cluster(_) => false,      // Cluster events are system-wide, not per-agent
+            DomainEvent::RateLimit(_) => false, // Rate limit events are system-wide, not per-agent
         }
     }
 }

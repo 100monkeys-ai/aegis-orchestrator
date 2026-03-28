@@ -7,7 +7,7 @@
 //!
 //! | Module | Contents |
 //! |--------|----------|
-//! | [`capability`] | `Capability`, `RateLimit` value objects |
+//! | [`capability`] | `Capability` value object |
 //! | [`security_context`] | `SecurityContext` aggregate root, `SecurityContextMetadata` |
 //! | [`repository`] | `SecurityContextRepository` persistence trait |
 //!
@@ -25,7 +25,7 @@ pub mod repository;
 #[allow(clippy::module_inception)]
 pub mod security_context;
 
-pub use capability::{Capability, RateLimit};
+pub use capability::Capability;
 pub use repository::SecurityContextRepository;
 pub use security_context::{
     validate_context_ownership, PolicyViolation, SecurityContext, SecurityContextMetadata,

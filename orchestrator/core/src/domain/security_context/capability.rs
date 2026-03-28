@@ -4,7 +4,7 @@
 //!
 //! A `Capability` is a fine-grained permission entry within a [`super::SecurityContext`].
 //! Each capability grants access to tools matching a pattern, optionally constrained
-//! by filesystem path, shell command, network domain, rate limit, and response size.
+//! by filesystem path, shell command, network domain, and response size.
 //!
 //! ## Pattern Matching
 //!
@@ -26,15 +26,6 @@ use super::PolicyViolation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
-
-/// Per-tool rate-limiting configuration within a [`Capability`].
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RateLimit {
-    /// Maximum number of tool invocations allowed within the time window.
-    pub calls: u32,
-    /// Length of the sliding time window in seconds.
-    pub per_seconds: u32,
-}
 
 /// Fine-grained MCP tool permission with optional constraints.
 ///
@@ -60,9 +51,6 @@ pub struct Capability {
     /// If set, `web.*` tool calls must target a URL whose domain suffix matches
     /// one of these entries.
     pub domain_allowlist: Option<Vec<String>>,
-    /// Optional per-capability rate limit. `None` means unlimited. Note: rate limiting
-    /// enforcement requires Phase 2 (in-memory rate counters not yet implemented).
-    pub rate_limit: Option<RateLimit>,
     /// Maximum allowed response body size in bytes. `None` means unlimited.
     pub max_response_size: Option<u64>,
 }
@@ -203,7 +191,6 @@ mod tests {
             command_allowlist: Some(vec!["cargo".to_string()]),
             subcommand_allowlist: Some(vec!["build".to_string(), "check".to_string()]),
             domain_allowlist: None,
-            rate_limit: None,
             max_response_size: None,
         };
 

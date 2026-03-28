@@ -264,7 +264,6 @@ mod tests {
                 command_allowlist: None,
                 subcommand_allowlist: None,
                 domain_allowlist: None,
-                rate_limit: None,
                 max_response_size: None,
             }],
             deny_list: vec![],

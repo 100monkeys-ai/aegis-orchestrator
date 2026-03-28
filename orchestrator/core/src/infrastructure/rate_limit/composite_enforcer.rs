@@ -14,11 +14,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Utc;
 
+use crate::domain::events::RateLimitEvent;
 use crate::domain::rate_limit::{
     RateLimitBucket, RateLimitDecision, RateLimitEnforcer, RateLimitError, RateLimitPolicy,
     RateLimitScope,
 };
+use crate::infrastructure::event_bus::EventBus;
 
 /// Threshold (percentage) at which a rate-limit warning is emitted.
 const RATE_LIMIT_WARNING_THRESHOLD_PCT: f64 = 80.0;
@@ -31,11 +34,22 @@ use super::postgres_enforcer::PostgresWindowEnforcer;
 pub struct CompositeRateLimitEnforcer {
     burst: Arc<GovernorBurstEnforcer>,
     postgres: Arc<PostgresWindowEnforcer>,
+    event_bus: Option<Arc<EventBus>>,
 }
 
 impl CompositeRateLimitEnforcer {
     pub fn new(burst: Arc<GovernorBurstEnforcer>, postgres: Arc<PostgresWindowEnforcer>) -> Self {
-        Self { burst, postgres }
+        Self {
+            burst,
+            postgres,
+            event_bus: None,
+        }
+    }
+
+    /// Attach an event bus for publishing rate-limit domain events (ADR-072).
+    pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(bus);
+        self
     }
 }
 
@@ -62,6 +76,11 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
             }
             Ok(None) => {} // No per-minute window configured
             Err(_) => {
+                let per_min_limit = policy
+                    .windows
+                    .get(&RateLimitBucket::PerMinute)
+                    .map(|w| w.limit)
+                    .unwrap_or(0);
                 let decision = RateLimitDecision {
                     allowed: false,
                     resource_type: policy.resource_type.clone(),
@@ -71,6 +90,13 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
                     remaining,
                 };
                 emit_decision_metrics(&decision, &resource_label, scope_label);
+                self.emit_exceeded_event(
+                    scope,
+                    &resource_label,
+                    RateLimitBucket::PerMinute,
+                    per_min_limit,
+                    per_min_limit, // counter >= limit at rejection
+                );
                 return Ok(decision);
             }
         }
@@ -82,6 +108,7 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
             }
             Err((bucket, _)) => {
                 let retry_after = bucket.window_seconds();
+                let window_limit = policy.windows.get(&bucket).map(|w| w.limit).unwrap_or(0);
                 let decision = RateLimitDecision {
                     allowed: false,
                     resource_type: policy.resource_type.clone(),
@@ -91,6 +118,13 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
                     remaining,
                 };
                 emit_decision_metrics(&decision, &resource_label, scope_label);
+                self.emit_exceeded_event(
+                    scope,
+                    &resource_label,
+                    bucket,
+                    window_limit,
+                    window_limit, // counter >= limit at rejection
+                );
                 return Ok(decision);
             }
         }
@@ -126,6 +160,19 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
                             "bucket" => format!("{bucket:?}"),
                         )
                         .increment(1);
+                        let (uid, tid) = scope_ids(scope);
+                        if let Some(bus) = &self.event_bus {
+                            bus.publish_rate_limit_event(RateLimitEvent::Warning {
+                                user_id: uid,
+                                tenant_id: tid,
+                                resource_type: resource_label.clone(),
+                                bucket: format!("{bucket:?}"),
+                                limit: window.limit,
+                                current: window.limit - remaining_count,
+                                threshold_percent: 80,
+                                timestamp: Utc::now(),
+                            });
+                        }
                     }
                 }
             }
@@ -149,6 +196,39 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
         result.extend(pg_remaining);
 
         Ok(result)
+    }
+}
+
+/// Extract `(user_id, tenant_id)` from a [`RateLimitScope`] for event payloads.
+fn scope_ids(scope: &RateLimitScope) -> (Option<String>, Option<String>) {
+    match scope {
+        RateLimitScope::User { user_id } => (Some(user_id.clone()), None),
+        RateLimitScope::Tenant { tenant_id } => (None, Some(tenant_id.to_string())),
+    }
+}
+
+impl CompositeRateLimitEnforcer {
+    /// Publish a [`RateLimitEvent::Exceeded`] if an event bus is configured.
+    fn emit_exceeded_event(
+        &self,
+        scope: &RateLimitScope,
+        resource_type: &str,
+        bucket: RateLimitBucket,
+        limit: u64,
+        counter: u64,
+    ) {
+        let (uid, tid) = scope_ids(scope);
+        if let Some(bus) = &self.event_bus {
+            bus.publish_rate_limit_event(RateLimitEvent::Exceeded {
+                user_id: uid,
+                tenant_id: tid,
+                resource_type: resource_type.to_owned(),
+                bucket: format!("{bucket:?}"),
+                limit,
+                counter,
+                timestamp: Utc::now(),
+            });
+        }
     }
 }
 
