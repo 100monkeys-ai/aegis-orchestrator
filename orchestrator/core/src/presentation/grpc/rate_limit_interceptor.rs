@@ -3,7 +3,7 @@
 //! # gRPC Rate Limit Interceptor (ADR-072)
 //!
 //! Async rate-limiting guard for incoming gRPC calls. Designed to run **after**
-//! the [`GrpcIamAuthInterceptor`] so that the resolved [`UserIdentity`] is
+//! the [`GrpcIamAuthInterceptor`](super::auth_interceptor::GrpcIamAuthInterceptor) so that the resolved [`UserIdentity`] is
 //! already available.
 //!
 //! Since Tonic interceptors are synchronous, this follows the same pattern as
