@@ -97,7 +97,7 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{DockerRuntime, ManagedAgentContainer},
+        runtime::{connect_container_runtime, ContainerRuntime, ManagedAgentContainer},
         temporal_client::TemporalClient,
         TemporalEventListener, TemporalEventPayload,
     },
@@ -250,7 +250,7 @@ fn managed_container_reap_reason(
 }
 
 async fn cleanup_orphaned_agent_containers(
-    runtime: Arc<DockerRuntime>,
+    runtime: Arc<ContainerRuntime>,
     execution_repo: Arc<dyn aegis_orchestrator_core::domain::repository::ExecutionRepository>,
 ) -> Result<usize> {
     let containers = runtime.list_managed_agent_containers().await?;
@@ -743,7 +743,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let network_mode = config
         .spec
         .runtime
-        .docker_network_mode
+        .container_network_mode
         .as_ref()
         .and_then(|nm| match resolve_env_value(nm) {
             Ok(resolved) if !resolved.is_empty() => Some(resolved),
@@ -758,9 +758,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
 
     let runtime = Arc::new(
-        DockerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::DockerRuntimeConfig {
+        ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
             bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
-            socket_path: config.spec.runtime.docker_socket_path.clone(),
+            socket_path: config.spec.runtime.container_socket_path.clone(),
             network_mode,
             orchestrator_url,
             nfs_server_host: nfs_server_host.clone(),
@@ -2056,8 +2056,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // steps executed by ContainerRun / ParallelContainerRun workflow states.
     // Delegates credential resolution to SecretsManager for secret-store paths and
     // to environment variables for env: paths.
-    let docker_for_steps = bollard::Docker::connect_with_local_defaults()
-        .context("Failed to connect Docker daemon for ContainerStepRunner (ADR-050)")?;
+    let docker_for_steps =
+        connect_container_runtime(config.spec.runtime.container_socket_path.as_deref())
+            .context("Failed to connect container runtime for ContainerStepRunner (ADR-050)")?;
     let step_credential_resolver: Arc<
         dyn aegis_orchestrator_core::infrastructure::image_manager::CredentialResolver,
     > = Arc::new(
@@ -2076,7 +2077,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let container_step_runner: Arc<
         dyn aegis_orchestrator_core::domain::runtime::ContainerStepRunner,
     > = Arc::new(
-        aegis_orchestrator_core::infrastructure::container_step_runner::DockerContainerStepRunner::new(
+        aegis_orchestrator_core::infrastructure::container_step_runner::ContainerStepRunnerImpl::new(
             docker_for_steps,
             step_image_manager,
             nfs_server_host,

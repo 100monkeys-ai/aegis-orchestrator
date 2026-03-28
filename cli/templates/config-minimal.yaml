@@ -53,8 +53,8 @@ spec:
   runtime:
     # bootstrap_script: "assets/bootstrap.py"  # Optional (default)
     # default_isolation: "inherit"             # Optional (default: inherit)
-    # Agent container networking (Docker deployments)
-    # docker_network_mode: "env:AEGIS_DOCKER_NETWORK"  # Optional, read from environment
+    # Agent container networking (Docker/Podman deployments)
+    # container_network_mode: "env:AEGIS_DOCKER_NETWORK"  # Optional, read from environment
     # Orchestrator URL for agent bootstrap callbacks
     # orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"    # Optional (default: http://localhost:8088)
     # NFS server hostname/IP for volume mounts (ADR-036)

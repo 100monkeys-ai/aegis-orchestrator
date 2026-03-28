@@ -1,12 +1,13 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # Docker Runtime Adapter — BC-2 (ADR-027)
+//! # Docker/Podman Runtime Adapter — BC-2 (ADR-027)
 //!
 //! Implements the [`crate::domain::runtime::AgentRuntime`] domain trait using
-//! the Docker Engine API via `bollard`. Provides container lifecycle management
-//! with configurable resource limits, network policies, and NFS volume mounts.
+//! a Docker-compatible container runtime (Docker or Podman) via `bollard`.
+//! Provides container lifecycle management with configurable resource limits,
+//! network policies, and NFS volume mounts.
 //!
-//! ⚠️ Phase 1 — Docker is the only supported runtime. Firecracker microVM
+//! ⚠️ Phase 1 — Docker/Podman runtime only. Firecracker microVM
 //! isolation is deferred to Phase 2 (ADR-003).
 //!
 //! ## Responsibilities
@@ -21,11 +22,11 @@
 // ============================================================================
 // ADR-003: Firecracker Isolation (DEFERRED to Phase 2 - Production Release)
 // ============================================================================
-// Current Implementation: Docker runtime only (Bollard client)
-// This module provides agent execution isolation via Docker containers.
+// Current Implementation: Docker/Podman runtime (Bollard client)
+// This module provides agent execution isolation via Docker/Podman containers.
 //
 // Firecracker VM-based isolation deferred to Phase 2 for production hardening.
-// Phase 1 uses Docker for development/testing convenience.
+// Phase 1 uses Docker/Podman for development/testing convenience.
 //
 // Firecracker runtime variant is planned for Phase 2.
 // See: adrs/003-firecracker-isolation.md
@@ -57,6 +58,26 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+/// Connect to a Docker-compatible container runtime (Docker or Podman) using an
+/// optional explicit socket path. Falls back to `Docker::connect_with_local_defaults()`
+/// when no path is given. This is the single source of truth for creating Bollard clients.
+pub fn connect_container_runtime(
+    socket_path: Option<&str>,
+) -> Result<Docker, bollard::errors::Error> {
+    if let Some(path) = socket_path {
+        #[cfg(unix)]
+        {
+            Docker::connect_with_unix(path, 120, bollard::API_DEFAULT_VERSION)
+        }
+        #[cfg(windows)]
+        {
+            Docker::connect_with_named_pipe(path, 120, bollard::API_DEFAULT_VERSION)
+        }
+    } else {
+        Docker::connect_with_local_defaults()
+    }
+}
+
 const AEGIS_CONTAINER_KIND_AGENT: &str = "agent";
 const AEGIS_CONTAINER_KIND_LABEL: &str = "aegis.container_kind";
 const AEGIS_EXECUTION_ID_LABEL: &str = "aegis.execution_id";
@@ -73,7 +94,7 @@ pub struct ManagedAgentContainer {
     pub state: Option<String>,
 }
 
-pub struct DockerRuntime {
+pub struct ContainerRuntime {
     docker: Docker,
     bootstrap_script_path: PathBuf, // Store as PathBuf for better path handling
     network_mode: Option<String>,
@@ -92,11 +113,11 @@ pub struct DockerRuntime {
     event_bus: Arc<EventBus>,
 }
 
-/// Configuration bundle for constructing a [`DockerRuntime`].
+/// Configuration bundle for constructing a [`ContainerRuntime`].
 ///
-/// Groups the nine constructor parameters into a single struct to keep the
+/// Groups the constructor parameters into a single struct to keep the
 /// `new` call-site readable and satisfy the `clippy::too_many_arguments` lint.
-pub struct DockerRuntimeConfig {
+pub struct ContainerRuntimeConfig {
     pub bootstrap_script: String,
     pub socket_path: Option<String>,
     pub network_mode: Option<String>,
@@ -108,9 +129,9 @@ pub struct DockerRuntimeConfig {
     pub credential_resolver: Arc<dyn CredentialResolver>,
 }
 
-impl DockerRuntime {
-    pub fn new(config: DockerRuntimeConfig) -> Result<Self, RuntimeError> {
-        let DockerRuntimeConfig {
+impl ContainerRuntime {
+    pub fn new(config: ContainerRuntimeConfig) -> Result<Self, RuntimeError> {
+        let ContainerRuntimeConfig {
             bootstrap_script,
             socket_path,
             network_mode,
@@ -147,37 +168,20 @@ impl DockerRuntime {
         }
 
         info!("Using bootstrap script: {}", bootstrap_path.display());
-        // Connect to Docker daemon (custom socket or auto-detect)
-        let docker = if let Some(path) = socket_path {
-            // Try custom socket path
-            #[cfg(unix)]
-            let result = Docker::connect_with_unix(&path, 120, bollard::API_DEFAULT_VERSION);
-
-            #[cfg(windows)]
-            let result = Docker::connect_with_named_pipe(&path, 120, bollard::API_DEFAULT_VERSION);
-
-            result.map_err(|e| {
+        // Connect to container runtime (Docker or Podman) — custom socket or auto-detect
+        let docker = connect_container_runtime(socket_path.as_deref())
+            .map_err(|e| {
                 RuntimeError::SpawnFailed(format!(
-                    "Failed to connect to Docker at {path}: {e}\n\n\
-                 Ensure Docker is running and the socket path is correct."
-                ))
-            })?
-        } else {
-            // Auto-detect Docker connection
-            Docker::connect_with_local_defaults()
-                .map_err(|e| RuntimeError::SpawnFailed(format!(
-                    "Failed to connect to Docker: {e}\n\n\
+                    "Failed to connect to container runtime: {e}\n\n\
                      Common causes:\n\
-                     - Docker daemon not running (check: docker ps)\n\
-                     - Permission denied accessing Docker socket\n\
-                     - On Windows: Docker Desktop not started\n\
-                     - On Linux: Current user not in 'docker' group\n\n\
+                     - Container runtime (Docker/Podman) not running\n\
+                     - Permission denied accessing runtime socket\n\
+                     - Socket path misconfigured\n\n\
                      Try:\n\
-                     - Start Docker: systemctl start docker (Linux) or Docker Desktop (Windows/Mac)\n\
-                     - Check permissions: ls -la /var/run/docker.sock\n\
-                     - Add user to docker group: sudo usermod -aG docker $USER"
-                )))?
-        };
+                     - Check socket: ls -la /var/run/docker.sock or /run/podman/podman.sock\n\
+                     - Start runtime: systemctl start docker (or systemctl --user start podman.socket)"
+                ))
+            })?;
         // Clone docker before moving it into Self (image_manager needs its own handle).
         let image_manager: Arc<dyn DockerImageManager> = Arc::new(StandardDockerImageManager::new(
             docker.clone(),
@@ -263,16 +267,15 @@ impl DockerRuntime {
             .collect())
     }
 
-    /// Verify Docker daemon is accessible
+    /// Verify container runtime (Docker/Podman) is accessible
     pub async fn healthcheck(&self) -> Result<(), RuntimeError> {
         self.docker.ping().await.map_err(|e| {
             RuntimeError::SpawnFailed(format!(
-                "Cannot connect to Docker daemon: {e}\n\n\
-                 Docker healthcheck failed. Ensure Docker is running:\n\
-                 - On Windows: Start Docker Desktop\n\
-                 - On Linux: sudo systemctl start docker\n\
-                 - On macOS: Start Docker Desktop\n\n\
-                 Verify with: docker ps"
+                "Cannot connect to container runtime: {e}\n\n\
+                 Healthcheck failed. Ensure Docker or Podman is running:\n\
+                 - Docker: sudo systemctl start docker\n\
+                 - Podman: systemctl --user start podman.socket\n\n\
+                 Verify with: docker ps (or podman ps)"
             ))
         })?;
         Ok(())
@@ -467,7 +470,7 @@ impl DockerRuntime {
 }
 
 #[async_trait]
-impl AgentRuntime for DockerRuntime {
+impl AgentRuntime for ContainerRuntime {
     async fn spawn(&self, config: RuntimeConfig) -> Result<InstanceId, RuntimeError> {
         // Validate isolation mode first
         config.validate_isolation()?;
@@ -520,7 +523,10 @@ impl AgentRuntime for DockerRuntime {
             network_mode: self.network_mode.clone(), // Optional Docker network (None = default)
             // ADR-027: Allow containers to reach host services (LLM APIs, orchestrator proxy) via
             // host.docker.internal (required on macOS/Windows; Linux uses host-gateway mapping)
-            extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+            extra_hosts: Some(vec![
+                "host.docker.internal:host-gateway".to_string(),
+                "host.containers.internal:host-gateway".to_string(),
+            ]),
             ..Default::default()
         };
 
@@ -920,7 +926,7 @@ impl AgentRuntime for DockerRuntime {
 #[cfg(test)]
 mod tests {
     use super::{
-        DockerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,
+        ContainerRuntime, AEGIS_CONTAINER_KIND_LABEL, AEGIS_EXECUTION_ID_LABEL,
         AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL, AEGIS_MANAGED_LABEL, AEGIS_RUNTIME_LABEL,
     };
     use crate::domain::agent::{ExecutionStrategy, ImagePullPolicy};
@@ -930,7 +936,7 @@ mod tests {
 
     #[test]
     fn bootstrap_stdout_is_labeled_as_model_authored_analysis() {
-        let formatted = DockerRuntime::format_bootstrap_stdout_for_log(
+        let formatted = ContainerRuntime::format_bootstrap_stdout_for_log(
             "The workflow is fine, but I think it should be rewritten.",
         );
 
@@ -943,7 +949,7 @@ mod tests {
 
     #[test]
     fn bootstrap_stdout_preserves_exact_deterministic_error_from_model_json() {
-        let formatted = DockerRuntime::format_bootstrap_stdout_for_log(
+        let formatted = ContainerRuntime::format_bootstrap_stdout_for_log(
             r#"{
   "errors": [
     "Workflow cycle validation failed: Workflow execution error: Circular reference detected in workflow"
@@ -994,7 +1000,7 @@ mod tests {
             execution_id: ExecutionId::new(),
         };
 
-        let labels = DockerRuntime::managed_container_labels(&config);
+        let labels = ContainerRuntime::managed_container_labels(&config);
 
         assert_eq!(labels.get(AEGIS_MANAGED_LABEL), Some(&"true".to_string()));
         assert_eq!(labels.get(AEGIS_RUNTIME_LABEL), Some(&"docker".to_string()));
@@ -1012,8 +1018,8 @@ mod tests {
         );
     }
 }
-// Private helper methods for DockerRuntime
-impl DockerRuntime {
+// Private helper methods for ContainerRuntime (Docker/Podman)
+impl ContainerRuntime {
     /// Copy bootstrap.py into a running container (if not already present)
     async fn copy_bootstrap_to_container(&self, container_id: &str) -> Result<(), RuntimeError> {
         // First, check if bootstrap script already exists in the container

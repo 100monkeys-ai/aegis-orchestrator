@@ -77,13 +77,13 @@ COPY aegis-orchestrator/assets ./assets
 # Expose gRPC ports
 EXPOSE 8088 50051
 
-# Run as non-root user with Docker socket access
-# Create docker group (use build arg for custom GID) and add aegis user to it
-# Default 989 matches the docker group GID on many Linux distros; override at build time
-# (DOCKER_GID=<host-docker-gid>) so the container's docker group aligns with the host's.
-ARG DOCKER_GID=989
-RUN groupadd -g ${DOCKER_GID} docker || true && \
-    useradd -m -u 10000 -G docker aegis && \
+# Run as non-root user with container runtime socket access
+# Create container-runtime group (use build arg for custom GID) and add aegis user to it
+# Default 989 matches the docker/podman group GID on many Linux distros; override at build time
+# (CONTAINER_RUNTIME_GID=<host-gid>) so the container's group aligns with the host's.
+ARG CONTAINER_RUNTIME_GID=989
+RUN groupadd -g ${CONTAINER_RUNTIME_GID} container-runtime || true && \
+    useradd -m -u 10000 -G container-runtime aegis && \
     chown -R aegis:aegis /app && \
     chmod +x /usr/local/bin/runtime-entrypoint.sh
 

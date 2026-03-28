@@ -51,7 +51,7 @@ const STREAM_BYTES_CAP: usize = 1_048_576;
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
 /// Docker Engine API (bollard). Shares image management and NFS configuration
 /// with [`crate::infrastructure::runtime::DockerRuntime`].
-pub struct DockerContainerStepRunner {
+pub struct ContainerStepRunnerImpl {
     docker: Docker,
     image_manager: Arc<dyn DockerImageManager>,
     /// Explicit NFS server host used for volume mount options (addr=...).
@@ -68,7 +68,7 @@ pub struct DockerContainerStepRunner {
     secrets_manager: Arc<SecretsManager>,
 }
 
-impl DockerContainerStepRunner {
+impl ContainerStepRunnerImpl {
     pub fn new(
         docker: Docker,
         image_manager: Arc<dyn DockerImageManager>,
@@ -136,7 +136,7 @@ impl DockerContainerStepRunner {
 }
 
 #[async_trait]
-impl ContainerStepRunner for DockerContainerStepRunner {
+impl ContainerStepRunner for ContainerStepRunnerImpl {
     async fn run_step(
         &self,
         config: ContainerStepConfig,

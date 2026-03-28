@@ -49,6 +49,7 @@ def _candidate_urls() -> list:
     if env_url:
         candidates.append(env_url)
     candidates.append("http://host.docker.internal:8088")
+    candidates.append("http://host.containers.internal:8088")
     seen = set()
     result = []
     for u in candidates:

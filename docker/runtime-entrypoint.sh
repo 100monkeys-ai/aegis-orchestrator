@@ -1,11 +1,28 @@
 #!/bin/sh
 set -eu
 
-# Allow the unprivileged runtime user to access host Docker socket when mounted.
-if stat -c '%g' /dev/null >/dev/null 2>&1; then
-  SOCK_GID="$(stat -c '%g' /var/run/docker.sock 2>/dev/null || true)"
-elif stat -f '%g' /dev/null >/dev/null 2>&1; then
-  SOCK_GID="$(stat -f '%g' /var/run/docker.sock 2>/dev/null || true)"
+# Determine container runtime socket path.
+# Priority: CONTAINER_HOST env > DOCKER_HOST env > well-known paths.
+SOCK_PATH=""
+for candidate in \
+    "${CONTAINER_HOST#unix://}" \
+    "${DOCKER_HOST#unix://}" \
+    "/run/podman/podman.sock" \
+    "/var/run/docker.sock"; do
+  if [ -S "$candidate" ] 2>/dev/null; then
+    SOCK_PATH="$candidate"
+    break
+  fi
+done
+
+if [ -n "$SOCK_PATH" ]; then
+  if stat -c '%g' /dev/null >/dev/null 2>&1; then
+    SOCK_GID="$(stat -c '%g' "$SOCK_PATH" 2>/dev/null || true)"
+  elif stat -f '%g' /dev/null >/dev/null 2>&1; then
+    SOCK_GID="$(stat -f '%g' "$SOCK_PATH" 2>/dev/null || true)"
+  else
+    SOCK_GID=""
+  fi
 else
   SOCK_GID=""
 fi

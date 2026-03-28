@@ -1280,7 +1280,7 @@ spec:
 {llm_section}
 {builtin_dispatchers_section}
   runtime:
-    docker_network_mode: "env:AEGIS_DOCKER_NETWORK"
+    container_network_mode: "env:AEGIS_DOCKER_NETWORK"
     orchestrator_url: "env:AEGIS_ORCHESTRATOR_URL"
     nfs_server_host: "env:AEGIS_NFS_HOST"
 

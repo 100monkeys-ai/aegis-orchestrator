@@ -343,17 +343,17 @@ pub struct RuntimeConfig {
     #[serde(default = "default_isolation_mode")]
     pub default_isolation: String,
 
-    /// Path to Docker socket (for Docker-based isolation)
-    /// Default: platform-specific Docker socket path (Unix) or named pipe (Windows)
+    /// Path to container runtime socket (for Docker/Podman-based isolation)
+    /// Default: platform-specific container socket path (Unix) or named pipe (Windows)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub docker_socket_path: Option<String>,
+    pub container_socket_path: Option<String>,
 
-    /// Docker network to attach agent containers to (e.g., "aegis-network", "bridge")
-    /// If None, uses Docker's default network behavior
+    /// Container network to attach agent containers to (e.g., "aegis-network", "bridge")
+    /// If None, uses the runtime's default network behavior
     /// Supports env:VAR_NAME syntax for environment variable substitution
     /// Default: None (no explicit network)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub docker_network_mode: Option<String>,
+    pub container_network_mode: Option<String>,
 
     /// Orchestrator URL for agent containers to call back to
     /// Used by agent bootstrap scripts to reach the LLM proxy endpoint
@@ -407,8 +407,8 @@ impl Default for RuntimeConfig {
         Self {
             bootstrap_script: default_bootstrap_script(),
             default_isolation: default_isolation_mode(),
-            docker_socket_path: None,
-            docker_network_mode: None,
+            container_socket_path: None,
+            container_network_mode: None,
             orchestrator_url: default_orchestrator_url(),
             nfs_server_host: None,
             nfs_port: default_nfs_port(),
@@ -1774,6 +1774,21 @@ impl NodeConfigManifest {
                 });
                 let logging = obs.logging.get_or_insert_with(LoggingConfig::default);
                 logging.service_name = Some(service_name);
+            }
+        }
+
+        // CONTAINER_HOST (Podman) / DOCKER_HOST (Docker) → container_socket_path.
+        // Both use URI format "unix:///path/to/sock"; strip the "unix://" prefix.
+        // Precedence: explicit YAML > CONTAINER_HOST > DOCKER_HOST > auto-detect.
+        if self.spec.runtime.container_socket_path.is_none() {
+            let host_uri = std::env::var("CONTAINER_HOST")
+                .or_else(|_| std::env::var("DOCKER_HOST"))
+                .ok();
+            if let Some(uri) = host_uri {
+                let path = uri.strip_prefix("unix://").unwrap_or(&uri);
+                if !path.is_empty() {
+                    self.spec.runtime.container_socket_path = Some(path.to_string());
+                }
             }
         }
     }
