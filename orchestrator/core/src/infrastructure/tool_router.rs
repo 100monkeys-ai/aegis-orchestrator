@@ -860,7 +860,11 @@ impl ToolRouter {
 // =============================================================================
 
 /// Tool metadata exposed to LLM prompts for tool discovery and schema injection.
+///
+/// Fields are serialized as camelCase to match the MCP protocol specification
+/// (e.g., `input_schema` → `inputSchema`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolMetadata {
     pub name: String,
     pub description: String,
