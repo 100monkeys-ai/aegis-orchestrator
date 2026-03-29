@@ -3222,6 +3222,8 @@ async fn run_workflow_legacy_handler(
         tenant_id: Some(tenant_id_from_identity(
             identity.as_ref().map(|identity| &identity.0),
         )),
+        // TODO(ADR-083): resolve security_context_name from the authenticated identity
+        security_context_name: None,
     };
     execute_temporal_workflow_handler(State(state), identity, Json(req)).await
 }

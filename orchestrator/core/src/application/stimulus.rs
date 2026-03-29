@@ -497,6 +497,9 @@ impl StimulusService for StandardStimulusService {
             blackboard: None,
             version: None,
             tenant_id: Some(Self::tenant_id_for_stimulus(&stimulus)),
+            // Stimulus-triggered workflows inherit the security context from the
+            // route's bound context once ADR-083 Phase 2 lands.
+            security_context_name: None,
         };
 
         let started = self

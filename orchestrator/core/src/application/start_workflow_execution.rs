@@ -52,6 +52,12 @@ pub struct StartWorkflowExecutionRequest {
 
     #[serde(default)]
     pub tenant_id: Option<TenantId>,
+
+    /// Security context name resolved from the calling agent's SMCP session (ADR-083).
+    /// Propagated so the workflow engine can enforce the same security boundary on
+    /// child agent executions spawned within workflow states.
+    #[serde(default)]
+    pub security_context_name: Option<String>,
 }
 
 /// Started workflow execution response
@@ -629,6 +635,7 @@ mod tests {
                 })),
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap();
@@ -699,6 +706,7 @@ mod tests {
                 blackboard: None,
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap_err();
@@ -734,6 +742,7 @@ mod tests {
                 blackboard: Some(json!(["not", "an", "object"])),
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap_err();
@@ -765,6 +774,7 @@ mod tests {
                 blackboard: Some(json!({ "input": "reserved" })),
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap_err();
@@ -794,6 +804,7 @@ mod tests {
                 blackboard: None,
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap();
@@ -827,6 +838,7 @@ mod tests {
                 blackboard: None,
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap();
@@ -973,6 +985,7 @@ mod tests {
                 blackboard: None,
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
+                security_context_name: None,
             })
             .await
             .unwrap_err();

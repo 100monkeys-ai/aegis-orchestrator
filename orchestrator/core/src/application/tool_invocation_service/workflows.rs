@@ -106,6 +106,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_run_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -139,6 +140,7 @@ impl ToolInvocationService {
                     blackboard,
                     version,
                     tenant_id: Some(tenant_id.clone()),
+                    security_context_name: Some(security_context.name.clone()),
                 },
             )
             .await
@@ -355,6 +357,7 @@ impl ToolInvocationService {
                     blackboard: None,
                     version: None,
                     tenant_id: Some(tenant_id),
+                    security_context_name: None,
                 },
             )
             .await

@@ -93,6 +93,7 @@ impl ClusterAwareExecutionService {
         agent_id: AgentId,
         input: &ExecutionInput,
         tenant_id: &TenantId,
+        security_context_name: &str,
     ) -> Result<ExecutionId> {
         let route_req = RouteRequest {
             execution_id,
@@ -133,6 +134,7 @@ impl ClusterAwareExecutionService {
                 &tenant_id.to_string(),
                 &self.forwarding_config.controller_node_id.to_string(),
                 &self.forwarding_config.security_token,
+                security_context_name,
             )
             .await?;
 
@@ -166,7 +168,7 @@ impl ExecutionService for ClusterAwareExecutionService {
             let tenant_id = TenantId::default();
 
             match self
-                .try_forward(execution_id, agent_id, &input, &tenant_id)
+                .try_forward(execution_id, agent_id, &input, &tenant_id, &security_context_name)
                 .await
             {
                 Ok(id) => return Ok(id),
@@ -206,7 +208,7 @@ impl ExecutionService for ClusterAwareExecutionService {
             let tenant_id = TenantId::default();
 
             match self
-                .try_forward(execution_id, agent_id, &input, &tenant_id)
+                .try_forward(execution_id, agent_id, &input, &tenant_id, &security_context_name)
                 .await
             {
                 Ok(id) => return Ok(id),

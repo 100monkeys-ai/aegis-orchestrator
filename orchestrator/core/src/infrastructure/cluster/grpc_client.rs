@@ -232,6 +232,7 @@ impl NodeClusterClient {
         tenant_id: &str,
         originating_node_id: &str,
         user_security_token: &str,
+        security_context_name: &str,
     ) -> Result<tonic::Streaming<ExecutionEvent>> {
         let inner = ForwardExecutionInner {
             execution_id: execution_id.to_string(),
@@ -240,6 +241,7 @@ impl NodeClusterClient {
             tenant_id: tenant_id.to_string(),
             originating_node_id: originating_node_id.to_string(),
             user_security_token: user_security_token.to_string(),
+            security_context_name: security_context_name.to_string(),
         };
         let inner_bytes = inner.encode_to_vec();
         let envelope = self.wrap_in_envelope(&inner_bytes).await?;

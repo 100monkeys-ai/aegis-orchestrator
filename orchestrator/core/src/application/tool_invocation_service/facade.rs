@@ -748,7 +748,10 @@ impl ToolInvocationService {
             "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
             "aegis.workflow.delete" => Some(self.invoke_aegis_workflow_delete_tool(args).await),
             "aegis.workflow.validate" => Some(self.invoke_aegis_workflow_validate_tool(args).await),
-            "aegis.workflow.run" => Some(self.invoke_aegis_workflow_run_tool(args).await),
+            "aegis.workflow.run" => Some(
+                self.invoke_aegis_workflow_run_tool(args, security_context)
+                    .await,
+            ),
             "aegis.workflow.executions.list" => {
                 Some(self.invoke_aegis_workflow_execution_list_tool(args).await)
             }

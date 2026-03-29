@@ -716,6 +716,7 @@ states:
         blackboard: None,
         version: None,
         tenant_id: Some(TenantId::local_default()),
+        security_context_name: None,
     };
 
     let start_result = start_use_case.start_execution(req).await;
@@ -750,6 +751,7 @@ async fn start_execution_surfaces_repository_save_failure_before_temporal_start(
             blackboard: None,
             version: None,
             tenant_id: Some(TenantId::local_default()),
+            security_context_name: None,
         })
         .await
         .unwrap_err();

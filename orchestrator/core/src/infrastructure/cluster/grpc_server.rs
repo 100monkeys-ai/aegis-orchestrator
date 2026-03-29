@@ -380,9 +380,8 @@ impl NodeClusterService for NodeClusterServiceHandler {
                 .map_err(|_| Status::invalid_argument("Invalid tenant_id"))?,
             originating_node_id: inner.originating_node_id,
             user_security_token: inner.user_security_token,
-            // ADR-083: propagate security context from proto once the field is added;
-            // until then, default to operator for cluster-forwarded executions.
-            security_context_name: "aegis-system-operator".to_string(),
+            // ADR-083: propagate security context from the proto message.
+            security_context_name: inner.security_context_name,
         };
 
         let stream = self
