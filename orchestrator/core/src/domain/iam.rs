@@ -66,7 +66,7 @@ pub enum RealmKind {
 /// UI applications use AuthorizationCode + PKCE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcClient {
-    /// OIDC client_id (e.g. "aegis-control-plane", "aegis-sdk-python")
+    /// OIDC client_id (e.g. "zaru-client", "aegis-sdk-python")
     pub client_id: String,
     /// Which realm this client belongs to
     pub realm_slug: String,
@@ -79,7 +79,7 @@ pub struct OidcClient {
 /// OAuth2 grant type for OIDC clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrantType {
-    /// Control Plane UI, Zaru Client
+    /// Zaru Client
     AuthorizationCodePkce,
     /// SDK clients, CI/CD pipelines
     ClientCredentials,

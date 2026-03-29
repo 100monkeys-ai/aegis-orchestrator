@@ -37,7 +37,7 @@ pub trait SecurityContextRepository: Send + Sync {
 
     /// Return all registered security contexts.
     ///
-    /// Used by the Control Plane's Architect component to enumerate available
+    /// Used by the Zaru client's Architect component to enumerate available
     /// contexts when generating agent manifests.
     async fn list_all(&self) -> Result<Vec<SecurityContext>>;
 

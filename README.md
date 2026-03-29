@@ -1,6 +1,6 @@
 # AEGIS Orchestrator
 
-The runtime and control plane for AEGIS: policy-governed infrastructure for running autonomous AI agents without giving up control.
+The runtime and orchestration layer for AEGIS: policy-governed infrastructure for running autonomous AI agents without giving up control.
 
 [![License](https://img.shields.io/badge/license-AGPL%203.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org/)
@@ -84,7 +84,7 @@ This is enough to start understanding the operator model: the orchestrator owns 
 
 ### Deterministic execution
 
-AEGIS is designed to make automation easier to reason about. Workflows are explicit, configuration is typed, and execution flows through the orchestrator rather than through a loose collection of direct agent integrations. That structure gives operators a more reproducible control plane and gives developers a clearer contract for how work is scheduled, executed, and observed.
+AEGIS is designed to make automation easier to reason about. Workflows are explicit, configuration is typed, and execution flows through the orchestrator rather than through a loose collection of direct agent integrations. That structure gives operators a more reproducible orchestration layer and gives developers a clearer contract for how work is scheduled, executed, and observed.
 
 ### Security and isolation
 

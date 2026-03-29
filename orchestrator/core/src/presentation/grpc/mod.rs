@@ -10,9 +10,8 @@
 //! | [`auth_interceptor`] | `GrpcIamAuthInterceptor` | gRPC JWT validation interceptor (ADR-041) |
 //! | [`rate_limit_interceptor`] | `GrpcRateLimiter` | Per-user rate limiting guard (ADR-072) |
 //!
-//! The Control Plane UI (`aegis-control-plane`) and Zaru product
-//! (`aegis-zaru-deployment`) connect to this service for real-time
-//! execution event streaming (ADR-026 gRPC server-stream).
+//! The Zaru client (`zaru-client`) connects to this service for
+//! real-time execution event streaming (ADR-026 gRPC server-stream).
 
 pub mod auth_interceptor;
 pub mod rate_limit_interceptor;

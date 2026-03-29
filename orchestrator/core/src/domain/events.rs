@@ -79,7 +79,7 @@ pub enum PullSource {
 /// during the `spawn()` path (ADR-045).
 ///
 /// Published to the [`crate::infrastructure::event_bus::EventBus`] before/after every
-/// Docker image pull so that the Control Plane, Cortex, and audit log can:
+/// Docker image pull so that the Zaru client, Cortex, and audit log can:
 /// - Track which images were pulled vs cache-hit across executions
 /// - Alert on systematic pull failures (misconfigured registry credentials, rate limits)
 /// - Feed Cortex with image-reuse patterns for cost optimisation signals
@@ -205,7 +205,7 @@ pub enum StorageEvent {
 /// Agent manifest lifecycle events (BC-1 Agent Lifecycle Context).
 ///
 /// Published by [`crate::application::lifecycle::StandardAgentLifecycleService`].
-/// Consumers: Control Plane gRPC stream, Cortex (tracks agent version history).
+/// Consumers: Zaru client gRPC stream, Cortex (tracks agent version history).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(clippy::large_enum_variant)]
 pub enum AgentLifecycleEvent {
@@ -640,7 +640,7 @@ pub enum ViolationType {
 /// [`crate::infrastructure::tool_router::ToolRouter`]. Consumed by:
 /// - The Cortex for tool-usage pattern learning (e.g. "always run `npm install`
 ///   after modifying `package.json`")
-/// - The Control Plane for real-time execution visualization
+/// - The Zaru client for real-time execution visualization
 /// - Security analytics for anomalous tool usage detection
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum MCPToolEvent {
@@ -839,7 +839,7 @@ pub enum CommandFailureReason {
 /// and [`crate::infrastructure::smcp::audit::SmcpAuditLogger`].
 /// Consumed by:
 /// - Cortex for security pattern learning (e.g. detecting attestation storms)
-/// - Control Plane for real-time security dashboard
+/// - Zaru client for real-time security dashboard
 /// - SOC 2 audit trail export (Phase 2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SmcpEvent {
@@ -882,7 +882,7 @@ pub enum SmcpEvent {
 /// Published by [`crate::application::stimulus::StandardStimulusService`].
 /// Consumed by:
 /// - Cortex for routing pattern learning (Stage 2 → Stage 1 promotion signals)
-/// - Control Plane for stimulus audit dashboard
+/// - Zaru client for stimulus audit dashboard
 /// - ADR-030 event replay (Phase 2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StimulusEvent {
@@ -928,7 +928,7 @@ pub enum StimulusEvent {
 /// realm lifecycle operations, and JWKS cache refresh cycles.
 /// Consumed by:
 /// - Cortex for security pattern learning (e.g. detecting brute-force token validation failures)
-/// - Control Plane for IAM audit dashboard
+/// - Zaru client for IAM audit dashboard
 /// - SOC 2 audit trail export (Phase 2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum IamEvent {

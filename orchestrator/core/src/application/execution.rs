@@ -173,7 +173,7 @@ pub trait ExecutionService: Send + Sync {
     /// Open a live stream of all [`DomainEvent`]s associated with a given agent.
     ///
     /// This includes events from all executions of the agent, not just a single one.
-    /// Used by the Control Plane to power per-agent monitoring views.
+    /// Used by the Zaru client to power per-agent monitoring views.
     async fn stream_agent_events(
         &self,
         id: AgentId,

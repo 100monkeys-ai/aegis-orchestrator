@@ -3,8 +3,8 @@
 //! # HTTP/SSE Presentation Layer — Axum (BC-2, BC-1, BC-12)
 //!
 //! Axum-based HTTP handlers for the orchestrator REST API and the
-//! Server-Sent Events (SSE) endpoint consumed by the Control Plane UI
-//! (`aegis-control-plane`) for real-time execution streaming (ADR-026).
+//! Server-Sent Events (SSE) endpoint consumed by the Zaru client
+//! (`zaru-client`) for real-time execution streaming (ADR-026).
 //!
 //! All handlers delegate immediately to application-layer use cases.
 //! No business logic lives here — see AGENTS.md §Anti-Patterns §Smart UI.

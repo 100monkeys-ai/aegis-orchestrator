@@ -14,7 +14,7 @@
 //!   ▼
 //! EventBus  (broadcast channel, capacity 1000)
 //!   ├── CLI subscriber  →  prints progress to terminal
-//!   ├── SSE subscriber  →  streams to Control Plane WebSocket
+//!   ├── SSE subscriber  →  streams to Zaru client WebSocket
 //!   └── Cortex subscriber → indexes RefinementApplied patterns
 //! ```
 //!

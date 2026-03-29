@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Tool Catalog Application Service
 //!
-//! Provides enriched tool discovery for agents and the Control Plane.
+//! Provides enriched tool discovery for agents and the Zaru client.
 //! Wraps the raw [`ToolMetadata`](crate::infrastructure::tool_router::ToolMetadata)
 //! from the infrastructure layer with source classification, category grouping,
 //! and tag inference so consumers can filter, search, and paginate the tool

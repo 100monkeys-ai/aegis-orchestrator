@@ -9,7 +9,7 @@
 //! | Module | Transport | Description |
 //! |--------|-----------|-------------|
 //! | [`api`] | HTTP/SSE (Axum) | REST endpoints + Server-Sent Events for execution streaming |
-//! | [`grpc`] | gRPC (Tonic) | Orchestrator gRPC service, streamed by the Control Plane UI |
+//! | [`grpc`] | gRPC (Tonic) | Orchestrator gRPC service, streamed by the Zaru client |
 //! | [`webhook_guard`] | HTTP | HMAC-SHA256 extractor for webhook requests (ADR-021) |
 //! | [`stimulus_handlers`] | HTTP | `POST /v1/stimuli` and `POST /v1/webhooks/{source}` handlers (ADR-021) |
 //! | [`keycloak_auth`] | HTTP | IAM/OIDC JWT auth middleware for HTTP endpoints (ADR-041) |

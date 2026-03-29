@@ -98,7 +98,7 @@ pub struct SecurityContextMetadata {
 pub struct SecurityContext {
     /// Unique name identifying this context (e.g. `"research-safe"`, `"zaru-free"`).
     pub name: String,
-    /// Human-readable description shown in the Control Plane UI.
+    /// Human-readable description shown in the Zaru client admin console.
     pub description: String,
     /// Permitted tool capabilities. Evaluated in order; first match wins.
     pub capabilities: Vec<Capability>,
