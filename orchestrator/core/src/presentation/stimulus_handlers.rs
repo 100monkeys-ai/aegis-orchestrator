@@ -233,6 +233,15 @@ mod tests {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }
 
+        async fn start_execution_with_id(
+            &self,
+            _execution_id: ExecutionId,
+            _agent_id: AgentId,
+            _input: crate::domain::execution::ExecutionInput,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("execution service should not be used by stimulus handler tests")
+        }
+
         async fn start_child_execution(
             &self,
             _agent_id: AgentId,

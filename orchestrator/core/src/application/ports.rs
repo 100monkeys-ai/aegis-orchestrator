@@ -138,3 +138,12 @@ pub trait AgentActivityPort: Send + Sync {
         offset: usize,
     ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>;
 }
+
+/// Port for cascade-cancelling a swarm when a parent execution is cancelled.
+/// Implemented by the swarm crate; injected into StandardExecutionService.
+#[async_trait]
+pub trait SwarmCancellationPort: Send + Sync {
+    /// Look up the swarm associated with this execution and cancel it.
+    /// Returns Ok(()) if no swarm is associated or the cancellation succeeds.
+    async fn cascade_cancel_for_execution(&self, execution_id: ExecutionId) -> anyhow::Result<()>;
+}

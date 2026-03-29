@@ -41,6 +41,14 @@ impl ExecutionService for MockExecutionService {
     ) -> anyhow::Result<ExecutionId> {
         Ok(ExecutionId::new())
     }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _agent_id: AgentId,
+        _input: ExecutionInput,
+    ) -> anyhow::Result<ExecutionId> {
+        Ok(execution_id)
+    }
     async fn get_execution(&self, _id: ExecutionId) -> anyhow::Result<Execution> {
         // Return a completed execution so ValidationService can parse output
         let mut exec = Execution::new(

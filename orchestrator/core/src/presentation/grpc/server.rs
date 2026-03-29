@@ -1113,6 +1113,15 @@ mod tests {
             Ok(self.execution_id)
         }
 
+        async fn start_execution_with_id(
+            &self,
+            execution_id: ExecutionId,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+        ) -> Result<ExecutionId> {
+            Ok(execution_id)
+        }
+
         async fn start_child_execution(
             &self,
             _agent_id: AgentId,

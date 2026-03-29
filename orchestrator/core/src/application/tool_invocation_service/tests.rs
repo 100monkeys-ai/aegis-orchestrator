@@ -297,6 +297,14 @@ impl ExecutionService for TestExecutionService {
     async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
         anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
     }
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
+    }
     async fn start_child_execution(
         &self,
         _: AgentId,
@@ -358,6 +366,15 @@ struct LogsTestExecutionService {
 impl ExecutionService for LogsTestExecutionService {
     async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
         anyhow::bail!("LogsTestExecutionService::start_execution not exercised in this test")
+    }
+
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        _: AgentId,
+        _: ExecutionInput,
+    ) -> Result<ExecutionId> {
+        Ok(execution_id)
     }
 
     async fn start_child_execution(

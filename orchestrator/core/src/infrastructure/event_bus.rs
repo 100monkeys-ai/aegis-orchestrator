@@ -38,6 +38,7 @@
 //! | `Iam` | BC-13 | ADR-041 |
 //! | `Secrets` | BC-11 | ADR-034 |
 //! | `RateLimit` | Cross-cutting | ADR-072 |
+//! | `Swarm` | BC-6 | ADR-039 |
 //!
 //! # Code Quality Principles
 //!
@@ -65,7 +66,8 @@ use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
     LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SecretEvent, SmcpEvent,
-    StimulusEvent, StorageEvent, TenantEvent, ValidationEvent, VolumeEvent, WorkflowEvent,
+    StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent, VolumeEvent,
+    WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -93,6 +95,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Tenant(_) => "tenant",
         DomainEvent::Cluster(_) => "cluster",
         DomainEvent::RateLimit(_) => "rate_limit",
+        DomainEvent::Swarm(_) => "swarm",
     }
 }
 
@@ -126,6 +129,8 @@ pub enum DomainEvent {
     Cluster(ClusterEvent),
     /// Rate limit enforcement events (ADR-072)
     RateLimit(RateLimitEvent),
+    /// BC-6 Swarm Coordination events (ADR-039)
+    Swarm(SwarmEvent),
 }
 
 impl DomainEvent {
@@ -258,6 +263,11 @@ impl DomainEvent {
                 | ClusterEvent::NodeUnhealthy { .. }
                 | ClusterEvent::ClusterConfigPushed { .. } => None,
             },
+            DomainEvent::Swarm(event) => match event {
+                SwarmEvent::ChildSpawned { execution_id, .. }
+                | SwarmEvent::LockAcquired { execution_id, .. } => Some(*execution_id),
+                _ => None,
+            },
         }
     }
 
@@ -334,9 +344,10 @@ impl DomainEvent {
                 | SecretEvent::LeaseRevoked { access_context, .. }
                 | SecretEvent::SecretAccessDenied { access_context, .. } => access_context.agent_id,
             },
-            DomainEvent::ContainerRun(_) | DomainEvent::Cluster(_) | DomainEvent::RateLimit(_) => {
-                None
-            }
+            DomainEvent::ContainerRun(_)
+            | DomainEvent::Cluster(_)
+            | DomainEvent::RateLimit(_)
+            | DomainEvent::Swarm(_) => None,
         }
     }
 
@@ -499,6 +510,14 @@ impl DomainEvent {
                 RateLimitEvent::Exceeded { timestamp, .. }
                 | RateLimitEvent::Warning { timestamp, .. } => *timestamp,
             },
+            DomainEvent::Swarm(event) => match event {
+                SwarmEvent::SwarmCreated { created_at, .. } => *created_at,
+                SwarmEvent::ChildSpawned { spawned_at, .. } => *spawned_at,
+                SwarmEvent::SwarmDissolved { dissolved_at, .. } => *dissolved_at,
+                SwarmEvent::LockAcquired { .. }
+                | SwarmEvent::LockReleased { .. }
+                | SwarmEvent::MessageBroadcast { .. } => Utc::now(),
+            },
         }
     }
 
@@ -655,6 +674,14 @@ impl DomainEvent {
                 RateLimitEvent::Exceeded { .. } => "rate_limit_exceeded",
                 RateLimitEvent::Warning { .. } => "rate_limit_warning",
             },
+            DomainEvent::Swarm(event) => match event {
+                SwarmEvent::SwarmCreated { .. } => "swarm_created",
+                SwarmEvent::ChildSpawned { .. } => "swarm_child_spawned",
+                SwarmEvent::SwarmDissolved { .. } => "swarm_dissolved",
+                SwarmEvent::LockAcquired { .. } => "swarm_lock_acquired",
+                SwarmEvent::LockReleased { .. } => "swarm_lock_released",
+                SwarmEvent::MessageBroadcast { .. } => "swarm_message_broadcast",
+            },
         }
     }
 
@@ -677,6 +704,7 @@ impl DomainEvent {
             DomainEvent::Tenant(_) => "tenant",
             DomainEvent::Cluster(_) => "cluster",
             DomainEvent::RateLimit(_) => "rate_limit",
+            DomainEvent::Swarm(_) => "swarm",
         }
     }
 
@@ -772,6 +800,7 @@ impl DomainEvent {
             DomainEvent::Tenant(_) => Some("tenant"),
             DomainEvent::Cluster(_) => Some("cluster"),
             DomainEvent::RateLimit(_) => Some("rate_limit"),
+            DomainEvent::Swarm(_) => Some("swarm"),
         }
     }
 }
@@ -876,6 +905,11 @@ impl EventBus {
     /// Publish a rate limit enforcement event (ADR-072)
     pub fn publish_rate_limit_event(&self, event: RateLimitEvent) {
         self.publish(DomainEvent::RateLimit(event));
+    }
+
+    /// Publish a swarm coordination event (BC-6 ADR-039)
+    pub fn publish_swarm_event(&self, event: SwarmEvent) {
+        self.publish(DomainEvent::Swarm(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1248,6 +1282,7 @@ impl AgentEventReceiver {
             DomainEvent::Tenant(_) => false,       // Tenant events are system-wide, not per-agent
             DomainEvent::Cluster(_) => false,      // Cluster events are system-wide, not per-agent
             DomainEvent::RateLimit(_) => false, // Rate limit events are system-wide, not per-agent
+            DomainEvent::Swarm(_) => false,     // Swarm events are system-wide, not per-agent
         }
     }
 }

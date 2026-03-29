@@ -64,6 +64,11 @@ pub struct ExecutionHierarchy {
 
     /// Execution path from root (list of execution IDs)
     pub path: Vec<ExecutionId>,
+
+    /// Optional swarm ID linking this execution to a multi-agent swarm (ADR-039).
+    /// Uses raw UUID to avoid circular dependency with the swarm crate.
+    #[serde(default)]
+    pub swarm_id: Option<uuid::Uuid>,
 }
 
 impl Default for ExecutionHierarchy {
@@ -81,6 +86,7 @@ impl ExecutionHierarchy {
             parent_execution_id: None,
             depth: 0,
             path: vec![execution_id],
+            swarm_id: None,
         }
     }
 
@@ -104,6 +110,7 @@ impl ExecutionHierarchy {
             parent_execution_id: Some(parent.path[parent.path.len() - 1]),
             depth: new_depth,
             path,
+            swarm_id: parent.swarm_id,
         })
     }
 
@@ -120,6 +127,12 @@ impl ExecutionHierarchy {
     /// Get the immediate parent execution ID
     pub fn parent_id(&self) -> Option<ExecutionId> {
         self.parent_execution_id
+    }
+
+    /// Associate this hierarchy with a swarm.
+    pub fn with_swarm_id(mut self, swarm_id: uuid::Uuid) -> Self {
+        self.swarm_id = Some(swarm_id);
+        self
     }
 }
 
@@ -267,7 +280,17 @@ pub enum ExecutionError {
 
 impl Execution {
     pub fn new(agent_id: AgentId, input: ExecutionInput, max_iterations: u8) -> Self {
-        let id = ExecutionId::new();
+        Self::new_with_id(ExecutionId::new(), agent_id, input, max_iterations)
+    }
+
+    /// Create an execution with a pre-assigned ID (used for cluster forwarding).
+    /// The execution_id is imported from the originating node to preserve tracing correlation.
+    pub fn new_with_id(
+        id: ExecutionId,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        max_iterations: u8,
+    ) -> Self {
         Self {
             id,
             agent_id,

@@ -3,6 +3,7 @@
 
 pub mod attest_node;
 pub mod challenge_node;
+pub mod cluster_aware_execution;
 pub mod forward_execution;
 pub mod health_sweeper;
 pub mod heartbeat;
@@ -13,6 +14,7 @@ pub mod sync_config;
 
 pub use attest_node::*;
 pub use challenge_node::*;
+pub use cluster_aware_execution::{ClusterAwareExecutionService, ClusterForwardingConfig};
 pub use forward_execution::*;
 pub use health_sweeper::HealthSweeper;
 pub use heartbeat::*;

@@ -36,18 +36,12 @@ impl ForwardExecutionUseCase {
         let input: ExecutionInput = serde_json::from_str(&req.input)
             .map_err(|e| anyhow!("Invalid execution input: {}", e))?;
 
-        // 2. Start execution locally. Cluster execution identity import is not supported in the
-        // single-node Phase 1 baseline, so the local execution service allocates the execution id.
+        // 2. Start execution locally with the imported execution identity from the
+        // originating node, preserving tracing correlation across the cluster.
         let local_id = self
             .execution_service
-            .start_execution(req.agent_id, input)
+            .start_execution_with_id(req.execution_id, req.agent_id, input)
             .await?;
-
-        if local_id != req.execution_id {
-            return Err(anyhow!(
-                "cluster execution forwarding requires imported execution identities, which are disabled for the single-node Phase 1 baseline"
-            ));
-        }
 
         // 3. Stream events back
         let stream = self.execution_service.stream_execution(local_id).await?;

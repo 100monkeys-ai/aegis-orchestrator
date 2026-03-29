@@ -10,7 +10,7 @@
 //!
 //! See AGENTS.md §Swarm Coordination Context.
 
-use aegis_orchestrator_core::domain::shared_kernel::AgentId;
+use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -52,41 +52,49 @@ pub enum CancellationReason {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Swarm {
     pub id: SwarmId,
-    pub parent_agent_id: AgentId,
-    /// Tracks the current members keyed by their synthetic child slot.
-    pub members: HashMap<Uuid, AgentId>,
+    pub parent_execution_id: ExecutionId,
+    /// Tracks the current members keyed by their execution ID.
+    pub members: HashMap<ExecutionId, AgentId>,
     pub status: SwarmStatus,
     pub created_at: DateTime<Utc>,
+    pub dissolved_at: Option<DateTime<Utc>>,
 }
 
 impl Swarm {
-    pub fn new(parent_agent_id: AgentId) -> Self {
+    pub fn new(parent_execution_id: ExecutionId) -> Self {
         Self {
             id: SwarmId::new(),
-            parent_agent_id,
+            parent_execution_id,
             members: HashMap::new(),
             status: SwarmStatus::Active,
             created_at: Utc::now(),
+            dissolved_at: None,
         }
     }
 
-    pub fn add_member(&mut self, agent_id: AgentId) {
-        self.members.insert(Uuid::new_v4(), agent_id);
+    pub fn add_member(&mut self, execution_id: ExecutionId, agent_id: AgentId) {
+        self.members.insert(execution_id, agent_id);
     }
 
     pub fn contains(&self, agent_id: AgentId) -> bool {
-        agent_id == self.parent_agent_id || self.members.values().any(|member| *member == agent_id)
+        self.members.values().any(|member| *member == agent_id)
+    }
+
+    pub fn contains_execution(&self, execution_id: &ExecutionId) -> bool {
+        self.members.contains_key(execution_id)
     }
 
     pub fn member_ids(&self) -> Vec<AgentId> {
-        let mut ids = Vec::with_capacity(self.members.len() + 1);
-        ids.push(self.parent_agent_id);
-        ids.extend(self.members.values().copied());
-        ids
+        self.members.values().copied().collect()
+    }
+
+    pub fn member_execution_ids(&self) -> Vec<ExecutionId> {
+        self.members.keys().copied().collect()
     }
 
     pub fn dissolve(&mut self) {
         self.status = SwarmStatus::Dissolved;
+        self.dissolved_at = Some(Utc::now());
     }
 }
 
@@ -99,6 +107,7 @@ impl Swarm {
 pub struct ResourceLock {
     pub resource_id: String,
     pub held_by: AgentId,
+    pub execution_id: ExecutionId,
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -143,40 +152,33 @@ mod tests {
     use super::*;
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Swarm::new() — creation with parent agent.
+    // Swarm::new() — creation with parent execution.
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
     fn new_swarm_has_active_status() {
-        let parent = AgentId::new();
-        let swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let swarm = Swarm::new(parent_exec);
         assert_eq!(swarm.status, SwarmStatus::Active);
-        assert_eq!(swarm.parent_agent_id, parent);
+        assert_eq!(swarm.parent_execution_id, parent_exec);
         assert!(swarm.members.is_empty());
-    }
-
-    #[test]
-    fn new_swarm_contains_parent() {
-        let parent = AgentId::new();
-        let swarm = Swarm::new(parent);
-        assert!(swarm.contains(parent));
+        assert!(swarm.dissolved_at.is_none());
     }
 
     #[test]
     fn new_swarm_does_not_contain_arbitrary_agent() {
-        let parent = AgentId::new();
-        let swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let swarm = Swarm::new(parent_exec);
         let other = AgentId::new();
         assert!(!swarm.contains(other));
     }
 
     #[test]
-    fn new_swarm_member_ids_includes_parent_only() {
-        let parent = AgentId::new();
-        let swarm = Swarm::new(parent);
+    fn new_swarm_member_ids_is_empty() {
+        let parent_exec = ExecutionId::new();
+        let swarm = Swarm::new(parent_exec);
         let ids = swarm.member_ids();
-        assert_eq!(ids.len(), 1);
-        assert_eq!(ids[0], parent);
+        assert!(ids.is_empty());
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -185,41 +187,57 @@ mod tests {
 
     #[test]
     fn add_member_makes_agent_contained() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         let child = AgentId::new();
-        swarm.add_member(child);
+        let child_exec = ExecutionId::new();
+        swarm.add_member(child_exec, child);
         assert!(swarm.contains(child));
+        assert!(swarm.contains_execution(&child_exec));
     }
 
     #[test]
     fn add_member_increments_member_count() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         assert_eq!(swarm.members.len(), 0);
-        swarm.add_member(AgentId::new());
+        swarm.add_member(ExecutionId::new(), AgentId::new());
         assert_eq!(swarm.members.len(), 1);
-        swarm.add_member(AgentId::new());
+        swarm.add_member(ExecutionId::new(), AgentId::new());
         assert_eq!(swarm.members.len(), 2);
     }
 
     #[test]
-    fn member_ids_includes_parent_and_all_children() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+    fn member_ids_includes_all_children() {
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         let child1 = AgentId::new();
         let child2 = AgentId::new();
         let child3 = AgentId::new();
-        swarm.add_member(child1);
-        swarm.add_member(child2);
-        swarm.add_member(child3);
+        swarm.add_member(ExecutionId::new(), child1);
+        swarm.add_member(ExecutionId::new(), child2);
+        swarm.add_member(ExecutionId::new(), child3);
 
         let ids = swarm.member_ids();
-        assert_eq!(ids.len(), 4); // parent + 3 children
-        assert_eq!(ids[0], parent);
+        assert_eq!(ids.len(), 3);
         assert!(ids.contains(&child1));
         assert!(ids.contains(&child2));
         assert!(ids.contains(&child3));
+    }
+
+    #[test]
+    fn member_execution_ids_returns_all_execution_ids() {
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
+        let exec1 = ExecutionId::new();
+        let exec2 = ExecutionId::new();
+        swarm.add_member(exec1, AgentId::new());
+        swarm.add_member(exec2, AgentId::new());
+
+        let exec_ids = swarm.member_execution_ids();
+        assert_eq!(exec_ids.len(), 2);
+        assert!(exec_ids.contains(&exec1));
+        assert!(exec_ids.contains(&exec2));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -228,36 +246,38 @@ mod tests {
 
     #[test]
     fn multiple_members_all_contained() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
-        let children: Vec<AgentId> = (0..10).map(|_| AgentId::new()).collect();
-        for &c in &children {
-            swarm.add_member(c);
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
+        let children: Vec<(ExecutionId, AgentId)> = (0..10)
+            .map(|_| (ExecutionId::new(), AgentId::new()))
+            .collect();
+        for &(exec_id, agent_id) in &children {
+            swarm.add_member(exec_id, agent_id);
         }
-        for &c in &children {
-            assert!(swarm.contains(c), "child {c} should be in swarm");
+        for &(_, agent_id) in &children {
+            assert!(
+                swarm.contains(agent_id),
+                "child {agent_id} should be in swarm"
+            );
         }
-        assert!(swarm.contains(parent));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
-    // Duplicate member handling — adding the same AgentId twice creates two
-    // member slots (each with a unique synthetic child UUID key).
+    // Duplicate member handling — adding the same AgentId with different
+    // ExecutionIds creates separate member entries.
     // ═══════════════════════════════════════════════════════════════════════════
 
     #[test]
-    fn duplicate_member_creates_separate_slots() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+    fn duplicate_agent_with_different_executions_creates_separate_slots() {
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         let child = AgentId::new();
-        swarm.add_member(child);
-        swarm.add_member(child);
-        // HashMap keys are random UUIDs, so both insertions create distinct entries.
+        swarm.add_member(ExecutionId::new(), child);
+        swarm.add_member(ExecutionId::new(), child);
         assert_eq!(swarm.members.len(), 2);
         assert!(swarm.contains(child));
-        // member_ids will list the child twice (plus parent).
         let ids = swarm.member_ids();
-        assert_eq!(ids.len(), 3);
+        assert_eq!(ids.len(), 2);
         assert_eq!(ids.iter().filter(|&&id| id == child).count(), 2);
     }
 
@@ -267,22 +287,23 @@ mod tests {
 
     #[test]
     fn dissolve_sets_status_to_dissolved() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
-        swarm.add_member(AgentId::new());
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
+        swarm.add_member(ExecutionId::new(), AgentId::new());
         assert_eq!(swarm.status, SwarmStatus::Active);
+        assert!(swarm.dissolved_at.is_none());
         swarm.dissolve();
         assert_eq!(swarm.status, SwarmStatus::Dissolved);
+        assert!(swarm.dissolved_at.is_some());
     }
 
     #[test]
     fn dissolve_preserves_members() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         let child = AgentId::new();
-        swarm.add_member(child);
+        swarm.add_member(ExecutionId::new(), child);
         swarm.dissolve();
-        // Members are still tracked even after dissolution.
         assert!(swarm.contains(child));
         assert_eq!(swarm.members.len(), 1);
     }
@@ -323,27 +344,32 @@ mod tests {
     #[test]
     fn resource_lock_construction() {
         let holder = AgentId::new();
+        let exec_id = ExecutionId::new();
         let now = Utc::now();
         let expires = now + chrono::Duration::minutes(5);
         let lock = ResourceLock {
             resource_id: "shared-db".to_string(),
             held_by: holder,
+            execution_id: exec_id,
             acquired_at: now,
             expires_at: expires,
         };
         assert_eq!(lock.resource_id, "shared-db");
         assert_eq!(lock.held_by, holder);
+        assert_eq!(lock.execution_id, exec_id);
         assert!(lock.expires_at > lock.acquired_at);
     }
 
     #[test]
     fn resource_lock_serde_roundtrip() {
         let holder = AgentId::new();
+        let exec_id = ExecutionId::new();
         let now = Utc::now();
         let expires = now + chrono::Duration::minutes(10);
         let lock = ResourceLock {
             resource_id: "file-lock".to_string(),
             held_by: holder,
+            execution_id: exec_id,
             acquired_at: now,
             expires_at: expires,
         };
@@ -351,16 +377,19 @@ mod tests {
         let deser: ResourceLock = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.resource_id, "file-lock");
         assert_eq!(deser.held_by, holder);
+        assert_eq!(deser.execution_id, exec_id);
     }
 
     #[test]
     fn resource_lock_equality() {
         let holder = AgentId::new();
+        let exec_id = ExecutionId::new();
         let now = Utc::now();
         let expires = now + chrono::Duration::minutes(5);
         let lock1 = ResourceLock {
             resource_id: "res-1".to_string(),
             held_by: holder,
+            execution_id: exec_id,
             acquired_at: now,
             expires_at: expires,
         };
@@ -470,21 +499,40 @@ mod tests {
 
     #[test]
     fn swarm_serde_roundtrip() {
-        let parent = AgentId::new();
-        let mut swarm = Swarm::new(parent);
+        let parent_exec = ExecutionId::new();
+        let mut swarm = Swarm::new(parent_exec);
         let child1 = AgentId::new();
         let child2 = AgentId::new();
-        swarm.add_member(child1);
-        swarm.add_member(child2);
+        swarm.add_member(ExecutionId::new(), child1);
+        swarm.add_member(ExecutionId::new(), child2);
 
         let json = serde_json::to_string(&swarm).unwrap();
         let deser: Swarm = serde_json::from_str(&json).unwrap();
         assert_eq!(deser.id, swarm.id);
-        assert_eq!(deser.parent_agent_id, parent);
+        assert_eq!(deser.parent_execution_id, parent_exec);
         assert_eq!(deser.status, SwarmStatus::Active);
         assert_eq!(deser.members.len(), 2);
         assert!(deser.contains(child1));
         assert!(deser.contains(child2));
-        assert!(deser.contains(parent));
+        assert!(deser.dissolved_at.is_none());
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // contains_execution() — execution-based lookup.
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn contains_execution_returns_false_for_unknown() {
+        let swarm = Swarm::new(ExecutionId::new());
+        let unknown = ExecutionId::new();
+        assert!(!swarm.contains_execution(&unknown));
+    }
+
+    #[test]
+    fn contains_execution_returns_true_for_member() {
+        let mut swarm = Swarm::new(ExecutionId::new());
+        let exec_id = ExecutionId::new();
+        swarm.add_member(exec_id, AgentId::new());
+        assert!(swarm.contains_execution(&exec_id));
     }
 }

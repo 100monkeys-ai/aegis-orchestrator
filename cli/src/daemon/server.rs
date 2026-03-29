@@ -105,6 +105,7 @@ use aegis_orchestrator_core::{
 
 use aegis_orchestrator_core::domain::repository::StorageEventRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
+use aegis_orchestrator_swarm::application::SwarmService;
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
 
 use super::operator_read_models::{
@@ -336,11 +337,12 @@ struct SwarmLockView {
 #[derive(Debug, Clone, serde::Serialize)]
 struct SwarmView {
     swarm_id: String,
-    parent_agent_id: String,
+    parent_execution_id: String,
     member_ids: Vec<String>,
     member_count: usize,
     status: String,
     created_at: chrono::DateTime<chrono::Utc>,
+    dissolved_at: Option<chrono::DateTime<chrono::Utc>>,
     lock_count: usize,
     recent_message_count: usize,
 }
@@ -842,6 +844,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let event_bus = Arc::new(EventBus::new(100));
     let operator_read_model = OperatorReadModelStore::spawn_collector(event_bus.clone());
     let swarm_service = Arc::new(StandardSwarmService::new());
+    swarm_service.start_gc_task();
     let iam_service: Option<Arc<dyn IdentityProvider>> = config.spec.iam.as_ref().map(|iam| {
         Arc::new(StandardIamService::new(iam, event_bus.clone())) as Arc<dyn IdentityProvider>
     });
@@ -2195,6 +2198,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         execution_service_builder =
             execution_service_builder.with_rate_limiting(enforcer.clone(), resolver.clone());
     }
+
+    // Wire swarm cascade cancellation so parent execution cancel propagates to child swarms (BC-6).
+    execution_service_builder = execution_service_builder
+        .with_swarm_cancellation(swarm_service.clone()
+            as Arc<dyn aegis_orchestrator_core::application::ports::SwarmCancellationPort>);
 
     let execution_service = Arc::new(execution_service_builder);
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
@@ -3681,7 +3689,7 @@ async fn list_swarms_handler(
         let locks = state.swarm_service.locks_for_swarm(swarm.id).await;
         items.push(SwarmView {
             swarm_id: swarm.id.0.to_string(),
-            parent_agent_id: swarm.parent_agent_id.0.to_string(),
+            parent_execution_id: swarm.parent_execution_id.0.to_string(),
             member_ids: swarm
                 .member_ids()
                 .into_iter()
@@ -3690,6 +3698,7 @@ async fn list_swarms_handler(
             member_count: swarm.member_ids().len(),
             status: format!("{:?}", swarm.status).to_lowercase(),
             created_at: swarm.created_at,
+            dissolved_at: swarm.dissolved_at,
             lock_count: locks.len(),
             recent_message_count: messages.len(),
         });
@@ -3704,12 +3713,12 @@ async fn get_swarm_handler(
 ) -> Json<serde_json::Value> {
     let swarm_id = aegis_orchestrator_swarm::domain::SwarmId(swarm_id);
     match state.swarm_service.get_swarm(swarm_id).await {
-        Some(swarm) => {
+        Ok(Some(swarm)) => {
             let messages = state.swarm_service.messages_for_swarm(swarm_id).await;
             let locks = state.swarm_service.locks_for_swarm(swarm_id).await;
             let view = SwarmView {
                 swarm_id: swarm.id.0.to_string(),
-                parent_agent_id: swarm.parent_agent_id.0.to_string(),
+                parent_execution_id: swarm.parent_execution_id.0.to_string(),
                 member_ids: swarm
                     .member_ids()
                     .into_iter()
@@ -3718,6 +3727,7 @@ async fn get_swarm_handler(
                 member_count: swarm.member_ids().len(),
                 status: format!("{:?}", swarm.status).to_lowercase(),
                 created_at: swarm.created_at,
+                dissolved_at: swarm.dissolved_at,
                 lock_count: locks.len(),
                 recent_message_count: messages.len(),
             };
@@ -3737,7 +3747,7 @@ async fn get_swarm_handler(
                 }).collect::<Vec<_>>(),
             }))
         }
-        None => Json(serde_json::json!({"error": "swarm not found"})),
+        Ok(None) | Err(_) => Json(serde_json::json!({"error": "swarm not found"})),
     }
 }
 

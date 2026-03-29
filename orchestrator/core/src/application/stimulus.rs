@@ -29,6 +29,7 @@ use tracing::{debug, info, warn};
 
 use crate::application::execution::ExecutionService;
 use crate::application::{StartWorkflowExecutionRequest, StartWorkflowExecutionUseCase};
+use crate::domain::cluster::StimulusIdempotencyRepository;
 use crate::domain::events::StimulusEvent;
 use crate::domain::execution::{ExecutionInput, ExecutionStatus};
 use crate::domain::stimulus::{RoutingDecision, RoutingMode, Stimulus, StimulusId};
@@ -152,8 +153,12 @@ pub struct StandardStimulusService {
     /// Domain event bus for StimulusEvents.
     event_bus: EventBus,
     /// In-memory idempotency store: `(source_name, idempotency_key) → (StimulusId, received_at)`.
-    /// Phase 2: move to Redis for multi-node consistency.
+    /// Used as write-through cache when `idempotency_repo` is present, or standalone fallback.
     idempotency_cache: Arc<DashMap<(String, String), IdempotencyEntry>>,
+    /// Optional Postgres-backed idempotency repository (ADR-021 Phase 2).
+    /// When present, Postgres is the authoritative store and DashMap acts as
+    /// a write-through cache. When absent, DashMap is the sole store.
+    idempotency_repo: Option<Arc<dyn StimulusIdempotencyRepository>>,
     /// TTL for idempotency entries (default: 24 hours).
     idempotency_ttl: Duration,
     /// Timeout for RouterAgent classification (default: 30 seconds).
@@ -182,6 +187,7 @@ impl StandardStimulusService {
             start_workflow_use_case,
             event_bus,
             idempotency_cache: Arc::new(DashMap::new()),
+            idempotency_repo: None,
             idempotency_ttl: Duration::from_secs(86_400), // 24 hours
             classification_timeout: Duration::from_secs(30),
         }
@@ -199,14 +205,53 @@ impl StandardStimulusService {
         self
     }
 
+    /// Wire a Postgres-backed idempotency repository (ADR-021 Phase 2).
+    ///
+    /// When present, Postgres is checked first (authoritative) and the DashMap
+    /// acts as a write-through cache. When absent, falls back to in-memory only.
+    pub fn with_idempotency_repo(mut self, repo: Arc<dyn StimulusIdempotencyRepository>) -> Self {
+        self.idempotency_repo = Some(repo);
+        self
+    }
+
     // ── Internal helpers ──────────────────────────────────────────────────────
 
     async fn check_idempotency(&self, stimulus: &Stimulus) -> Option<StimulusId> {
+        stimulus.idempotency_key.as_ref()?;
+
+        // When a Postgres repo is wired, it is the authoritative store.
+        // Check it FIRST; the DashMap is only a write-through cache.
+        if let Some(repo) = &self.idempotency_repo {
+            match repo.check_and_insert(&stimulus.id).await {
+                Ok(true) => {
+                    // Newly inserted — not a duplicate. Populate cache.
+                    if let Some(key) = &stimulus.idempotency_key {
+                        let cache_key = (stimulus.source.name(), key.clone());
+                        self.idempotency_cache
+                            .insert(cache_key, (stimulus.id, Utc::now()));
+                    }
+                    return None;
+                }
+                Ok(false) => {
+                    // Already exists in Postgres — duplicate.
+                    return Some(stimulus.id);
+                }
+                Err(e) => {
+                    warn!(
+                        stimulus_id = %stimulus.id,
+                        error = %e,
+                        "Postgres idempotency check failed; falling through to in-memory cache"
+                    );
+                    // Fall through to in-memory check below
+                }
+            }
+        }
+
+        // In-memory fallback (or sole store when no repo is wired)
         if let Some(key) = &stimulus.idempotency_key {
             let cache_key = (stimulus.source.name(), key.clone());
             if let Some(entry) = self.idempotency_cache.get(&cache_key) {
                 let (original_id, recorded_at) = entry.value();
-                // Check TTL — if entry is still fresh, treat as duplicate
                 if Utc::now()
                     .signed_duration_since(*recorded_at)
                     .to_std()
@@ -578,6 +623,16 @@ mod tests {
         ) -> Result<ExecutionId> {
             self.start_calls.lock().unwrap().push((agent_id, input));
             Ok(self.exec_id)
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            execution_id: ExecutionId,
+            agent_id: AgentId,
+            input: ExecutionInput,
+        ) -> Result<ExecutionId> {
+            self.start_calls.lock().unwrap().push((agent_id, input));
+            Ok(execution_id)
         }
 
         async fn start_child_execution(

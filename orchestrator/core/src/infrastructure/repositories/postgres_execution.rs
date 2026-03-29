@@ -219,6 +219,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                         parent_execution_id: Some(ExecutionId(parent_id)),
                         depth: 1,
                         path: vec![ExecutionId(id)],
+                        swarm_id: None,
                     }
                 }
             };
@@ -328,6 +329,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     parent_execution_id: Some(ExecutionId(parent_id)),
                     depth: 1,
                     path: vec![ExecutionId(id)],
+                    swarm_id: None,
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),
             };
@@ -434,6 +436,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                     parent_execution_id: Some(ExecutionId(parent_id)),
                     depth: 1,
                     path: vec![ExecutionId(id)],
+                    swarm_id: None,
                 },
                 None => ExecutionHierarchy::root(ExecutionId(id)),
             };

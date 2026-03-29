@@ -1401,6 +1401,15 @@ mod tests {
             Err(anyhow!("not used in presentation api tests"))
         }
 
+        async fn start_execution_with_id(
+            &self,
+            _execution_id: crate::domain::execution::ExecutionId,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+        ) -> Result<crate::domain::execution::ExecutionId> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
         async fn start_child_execution(
             &self,
             _agent_id: AgentId,

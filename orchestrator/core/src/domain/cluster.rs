@@ -251,7 +251,7 @@ pub struct SmcpNodeEnvelope {
 /// NodeCapabilityAdvertisement (Value Object)
 ///
 /// Advertised resource profile of a worker node.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct NodeCapabilityAdvertisement {
     pub gpu_count: u32,
     pub vram_gb: u32,
@@ -404,6 +404,40 @@ pub trait NodeClusterRepository: Send + Sync {
     ) -> anyhow::Result<Option<RegisteredNode>>;
 }
 
+/// Repository for node configuration and registry assignment (ADR-061).
+///
+/// Distinct from [`NodeClusterRepository`] which handles cluster membership
+/// and health. This repository manages what config/runtime each node should run.
+#[async_trait::async_trait]
+pub trait NodeRegistryRepository: Send + Sync {
+    /// Find a registered node by ID.
+    async fn find_registered_node(
+        &self,
+        node_id: &NodeId,
+    ) -> anyhow::Result<Option<RegisteredNode>>;
+    /// List all registered nodes.
+    async fn list_registered_nodes(&self) -> anyhow::Result<Vec<RegisteredNode>>;
+    /// Insert or update a registered node record.
+    async fn upsert_registered_node(&self, node: &RegisteredNode) -> anyhow::Result<()>;
+    /// Assign a config layer to a node.
+    async fn assign_config(&self, assignment: &NodeConfigAssignment) -> anyhow::Result<()>;
+    /// Get all config assignments for a node.
+    async fn get_config_assignments(
+        &self,
+        node_id: &NodeId,
+    ) -> anyhow::Result<Vec<NodeConfigAssignment>>;
+    /// Assign a runtime registry to a node.
+    async fn assign_runtime_registry(
+        &self,
+        assignment: &RuntimeRegistryAssignment,
+    ) -> anyhow::Result<()>;
+    /// Get all runtime registry assignments for a node.
+    async fn get_runtime_registry_assignments(
+        &self,
+        node_id: &NodeId,
+    ) -> anyhow::Result<Vec<RuntimeRegistryAssignment>>;
+}
+
 /// Multi-node stimulus idempotency store (fulfills ADR-021 Phase 2 deferral).
 #[async_trait::async_trait]
 pub trait StimulusIdempotencyRepository: Send + Sync {
@@ -426,9 +460,12 @@ pub struct NodeChallenge {
     pub created_at: DateTime<Utc>,
 }
 
+/// Challenge TTL in seconds per ADR-059 §4.1 attestation handshake (5 minutes).
+const CHALLENGE_TTL_SECONDS: i64 = 300;
+
 impl NodeChallenge {
     pub fn is_expired(&self) -> bool {
-        Utc::now() > self.created_at + chrono::Duration::seconds(60)
+        Utc::now() > self.created_at + chrono::Duration::seconds(CHALLENGE_TTL_SECONDS)
     }
 }
 
@@ -574,5 +611,52 @@ impl RegisteredNode {
     /// Check if node is intentionally excluded from new work
     pub fn is_draining(&self) -> bool {
         self.status == NodePeerStatus::Draining
+    }
+}
+
+/// Explicit assignment of a configuration layer to a node (ADR-061).
+///
+/// Separates the "is this node alive?" question (NodeClusterRepository) from
+/// the "what config should this node run?" question (NodeRegistryRepository).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeConfigAssignment {
+    pub node_id: NodeId,
+    pub config_type: ConfigType,
+    pub scope: ConfigScope,
+    pub assigned_at: DateTime<Utc>,
+}
+
+/// Assignment of a runtime registry to a node (ADR-061).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeRegistryAssignment {
+    pub node_id: NodeId,
+    pub registry_name: String,
+    pub assigned_at: DateTime<Utc>,
+}
+
+/// Validates that a merged effective configuration contains all required fields
+/// before a node begins accepting work (ADR-060 §4).
+pub struct EffectiveConfigValidator;
+
+impl EffectiveConfigValidator {
+    /// Validate that the merged config has all required top-level sections.
+    /// Returns the list of missing required fields, or Ok(()) if valid.
+    pub fn validate(merged: &MergedConfig) -> Result<(), Vec<String>> {
+        let required_fields = ["runtime", "storage", "llm"];
+        let mut missing = Vec::new();
+        if let Some(obj) = merged.payload.as_object() {
+            for field in &required_fields {
+                if !obj.contains_key(*field) {
+                    missing.push(field.to_string());
+                }
+            }
+        } else {
+            missing.push("root object (expected JSON object)".to_string());
+        }
+        if missing.is_empty() {
+            Ok(())
+        } else {
+            Err(missing)
+        }
     }
 }
