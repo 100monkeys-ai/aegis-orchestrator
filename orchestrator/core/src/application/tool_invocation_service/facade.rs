@@ -330,112 +330,108 @@ impl ToolInvocationService {
         }
 
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
-        let agent = self
-            .agent_lifecycle
-            .get_agent(*agent_id)
-            .await
-            .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
-                    "Failed to retrieve agent: {e}"
-                ))
-            })?;
+        // Agent lookup is optional — Zaru SMCP sessions use synthetic agent IDs
+        // that don't correspond to registered agents. Skip the judge pipeline
+        // when no agent manifest is available.
+        let agent = self.agent_lifecycle.get_agent(*agent_id).await.ok();
 
-        if let Some(exec_spec) = &agent.manifest.spec.execution {
-            let should_skip_judge = self.tool_router.is_skip_judge(&tool_name).await;
-            if should_skip_judge {
-                tracing::debug!(
-                    tool_name = %tool_name,
-                    "Inner-loop semantic judge skipped (skip_judge=true in node config for this tool)"
-                );
-            } else if let Some(validation_pipeline) = &exec_spec.tool_validation {
-                for validator in validation_pipeline {
-                    if let crate::domain::agent::ValidatorSpec::Semantic {
-                        judge_agent,
-                        criteria,
-                        min_score,
-                        min_confidence,
-                        timeout_seconds,
-                    } = validator
-                    {
-                        tracing::info!(
+        if let Some(ref agent) = agent {
+            if let Some(exec_spec) = &agent.manifest.spec.execution {
+                let should_skip_judge = self.tool_router.is_skip_judge(&tool_name).await;
+                if should_skip_judge {
+                    tracing::debug!(
+                        tool_name = %tool_name,
+                        "Inner-loop semantic judge skipped (skip_judge=true in node config for this tool)"
+                    );
+                } else if let Some(validation_pipeline) = &exec_spec.tool_validation {
+                    for validator in validation_pipeline {
+                        if let crate::domain::agent::ValidatorSpec::Semantic {
+                            judge_agent,
+                            criteria,
+                            min_score,
+                            min_confidence,
+                            timeout_seconds,
+                        } = validator
+                        {
+                            tracing::info!(
                             "Running inner-loop semantic validation for tool '{}' via judge '{}'",
                             tool_name,
                             judge_agent
                         );
 
-                        let judge_id = self
-                            .agent_lifecycle
-                            .lookup_agent(judge_agent)
-                            .await
-                            .map_err(|e| {
-                                SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Failed to lookup judge: {e}"
-                                ))
-                            })?
-                            .ok_or_else(|| {
-                                SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Judge agent '{judge_agent}' not found"
-                                ))
-                            })?;
+                            let judge_id = self
+                                .agent_lifecycle
+                                .lookup_agent(judge_agent)
+                                .await
+                                .map_err(|e| {
+                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                        "Failed to lookup judge: {e}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                        "Judge agent '{judge_agent}' not found"
+                                    ))
+                                })?;
 
-                        let execution_objective = self
-                            .execution_service
-                            .get_execution(execution_id)
-                            .await
-                            .ok()
-                            .and_then(|exec| exec.input.intent)
-                            .unwrap_or_else(|| "No objective available".to_string());
-                        let available_tools = self
-                            .get_available_tools_for_agent(*agent_id)
-                            .await
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|t| t.name)
-                            .collect::<Vec<String>>();
-                        let worker_mounts = self
-                            .volume_registry
-                            .find_all_by_execution(execution_id)
-                            .into_iter()
-                            .map(|ctx| ctx.mount_point.to_string_lossy().to_string())
-                            .collect::<Vec<String>>();
+                            let execution_objective = self
+                                .execution_service
+                                .get_execution(execution_id)
+                                .await
+                                .ok()
+                                .and_then(|exec| exec.input.intent)
+                                .unwrap_or_else(|| "No objective available".to_string());
+                            let available_tools = self
+                                .get_available_tools_for_agent(*agent_id)
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|t| t.name)
+                                .collect::<Vec<String>>();
+                            let worker_mounts = self
+                                .volume_registry
+                                .find_all_by_execution(execution_id)
+                                .into_iter()
+                                .map(|ctx| ctx.mount_point.to_string_lossy().to_string())
+                                .collect::<Vec<String>>();
 
-                        let input = ExecutionInput {
-                            intent: None,
-                            payload: Self::build_semantic_judge_payload(
-                                execution_id,
-                                execution_objective,
-                                &tool_name,
-                                &args,
-                                available_tools,
-                                worker_mounts,
-                                criteria,
-                                "semantic_judge_pre_execution_inner_loop",
-                                iteration_number,
-                                &tool_audit_history,
-                            ),
-                        };
+                            let input = ExecutionInput {
+                                intent: None,
+                                payload: Self::build_semantic_judge_payload(
+                                    execution_id,
+                                    execution_objective,
+                                    &tool_name,
+                                    &args,
+                                    available_tools,
+                                    worker_mounts,
+                                    criteria,
+                                    "semantic_judge_pre_execution_inner_loop",
+                                    iteration_number,
+                                    &tool_audit_history,
+                                ),
+                            };
 
-                        // Start the single iteration judge as child execution
-                        let exec_id = self
-                            .execution_service
-                            .start_child_execution(judge_id, input, execution_id)
-                            .await
-                            .map_err(|e| {
-                                SmcpSessionError::SignatureVerificationFailed(format!(
-                                    "Failed to spawn judge child execution: {e}"
-                                ))
-                            })?;
+                            // Start the single iteration judge as child execution
+                            let exec_id = self
+                                .execution_service
+                                .start_child_execution(judge_id, input, execution_id)
+                                .await
+                                .map_err(|e| {
+                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                        "Failed to spawn judge child execution: {e}"
+                                    ))
+                                })?;
 
-                        let poll_interval_ms = JUDGE_POLL_INTERVAL_MS;
-                        let timeout_ms = timeout_seconds.saturating_mul(1000);
-                        let max_attempts = timeout_ms
-                            .saturating_add(poll_interval_ms.saturating_sub(1))
-                            / poll_interval_ms;
-                        let mut attempts = 0;
+                            let poll_interval_ms = JUDGE_POLL_INTERVAL_MS;
+                            let timeout_ms = timeout_seconds.saturating_mul(1000);
+                            let max_attempts = timeout_ms
+                                .saturating_add(poll_interval_ms.saturating_sub(1))
+                                / poll_interval_ms;
+                            let mut attempts = 0;
 
-                        loop {
-                            if attempts >= max_attempts {
-                                self.publish_invocation_failed(
+                            loop {
+                                if attempts >= max_attempts {
+                                    self.publish_invocation_failed(
                                     invocation_id,
                                     execution_id,
                                     *agent_id,
@@ -443,48 +439,50 @@ impl ToolInvocationService {
                                         "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds"
                                     ),
                                 );
-                                return Err(SmcpSessionError::JudgeTimeout(format!(
+                                    return Err(SmcpSessionError::JudgeTimeout(format!(
                                     "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds."
                                 )));
-                            }
+                                }
 
-                            let exec = self
-                                .execution_service
-                                .get_execution(exec_id)
-                                .await
-                                .map_err(|e| {
-                                    SmcpSessionError::InternalError(format!(
-                                        "Failed to get judge execution {exec_id}: {e}"
-                                    ))
-                                })?;
-
-                            match exec.status {
-                                crate::domain::execution::ExecutionStatus::Completed => {
-                                    let last_iter = exec.iterations().last().ok_or_else(|| {
-                                        SmcpSessionError::SignatureVerificationFailed(
-                                            "Judge completed but has no iterations".to_string(),
-                                        )
+                                let exec = self
+                                    .execution_service
+                                    .get_execution(exec_id)
+                                    .await
+                                    .map_err(|e| {
+                                        SmcpSessionError::InternalError(format!(
+                                            "Failed to get judge execution {exec_id}: {e}"
+                                        ))
                                     })?;
-                                    let output_str =
-                                        last_iter.output.as_ref().ok_or_else(|| {
-                                            SmcpSessionError::SignatureVerificationFailed(
-                                                "Judge completed but has no output".to_string(),
-                                            )
-                                        })?;
 
-                                    let json_str = extract_json_from_text(output_str)
-                                        .unwrap_or_else(|| output_str.clone());
-                                    let result: crate::domain::validation::GradientResult =
-                                        serde_json::from_str(&json_str).map_err(|e| {
-                                            SmcpSessionError::SignatureVerificationFailed(format!(
-                                                "Failed to parse judge output: {e}"
-                                            ))
-                                        })?;
+                                match exec.status {
+                                    crate::domain::execution::ExecutionStatus::Completed => {
+                                        let last_iter =
+                                            exec.iterations().last().ok_or_else(|| {
+                                                SmcpSessionError::SignatureVerificationFailed(
+                                                    "Judge completed but has no iterations"
+                                                        .to_string(),
+                                                )
+                                            })?;
+                                        let output_str =
+                                            last_iter.output.as_ref().ok_or_else(|| {
+                                                SmcpSessionError::SignatureVerificationFailed(
+                                                    "Judge completed but has no output".to_string(),
+                                                )
+                                            })?;
 
-                                    if !(result.score >= *min_score
-                                        && result.confidence >= *min_confidence)
-                                    {
-                                        self.publish_invocation_failed(
+                                        let json_str = extract_json_from_text(output_str)
+                                            .unwrap_or_else(|| output_str.clone());
+                                        let result: crate::domain::validation::GradientResult =
+                                            serde_json::from_str(&json_str).map_err(|e| {
+                                                SmcpSessionError::SignatureVerificationFailed(
+                                                    format!("Failed to parse judge output: {e}"),
+                                                )
+                                            })?;
+
+                                        if !(result.score >= *min_score
+                                            && result.confidence >= *min_confidence)
+                                        {
+                                            self.publish_invocation_failed(
                                             invocation_id,
                                             execution_id,
                                             *agent_id,
@@ -494,41 +492,42 @@ impl ToolInvocationService {
                                                 result.score, min_score, result.reasoning
                                             ),
                                         );
-                                        return Err(SmcpSessionError::SignatureVerificationFailed(
+                                            return Err(SmcpSessionError::SignatureVerificationFailed(
                                             format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
                                                 result.score, min_score, result.reasoning,
                                             ),
                                         ));
+                                        }
+                                        break;
                                     }
-                                    break;
-                                }
-                                crate::domain::execution::ExecutionStatus::Failed
-                                | crate::domain::execution::ExecutionStatus::Cancelled => {
-                                    self.publish_invocation_failed(
+                                    crate::domain::execution::ExecutionStatus::Failed
+                                    | crate::domain::execution::ExecutionStatus::Cancelled => {
+                                        self.publish_invocation_failed(
                                         invocation_id,
                                         execution_id,
                                         *agent_id,
                                         "Inner-loop semantic judge execution failed or was cancelled"
                                             .to_string(),
                                     );
-                                    return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
-                                }
-                                _ => {
-                                    tokio::time::sleep(std::time::Duration::from_millis(
-                                        poll_interval_ms,
-                                    ))
-                                    .await;
-                                    attempts += 1;
+                                        return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
+                                    }
+                                    _ => {
+                                        tokio::time::sleep(std::time::Duration::from_millis(
+                                            poll_interval_ms,
+                                        ))
+                                        .await;
+                                        attempts += 1;
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
-        // --- End Pre-Execution Validation ---
+        } // end if let Some(ref agent)
+          // --- End Pre-Execution Validation ---
 
         // Helper closure to publish invocation events based on tool result.
         let publish_result = |result: &Result<ToolInvocationResult, SmcpSessionError>| match result

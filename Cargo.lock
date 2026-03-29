@@ -154,6 +154,7 @@ dependencies = [
  "chrono",
  "metrics 0.24.3",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
