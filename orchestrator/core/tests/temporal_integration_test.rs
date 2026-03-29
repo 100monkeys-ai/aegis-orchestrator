@@ -199,6 +199,42 @@ impl WorkflowRepository for MockWorkflowRepo {
     async fn delete(&self, _i: WorkflowId) -> Result<(), RepositoryError> {
         Ok(())
     }
+
+    async fn resolve_by_name(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        _name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
+    async fn resolve_by_name_and_version(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        _name: &str,
+        _version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
+    async fn list_visible(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
+    }
+    async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
+    }
+    async fn update_scope(
+        &self,
+        _id: WorkflowId,
+        _new_scope: aegis_orchestrator_core::domain::workflow::WorkflowScope,
+        _new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
+    }
 }
 
 struct StaticWorkflowRepo {
@@ -282,6 +318,44 @@ impl WorkflowRepository for StaticWorkflowRepo {
         } else {
             Err(RepositoryError::NotFound(workflow_id.to_string()))
         }
+    }
+
+    async fn resolve_by_name(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_name(name).await
+    }
+    async fn resolve_by_name_and_version(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok((self.workflow.metadata.name == name
+            && self.workflow.metadata.version.as_deref() == Some(version))
+        .then(|| self.workflow.clone()))
+    }
+    async fn list_visible(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        self.list_all().await
+    }
+    async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
+    }
+    async fn update_scope(
+        &self,
+        _id: WorkflowId,
+        _new_scope: aegis_orchestrator_core::domain::workflow::WorkflowScope,
+        _new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        Ok(())
     }
 }
 

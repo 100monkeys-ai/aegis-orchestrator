@@ -109,6 +109,7 @@ fn execution_id_returns_none_for_workflow_registered() {
         workflow_id: wid,
         name: "build-pipeline".to_string(),
         version: "1.0.0".to_string(),
+        scope: aegis_orchestrator_core::domain::workflow::WorkflowScope::default(),
         registered_at: Utc::now(),
     });
     assert_eq!(event.execution_id(), None);

@@ -762,28 +762,39 @@ fn format_details(details: &Value) -> String {
 
 impl DaemonClient {
     /// Deploy a workflow from a file with optional force overwrite.
-    pub async fn deploy_workflow_with_force(
+    /// Deploy a workflow from a file with optional force overwrite and scope.
+    pub async fn deploy_workflow_with_force_and_scope(
         &self,
         file: &std::path::Path,
         force: bool,
+        scope: Option<&str>,
     ) -> Result<()> {
         let workflow_yaml =
             std::fs::read_to_string(file).context("Failed to read workflow file")?;
-        self.deploy_workflow_manifest_with_force(&workflow_yaml, force)
+        self.deploy_workflow_manifest_with_force_and_scope(&workflow_yaml, force, scope)
             .await
     }
 
-    /// Deploy a workflow from YAML content with optional force overwrite.
-    pub async fn deploy_workflow_manifest_with_force(
+    /// Deploy a workflow from YAML content with optional force overwrite and scope.
+    pub async fn deploy_workflow_manifest_with_force_and_scope(
         &self,
         workflow_yaml: &str,
         force: bool,
+        scope: Option<&str>,
     ) -> Result<()> {
-        let url = if force {
-            format!("{}/v1/workflows?force=true", self.base_url)
+        let mut params = Vec::new();
+        if force {
+            params.push("force=true".to_string());
+        }
+        if let Some(s) = scope {
+            params.push(format!("scope={s}"));
+        }
+        let query = if params.is_empty() {
+            String::new()
         } else {
-            format!("{}/v1/workflows", self.base_url)
+            format!("?{}", params.join("&"))
         };
+        let url = format!("{}/v1/workflows{query}", self.base_url);
 
         let response = self
             .client
@@ -800,6 +811,16 @@ impl DaemonClient {
         }
 
         Ok(())
+    }
+
+    /// Deploy a workflow from YAML content with optional force overwrite.
+    pub async fn deploy_workflow_manifest_with_force(
+        &self,
+        workflow_yaml: &str,
+        force: bool,
+    ) -> Result<()> {
+        self.deploy_workflow_manifest_with_force_and_scope(workflow_yaml, force, None)
+            .await
     }
 
     /// Run a workflow
@@ -873,6 +894,81 @@ impl DaemonClient {
         };
 
         Ok(workflows)
+    }
+
+    /// List workflows with optional scope filter or visible-all mode.
+    pub async fn list_workflows_with_scope(
+        &self,
+        scope: Option<&str>,
+        visible: bool,
+    ) -> Result<Vec<serde_json::Value>> {
+        let mut params = Vec::new();
+        if let Some(s) = scope {
+            params.push(format!("scope={s}"));
+        }
+        if visible {
+            params.push("visible=true".to_string());
+        }
+        let query = if params.is_empty() {
+            String::new()
+        } else {
+            format!("?{}", params.join("&"))
+        };
+        let url = format!("{}/v1/workflows{query}", self.base_url);
+
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .context("Failed to list workflows")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list workflows: {error_text}");
+        }
+
+        let list_response: WorkflowListResponse = response
+            .json()
+            .await
+            .context("Failed to parse list response")?;
+
+        let workflows = match list_response {
+            WorkflowListResponse::Wrapped { workflows } => workflows,
+            WorkflowListResponse::Bare(workflows) => workflows,
+        };
+
+        Ok(workflows)
+    }
+
+    /// Change workflow scope (promote/demote).
+    pub async fn change_workflow_scope(
+        &self,
+        name_or_id: &str,
+        target_scope: &str,
+    ) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/workflows/{}/scope", self.base_url, name_or_id);
+        let body = serde_json::json!({ "target_scope": target_scope });
+
+        let response = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to change workflow scope")?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to change workflow scope: {error_text}");
+        }
+
+        let result: serde_json::Value = response
+            .json()
+            .await
+            .context("Failed to parse scope change response")?;
+
+        Ok(result)
     }
 
     /// List workflow executions (paginated, newest first)

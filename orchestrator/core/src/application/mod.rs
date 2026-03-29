@@ -63,6 +63,7 @@ pub mod storage_event_persister;
 pub mod storage_router;
 pub mod temporal_mapper;
 pub mod volume_manager;
+pub mod workflow_scope;
 
 // Re-export use cases for convenience
 pub use complete_workflow_execution::{

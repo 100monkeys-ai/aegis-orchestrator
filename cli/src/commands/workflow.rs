@@ -52,6 +52,10 @@ pub enum WorkflowCommand {
         /// Overwrite an existing workflow with the same name/version
         #[arg(long, short = 'f')]
         force: bool,
+
+        /// Workflow visibility scope (user, tenant, global). Default: tenant.
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
     },
 
     /// Execute a registered workflow
@@ -94,6 +98,14 @@ pub enum WorkflowCommand {
         /// Filter by label (key=value)
         #[arg(long = "label", value_name = "KEY=VALUE")]
         labels: Vec<String>,
+
+        /// Filter by scope (global, tenant, user)
+        #[arg(long, value_name = "SCOPE")]
+        scope: Option<String>,
+
+        /// Show all visible workflows (user + tenant + global)
+        #[arg(long)]
+        visible: bool,
     },
 
     /// Describe a workflow (show YAML definition)
@@ -180,6 +192,28 @@ pub enum WorkflowCommand {
         execution_id: Uuid,
     },
 
+    /// Promote a workflow's visibility scope
+    Promote {
+        /// Workflow name or ID
+        #[arg(value_name = "NAME_OR_ID")]
+        name_or_id: String,
+
+        /// Target scope to promote to (tenant, global)
+        #[arg(long, value_name = "SCOPE")]
+        to: String,
+    },
+
+    /// Demote a workflow's visibility scope
+    Demote {
+        /// Workflow name or ID
+        #[arg(value_name = "NAME_OR_ID")]
+        name_or_id: String,
+
+        /// Target scope to demote to (tenant, user)
+        #[arg(long, value_name = "SCOPE")]
+        to: String,
+    },
+
     /// Manage workflow executions
     Executions {
         #[command(subcommand)]
@@ -222,8 +256,8 @@ pub async fn handle_command(
 ) -> Result<()> {
     match command {
         WorkflowCommand::Validate { file } => validate_workflow(file, output_format).await,
-        WorkflowCommand::Deploy { file, force } => {
-            deploy_workflow(file, force, host, port, output_format).await
+        WorkflowCommand::Deploy { file, force, scope } => {
+            deploy_workflow(file, force, scope, host, port, output_format).await
         }
         WorkflowCommand::Run {
             name,
@@ -250,9 +284,12 @@ pub async fn handle_command(
             )
             .await
         }
-        WorkflowCommand::List { long, labels } => {
-            list_workflows(long, labels, host, port, output_format).await
-        }
+        WorkflowCommand::List {
+            long,
+            labels,
+            scope,
+            visible,
+        } => list_workflows(long, labels, scope, visible, host, port, output_format).await,
         WorkflowCommand::Describe { name } => {
             describe_workflow(name, output_format, host, port).await
         }
@@ -291,6 +328,12 @@ pub async fn handle_command(
                 output_format,
             )
             .await
+        }
+        WorkflowCommand::Promote { name_or_id, to } => {
+            change_workflow_scope(name_or_id, to, "promote", host, port, output_format).await
+        }
+        WorkflowCommand::Demote { name_or_id, to } => {
+            change_workflow_scope(name_or_id, to, "demote", host, port, output_format).await
         }
         WorkflowCommand::Executions { command } => {
             handle_executions_command(command, host, port, output_format).await
@@ -465,6 +508,7 @@ async fn validate_workflow(file: PathBuf, output_format: OutputFormat) -> Result
 async fn deploy_workflow(
     file: PathBuf,
     force: bool,
+    scope: Option<String>,
     host: &str,
     port: u16,
     output_format: OutputFormat,
@@ -497,6 +541,9 @@ async fn deploy_workflow(
         if force {
             println!("   Mode: overwrite existing workflow");
         }
+        if let Some(ref s) = scope {
+            println!("   Scope: {s}");
+        }
         println!();
     }
 
@@ -510,7 +557,7 @@ async fn deploy_workflow(
     // Deploy via daemon API
     let client = DaemonClient::new(host, port)?;
     client
-        .deploy_workflow_with_force(&file, force)
+        .deploy_workflow_with_force_and_scope(&file, force, scope.as_deref())
         .await
         .context("Failed to deploy workflow")?;
 
@@ -847,6 +894,8 @@ async fn generate_workflow(
 async fn list_workflows(
     long: bool,
     labels: Vec<String>,
+    scope: Option<String>,
+    visible: bool,
     host: &str,
     port: u16,
     output_format: OutputFormat,
@@ -867,7 +916,7 @@ async fn list_workflows(
 
     let client = DaemonClient::new(host, port)?;
     let workflows = client
-        .list_workflows()
+        .list_workflows_with_scope(scope.as_deref(), visible)
         .await
         .context("Failed to list workflows")?;
 
@@ -929,14 +978,90 @@ async fn list_workflows(
             if let Some(desc) = workflow.get("description").and_then(|d| d.as_str()) {
                 println!("  Description: {desc}");
             }
+            if let Some(scope_val) = workflow.get("scope").and_then(|s| s.as_str()) {
+                println!("  Scope:       {scope_val}");
+            }
             if let Some(states) = workflow.get("state_count").and_then(|s| s.as_u64()) {
                 println!("  States:      {states}");
             }
             println!();
         } else {
-            println!("• {}", name.green());
+            let scope_tag = workflow
+                .get("scope")
+                .and_then(|s| s.as_str())
+                .unwrap_or("tenant");
+            println!("• {} [{}]", name.green(), scope_tag);
         }
     }
+
+    Ok(())
+}
+
+/// Change workflow scope (promote or demote)
+async fn change_workflow_scope(
+    name_or_id: String,
+    to: String,
+    direction: &str,
+    host: &str,
+    port: u16,
+    output_format: OutputFormat,
+) -> Result<()> {
+    let daemon_status = check_daemon_running(host, port).await;
+    match daemon_status {
+        Ok(DaemonStatus::Running { .. }) => {}
+        _ => {
+            println!(
+                "{}",
+                "Workflow scope changes require the daemon to be running.".red()
+            );
+            println!("Run 'aegis daemon start' to start the daemon.");
+            return Ok(());
+        }
+    }
+
+    if !output_format.is_structured() {
+        let action = if direction == "promote" {
+            "Promoting"
+        } else {
+            "Demoting"
+        };
+        println!(
+            "{}",
+            format!("🔄 {action} workflow '{name_or_id}' to scope '{to}'...").cyan()
+        );
+        println!();
+    }
+
+    let client = DaemonClient::new(host, port)?;
+    let result = client
+        .change_workflow_scope(&name_or_id, &to)
+        .await
+        .context("Failed to change workflow scope")?;
+
+    if output_format.is_structured() {
+        return render_serialized(output_format, &result);
+    }
+
+    let previous = result
+        .get("previous_scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    let new_scope = result
+        .get("new_scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+
+    let action_past = if direction == "promote" {
+        "promoted"
+    } else {
+        "demoted"
+    };
+    println!(
+        "{}",
+        format!("✓ Workflow '{name_or_id}' {action_past}: {previous} → {new_scope}")
+            .green()
+            .bold()
+    );
 
     Ok(())
 }
@@ -1379,7 +1504,7 @@ mod tests {
             .expect("deploy command should parse");
 
         match cli.command {
-            WorkflowCommand::Deploy { file, force } => {
+            WorkflowCommand::Deploy { file, force, .. } => {
                 assert_eq!(file, PathBuf::from("./test.yaml"));
                 assert!(force);
             }

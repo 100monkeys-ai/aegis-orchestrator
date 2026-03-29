@@ -616,9 +616,26 @@ impl ToolInvocationService {
             }
         };
 
-        let workflows = repo.list_all_for_tenant(&tenant_id).await.map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list workflows: {e}"))
-        })?;
+        let scope_filter = args.get("scope").and_then(|v| v.as_str());
+        let user_id = args.get("user_id").and_then(|v| v.as_str());
+
+        let workflows = match scope_filter {
+            Some("global") => repo.list_global().await.map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to list workflows: {e}"
+                ))
+            })?,
+            Some("visible") => repo.list_visible(&tenant_id, user_id).await.map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to list workflows: {e}"
+                ))
+            })?,
+            _ => repo.list_all_for_tenant(&tenant_id).await.map_err(|e| {
+                SmcpSessionError::SignatureVerificationFailed(format!(
+                    "Failed to list workflows: {e}"
+                ))
+            })?,
+        };
 
         let entries: Vec<serde_json::Value> = workflows
             .iter()
@@ -627,6 +644,7 @@ impl ToolInvocationService {
                     "id": w.id.0.to_string(),
                     "name": w.metadata.name,
                     "version": w.metadata.version.clone().unwrap_or_default(),
+                    "scope": w.scope.to_string(),
                     "initial_state": w.spec.initial_state,
                 })
             })
@@ -637,6 +655,202 @@ impl ToolInvocationService {
             "count": entries.len(),
             "workflows": entries
         })))
+    }
+
+    pub(super) async fn invoke_aegis_workflow_promote_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.workflow.promote requires 'name' string".to_string(),
+            )
+        })?;
+
+        let target_scope_str = args
+            .get("target_scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("global");
+
+        let target_scope: crate::domain::workflow::WorkflowScope =
+            target_scope_str.parse().map_err(|_| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "Invalid target_scope '{target_scope_str}': expected 'tenant' or 'global'"
+                ))
+            })?;
+
+        let repo = match &self.workflow_repository {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.promote",
+                    "error": "Workflow repository not configured"
+                })));
+            }
+        };
+
+        // Resolve workflow by name or ID
+        let workflow = match repo.find_by_name_for_tenant(&tenant_id, name).await {
+            Ok(Some(w)) => w,
+            _ => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    match repo
+                        .find_by_id_for_tenant(
+                            &tenant_id,
+                            crate::domain::workflow::WorkflowId(uuid),
+                        )
+                        .await
+                    {
+                        Ok(Some(w)) => w,
+                        _ => {
+                            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                                "tool": "aegis.workflow.promote",
+                                "error": "Workflow not found"
+                            })));
+                        }
+                    }
+                } else {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.promote",
+                        "error": "Workflow not found"
+                    })));
+                }
+            }
+        };
+
+        let requester = crate::application::workflow_scope::ScopeChangeRequester {
+            user_id: "smcp-tool-user".to_string(),
+            roles: vec!["aegis:operator".to_string()],
+            tenant_id: tenant_id.clone(),
+        };
+
+        let scope_service = crate::application::workflow_scope::WorkflowScopeService::new(
+            repo.clone(),
+            self.event_bus.clone(),
+        );
+
+        match scope_service
+            .change_scope(workflow.id, target_scope.clone(), &requester)
+            .await
+        {
+            Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.promote",
+                "promoted": true,
+                "workflow_id": workflow.id.0.to_string(),
+                "name": workflow.metadata.name,
+                "previous_scope": workflow.scope.to_string(),
+                "new_scope": target_scope.to_string()
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.promote",
+                "promoted": false,
+                "error": format!("{e}")
+            }))),
+        }
+    }
+
+    pub(super) async fn invoke_aegis_workflow_demote_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
+            SmcpSessionError::SignatureVerificationFailed(
+                "aegis.workflow.demote requires 'name' string".to_string(),
+            )
+        })?;
+
+        let target_scope_str = args
+            .get("target_scope")
+            .and_then(|v| v.as_str())
+            .unwrap_or("tenant");
+
+        let target_scope: crate::domain::workflow::WorkflowScope = match target_scope_str {
+            "user" => {
+                let owner = args
+                    .get("user_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("smcp-tool-user");
+                crate::domain::workflow::WorkflowScope::User {
+                    owner_user_id: owner.to_string(),
+                }
+            }
+            other => other.parse().map_err(|_| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "Invalid target_scope '{other}': expected 'tenant' or 'user'"
+                ))
+            })?,
+        };
+
+        let repo = match &self.workflow_repository {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.demote",
+                    "error": "Workflow repository not configured"
+                })));
+            }
+        };
+
+        // Resolve workflow by name or ID
+        let workflow = match repo.find_by_name_for_tenant(&tenant_id, name).await {
+            Ok(Some(w)) => w,
+            _ => {
+                if let Ok(uuid) = uuid::Uuid::parse_str(name) {
+                    match repo
+                        .find_by_id_for_tenant(
+                            &tenant_id,
+                            crate::domain::workflow::WorkflowId(uuid),
+                        )
+                        .await
+                    {
+                        Ok(Some(w)) => w,
+                        _ => {
+                            return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                                "tool": "aegis.workflow.demote",
+                                "error": "Workflow not found"
+                            })));
+                        }
+                    }
+                } else {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.demote",
+                        "error": "Workflow not found"
+                    })));
+                }
+            }
+        };
+
+        let requester = crate::application::workflow_scope::ScopeChangeRequester {
+            user_id: "smcp-tool-user".to_string(),
+            roles: vec!["aegis:operator".to_string()],
+            tenant_id: tenant_id.clone(),
+        };
+
+        let scope_service = crate::application::workflow_scope::WorkflowScopeService::new(
+            repo.clone(),
+            self.event_bus.clone(),
+        );
+
+        match scope_service
+            .change_scope(workflow.id, target_scope.clone(), &requester)
+            .await
+        {
+            Ok(()) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.demote",
+                "demoted": true,
+                "workflow_id": workflow.id.0.to_string(),
+                "name": workflow.metadata.name,
+                "previous_scope": workflow.scope.to_string(),
+                "new_scope": target_scope.to_string()
+            }))),
+            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
+                "tool": "aegis.workflow.demote",
+                "demoted": false,
+                "error": format!("{e}")
+            }))),
+        }
     }
 
     pub(super) async fn invoke_aegis_workflow_export_tool(

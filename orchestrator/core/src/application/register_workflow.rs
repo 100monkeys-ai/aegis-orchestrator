@@ -249,6 +249,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
                 workflow_id: workflow.id,
                 name: workflow_name.clone(),
                 version: workflow_version.clone(),
+                scope: workflow.scope.clone(),
                 registered_at: chrono::Utc::now(),
             },
         );
@@ -524,6 +525,42 @@ spec:
         }
 
         async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
+            Ok(())
+        }
+
+        async fn resolve_by_name(
+            &self,
+            _tenant_id: &TenantId,
+            _user_id: Option<&str>,
+            _name: &str,
+        ) -> Result<Option<Workflow>, RepositoryError> {
+            Ok(None)
+        }
+        async fn resolve_by_name_and_version(
+            &self,
+            _tenant_id: &TenantId,
+            _user_id: Option<&str>,
+            _name: &str,
+            _version: &str,
+        ) -> Result<Option<Workflow>, RepositoryError> {
+            Ok(None)
+        }
+        async fn list_visible(
+            &self,
+            _tenant_id: &TenantId,
+            _user_id: Option<&str>,
+        ) -> Result<Vec<Workflow>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
+            Ok(vec![])
+        }
+        async fn update_scope(
+            &self,
+            _id: WorkflowId,
+            _new_scope: crate::domain::workflow::WorkflowScope,
+            _new_tenant_id: &TenantId,
+        ) -> Result<(), RepositoryError> {
             Ok(())
         }
     }

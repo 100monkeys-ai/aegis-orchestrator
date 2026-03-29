@@ -636,10 +636,12 @@ impl TemporalEventListener {
                 parent_execution_id,
                 ..
             } => *parent_execution_id,
-            WorkflowEvent::WorkflowRegistered { .. } => {
+            WorkflowEvent::WorkflowRegistered { .. }
+            | WorkflowEvent::WorkflowScopeChanged { .. } => {
                 return Err(anyhow!(
-                    "WorkflowRegistered event unexpectedly reached execution-scoped handling; \
-                     this variant should be handled by TemporalEventMapper::to_domain_event"
+                    "WorkflowRegistered/WorkflowScopeChanged event unexpectedly reached \
+                     execution-scoped handling; this variant should be handled by \
+                     TemporalEventMapper::to_domain_event"
                 ));
             }
         };

@@ -72,6 +72,70 @@ impl std::fmt::Display for StateName {
     }
 }
 
+/// Visibility scope for a workflow definition (ADR-076).
+///
+/// Scope determines which principals can discover and execute a workflow.
+/// Scope is mutable via explicit promote/demote operations (not via save).
+///
+/// Hierarchy (broadest to narrowest): Global > Tenant > User
+///
+/// Invariants:
+/// - `Global` workflows MUST have `tenant_id == TenantId::system()`.
+/// - `Tenant` workflows have no `owner_user_id`.
+/// - `User` workflows MUST have a non-None `owner_user_id`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum WorkflowScope {
+    /// Platform-wide: visible to all tenants, managed by operators.
+    /// Stored with `tenant_id = "aegis-system"`.
+    Global,
+
+    /// Tenant-wide: visible to all users within the owning tenant.
+    #[default]
+    Tenant,
+
+    /// User-private: visible only to the owning user within their tenant.
+    User {
+        /// OIDC `sub` claim identifying the owning user.
+        owner_user_id: String,
+    },
+}
+
+impl WorkflowScope {
+    pub fn as_db_str(&self) -> &'static str {
+        match self {
+            WorkflowScope::Global => "global",
+            WorkflowScope::Tenant => "tenant",
+            WorkflowScope::User { .. } => "user",
+        }
+    }
+
+    /// Extract the owner_user_id if this is a User scope, else None.
+    pub fn owner_user_id(&self) -> Option<&str> {
+        match self {
+            WorkflowScope::User { owner_user_id } => Some(owner_user_id.as_str()),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for WorkflowScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_db_str())
+    }
+}
+
+impl std::str::FromStr for WorkflowScope {
+    type Err = WorkflowError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "global" => Ok(WorkflowScope::Global),
+            "tenant" => Ok(WorkflowScope::Tenant),
+            _ => Err(WorkflowError::InvalidScope(s.to_string())),
+        }
+    }
+}
+
 // ============================================================================
 // Aggregate Root: Workflow
 // ============================================================================
@@ -91,6 +155,8 @@ pub struct Workflow {
     pub id: WorkflowId,
     #[serde(default)]
     pub tenant_id: TenantId,
+    #[serde(default)]
+    pub scope: WorkflowScope,
     pub metadata: WorkflowMetadata,
     pub spec: WorkflowSpec,
     pub created_at: DateTime<Utc>,
@@ -311,6 +377,7 @@ impl Workflow {
         Ok(Self {
             id: WorkflowId::new(),
             tenant_id: TenantId::default(),
+            scope: WorkflowScope::default(),
             metadata,
             spec,
             created_at: Utc::now(),
@@ -1234,6 +1301,9 @@ pub enum WorkflowError {
 
     #[error("Invalid subworkflow state configuration in state '{state}': {detail}")]
     InvalidSubworkflowState { state: StateName, detail: String },
+
+    #[error("Invalid workflow scope: {0}")]
+    InvalidScope(String),
 }
 
 // ============================================================================
@@ -1430,6 +1500,7 @@ mod tests {
         let workflow = Workflow {
             id: WorkflowId::new(),
             tenant_id: TenantId::default(),
+            scope: WorkflowScope::default(),
             metadata: WorkflowMetadata {
                 name: "test".to_string(),
                 version: Some("1.0.0".to_string()),

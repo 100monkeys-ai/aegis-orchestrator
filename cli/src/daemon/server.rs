@@ -2498,6 +2498,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(ils)
     };
 
+    let workflow_scope_service = Arc::new(
+        aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService::new(
+            workflow_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -2516,6 +2523,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         start_workflow_execution_use_case,
         workflow_repo: workflow_repo.clone(),
         workflow_execution_repo: workflow_execution_repo.clone(),
+        workflow_scope_service,
         temporal_client_container: temporal_client_container.clone(),
         storage_event_repo: storage_event_repo.clone(),
         tool_invocation_service: tool_invocation_service.clone(),
@@ -3099,6 +3107,8 @@ async fn shutdown_signal() {
 struct RegisterWorkflowQuery {
     #[serde(default)]
     force: bool,
+    /// Optional workflow scope override (user, tenant, global). Default: tenant.
+    scope: Option<String>,
 }
 
 async fn register_temporal_workflow_handler(
@@ -3113,7 +3123,41 @@ async fn register_temporal_workflow_handler(
         .register_workflow_for_tenant(&tenant_id, &body, query.force)
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Ok(res) => {
+            // If a scope was requested, update the workflow scope after registration
+            if let Some(scope_str) = &query.scope {
+                use aegis_orchestrator_core::domain::workflow::WorkflowScope;
+                let user_id = identity
+                    .as_ref()
+                    .map(|ext| ext.0.sub.clone())
+                    .unwrap_or_default();
+                let target_scope = match scope_str.as_str() {
+                    "global" => WorkflowScope::Global,
+                    "user" => WorkflowScope::User {
+                        owner_user_id: user_id,
+                    },
+                    _ => WorkflowScope::Tenant, // default / "tenant"
+                };
+                if let Ok(Some(workflow)) = state
+                    .workflow_repo
+                    .find_by_name_for_tenant(&tenant_id, &res.name)
+                    .await
+                {
+                    let new_tenant_id = match &target_scope {
+                        WorkflowScope::Global => TenantId::system(),
+                        _ => tenant_id.clone(),
+                    };
+                    if let Err(e) = state
+                        .workflow_repo
+                        .update_scope(workflow.id, target_scope, &new_tenant_id)
+                        .await
+                    {
+                        warn!("Failed to set workflow scope after registration: {e}");
+                    }
+                }
+            }
+            (StatusCode::OK, Json(res)).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -3497,6 +3541,10 @@ fn create_router(
             get(get_workflow_handler).delete(delete_workflow_handler),
         )
         .route(
+            "/v1/workflows/{name}/scope",
+            post(update_workflow_scope_handler),
+        )
+        .route(
             "/v1/workflows/{name}/run",
             post(run_workflow_legacy_handler),
         )
@@ -3612,6 +3660,8 @@ struct AppState {
     workflow_repo: Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowRepository>,
     workflow_execution_repo:
         Arc<dyn aegis_orchestrator_core::domain::repository::WorkflowExecutionRepository>,
+    workflow_scope_service:
+        Arc<aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService>,
     temporal_client_container: Arc<
         tokio::sync::RwLock<
             Option<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>>,
@@ -4369,17 +4419,37 @@ async fn dispatch_gateway_handler(
 // Workflow API Handlers
 // ========================================
 
+#[derive(serde::Deserialize, Default)]
+struct ListWorkflowsQuery {
+    scope: Option<String>,
+    #[serde(default)]
+    visible: Option<bool>,
+}
+
 /// GET /v1/workflows - List all workflows
 async fn list_workflows_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<ListWorkflowsQuery>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    let workflows = state
-        .workflow_repo
-        .list_all_for_tenant(&tenant_id)
-        .await
-        .unwrap_or_default();
+    let user_id = identity.as_ref().map(|ext| ext.0.sub.as_str());
+
+    let workflows = if query.scope.as_deref() == Some("global") {
+        state.workflow_repo.list_global().await.unwrap_or_default()
+    } else if query.visible.unwrap_or(false) {
+        state
+            .workflow_repo
+            .list_visible(&tenant_id, user_id)
+            .await
+            .unwrap_or_default()
+    } else {
+        state
+            .workflow_repo
+            .list_all_for_tenant(&tenant_id)
+            .await
+            .unwrap_or_default()
+    };
 
     let workflow_list: Vec<serde_json::Value> = workflows
         .iter()
@@ -4388,6 +4458,7 @@ async fn list_workflows_handler(
                 "name": w.metadata.name,
                 "version": w.metadata.version,
                 "description": w.metadata.description,
+                "scope": w.scope.to_string(),
                 "status": "active"
             })
         })
@@ -4520,6 +4591,146 @@ async fn delete_workflow_handler(
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not found"})),
         ),
+    }
+}
+
+/// POST /v1/workflows/:id_or_name/scope - Change workflow scope (promote/demote)
+async fn update_workflow_scope_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(id_or_name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use aegis_orchestrator_core::application::workflow_scope::ScopeChangeRequester;
+    use aegis_orchestrator_core::domain::workflow::WorkflowScope;
+
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let user_id = identity
+        .as_ref()
+        .map(|ext| ext.0.sub.clone())
+        .unwrap_or_default();
+
+    // Derive roles from identity kind
+    let roles: Vec<String> = identity
+        .as_ref()
+        .map(|ext| match &ext.0.identity_kind {
+            IdentityKind::Operator { aegis_role } => vec![aegis_role.as_claim_str().to_string()],
+            IdentityKind::ServiceAccount { .. } => vec!["aegis:operator".to_string()],
+            IdentityKind::TenantUser { .. } => vec!["tenant:admin".to_string()],
+            _ => vec!["user".to_string()],
+        })
+        .unwrap_or_else(|| vec!["aegis:operator".to_string()]); // local daemon defaults to operator
+
+    // Parse target_scope from body
+    let target_scope_str = match body.get("target_scope").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'target_scope' field"})),
+            )
+                .into_response();
+        }
+    };
+
+    let target_scope = match target_scope_str.as_str() {
+        "global" => WorkflowScope::Global,
+        "tenant" => WorkflowScope::Tenant,
+        "user" => WorkflowScope::User {
+            owner_user_id: user_id.clone(),
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant, user")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Resolve workflow by UUID or name
+    let workflow = if let Ok(uuid) = id_or_name.parse::<Uuid>() {
+        let wf_id = aegis_orchestrator_core::domain::workflow::WorkflowId(uuid);
+        state
+            .workflow_repo
+            .find_by_id_for_tenant(&tenant_id, wf_id)
+            .await
+    } else {
+        state
+            .workflow_repo
+            .find_by_name_for_tenant(&tenant_id, &id_or_name)
+            .await
+    };
+
+    let workflow = match workflow {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": format!("workflow '{}' not found", id_or_name)})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let previous_scope = workflow.scope.to_string();
+    let workflow_id = workflow.id;
+
+    let requester = ScopeChangeRequester {
+        user_id,
+        roles,
+        tenant_id,
+    };
+
+    match state
+        .workflow_scope_service
+        .change_scope(workflow_id, target_scope.clone(), &requester)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "workflow_id": workflow_id.0,
+                "previous_scope": previous_scope,
+                "new_scope": target_scope.to_string(),
+            })),
+        )
+            .into_response(),
+        Err(
+            aegis_orchestrator_core::application::workflow_scope::ScopeChangeError::NameCollision {
+                existing_id,
+                name,
+                version,
+            },
+        ) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("Name collision: workflow '{name}' v{version} already exists at target scope"),
+                "existing_id": existing_id.0,
+            })),
+        )
+            .into_response(),
+        Err(
+            aegis_orchestrator_core::application::workflow_scope::ScopeChangeError::Unauthorized {
+                reason,
+            },
+        ) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": reason})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -4680,6 +4891,13 @@ fn workflow_event_message(event: &WorkflowEvent) -> String {
         WorkflowEvent::WorkflowRegistered { name, .. } => {
             format!("Workflow {name} registered")
         }
+        WorkflowEvent::WorkflowScopeChanged {
+            workflow_name,
+            new_scope,
+            ..
+        } => {
+            format!("Workflow {workflow_name} scope changed to {new_scope}")
+        }
         WorkflowEvent::SubworkflowTriggered {
             child_workflow_id,
             mode,
@@ -4706,6 +4924,7 @@ fn workflow_event_message(event: &WorkflowEvent) -> String {
 fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
     match event {
         WorkflowEvent::WorkflowRegistered { .. } => "WorkflowRegistered",
+        WorkflowEvent::WorkflowScopeChanged { .. } => "WorkflowScopeChanged",
         WorkflowEvent::WorkflowExecutionStarted { .. } => "WorkflowExecutionStarted",
         WorkflowEvent::WorkflowStateEntered { .. } => "WorkflowStateEntered",
         WorkflowEvent::WorkflowStateExited { .. } => "WorkflowStateExited",
@@ -4733,6 +4952,13 @@ fn workflow_event_view_from_domain(
             None,
             None,
             registered_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowScopeChanged { changed_at, .. } => (
+            Uuid::nil(),
+            None,
+            None,
+            changed_at.to_rfc3339(),
             serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
         ),
         WorkflowEvent::WorkflowExecutionStarted {

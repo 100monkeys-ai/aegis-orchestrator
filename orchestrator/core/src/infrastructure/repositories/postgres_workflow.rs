@@ -45,7 +45,7 @@
 
 use crate::domain::repository::{RepositoryError, WorkflowRepository};
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{Workflow, WorkflowId};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -116,11 +116,14 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT id
             FROM workflows
             WHERE tenant_id = $1 AND name = $2 AND version = $3
+              AND scope = $4 AND COALESCE(owner_user_id, '') = $5
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
+        .bind(workflow.scope.as_db_str())
+        .bind(workflow.scope.owner_user_id().unwrap_or(""))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to load existing workflow: {e}")))?
@@ -151,15 +154,20 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         let description = workflow.metadata.description.clone();
 
+        let scope_str = workflow.scope.as_db_str();
+        let owner_user_id = workflow.scope.owner_user_id().map(|s| s.to_string());
+
         sqlx::query(
             r#"
-            INSERT INTO workflows (id, tenant_id, name, version, description, yaml_source, domain_json, temporal_def_json, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-            ON CONFLICT (tenant_id, name, version) DO UPDATE SET
+            INSERT INTO workflows (id, tenant_id, name, version, scope, owner_user_id, description, yaml_source, domain_json, temporal_def_json, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            ON CONFLICT (tenant_id, name, version, scope, COALESCE(owner_user_id, '')) DO UPDATE SET
                 description = EXCLUDED.description,
                 yaml_source = EXCLUDED.yaml_source,
                 domain_json = EXCLUDED.domain_json,
                 temporal_def_json = EXCLUDED.temporal_def_json,
+                scope = EXCLUDED.scope,
+                owner_user_id = EXCLUDED.owner_user_id,
                 updated_at = NOW()
             "#
         )
@@ -167,6 +175,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
+        .bind(scope_str)
+        .bind(&owner_user_id)
         .bind(&description)
         .bind(yaml_source)
         .bind(&definition_json)
@@ -180,12 +190,14 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflow_definitions (workflow_id, tenant_id, name, version, definition, definition_hash, registered_at)
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
-            ON CONFLICT (tenant_id, name, version) DO UPDATE SET
+            INSERT INTO workflow_definitions (workflow_id, tenant_id, name, version, scope, owner_user_id, definition, definition_hash, registered_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+            ON CONFLICT (tenant_id, name, version, scope, COALESCE(owner_user_id, '')) DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
                 definition = EXCLUDED.definition,
                 definition_hash = EXCLUDED.definition_hash,
+                scope = EXCLUDED.scope,
+                owner_user_id = EXCLUDED.owner_user_id,
                 registered_at = NOW()
             "#
         )
@@ -193,6 +205,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
+        .bind(scope_str)
+        .bind(&owner_user_id)
         .bind(&temporal_def_json)
         .bind(def_hash)
         .execute(&self.pool)
@@ -323,6 +337,211 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             workflows.push(workflow);
         }
         Ok(workflows)
+    }
+
+    async fn resolve_by_name(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        // Build query that looks across user/tenant/global scopes
+        // Priority: user (0) > tenant (1) > global (2)
+        let row = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE name = $1
+              AND (
+                  (scope = 'user' AND tenant_id = $2 AND owner_user_id = $3)
+                  OR (scope = 'tenant' AND tenant_id = $2)
+                  OR (scope = 'global' AND tenant_id = 'aegis-system')
+              )
+            ORDER BY
+                CASE scope
+                    WHEN 'user' THEN 0
+                    WHEN 'tenant' THEN 1
+                    WHEN 'global' THEN 2
+                END,
+                version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(name)
+        .bind(tenant_id.as_str())
+        .bind(user_id.unwrap_or(""))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Some(row) = row {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            Ok(Some(workflow))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn resolve_by_name_and_version(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE name = $1 AND version = $2
+              AND (
+                  (scope = 'user' AND tenant_id = $3 AND owner_user_id = $4)
+                  OR (scope = 'tenant' AND tenant_id = $3)
+                  OR (scope = 'global' AND tenant_id = 'aegis-system')
+              )
+            ORDER BY
+                CASE scope
+                    WHEN 'user' THEN 0
+                    WHEN 'tenant' THEN 1
+                    WHEN 'global' THEN 2
+                END
+            LIMIT 1
+            "#,
+        )
+        .bind(name)
+        .bind(version)
+        .bind(tenant_id.as_str())
+        .bind(user_id.unwrap_or(""))
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        if let Some(row) = row {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            Ok(Some(workflow))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn list_visible(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE
+                (scope = 'user' AND tenant_id = $1 AND owner_user_id = $2)
+                OR (scope = 'tenant' AND tenant_id = $1)
+                OR (scope = 'global' AND tenant_id = 'aegis-system')
+            ORDER BY name ASC, version DESC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(user_id.unwrap_or(""))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut workflows = Vec::new();
+        for row in rows {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            workflows.push(workflow);
+        }
+        Ok(workflows)
+    }
+
+    async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE scope = 'global'
+            ORDER BY name ASC, version DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut workflows = Vec::new();
+        for row in rows {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            workflows.push(workflow);
+        }
+        Ok(workflows)
+    }
+
+    async fn update_scope(
+        &self,
+        id: WorkflowId,
+        new_scope: WorkflowScope,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        let scope_str = new_scope.as_db_str();
+        let owner_user_id = new_scope.owner_user_id().map(|s| s.to_string());
+
+        let mut tx =
+            self.pool.begin().await.map_err(|e| {
+                RepositoryError::Database(format!("Failed to begin transaction: {e}"))
+            })?;
+
+        sqlx::query(
+            r#"
+            UPDATE workflows
+            SET scope = $1, owner_user_id = $2, tenant_id = $3, updated_at = NOW()
+            WHERE id = $4
+            "#,
+        )
+        .bind(scope_str)
+        .bind(&owner_user_id)
+        .bind(new_tenant_id.as_str())
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| RepositoryError::Database(format!("Failed to update workflow scope: {e}")))?;
+
+        sqlx::query(
+            r#"
+            UPDATE workflow_definitions
+            SET scope = $1, owner_user_id = $2, tenant_id = $3
+            WHERE workflow_id = $4
+            "#,
+        )
+        .bind(scope_str)
+        .bind(&owner_user_id)
+        .bind(new_tenant_id.as_str())
+        .bind(id.0)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to update workflow_definitions scope: {e}"))
+        })?;
+
+        tx.commit()
+            .await
+            .map_err(|e| RepositoryError::Database(format!("Failed to commit transaction: {e}")))?;
+
+        Ok(())
     }
 
     async fn delete_for_tenant(

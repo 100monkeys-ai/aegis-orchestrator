@@ -63,7 +63,7 @@ use crate::domain::repository::{
     WorkflowRepository,
 };
 use crate::domain::tenant::TenantId;
-use crate::domain::workflow::{Workflow, WorkflowId};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -474,6 +474,220 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
             .get(tenant_id)
             .map(|tenant_workflows| tenant_workflows.values().cloned().collect())
             .unwrap_or_default())
+    }
+
+    async fn resolve_by_name(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let system_tenant = TenantId::system();
+
+        // Scope priority: user=0 (best), tenant=1, global=2 (worst).
+        let scope_priority = |w: &Workflow| -> u8 {
+            match &w.scope {
+                WorkflowScope::User { .. } => 0,
+                WorkflowScope::Tenant => 1,
+                WorkflowScope::Global => 2,
+            }
+        };
+
+        let mut candidates: Vec<&Workflow> = Vec::new();
+
+        // User scope
+        if let Some(uid) = user_id {
+            if let Some(tenant_wfs) = workflows.get(tenant_id) {
+                for w in tenant_wfs.values() {
+                    if w.metadata.name == name {
+                        if let WorkflowScope::User { owner_user_id } = &w.scope {
+                            if owner_user_id == uid {
+                                candidates.push(w);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tenant scope
+        if let Some(tenant_wfs) = workflows.get(tenant_id) {
+            for w in tenant_wfs.values() {
+                if w.metadata.name == name && w.scope == WorkflowScope::Tenant {
+                    candidates.push(w);
+                }
+            }
+        }
+
+        // Global scope
+        if let Some(global_wfs) = workflows.get(&system_tenant) {
+            for w in global_wfs.values() {
+                if w.metadata.name == name && w.scope == WorkflowScope::Global {
+                    candidates.push(w);
+                }
+            }
+        }
+
+        // Sort by priority (ascending), then by version (descending)
+        candidates.sort_by(|a, b| {
+            scope_priority(a)
+                .cmp(&scope_priority(b))
+                .then_with(|| b.metadata.version.cmp(&a.metadata.version))
+        });
+
+        Ok(candidates.first().cloned().cloned())
+    }
+
+    async fn resolve_by_name_and_version(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let system_tenant = TenantId::system();
+
+        // User scope (highest priority)
+        if let Some(uid) = user_id {
+            if let Some(tenant_wfs) = workflows.get(tenant_id) {
+                for w in tenant_wfs.values() {
+                    if w.metadata.name == name && w.metadata.version.as_deref() == Some(version) {
+                        if let WorkflowScope::User { owner_user_id } = &w.scope {
+                            if owner_user_id == uid {
+                                return Ok(Some(w.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tenant scope
+        if let Some(tenant_wfs) = workflows.get(tenant_id) {
+            for w in tenant_wfs.values() {
+                if w.metadata.name == name
+                    && w.metadata.version.as_deref() == Some(version)
+                    && w.scope == WorkflowScope::Tenant
+                {
+                    return Ok(Some(w.clone()));
+                }
+            }
+        }
+
+        // Global scope
+        if let Some(global_wfs) = workflows.get(&system_tenant) {
+            for w in global_wfs.values() {
+                if w.metadata.name == name
+                    && w.metadata.version.as_deref() == Some(version)
+                    && w.scope == WorkflowScope::Global
+                {
+                    return Ok(Some(w.clone()));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    async fn list_visible(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let system_tenant = TenantId::system();
+        let mut result = Vec::new();
+
+        // User-scoped workflows
+        if let Some(uid) = user_id {
+            if let Some(tenant_wfs) = workflows.get(tenant_id) {
+                for w in tenant_wfs.values() {
+                    if let WorkflowScope::User { owner_user_id } = &w.scope {
+                        if owner_user_id == uid {
+                            result.push(w.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tenant-scoped workflows
+        if let Some(tenant_wfs) = workflows.get(tenant_id) {
+            for w in tenant_wfs.values() {
+                if w.scope == WorkflowScope::Tenant {
+                    result.push(w.clone());
+                }
+            }
+        }
+
+        // Global-scoped workflows
+        if let Some(global_wfs) = workflows.get(&system_tenant) {
+            for w in global_wfs.values() {
+                if w.scope == WorkflowScope::Global {
+                    result.push(w.clone());
+                }
+            }
+        }
+
+        result.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        Ok(result)
+    }
+
+    async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let system_tenant = TenantId::system();
+        let mut result = Vec::new();
+
+        if let Some(global_wfs) = workflows.get(&system_tenant) {
+            for w in global_wfs.values() {
+                if w.scope == WorkflowScope::Global {
+                    result.push(w.clone());
+                }
+            }
+        }
+
+        result.sort_by(|a, b| a.metadata.name.cmp(&b.metadata.name));
+        Ok(result)
+    }
+
+    async fn update_scope(
+        &self,
+        id: WorkflowId,
+        new_scope: WorkflowScope,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        let mut workflows = self.workflows.write().unwrap();
+
+        // Find the workflow across all tenants
+        let mut found = None;
+        for (tid, tenant_wfs) in workflows.iter() {
+            if let Some(w) = tenant_wfs.get(&id) {
+                found = Some((tid.clone(), w.clone()));
+                break;
+            }
+        }
+
+        let (old_tenant_id, mut workflow) =
+            found.ok_or_else(|| RepositoryError::NotFound(format!("Workflow {id} not found")))?;
+
+        // Remove from old tenant
+        if let Some(tenant_wfs) = workflows.get_mut(&old_tenant_id) {
+            tenant_wfs.remove(&id);
+        }
+
+        // Update scope and tenant
+        workflow.scope = new_scope;
+        workflow.tenant_id = new_tenant_id.clone();
+
+        // Insert under new tenant
+        workflows
+            .entry(new_tenant_id.clone())
+            .or_default()
+            .insert(id, workflow);
+
+        Ok(())
     }
 
     async fn delete_for_tenant(
