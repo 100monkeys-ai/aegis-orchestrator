@@ -150,6 +150,8 @@ impl ToolRouter {
                 | "aegis.workflow.cancel"
                 | "aegis.workflow.signal"
                 | "aegis.workflow.remove"
+                | "aegis.workflow.promote"
+                | "aegis.workflow.demote"
         )
     }
 
@@ -590,6 +592,15 @@ impl ToolRouter {
                             "tenant_id": {
                                 "type": "string",
                                 "description": "Optional tenant identifier. Defaults to the local tenant."
+                            },
+                            "scope": {
+                                "type": "string",
+                                "enum": ["global", "visible"],
+                                "description": "Optional scope filter. 'global' lists only global workflows. 'visible' lists user+tenant+global. Omit to list all for tenant."
+                            },
+                            "user_id": {
+                                "type": "string",
+                                "description": "Optional user ID for 'visible' scope filter."
                             }
                         }
                     }),
@@ -757,6 +768,48 @@ impl ToolRouter {
                             }
                         },
                         "required": ["execution_id"]
+                    }),
+                    "aegis.workflow.promote" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Workflow name or ID to promote."
+                            },
+                            "target_scope": {
+                                "type": "string",
+                                "enum": ["tenant", "global"],
+                                "description": "Target scope (default: global)."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["name"]
+                    }),
+                    "aegis.workflow.demote" => json!({
+                        "type": "object",
+                        "properties": {
+                            "name": {
+                                "type": "string",
+                                "description": "Workflow name or ID to demote."
+                            },
+                            "target_scope": {
+                                "type": "string",
+                                "enum": ["tenant", "user"],
+                                "description": "Target scope (default: tenant)."
+                            },
+                            "user_id": {
+                                "type": "string",
+                                "description": "Owner user ID when demoting to user scope."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["name"]
                     }),
                     "aegis.task.execute" => json!({
                         "type": "object",

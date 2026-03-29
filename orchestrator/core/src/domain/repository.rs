@@ -42,7 +42,7 @@ use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::tenancy::Tenant;
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::{Volume, VolumeId, VolumeOwnership};
-use crate::domain::workflow::{Workflow, WorkflowId};
+use crate::domain::workflow::{Workflow, WorkflowId, WorkflowScope};
 use async_trait::async_trait;
 
 /// Storage backend enum for pluggable persistence
@@ -244,6 +244,44 @@ pub trait WorkflowRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
         id: WorkflowId,
+    ) -> Result<(), RepositoryError>;
+
+    // --- Scope-aware methods (ADR-076) ---
+
+    /// Resolve a workflow by name using the scope hierarchy.
+    /// Priority: User > Tenant > Global (narrowest wins).
+    async fn resolve_by_name(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError>;
+
+    /// Resolve a workflow by name and version using the scope hierarchy.
+    async fn resolve_by_name_and_version(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+        version: &str,
+    ) -> Result<Option<Workflow>, RepositoryError>;
+
+    /// List all workflows visible to a user (user-owned + tenant + global).
+    async fn list_visible(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Workflow>, RepositoryError>;
+
+    /// List only global-scope workflows.
+    async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError>;
+
+    /// Update the scope of an existing workflow (for promote/demote).
+    async fn update_scope(
+        &self,
+        id: WorkflowId,
+        new_scope: WorkflowScope,
+        new_tenant_id: &TenantId,
     ) -> Result<(), RepositoryError>;
 
     /// Save workflow (create or update)

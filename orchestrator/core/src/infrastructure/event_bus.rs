@@ -179,7 +179,8 @@ impl DomainEvent {
                     parent_execution_id,
                     ..
                 } => *parent_execution_id,
-                WorkflowEvent::WorkflowRegistered { .. } => return None,
+                WorkflowEvent::WorkflowRegistered { .. }
+                | WorkflowEvent::WorkflowScopeChanged { .. } => return None,
             }),
             DomainEvent::Learning(event) => Some(match event {
                 LearningEvent::PatternDiscovered { execution_id, .. }
@@ -387,6 +388,7 @@ impl DomainEvent {
                 WorkflowEvent::SubworkflowTriggered { triggered_at, .. } => *triggered_at,
                 WorkflowEvent::SubworkflowCompleted { completed_at, .. } => *completed_at,
                 WorkflowEvent::SubworkflowFailed { failed_at, .. } => *failed_at,
+                WorkflowEvent::WorkflowScopeChanged { changed_at, .. } => *changed_at,
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { discovered_at, .. } => *discovered_at,
@@ -549,6 +551,7 @@ impl DomainEvent {
                 WorkflowEvent::SubworkflowTriggered { .. } => "subworkflow_triggered",
                 WorkflowEvent::SubworkflowCompleted { .. } => "subworkflow_completed",
                 WorkflowEvent::SubworkflowFailed { .. } => "subworkflow_failed",
+                WorkflowEvent::WorkflowScopeChanged { .. } => "workflow_scope_changed",
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { .. } => "pattern_discovered",

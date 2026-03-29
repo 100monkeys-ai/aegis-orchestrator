@@ -396,6 +396,7 @@ pub enum WorkflowEvent {
         workflow_id: crate::domain::workflow::WorkflowId,
         name: String,
         version: String,
+        scope: crate::domain::workflow::WorkflowScope,
         registered_at: DateTime<Utc>,
     },
     WorkflowExecutionStarted {
@@ -474,6 +475,17 @@ pub enum WorkflowEvent {
         child_execution_id: ExecutionId,
         reason: String,
         failed_at: DateTime<Utc>,
+    },
+    /// A workflow's visibility scope was changed (ADR-076)
+    WorkflowScopeChanged {
+        workflow_id: crate::domain::workflow::WorkflowId,
+        workflow_name: String,
+        previous_scope: crate::domain::workflow::WorkflowScope,
+        new_scope: crate::domain::workflow::WorkflowScope,
+        previous_tenant_id: crate::domain::tenant::TenantId,
+        new_tenant_id: crate::domain::tenant::TenantId,
+        changed_by: String,
+        changed_at: DateTime<Utc>,
     },
 }
 

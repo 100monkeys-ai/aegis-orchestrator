@@ -57,30 +57,45 @@ CREATE TABLE workflows (
     tenant_id TEXT NOT NULL,
     name TEXT NOT NULL,
     version TEXT NOT NULL,
+    scope TEXT NOT NULL DEFAULT 'tenant',
+    owner_user_id TEXT NULL,
     description TEXT,
-    
+
     -- Source artifacts
     yaml_source TEXT NOT NULL,
     domain_json JSONB NOT NULL,       -- Serialized Rust Workflow domain object
     temporal_def_json JSONB NOT NULL, -- Generated Temporal workflow definition
-    
+
     -- Metadata
     labels JSONB DEFAULT '{}'::jsonb,
     annotations JSONB DEFAULT '{}'::jsonb,
-    
+
     -- Timestamps
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    
+
     -- Validation
     CONSTRAINT workflows_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT workflows_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
-    CONSTRAINT workflows_tenant_name_version_unique UNIQUE (tenant_id, name, version),
+    CONSTRAINT workflows_scope_check CHECK (scope IN ('global', 'tenant', 'user')),
+    CONSTRAINT workflows_user_scope_requires_owner CHECK (
+        (scope = 'user' AND owner_user_id IS NOT NULL)
+        OR (scope != 'user' AND owner_user_id IS NULL)
+    ),
+    CONSTRAINT workflows_global_requires_system_tenant CHECK (
+        scope != 'global' OR tenant_id = 'aegis-system'
+    ),
     CONSTRAINT workflows_version_format CHECK (version ~ '^\d+\.\d+\.\d+$'),
     CONSTRAINT workflows_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
-CREATE INDEX idx_workflows_tenant_name ON workflows(tenant_id, name);
+CREATE UNIQUE INDEX idx_workflows_scope_unique
+    ON workflows (tenant_id, name, version, scope, COALESCE(owner_user_id, ''));
+CREATE INDEX idx_workflows_scope ON workflows(scope);
+CREATE INDEX idx_workflows_owner ON workflows(owner_user_id)
+    WHERE owner_user_id IS NOT NULL;
+CREATE INDEX idx_workflows_global_lookup ON workflows(name, version)
+    WHERE scope = 'global';
 CREATE INDEX idx_workflows_created_at ON workflows(created_at DESC);
 
 -- Trigger to update updated_at
@@ -302,23 +317,38 @@ CREATE TABLE workflow_definitions (
     tenant_id TEXT NOT NULL,
     name TEXT NOT NULL,
     definition JSONB NOT NULL,
-    
+    scope TEXT NOT NULL DEFAULT 'tenant',
+    owner_user_id TEXT NULL,
+
     -- Registration metadata
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     registered_by TEXT,
-    
+
     -- Version tracking
     version TEXT NOT NULL DEFAULT '0.0.1',
     definition_hash TEXT NOT NULL,
-    
+
     CONSTRAINT workflow_definitions_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
+    CONSTRAINT workflow_definitions_scope_check CHECK (scope IN ('global', 'tenant', 'user')),
+    CONSTRAINT workflow_definitions_user_scope_requires_owner CHECK (
+        (scope = 'user' AND owner_user_id IS NOT NULL)
+        OR (scope != 'user' AND owner_user_id IS NULL)
+    ),
+    CONSTRAINT workflow_definitions_global_requires_system_tenant CHECK (
+        scope != 'global' OR tenant_id = 'aegis-system'
+    ),
     CONSTRAINT workflow_definitions_tenant_fk FOREIGN KEY (tenant_id) REFERENCES tenants(slug) ON DELETE RESTRICT
 );
 
-CREATE UNIQUE INDEX idx_workflow_definitions_tenant_name_version
-    ON workflow_definitions(tenant_id, name, version);
+CREATE UNIQUE INDEX idx_workflow_definitions_scope_unique
+    ON workflow_definitions(tenant_id, name, version, scope, COALESCE(owner_user_id, ''));
 
 CREATE INDEX idx_workflow_definitions_name ON workflow_definitions(name);
+CREATE INDEX idx_workflow_definitions_scope ON workflow_definitions(scope);
+CREATE INDEX idx_workflow_definitions_owner ON workflow_definitions(owner_user_id)
+    WHERE owner_user_id IS NOT NULL;
+CREATE INDEX idx_workflow_definitions_global_lookup ON workflow_definitions(name, version)
+    WHERE scope = 'global';
 CREATE INDEX idx_workflow_definitions_registered_at ON workflow_definitions(registered_at DESC);
 CREATE INDEX idx_workflow_definitions_hash ON workflow_definitions(definition_hash);
 
