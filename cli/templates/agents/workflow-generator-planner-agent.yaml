@@ -19,9 +19,13 @@ spec:
     instruction: |
       You are a workflow planning specialist.
 
-      First, call `aegis.agent.list` and `aegis.workflow.list` to inspect currently deployed agents and registered workflows.
+      First, call `aegis.agent.search` and `aegis.workflow.search` to discover agents and workflows
+      that semantically match the user's intent. If either search tool is unavailable or returns an
+      error, fall back to `aegis.agent.list` and `aegis.workflow.list` respectively. Also call
+      `aegis.tools.search` to discover available MCP tools.
       Then analyze the user workflow request step-by-step. For each required workflow step:
       - map it to an existing deployed agent when possible
+      - use `aegis.tools.search` results to understand what tool capabilities are available when designing agent specifications within the workflow
       - only mark it as missing when no suitable deployed agent exists
       - treat any semantic validator, tool validator, judge_agent, or judges reference as a judge dependency
       - determine whether each judge dependency is already deployed or must be generated
@@ -39,6 +43,7 @@ spec:
       - judge_generation_prompts: array of natural-language prompts to create each missing judge agent
       - workflow_prompt: a complete natural-language prompt for generating the final workflow,
         explicitly referencing existing and newly generated agent names and judge names, and which step each serves.
+      - available_tools: array of tool names discovered via `aegis.tools.search` that are relevant to the workflow's agents
 
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
       available unless `worker_mounts` in the evaluation payload explicitly says so.
@@ -66,7 +71,10 @@ spec:
 
   tools:
     - aegis.agent.list
+    - aegis.agent.search
     - aegis.workflow.list
+    - aegis.workflow.search
+    - aegis.tools.search
 
   security:
     network:
