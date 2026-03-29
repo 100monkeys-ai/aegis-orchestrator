@@ -722,7 +722,7 @@ fn node_challenge_not_expired_when_fresh() {
 }
 
 #[test]
-fn node_challenge_expired_after_60s() {
+fn node_challenge_expired_after_300s() {
     let challenge = NodeChallenge {
         challenge_id: Uuid::new_v4(),
         node_id: make_node_id(),
@@ -731,7 +731,7 @@ fn node_challenge_expired_after_60s() {
         role: NodeRole::Worker,
         capabilities: make_capabilities(),
         grpc_address: "https://node:9090".to_string(),
-        created_at: Utc::now() - Duration::seconds(61),
+        created_at: Utc::now() - Duration::seconds(301),
     };
     assert!(challenge.is_expired());
 }

@@ -26,6 +26,7 @@
 //! | [`SecretEvent`] | BC-11 Secrets & Identity | Secret access, dynamic credential generation, and access denial audit (ADR-034) |
 //! | [`TenantEvent`] | Multi-Tenant | Tenant lifecycle, audit, and quota events (ADR-056) |
 //! | [`RateLimitEvent`] | Cross-cutting (ADR-072) | Rate limit rejection and warning threshold events |
+//! | [`SwarmEvent`] | BC-6 Swarm Coordination | Swarm lifecycle, child spawning, lock, and broadcast events (ADR-039) |
 //!
 //! ## Phase 2 Note
 //!
@@ -1115,6 +1116,52 @@ pub enum RateLimitEvent {
         current: u64,
         threshold_percent: u8,
         timestamp: DateTime<Utc>,
+    },
+}
+
+/// Swarm coordination events (BC-6, ADR-039).
+///
+/// Published by `StandardSwarmService` for multi-agent lifecycle observability.
+/// Feeds The Synapse's Glass Laboratory nested iteration sub-panels, the audit
+/// trail, and Cortex swarm topology learning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum SwarmEvent {
+    /// A new swarm was created for coordinated multi-agent execution.
+    SwarmCreated {
+        swarm_id: uuid::Uuid,
+        parent_execution_id: ExecutionId,
+        created_at: DateTime<Utc>,
+    },
+    /// A child agent was spawned within a swarm.
+    ChildSpawned {
+        swarm_id: uuid::Uuid,
+        agent_id: AgentId,
+        execution_id: ExecutionId,
+        spawned_at: DateTime<Utc>,
+    },
+    /// A swarm was dissolved (all children cancelled or completed).
+    SwarmDissolved {
+        swarm_id: uuid::Uuid,
+        reason: String,
+        dissolved_at: DateTime<Utc>,
+    },
+    /// A resource lock was acquired within a swarm.
+    LockAcquired {
+        swarm_id: uuid::Uuid,
+        resource_id: String,
+        holder: AgentId,
+        execution_id: ExecutionId,
+    },
+    /// A resource lock was released within a swarm.
+    LockReleased {
+        swarm_id: uuid::Uuid,
+        resource_id: String,
+    },
+    /// A message was broadcast to all swarm members.
+    MessageBroadcast {
+        swarm_id: uuid::Uuid,
+        from: AgentId,
+        recipient_count: usize,
     },
 }
 

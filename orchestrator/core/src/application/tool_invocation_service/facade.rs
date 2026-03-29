@@ -739,7 +739,10 @@ impl ToolInvocationService {
             "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
             "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),
             "aegis.agent.delete" => Some(self.invoke_aegis_agent_delete_tool(args).await),
-            "aegis.agent.generate" => Some(self.invoke_aegis_agent_generate_tool(args, security_context).await),
+            "aegis.agent.generate" => Some(
+                self.invoke_aegis_agent_generate_tool(args, security_context)
+                    .await,
+            ),
             "aegis.agent.export" => Some(self.invoke_aegis_agent_export_tool(args).await),
             "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args).await),
             "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
@@ -774,7 +777,10 @@ impl ToolInvocationService {
                 )
                 .await,
             ),
-            "aegis.task.execute" => Some(self.invoke_aegis_task_execute_tool(args, security_context).await),
+            "aegis.task.execute" => Some(
+                self.invoke_aegis_task_execute_tool(args, security_context)
+                    .await,
+            ),
             "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
             "aegis.task.wait" => Some(self.invoke_aegis_task_wait_tool(args).await),
             "aegis.task.logs" => Some(self.invoke_aegis_task_logs_tool(args).await),

@@ -97,6 +97,16 @@ pub trait ExecutionService: Send + Sync {
         security_context_name: String,
     ) -> Result<ExecutionId>;
 
+    /// Start an execution with a pre-assigned ID (used for cluster forwarding).
+    /// The execution_id is imported from the originating node to preserve tracing correlation.
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+    ) -> Result<ExecutionId>;
+
     /// Start a new child execution spawned by a parent (e.g., a judge agent).
     ///
     /// Enforces `MAX_RECURSIVE_DEPTH` from the parent's [`crate::domain::execution::ExecutionHierarchy`].
@@ -231,6 +241,8 @@ pub struct StandardExecutionService {
     rate_limit_enforcer: Option<Arc<dyn crate::domain::rate_limit::RateLimitEnforcer>>,
     /// Optional rate limit policy resolver for resolving tier/tenant/user policies (ADR-072).
     rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
+    /// Optional swarm cancellation port for cascade-cancelling child swarms (BC-6).
+    swarm_cancellation: Option<Arc<dyn crate::application::ports::SwarmCancellationPort>>,
 }
 
 impl StandardExecutionService {
@@ -429,6 +441,17 @@ impl StandardExecutionService {
                 cancelled_at: Utc::now(),
             });
 
+        // Cascade cancellation to any child swarm associated with this execution (BC-6).
+        if let Some(ref port) = self.swarm_cancellation {
+            if let Err(e) = port.cascade_cancel_for_execution(id).await {
+                tracing::warn!(
+                    "swarm cascade cancellation failed for execution {:?}: {}",
+                    id,
+                    e
+                );
+            }
+        }
+
         self.cancellation_tokens.remove(&id);
 
         Ok(())
@@ -485,6 +508,7 @@ impl StandardExecutionService {
             cortex_client: None,
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
+            swarm_cancellation: None,
         }
     }
 
@@ -543,6 +567,15 @@ impl StandardExecutionService {
     ) -> Self {
         self.rate_limit_enforcer = Some(enforcer);
         self.rate_limit_resolver = Some(resolver);
+        self
+    }
+
+    /// Attach swarm cascade cancellation port (BC-6).
+    pub fn with_swarm_cancellation(
+        mut self,
+        port: Arc<dyn crate::application::ports::SwarmCancellationPort>,
+    ) -> Self {
+        self.swarm_cancellation = Some(port);
         self
     }
 }
@@ -1414,10 +1447,14 @@ impl StandardExecutionService {
     }
 }
 
-#[async_trait]
-impl ExecutionService for StandardExecutionService {
-    async fn start_execution(
+// Private execution lifecycle helpers for StandardExecutionService.
+impl StandardExecutionService {
+    /// Shared implementation for `start_execution` and `start_execution_with_id`.
+    /// When `imported_id` is `Some`, the execution re-uses a pre-assigned identity
+    /// (cluster forwarding). When `None`, a fresh ID is generated locally.
+    async fn do_start_execution(
         &self,
+        imported_id: Option<ExecutionId>,
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
@@ -1519,7 +1556,21 @@ impl ExecutionService for StandardExecutionService {
             3 // Default
         };
 
-        let mut execution = Execution::new(agent_id, prepared_input.clone(), max_retries, security_context_name);
+        let mut execution = match imported_id {
+            Some(id) => Execution::new_with_id(
+                id,
+                agent_id,
+                prepared_input.clone(),
+                max_retries,
+                security_context_name,
+            ),
+            None => Execution::new(
+                agent_id,
+                prepared_input.clone(),
+                max_retries,
+                security_context_name,
+            ),
+        };
         let execution_id = execution.id;
 
         // 3. Save initial state
@@ -2012,6 +2063,30 @@ impl ExecutionService for StandardExecutionService {
         });
 
         Ok(execution_id)
+    }
+}
+
+#[async_trait]
+impl ExecutionService for StandardExecutionService {
+    async fn start_execution(
+        &self,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+    ) -> Result<ExecutionId> {
+        self.do_start_execution(None, agent_id, input, security_context_name)
+            .await
+    }
+
+    async fn start_execution_with_id(
+        &self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: ExecutionInput,
+        security_context_name: String,
+    ) -> Result<ExecutionId> {
+        self.do_start_execution(Some(execution_id), agent_id, input, security_context_name)
+            .await
     }
 
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {

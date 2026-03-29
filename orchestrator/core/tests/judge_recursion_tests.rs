@@ -90,7 +90,12 @@ fn test_can_spawn_child_at_each_depth() {
 #[test]
 fn test_meta_monkey_judge_hierarchy_chain() {
     // Primary execution (root, depth 0).
-    let root_exec = Execution::new(AgentId::new(), make_input("primary task"), 5, "aegis-system-operator".to_string());
+    let root_exec = Execution::new(
+        AgentId::new(),
+        make_input("primary task"),
+        5,
+        "aegis-system-operator".to_string(),
+    );
     let root_id = root_exec.id;
     assert_eq!(root_exec.depth(), 0);
     assert!(root_exec.parent_id().is_none());
@@ -143,7 +148,12 @@ fn test_meta_monkey_judge_hierarchy_chain() {
 /// propagates the hierarchy enforcement correctly.
 #[test]
 fn test_new_child_at_max_depth_returns_error() {
-    let root = Execution::new(AgentId::new(), make_input("root"), 5, "aegis-system-operator".to_string());
+    let root = Execution::new(
+        AgentId::new(),
+        make_input("root"),
+        5,
+        "aegis-system-operator".to_string(),
+    );
     let l1 = Execution::new_child(AgentId::new(), make_input("l1"), 1, &root).unwrap();
     let l2 = Execution::new_child(AgentId::new(), make_input("l2"), 1, &l1).unwrap();
     let l3 = Execution::new_child(AgentId::new(), make_input("l3"), 1, &l2).unwrap();

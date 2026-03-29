@@ -14,13 +14,16 @@ use ed25519_dalek::Signer;
 use prost::Message;
 use tonic::transport::Channel;
 
+use crate::domain::agent::AgentId;
 use crate::domain::cluster::NodeId;
+use crate::domain::execution::ExecutionId;
 use crate::infrastructure::aegis_cluster_proto::{
     node_cluster_service_client::NodeClusterServiceClient, AttestNodeRequest, ChallengeNodeRequest,
-    DeregisterNodeInner, DeregisterNodeRequest, NodeCapabilities, NodeCommand, NodeHeartbeatInner,
-    NodeHeartbeatRequest, NodeStatus, RegisterNodeInner, RegisterNodeRequest,
-    SmcpNodeEnvelope as ProtoEnvelope,
+    DeregisterNodeInner, DeregisterNodeRequest, ForwardExecutionInner, ForwardExecutionRequest,
+    NodeCapabilities, NodeCommand, NodeHeartbeatInner, NodeHeartbeatRequest, NodeStatus,
+    RegisterNodeInner, RegisterNodeRequest, SmcpNodeEnvelope as ProtoEnvelope,
 };
+use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
 
 /// gRPC client for inter-node cluster communication.
 ///
@@ -189,6 +192,67 @@ impl NodeClusterClient {
             .into_inner();
 
         Ok(resp.accepted)
+    }
+
+    /// Create a client pre-connected to a specific worker node endpoint.
+    ///
+    /// Used by the controller to dial a worker selected by `RouteExecutionUseCase`
+    /// and forward an execution via [`NodeClusterClient::forward_execution`].
+    pub async fn connect_to_worker(
+        endpoint: &str,
+        signing_key: Arc<ed25519_dalek::SigningKey>,
+        node_id: NodeId,
+        security_token: String,
+    ) -> Result<Self> {
+        let channel = Channel::from_shared(endpoint.to_string())
+            .context("Invalid worker endpoint URL")?
+            .connect()
+            .await
+            .context("Failed to connect to worker node")?;
+
+        Ok(Self {
+            endpoint: endpoint.to_string(),
+            client: Some(NodeClusterServiceClient::new(channel)),
+            signing_key,
+            token: Arc::new(tokio::sync::RwLock::new(Some(security_token))),
+            node_id,
+        })
+    }
+
+    /// Forward an execution to a worker node for remote execution.
+    ///
+    /// Returns a stream of `ExecutionEvent` protobuf messages from the worker.
+    /// The stream closes when the execution reaches a terminal state
+    /// (`ExecutionCompleted` or `ExecutionFailed`).
+    pub async fn forward_execution(
+        &mut self,
+        execution_id: ExecutionId,
+        agent_id: AgentId,
+        input: &str,
+        tenant_id: &str,
+        originating_node_id: &str,
+        user_security_token: &str,
+    ) -> Result<tonic::Streaming<ExecutionEvent>> {
+        let inner = ForwardExecutionInner {
+            execution_id: execution_id.to_string(),
+            agent_id: agent_id.to_string(),
+            input: input.to_string(),
+            tenant_id: tenant_id.to_string(),
+            originating_node_id: originating_node_id.to_string(),
+            user_security_token: user_security_token.to_string(),
+        };
+        let inner_bytes = inner.encode_to_vec();
+        let envelope = self.wrap_in_envelope(&inner_bytes).await?;
+
+        let resp = self
+            .client_mut()?
+            .forward_execution(tonic::Request::new(ForwardExecutionRequest {
+                envelope: Some(envelope),
+            }))
+            .await
+            .context("ForwardExecution RPC failed")?;
+
+        Ok(resp.into_inner())
     }
 
     // ── Private helpers ──────────────────────────────────────────────────

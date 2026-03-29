@@ -37,7 +37,12 @@ fn make_input_with_payload(intent: &str, payload: serde_json::Value) -> Executio
 }
 
 fn make_execution(max_iterations: u8) -> Execution {
-    Execution::new(AgentId::new(), make_input("test task"), max_iterations, "aegis-system-operator".to_string())
+    Execution::new(
+        AgentId::new(),
+        make_input("test task"),
+        max_iterations,
+        "aegis-system-operator".to_string(),
+    )
 }
 
 fn make_running_execution(max_iterations: u8) -> Execution {
@@ -99,7 +104,12 @@ fn new_execution_has_unique_id() {
 #[test]
 fn new_execution_stores_agent_id() {
     let agent_id = AgentId::new();
-    let exec = Execution::new(agent_id, make_input("task"), 5, "aegis-system-operator".to_string());
+    let exec = Execution::new(
+        agent_id,
+        make_input("task"),
+        5,
+        "aegis-system-operator".to_string(),
+    );
     assert_eq!(exec.agent_id, agent_id);
 }
 
@@ -830,7 +840,12 @@ fn execution_input_without_intent() {
 #[test]
 fn execution_info_from_completed_execution() {
     let agent_id = AgentId::new();
-    let mut exec = Execution::new(agent_id, make_input("task"), 5, "aegis-system-operator".to_string());
+    let mut exec = Execution::new(
+        agent_id,
+        make_input("task"),
+        5,
+        "aegis-system-operator".to_string(),
+    );
     exec.start();
     exec.complete();
 
