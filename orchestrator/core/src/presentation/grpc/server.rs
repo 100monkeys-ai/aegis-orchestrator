@@ -236,11 +236,19 @@ impl AegisRuntime for AegisRuntimeService {
         // Channel for streaming events
         let (tx, rx) = mpsc::channel(100);
 
-        // ADR-083: derive security context from authenticated identity
-        let security_context_name = identity
-            .as_ref()
-            .map(|id| id.to_security_context_name())
-            .unwrap_or_else(|| "aegis-system-operator".to_string());
+        // ADR-083: prefer explicit security_context_name from the request (e.g. when
+        // the Temporal worker calls back with the context propagated through the
+        // workflow input), falling back to the identity-derived context name.
+        let security_context_name = req
+            .security_context_name
+            .clone()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                identity
+                    .as_ref()
+                    .map(|id| id.to_security_context_name())
+                    .unwrap_or_else(|| "aegis-system-operator".to_string())
+            });
 
         // Clone for async task
         let execution_service = self.execution_service.clone();
@@ -1263,6 +1271,7 @@ mod tests {
                 workflow_execution_id: None,
                 security_policy: None,
                 tenant_id: String::new(),
+                security_context_name: Some("aegis-system-operator".to_string()),
             }))
             .await
             .expect("execute_agent should succeed");
@@ -1339,6 +1348,7 @@ mod tests {
                 workflow_execution_id: None,
                 security_policy: None,
                 tenant_id: String::new(),
+                security_context_name: Some("aegis-system-operator".to_string()),
             }))
             .await
             .expect("execute_agent should succeed");

@@ -29,6 +29,7 @@ pub trait WorkflowEnginePort: Send + Sync {
         execution_id: ExecutionId,
         input: HashMap<String, Value>,
         blackboard: Option<HashMap<String, Value>>,
+        security_context_name: Option<String>,
     ) -> anyhow::Result<String>;
 }
 

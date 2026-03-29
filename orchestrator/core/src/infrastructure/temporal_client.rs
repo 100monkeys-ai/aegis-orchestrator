@@ -126,6 +126,7 @@ impl TemporalClient {
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
+        security_context_name: Option<String>,
     ) -> Result<String> {
         let execution_workflow_id = execution_id.0.to_string();
 
@@ -138,6 +139,7 @@ impl TemporalClient {
             "workflow_id": workflow_id,
             "input": input,
             "blackboard": blackboard,
+            "security_context_name": security_context_name,
         });
 
         // Serialize to JSON payload
@@ -330,7 +332,8 @@ impl WorkflowEnginePort for TemporalClient {
         execution_id: ExecutionId,
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
+        security_context_name: Option<String>,
     ) -> Result<String> {
-        TemporalClient::start_workflow(self, workflow_id, execution_id, input, blackboard).await
+        TemporalClient::start_workflow(self, workflow_id, execution_id, input, blackboard, security_context_name).await
     }
 }

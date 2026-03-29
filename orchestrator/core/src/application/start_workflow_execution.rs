@@ -322,6 +322,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                     }
                 },
                 normalized_blackboard,
+                request.security_context_name.clone(),
             )
             .await
             .context("Failed to start workflow execution in Temporal")?;
@@ -429,6 +430,7 @@ mod tests {
             execution_id: ExecutionId,
             input: HashMap<String, serde_json::Value>,
             blackboard: Option<HashMap<String, serde_json::Value>>,
+            _security_context_name: Option<String>,
         ) -> Result<String> {
             self.calls.lock().unwrap().push(StartCall {
                 workflow_id: workflow_id.to_string(),

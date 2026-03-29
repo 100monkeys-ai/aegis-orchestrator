@@ -432,6 +432,7 @@ spec:
             _execution_id: crate::domain::execution::ExecutionId,
             _input: std::collections::HashMap<String, serde_json::Value>,
             _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
+            _security_context_name: Option<String>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }
@@ -451,6 +452,7 @@ spec:
             _execution_id: crate::domain::execution::ExecutionId,
             _input: std::collections::HashMap<String, serde_json::Value>,
             _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
+            _security_context_name: Option<String>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }
