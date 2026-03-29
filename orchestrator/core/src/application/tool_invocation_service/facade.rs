@@ -153,7 +153,40 @@ impl ToolInvocationService {
         ToolInputContract::validate(&tool_name, &args)
             .map_err(SmcpSessionError::InvalidArguments)?;
 
-        // 3. Route tool call to the appropriate TCP server.
+        // 3. Try builtin tools first (aegis.schema.*, aegis.agent.*, aegis.workflow.*, etc.)
+        // These are handled directly by the orchestrator without routing to an external MCP server.
+        match crate::application::tools::try_invoke_builtin(
+            &tool_name,
+            &args,
+            session.execution_id,
+            &self.fsal,
+            &self.volume_registry,
+            &self.web_tool_port,
+            &self.schema_registry,
+        )
+        .await
+        {
+            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => {
+                tracing::info!("SMCP builtin tool executed: {}", tool_name);
+                return match result {
+                    ToolInvocationResult::Direct(value) => Ok(value),
+                    ToolInvocationResult::DispatchRequired(action) => Ok(
+                        serde_json::json!({"status": "dispatch_required", "action": format!("{:?}", action)}),
+                    ),
+                };
+            }
+            Ok(crate::application::tools::BuiltinToolResult::NotBuiltin) => {
+                // Fall through to ToolRouter for MCP server-hosted tools
+            }
+            Err(e) => {
+                return Err(SmcpSessionError::InternalError(format!(
+                    "Builtin tool '{}' failed: {}",
+                    tool_name, e
+                )));
+            }
+        }
+
+        // 4. Route tool call to the appropriate TCP server.
         // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
         let server_id = self
             .tool_router
@@ -165,19 +198,14 @@ impl ToolInvocationService {
             SmcpSessionError::MalformedPayload("Server vanished after routing".to_string()),
         )?;
 
-        // 4. Execute based on ExecutionMode (Gateway Retrofit)
+        // 5. Execute based on ExecutionMode (Gateway Retrofit)
         match server.execution_mode {
             crate::domain::mcp::ExecutionMode::Local => {
-                // FSAL Execution
-                // In a production implementation, we'd look up the agent's volume path via the Storage manager
-                // and directly manipulate files using the runtime-agnostic FSAL.
                 tracing::info!(
                     "Executing local tool via FSAL: {} for agent {:?}",
                     tool_name,
                     agent_id
                 );
-
-                // FSAL execution wiring can be expanded with concrete file operations.
 
                 Ok(serde_json::json!({
                     "status": "success",
@@ -187,9 +215,6 @@ impl ToolInvocationService {
                 }))
             }
             crate::domain::mcp::ExecutionMode::Remote => {
-                // SMCP to JSONRPC Proxy
-                // We've unwrapped the SMCP envelope, now we build a JSON-RPC 2.0 request
-                // and dispatch it to the ToolServer's raw stdio or HTTP interfaces.
                 let _json_rpc_payload = serde_json::json!({
                     "jsonrpc": "2.0",
                     "method": tool_name,
@@ -203,7 +228,6 @@ impl ToolInvocationService {
                     server_id
                 );
 
-                // JSON-RPC transport wiring can be expanded with concrete stdio/http IPC.
                 Ok(serde_json::json!({
                     "status": "success",
                     "execution_mode": "remote_jsonrpc",
