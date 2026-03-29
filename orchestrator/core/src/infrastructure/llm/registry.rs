@@ -524,6 +524,7 @@ mod tests {
                 smcp_gateway: None,
                 image_tag: None,
                 agent_skills: None,
+                deploy_builtins: false,
                 max_execution_list_limit: None,
             },
         };
