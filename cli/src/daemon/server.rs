@@ -2504,7 +2504,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         inner_loop_service: inner_loop_service.clone(),
         human_input_service: human_input_service.clone(),
         temporal_event_listener,
-        register_workflow_use_case,
+        register_workflow_use_case: register_workflow_use_case.clone(),
         start_workflow_execution_use_case,
         workflow_repo: workflow_repo.clone(),
         workflow_execution_repo: workflow_execution_repo.clone(),
@@ -2930,6 +2930,89 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 }
             }
         }
+    }
+
+    // --- Deploy vendored built-in agents and workflows ---
+    if config.spec.deploy_builtins {
+        use crate::commands::builtins;
+
+        let builtin_templates: &[(&str, &str)] = &[
+            ("hello-world-agent", builtins::HELLO_WORLD_TEMPLATE),
+            ("code-quality-judge", builtins::CODE_QUALITY_JUDGE_TEMPLATE),
+            (
+                "tool-call-policy-judge",
+                builtins::TOOL_CALL_POLICY_JUDGE_TEMPLATE,
+            ),
+            (
+                builtins::WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
+                builtins::WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+            ),
+            (
+                builtins::AGENT_GENERATOR_AGENT_NAME,
+                builtins::AGENT_GENERATOR_AGENT_TEMPLATE,
+            ),
+            (
+                builtins::AGENT_GENERATOR_JUDGE_NAME,
+                builtins::AGENT_GENERATOR_JUDGE_TEMPLATE,
+            ),
+            (
+                builtins::WORKFLOW_GENERATOR_JUDGE_NAME,
+                builtins::WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+            ),
+            (
+                builtins::WORKFLOW_CREATOR_AGENT_NAME,
+                builtins::WORKFLOW_CREATOR_AGENT_TEMPLATE,
+            ),
+        ];
+
+        for (name, yaml) in builtin_templates {
+            match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
+                Ok(manifest) => {
+                    if agent_service
+                        .lookup_agent(&manifest.metadata.name)
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        info!("Built-in agent '{}' already registered, skipping", name);
+                    } else {
+                        match agent_service.deploy_agent(manifest, false).await {
+                            Ok(id) => info!("Deployed built-in agent '{}' (id: {})", name, id),
+                            Err(e) => warn!("Failed to deploy built-in agent '{}': {}", name, e),
+                        }
+                    }
+                }
+                Err(e) => warn!("Failed to parse built-in agent template '{}': {}", name, e),
+            }
+        }
+
+        // Deploy built-in workflow
+        let wf_name = builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME;
+        if workflow_repo
+            .find_by_name(wf_name)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            info!(
+                "Built-in workflow '{}' already registered, skipping",
+                wf_name
+            );
+        } else {
+            match register_workflow_use_case
+                .register_workflow(builtins::WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE, false)
+                .await
+            {
+                Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
+                Err(e) => warn!("Failed to deploy built-in workflow '{}': {}", wf_name, e),
+            }
+        }
+
+        info!("Built-in template deployment complete");
+    } else {
+        info!("Built-in template deployment disabled (spec.deploy_builtins = false)");
     }
 
     let addr = format!("{bind_addr}:{final_port}");

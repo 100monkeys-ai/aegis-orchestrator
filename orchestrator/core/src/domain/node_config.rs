@@ -182,6 +182,12 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_skills: Option<AgentSkillsConfig>,
 
+    /// Whether to deploy vendored built-in agent and workflow templates on startup.
+    /// Includes agent-creator-agent, workflow-generator-planner-agent, judge agents, etc.
+    /// Default: false (disabled). Enable in deployment configs that need agent/workflow generation.
+    #[serde(default)]
+    pub deploy_builtins: bool,
+
     /// Maximum number of executions returned by a single `list_executions` request.
     /// Protects against excessive memory usage. Defaults to 1000 if not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1488,6 +1494,7 @@ impl Default for NodeConfigSpec {
             smcp_gateway: None,
             image_tag: None,
             agent_skills: None,
+            deploy_builtins: false,
             max_execution_list_limit: None,
         }
     }

@@ -308,6 +308,16 @@ spec:
         region: "us-east-1"
 
   # --------------------------------------------------------------------------
+  # Deploy Built-In Templates (Optional)
+  # --------------------------------------------------------------------------
+  # Deploy vendored built-in agent and workflow templates on startup.
+  # Includes agent-creator-agent, workflow-generator-planner-agent, judge agents,
+  # and the builtin-workflow-generator workflow.
+  # Required for aegis.agent.generate and aegis.workflow.generate to function.
+  # Default: false
+  # deploy_builtins: false
+
+  # --------------------------------------------------------------------------
   # MCP Tool Servers (Optional)
   # --------------------------------------------------------------------------
   # mcp_servers:

@@ -78,6 +78,10 @@ spec:
     # tracing:
     #   enabled: false
 
+  # Deploy vendored built-in agent and workflow templates on startup.
+  # Required for aegis.agent.generate and aegis.workflow.generate to function.
+  # deploy_builtins: false
+
   # storage:
   #   backend: "local_host"  # Local filesystem (default) or "seaweedfs" for distributed storage
   #   # For SeaweedFS configuration, see config-with-examples.yaml
