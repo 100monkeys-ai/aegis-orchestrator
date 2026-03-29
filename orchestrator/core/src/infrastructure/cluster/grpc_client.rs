@@ -224,6 +224,7 @@ impl NodeClusterClient {
     /// Returns a stream of `ExecutionEvent` protobuf messages from the worker.
     /// The stream closes when the execution reaches a terminal state
     /// (`ExecutionCompleted` or `ExecutionFailed`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn forward_execution(
         &mut self,
         execution_id: ExecutionId,

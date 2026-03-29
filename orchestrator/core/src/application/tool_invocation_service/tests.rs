@@ -1242,12 +1242,31 @@ async fn workflow_run_tool_forwards_blackboard() {
     )
     .with_workflow_execution(start_use_case.clone());
 
+    let operator_context = SecurityContext {
+        name: "aegis-system-operator".to_string(),
+        description: "Operator".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "*".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
     let result = service
         .invoke_aegis_workflow_run_tool(&serde_json::json!({
             "name": "run-me",
             "input": { "job": "demo" },
             "blackboard": { "priority": "high" },
-        }))
+        }), &operator_context)
         .await
         .expect("workflow run should return a result");
 
@@ -1915,16 +1934,29 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         },
     };
 
-    let session_token = make_fake_token(agent_id);
-    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
-    repo.save(session).await.unwrap();
+    // ADR-083: invoke_tool_internal now reads security context from the Execution record,
+    // not from the SMCP session. Seed the security_context_repo and provide an execution
+    // with the matching security_context_name.
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    security_context_repo.save(context.clone()).await.unwrap();
+
+    let execution = Execution::new_with_id(
+        exec_id,
+        agent_id,
+        ExecutionInput {
+            intent: None,
+            payload: serde_json::json!({}),
+        },
+        5,
+        "zaru-free".to_string(),
+    );
+    let exec_service = LogsTestExecutionService { execution };
 
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
     let middleware = Arc::new(SmcpMiddleware::new());
-    let security_context_repo =
-        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
@@ -1934,7 +1966,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         fsal,
         volume_registry,
         Arc::new(FilteringAgentLifecycleService { agent }),
-        Arc::new(TestExecutionService),
+        Arc::new(exec_service),
         Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
@@ -2333,12 +2365,31 @@ async fn workflow_run_with_version_passes_version_through() {
     )
     .with_workflow_execution(start_use_case.clone());
 
+    let operator_context = SecurityContext {
+        name: "aegis-system-operator".to_string(),
+        description: "Operator".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "*".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
     let result = service
         .invoke_aegis_workflow_run_tool(&serde_json::json!({
             "name": "my-workflow",
             "version": "3.1.0",
             "input": { "task": "demo" },
-        }))
+        }), &operator_context)
         .await
         .expect("workflow run should return a result");
 
