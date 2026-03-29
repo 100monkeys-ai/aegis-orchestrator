@@ -910,6 +910,27 @@ async fn smcp_tool_invoke(
                         .insert(axum::http::header::RETRY_AFTER, val);
                 }
             }
+            if let SmcpSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+                limit,
+                current,
+                retry_after_seconds,
+                ..
+            }) = &e
+            {
+                let headers = response.headers_mut();
+                if let Ok(v) = axum::http::HeaderValue::from_str(&limit.to_string()) {
+                    headers.insert("X-RateLimit-Limit", v);
+                }
+                if let Ok(v) =
+                    axum::http::HeaderValue::from_str(&limit.saturating_sub(*current).to_string())
+                {
+                    headers.insert("X-RateLimit-Remaining", v);
+                }
+                let reset = chrono::Utc::now().timestamp() as u64 + retry_after_seconds;
+                if let Ok(v) = axum::http::HeaderValue::from_str(&reset.to_string()) {
+                    headers.insert("X-RateLimit-Reset", v);
+                }
+            }
             response
         }
     }

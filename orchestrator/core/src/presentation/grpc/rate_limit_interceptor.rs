@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use tonic::metadata::MetadataMap;
 use tonic::Status;
 use tracing::warn;
 
@@ -132,9 +133,26 @@ pub async fn check_rate_limit(
             "gRPC request rate limited"
         );
 
-        return Err(Status::resource_exhausted(format!(
-            "Rate limit exceeded ({bucket} window). Retry after {retry_after}s."
-        )));
+        let message = format!("Rate limit exceeded ({bucket} window). Retry after {retry_after}s.");
+        let mut metadata = MetadataMap::new();
+        if let Ok(v) = (retry_after * 1000).to_string().parse() {
+            metadata.insert("retry-after-ms", v);
+        }
+        if let Some(ref exhausted) = decision.exhausted_bucket {
+            if let Some(window) = policy.windows.get(exhausted) {
+                if let Ok(v) = window.limit.to_string().parse() {
+                    metadata.insert("x-ratelimit-limit", v);
+                }
+            }
+        }
+        if let Ok(v) = "0".parse() {
+            metadata.insert("x-ratelimit-remaining", v);
+        }
+        return Err(Status::with_metadata(
+            tonic::Code::ResourceExhausted,
+            message,
+            metadata,
+        ));
     }
 
     Ok(decision)
