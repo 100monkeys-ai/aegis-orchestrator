@@ -294,7 +294,7 @@ impl AegisRuntime for AegisRuntimeService {
                     .await
             } else {
                 execution_service
-                    .start_execution(agent_id, input, security_context_name)
+                    .start_execution(agent_id, input, security_context_name, identity.as_ref())
                     .await
             };
 
@@ -1126,6 +1126,7 @@ mod tests {
             _agent_id: AgentId,
             _input: ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             Ok(self.execution_id)
         }
@@ -1136,6 +1137,7 @@ mod tests {
             _agent_id: AgentId,
             _input: ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             Ok(execution_id)
         }

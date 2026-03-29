@@ -299,6 +299,7 @@ impl ExecutionService for TestExecutionService {
         _: AgentId,
         _: ExecutionInput,
         _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ExecutionId> {
         anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
     }
@@ -308,6 +309,7 @@ impl ExecutionService for TestExecutionService {
         _: AgentId,
         _: ExecutionInput,
         _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ExecutionId> {
         Ok(execution_id)
     }
@@ -375,6 +377,7 @@ impl ExecutionService for LogsTestExecutionService {
         _: AgentId,
         _: ExecutionInput,
         _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ExecutionId> {
         anyhow::bail!("LogsTestExecutionService::start_execution not exercised in this test")
     }
@@ -385,6 +388,7 @@ impl ExecutionService for LogsTestExecutionService {
         _: AgentId,
         _: ExecutionInput,
         _: String,
+        _: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ExecutionId> {
         Ok(execution_id)
     }
@@ -590,6 +594,7 @@ impl StartWorkflowExecutionUseCase for TestStartWorkflowExecutionUseCase {
         &self,
         tenant_id: &TenantId,
         mut request: crate::application::start_workflow_execution::StartWorkflowExecutionRequest,
+        _identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<crate::application::start_workflow_execution::StartedWorkflowExecution> {
         request.tenant_id = Some(tenant_id.clone());
         *self.last_request.lock().await = Some(request.clone());

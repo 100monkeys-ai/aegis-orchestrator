@@ -39,6 +39,7 @@ impl ExecutionService for MockExecutionService {
         _agent_id: AgentId,
         _input: ExecutionInput,
         _security_context_name: String,
+        _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
     ) -> anyhow::Result<ExecutionId> {
         Ok(ExecutionId::new())
     }
@@ -48,6 +49,7 @@ impl ExecutionService for MockExecutionService {
         _agent_id: AgentId,
         _input: ExecutionInput,
         _security_context_name: String,
+        _identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
     ) -> anyhow::Result<ExecutionId> {
         Ok(execution_id)
     }

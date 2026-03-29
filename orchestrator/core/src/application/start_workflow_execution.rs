@@ -19,6 +19,7 @@
 
 use crate::application::ports::WorkflowEnginePort;
 use crate::domain::execution::ExecutionId;
+use crate::domain::iam::UserIdentity;
 use crate::domain::repository::{WorkflowExecutionRepository, WorkflowRepository};
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::{WorkflowExecution, WorkflowId};
@@ -77,6 +78,7 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
         &self,
         tenant_id: &TenantId,
         request: StartWorkflowExecutionRequest,
+        identity: Option<&UserIdentity>,
     ) -> Result<StartedWorkflowExecution>;
 
     /// Start a workflow execution
@@ -102,7 +104,8 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
             .tenant_id
             .clone()
             .unwrap_or_else(TenantId::local_default);
-        self.start_execution_for_tenant(&tenant_id, request).await
+        self.start_execution_for_tenant(&tenant_id, request, None)
+            .await
     }
 }
 
@@ -184,6 +187,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         &self,
         tenant_id: &TenantId,
         request: StartWorkflowExecutionRequest,
+        identity: Option<&UserIdentity>,
     ) -> Result<StartedWorkflowExecution> {
         let normalized_blackboard = Self::normalize_blackboard(request.blackboard.clone())?;
 
@@ -246,6 +250,53 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                         error = %e,
                         "Rate limit policy resolution failed (allowing workflow execution)"
                     );
+                }
+            }
+
+            // ADR-072: dual-scope — enforce user-scoped rate limit when identity is available
+            if let Some(id) = identity {
+                let user_scope = RateLimitScope::User {
+                    user_id: id.sub.clone(),
+                };
+                let resource_type = RateLimitResourceType::WorkflowExecution;
+
+                match resolver.resolve_policy(id, tenant_id, &resource_type).await {
+                    Ok(policy) => {
+                        match enforcer.check_and_increment(&user_scope, &policy, 1).await {
+                            Ok(decision) if !decision.allowed => {
+                                let retry_hint = decision
+                                    .retry_after_seconds
+                                    .map(|s| format!(", retry after {s}s"))
+                                    .unwrap_or_default();
+                                tracing::warn!(
+                                    user_id = %id.sub,
+                                    tenant_id = %tenant_id.as_str(),
+                                    workflow_id = %request.workflow_id,
+                                    bucket = ?decision.exhausted_bucket,
+                                    "User-scoped rate limit exceeded for WorkflowExecution"
+                                );
+                                anyhow::bail!(
+                                    "Rate limit exceeded for workflow execution (user: {}){retry_hint}",
+                                    id.sub
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user_id = %id.sub,
+                                    error = %e,
+                                    "User-scoped rate limit enforcement error (allowing workflow execution)"
+                                );
+                            }
+                            Ok(_) => {} // allowed
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %id.sub,
+                            error = %e,
+                            "User-scoped rate limit policy resolution failed (allowing workflow execution)"
+                        );
+                    }
                 }
             }
         }

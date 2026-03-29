@@ -325,7 +325,7 @@ impl StandardStimulusService {
         // ADR-083: operator context for system-initiated RouterAgent classification
         let exec_id = self
             .execution_service
-            .start_execution(agent_id, input, "aegis-system-operator".to_string())
+            .start_execution(agent_id, input, "aegis-system-operator".to_string(), None)
             .await
             .map_err(|e| StimulusError::RouterAgentFailed(e.to_string()))?;
 
@@ -626,6 +626,7 @@ mod tests {
             agent_id: AgentId,
             input: ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             self.start_calls.lock().unwrap().push((agent_id, input));
             Ok(self.exec_id)
@@ -637,6 +638,7 @@ mod tests {
             agent_id: AgentId,
             input: ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             self.start_calls.lock().unwrap().push((agent_id, input));
             Ok(execution_id)
@@ -741,6 +743,7 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
             request: StartWorkflowExecutionRequest,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<StartedWorkflowExecution> {
             self.calls.lock().unwrap().push(request.clone());
             Ok(StartedWorkflowExecution {

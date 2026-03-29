@@ -3175,12 +3175,15 @@ async fn execute_temporal_workflow_handler(
     identity: Option<Extension<UserIdentity>>,
     Json(mut request): Json<StartWorkflowExecutionRequest>,
 ) -> impl IntoResponse {
-    request.tenant_id.get_or_insert_with(|| {
-        tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0))
-    });
+    let tenant_id = request
+        .tenant_id
+        .get_or_insert_with(|| {
+            tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0))
+        })
+        .clone();
     match state
         .start_workflow_execution_use_case
-        .start_execution(request)
+        .start_execution_for_tenant(&tenant_id, request, identity.as_ref().map(|ext| &ext.0))
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
@@ -3997,7 +4000,12 @@ async fn execute_agent_handler(
 
     match state
         .execution_service
-        .start_execution(AgentId(agent_id), input, security_context_name)
+        .start_execution(
+            AgentId(agent_id),
+            input,
+            security_context_name,
+            identity.as_ref().map(|ext| &ext.0),
+        )
         .await
     {
         Ok(id) => (

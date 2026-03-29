@@ -174,6 +174,7 @@ impl ToolInvocationService {
                     payload: serde_json::Value::String(input.to_string()),
                 },
                 security_context.name.clone(),
+                None,
             )
             .await
         {

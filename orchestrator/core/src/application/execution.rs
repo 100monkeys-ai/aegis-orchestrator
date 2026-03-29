@@ -49,6 +49,7 @@ use crate::domain::execution::{
     Execution, ExecutionError, ExecutionId, ExecutionInput, ExecutionStatus, Iteration,
 };
 use crate::domain::fsal::FsalAccessPolicy;
+use crate::domain::iam::UserIdentity;
 use crate::domain::node_config::resolve_env_value;
 use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::RuntimeError;
@@ -95,6 +96,7 @@ pub trait ExecutionService: Send + Sync {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId>;
 
     /// Start an execution with a pre-assigned ID (used for cluster forwarding).
@@ -105,6 +107,7 @@ pub trait ExecutionService: Send + Sync {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId>;
 
     /// Start a new child execution spawned by a parent (e.g., a judge agent).
@@ -1458,6 +1461,7 @@ impl StandardExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
 
@@ -1520,6 +1524,56 @@ impl StandardExecutionService {
                         error = %e,
                         "Rate limit policy resolution failed (allowing execution)"
                     );
+                }
+            }
+
+            // ADR-072: dual-scope — enforce user-scoped rate limit when identity is available
+            if let Some(id) = identity {
+                let user_scope = RateLimitScope::User {
+                    user_id: id.sub.clone(),
+                };
+                let resource_type = RateLimitResourceType::AgentExecution;
+
+                match resolver
+                    .resolve_policy(id, &tenant_id, &resource_type)
+                    .await
+                {
+                    Ok(policy) => {
+                        match enforcer.check_and_increment(&user_scope, &policy, 1).await {
+                            Ok(decision) if !decision.allowed => {
+                                let retry_hint = decision
+                                    .retry_after_seconds
+                                    .map(|s| format!(", retry after {s}s"))
+                                    .unwrap_or_default();
+                                tracing::warn!(
+                                    user_id = %id.sub,
+                                    tenant_id = %tenant_id.as_str(),
+                                    agent_id = %agent_id,
+                                    bucket = ?decision.exhausted_bucket,
+                                    "User-scoped rate limit exceeded for AgentExecution"
+                                );
+                                anyhow::bail!(
+                                    "Rate limit exceeded for agent execution (user: {}){retry_hint}",
+                                    id.sub
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    user_id = %id.sub,
+                                    error = %e,
+                                    "User-scoped rate limit enforcement error (allowing execution)"
+                                );
+                            }
+                            Ok(_) => {} // allowed
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            user_id = %id.sub,
+                            error = %e,
+                            "User-scoped rate limit policy resolution failed (allowing execution)"
+                        );
+                    }
                 }
             }
         }
@@ -2073,8 +2127,9 @@ impl ExecutionService for StandardExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
-        self.do_start_execution(None, agent_id, input, security_context_name)
+        self.do_start_execution(None, agent_id, input, security_context_name, identity)
             .await
     }
 
@@ -2084,9 +2139,16 @@ impl ExecutionService for StandardExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
-        self.do_start_execution(Some(execution_id), agent_id, input, security_context_name)
-            .await
+        self.do_start_execution(
+            Some(execution_id),
+            agent_id,
+            input,
+            security_context_name,
+            identity,
+        )
+        .await
     }
 
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {

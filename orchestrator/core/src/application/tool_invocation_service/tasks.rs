@@ -67,6 +67,7 @@ impl ToolInvocationService {
                     payload: input,
                 },
                 security_context.name.clone(),
+                None,
             )
             .await
         {

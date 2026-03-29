@@ -47,6 +47,7 @@ impl ForwardExecutionUseCase {
                 req.agent_id,
                 input,
                 req.security_context_name,
+                None,
             )
             .await?;
 

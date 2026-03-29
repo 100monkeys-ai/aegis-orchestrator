@@ -230,6 +230,7 @@ mod tests {
             _agent_id: AgentId,
             _input: crate::domain::execution::ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }
@@ -240,6 +241,7 @@ mod tests {
             _agent_id: AgentId,
             _input: crate::domain::execution::ExecutionInput,
             _security_context_name: String,
+            _identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<ExecutionId> {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }

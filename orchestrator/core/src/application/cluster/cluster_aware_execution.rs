@@ -22,6 +22,7 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{
     Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction, TrajectoryStep,
 };
+use crate::domain::iam::UserIdentity;
 use crate::domain::node_config::NodeRole;
 use crate::domain::volume::TenantId;
 use crate::infrastructure::cluster::NodeClusterClient;
@@ -160,6 +161,7 @@ impl ExecutionService for ClusterAwareExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
         if self.should_route() {
             // Pre-generate an execution ID so it's consistent across routing
@@ -192,6 +194,7 @@ impl ExecutionService for ClusterAwareExecutionService {
                             agent_id,
                             input,
                             security_context_name,
+                            identity,
                         )
                         .await;
                 }
@@ -199,7 +202,7 @@ impl ExecutionService for ClusterAwareExecutionService {
         }
 
         self.inner
-            .start_execution(agent_id, input, security_context_name)
+            .start_execution(agent_id, input, security_context_name, identity)
             .await
     }
 
@@ -209,6 +212,7 @@ impl ExecutionService for ClusterAwareExecutionService {
         agent_id: AgentId,
         input: ExecutionInput,
         security_context_name: String,
+        identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
         if self.should_route() {
             let tenant_id = TenantId::default();
@@ -235,7 +239,13 @@ impl ExecutionService for ClusterAwareExecutionService {
         }
 
         self.inner
-            .start_execution_with_id(execution_id, agent_id, input, security_context_name)
+            .start_execution_with_id(
+                execution_id,
+                agent_id,
+                input,
+                security_context_name,
+                identity,
+            )
             .await
     }
 
