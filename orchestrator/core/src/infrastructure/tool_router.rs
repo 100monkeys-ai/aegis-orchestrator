@@ -820,7 +820,13 @@ impl ToolRouter {
                             },
                             "input": {
                                 "type": "object",
-                                "description": "Input data for the task."
+                                "description": "Task instructions and data for the agent. Pass the user's request as { \"prompt\": \"<the full task description>\" }. Always include this field with the user's intent.",
+                                "properties": {
+                                    "prompt": {
+                                        "type": "string",
+                                        "description": "The full task instructions or user request to pass to the agent."
+                                    }
+                                }
                             },
                             "version": {
                                 "type": "string",
