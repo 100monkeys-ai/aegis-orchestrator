@@ -49,6 +49,7 @@ impl ToolInvocationService {
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
+            tool_catalog: None,
         }
     }
 
@@ -116,13 +117,20 @@ impl ToolInvocationService {
         self
     }
 
+    /// Attach a `StandardToolCatalog` to enable `aegis.tools.list` and `aegis.tools.search`.
+    pub fn with_tool_catalog(mut self, catalog: Arc<StandardToolCatalog>) -> Self {
+        self.tool_catalog = Some(catalog);
+        self
+    }
+
+    /// SMCP envelope-based tool invocation (Path 1).
+    /// Verifies the SMCP envelope, validates tool input contracts, then delegates
+    /// to `dispatch_tool_core` for unified tool dispatch.
     pub async fn invoke_tool(
         &self,
         envelope: &(impl EnvelopeVerifier + Send + Sync),
     ) -> Result<Value, SmcpSessionError> {
         // 1. Look up the active session by the opaque security_token string.
-        //    This avoids relying on unverified JWT payload content to route the request;
-        //    the agent_id and other claims are read from the already-loaded session record.
         let mut session = self
             .smcp_session_repo
             .find_active_by_security_token(envelope.security_token())
@@ -135,6 +143,7 @@ impl ToolInvocationService {
             ))?;
 
         let agent_id = session.agent_id;
+        let execution_id = session.execution_id;
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
@@ -148,100 +157,38 @@ impl ToolInvocationService {
             ))?;
 
         // 2b. Validate required arguments against the tool's input contract (ADR-055).
-        // Domain knowledge lives in ToolInputContract (domain/mcp.rs); this layer
-        // only maps the domain error string to the appropriate SmcpSessionError variant.
         ToolInputContract::validate(&tool_name, &args)
             .map_err(SmcpSessionError::InvalidArguments)?;
 
-        // 3. Try builtin tools first (aegis.schema.*, aegis.agent.*, aegis.workflow.*, etc.)
-        // These are handled directly by the orchestrator without routing to an external MCP server.
-        match crate::application::tools::try_invoke_builtin(
-            &tool_name,
-            &args,
-            session.execution_id,
-            &self.fsal,
-            &self.volume_registry,
-            &self.web_tool_port,
-            &self.schema_registry,
-        )
-        .await
-        {
-            Ok(crate::application::tools::BuiltinToolResult::Handled(result)) => {
-                tracing::info!("SMCP builtin tool executed: {}", tool_name);
-                return match result {
-                    ToolInvocationResult::Direct(value) => Ok(value),
-                    ToolInvocationResult::DispatchRequired(action) => Ok(
-                        serde_json::json!({"status": "dispatch_required", "action": format!("{:?}", action)}),
-                    ),
-                };
-            }
-            Ok(crate::application::tools::BuiltinToolResult::NotBuiltin) => {
-                // Fall through to ToolRouter for MCP server-hosted tools
-            }
-            Err(e) => {
-                return Err(SmcpSessionError::InternalError(format!(
-                    "Builtin tool '{}' failed: {}",
-                    tool_name, e
-                )));
-            }
-        }
+        // 3. Get security context from the session.
+        let security_context = session.security_context;
 
-        // 4. Route tool call to the appropriate TCP server.
-        // ToolRouter resolves a ToolServerId; invocation execution happens after routing.
-        let server_id = self
-            .tool_router
-            .route_tool(session.execution_id, &tool_name)
-            .await
-            .map_err(|e| SmcpSessionError::MalformedPayload(format!("Routing error: {e}")))?;
+        // 4. Delegate to unified dispatch core (iteration_number=0, empty audit history for SMCP path).
+        let result = self
+            .dispatch_tool_core(
+                &agent_id,
+                execution_id,
+                &security_context,
+                tool_name,
+                args,
+                0,
+                Vec::new(),
+            )
+            .await?;
 
-        let server = self.tool_router.get_server(server_id).await.ok_or(
-            SmcpSessionError::MalformedPayload("Server vanished after routing".to_string()),
-        )?;
-
-        // 5. Execute based on ExecutionMode (Gateway Retrofit)
-        match server.execution_mode {
-            crate::domain::mcp::ExecutionMode::Local => {
-                tracing::info!(
-                    "Executing local tool via FSAL: {} for agent {:?}",
-                    tool_name,
-                    agent_id
-                );
-
-                Ok(serde_json::json!({
-                    "status": "success",
-                    "execution_mode": "local_fsal",
-                    "message": format!("Locally executed {} affecting agent volume", tool_name),
-                    "args_executed": args
-                }))
-            }
-            crate::domain::mcp::ExecutionMode::Remote => {
-                let _json_rpc_payload = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "method": tool_name,
-                    "params": args,
-                    "id": session.execution_id.to_string()
-                });
-
-                tracing::info!(
-                    "Proxying remote tool via JSON-RPC: {} to server {:?}",
-                    tool_name,
-                    server_id
-                );
-
-                Ok(serde_json::json!({
-                    "status": "success",
-                    "execution_mode": "remote_jsonrpc",
-                    "message": format!("Proxied {} to external MCP server {:?}", tool_name, server_id),
-                    "args_proxied": args
-                }))
-            }
+        // 5. Map ToolInvocationResult to Value for SMCP return type.
+        match result {
+            ToolInvocationResult::Direct(value) => Ok(value),
+            ToolInvocationResult::DispatchRequired(action) => Ok(serde_json::json!({
+                "status": "dispatch_required",
+                "action": format!("{:?}", action)
+            })),
         }
     }
 
-    /// Internal orchestrator-driven tool invocation (Gateway pattern)
-    /// Performs SecurityContext validation against the agent's active session,
-    /// so that orchestrator-mediated calls (e.g. from generated LLM text)
-    /// enforce the same policies as direct agent SMCP calls.
+    /// Internal orchestrator-driven tool invocation (Gateway pattern).
+    /// Resolves the SecurityContext from the agent's active SMCP session or
+    /// the "default" fallback, then delegates to `dispatch_tool_core`.
     pub async fn invoke_tool_internal(
         &self,
         agent_id: &AgentId,
@@ -251,16 +198,6 @@ impl ToolInvocationService {
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
-        let invocation_id = ToolInvocationId::new();
-        let started_at = Instant::now();
-        self.publish_invocation_requested(
-            invocation_id,
-            execution_id,
-            *agent_id,
-            &tool_name,
-            &args,
-        );
-
         // 1. Determine the applicable SecurityContext.
         // If the agent is connected via SMCP (Path 1), it has an active session.
         // If the agent is running via Container Dispatch Protocol (Path 3), it does NOT
@@ -283,6 +220,49 @@ impl ToolInvocationService {
             }
         };
 
+        // 2. Delegate to unified dispatch core.
+        self.dispatch_tool_core(
+            agent_id,
+            execution_id,
+            &security_context,
+            tool_name,
+            args,
+            iteration_number,
+            tool_audit_history,
+        )
+        .await
+    }
+
+    /// Unified tool dispatch core shared by both SMCP (`invoke_tool`) and
+    /// container (`invoke_tool_internal`) paths. Contains ALL dispatch logic:
+    /// - ADR-073 operator-only param stripping
+    /// - SecurityContext policy enforcement
+    /// - Inner-loop semantic judge (ADR-049)
+    /// - aegis.* built-in tool dispatch
+    /// - try_invoke_builtin fallback (cmd.run, fs.*, web.*, aegis.schema.*)
+    /// - ToolRouter dynamic routing
+    /// - SMCP gateway fallback
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_tool_core(
+        &self,
+        agent_id: &AgentId,
+        execution_id: crate::domain::execution::ExecutionId,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tool_name: String,
+        args: Value,
+        iteration_number: u8,
+        tool_audit_history: Vec<TrajectoryStep>,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let invocation_id = ToolInvocationId::new();
+        let started_at = Instant::now();
+        self.publish_invocation_requested(
+            invocation_id,
+            execution_id,
+            *agent_id,
+            &tool_name,
+            &args,
+        );
+
         // ADR-073: Strip operator-only parameters for consumer tier contexts.
         // Consumer security contexts (zaru-*) must not pass `force` or `version`
         // through to tool handlers — those are operator-level overrides.
@@ -293,7 +273,7 @@ impl ToolInvocationService {
                     if map.remove(*key).is_some() {
                         tracing::info!(
                             param = *key,
-                            "Stripped operator-only parameter from consumer tier tool call (internal path)"
+                            "Stripped operator-only parameter from consumer tier tool call"
                         );
                     }
                 }
@@ -350,9 +330,6 @@ impl ToolInvocationService {
         }
 
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
-        // If the agent manifest specifies an inner-loop semantic validation step,
-        // execute it BEFORE the tool call is dispatched to external systems.
-        // This is a synchronous block that fails the tool call if the judge rejects it.
         let agent = self
             .agent_lifecycle
             .get_agent(*agent_id)
@@ -364,10 +341,6 @@ impl ToolInvocationService {
             })?;
 
         if let Some(exec_spec) = &agent.manifest.spec.execution {
-            // Check operator-level skip_judge flag before running the inner-loop semantic
-            // judge pipeline. When the node config marks a tool with `skip_judge: true`
-            // (e.g. read-only tools such as fs.read, fs.list), we bypass the judge entirely
-            // to reduce latency on low-risk operations (NODE_CONFIGURATION_SPEC_V1.md).
             let should_skip_judge = self.tool_router.is_skip_judge(&tool_name).await;
             if should_skip_judge {
                 tracing::debug!(
@@ -376,7 +349,6 @@ impl ToolInvocationService {
                 );
             } else if let Some(validation_pipeline) = &exec_spec.tool_validation {
                 for validator in validation_pipeline {
-                    // Check if this is an Inner-Loop Semantic Validator configuration
                     if let crate::domain::agent::ValidatorSpec::Semantic {
                         judge_agent,
                         criteria,
@@ -558,795 +530,45 @@ impl ToolInvocationService {
         }
         // --- End Pre-Execution Validation ---
 
-        // Built-in orchestrator authoring tools
-        if tool_name == "aegis.agent.create" {
-            let result = self.invoke_aegis_agent_create_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.update" {
-            let result = self.invoke_aegis_agent_update_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.delete" {
-            let result = self.invoke_aegis_agent_delete_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.generate" {
-            let result = self.invoke_aegis_agent_generate_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.delete" {
-            let result = self.invoke_aegis_workflow_delete_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.validate" {
-            let result = self.invoke_aegis_workflow_validate_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.run" {
-            let result = self.invoke_aegis_workflow_run_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.executions.list" {
-            let result = self.invoke_aegis_workflow_execution_list_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.executions.get" {
-            let result = self.invoke_aegis_workflow_execution_get_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.status" {
-            let result = self.invoke_aegis_workflow_status_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.generate" {
-            let result = self.invoke_aegis_workflow_generate_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.logs" {
-            let result = self.invoke_aegis_workflow_logs_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.cancel" {
-            let result = self.invoke_aegis_workflow_cancel_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.signal" {
-            let result = self.invoke_aegis_workflow_signal_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.remove" {
-            let result = self.invoke_aegis_workflow_remove_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.execute" {
-            let result = self.invoke_aegis_task_execute_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.status" {
-            let result = self.invoke_aegis_task_status_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.logs" {
-            let result = self.invoke_aegis_task_logs_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.list" {
-            let result = self.invoke_aegis_task_list_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.cancel" {
-            let result = self.invoke_aegis_task_cancel_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.task.remove" {
-            let result = self.invoke_aegis_task_remove_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.system.info" {
-            let result = self.invoke_aegis_system_info_tool().await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.system.config" {
-            let result = self.invoke_aegis_system_config_tool().await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.export" {
-            let result = self.invoke_aegis_agent_export_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.list" {
-            let result = self.invoke_aegis_agent_list_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.agent.logs" {
-            let result = self.invoke_aegis_agent_logs_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.list" {
-            let result = self.invoke_aegis_workflow_list_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.export" {
-            let result = self.invoke_aegis_workflow_export_tool(&args).await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.update" {
-            let result = self
-                .invoke_aegis_workflow_update_tool(&args, execution_id, *agent_id)
-                .await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
-            return result;
-        }
-        if tool_name == "aegis.workflow.create" {
-            let result = self
-                .invoke_aegis_workflow_create_tool(
-                    &args,
-                    execution_id,
-                    *agent_id,
-                    iteration_number,
-                    &tool_audit_history,
-                )
-                .await;
-            match &result {
-                Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    value,
-                    started_at,
-                ),
-                Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    &serde_json::json!({"status":"dispatch_required"}),
-                    started_at,
-                ),
-                Err(e) => self.publish_invocation_failed(
-                    invocation_id,
-                    execution_id,
-                    *agent_id,
-                    e.to_string(),
-                ),
-            }
+        // Helper closure to publish invocation events based on tool result.
+        let publish_result = |result: &Result<ToolInvocationResult, SmcpSessionError>| match result
+        {
+            Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
+                invocation_id,
+                execution_id,
+                *agent_id,
+                value,
+                started_at,
+            ),
+            Ok(ToolInvocationResult::DispatchRequired(_)) => self.publish_invocation_completed(
+                invocation_id,
+                execution_id,
+                *agent_id,
+                &serde_json::json!({"status":"dispatch_required"}),
+                started_at,
+            ),
+            Err(e) => self.publish_invocation_failed(
+                invocation_id,
+                execution_id,
+                *agent_id,
+                e.to_string(),
+            ),
+        };
+
+        // Built-in orchestrator aegis.* tool dispatch chain.
+        let aegis_result = self
+            .try_dispatch_aegis_tool(
+                &tool_name,
+                &args,
+                execution_id,
+                *agent_id,
+                iteration_number,
+                &tool_audit_history,
+                security_context,
+            )
+            .await;
+        if let Some(result) = aegis_result {
+            publish_result(&result);
             return result;
         }
 
@@ -1491,6 +713,75 @@ impl ToolInvocationService {
                 );
                 Ok(ToolInvocationResult::Direct(result))
             }
+        }
+    }
+
+    /// Attempt to dispatch an aegis.* tool by name. Returns `Some(result)` if
+    /// the tool name matched an aegis.* handler, `None` if it should fall through
+    /// to the builtin / ToolRouter / gateway chain.
+    #[allow(clippy::too_many_arguments)]
+    async fn try_dispatch_aegis_tool(
+        &self,
+        tool_name: &str,
+        args: &Value,
+        execution_id: crate::domain::execution::ExecutionId,
+        agent_id: AgentId,
+        iteration_number: u8,
+        tool_audit_history: &[TrajectoryStep],
+        security_context: &crate::domain::security_context::SecurityContext,
+    ) -> Option<Result<ToolInvocationResult, SmcpSessionError>> {
+        match tool_name {
+            "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
+            "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),
+            "aegis.agent.delete" => Some(self.invoke_aegis_agent_delete_tool(args).await),
+            "aegis.agent.generate" => Some(self.invoke_aegis_agent_generate_tool(args).await),
+            "aegis.agent.export" => Some(self.invoke_aegis_agent_export_tool(args).await),
+            "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args).await),
+            "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
+            "aegis.workflow.delete" => Some(self.invoke_aegis_workflow_delete_tool(args).await),
+            "aegis.workflow.validate" => Some(self.invoke_aegis_workflow_validate_tool(args).await),
+            "aegis.workflow.run" => Some(self.invoke_aegis_workflow_run_tool(args).await),
+            "aegis.workflow.executions.list" => {
+                Some(self.invoke_aegis_workflow_execution_list_tool(args).await)
+            }
+            "aegis.workflow.executions.get" => {
+                Some(self.invoke_aegis_workflow_execution_get_tool(args).await)
+            }
+            "aegis.workflow.status" => Some(self.invoke_aegis_workflow_status_tool(args).await),
+            "aegis.workflow.generate" => Some(self.invoke_aegis_workflow_generate_tool(args).await),
+            "aegis.workflow.logs" => Some(self.invoke_aegis_workflow_logs_tool(args).await),
+            "aegis.workflow.cancel" => Some(self.invoke_aegis_workflow_cancel_tool(args).await),
+            "aegis.workflow.signal" => Some(self.invoke_aegis_workflow_signal_tool(args).await),
+            "aegis.workflow.remove" => Some(self.invoke_aegis_workflow_remove_tool(args).await),
+            "aegis.workflow.list" => Some(self.invoke_aegis_workflow_list_tool(args).await),
+            "aegis.workflow.export" => Some(self.invoke_aegis_workflow_export_tool(args).await),
+            "aegis.workflow.update" => Some(
+                self.invoke_aegis_workflow_update_tool(args, execution_id, agent_id)
+                    .await,
+            ),
+            "aegis.workflow.create" => Some(
+                self.invoke_aegis_workflow_create_tool(
+                    args,
+                    execution_id,
+                    agent_id,
+                    iteration_number,
+                    tool_audit_history,
+                )
+                .await,
+            ),
+            "aegis.task.execute" => Some(self.invoke_aegis_task_execute_tool(args).await),
+            "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
+            "aegis.task.logs" => Some(self.invoke_aegis_task_logs_tool(args).await),
+            "aegis.task.list" => Some(self.invoke_aegis_task_list_tool(args).await),
+            "aegis.task.cancel" => Some(self.invoke_aegis_task_cancel_tool(args).await),
+            "aegis.task.remove" => Some(self.invoke_aegis_task_remove_tool(args).await),
+            "aegis.system.info" => Some(self.invoke_aegis_system_info_tool().await),
+            "aegis.system.config" => Some(self.invoke_aegis_system_config_tool().await),
+            "aegis.tools.list" => Some(self.invoke_aegis_tools_list(args, security_context).await),
+            "aegis.tools.search" => {
+                Some(self.invoke_aegis_tools_search(args, security_context).await)
+            }
+            _ => None,
         }
     }
 }

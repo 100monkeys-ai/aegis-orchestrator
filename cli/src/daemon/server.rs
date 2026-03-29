@@ -2091,6 +2091,44 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    // aegis.tools discovery tools
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.tools.list")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.tools.list".to_string(),
+                description: "List all MCP tools available to your security context with pagination and optional source/category filtering.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.tools.list".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.tools.search")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.tools.search".to_string(),
+                description: "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context.".to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.tools.search".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
     let tool_router = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
             tool_registry.clone(),
@@ -2375,6 +2413,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         tool_manager_clone.health_check_loop().await;
     });
 
+    let tool_catalog =
+        Arc::new(aegis_orchestrator_core::application::tool_catalog::StandardToolCatalog::new());
+
     let tool_invocation_service = Arc::new(
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             smcp_session_repo.clone(),
@@ -2408,9 +2449,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }))
         .with_agent_activity(Arc::new(DaemonAgentActivity {
             execution_repo: execution_repo.clone(),
-        })),
+        }))
+        .with_tool_catalog(tool_catalog.clone()),
     );
     info!(path = %generated_artifacts_root.display(), "Generated manifests will be written to configured path");
+
+    // Initial tool catalog population + periodic refresh loop
+    {
+        let tis = tool_invocation_service.clone();
+        let catalog = tool_catalog.clone();
+        if let Ok(tools) = tis.get_available_tools().await {
+            catalog.refresh_from(tools).await;
+            tracing::info!("Tool catalog populated with initial tool set");
+        }
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await; // skip immediate first tick (already populated above)
+            loop {
+                interval.tick().await;
+                if let Ok(tools) = tis.get_available_tools().await {
+                    catalog.refresh_from(tools).await;
+                    tracing::debug!("Tool catalog refreshed");
+                }
+            }
+        });
+    }
 
     let inner_loop_service = {
         let mut ils =

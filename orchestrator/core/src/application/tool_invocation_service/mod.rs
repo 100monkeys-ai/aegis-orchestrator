@@ -27,6 +27,7 @@ use crate::application::ports::{
 use crate::application::register_workflow::RegisterWorkflowUseCase;
 use crate::application::schema_registry::SchemaRegistry;
 use crate::application::start_workflow_execution::StartWorkflowExecutionUseCase;
+use crate::application::tool_catalog::StandardToolCatalog;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
 use crate::domain::dispatch::DispatchAction;
@@ -106,4 +107,6 @@ pub struct ToolInvocationService {
     workflow_execution_control: Option<Arc<dyn WorkflowExecutionControlPort>>,
     /// Optional port for agent-level activity logs.
     agent_activity: Option<Arc<dyn AgentActivityPort>>,
+    /// Optional tool catalog for aegis.tools.list / aegis.tools.search discovery.
+    tool_catalog: Option<Arc<StandardToolCatalog>>,
 }

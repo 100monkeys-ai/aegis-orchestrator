@@ -121,17 +121,11 @@ impl ToolInvocationService {
 
         let mut converted = Vec::new();
         for item in response.into_inner().tools {
-            let input_schema = if item.kind == "cli" {
-                serde_json::json!({
-                    "type":"object",
-                    "properties": {
-                        "subcommand": {"type":"string"},
-                        "args": {"type":"array","items":{"type":"string"}}
-                    },
-                    "required": ["subcommand"]
-                })
+            let input_schema = if !item.input_schema_json.is_empty() {
+                serde_json::from_str(&item.input_schema_json)
+                    .unwrap_or_else(|_| Self::dummy_input_schema(&item.kind))
             } else {
-                serde_json::json!({"type":"object"})
+                Self::dummy_input_schema(&item.kind)
             };
             converted.push(crate::infrastructure::tool_router::ToolMetadata {
                 name: item.name,
@@ -141,6 +135,21 @@ impl ToolInvocationService {
         }
 
         Ok(converted)
+    }
+
+    fn dummy_input_schema(kind: &str) -> serde_json::Value {
+        if kind == "cli" {
+            serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "subcommand": {"type":"string"},
+                    "args": {"type":"array","items":{"type":"string"}}
+                },
+                "required": ["subcommand"]
+            })
+        } else {
+            serde_json::json!({"type":"object"})
+        }
     }
 
     pub(super) async fn invoke_smcp_gateway_internal_grpc(

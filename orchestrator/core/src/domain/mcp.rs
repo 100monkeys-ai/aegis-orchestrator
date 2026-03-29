@@ -666,6 +666,7 @@ impl ToolInputContract {
             "fs.grep" | "fs.glob" => &["pattern", "path"],
             "web.search" => &["query"],
             "web.fetch" => &["url"],
+            "aegis.tools.list" | "aegis.tools.search" => &[],
             _ => &[],
         }
     }
