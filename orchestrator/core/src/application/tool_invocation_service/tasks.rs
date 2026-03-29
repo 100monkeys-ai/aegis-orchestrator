@@ -120,6 +120,89 @@ impl ToolInvocationService {
         }
     }
 
+    /// Blocking poll tool — waits for an execution to reach a terminal state.
+    /// Polls every `poll_interval_seconds` (default 10s) up to `timeout_seconds` (default 300s).
+    /// Returns the final execution status, output, and error (if any).
+    pub(super) async fn invoke_aegis_task_wait_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let exec_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.task.wait requires 'execution_id' string".to_string(),
+                )
+            })?;
+
+        let exec_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(exec_id_str)
+                .map_err(|e| SmcpSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+        );
+
+        let poll_interval = args
+            .get("poll_interval_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(10);
+        let timeout = args
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+
+        let poll_duration = std::time::Duration::from_secs(poll_interval);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+
+        loop {
+            match self.execution_service.get_execution(exec_id).await {
+                Ok(exec) => {
+                    let status_str = format!("{:?}", exec.status).to_lowercase();
+                    let is_terminal = matches!(
+                        exec.status,
+                        crate::domain::execution::ExecutionStatus::Completed
+                            | crate::domain::execution::ExecutionStatus::Failed
+                            | crate::domain::execution::ExecutionStatus::Cancelled
+                    );
+
+                    if is_terminal {
+                        let last_iter = exec.iterations().last();
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.task.wait",
+                            "execution_id": exec_id_str,
+                            "agent_id": exec.agent_id.0.to_string(),
+                            "status": status_str,
+                            "started_at": exec.started_at,
+                            "ended_at": exec.ended_at,
+                            "iteration_count": exec.iterations().len(),
+                            "last_output": last_iter.and_then(|i| i.output.as_ref()),
+                            "last_error": last_iter.and_then(|i| i.error.as_ref().map(|e| format!("{e:?}")))
+                        })));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.task.wait",
+                            "execution_id": exec_id_str,
+                            "status": status_str,
+                            "timed_out": true,
+                            "message": format!("Execution still {} after {}s timeout", status_str, timeout),
+                            "iteration_count": exec.iterations().len()
+                        })));
+                    }
+
+                    tokio::time::sleep(poll_duration).await;
+                }
+                Err(e) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.task.wait",
+                        "execution_id": exec_id_str,
+                        "error": format!("Failed to get execution: {e}")
+                    })));
+                }
+            }
+        }
+    }
+
     pub(super) async fn invoke_aegis_task_logs_tool(
         &self,
         args: &Value,

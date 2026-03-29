@@ -786,6 +786,26 @@ impl ToolRouter {
                         },
                         "required": ["execution_id"]
                     }),
+                    "aegis.task.wait" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution to wait for."
+                            },
+                            "poll_interval_seconds": {
+                                "type": "integer",
+                                "description": "Seconds between status polls (default 10).",
+                                "minimum": 1
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
                     "aegis.task.logs" => json!({
                         "type": "object",
                         "properties": {

@@ -653,9 +653,8 @@ impl ToolInputContract {
             | "aegis.workflow.cancel"
             | "aegis.workflow.remove" => &["execution_id"],
             "aegis.workflow.signal" => &["execution_id", "response"],
-            "aegis.task.status" | "aegis.task.logs" | "aegis.task.cancel" | "aegis.task.remove" => {
-                &["execution_id"]
-            }
+            "aegis.task.status" | "aegis.task.wait" | "aegis.task.logs" | "aegis.task.cancel"
+            | "aegis.task.remove" => &["execution_id"],
             "aegis.schema.get" => &["key"],
             "aegis.schema.validate" => &["kind", "manifest_yaml"],
             "cmd.run" => &["command"],
