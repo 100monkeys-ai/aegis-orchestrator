@@ -2185,12 +2185,26 @@ async fn task_execute_with_version_on_name_lookup_uses_versioned_resolution() {
     // Should resolve using version-qualified lookup and fail to start
     // (TestExecutionService always bails), but the point is that it reaches
     // the execution phase — meaning the version lookup succeeded.
+    let context = SecurityContext {
+        name: "test".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
     let result = service
-        .invoke_aegis_task_execute_tool(&serde_json::json!({
-            "agent_id": "my-agent",
-            "version": "2.0.0",
-            "input": { "task": "hello" },
-        }))
+        .invoke_aegis_task_execute_tool(
+            &serde_json::json!({
+                "agent_id": "my-agent",
+                "version": "2.0.0",
+                "input": { "task": "hello" },
+            }),
+            &context,
+        )
         .await
         .expect("should return a direct result");
 
@@ -2212,12 +2226,26 @@ async fn task_execute_with_version_on_name_lookup_returns_not_found_for_wrong_ve
     let agent_id = AgentId::new();
     let service = build_version_aware_service("my-agent", "2.0.0", agent_id);
 
+    let context = SecurityContext {
+        name: "test".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
     let result = service
-        .invoke_aegis_task_execute_tool(&serde_json::json!({
-            "agent_id": "my-agent",
-            "version": "9.9.9",
-            "input": {},
-        }))
+        .invoke_aegis_task_execute_tool(
+            &serde_json::json!({
+                "agent_id": "my-agent",
+                "version": "9.9.9",
+                "input": {},
+            }),
+            &context,
+        )
         .await
         .expect("should return a direct result");
 
@@ -2238,12 +2266,26 @@ async fn task_execute_with_version_on_uuid_returns_error() {
     let agent_id = AgentId::new();
     let service = build_version_aware_service("my-agent", "1.0.0", agent_id);
 
+    let context = SecurityContext {
+        name: "test".to_string(),
+        description: "".to_string(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
     let result = service
-        .invoke_aegis_task_execute_tool(&serde_json::json!({
-            "agent_id": agent_id.0.to_string(),
-            "version": "1.0.0",
-            "input": {},
-        }))
+        .invoke_aegis_task_execute_tool(
+            &serde_json::json!({
+                "agent_id": agent_id.0.to_string(),
+                "version": "1.0.0",
+                "input": {},
+            }),
+            &context,
+        )
         .await
         .expect("should return a direct result");
 
