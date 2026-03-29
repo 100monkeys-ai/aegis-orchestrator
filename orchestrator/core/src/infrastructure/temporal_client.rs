@@ -334,6 +334,14 @@ impl WorkflowEnginePort for TemporalClient {
         blackboard: Option<HashMap<String, serde_json::Value>>,
         security_context_name: Option<String>,
     ) -> Result<String> {
-        TemporalClient::start_workflow(self, workflow_id, execution_id, input, blackboard, security_context_name).await
+        TemporalClient::start_workflow(
+            self,
+            workflow_id,
+            execution_id,
+            input,
+            blackboard,
+            security_context_name,
+        )
+        .await
     }
 }

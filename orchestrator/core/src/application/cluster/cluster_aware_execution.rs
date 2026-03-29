@@ -168,7 +168,13 @@ impl ExecutionService for ClusterAwareExecutionService {
             let tenant_id = TenantId::default();
 
             match self
-                .try_forward(execution_id, agent_id, &input, &tenant_id, &security_context_name)
+                .try_forward(
+                    execution_id,
+                    agent_id,
+                    &input,
+                    &tenant_id,
+                    &security_context_name,
+                )
                 .await
             {
                 Ok(id) => return Ok(id),
@@ -208,7 +214,13 @@ impl ExecutionService for ClusterAwareExecutionService {
             let tenant_id = TenantId::default();
 
             match self
-                .try_forward(execution_id, agent_id, &input, &tenant_id, &security_context_name)
+                .try_forward(
+                    execution_id,
+                    agent_id,
+                    &input,
+                    &tenant_id,
+                    &security_context_name,
+                )
                 .await
             {
                 Ok(id) => return Ok(id),

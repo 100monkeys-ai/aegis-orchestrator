@@ -778,7 +778,13 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
     ]);
 
     let run_id = engine
-        .start_workflow("workflow-alpha", execution_id.clone(), input.clone(), None, None)
+        .start_workflow(
+            "workflow-alpha",
+            execution_id.clone(),
+            input.clone(),
+            None,
+            None,
+        )
         .await
         .expect("recording engine should return its configured run id");
 

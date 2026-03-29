@@ -1262,11 +1262,14 @@ async fn workflow_run_tool_forwards_blackboard() {
     };
 
     let result = service
-        .invoke_aegis_workflow_run_tool(&serde_json::json!({
-            "name": "run-me",
-            "input": { "job": "demo" },
-            "blackboard": { "priority": "high" },
-        }), &operator_context)
+        .invoke_aegis_workflow_run_tool(
+            &serde_json::json!({
+                "name": "run-me",
+                "input": { "job": "demo" },
+                "blackboard": { "priority": "high" },
+            }),
+            &operator_context,
+        )
         .await
         .expect("workflow run should return a result");
 
@@ -2385,11 +2388,14 @@ async fn workflow_run_with_version_passes_version_through() {
     };
 
     let result = service
-        .invoke_aegis_workflow_run_tool(&serde_json::json!({
-            "name": "my-workflow",
-            "version": "3.1.0",
-            "input": { "task": "demo" },
-        }), &operator_context)
+        .invoke_aegis_workflow_run_tool(
+            &serde_json::json!({
+                "name": "my-workflow",
+                "version": "3.1.0",
+                "input": { "task": "demo" },
+            }),
+            &operator_context,
+        )
         .await
         .expect("workflow run should return a result");
 
