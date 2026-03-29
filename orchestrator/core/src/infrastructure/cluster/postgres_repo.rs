@@ -143,6 +143,14 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         Ok(())
     }
 
+    async fn start_drain(&self, node_id: &NodeId) -> anyhow::Result<()> {
+        sqlx::query("UPDATE cluster_nodes SET status = 'draining' WHERE node_id = $1")
+            .bind(node_id.0)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn deregister(&self, node_id: &NodeId, _reason: &str) -> anyhow::Result<()> {
         sqlx::query("DELETE FROM cluster_nodes WHERE node_id = $1")
             .bind(node_id.0)

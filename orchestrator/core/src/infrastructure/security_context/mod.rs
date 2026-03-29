@@ -45,4 +45,9 @@ impl SecurityContextRepository for InMemorySecurityContextRepository {
         let guard = self.contexts.read().await;
         Ok(guard.values().cloned().collect())
     }
+
+    async fn delete(&self, name: &str) -> Result<bool> {
+        let mut guard = self.contexts.write().await;
+        Ok(guard.remove(name).is_some())
+    }
 }

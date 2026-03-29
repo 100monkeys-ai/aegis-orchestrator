@@ -388,6 +388,10 @@ mod tests {
             tenant_repo: None,
             smcp_session_repo: None,
             rate_limit_override_repo: None,
+            config_layer_repo: None,
+            node_cluster_repo: None,
+            security_context_repo: None,
+            pg_pool: None,
         })
     }
 

@@ -40,4 +40,7 @@ pub trait SecurityContextRepository: Send + Sync {
     /// Used by the Control Plane's Architect component to enumerate available
     /// contexts when generating agent manifests.
     async fn list_all(&self) -> Result<Vec<SecurityContext>>;
+
+    /// Delete a security context by name. Returns true if a context was removed.
+    async fn delete(&self, name: &str) -> Result<bool>;
 }

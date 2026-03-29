@@ -393,6 +393,8 @@ pub trait NodeClusterRepository: Send + Sync {
         snapshot: ResourceSnapshot,
     ) -> anyhow::Result<()>;
     async fn mark_unhealthy(&self, node_id: &NodeId) -> anyhow::Result<()>;
+    /// Transition a node to Draining status without marking it unhealthy.
+    async fn start_drain(&self, node_id: &NodeId) -> anyhow::Result<()>;
     async fn deregister(&self, node_id: &NodeId, reason: &str) -> anyhow::Result<()>;
     async fn get_config_version(&self, node_id: &NodeId) -> anyhow::Result<Option<String>>;
     async fn record_config_version(&self, node_id: &NodeId, hash: &str) -> anyhow::Result<()>;
@@ -475,7 +477,7 @@ impl std::fmt::Display for ConfigType {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigSnapshot {
     pub scope: ConfigScope,
     pub scope_key: String,
@@ -485,7 +487,7 @@ pub struct ConfigSnapshot {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MergedConfig {
     pub payload: serde_json::Value,
     pub version: String,
@@ -521,13 +523,21 @@ pub trait ConfigLayerRepository: Send + Sync {
 
     /// List all layers for a given config type
     async fn list_layers(&self, config_type: &ConfigType) -> anyhow::Result<Vec<ConfigSnapshot>>;
+
+    /// Delete a specific config layer. Returns true if a row was deleted.
+    async fn delete_layer(
+        &self,
+        scope: &ConfigScope,
+        scope_key: &str,
+        config_type: &ConfigType,
+    ) -> anyhow::Result<bool>;
 }
 
 // === Node Registry (ADR-061) ===
 
 /// Enriched node record for configuration assignment and registry queries.
 /// Extends NodePeer with additional metadata for operational management.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredNode {
     pub node_id: NodeId,
     pub hostname: String,

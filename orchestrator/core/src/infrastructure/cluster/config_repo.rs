@@ -200,6 +200,27 @@ impl ConfigLayerRepository for PgConfigLayerRepository {
             })
             .collect())
     }
+
+    async fn delete_layer(
+        &self,
+        scope: &ConfigScope,
+        scope_key: &str,
+        config_type: &ConfigType,
+    ) -> anyhow::Result<bool> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM config_layers
+            WHERE scope = $1 AND scope_key = $2 AND config_type = $3
+            "#,
+        )
+        .bind(Self::scope_to_str(scope))
+        .bind(scope_key)
+        .bind(Self::type_to_str(config_type))
+        .execute(self.pool.as_ref())
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 /// Deep merge two JSON objects. Values in `overlay` override `base`.

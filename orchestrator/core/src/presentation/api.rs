@@ -30,14 +30,19 @@ use crate::application::inner_loop_service::InnerLoopService;
 use crate::application::stimulus::StimulusService;
 use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
+use crate::domain::cluster::{
+    ConfigLayerRepository, ConfigScope, ConfigType, NodeClusterRepository, NodeId,
+};
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
 use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::mcp::PolicyViolation;
 use crate::domain::repository::{TenantRepository, WorkflowExecutionRepository};
+use crate::domain::security_context::repository::SecurityContextRepository;
+use crate::domain::security_context::security_context::SecurityContext;
 use crate::domain::smcp_session::SmcpSessionError;
 use crate::domain::smcp_session_repository::SmcpSessionRepository;
-use crate::domain::tenancy::{Tenant, TenantStatus, TenantTier};
+use crate::domain::tenancy::{Tenant, TenantQuotas, TenantStatus, TenantTier};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::rate_limit::override_repository::{
@@ -53,7 +58,7 @@ use axum::{
     extract::{FromRef, Path, Query, State},
     middleware,
     response::{IntoResponse, Response, Sse},
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use futures::stream::Stream;
@@ -86,6 +91,14 @@ pub struct AppState {
     pub smcp_session_repo: Option<Arc<dyn SmcpSessionRepository>>,
     /// Rate-limit override repository for admin CRUD (ADR-072). Optional until wired.
     pub rate_limit_override_repo: Option<Arc<RateLimitOverrideRepository>>,
+    /// Config layer repository for hierarchical config admin (ADR-060). Optional until wired.
+    pub config_layer_repo: Option<Arc<dyn ConfigLayerRepository>>,
+    /// Node cluster repository for node registry admin (ADR-059). Optional until wired.
+    pub node_cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
+    /// Security context repository for SMCP policy admin (ADR-035). Optional until wired.
+    pub security_context_repo: Option<Arc<dyn SecurityContextRepository>>,
+    /// PostgreSQL pool for direct audit-log queries. Optional until wired.
+    pub pg_pool: Option<Arc<sqlx::PgPool>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -114,6 +127,10 @@ pub fn app(
         tenant_repo: None,
         smcp_session_repo: None,
         rate_limit_override_repo: None,
+        config_layer_repo: None,
+        node_cluster_repo: None,
+        security_context_repo: None,
+        pg_pool: None,
     });
 
     Router::new()
@@ -144,7 +161,10 @@ pub fn app(
         .route("/v1/admin/tenants", post(create_tenant))
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
-        .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        .route(
+            "/v1/admin/tenants/:slug",
+            get(get_tenant).delete(soft_delete_tenant),
+        )
         // Admin rate-limit override management (ADR-072)
         .route(
             "/v1/admin/rate-limits/overrides",
@@ -155,6 +175,39 @@ pub fn app(
             delete(delete_rate_limit_override),
         )
         .route("/v1/admin/rate-limits/usage", get(get_rate_limit_usage))
+        // Admin tenant quotas (ADR-073)
+        .route("/v1/admin/tenants/:slug/quotas", put(update_tenant_quotas))
+        // Admin config layer management (ADR-060)
+        .route(
+            "/v1/admin/config/layers",
+            get(list_config_layers).put(upsert_config_layer),
+        )
+        .route(
+            "/v1/admin/config/layers/:layer_id",
+            delete(delete_config_layer),
+        )
+        .route("/v1/admin/config/effective", get(get_effective_config))
+        // Admin node registry (ADR-059)
+        .route("/v1/admin/nodes", get(list_nodes))
+        .route(
+            "/v1/admin/nodes/:node_id",
+            get(get_node).delete(deregister_node_handler),
+        )
+        .route("/v1/admin/nodes/:node_id/drain", post(drain_node))
+        .route(
+            "/v1/admin/nodes/:node_id/push-config",
+            post(push_node_config),
+        )
+        // Admin security context management (ADR-035)
+        .route("/v1/admin/security-contexts", get(list_security_contexts))
+        .route(
+            "/v1/admin/security-contexts/:name",
+            get(get_security_context)
+                .put(upsert_security_context)
+                .delete(delete_security_context),
+        )
+        // Admin audit log (ADR-073)
+        .route("/v1/admin/audit-log", get(query_audit_log))
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -184,6 +237,10 @@ pub fn app_with_inner_loop(
         tenant_repo: None,
         smcp_session_repo: None,
         rate_limit_override_repo: None,
+        config_layer_repo: None,
+        node_cluster_repo: None,
+        security_context_repo: None,
+        pg_pool: None,
     });
 
     Router::new()
@@ -212,7 +269,10 @@ pub fn app_with_inner_loop(
         .route("/v1/admin/tenants", post(create_tenant))
         .route("/v1/admin/tenants", get(list_tenants))
         .route("/v1/admin/tenants/:slug/suspend", post(suspend_tenant))
-        .route("/v1/admin/tenants/:slug", delete(soft_delete_tenant))
+        .route(
+            "/v1/admin/tenants/:slug",
+            get(get_tenant).delete(soft_delete_tenant),
+        )
         // Admin rate-limit override management (ADR-072)
         .route(
             "/v1/admin/rate-limits/overrides",
@@ -223,6 +283,39 @@ pub fn app_with_inner_loop(
             delete(delete_rate_limit_override),
         )
         .route("/v1/admin/rate-limits/usage", get(get_rate_limit_usage))
+        // Admin tenant quotas (ADR-073)
+        .route("/v1/admin/tenants/:slug/quotas", put(update_tenant_quotas))
+        // Admin config layer management (ADR-060)
+        .route(
+            "/v1/admin/config/layers",
+            get(list_config_layers).put(upsert_config_layer),
+        )
+        .route(
+            "/v1/admin/config/layers/:layer_id",
+            delete(delete_config_layer),
+        )
+        .route("/v1/admin/config/effective", get(get_effective_config))
+        // Admin node registry (ADR-059)
+        .route("/v1/admin/nodes", get(list_nodes))
+        .route(
+            "/v1/admin/nodes/:node_id",
+            get(get_node).delete(deregister_node_handler),
+        )
+        .route("/v1/admin/nodes/:node_id/drain", post(drain_node))
+        .route(
+            "/v1/admin/nodes/:node_id/push-config",
+            post(push_node_config),
+        )
+        // Admin security context management (ADR-035)
+        .route("/v1/admin/security-contexts", get(list_security_contexts))
+        .route(
+            "/v1/admin/security-contexts/:name",
+            get(get_security_context)
+                .put(upsert_security_context)
+                .delete(delete_security_context),
+        )
+        // Admin audit log (ADR-073)
+        .route("/v1/admin/audit-log", get(query_audit_log))
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -1375,6 +1468,1091 @@ async fn get_rate_limit_usage(
     }
 }
 
+// ============================================================================
+// Admin Tenant Detail + Quotas Endpoints (ADR-073)
+// ============================================================================
+
+/// `GET /v1/admin/tenants/:slug` — get tenant detail
+async fn get_tenant(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = match TenantId::from_realm_slug(&slug) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.find_by_slug(&tenant_id).await {
+        Ok(Some(tenant)) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&tenant).unwrap_or(json!({"error": "serialization failed"}))),
+        )
+            .into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Tenant '{}' not found", slug)})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UpdateQuotasRequest {
+    max_concurrent_executions: Option<u32>,
+    max_agents: Option<u32>,
+    max_storage_gb: Option<f64>,
+}
+
+/// `PUT /v1/admin/tenants/:slug/quotas` — update tenant quotas
+async fn update_tenant_quotas(
+    State(state): State<Arc<AppState>>,
+    Path(slug): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: UpdateQuotasRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = match TenantId::from_realm_slug(&slug) {
+        Ok(id) => id,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Fetch current tenant to get existing quotas for partial update
+    let current = match repo.find_by_slug(&tenant_id).await {
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            return (
+                axum::http::StatusCode::NOT_FOUND,
+                Json(json!({"error": format!("Tenant '{}' not found", slug)})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let quotas = TenantQuotas {
+        max_concurrent_executions: payload
+            .max_concurrent_executions
+            .unwrap_or(current.quotas.max_concurrent_executions),
+        max_agents: payload.max_agents.unwrap_or(current.quotas.max_agents),
+        max_storage_gb: payload
+            .max_storage_gb
+            .unwrap_or(current.quotas.max_storage_gb),
+    };
+
+    match repo.update_quotas(&tenant_id, &quotas).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "slug": slug,
+                "quotas": {
+                    "max_concurrent_executions": quotas.max_concurrent_executions,
+                    "max_agents": quotas.max_agents,
+                    "max_storage_gb": quotas.max_storage_gb,
+                }
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Admin Config Layer Endpoints (ADR-060, ADR-073)
+// ============================================================================
+
+#[derive(serde::Deserialize, Default)]
+struct ListConfigLayersParams {
+    scope: Option<String>,
+    target_id: Option<String>,
+    config_type: Option<String>,
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_config_type(s: &str) -> Result<ConfigType, Response> {
+    match s {
+        "aegis_config" | "aegis-config" => Ok(ConfigType::AegisConfig),
+        "runtime_registry" | "runtime-registry" => Ok(ConfigType::RuntimeRegistry),
+        other => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid config_type: {other}")})),
+        )
+            .into_response()),
+    }
+}
+
+#[allow(clippy::result_large_err)]
+fn parse_config_scope(s: &str) -> Result<ConfigScope, Response> {
+    match s {
+        "global" => Ok(ConfigScope::Global),
+        "tenant" => Ok(ConfigScope::Tenant),
+        "node" => Ok(ConfigScope::Node),
+        other => Err((
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Invalid scope: {other}")})),
+        )
+            .into_response()),
+    }
+}
+
+/// `GET /v1/admin/config/layers` — list config layers
+async fn list_config_layers(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ListConfigLayersParams>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.config_layer_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Config layer repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let config_type = match params.config_type.as_deref() {
+        Some(ct) => match parse_config_type(ct) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        },
+        None => ConfigType::AegisConfig,
+    };
+
+    // If scope + target_id provided, get a specific layer
+    if let (Some(scope_str), Some(target_id)) =
+        (params.scope.as_deref(), params.target_id.as_deref())
+    {
+        let scope = match parse_config_scope(scope_str) {
+            Ok(s) => s,
+            Err(resp) => return resp,
+        };
+        match repo.get_layer(&scope, target_id, &config_type).await {
+            Ok(Some(layer)) => {
+                return (
+                    axum::http::StatusCode::OK,
+                    Json(serde_json::to_value(&layer).unwrap_or(json!({}))),
+                )
+                    .into_response();
+            }
+            Ok(None) => {
+                return (
+                    axum::http::StatusCode::NOT_FOUND,
+                    Json(json!({"error": "Config layer not found"})),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match repo.list_layers(&config_type).await {
+        Ok(layers) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "layers": serde_json::to_value(&layers).unwrap_or(json!([])),
+                "count": layers.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct UpsertConfigLayerRequest {
+    scope: String,
+    scope_key: String,
+    config_type: String,
+    payload: serde_json::Value,
+}
+
+/// `PUT /v1/admin/config/layers` — upsert a config layer
+async fn upsert_config_layer(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.config_layer_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Config layer repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 256).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: UpsertConfigLayerRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    let scope = match parse_config_scope(&payload.scope) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+
+    let config_type = match parse_config_type(&payload.config_type) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    match repo
+        .upsert_layer(&scope, &payload.scope_key, &config_type, payload.payload)
+        .await
+    {
+        Ok(snapshot) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&snapshot).unwrap_or(json!({"status": "upserted"}))),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/admin/config/layers/:layer_id` — delete a config layer
+///
+/// The layer_id is expected as `{scope}:{scope_key}:{config_type}` (URL-encoded).
+async fn delete_config_layer(
+    State(state): State<Arc<AppState>>,
+    Path(layer_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.config_layer_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Config layer repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    // Parse composite layer_id: "scope:scope_key:config_type"
+    let parts: Vec<&str> = layer_id.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(json!({"error": "layer_id must be formatted as 'scope:scope_key:config_type'"})),
+        )
+            .into_response();
+    }
+
+    let scope = match parse_config_scope(parts[0]) {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let scope_key = parts[1];
+    let config_type = match parse_config_type(parts[2]) {
+        Ok(t) => t,
+        Err(resp) => return resp,
+    };
+
+    match repo.delete_layer(&scope, scope_key, &config_type).await {
+        Ok(true) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "deleted", "layer_id": layer_id})),
+        )
+            .into_response(),
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": "Config layer not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct EffectiveConfigParams {
+    node_id: String,
+    config_type: Option<String>,
+    tenant_id: Option<String>,
+}
+
+/// `GET /v1/admin/config/effective` — get merged effective config for a node
+async fn get_effective_config(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<EffectiveConfigParams>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.config_layer_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Config layer repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let node_id = match uuid::Uuid::parse_str(&params.node_id) {
+        Ok(uid) => NodeId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid node_id UUID"})),
+            )
+                .into_response();
+        }
+    };
+
+    let config_type = match params.config_type.as_deref() {
+        Some(ct) => match parse_config_type(ct) {
+            Ok(t) => t,
+            Err(resp) => return resp,
+        },
+        None => ConfigType::AegisConfig,
+    };
+
+    match repo
+        .get_merged_config(&node_id, params.tenant_id.as_deref(), &config_type)
+        .await
+    {
+        Ok(merged) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&merged).unwrap_or(json!({}))),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Admin Node Registry Endpoints (ADR-059, ADR-073)
+// ============================================================================
+
+/// `GET /v1/admin/nodes` — list all registered nodes
+async fn list_nodes(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.node_cluster_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Node cluster repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.list_all_peers().await {
+        Ok(peers) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "nodes": peers,
+                "count": peers.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/admin/nodes/:node_id` — get a single registered node
+async fn get_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.node_cluster_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Node cluster repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let nid = match uuid::Uuid::parse_str(&node_id) {
+        Ok(uid) => NodeId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid node_id UUID"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.find_registered_node(&nid).await {
+        Ok(Some(node)) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&node).unwrap_or(json!({}))),
+        )
+            .into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Node '{}' not found", node_id)})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /v1/admin/nodes/:node_id/drain` — start draining a node
+async fn drain_node(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.node_cluster_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Node cluster repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let nid = match uuid::Uuid::parse_str(&node_id) {
+        Ok(uid) => NodeId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid node_id UUID"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.start_drain(&nid).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "draining", "node_id": node_id})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct PushNodeConfigRequest {
+    config_payload: serde_json::Value,
+}
+
+/// `POST /v1/admin/nodes/:node_id/push-config` — push config to a node
+async fn push_node_config(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let config_repo = match &state.config_layer_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Config layer repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let node_repo = match &state.node_cluster_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Node cluster repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let nid = match uuid::Uuid::parse_str(&node_id) {
+        Ok(uid) => NodeId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid node_id UUID"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 256).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let payload: PushNodeConfigRequest = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Upsert the node-scoped config layer
+    let snapshot = match config_repo
+        .upsert_layer(
+            &ConfigScope::Node,
+            &nid.to_string(),
+            &ConfigType::AegisConfig,
+            payload.config_payload,
+        )
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    // Record the new config version on the node
+    if let Err(e) = node_repo
+        .record_config_version(&nid, &snapshot.version)
+        .await
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("Config saved but version recording failed: {e}")})),
+        )
+            .into_response();
+    }
+
+    (
+        axum::http::StatusCode::OK,
+        Json(json!({
+            "status": "pushed",
+            "node_id": node_id,
+            "config_version": snapshot.version,
+        })),
+    )
+        .into_response()
+}
+
+/// `DELETE /v1/admin/nodes/:node_id` — deregister a node
+async fn deregister_node_handler(
+    State(state): State<Arc<AppState>>,
+    Path(node_id): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.node_cluster_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Node cluster repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let nid = match uuid::Uuid::parse_str(&node_id) {
+        Ok(uid) => NodeId(uid),
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid node_id UUID"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.deregister(&nid, "admin deregistration").await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "deregistered", "node_id": node_id})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Admin SecurityContext Endpoints (ADR-035, ADR-073)
+// ============================================================================
+
+/// `GET /v1/admin/security-contexts` — list all security contexts
+async fn list_security_contexts(
+    State(state): State<Arc<AppState>>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.security_context_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Security context repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.list_all().await {
+        Ok(contexts) => (
+            axum::http::StatusCode::OK,
+            Json(json!({
+                "security_contexts": contexts,
+                "count": contexts.len(),
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /v1/admin/security-contexts/:name` — get a security context by name
+async fn get_security_context(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.security_context_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Security context repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.find_by_name(&name).await {
+        Ok(Some(ctx)) => (
+            axum::http::StatusCode::OK,
+            Json(serde_json::to_value(&ctx).unwrap_or(json!({}))),
+        )
+            .into_response(),
+        Ok(None) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Security context '{}' not found", name)})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `PUT /v1/admin/security-contexts/:name` — upsert a security context
+async fn upsert_security_context(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.security_context_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Security context repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Invalid request body"})),
+            )
+                .into_response();
+        }
+    };
+
+    let mut context: SecurityContext = match serde_json::from_slice(&body) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid JSON: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Ensure name in path matches body
+    context.name = name.clone();
+
+    match repo.save(context).await {
+        Ok(()) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "saved", "name": name})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+/// `DELETE /v1/admin/security-contexts/:name` — delete a security context
+async fn delete_security_context(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let repo = match &state.security_context_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Security context repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    match repo.delete(&name).await {
+        Ok(true) => (
+            axum::http::StatusCode::OK,
+            Json(json!({"status": "deleted", "name": name})),
+        )
+            .into_response(),
+        Ok(false) => (
+            axum::http::StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("Security context '{}' not found", name)})),
+        )
+            .into_response(),
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// ============================================================================
+// Admin Audit Log Endpoints (ADR-073)
+// ============================================================================
+
+#[derive(serde::Deserialize, Default)]
+struct AuditLogParams {
+    actor: Option<String>,
+    action: Option<String>,
+    target: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+/// `GET /v1/admin/audit-log` — query admin audit log
+async fn query_audit_log(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<AuditLogParams>,
+    request: axum::extract::Request,
+) -> Response {
+    if let Err(resp) = require_admin(request.extensions()) {
+        return resp;
+    }
+
+    let pool = match &state.pg_pool {
+        Some(p) => p.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Database pool not configured for audit queries"})),
+            )
+                .into_response();
+        }
+    };
+
+    let limit = params.limit.unwrap_or(50).min(500);
+    let offset = params.offset.unwrap_or(0);
+
+    // Build dynamic query with optional filters
+    let mut query = String::from(
+        "SELECT id, actor_id, action, target_resource, before_state, after_state, created_at \
+         FROM admin_audit_log WHERE 1=1",
+    );
+    let mut bind_idx = 1u32;
+    let mut binds: Vec<String> = Vec::new();
+
+    if let Some(ref actor) = params.actor {
+        query.push_str(&format!(" AND actor_id = ${bind_idx}"));
+        bind_idx += 1;
+        binds.push(actor.clone());
+    }
+    if let Some(ref action) = params.action {
+        query.push_str(&format!(" AND action = ${bind_idx}"));
+        bind_idx += 1;
+        binds.push(action.clone());
+    }
+    if let Some(ref target) = params.target {
+        query.push_str(&format!(" AND target_resource = ${bind_idx}"));
+        bind_idx += 1;
+        binds.push(target.clone());
+    }
+    if let Some(ref from) = params.from {
+        query.push_str(&format!(" AND created_at >= ${bind_idx}::timestamptz"));
+        bind_idx += 1;
+        binds.push(from.clone());
+    }
+    if let Some(ref to) = params.to {
+        query.push_str(&format!(" AND created_at <= ${bind_idx}::timestamptz"));
+        bind_idx += 1;
+        binds.push(to.clone());
+    }
+
+    query.push_str(&format!(
+        " ORDER BY created_at DESC LIMIT ${bind_idx} OFFSET ${}",
+        bind_idx + 1
+    ));
+
+    let mut sql_query = sqlx::query(&query);
+    for b in &binds {
+        sql_query = sql_query.bind(b);
+    }
+    sql_query = sql_query.bind(limit).bind(offset);
+
+    match sql_query.fetch_all(pool.as_ref()).await {
+        Ok(rows) => {
+            let entries: Vec<serde_json::Value> = rows
+                .iter()
+                .map(|r| {
+                    use sqlx::Row;
+                    json!({
+                        "id": r.get::<uuid::Uuid, _>("id").to_string(),
+                        "actor_id": r.get::<String, _>("actor_id"),
+                        "action": r.get::<String, _>("action"),
+                        "target_resource": r.get::<String, _>("target_resource"),
+                        "before_state": r.get::<Option<serde_json::Value>, _>("before_state"),
+                        "after_state": r.get::<Option<serde_json::Value>, _>("after_state"),
+                        "created_at": r.get::<chrono::DateTime<chrono::Utc>, _>("created_at").to_rfc3339(),
+                    })
+                })
+                .collect();
+
+            (
+                axum::http::StatusCode::OK,
+                Json(json!({
+                    "entries": entries,
+                    "count": entries.len(),
+                    "limit": limit,
+                    "offset": offset,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1494,6 +2672,10 @@ mod tests {
             tenant_repo: None,
             smcp_session_repo: None,
             rate_limit_override_repo: None,
+            config_layer_repo: None,
+            node_cluster_repo: None,
+            security_context_repo: None,
+            pg_pool: None,
         })
     }
 
