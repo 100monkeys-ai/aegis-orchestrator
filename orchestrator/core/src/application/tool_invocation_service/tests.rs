@@ -154,7 +154,7 @@ impl AgentLifecycleService for TestAgentLifecycleService {
     }
 
     async fn get_agent(&self, _: AgentId) -> Result<Agent> {
-        anyhow::bail!("TestAgentLifecycleService::get_agent not exercised in this test")
+        Ok(test_agent_with_tools(&[]))
     }
 
     async fn update_agent_for_tenant(
