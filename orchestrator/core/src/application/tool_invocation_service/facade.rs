@@ -765,8 +765,14 @@ impl ToolInvocationService {
             "aegis.workflow.signal" => Some(self.invoke_aegis_workflow_signal_tool(args).await),
             "aegis.workflow.remove" => Some(self.invoke_aegis_workflow_remove_tool(args).await),
             "aegis.workflow.list" => Some(self.invoke_aegis_workflow_list_tool(args).await),
-            "aegis.workflow.promote" => Some(self.invoke_aegis_workflow_promote_tool(args).await),
-            "aegis.workflow.demote" => Some(self.invoke_aegis_workflow_demote_tool(args).await),
+            "aegis.workflow.promote" => Some(
+                self.invoke_aegis_workflow_promote_tool(args, security_context)
+                    .await,
+            ),
+            "aegis.workflow.demote" => Some(
+                self.invoke_aegis_workflow_demote_tool(args, security_context)
+                    .await,
+            ),
             "aegis.workflow.export" => Some(self.invoke_aegis_workflow_export_tool(args).await),
             "aegis.workflow.update" => Some(
                 self.invoke_aegis_workflow_update_tool(args, execution_id, agent_id)

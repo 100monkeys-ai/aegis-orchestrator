@@ -1,6 +1,41 @@
 use super::*;
 
 impl ToolInvocationService {
+    /// Build a [`ScopeChangeRequester`] from tool args and the active security context.
+    ///
+    /// Callers MUST supply `user_id` and `roles` in the tool args so that the
+    /// authorization check in [`WorkflowScopeService::change_scope`] evaluates
+    /// against the *actual* caller identity.  When `roles` is omitted the
+    /// requester is constructed with an empty role set — fail-closed — so the
+    /// downstream authorization check will reject any privileged transition.
+    fn resolve_scope_change_requester(
+        args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
+        tenant_id: &TenantId,
+    ) -> Result<crate::application::workflow_scope::ScopeChangeRequester, SmcpSessionError> {
+        let user_id = args
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&security_context.name)
+            .to_string();
+
+        let roles: Vec<String> = args
+            .get("roles")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        Ok(crate::application::workflow_scope::ScopeChangeRequester {
+            user_id,
+            roles,
+            tenant_id: tenant_id.clone(),
+        })
+    }
+
     pub(super) async fn invoke_aegis_workflow_delete_tool(
         &self,
         args: &Value,
@@ -663,6 +698,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_promote_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -722,11 +758,7 @@ impl ToolInvocationService {
             }
         };
 
-        let requester = crate::application::workflow_scope::ScopeChangeRequester {
-            user_id: "smcp-tool-user".to_string(),
-            roles: vec!["aegis:operator".to_string()],
-            tenant_id: tenant_id.clone(),
-        };
+        let requester = Self::resolve_scope_change_requester(args, security_context, &tenant_id)?;
 
         let scope_service = crate::application::workflow_scope::WorkflowScopeService::new(
             repo.clone(),
@@ -756,6 +788,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_demote_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -774,7 +807,7 @@ impl ToolInvocationService {
                 let owner = args
                     .get("user_id")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("smcp-tool-user");
+                    .unwrap_or(&security_context.name);
                 crate::domain::workflow::WorkflowScope::User {
                     owner_user_id: owner.to_string(),
                 }
@@ -825,11 +858,7 @@ impl ToolInvocationService {
             }
         };
 
-        let requester = crate::application::workflow_scope::ScopeChangeRequester {
-            user_id: "smcp-tool-user".to_string(),
-            roles: vec!["aegis:operator".to_string()],
-            tenant_id: tenant_id.clone(),
-        };
+        let requester = Self::resolve_scope_change_requester(args, security_context, &tenant_id)?;
 
         let scope_service = crate::application::workflow_scope::WorkflowScopeService::new(
             repo.clone(),
