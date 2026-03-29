@@ -73,6 +73,10 @@ const ALLOWED_AEGIS_VARS: &[&str] = &[
     "AEGIS_AGENT_ID",
     "AEGIS_EXECUTION_ID",
     "AEGIS_WORKFLOW_ID",
+    "AEGIS_MODEL_ALIAS",
+    "AEGIS_AGENT_INSTRUCTION",
+    "AEGIS_PROMPT_TEMPLATE",
+    "AEGIS_LLM_TIMEOUT_SECONDS",
 ];
 
 /// Validates whether an environment variable name is safe to pass to
