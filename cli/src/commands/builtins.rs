@@ -41,6 +41,11 @@ pub const WORKFLOW_CREATOR_AGENT_NAME: &str = "workflow-creator-validator-agent"
 pub const WORKFLOW_CREATOR_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/workflow-creator-validator-agent.yaml");
 
+pub const SKILL_VALIDATOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/skill-validator.yaml");
+pub const SKILL_IMPORT_WORKFLOW_TEMPLATE: &str =
+    include_str!("../../templates/workflows/skill-import.yaml");
+
 // ─── Deployment Logic ───────────────────────────────────────────────────────
 
 pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<()> {
@@ -95,12 +100,26 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
         force,
     )
     .await?;
+    deploy_builtin_agent(
+        client,
+        "skill-validator",
+        SKILL_VALIDATOR_AGENT_TEMPLATE,
+        force,
+    )
+    .await?;
 
     // Workflows
     deploy_builtin_workflow(
         client,
         WORKFLOW_GENERATOR_WORKFLOW_NAME,
         WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+        force,
+    )
+    .await?;
+    deploy_builtin_workflow(
+        client,
+        "skill-import",
+        SKILL_IMPORT_WORKFLOW_TEMPLATE,
         force,
     )
     .await?;

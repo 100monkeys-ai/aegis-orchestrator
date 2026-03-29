@@ -113,12 +113,11 @@ pub struct StandardStartWorkflowExecutionUseCase {
 }
 
 impl StandardStartWorkflowExecutionUseCase {
-    const RESERVED_BLACKBOARD_KEYS: [&'static str; 7] = [
+    const RESERVED_BLACKBOARD_KEYS: [&'static str; 6] = [
         "instruction",
         "input",
         "iteration_number",
         "previous_error",
-        "agentskills",
         "context",
         "workflow",
     ];

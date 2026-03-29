@@ -779,6 +779,9 @@ async fn smcp_tool_invoke(
                     -32005_i32,
                     Some(*retry_after_seconds),
                 ),
+                SmcpSessionError::SessionInactive(
+                    crate::domain::smcp_session::SessionStatus::Expired,
+                ) => (axum::http::StatusCode::UNAUTHORIZED, -32000_i32, None),
                 SmcpSessionError::PolicyViolation(_) | SmcpSessionError::SessionInactive(_) => {
                     (axum::http::StatusCode::FORBIDDEN, -32000_i32, None)
                 }

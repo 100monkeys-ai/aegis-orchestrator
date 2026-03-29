@@ -17,7 +17,6 @@
 //! - `{{input}}` - User input for this execution
 //! - `{{iteration_number}}` - Current iteration count
 //! - `{{previous_error}}` - Error from previous iteration
-//! - `{{agentskills}}` - Concatenated skill content
 //! - `{{context}}` - Concatenated context attachments
 //!
 //! # Usage
@@ -60,10 +59,6 @@ pub struct PromptContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_error: Option<String>,
 
-    /// Concatenated AgentSkills content
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agentskills: Option<String>,
-
     /// Concatenated context attachments
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
@@ -81,7 +76,6 @@ impl PromptContext {
             input: None,
             iteration_number: None,
             previous_error: None,
-            agentskills: None,
             context: None,
             extras: HashMap::new(),
         }
@@ -108,12 +102,6 @@ impl PromptContext {
     /// Builder-style setter for previous error
     pub fn previous_error(mut self, error: impl Into<String>) -> Self {
         self.previous_error = Some(error.into());
-        self
-    }
-
-    /// Builder-style setter for agentskills
-    pub fn agentskills(mut self, skills: impl Into<String>) -> Self {
-        self.agentskills = Some(skills.into());
         self
     }
 
@@ -294,20 +282,6 @@ mod tests {
         let context = PromptContext::new();
         let result = engine.render(template, &context).unwrap();
         assert_eq!(result, "");
-    }
-
-    #[test]
-    fn test_agentskills_context() {
-        let engine = PromptTemplateEngine::new();
-        let context = PromptContext::new()
-            .instruction("Use email skills")
-            .agentskills("# Skill: Email Reader\nStep 1: Connect\nStep 2: Read");
-
-        let template = "{{instruction}}\n\nAvailable Skills:\n{{agentskills}}";
-        let result = engine.render(template, &context).unwrap();
-
-        assert!(result.contains("# Skill: Email Reader"));
-        assert!(result.contains("Step 1: Connect"));
     }
 
     #[test]

@@ -306,8 +306,6 @@ pub enum ScheduleConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct TaskConfig {
-    #[serde(default)]
-    pub agentskills: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -118,8 +118,6 @@ spec:
     entrypoint: main.py
     isolation: docker
   task:
-    agentskills:
-      - email:imap-reader
     instruction: |
       Summarize emails from the last 24 hours
     prompt_template: |
@@ -159,7 +157,6 @@ spec:
 
         // Check task
         let task = manifest.spec.task.as_ref().unwrap();
-        assert_eq!(task.agentskills.len(), 1);
         assert!(task.instruction.is_some());
 
         // Check execution

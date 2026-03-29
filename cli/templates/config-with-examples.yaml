@@ -499,13 +499,6 @@ spec:
   #   url: "http://aegis-smcp-gateway:50055"
 
   # --------------------------------------------------------------------------
-  # AgentSkills API (Optional)
-  # --------------------------------------------------------------------------
-  # External registry for fetching advanced agent capabilities.
-  # agent_skills:
-  #   endpoint: "https://agentskills.io/api"
-
-  # --------------------------------------------------------------------------
   # Execution Limits (Optional)
   # --------------------------------------------------------------------------
   # Maximum number of executions returned by a single `list_executions` request.

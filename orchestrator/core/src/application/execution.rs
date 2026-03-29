@@ -233,12 +233,11 @@ pub struct StandardExecutionService {
 }
 
 impl StandardExecutionService {
-    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 6] = [
+    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 5] = [
         "instruction",
         "input",
         "iteration_number",
         "previous_error",
-        "agentskills",
         "context",
     ];
 
@@ -729,7 +728,6 @@ mod tests {
                     model: "default".to_string(),
                 },
                 task: Some(TaskConfig {
-                    agentskills: Vec::new(),
                     instruction: Some(format!("Run the {name} task")),
                     prompt_template: None,
                     input_data: None,
