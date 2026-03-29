@@ -139,7 +139,7 @@ pub trait AgentLifecycleService: Send + Sync {
         version: &str,
     ) -> Result<Option<AgentId>>;
 
-    /// Convenience wrapper calling [`lookup_agent_for_tenant_with_version`] with the local default tenant.
+    /// Convenience wrapper calling [`Self::lookup_agent_for_tenant_with_version`] with the local default tenant.
     async fn lookup_agent_with_version(
         &self,
         name: &str,
