@@ -72,14 +72,35 @@ impl ToolInvocationService {
                 ))
             })?;
 
+        tracing::debug!(
+            context = %security_context.name,
+            capabilities_count = security_context.capabilities.len(),
+            capabilities = ?security_context.capabilities.iter().map(|c| &c.tool_pattern).collect::<Vec<_>>(),
+            "Filtering tools for security context"
+        );
+
         let tools = self.get_available_tools().await?;
-        Ok(tools
+        let filtered: Vec<_> = tools
             .into_iter()
             .filter(|tool| {
-                security_context.permits_tool_name(&tool.name)
-                    && Self::context_allows_tool_name(security_context_name, &tool.name)
+                let permitted = security_context.permits_tool_name(&tool.name);
+                let context_allowed = Self::context_allows_tool_name(security_context_name, &tool.name);
+                if !permitted || !context_allowed {
+                    tracing::trace!(tool = %tool.name, permitted, context_allowed, "Tool filtered out");
+                }
+                permitted && context_allowed
             })
-            .collect())
+            .collect();
+
+        tracing::debug!(
+            context = %security_context.name,
+            total_before = ?self.get_available_tools().await.map(|t| t.len()).unwrap_or(0),
+            total_after = filtered.len(),
+            tools = ?filtered.iter().map(|t| &t.name).collect::<Vec<_>>(),
+            "Filtered tools result"
+        );
+
+        Ok(filtered)
     }
 
     pub(super) async fn fetch_gateway_tools_grpc(
