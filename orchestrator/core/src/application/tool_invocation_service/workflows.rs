@@ -1,10 +1,10 @@
 use super::*;
 
 impl ToolInvocationService {
-    /// Build a [`ScopeChangeRequester`] from tool args and the active security context.
+    /// Build a [`crate::application::workflow_scope::ScopeChangeRequester`] from tool args and the active security context.
     ///
     /// Callers MUST supply `user_id` and `roles` in the tool args so that the
-    /// authorization check in [`WorkflowScopeService::change_scope`] evaluates
+    /// authorization check in [`crate::application::workflow_scope::WorkflowScopeService::change_scope`] evaluates
     /// against the *actual* caller identity.  When `roles` is omitted the
     /// requester is constructed with an empty role set — fail-closed — so the
     /// downstream authorization check will reject any privileged transition.
