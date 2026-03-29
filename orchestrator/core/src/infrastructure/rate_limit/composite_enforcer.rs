@@ -139,6 +139,22 @@ impl RateLimitEnforcer for CompositeRateLimitEnforcer {
         };
         emit_decision_metrics(&decision, &resource_label, scope_label);
 
+        // Emit remaining-quota gauge for each bucket (ADR-072 §10)
+        let scope_id = match scope {
+            RateLimitScope::User { user_id } => user_id.clone(),
+            RateLimitScope::Tenant { tenant_id } => tenant_id.to_string(),
+        };
+        for (bucket, remaining_value) in &decision.remaining {
+            metrics::gauge!(
+                "aegis_rate_limit_remaining",
+                "resource_type" => resource_label.clone(),
+                "bucket" => format!("{bucket:?}"),
+                "scope_type" => scope_label.to_owned(),
+                "scope_id" => scope_id.clone(),
+            )
+            .set(*remaining_value as f64);
+        }
+
         // Check for 80% threshold warning on allowed decisions
         for (bucket, remaining_count) in &decision.remaining {
             if let Some(window) = policy.windows.get(bucket) {
