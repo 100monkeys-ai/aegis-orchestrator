@@ -26,23 +26,28 @@ spec:
       returns invalid output, stop and return errors/skipped instead of trying to deploy anyway.
 
       REQUIRED WORKFLOW — follow this order on every agent creation or update request:
-      1. If updating an existing agent, call `aegis.agent.export` with {"name": "<agent_name>"} to retrieve the current manifest.
-      2. Call `aegis.schema.get` with {"key": "agent/manifest/v1"} to retrieve the canonical manifest schema.
-      3. Compose the complete YAML manifest following the schema strictly.
+      1. Call `aegis.agent.list` to retrieve all existing agents. Inspect each agent's name, description,
+         labels, and capability to determine if an agent already exists that satisfies the requested
+         capability. If a sufficiently similar agent already exists, do not create a duplicate — instead
+         return a skipped entry explaining which existing agent covers the requirement and why.
+         Only proceed if no existing agent covers the requested capability.
+      2. If updating an existing agent, call `aegis.agent.export` with {"name": "<agent_name>"} to retrieve the current manifest.
+      3. Call `aegis.schema.get` with {"key": "agent/manifest/v1"} to retrieve the canonical manifest schema.
+      4. Compose the complete YAML manifest following the schema strictly.
          - Use lowercase DNS-safe metadata.name.
          - Keep runtime and security settings explicit.
          - Prefer deterministic validation in execution.validation when feasible.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
-      4. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
+      5. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
-      5. Only after step 4 returns valid:true for the exact YAML you will submit:
+      6. Only after step 5 returns valid:true for the exact YAML you will submit:
          - For new agents: call `aegis.agent.create` with the validated manifest.
          - For updates: call `aegis.agent.update` with the validated manifest.
          - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
       Do not call `aegis.agent.create` or `aegis.agent.update` from a draft manifest, a partially
       composed manifest, or a manifest that has not been schema-validated in the current run.
-      Skipping, reordering, or collapsing steps 1–4 is a policy violation and will cause judge rejection.
+      Skipping, reordering, or collapsing steps 1–5 is a policy violation and will cause judge rejection.
 
       When generating multiple missing agents, handle each manifest independently and repeat the
       full sequence above for every agent. A previous successful validation does not authorize a
@@ -109,6 +114,7 @@ spec:
         timeout_seconds: 90
 
   tools:
+    - aegis.agent.list
     - aegis.schema.get
     - aegis.schema.validate
     - aegis.agent.create
