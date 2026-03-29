@@ -1,0 +1,40 @@
+# Slim runtime image for AEGIS Runtime Service
+# Requires a pre-built 'aegis' binary at the build context root.
+# Use Dockerfile.runtime for a self-contained multi-stage build.
+
+FROM ubuntu:24.04
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    curl \
+    tini \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy pre-built binary from build context root
+COPY aegis /usr/local/bin/aegis-runtime
+COPY aegis-orchestrator/docker/runtime-entrypoint.sh /usr/local/bin/runtime-entrypoint.sh
+
+# Copy bootstrap script for mounting into agent containers
+COPY aegis-orchestrator/assets ./assets
+
+# Expose gRPC ports
+EXPOSE 8088 50051
+
+# Run as non-root user with container runtime socket access
+# Create container-runtime group (use build arg for custom GID) and add aegis user to it
+# Default 989 matches the docker/podman group GID on many Linux distros; override at build time
+# (CONTAINER_RUNTIME_GID=<host-gid>) so the container's group aligns with the host's.
+ARG CONTAINER_RUNTIME_GID=989
+RUN groupadd -g ${CONTAINER_RUNTIME_GID} container-runtime || true && \
+    useradd -m -u 10000 -G container-runtime aegis && \
+    chown -R aegis:aegis /app && \
+    chmod +x /usr/local/bin/runtime-entrypoint.sh
+
+# Use tini for proper signal forwarding/reaping and run startup glue from
+# entrypoint, then exec runtime as unprivileged user in foreground.
+ENTRYPOINT ["tini", "--", "/usr/local/bin/runtime-entrypoint.sh"]
+CMD ["/usr/local/bin/aegis-runtime", "--daemon"]

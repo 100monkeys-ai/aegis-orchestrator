@@ -6,9 +6,21 @@ This directory contains the **build tooling** (Dockerfiles) for the AEGIS runtim
 > It has moved to [aegis-examples/deploy/](https://github.com/100monkeys-ai/aegis-examples/tree/main/deploy).
 > Clone `aegis-examples` and follow the [Getting Started guide](https://docs.aegis.ai/docs/getting-started).
 
-## Files
+## Dockerfiles
 
-- **Dockerfile.runtime** - Multi-stage build for the AEGIS Rust runtime (`ghcr.io/100monkeys-ai/aegis-runtime`)
+| File | Purpose |
+| --- | --- |
+| **Dockerfile.runtime** | Self-contained multi-stage build. Compiles Rust inside Docker using BuildKit layer caching. Slower, but requires no local toolchain — good fallback when a local build environment is unavailable. |
+| **Dockerfile.runtime-slim** | Copy-only runtime image. Expects a pre-built `aegis` binary at the build context root. Used by CI and the `scripts/docker-build-local.sh` helper for fast image packaging. |
+
+Both produce `ghcr.io/100monkeys-ai/aegis-runtime`.
+
+### glibc Compatibility
+
+The `Dockerfile.runtime-slim` image is based on Ubuntu 24.04 (glibc 2.39). Any binary copied in **must** be built on a system with glibc <= 2.39 to avoid runtime linker errors. CI enforces this by building on Ubuntu 24.04 runners.
+
+### Other Files
+
 - **CORTEX_SERVICES.md** - Notes on the Cortex embedding and Neo4j services
 
 > **Temporal Worker image** moved to its own repo: [aegis-temporal-worker](https://github.com/100monkeys-ai/aegis-temporal-worker).
@@ -25,20 +37,48 @@ Both platform images are automatically built and pushed to `ghcr.io` via GitHub 
 | `ghcr.io/100monkeys-ai/aegis-runtime` | `aegis-orchestrator` | `.github/workflows/docker-publish.yml` | Push to `main` (`:latest`, `:sha-<short>`) Semver tags `*.*.*` |
 | `ghcr.io/100monkeys-ai/aegis-temporal-worker` | `aegis-temporal-worker` | `.github/workflows/docker-publish.yml` | Push to `main` (`:latest`, `:sha-<short>`) Semver tags `*.*.*` |
 
+CI now builds the `aegis` binary **natively** on the runner (for better cargo/sccache caching), then packages it via `Dockerfile.runtime-slim`. This separates compilation from image assembly, making builds faster and more cacheable.
+
 ### Tagging Strategy
 
 - **`:latest`** — updated on every push to `main`
 - **`:sha-abc1234`** — short commit SHA for traceability on `main` pushes
 - **`:0.1.0`**, **`:0.1`**, **`:0`** — semver tags when `v0.1.0` git tag is pushed
-- Rust builds use **BuildKit GHA layer caching** to avoid rebuilding unchanged dependencies
 
-## Building images locally
+## Building Images Locally
 
-From the repo root:
+### Recommended: `scripts/docker-build-local.sh`
+
+The helper script builds the binary and packages the image in one step:
 
 ```bash
-# Build the Rust runtime image
+# Auto-detect: uses native cargo if available, falls back to Docker multi-stage
+scripts/docker-build-local.sh
+
+# Force native build (fastest — requires local Rust toolchain)
+scripts/docker-build-local.sh native
+
+# Force Docker multi-stage build (no local toolchain needed)
+scripts/docker-build-local.sh docker
+```
+
+**Modes:**
+
+| Mode | What it does |
+| --- | --- |
+| `native` | Runs `cargo build --release` locally, then packages via `Dockerfile.runtime-slim`. Fastest option. |
+| `docker` | Uses `Dockerfile.runtime` to compile Rust inside Docker. No local toolchain required. |
+| `auto` (default) | Uses `native` if `cargo` is on `$PATH`, otherwise falls back to `docker`. |
+
+### Manual builds
+
+```bash
+# Multi-stage (self-contained, no local toolchain)
 docker build -f docker/Dockerfile.runtime -t aegis-runtime:local .
+
+# Slim (pre-built binary — must exist at repo root as ./aegis)
+cargo build --release && cp target/release/aegis .
+docker build -f docker/Dockerfile.runtime-slim -t aegis-runtime:local .
 ```
 
 To build the Temporal Worker image locally, clone [aegis-temporal-worker](https://github.com/100monkeys-ai/aegis-temporal-worker) and run `docker build -t aegis-temporal-worker:local .` from that repo root.
