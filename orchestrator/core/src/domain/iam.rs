@@ -102,6 +102,24 @@ pub struct UserIdentity {
     pub identity_kind: IdentityKind,
 }
 
+impl UserIdentity {
+    /// Derive the SMCP SecurityContext name from this identity (ADR-083).
+    ///
+    /// - Consumer users map to their Zaru tier context (`zaru-free`, `zaru-pro`, …).
+    /// - Operators and service accounts map to `aegis-system-operator`.
+    /// - Tenant users map to `aegis-system-operator` (tenant-scoped contexts are a future extension).
+    pub fn to_security_context_name(&self) -> String {
+        match &self.identity_kind {
+            IdentityKind::ConsumerUser { zaru_tier } => {
+                zaru_tier.to_security_context_name().to_string()
+            }
+            IdentityKind::Operator { .. }
+            | IdentityKind::ServiceAccount { .. }
+            | IdentityKind::TenantUser { .. } => "aegis-system-operator".to_string(),
+        }
+    }
+}
+
 /// Classification of the authenticated entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IdentityKind {

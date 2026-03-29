@@ -236,6 +236,12 @@ impl AegisRuntime for AegisRuntimeService {
         // Channel for streaming events
         let (tx, rx) = mpsc::channel(100);
 
+        // ADR-083: derive security context from authenticated identity
+        let security_context_name = identity
+            .as_ref()
+            .map(|id| id.to_security_context_name())
+            .unwrap_or_else(|| "aegis-system-operator".to_string());
+
         // Clone for async task
         let execution_service = self.execution_service.clone();
         let tx_clone = tx.clone();
@@ -279,7 +285,9 @@ impl AegisRuntime for AegisRuntimeService {
                     .start_child_execution(agent_id, input, parent_id)
                     .await
             } else {
-                execution_service.start_execution(agent_id, input).await
+                execution_service
+                    .start_execution(agent_id, input, security_context_name)
+                    .await
             };
 
             // Start execution
@@ -1109,6 +1117,7 @@ mod tests {
             &self,
             _agent_id: AgentId,
             _input: ExecutionInput,
+            _security_context_name: String,
         ) -> Result<ExecutionId> {
             Ok(self.execution_id)
         }
@@ -1300,6 +1309,7 @@ mod tests {
             hierarchy: crate::domain::execution::ExecutionHierarchy::root(execution_id),
             container_uid: 1000,
             container_gid: 1000,
+            security_context_name: "aegis-system-operator".to_string(),
         };
         let execution_service = Arc::new(TestExecutionService {
             execution_id,

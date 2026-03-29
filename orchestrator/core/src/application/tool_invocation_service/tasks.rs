@@ -4,6 +4,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_execute_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let agent_ref = args
             .get("agent_id")
@@ -65,6 +66,7 @@ impl ToolInvocationService {
                     intent: None,
                     payload: input,
                 },
+                security_context.name.clone(),
             )
             .await
         {

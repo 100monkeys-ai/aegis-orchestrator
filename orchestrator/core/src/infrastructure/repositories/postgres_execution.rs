@@ -100,11 +100,12 @@ impl ExecutionRepository for PostgresExecutionRepository {
             r#"
             INSERT INTO executions (
                 id, tenant_id, agent_id, input, status, iterations,
-                current_iteration, max_iterations, final_output, error_message, 
+                current_iteration, max_iterations, final_output, error_message,
                 container_uid, container_gid,
-                started_at, completed_at, parent_execution_id
+                started_at, completed_at, parent_execution_id,
+                security_context_name
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 status = EXCLUDED.status,
@@ -115,7 +116,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 container_uid = EXCLUDED.container_uid,
                 container_gid = EXCLUDED.container_gid,
                 completed_at = EXCLUDED.completed_at,
-                parent_execution_id = EXCLUDED.parent_execution_id
+                parent_execution_id = EXCLUDED.parent_execution_id,
+                security_context_name = EXCLUDED.security_context_name
             "#,
         )
         .bind(execution.id.0)
@@ -133,6 +135,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(execution.started_at)
         .bind(execution.ended_at)
         .bind(parent_execution_id)
+        .bind(&execution.security_context_name)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
@@ -147,11 +150,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
     ) -> Result<Option<Execution>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT 
-                id, agent_id, input, status, iterations, max_iterations, 
+            SELECT
+                id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message,
-                parent_execution_id
+                parent_execution_id, security_context_name
             FROM executions
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -175,6 +178,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
+            let security_context_name: String = row.get("security_context_name");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -249,6 +253,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 ended_at: completed_at,
                 error: error_message,
                 hierarchy,
+                security_context_name,
             }))
         } else {
             Ok(None)
@@ -263,10 +268,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                id, agent_id, input, status, iterations, max_iterations, 
+            SELECT
+                id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
-                started_at, completed_at, error_message, parent_execution_id
+                started_at, completed_at, error_message, parent_execution_id,
+                security_context_name
             FROM executions
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY started_at DESC
@@ -295,6 +301,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
+            let security_context_name: String = row.get("security_context_name");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -358,6 +365,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 ended_at: completed_at,
                 error: error_message,
                 hierarchy,
+                security_context_name,
             });
         }
 
@@ -371,10 +379,11 @@ impl ExecutionRepository for PostgresExecutionRepository {
     ) -> Result<Vec<Execution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                id, agent_id, input, status, iterations, max_iterations, 
+            SELECT
+                id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
-                started_at, completed_at, error_message, parent_execution_id
+                started_at, completed_at, error_message, parent_execution_id,
+                security_context_name
             FROM executions
             WHERE tenant_id = $1
             ORDER BY started_at DESC
@@ -401,6 +410,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
+            let security_context_name: String = row.get("security_context_name");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -464,6 +474,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 ended_at: completed_at,
                 error: error_message,
                 hierarchy,
+                security_context_name,
             });
         }
         Ok(executions)

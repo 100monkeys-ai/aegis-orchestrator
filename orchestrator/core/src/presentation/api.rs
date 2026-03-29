@@ -364,7 +364,8 @@ async fn start_execution(
 
     match state
         .execution_service
-        .start_execution(agent_id, input)
+        // ADR-083: operator context for internal REST API (no identity extraction)
+        .start_execution(agent_id, input, "aegis-system-operator".to_string())
         .await
     {
         Ok(id) => Json(json!({ "execution_id": id.0.to_string() })),
@@ -2575,6 +2576,7 @@ mod tests {
             &self,
             _agent_id: AgentId,
             _input: ExecutionInput,
+            _security_context_name: String,
         ) -> Result<crate::domain::execution::ExecutionId> {
             Err(anyhow!("not used in presentation api tests"))
         }

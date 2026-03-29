@@ -3927,9 +3927,15 @@ async fn execute_agent_handler(
         payload,
     };
 
+    // ADR-083: derive security context from authenticated identity
+    let security_context_name = identity
+        .as_ref()
+        .map(|ext| ext.0.to_security_context_name())
+        .unwrap_or_else(|| "aegis-system-operator".to_string());
+
     match state
         .execution_service
-        .start_execution(AgentId(agent_id), input)
+        .start_execution(AgentId(agent_id), input, security_context_name)
         .await
     {
         Ok(id) => (

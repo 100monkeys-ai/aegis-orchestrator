@@ -187,8 +187,8 @@ impl ToolInvocationService {
     }
 
     /// Internal orchestrator-driven tool invocation (Gateway pattern).
-    /// Resolves the SecurityContext from the agent's active SMCP session or
-    /// the "default" fallback, then delegates to `dispatch_tool_core`.
+    /// Resolves the SecurityContext from the execution's `security_context_name`
+    /// (ADR-083), then delegates to `dispatch_tool_core`.
     pub async fn invoke_tool_internal(
         &self,
         agent_id: &AgentId,
@@ -198,27 +198,33 @@ impl ToolInvocationService {
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
-        // 1. Determine the applicable SecurityContext.
-        // If the agent is connected via SMCP (Path 1), it has an active session.
-        // If the agent is running via Container Dispatch Protocol (Path 3), it does NOT
-        // establish an SMCP session natively but still needs policy enforcement.
-        let security_context = match self.smcp_session_repo.find_active_by_agent(agent_id).await {
-            Ok(Some(session)) => session.security_context,
-            _ => {
-                // Fallback for inner-loop executions. Try to load the "default" context.
-                self.security_context_repo
-                    .find_by_name("default")
-                    .await
-                    .map_err(|e| {
-                        SmcpSessionError::MalformedPayload(format!(
-                            "Failed to load fallback security context 'default': {e}"
-                        ))
-                    })?
-                    .ok_or(SmcpSessionError::SessionInactive(
-                        crate::domain::smcp_session::SessionStatus::Expired,
-                    ))?
-            }
-        };
+        // 1. Load the execution to obtain its security_context_name (ADR-083).
+        let execution = self
+            .execution_service
+            .get_execution(execution_id)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::MalformedPayload(format!(
+                    "Failed to load execution {execution_id}: {e}"
+                ))
+            })?;
+
+        let security_context = self
+            .security_context_repo
+            .find_by_name(&execution.security_context_name)
+            .await
+            .map_err(|e| {
+                SmcpSessionError::MalformedPayload(format!(
+                    "Failed to load security context '{}': {e}",
+                    execution.security_context_name
+                ))
+            })?
+            .ok_or_else(|| {
+                SmcpSessionError::MalformedPayload(format!(
+                    "Security context '{}' not found for execution {execution_id}",
+                    execution.security_context_name
+                ))
+            })?;
 
         // 2. Delegate to unified dispatch core.
         self.dispatch_tool_core(
@@ -733,7 +739,7 @@ impl ToolInvocationService {
             "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
             "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),
             "aegis.agent.delete" => Some(self.invoke_aegis_agent_delete_tool(args).await),
-            "aegis.agent.generate" => Some(self.invoke_aegis_agent_generate_tool(args).await),
+            "aegis.agent.generate" => Some(self.invoke_aegis_agent_generate_tool(args, security_context).await),
             "aegis.agent.export" => Some(self.invoke_aegis_agent_export_tool(args).await),
             "aegis.agent.list" => Some(self.invoke_aegis_agent_list_tool(args).await),
             "aegis.agent.logs" => Some(self.invoke_aegis_agent_logs_tool(args).await),
@@ -768,7 +774,7 @@ impl ToolInvocationService {
                 )
                 .await,
             ),
-            "aegis.task.execute" => Some(self.invoke_aegis_task_execute_tool(args).await),
+            "aegis.task.execute" => Some(self.invoke_aegis_task_execute_tool(args, security_context).await),
             "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
             "aegis.task.wait" => Some(self.invoke_aegis_task_wait_tool(args).await),
             "aegis.task.logs" => Some(self.invoke_aegis_task_logs_tool(args).await),

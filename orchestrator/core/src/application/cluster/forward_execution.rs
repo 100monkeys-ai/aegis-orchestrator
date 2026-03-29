@@ -20,6 +20,8 @@ pub struct ForwardExecutionRequest {
     pub tenant_id: TenantId,
     pub originating_node_id: String,
     pub user_security_token: String,
+    /// ADR-083: security context name propagated from the originating node
+    pub security_context_name: String,
 }
 
 pub struct ForwardExecutionUseCase {
@@ -40,7 +42,7 @@ impl ForwardExecutionUseCase {
         // single-node Phase 1 baseline, so the local execution service allocates the execution id.
         let local_id = self
             .execution_service
-            .start_execution(req.agent_id, input)
+            .start_execution(req.agent_id, input, req.security_context_name)
             .await?;
 
         if local_id != req.execution_id {

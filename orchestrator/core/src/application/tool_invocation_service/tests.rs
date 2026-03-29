@@ -294,7 +294,7 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
 struct TestExecutionService;
 #[async_trait]
 impl ExecutionService for TestExecutionService {
-    async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+    async fn start_execution(&self, _: AgentId, _: ExecutionInput, _: String) -> Result<ExecutionId> {
         anyhow::bail!("TestExecutionService::start_execution not exercised in this test")
     }
     async fn start_child_execution(
@@ -356,7 +356,7 @@ struct LogsTestExecutionService {
 
 #[async_trait]
 impl ExecutionService for LogsTestExecutionService {
-    async fn start_execution(&self, _: AgentId, _: ExecutionInput) -> Result<ExecutionId> {
+    async fn start_execution(&self, _: AgentId, _: ExecutionInput, _: String) -> Result<ExecutionId> {
         anyhow::bail!("LogsTestExecutionService::start_execution not exercised in this test")
     }
 
@@ -1357,6 +1357,7 @@ async fn task_logs_tool_returns_paginated_execution_events() {
             payload: serde_json::json!({"task":"demo"}),
         },
         3,
+        "aegis-system-operator".to_string(),
     );
     execution.status = ExecutionStatus::Running;
 
@@ -1448,6 +1449,7 @@ async fn task_logs_tool_returns_execution_fetch_error() {
             payload: serde_json::json!({}),
         },
         1,
+        "aegis-system-operator".to_string(),
     );
 
     let service = ToolInvocationService::new(

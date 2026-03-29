@@ -157,6 +157,10 @@ pub struct Execution {
     /// Default: 1000 (standard non-root group)
     #[serde(default = "default_container_gid")]
     pub container_gid: u32,
+
+    /// Security context name governing tool access for this execution (ADR-083).
+    #[serde(default = "default_security_context_name")]
+    pub security_context_name: String,
 }
 
 fn default_container_uid() -> u32 {
@@ -165,6 +169,10 @@ fn default_container_uid() -> u32 {
 
 fn default_container_gid() -> u32 {
     1000
+}
+
+fn default_security_context_name() -> String {
+    "aegis-system-operator".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,7 +274,7 @@ pub enum ExecutionError {
 }
 
 impl Execution {
-    pub fn new(agent_id: AgentId, input: ExecutionInput, max_iterations: u8) -> Self {
+    pub fn new(agent_id: AgentId, input: ExecutionInput, max_iterations: u8, security_context_name: String) -> Self {
         let id = ExecutionId::new();
         Self {
             id,
@@ -282,6 +290,7 @@ impl Execution {
             container_uid: 1000,
             container_gid: 1000,
             hierarchy: ExecutionHierarchy::root(id),
+            security_context_name,
         }
     }
 
@@ -310,6 +319,7 @@ impl Execution {
             container_uid: 1000,
             container_gid: 1000,
             hierarchy,
+            security_context_name: parent.security_context_name.clone(),
         })
     }
 
@@ -521,7 +531,7 @@ mod tests {
 
     #[test]
     fn test_new_execution_is_pending() {
-        let exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         assert_eq!(exec.status, ExecutionStatus::Pending);
         assert_eq!(exec.depth(), 0);
         assert!(exec.parent_id().is_none());
@@ -532,14 +542,14 @@ mod tests {
 
     #[test]
     fn test_execution_start_changes_status() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         assert_eq!(exec.status, ExecutionStatus::Running);
     }
 
     #[test]
     fn test_execution_complete() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.complete();
         assert_eq!(exec.status, ExecutionStatus::Completed);
@@ -548,7 +558,7 @@ mod tests {
 
     #[test]
     fn test_execution_fail() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.fail("something broke".to_string());
         assert_eq!(exec.status, ExecutionStatus::Failed);
@@ -560,7 +570,7 @@ mod tests {
 
     #[test]
     fn test_start_iteration() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         let iter = exec.start_iteration("generate".to_string()).unwrap();
         assert_eq!(iter.number, 1);
@@ -570,7 +580,7 @@ mod tests {
 
     #[test]
     fn test_complete_iteration() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("generate".to_string()).unwrap();
         exec.complete_iteration("result".to_string());
@@ -581,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_fail_iteration() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("generate".to_string()).unwrap();
         exec.fail_iteration(IterationError {
@@ -595,7 +605,7 @@ mod tests {
 
     #[test]
     fn test_max_iterations_enforced() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 2);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 2, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("iter1".to_string()).unwrap();
         exec.complete_iteration("out1".to_string());
@@ -607,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_store_validation_results() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("validate".to_string()).unwrap();
         let results = ValidationResults {
@@ -623,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_store_validation_results_wrong_iteration() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("validate".to_string()).unwrap();
         let results = ValidationResults {
@@ -639,7 +649,7 @@ mod tests {
 
     #[test]
     fn test_add_llm_interaction() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("generate".to_string()).unwrap();
         let interaction = LlmInteraction {
@@ -655,7 +665,7 @@ mod tests {
 
     #[test]
     fn test_add_llm_interaction_wrong_iteration() {
-        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5);
+        let mut exec = Execution::new(AgentId::new(), make_input("task"), 5, "aegis-system-operator".to_string());
         exec.start();
         exec.start_iteration("generate".to_string()).unwrap();
         let interaction = LlmInteraction {
@@ -717,7 +727,7 @@ mod tests {
     #[test]
     fn test_execution_info_from_execution() {
         let agent_id = AgentId::new();
-        let mut exec = Execution::new(agent_id, make_input("task"), 3);
+        let mut exec = Execution::new(agent_id, make_input("task"), 3, "aegis-system-operator".to_string());
         exec.start();
         exec.complete();
 

@@ -229,6 +229,7 @@ mod tests {
             &self,
             _agent_id: AgentId,
             _input: crate::domain::execution::ExecutionInput,
+            _security_context_name: String,
         ) -> Result<ExecutionId> {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }

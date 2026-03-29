@@ -94,6 +94,7 @@ pub trait ExecutionService: Send + Sync {
         &self,
         agent_id: AgentId,
         input: ExecutionInput,
+        security_context_name: String,
     ) -> Result<ExecutionId>;
 
     /// Start a new child execution spawned by a parent (e.g., a judge agent).
@@ -766,6 +767,7 @@ mod tests {
                 payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
             },
             1,
+            "aegis-system-operator".to_string(),
         )
     }
 
@@ -1418,6 +1420,7 @@ impl ExecutionService for StandardExecutionService {
         &self,
         agent_id: AgentId,
         input: ExecutionInput,
+        security_context_name: String,
     ) -> Result<ExecutionId> {
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
 
@@ -1516,7 +1519,7 @@ impl ExecutionService for StandardExecutionService {
             3 // Default
         };
 
-        let mut execution = Execution::new(agent_id, prepared_input.clone(), max_retries);
+        let mut execution = Execution::new(agent_id, prepared_input.clone(), max_retries, security_context_name);
         let execution_id = execution.id;
 
         // 3. Save initial state

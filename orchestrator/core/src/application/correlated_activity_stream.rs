@@ -712,6 +712,7 @@ mod tests {
                 payload: Value::Null,
             },
             3,
+            "aegis-system-operator".to_string(),
         );
         execution.start();
         execution.start_iteration("generate".to_string()).unwrap();
@@ -779,6 +780,7 @@ mod tests {
                 payload: Value::Null,
             },
             2,
+            "aegis-system-operator".to_string(),
         );
         let execution_id = execution.id;
         repository.save(&execution).await.unwrap();

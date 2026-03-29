@@ -277,9 +277,10 @@ impl StandardStimulusService {
         };
 
         // Run the RouterAgent
+        // ADR-083: operator context for system-initiated RouterAgent classification
         let exec_id = self
             .execution_service
-            .start_execution(agent_id, input)
+            .start_execution(agent_id, input, "aegis-system-operator".to_string())
             .await
             .map_err(|e| StimulusError::RouterAgentFailed(e.to_string()))?;
 
@@ -551,6 +552,7 @@ mod tests {
                     payload: json!({}),
                 },
                 1,
+                "aegis-system-operator".to_string(),
             );
             execution.start();
             execution.start_iteration("classify".to_string()).unwrap();
@@ -575,6 +577,7 @@ mod tests {
             &self,
             agent_id: AgentId,
             input: ExecutionInput,
+            _security_context_name: String,
         ) -> Result<ExecutionId> {
             self.start_calls.lock().unwrap().push((agent_id, input));
             Ok(self.exec_id)

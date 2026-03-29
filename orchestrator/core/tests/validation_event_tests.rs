@@ -38,6 +38,7 @@ impl ExecutionService for MockExecutionService {
         &self,
         _agent_id: AgentId,
         _input: ExecutionInput,
+        _security_context_name: String,
     ) -> anyhow::Result<ExecutionId> {
         Ok(ExecutionId::new())
     }
@@ -50,6 +51,7 @@ impl ExecutionService for MockExecutionService {
                 payload: serde_json::Value::Null,
             },
             3,
+            "aegis-system-operator".to_string(),
         );
 
         // Use public methods to populate state
