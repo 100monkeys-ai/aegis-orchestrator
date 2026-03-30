@@ -1985,7 +1985,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         builtin_dispatchers.push(
             aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
                 name: "aegis.task.wait".to_string(),
-                description: "Polls an execution until it reaches a terminal state and returns the result.".to_string(),
+                description:
+                    "Polls an execution until it reaches a terminal state and returns the result."
+                        .to_string(),
                 enabled: true,
                 capabilities: vec![
                     aegis_orchestrator_core::domain::node_config::CapabilityConfig {
