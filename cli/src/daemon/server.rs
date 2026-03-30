@@ -5729,7 +5729,7 @@ async fn remove_workflow_execution_handler(
                 .execute(&pool)
                 .await
                 .map(|_| ()),
-            Err(error) => Err(sqlx::Error::Configuration(Box::new(error))),
+            Err(error) => Err(error),
         }
     } else {
         Ok(())
