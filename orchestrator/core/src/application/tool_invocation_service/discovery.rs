@@ -13,6 +13,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_search_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
             SmcpSessionError::InternalError(
@@ -64,8 +65,10 @@ impl ToolInvocationService {
             include_platform_templates: include_templates,
         };
 
-        // Use Free tier as default — tier enforcement happens in StandardDiscoveryService
-        let tier = crate::domain::iam::ZaruTier::Free;
+        // Derive tier from the caller's SecurityContext name.
+        // Non-Zaru contexts (operators, service accounts) get Enterprise-level results.
+        let tier = crate::domain::iam::ZaruTier::from_security_context_name(&security_context.name)
+            .unwrap_or(crate::domain::iam::ZaruTier::Enterprise);
 
         let response = discovery
             .search_agents(&tenant_id, &tier, query)
@@ -104,6 +107,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_search_tool(
         &self,
         args: &Value,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SmcpSessionError> {
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
             SmcpSessionError::InternalError(
@@ -151,7 +155,10 @@ impl ToolInvocationService {
             include_platform_templates: include_templates,
         };
 
-        let tier = crate::domain::iam::ZaruTier::Free;
+        // Derive tier from the caller's SecurityContext name.
+        // Non-Zaru contexts (operators, service accounts) get Enterprise-level results.
+        let tier = crate::domain::iam::ZaruTier::from_security_context_name(&security_context.name)
+            .unwrap_or(crate::domain::iam::ZaruTier::Enterprise);
 
         let response = discovery
             .search_workflows(&tenant_id, &tier, query)

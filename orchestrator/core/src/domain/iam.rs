@@ -154,6 +154,19 @@ impl ZaruTier {
         }
     }
 
+    /// Derive from a SMCP SecurityContext name.
+    ///
+    /// Returns `None` for non-Zaru contexts (e.g. `aegis-system-operator`).
+    pub fn from_security_context_name(name: &str) -> Option<ZaruTier> {
+        match name {
+            "zaru-free" => Some(ZaruTier::Free),
+            "zaru-pro" => Some(ZaruTier::Pro),
+            "zaru-business" => Some(ZaruTier::Business),
+            "zaru-enterprise" => Some(ZaruTier::Enterprise),
+            _ => None,
+        }
+    }
+
     /// Parse from the string value in the OIDC `zaru_tier` custom claim.
     pub fn from_claim(value: &str) -> Option<ZaruTier> {
         match value {
@@ -321,6 +334,31 @@ mod tests {
             ZaruTier::Enterprise.to_security_context_name(),
             "zaru-enterprise"
         );
+    }
+
+    #[test]
+    fn zaru_tier_from_security_context_name() {
+        assert_eq!(
+            ZaruTier::from_security_context_name("zaru-free"),
+            Some(ZaruTier::Free)
+        );
+        assert_eq!(
+            ZaruTier::from_security_context_name("zaru-pro"),
+            Some(ZaruTier::Pro)
+        );
+        assert_eq!(
+            ZaruTier::from_security_context_name("zaru-business"),
+            Some(ZaruTier::Business)
+        );
+        assert_eq!(
+            ZaruTier::from_security_context_name("zaru-enterprise"),
+            Some(ZaruTier::Enterprise)
+        );
+        assert_eq!(
+            ZaruTier::from_security_context_name("aegis-system-operator"),
+            None
+        );
+        assert_eq!(ZaruTier::from_security_context_name("unknown"), None);
     }
 
     #[test]

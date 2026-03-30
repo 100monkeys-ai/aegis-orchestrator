@@ -814,8 +814,14 @@ impl ToolInvocationService {
             "aegis.tools.search" => {
                 Some(self.invoke_aegis_tools_search(args, security_context).await)
             }
-            "aegis.agent.search" => Some(self.invoke_aegis_agent_search_tool(args).await),
-            "aegis.workflow.search" => Some(self.invoke_aegis_workflow_search_tool(args).await),
+            "aegis.agent.search" => Some(
+                self.invoke_aegis_agent_search_tool(args, security_context)
+                    .await,
+            ),
+            "aegis.workflow.search" => Some(
+                self.invoke_aegis_workflow_search_tool(args, security_context)
+                    .await,
+            ),
             _ => None,
         }
     }
