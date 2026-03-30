@@ -182,6 +182,10 @@ fn per_minute_only(limit: u64) -> HashMap<RateLimitBucket, RateLimitWindow> {
     HashMap::from([win(RateLimitBucket::PerMinute, limit)])
 }
 
+fn hourly_only(limit: u64) -> HashMap<RateLimitBucket, RateLimitWindow> {
+    HashMap::from([win(RateLimitBucket::Hourly, limit)])
+}
+
 fn mk_policy(
     resource_type: RateLimitResourceType,
     windows: HashMap<RateLimitBucket, RateLimitWindow>,
@@ -190,6 +194,23 @@ fn mk_policy(
         resource_type,
         windows,
     }
+}
+
+fn discovery_search_policies(searches_per_hour: u64) -> Vec<RateLimitPolicy> {
+    vec![
+        mk_policy(
+            RateLimitResourceType::SmcpToolCall {
+                tool_pattern: "aegis.agent.search".into(),
+            },
+            hourly_only(searches_per_hour),
+        ),
+        mk_policy(
+            RateLimitResourceType::SmcpToolCall {
+                tool_pattern: "aegis.workflow.search".into(),
+            },
+            hourly_only(searches_per_hour),
+        ),
+    ]
 }
 
 fn smcp_policies(fs: u64, web_search: u64, other: u64) -> Vec<RateLimitPolicy> {
@@ -235,6 +256,7 @@ fn free_defaults() -> Vec<RateLimitPolicy> {
         ),
     ];
     p.extend(smcp_policies(60, 20, 30));
+    p.extend(discovery_search_policies(30));
     p
 }
 
@@ -258,6 +280,7 @@ fn pro_defaults() -> Vec<RateLimitPolicy> {
         ),
     ];
     p.extend(smcp_policies(300, 60, 120));
+    p.extend(discovery_search_policies(300));
     p
 }
 
@@ -281,6 +304,7 @@ fn business_defaults() -> Vec<RateLimitPolicy> {
         ),
     ];
     p.extend(smcp_policies(600, 200, 300));
+    p.extend(discovery_search_policies(1_000));
     p
 }
 
@@ -310,6 +334,7 @@ fn enterprise_defaults() -> Vec<RateLimitPolicy> {
         ),
     ];
     p.extend(smcp_policies(1_200, 500, 600));
+    p.extend(discovery_search_policies(5_000));
     p
 }
 
@@ -327,9 +352,9 @@ mod tests {
     }
 
     #[test]
-    fn free_tier_has_seven_policies() {
+    fn free_tier_has_nine_policies() {
         let policies = tier_defaults(&ZaruTier::Free);
-        assert_eq!(policies.len(), 7);
+        assert_eq!(policies.len(), 9);
     }
 
     #[test]
@@ -347,12 +372,22 @@ mod tests {
     }
 
     #[test]
-    fn smcp_tool_policies_are_per_minute_only() {
+    fn smcp_tool_policies_use_single_window() {
         let policies = tier_defaults(&ZaruTier::Pro);
         for p in &policies {
-            if let RateLimitResourceType::SmcpToolCall { .. } = &p.resource_type {
-                assert_eq!(p.windows.len(), 1);
-                assert!(p.windows.contains_key(&RateLimitBucket::PerMinute));
+            if let RateLimitResourceType::SmcpToolCall { tool_pattern } = &p.resource_type {
+                assert_eq!(
+                    p.windows.len(),
+                    1,
+                    "tool {tool_pattern} should have exactly one window"
+                );
+                // Discovery search tools use hourly windows; all others use per-minute
+                let is_discovery = tool_pattern.contains(".search");
+                if is_discovery {
+                    assert!(p.windows.contains_key(&RateLimitBucket::Hourly));
+                } else {
+                    assert!(p.windows.contains_key(&RateLimitBucket::PerMinute));
+                }
             }
         }
     }

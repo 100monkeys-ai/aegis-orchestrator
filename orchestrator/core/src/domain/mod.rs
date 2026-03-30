@@ -30,6 +30,7 @@
 //! | [`mcp`] | BC-12 SMCP / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
 //! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
 //! | [`shared_kernel`] | Shared Kernel | Cross-context identity types — DDD Shared Kernel pattern |
+//! | [`discovery`] | BC-1/BC-3 Agent & Workflow Discovery | `DiscoveryQuery`, `DiscoveryResult`, `DiscoveryResponse` value objects (ADR-075) |
 //! | [`env_guard`] | Cross-cutting | Environment variable isolation guard for execution contexts |
 //! | [`events`] | Cross-cutting | All domain events — single catalog used by the event bus (ADR-030) |
 //! | [`repository`] | Cross-cutting | Repository traits for all aggregate roots |
@@ -41,6 +42,7 @@
 
 pub mod agent;
 pub mod cluster;
+pub mod discovery;
 pub mod dispatch;
 pub mod env_guard;
 pub mod events;

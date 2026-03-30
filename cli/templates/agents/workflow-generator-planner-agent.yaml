@@ -19,9 +19,20 @@ spec:
     instruction: |
       You are a workflow planning specialist.
 
-      First, call `aegis.agent.list` and `aegis.workflow.list` to inspect currently deployed agents and registered workflows.
+      First, call `aegis.workflow.search` with a semantic query derived from the user's workflow request.
+      - If the call succeeds and any result has `similarity_score >= 0.85`, present them to the user:
+        "Found existing workflows that may match your intent: [list with scores]. Would you like to
+        use one of these, or proceed with generating a new workflow?" Only proceed with generation
+        if no matches exceed the threshold or the user explicitly confirms.
+      - If the call returns an error (e.g., discovery not configured), fall back to `aegis.workflow.list`.
+
+      Next, discover agents. For each required workflow step, call `aegis.agent.search` with a
+      semantic query describing the needed capability.
+      - If the call succeeds and returns results with `similarity_score >= 0.85`, map them as existing agents.
+      - If the call returns an error, fall back to `aegis.agent.list` and inspect agents manually.
+
       Then analyze the user workflow request step-by-step. For each required workflow step:
-      - map it to an existing deployed agent when possible
+      - map it to an existing deployed agent when possible (preferring search results)
       - only mark it as missing when no suitable deployed agent exists
       - treat any semantic validator, tool validator, judge_agent, or judges reference as a judge dependency
       - determine whether each judge dependency is already deployed or must be generated
@@ -65,6 +76,8 @@ spec:
         timeout_seconds: 120
 
   tools:
+    - aegis.workflow.search
+    - aegis.agent.search
     - aegis.agent.list
     - aegis.workflow.list
 

@@ -50,6 +50,7 @@ impl ToolInvocationService {
             workflow_execution_control: None,
             agent_activity: None,
             tool_catalog: None,
+            discovery_service: None,
         }
     }
 
@@ -120,6 +121,15 @@ impl ToolInvocationService {
     /// Attach a `StandardToolCatalog` to enable `aegis.tools.list` and `aegis.tools.search`.
     pub fn with_tool_catalog(mut self, catalog: Arc<StandardToolCatalog>) -> Self {
         self.tool_catalog = Some(catalog);
+        self
+    }
+
+    /// Attach a `DiscoveryService` for semantic search over agents and workflows (ADR-075).
+    pub fn with_discovery_service(
+        mut self,
+        svc: Arc<dyn crate::application::discovery_service::DiscoveryService>,
+    ) -> Self {
+        self.discovery_service = Some(svc);
         self
     }
 
@@ -804,6 +814,8 @@ impl ToolInvocationService {
             "aegis.tools.search" => {
                 Some(self.invoke_aegis_tools_search(args, security_context).await)
             }
+            "aegis.agent.search" => Some(self.invoke_aegis_agent_search_tool(args).await),
+            "aegis.workflow.search" => Some(self.invoke_aegis_workflow_search_tool(args).await),
             _ => None,
         }
     }

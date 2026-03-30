@@ -15,13 +15,15 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::application::agent::AgentLifecycleService;
+use crate::application::discovery_service::DiscoveryService;
 use crate::application::execution::ExecutionService;
 use crate::application::run_container_step::RunContainerStepUseCase;
 use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
 use crate::domain::agent::AgentId;
+use crate::domain::discovery::DiscoveryQuery;
 use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus};
-use crate::domain::iam::{IdentityKind, UserIdentity};
+use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::tenant::TenantId;
 
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
@@ -67,6 +69,8 @@ pub struct AegisRuntimeService {
     run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
     /// BC-1: Agent lifecycle service for resolving agent name → UUID at execution time (Phase 1b).
     agent_service: Option<Arc<dyn AgentLifecycleService>>,
+    /// ADR-075: Discovery service for semantic search over agents and workflows.
+    discovery_service: Option<Arc<dyn DiscoveryService>>,
 }
 
 impl AegisRuntimeService {
@@ -79,6 +83,17 @@ impl AegisRuntimeService {
             Some(IdentityKind::Operator { .. }) => TenantId::system(),
             Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
             None => TenantId::default(),
+        }
+    }
+
+    fn zaru_tier_from_identity(identity: Option<&UserIdentity>) -> ZaruTier {
+        match identity.map(|id| &id.identity_kind) {
+            Some(IdentityKind::ConsumerUser { zaru_tier }) => zaru_tier.clone(),
+            // Operators and service accounts get Enterprise-level discovery access.
+            Some(IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. }) => {
+                ZaruTier::Enterprise
+            }
+            Some(IdentityKind::TenantUser { .. }) | None => ZaruTier::Free,
         }
     }
 
@@ -96,6 +111,7 @@ impl AegisRuntimeService {
             stimulus_service: None,
             run_container_step_use_case: None,
             agent_service: None,
+            discovery_service: None,
         }
     }
 
@@ -142,6 +158,12 @@ impl AegisRuntimeService {
     /// Set the agent lifecycle service for name-to-UUID resolution at execution time (Phase 1b).
     pub fn with_agent_service(mut self, svc: Arc<dyn AgentLifecycleService>) -> Self {
         self.agent_service = Some(svc);
+        self
+    }
+
+    /// Set the discovery service for semantic search over agents and workflows (ADR-075).
+    pub fn with_discovery_service(mut self, svc: Arc<dyn DiscoveryService>) -> Self {
+        self.discovery_service = Some(svc);
         self
     }
 
@@ -810,6 +832,130 @@ impl AegisRuntime for AegisRuntimeService {
             }
         }
     }
+
+    /// Search for agents matching a natural-language query (ADR-075).
+    async fn search_agents(
+        &self,
+        request: Request<SearchAgentsRequest>,
+    ) -> Result<Response<SearchAgentsResponse>, Status> {
+        let identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/SearchAgents")
+            .await?;
+
+        let Some(ref discovery) = self.discovery_service else {
+            return Err(Status::unavailable(
+                "Discovery service not configured — enterprise feature",
+            ));
+        };
+
+        let req = request.into_inner();
+        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
+
+        let query = DiscoveryQuery {
+            query: req.query,
+            limit: req.limit,
+            min_score: req.min_score,
+            label_filters: req.label_filters,
+            status_filter: if req.status_filter.is_empty() {
+                None
+            } else {
+                Some(req.status_filter)
+            },
+            include_platform_templates: req.include_platform_templates,
+        };
+
+        let tier = Self::zaru_tier_from_identity(identity.as_ref());
+
+        match discovery.search_agents(&tenant_id, &tier, query).await {
+            Ok(response) => {
+                let results = response
+                    .results
+                    .into_iter()
+                    .map(|r| DiscoveryResultProto {
+                        resource_id: r.resource_id,
+                        kind: format!("{:?}", r.kind),
+                        name: r.name,
+                        version: r.version,
+                        description: r.description,
+                        labels: r.labels,
+                        similarity_score: r.similarity_score,
+                        relevance_score: r.relevance_score,
+                        tenant_id: r.tenant_id,
+                        updated_at: r.updated_at.to_rfc3339(),
+                        is_platform_template: r.is_platform_template,
+                    })
+                    .collect();
+
+                Ok(Response::new(SearchAgentsResponse {
+                    results,
+                    total_indexed: response.total_indexed,
+                    query_time_ms: response.query_time_ms,
+                    search_mode: format!("{:?}", response.search_mode),
+                }))
+            }
+            Err(e) => Err(Status::internal(format!("Agent search failed: {e}"))),
+        }
+    }
+
+    /// Search for workflows matching a natural-language query (ADR-075).
+    async fn search_workflows(
+        &self,
+        request: Request<SearchWorkflowsRequest>,
+    ) -> Result<Response<SearchWorkflowsResponse>, Status> {
+        let identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/SearchWorkflows")
+            .await?;
+
+        let Some(ref discovery) = self.discovery_service else {
+            return Err(Status::unavailable(
+                "Discovery service not configured — enterprise feature",
+            ));
+        };
+
+        let req = request.into_inner();
+        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
+
+        let query = DiscoveryQuery {
+            query: req.query,
+            limit: req.limit,
+            min_score: req.min_score,
+            label_filters: req.label_filters,
+            status_filter: None,
+            include_platform_templates: req.include_platform_templates,
+        };
+
+        let tier = Self::zaru_tier_from_identity(identity.as_ref());
+
+        match discovery.search_workflows(&tenant_id, &tier, query).await {
+            Ok(response) => {
+                let results = response
+                    .results
+                    .into_iter()
+                    .map(|r| DiscoveryResultProto {
+                        resource_id: r.resource_id,
+                        kind: format!("{:?}", r.kind),
+                        name: r.name,
+                        version: r.version,
+                        description: r.description,
+                        labels: r.labels,
+                        similarity_score: r.similarity_score,
+                        relevance_score: r.relevance_score,
+                        tenant_id: r.tenant_id,
+                        updated_at: r.updated_at.to_rfc3339(),
+                        is_platform_template: r.is_platform_template,
+                    })
+                    .collect();
+
+                Ok(Response::new(SearchWorkflowsResponse {
+                    results,
+                    total_indexed: response.total_indexed,
+                    query_time_ms: response.query_time_ms,
+                    search_mode: format!("{:?}", response.search_mode),
+                }))
+            }
+            Err(e) => Err(Status::internal(format!("Workflow search failed: {e}"))),
+        }
+    }
 }
 
 // ── BC-8: IngestStimulus gRPC helper ──────────────────────────────────────────
@@ -1055,6 +1201,7 @@ pub struct GrpcServerConfig {
     pub run_container_step_use_case: Option<Arc<RunContainerStepUseCase>>,
     pub agent_service: Option<Arc<dyn AgentLifecycleService>>,
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
+    pub discovery_service: Option<Arc<dyn DiscoveryService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1082,6 +1229,10 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     if let Some(agent_service) = config.agent_service {
         service = service.with_agent_service(agent_service);
+    }
+
+    if let Some(discovery) = config.discovery_service {
+        service = service.with_discovery_service(discovery);
     }
 
     let server = service.into_server();

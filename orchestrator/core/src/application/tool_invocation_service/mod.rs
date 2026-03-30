@@ -3,6 +3,7 @@
 
 mod agents;
 mod audit;
+mod discovery;
 mod facade;
 mod gateway;
 mod system;
@@ -109,4 +110,6 @@ pub struct ToolInvocationService {
     agent_activity: Option<Arc<dyn AgentActivityPort>>,
     /// Optional tool catalog for aegis.tools.list / aegis.tools.search discovery.
     tool_catalog: Option<Arc<StandardToolCatalog>>,
+    /// Optional discovery service for semantic search over agents and workflows (ADR-075).
+    discovery_service: Option<Arc<dyn crate::application::discovery_service::DiscoveryService>>,
 }
