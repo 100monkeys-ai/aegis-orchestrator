@@ -82,6 +82,9 @@ vaultrs = "0.7"
 # Secrets Manager (ADR-034)
 lru = "0.16"
 
+# Discovery Index (ADR-075)
+qdrant-client = "1.13"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.27"

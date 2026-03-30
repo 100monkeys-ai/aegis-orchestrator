@@ -525,6 +525,7 @@ mod tests {
                 image_tag: None,
                 deploy_builtins: false,
                 max_execution_list_limit: None,
+                discovery: None,
             },
         };
 

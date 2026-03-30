@@ -101,3 +101,7 @@ spec:
 
   # cortex:
   #   grpc_url: "http://cortex:50052"      # Cortex gRPC service URL
+
+  # discovery:                                # Enterprise-only (ADR-075)
+  #   qdrant_url: "http://aegis-cortex:6334"
+  #   embedding_url: "http://aegis-cortex:50054"

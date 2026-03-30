@@ -26,12 +26,16 @@ spec:
       returns invalid output, stop and return errors/skipped instead of trying to deploy anyway.
 
       REQUIRED WORKFLOW — follow this order on every agent creation or update request:
-      1. Call `aegis.agent.search` with keywords derived from the user's intent to find semantically
-         similar existing agents. If the search tool is unavailable or returns an error, fall back to
-         `aegis.agent.list` and inspect each agent's name, description, labels, and capability manually.
-         In either case, determine if an agent already exists that satisfies the requested capability.
-         If a sufficiently similar agent already exists, do not create a duplicate — instead return a
-         skipped entry explaining which existing agent covers the requirement and why.
+      1. Call `aegis.agent.search` with a semantic query derived from the user's requested capability.
+         - If the call succeeds and any result has `similarity_score >= 0.85`, present them to the user:
+           "Found existing agents that may match your intent: [list with scores]. Would you like to
+           use one of these, or proceed with generating a new agent?" Only proceed with generation
+           if no matches exceed the threshold or the user explicitly confirms.
+         - If the call returns an error (e.g., discovery not configured), fall back to `aegis.agent.list`
+           and inspect each agent's name, description, labels, and capability to determine if an agent
+           already exists that satisfies the requested capability.
+         In either case, if a sufficiently similar agent already exists, do not create a duplicate —
+         instead return a skipped entry explaining which existing agent covers the requirement and why.
          Only proceed if no existing agent covers the requested capability.
       2. Call `aegis.tools.search` with keywords and/or categories derived from the user's intent
          to discover which MCP tools are available on the platform. Use the results to inform
@@ -120,8 +124,8 @@ spec:
         timeout_seconds: 90
 
   tools:
-    - aegis.agent.list
     - aegis.agent.search
+    - aegis.agent.list
     - aegis.tools.search
     - aegis.schema.get
     - aegis.schema.validate

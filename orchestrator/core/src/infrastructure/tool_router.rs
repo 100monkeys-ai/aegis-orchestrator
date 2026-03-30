@@ -927,6 +927,73 @@ impl ToolRouter {
                         "type": "object",
                         "properties": {}
                     }),
+                    "aegis.agent.search" => json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language description of the agent you are looking for."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Tenant ID to search within. Defaults to current tenant."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
+                            },
+                            "min_score": {
+                                "type": "number",
+                                "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
+                            },
+                            "labels": {
+                                "type": "object",
+                                "description": "Label key-value pairs to filter by. All must match.",
+                                "additionalProperties": { "type": "string" }
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "Filter by agent status.",
+                                "enum": ["active", "paused", "failed"]
+                            },
+                            "include_platform_templates": {
+                                "type": "boolean",
+                                "description": "Include platform-provided template agents. Default: true."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
+                    "aegis.workflow.search" => json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "Natural-language description of the workflow you are looking for."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Tenant ID to search within. Defaults to current tenant."
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Maximum results (1-100, tier-dependent cap). Default: 10."
+                            },
+                            "min_score": {
+                                "type": "number",
+                                "description": "Minimum relevance score threshold (0.0-1.0). Default: 0.3."
+                            },
+                            "labels": {
+                                "type": "object",
+                                "description": "Label key-value pairs to filter by. All must match.",
+                                "additionalProperties": { "type": "string" }
+                            },
+                            "include_platform_templates": {
+                                "type": "boolean",
+                                "description": "Include platform-provided template workflows. Default: true."
+                            }
+                        },
+                        "required": ["query"]
+                    }),
                     "aegis.workflow.create" => json!({
                         "type": "object",
                         "properties": {
