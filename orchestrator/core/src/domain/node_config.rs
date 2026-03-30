@@ -145,11 +145,6 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cortex: Option<CortexConfig>,
 
-    /// Workflow & Agent Discovery Service configuration (ADR-075).
-    /// If omitted, the orchestrator runs without semantic search — enterprise feature.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub discovery: Option<DiscoveryConfig>,
-
     /// Secrets management configuration (ADR-034).
     /// Placed at `spec.secrets` in `aegis-config.yaml`.
     /// If omitted, the orchestrator uses `MockSecretStore` (dev/test only, logs a warning).
@@ -978,7 +973,7 @@ impl Default for TemporalConfig {
 /// is `None`), the orchestrator runs in **memoryless mode** — no error,
 /// no retry, patterns are simply not stored.
 ///
-/// The `grpc_url` field supports the `env:VAR_NAME` credential resolution pattern.
+/// Both fields support the `env:VAR_NAME` credential resolution pattern.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CortexConfig {
     /// gRPC URL of the Cortex service.
@@ -986,46 +981,13 @@ pub struct CortexConfig {
     /// If `None`, the orchestrator runs in memoryless mode.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_url: Option<String>,
-}
 
-/// Workflow & Agent Discovery Service configuration (ADR-075).
-///
-/// Configures semantic search over agents and workflows via Qdrant vector
-/// store and the embedding service. Enterprise-only feature.
-///
-/// If this section is omitted (or both URLs are `None`), the orchestrator
-/// runs without discovery — search tools return a clear error, and generator
-/// agents skip the deduplication step. No error, no retry.
-///
-/// Both URL fields support the `env:VAR_NAME` credential resolution pattern.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DiscoveryConfig {
-    /// Qdrant gRPC URL for vector storage.
-    /// Example: `"http://aegis-cortex:6334"`, `"env:QDRANT_URL"`
-    /// If `None`, discovery is disabled.
+    /// API key for the 100monkeys Cortex service (Zaru SaaS).
+    /// When set, every outbound Cortex RPC includes `Authorization: Bearer <key>`.
+    /// Omit for self-hosted deployments.
+    /// Example: `"env:CORTEX_API_KEY"`
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub qdrant_url: Option<String>,
-
-    /// Embedding service gRPC URL for vector generation.
-    /// Example: `"http://aegis-cortex:50054"`, `"env:EMBEDDING_SERVICE_URL"`
-    /// If `None`, discovery is disabled.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub embedding_url: Option<String>,
-
-    /// Similarity score threshold for deduplication during generation.
-    /// Agents/workflows with similarity above this threshold are flagged as
-    /// potential duplicates. Default: 0.85.
-    #[serde(default = "default_dedup_threshold")]
-    pub deduplication_threshold: f64,
-
-    /// Whether to backfill the discovery index on startup by iterating all
-    /// existing agents and workflows from PostgreSQL. Default: true.
-    #[serde(default = "default_true")]
-    pub backfill_on_startup: bool,
-}
-
-fn default_dedup_threshold() -> f64 {
-    0.85
+    pub api_key: Option<String>,
 }
 
 /// Top-level secrets configuration wrapper (ADR-034).
@@ -1526,7 +1488,6 @@ impl Default for NodeConfigSpec {
             database: None,
             temporal: None,
             cortex: None,
-            discovery: None,
             secrets: None,
             smcp: None,
             cluster: None,
@@ -2048,7 +2009,6 @@ mod tests {
                 image_tag: None,
                 deploy_builtins: false,
                 max_execution_list_limit: None,
-                discovery: None,
             },
         };
 

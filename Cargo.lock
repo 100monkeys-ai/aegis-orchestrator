@@ -3,12 +3,6 @@
 version = 4
 
 [[package]]
-name = "adler2"
-version = "2.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
-
-[[package]]
 name = "aegis-orchestrator"
 version = "0.14.0-pre-alpha"
 dependencies = [
@@ -91,9 +85,8 @@ dependencies = [
  "opendal",
  "parking_lot",
  "prost 0.14.3",
- "prost-types 0.14.3",
+ "prost-types",
  "protoc-bin-vendored",
- "qdrant-client",
  "regex",
  "reqwest 0.13.2",
  "schemars",
@@ -129,7 +122,7 @@ name = "aegis-orchestrator-proto"
 version = "0.14.0-pre-alpha"
 dependencies = [
  "prost 0.14.3",
- "prost-types 0.14.3",
+ "prost-types",
  "protoc-bin-vendored",
  "tonic 0.14.5",
  "tonic-prost",
@@ -780,15 +773,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
 
 [[package]]
-name = "crc32fast"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9481c1c90cbf2ac953f07c8d4a58aa3945c425b7185c9154d67a65e4230da511"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1331,16 +1315,6 @@ name = "fixedbitset"
 version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
-
-[[package]]
-name = "flate2"
-version = "1.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
-dependencies = [
- "crc32fast",
- "miniz_oxide",
-]
 
 [[package]]
 name = "fluent-uri"
@@ -2577,16 +2551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "miniz_oxide"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
-dependencies = [
- "adler2",
- "simd-adler32",
-]
-
-[[package]]
 name = "mio"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3346,7 +3310,7 @@ dependencies = [
  "petgraph",
  "prettyplease",
  "prost 0.14.3",
- "prost-types 0.14.3",
+ "prost-types",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
@@ -3378,15 +3342,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "prost-types"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
-dependencies = [
- "prost 0.13.5",
 ]
 
 [[package]]
@@ -3480,28 +3435,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50793def1b900256624a709439404384204a5dc3a6ec580281bfaac35e882e90"
 dependencies = [
  "pulldown-cmark",
-]
-
-[[package]]
-name = "qdrant-client"
-version = "1.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5d0a9b168ecf8f30a3eb7e8f4766e3050701242ffbe99838b58e6c4251e7211"
-dependencies = [
- "anyhow",
- "derive_builder 0.20.2",
- "futures",
- "futures-util",
- "parking_lot",
- "prost 0.13.5",
- "prost-types 0.13.5",
- "reqwest 0.12.28",
- "semver",
- "serde",
- "serde_json",
- "thiserror 1.0.69",
- "tokio",
- "tonic 0.12.3",
 ]
 
 [[package]]
@@ -3788,7 +3721,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-util",
- "h2",
  "http",
  "http-body",
  "http-body-util",
@@ -4351,12 +4283,6 @@ dependencies = [
  "digest",
  "rand_core 0.6.4",
 ]
-
-[[package]]
-name = "simd-adler32"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 
 [[package]]
 name = "simple_asn1"
@@ -5027,7 +4953,6 @@ dependencies = [
  "axum 0.7.9",
  "base64",
  "bytes",
- "flate2",
  "h2",
  "http",
  "http-body",
@@ -5111,7 +5036,7 @@ dependencies = [
  "prettyplease",
  "proc-macro2",
  "prost-build",
- "prost-types 0.14.3",
+ "prost-types",
  "quote",
  "syn 2.0.117",
  "tempfile",

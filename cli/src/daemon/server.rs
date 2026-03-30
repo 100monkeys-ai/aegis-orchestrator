@@ -1655,11 +1655,21 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .as_ref()
         .and_then(|c| c.grpc_url.as_ref())
         .and_then(|url| resolve_env_value(url).ok());
+    let cortex_api_key: Option<String> = config
+        .spec
+        .cortex
+        .as_ref()
+        .and_then(|c| c.api_key.as_ref())
+        .and_then(|k| resolve_env_value(k).ok());
     let cortex_client: Option<
         std::sync::Arc<aegis_orchestrator_core::infrastructure::CortexGrpcClient>,
     > = match cortex_grpc_url {
         Some(url) => {
-            match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(url.clone()).await
+            match aegis_orchestrator_core::infrastructure::CortexGrpcClient::new(
+                url.clone(),
+                cortex_api_key,
+            )
+            .await
             {
                 Ok(client) => {
                     tracing::info!(url = %url, "Connected to Cortex gRPC service");
@@ -1682,99 +1692,47 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     };
 
     // ─── Discovery Service (ADR-075) ───────────────────────────────────────
+    // Discovery is backed by the Cortex service when connected.
     let discovery_service: Option<
-        Arc<aegis_orchestrator_core::application::discovery_service::StandardDiscoveryService>,
-    > = match &config.spec.discovery {
-        Some(disc_config) => {
-            let qdrant_url = disc_config
-                .qdrant_url
-                .as_ref()
-                .and_then(|url| resolve_env_value(url).ok());
-            let embedding_url = disc_config
-                .embedding_url
-                .as_ref()
-                .and_then(|url| resolve_env_value(url).ok());
+        Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService>,
+    > = cortex_client.as_ref().map(|cx| {
+        let svc = Arc::new(
+            aegis_orchestrator_core::application::discovery_service::CortexDiscoveryService::new(
+                cx.clone(),
+            ),
+        );
 
-            match (qdrant_url, embedding_url) {
-                (Some(q_url), Some(e_url)) => {
-                    match (
-                        aegis_orchestrator_core::infrastructure::discovery::QdrantDiscoveryIndex::connect(&q_url).await,
-                        aegis_orchestrator_core::infrastructure::embedding_client::GrpcEmbeddingClient::connect(&e_url).await,
-                    ) {
-                        (Ok(index), Ok(embedding)) => {
-                            if let Err(e) = index.ensure_collections().await {
-                                tracing::warn!(error = %e, "Failed to ensure discovery collections");
-                                None
-                            } else {
-                                let index = Arc::new(index);
-                                let embedding = Arc::new(embedding);
-                                let svc = Arc::new(aegis_orchestrator_core::application::discovery_service::StandardDiscoveryService::new(
-                                    index.clone() as Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryIndex>,
-                                    embedding.clone() as Arc<dyn aegis_orchestrator_core::infrastructure::embedding_client::EmbeddingPort>,
-                                ));
+        // Spawn event handler to keep Cortex discovery index in sync
+        let handler = Arc::new(
+            aegis_orchestrator_core::infrastructure::discovery::DiscoveryIndexEventHandler::new(
+                cx.clone(),
+                agent_repo.clone(),
+                workflow_repo.clone(),
+                event_bus.clone(),
+            ),
+        );
+        handler.clone().spawn();
 
-                                // Spawn event handler to keep indexes in sync
-                                let handler = Arc::new(aegis_orchestrator_core::infrastructure::discovery::DiscoveryIndexEventHandler::new(
-                                    index.clone() as Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryIndex>,
-                                    embedding.clone() as Arc<dyn aegis_orchestrator_core::infrastructure::embedding_client::EmbeddingPort>,
-                                    agent_repo.clone(),
-                                    workflow_repo.clone(),
-                                    event_bus.clone(),
-                                ));
-                                handler.clone().spawn();
-
-                                // Backfill if configured
-                                if disc_config.backfill_on_startup {
-                                    let handler_clone = handler.clone();
-                                    tokio::spawn(async move {
-                                        match handler_clone.backfill().await {
-                                            Ok((agents, workflows)) => {
-                                                tracing::info!(
-                                                    agents_indexed = agents,
-                                                    workflows_indexed = workflows,
-                                                    "Discovery index backfill complete"
-                                                );
-                                            }
-                                            Err(e) => {
-                                                tracing::warn!(error = %e, "Discovery index backfill failed");
-                                            }
-                                        }
-                                    });
-                                }
-
-                                tracing::info!(
-                                    qdrant_url = %q_url,
-                                    embedding_url = %e_url,
-                                    "Discovery service initialized (ADR-075)"
-                                );
-                                Some(svc)
-                            }
-                        }
-                        (Err(e), _) => {
-                            tracing::warn!(error = %e, "Failed to connect to Qdrant — running without discovery");
-                            None
-                        }
-                        (_, Err(e)) => {
-                            tracing::warn!(error = %e, "Failed to connect to embedding service — running without discovery");
-                            None
-                        }
-                    }
-                }
-                _ => {
+        // Backfill on startup
+        let handler_bg = handler.clone();
+        tokio::spawn(async move {
+            match handler_bg.backfill().await {
+                Ok((agents, workflows)) => {
                     tracing::info!(
-                        "Discovery URLs not fully configured — running without discovery"
+                        agents_indexed = agents,
+                        workflows_indexed = workflows,
+                        "Cortex discovery index backfill complete"
                     );
-                    None
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Cortex discovery index backfill failed");
                 }
             }
-        }
-        None => {
-            tracing::info!(
-                "Discovery not configured (spec.discovery omitted) — search tools disabled"
-            );
-            None
-        }
-    };
+        });
+
+        tracing::info!("Discovery service initialized (Cortex-backed)");
+        svc as Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService>
+    });
 
     // Finally initialize ExecutionService now that ToolRouter is ready
     let mut execution_service_builder = StandardExecutionService::new(
@@ -2062,10 +2020,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Wire discovery service into ToolInvocationService if available (ADR-075)
     if let Some(ref disc_svc) = discovery_service {
         tool_invocation_service_builder =
-            tool_invocation_service_builder.with_discovery_service(disc_svc.clone()
-                as Arc<
-                    dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService,
-                >);
+            tool_invocation_service_builder.with_discovery_service(disc_svc.clone());
     }
 
     let tool_invocation_service = Arc::new(tool_invocation_service_builder);
@@ -2228,9 +2183,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // here. To enable ingest_stimulus in the daemon, construct a WorkflowRegistry,
                 // build a StandardStimulusService, and pass it as Some(...).
                 stimulus_service: None,
-                discovery_service: discovery_service
-                    .clone()
-                    .map(|s| s as std::sync::Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService>),
+                discovery_service: discovery_service.clone(),
             },
         )
         .await

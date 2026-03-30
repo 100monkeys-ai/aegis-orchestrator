@@ -402,27 +402,8 @@ spec:
   # cortex:
   #   # Cortex gRPC service URL (supports "env:VAR_NAME")
   #   grpc_url: "http://cortex:50052"
-
-  # --------------------------------------------------------------------------
-  # Discovery (ADR-075)
-  # --------------------------------------------------------------------------
-  # Semantic search over agents and workflows via Qdrant vector store.
-  # Enterprise-only feature. Omit this section to disable discovery —
-  # the orchestrator runs without it; search tools return a clear error.
-  #
-  # discovery:
-  #   # Qdrant gRPC URL (supports "env:VAR_NAME"). Required for discovery.
-  #   qdrant_url: "http://aegis-cortex:6334"
-  #
-  #   # Embedding service gRPC URL (supports "env:VAR_NAME"). Required.
-  #   embedding_url: "http://aegis-cortex:50054"
-  #
-  #   # Similarity threshold for deduplication during agent/workflow generation.
-  #   # Values above this trigger a "similar already exists" prompt. Default: 0.85
-  #   deduplication_threshold: 0.85
-  #
-  #   # Re-index all agents and workflows from PostgreSQL on startup. Default: true
-  #   backfill_on_startup: true
+  #   # 100monkeys Cortex API key (Zaru SaaS; absent = self-hosted / memoryless mode)
+  #   api_key: "env:CORTEX_API_KEY"
 
   # --------------------------------------------------------------------------
   # Secrets Management (Optional)

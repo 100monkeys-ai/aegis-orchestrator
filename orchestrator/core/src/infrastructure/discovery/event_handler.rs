@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Discovery Index Event Handler (ADR-075)
 //!
-//! Subscribes to the domain event bus and maintains the Qdrant discovery
+//! Subscribes to the domain event bus and maintains the Cortex discovery
 //! indexes in response to agent and workflow lifecycle events. Runs as a
 //! background tokio task. Failed indexing is logged but never blocks the
 //! registration flow.
@@ -12,31 +12,29 @@ use std::time::Duration;
 
 use chrono::Utc;
 
-use crate::application::discovery_service::{
-    agent_embedding_text, workflow_embedding_text, AgentIndexEntry, DiscoveryIndex,
-    WorkflowIndexEntry,
-};
 use crate::domain::agent::AgentManifest;
 use crate::domain::events::{AgentLifecycleEvent, WorkflowEvent};
 use crate::domain::repository::{AgentRepository, WorkflowRepository};
 use crate::domain::shared_kernel::AgentId;
 use crate::domain::tenant::TenantId;
 use crate::domain::workflow::WorkflowId;
-use crate::infrastructure::embedding_client::EmbeddingPort;
+use crate::infrastructure::aegis_cortex_proto::{
+    IndexAgentRequest, IndexWorkflowRequest, RemoveDiscoveryAgentRequest,
+};
+use crate::infrastructure::cortex_client::CortexGrpcClient;
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 
 // ──────────────────────────────────────────────────────────────────────────────
 // DiscoveryIndexEventHandler
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Background event handler that keeps the Qdrant discovery indexes in sync
+/// Background event handler that keeps the Cortex discovery indexes in sync
 /// with agent and workflow lifecycle events from the domain event bus.
 ///
 /// Spawn via [`DiscoveryIndexEventHandler::spawn`] — the returned
 /// `JoinHandle` runs until the event bus is closed.
 pub struct DiscoveryIndexEventHandler {
-    index: Arc<dyn DiscoveryIndex>,
-    embedding: Arc<dyn EmbeddingPort>,
+    cortex_client: Arc<CortexGrpcClient>,
     agent_repo: Arc<dyn AgentRepository>,
     workflow_repo: Arc<dyn WorkflowRepository>,
     event_bus: Arc<EventBus>,
@@ -45,15 +43,13 @@ pub struct DiscoveryIndexEventHandler {
 impl DiscoveryIndexEventHandler {
     /// Create a new handler with all required dependencies.
     pub fn new(
-        index: Arc<dyn DiscoveryIndex>,
-        embedding: Arc<dyn EmbeddingPort>,
+        cortex_client: Arc<CortexGrpcClient>,
         agent_repo: Arc<dyn AgentRepository>,
         workflow_repo: Arc<dyn WorkflowRepository>,
         event_bus: Arc<EventBus>,
     ) -> Self {
         Self {
-            index,
-            embedding,
+            cortex_client,
             agent_repo,
             workflow_repo,
             event_bus,
@@ -120,56 +116,48 @@ impl DiscoveryIndexEventHandler {
     async fn handle_agent_upsert(&self, agent_id: &AgentId, manifest: &AgentManifest) {
         let name = &manifest.metadata.name;
         let version = &manifest.metadata.version;
-        let description = manifest.metadata.description.as_deref().unwrap_or_default();
-        let labels = &manifest.metadata.labels;
-        let tools = &manifest.spec.tools;
+        let description = manifest
+            .metadata
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let labels = manifest.metadata.labels.clone();
+        let tools = manifest.spec.tools.clone();
         let task_description = manifest
             .spec
             .task
             .as_ref()
             .and_then(|t| t.instruction.as_deref())
-            .unwrap_or_default();
+            .unwrap_or_default()
+            .to_string();
         let runtime_language = manifest
             .spec
             .runtime
             .language
             .as_deref()
-            .unwrap_or("unknown");
+            .unwrap_or("unknown")
+            .to_string();
 
-        let text = agent_embedding_text(
-            name,
-            description,
-            task_description,
-            labels,
-            tools,
-            runtime_language,
-        );
-
-        let embedding = match self.generate_embedding_with_retry(&text).await {
-            Some(v) => v,
-            None => return,
-        };
-
-        let entry = AgentIndexEntry {
+        let req = IndexAgentRequest {
             agent_id: agent_id.to_string(),
             tenant_id: TenantId::local_default().to_string(),
             name: name.clone(),
             version: version.clone(),
-            description: description.to_string(),
-            labels: labels.clone(),
-            tools: tools.clone(),
-            task_description: task_description.to_string(),
-            runtime_language: runtime_language.to_string(),
+            description,
+            labels,
+            tools,
+            task_description,
+            runtime_language,
             status: "Active".to_string(),
-            embedding,
-            updated_at: Utc::now(),
             is_platform_template: false,
+            updated_at: Utc::now().to_rfc3339(),
         };
 
-        if let Err(e) = self.index.index_agent(entry).await {
-            tracing::warn!(agent_id = %agent_id, error = %e, "Failed to index deployed agent");
+        if let Err(e) = self.index_agent_with_retry(req).await {
+            tracing::warn!(agent_id = %agent_id, error = %e, "Failed to index deployed agent in Cortex");
         } else {
-            tracing::debug!(agent_id = %agent_id, "Indexed deployed agent");
+            tracing::debug!(agent_id = %agent_id, "Indexed deployed agent in Cortex");
         }
     }
 
@@ -194,10 +182,15 @@ impl DiscoveryIndexEventHandler {
     }
 
     async fn handle_agent_remove(&self, agent_id: &AgentId) {
-        if let Err(e) = self.index.remove_agent(&agent_id.to_string()).await {
-            tracing::warn!(agent_id = %agent_id, error = %e, "Failed to remove agent from index");
+        let req = RemoveDiscoveryAgentRequest {
+            agent_id: agent_id.to_string(),
+            tenant_id: TenantId::local_default().to_string(),
+        };
+
+        if let Err(e) = self.cortex_client.remove_discovery_agent(req).await {
+            tracing::warn!(agent_id = %agent_id, error = %e, "Failed to remove agent from Cortex index");
         } else {
-            tracing::debug!(agent_id = %agent_id, "Removed agent from discovery index");
+            tracing::debug!(agent_id = %agent_id, "Removed agent from Cortex discovery index");
         }
     }
 
@@ -249,71 +242,96 @@ impl DiscoveryIndexEventHandler {
             }
         };
 
-        let description = workflow.metadata.description.as_deref().unwrap_or_default();
-        let labels = &workflow.metadata.labels;
+        let description = workflow
+            .metadata
+            .description
+            .as_deref()
+            .unwrap_or_default()
+            .to_string();
+        let labels = workflow.metadata.labels.clone();
         let state_names: Vec<String> = workflow.spec.states.keys().map(|s| s.to_string()).collect();
         let agent_names: Vec<String> = extract_agent_names_from_workflow(&workflow);
 
-        let text = workflow_embedding_text(name, description, &state_names, &agent_names, labels);
-
-        let embedding = match self.generate_embedding_with_retry(&text).await {
-            Some(v) => v,
-            None => return,
-        };
-
-        let entry = WorkflowIndexEntry {
+        let req = IndexWorkflowRequest {
             workflow_id: workflow_id.to_string(),
             tenant_id: workflow.tenant_id.to_string(),
             name: name.to_string(),
             version: version.to_string(),
-            description: description.to_string(),
-            labels: labels.clone(),
+            description,
+            labels,
             state_names,
             agent_names,
-            embedding,
-            updated_at: Utc::now(),
             is_platform_template: false,
+            updated_at: Utc::now().to_rfc3339(),
         };
 
-        if let Err(e) = self.index.index_workflow(entry).await {
-            tracing::warn!(workflow_id = %workflow_id, error = %e, "Failed to index workflow");
+        if let Err(e) = self.index_workflow_with_retry(req).await {
+            tracing::warn!(workflow_id = %workflow_id, error = %e, "Failed to index workflow in Cortex");
         } else {
-            tracing::debug!(workflow_id = %workflow_id, name = name, "Indexed workflow");
+            tracing::debug!(workflow_id = %workflow_id, name = name, "Indexed workflow in Cortex");
         }
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // Embedding retry helper
+    // Retry helpers
     // ──────────────────────────────────────────────────────────────────────
 
-    async fn generate_embedding_with_retry(&self, text: &str) -> Option<Vec<f32>> {
+    async fn index_agent_with_retry(&self, req: IndexAgentRequest) -> anyhow::Result<()> {
         let mut delay = Duration::from_millis(100);
+        let mut last_err = None;
         for attempt in 0..3u32 {
-            match self.embedding.generate_embedding(text).await {
-                Ok(embedding) => return Some(embedding),
+            match self.cortex_client.index_agent(req.clone()).await {
+                Ok(_) => return Ok(()),
                 Err(e) => {
                     tracing::warn!(
                         attempt = attempt + 1,
                         error = %e,
-                        "Embedding generation failed, retrying"
+                        "Cortex IndexAgent failed, retrying"
                     );
+                    last_err = Some(e);
                     tokio::time::sleep(delay).await;
                     delay *= 2;
                 }
             }
         }
-        tracing::warn!("Embedding generation failed after 3 attempts, skipping index update");
-        None
+        Err(anyhow::anyhow!(
+            "Cortex IndexAgent failed after 3 attempts: {}",
+            last_err.unwrap()
+        ))
+    }
+
+    async fn index_workflow_with_retry(&self, req: IndexWorkflowRequest) -> anyhow::Result<()> {
+        let mut delay = Duration::from_millis(100);
+        let mut last_err = None;
+        for attempt in 0..3u32 {
+            match self.cortex_client.index_workflow(req.clone()).await {
+                Ok(_) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!(
+                        attempt = attempt + 1,
+                        error = %e,
+                        "Cortex IndexWorkflow failed, retrying"
+                    );
+                    last_err = Some(e);
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "Cortex IndexWorkflow failed after 3 attempts: {}",
+            last_err.unwrap()
+        ))
     }
 
     // ──────────────────────────────────────────────────────────────────────
     // Backfill
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Backfill the discovery index from all existing agents and workflows.
-    /// Called once at startup when `backfill_on_startup` is true.
+    /// Backfill the Cortex discovery index from all existing agents and workflows.
+    /// Called once at startup.
     pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
-        tracing::info!("Starting discovery index backfill");
+        tracing::info!("Starting Cortex discovery index backfill");
 
         // ── Agents ──────────────────────────────────────────────────────
         let agents = self
@@ -352,7 +370,7 @@ impl DiscoveryIndexEventHandler {
         tracing::info!(
             agent_count,
             workflow_count,
-            "Discovery index backfill complete"
+            "Cortex discovery index backfill complete"
         );
 
         Ok((agent_count, workflow_count))
