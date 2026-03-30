@@ -65,6 +65,8 @@ impl QdrantDiscoveryIndex {
     ///
     /// Creates collections with 384-dimensional cosine vectors, HNSW params
     /// (m=16, ef_construct=100), and payload field indexes for filtered search.
+    /// Each collection receives common indexes plus collection-specific indexes
+    /// per ADR-075 §4.
     pub async fn ensure_collections(&self) -> Result<()> {
         for collection in [AGENT_COLLECTION, WORKFLOW_COLLECTION] {
             self.ensure_single_collection(collection).await?;
@@ -103,19 +105,32 @@ impl QdrantDiscoveryIndex {
 
         info!(collection = name, "created discovery collection");
 
-        // Create payload field indexes for filtered search
+        // Common payload field indexes for filtered search
         self.create_field_index(name, "tenant_id", FieldType::Keyword)
             .await?;
         self.create_field_index(name, "name", FieldType::Keyword)
             .await?;
         self.create_field_index(name, "labels", FieldType::Keyword)
             .await?;
-        self.create_field_index(name, "status", FieldType::Keyword)
-            .await?;
         self.create_field_index(name, "is_platform_template", FieldType::Bool)
             .await?;
         self.create_field_index(name, "updated_at", FieldType::Integer)
             .await?;
+
+        // Collection-specific field indexes (ADR-075 §4)
+        if name == AGENT_COLLECTION {
+            self.create_field_index(name, "tools", FieldType::Keyword)
+                .await?;
+            self.create_field_index(name, "runtime_language", FieldType::Keyword)
+                .await?;
+            self.create_field_index(name, "status", FieldType::Keyword)
+                .await?;
+        } else if name == WORKFLOW_COLLECTION {
+            self.create_field_index(name, "state_names", FieldType::Keyword)
+                .await?;
+            self.create_field_index(name, "agent_names", FieldType::Keyword)
+                .await?;
+        }
 
         Ok(())
     }
