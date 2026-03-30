@@ -25,10 +25,17 @@ use tracing::info;
 use tracing::warn;
 
 pub mod client;
+pub(crate) mod cluster_helpers;
+pub(crate) mod container_helpers;
+pub mod handlers;
 #[cfg(unix)]
 pub mod install;
 pub mod operator_read_models;
+pub(crate) mod ports;
+pub(crate) mod router;
 pub mod server;
+pub(crate) mod state;
+pub(crate) mod temporal_helpers;
 pub mod worker_lifecycle;
 
 pub use client::DaemonClient;

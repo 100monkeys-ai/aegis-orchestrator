@@ -1,0 +1,155 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+//! SMCP attestation, invocation, and tool listing handlers.
+
+use std::sync::Arc;
+
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::Json;
+
+use crate::daemon::state::AppState;
+
+#[derive(serde::Deserialize)]
+pub struct HttpAttestationRequest {
+    pub agent_id: Option<String>,
+    pub execution_id: Option<String>,
+    pub container_id: Option<String>,
+    #[serde(alias = "public_key_pem", alias = "agent_public_key")]
+    pub public_key: String,
+    pub security_context: Option<String>,
+    pub principal_subject: Option<String>,
+    pub user_id: Option<String>,
+    pub workload_id: Option<String>,
+    pub zaru_tier: Option<String>,
+    pub tenant_id: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct HttpSmcpEnvelope {
+    pub protocol: Option<String>,
+    pub security_token: String,
+    pub signature: String,
+    pub payload: serde_json::Value,
+    pub timestamp: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct SmcpToolsQuery {
+    security_context: Option<String>,
+}
+
+pub(crate) async fn attest_smcp_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HttpAttestationRequest>,
+) -> impl IntoResponse {
+    let tenant_id = request
+        .tenant_id
+        .as_deref()
+        .and_then(|s| aegis_orchestrator_core::domain::tenant::TenantId::from_realm_slug(s).ok())
+        .unwrap_or_else(aegis_orchestrator_core::domain::tenant::TenantId::consumer);
+
+    let internal_req =
+        aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
+            agent_id: request.agent_id.clone(),
+            execution_id: request.execution_id.clone(),
+            container_id: request.container_id.clone(),
+            public_key_pem: request.public_key.clone(),
+            security_context: request.security_context.clone(),
+            principal_subject: request.principal_subject.clone(),
+            user_id: request.user_id.clone(),
+            workload_id: request.workload_id.clone(),
+            zaru_tier: request.zaru_tier.clone(),
+            tenant_id,
+        };
+
+    match state.attestation_service.attest(internal_req).await {
+        Ok(res) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "security_token": res.security_token
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn invoke_smcp_handler(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<HttpSmcpEnvelope>,
+) -> impl IntoResponse {
+    let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
+
+    let envelope = aegis_orchestrator_core::infrastructure::smcp::envelope::SmcpEnvelope {
+        protocol: request.protocol,
+        security_token: request.security_token,
+        signature: request.signature,
+        inner_mcp: payload_bytes,
+        timestamp: request.timestamp,
+    };
+
+    // The ToolInvocationService is responsible for validating the security_token
+    // and extracting any required claims (such as agent_id) from it as appropriate.
+    match state.tool_invocation_service.invoke_tool(&envelope).await {
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": e.to_string()
+            })),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn list_smcp_tools_handler(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<SmcpToolsQuery>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
+    let security_context = headers
+        .get("X-Zaru-Security-Context")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or(query.security_context);
+
+    let tools_result = if let Some(ref security_context) = security_context {
+        state
+            .tool_invocation_service
+            .get_available_tools_for_context(security_context)
+            .await
+    } else {
+        state.tool_invocation_service.get_available_tools().await
+    };
+
+    match tools_result {
+        Ok(tools) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "protocol": "smcp/v1",
+                "attestation_endpoint": "/v1/smcp/attest",
+                "invoke_endpoint": "/v1/smcp/invoke",
+                "security_context": security_context,
+                "tools": tools,
+            })),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "error": error.to_string(),
+            })),
+        )
+            .into_response(),
+    }
+}

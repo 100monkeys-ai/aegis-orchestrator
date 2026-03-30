@@ -1,0 +1,223 @@
+// Copyright (c) 2026 100monkeys.ai
+// SPDX-License-Identifier: AGPL-3.0
+//! Dispatch gateway and temporal events handlers.
+
+use std::sync::Arc;
+
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
+use axum::Json;
+use uuid::Uuid;
+
+use aegis_orchestrator_core::application::execution::ExecutionService;
+use aegis_orchestrator_core::domain::node_config::resolve_env_value;
+use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
+
+use crate::daemon::state::AppState;
+
+pub(crate) async fn dispatch_gateway_handler(
+    State(state): State<Arc<AppState>>,
+    Json(agent_msg): Json<aegis_orchestrator_core::domain::dispatch::AgentMessage>,
+) -> impl IntoResponse {
+    use aegis_orchestrator_core::domain::dispatch::{AgentMessage, OrchestratorMessage};
+
+    let (exec_id_opt, iteration_number, prompt_opt, model_opt) = match &agent_msg {
+        AgentMessage::Generate {
+            execution_id,
+            iteration_number,
+            prompt,
+            model_alias,
+            ..
+        } => (
+            Uuid::parse_str(execution_id).ok(),
+            *iteration_number,
+            Some(prompt.clone()),
+            Some(model_alias.clone()),
+        ),
+        AgentMessage::DispatchResult { execution_id, .. } => {
+            (Uuid::parse_str(execution_id).ok(), 0, None, None)
+        }
+    };
+
+    // Resolve agent_id for event logging and inner loop request
+    let agent_id = if let Some(exec_id) = exec_id_opt {
+        let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
+        if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
+            exec.agent_id
+        } else {
+            tracing::warn!("Could not find execution {} for LLM event", exec_id);
+            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
+        }
+    } else {
+        aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
+    };
+
+    match state
+        .inner_loop_service
+        .handle_agent_message(agent_msg)
+        .await
+    {
+        Ok(OrchestratorMessage::Final {
+            content,
+            tool_calls_executed,
+            conversation,
+        }) => {
+            // Publish LlmInteraction event for observability
+            if agent_id.0 != Uuid::nil() {
+                if let (Some(exec_id), Some(prompt), Some(model_alias)) =
+                    (exec_id_opt, prompt_opt, model_opt)
+                {
+                    let event =
+                        aegis_orchestrator_core::domain::events::ExecutionEvent::LlmInteraction {
+                            execution_id: aegis_orchestrator_core::domain::execution::ExecutionId(
+                                exec_id,
+                            ),
+                            agent_id,
+                            iteration_number,
+                            provider: "orchestrator".to_string(),
+                            model: model_alias.clone(),
+                            input_tokens: None,
+                            output_tokens: None,
+                            prompt: prompt.clone(),
+                            response: content.clone(),
+                            timestamp: chrono::Utc::now(),
+                        };
+                    state.event_bus.publish_execution_event(event);
+
+                    let interaction = aegis_orchestrator_core::domain::execution::LlmInteraction {
+                        provider: "orchestrator".to_string(),
+                        model: model_alias.clone(),
+                        prompt: prompt.clone(),
+                        response: content.clone(),
+                        timestamp: chrono::Utc::now(),
+                    };
+                    let _ = state
+                        .execution_service
+                        .record_llm_interaction(
+                            aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
+                            iteration_number,
+                            interaction,
+                        )
+                        .await;
+
+                    // ADR-049: Extract tool trajectory from conversation and store it
+                    let mut trajectory = Vec::new();
+                    for msg in conversation {
+                        if let Some(calls) = msg.tool_calls {
+                            for call in calls {
+                                trajectory.push(
+                                    aegis_orchestrator_core::domain::execution::TrajectoryStep {
+                                        tool_name: call.name.clone(),
+                                        arguments_json: serde_json::to_string(&call.arguments)
+                                            .unwrap_or_default(),
+                                        status: "pending".to_string(),
+                                        result_json: None,
+                                        error: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                    if !trajectory.is_empty() {
+                        let _ = state
+                            .execution_service
+                            .store_iteration_trajectory(
+                                aegis_orchestrator_core::domain::execution::ExecutionId(exec_id),
+                                iteration_number,
+                                trajectory,
+                            )
+                            .await;
+                    }
+                }
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "content": content,
+                    "tool_calls_executed": tool_calls_executed,
+                })),
+            )
+        }
+        Ok(OrchestratorMessage::Dispatch {
+            dispatch_id,
+            action,
+        }) => {
+            // Respond with the dispatch action so bootstrap.py can execute it
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(OrchestratorMessage::Dispatch {
+                        dispatch_id,
+                        action,
+                    })
+                    .unwrap_or_else(
+                        |_| serde_json::json!({"error": "dispatch serialization failed"}),
+                    ),
+                ),
+            )
+        }
+        Err(e) => {
+            tracing::error!("Inner loop generation failed: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+        }
+    }
+}
+
+/// POST /v1/temporal-events - Receive events from Temporal worker
+pub(crate) async fn temporal_events_handler(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(payload): Json<TemporalEventPayload>,
+) -> impl IntoResponse {
+    // Validate shared secret from X-Temporal-Worker-Secret header
+    // Read from config (spec.temporal.worker_secret) instead of direct env var
+    let temporal_config_for_secret = state.config.spec.temporal.as_ref();
+    let expected_secret = temporal_config_for_secret
+        .and_then(|tc| tc.worker_secret.as_ref())
+        .and_then(|s| resolve_env_value(s).ok());
+    if let Some(secret) = expected_secret {
+        let provided = headers
+            .get("x-temporal-worker-secret")
+            .and_then(|v| v.to_str().ok());
+        match provided {
+            Some(value) if value == secret => {}
+            _ => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "Unauthorized: invalid or missing X-Temporal-Worker-Secret header"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        tracing::warn!(
+            "spec.temporal.worker_secret not configured; /v1/temporal-events endpoint is unauthenticated. \
+             Set spec.temporal.worker_secret in aegis-config.yaml for production."
+        );
+    }
+
+    match state.temporal_event_listener.handle_event(payload).await {
+        Ok(execution_id) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "execution_id": execution_id,
+                "status": "received"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("Failed to process event: {}", e)
+            })),
+        )
+            .into_response(),
+    }
+}
