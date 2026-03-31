@@ -34,6 +34,7 @@ fn minimal_metadata(name: &str) -> WorkflowMetadata {
         name: name.to_string(),
         version: None,
         description: None,
+        tags: vec![],
         labels: HashMap::new(),
         annotations: HashMap::new(),
     }
@@ -1530,6 +1531,7 @@ fn workflow_serde_roundtrip() {
             name: "roundtrip-test".to_string(),
             version: Some("1.2.3".to_string()),
             description: Some("A test workflow".to_string()),
+            tags: vec![],
             labels: {
                 let mut m = HashMap::new();
                 m.insert("env".to_string(), "test".to_string());

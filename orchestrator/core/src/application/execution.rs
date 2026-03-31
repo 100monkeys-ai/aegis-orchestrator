@@ -752,6 +752,7 @@ mod tests {
                 name: name.to_string(),
                 version: "1.0.0".to_string(),
                 description: Some(format!("{name} description")),
+                tags: vec![],
                 labels,
                 annotations: HashMap::new(),
             },

@@ -116,6 +116,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             name: name.to_string(),
             version: Some("1.0.0".to_string()),
             description: description_owned,
+            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
         },

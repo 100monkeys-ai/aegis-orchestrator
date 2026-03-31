@@ -684,6 +684,9 @@ impl ToolInvocationService {
                     "version": w.metadata.version.clone().unwrap_or_default(),
                     "scope": w.scope.to_string(),
                     "initial_state": w.spec.initial_state,
+                    "description": w.metadata.description,
+                    "labels": w.metadata.labels,
+                    "tags": w.metadata.tags,
                 })
             })
             .collect();

@@ -90,7 +90,9 @@ impl ToolInvocationService {
                     "name": a.name,
                     "version": a.manifest.metadata.version,
                     "status": format!("{:?}", a.status).to_lowercase(),
+                    "description": a.manifest.metadata.description,
                     "labels": a.manifest.metadata.labels,
+                    "tags": a.manifest.metadata.tags,
                 })
             })
             .collect();

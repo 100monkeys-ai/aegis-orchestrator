@@ -36,6 +36,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
             name: name.to_string(),
             version: "1.0.0".to_string(),
             description: None,
+            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
         },

@@ -95,6 +95,10 @@ pub struct ManifestMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
 
+    /// Free-form tags for categorization and discovery
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
+
     /// Optional labels for categorization
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub labels: std::collections::HashMap<String, String>,
@@ -892,6 +896,7 @@ mod tests {
                 name: name.to_string(),
                 version: "1.0.0".to_string(),
                 description: None,
+                tags: vec![],
                 labels: std::collections::HashMap::new(),
                 annotations: std::collections::HashMap::new(),
             },

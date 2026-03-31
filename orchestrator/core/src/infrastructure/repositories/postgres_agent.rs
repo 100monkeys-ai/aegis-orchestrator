@@ -56,10 +56,10 @@ impl AgentRepository for PostgresAgentRepository {
             r#"
             INSERT INTO agents (
                 id, tenant_id, name, version, manifest_yaml, manifest_json,
-                runtime, timeout_seconds, security_policy, status, 
-                created_at, updated_at
+                runtime, timeout_seconds, security_policy, status,
+                description, tags, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 name = EXCLUDED.name,
@@ -70,6 +70,8 @@ impl AgentRepository for PostgresAgentRepository {
                 timeout_seconds = EXCLUDED.timeout_seconds,
                 security_policy = EXCLUDED.security_policy,
                 status = EXCLUDED.status,
+                description = EXCLUDED.description,
+                tags = EXCLUDED.tags,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -83,6 +85,8 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(300_i32) // Default timeout, can be extracted from spec.security.resources.timeout if present
         .bind(security_policy)
         .bind(status_str)
+        .bind(agent.manifest.metadata.description.as_deref())
+        .bind(&agent.manifest.metadata.tags)
         .bind(agent.created_at)
         .bind(agent.updated_at)
         .execute(&self.pool)

@@ -656,6 +656,7 @@ fn build_test_workflow(name: &str) -> Workflow {
             name: name.to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
+            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
         },
