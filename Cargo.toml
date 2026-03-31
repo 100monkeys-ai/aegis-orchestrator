@@ -86,6 +86,9 @@ async-trait = "0.1"
 # Code Quality
 rust-guardian = "0.1"
 
+[patch.crates-io]
+bollard-stubs = { path = "orchestrator/vendor/bollard-stubs" }
+
 [profile.release]
 opt-level = 3
 lto = true
