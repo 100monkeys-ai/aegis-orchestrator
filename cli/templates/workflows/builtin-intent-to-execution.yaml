@@ -1,0 +1,137 @@
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: builtin-intent-to-execution
+  version: "1.0.0"
+  description: >-
+    Seamless intent-to-execution pipeline. Accepts a natural-language intent and
+    optional typed inputs, discovers or generates a code-writing agent, writes
+    code to an ephemeral workspace volume, executes it in an isolated container,
+    and returns a formatted result. Invoked via the aegis.execute.intent MCP tool
+    from Zaru Execute mode.
+  labels:
+    category: platform
+    type: builtin-execute
+    builtin: "true"
+    adr: "087"
+spec:
+  initial_state: DISCOVER_OR_GENERATE_AGENT
+
+  workspace:
+    kind: ephemeral
+    size_limit_mb: 256
+    ttl_minutes: 60
+    mount_path: /workspace
+
+  states:
+    DISCOVER_OR_GENERATE_AGENT:
+      kind: Agent
+      agent: intent-executor-discovery-agent
+      input: |
+        Discover or generate a code-writing agent for this execution request.
+
+        Intent: {{workflow.intent}}
+        Language: {{workflow.language}}
+
+        Step 1: Call aegis.agent.search with a query that captures the intent
+        and target language. If any result has similarity_score >= 0.85, select it.
+
+        Step 2: If no match found with sufficient confidence, call
+        aegis.agent.generate to create a minimal code-writer agent for
+        {{workflow.language}} that writes working code to a given file path
+        and prints the result to stdout.
+
+        Return JSON: { "agent_name": "<string>", "created": <bool> }
+      transitions:
+        - condition: on_success
+          target: GENERATE_CODE
+        - condition: on_failure
+          target: DISCOVERY_FAILED
+
+    GENERATE_CODE:
+      kind: Agent
+      agent: "{{DISCOVER_OR_GENERATE_AGENT.output.agent_name}}"
+      input: |
+        Write {{workflow.language}} code that fulfills this intent:
+
+        Intent: {{workflow.intent}}
+        Input values: {{workflow.inputs}}
+
+        Requirements:
+        1. Write the complete solution to /workspace/solution.{{workflow.language_ext}}
+        2. The solution MUST print its final result to stdout
+        3. Embed the input values directly in the code
+        4. Use only the standard library — no third-party packages
+
+        Use fs.write to write to /workspace/solution.{{workflow.language_ext}}
+        Confirm the write succeeded before returning.
+      transitions:
+        - condition: on_success
+          target: EXECUTE_CODE
+        - condition: on_failure
+          target: GENERATION_FAILED
+
+    EXECUTE_CODE:
+      kind: ContainerRun
+      name: execute-user-code
+      image: "{{workflow.container_image}}"
+      command: ["{{workflow.runner}}", "/workspace/solution.{{workflow.language_ext}}"]
+      workdir: /workspace
+      env:
+        INTENT_INPUTS: "{{workflow.inputs_json}}"
+      volumes:
+        - volume_id: "{{blackboard.workspace_volume_id}}"
+          mount_path: /workspace
+          access_mode: ReadOnly
+      resources:
+        cpu_millicores: "{{workflow.cpu_millicores}}"
+        memory_mb: "{{workflow.memory_mb}}"
+        timeout_seconds: "{{workflow.timeout_seconds}}"
+      security:
+        network: none
+        user: "65534:65534"
+        read_only_root_filesystem: true
+      transitions:
+        - condition: exit_code_zero
+          target: FORMAT_RESULT
+        - condition: exit_code_non_zero
+          target: EXECUTION_FAILED
+
+    FORMAT_RESULT:
+      kind: Agent
+      agent: intent-result-formatter-agent
+      max_iterations: 1
+      input: |
+        The user's original request: {{workflow.intent}}
+
+        The code produced this output:
+        {{blackboard.EXECUTE_CODE.stdout}}
+
+        Format as a clean, human-readable answer in one sentence or less.
+        State the result directly. Do not include code. Just give the answer.
+      transitions: []
+
+    DISCOVERY_FAILED:
+      kind: System
+      action: emit_event
+      event: IntentExecutionPipelineFailed
+      payload:
+        failed_state: "DISCOVER_OR_GENERATE_AGENT"
+      transitions: []
+
+    GENERATION_FAILED:
+      kind: System
+      action: emit_event
+      event: IntentExecutionPipelineFailed
+      payload:
+        failed_state: "GENERATE_CODE"
+      transitions: []
+
+    EXECUTION_FAILED:
+      kind: System
+      action: emit_event
+      event: IntentExecutionPipelineFailed
+      payload:
+        failed_state: "EXECUTE_CODE"
+        exit_code: "{{blackboard.EXECUTE_CODE.exit_code}}"
+      transitions: []

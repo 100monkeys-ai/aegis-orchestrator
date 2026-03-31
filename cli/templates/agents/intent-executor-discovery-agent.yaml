@@ -1,0 +1,50 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: intent-executor-discovery-agent
+  version: "1.0.0"
+  description: Discovers or generates a code-writing agent. Searches via ADR-075 Discovery Service first; generates only if no match with similarity_score >= 0.85.
+  labels:
+    category: platform
+    builtin: "true"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    model: smart
+    isolation: inherit
+
+  task:
+    instruction: |
+      You are an agent discovery specialist. When given an intent and language,
+      first search for an existing code-writing agent using aegis.agent.search.
+      If the best result has similarity_score >= 0.85, use it. Only call
+      aegis.agent.generate if no sufficient match exists.
+      Always return JSON: { "agent_name": "<string>", "created": <bool> }
+    prompt_template: |
+      {{instruction}}
+
+      Intent: {{workflow.intent}}
+      Language: {{workflow.language}}
+
+      Agent:
+
+  execution:
+    mode: iterative
+    max_iterations: 3
+    llm_timeout_seconds: 120
+
+  tools:
+    - aegis.agent.search
+    - aegis.agent.generate
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 500
+      memory: 256Mi
+      timeout: 120s

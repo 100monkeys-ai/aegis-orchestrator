@@ -1,0 +1,49 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: intent-result-formatter-agent
+  version: "1.0.0"
+  description: Single-shot result formatter. Takes raw code execution output and the user's original intent. Returns a clean one-sentence natural language answer.
+  labels:
+    category: platform
+    builtin: "true"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+    model: smart
+    isolation: inherit
+
+  task:
+    instruction: |
+      You receive a user's original request and the raw output of executed code.
+      Return exactly one sentence stating the result clearly and directly.
+      Do not include code snippets. Do not explain what was computed.
+      State only the answer.
+    prompt_template: |
+      {{instruction}}
+
+      User's original request: {{workflow.intent}}
+
+      Code output:
+      {{blackboard.EXECUTE_CODE.stdout}}
+
+      Answer:
+
+  execution:
+    mode: iterative
+    max_iterations: 1
+    llm_timeout_seconds: 60
+
+  tools: []
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write: []
+    resources:
+      cpu: 250
+      memory: 128Mi
+      timeout: 60s
