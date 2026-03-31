@@ -28,6 +28,42 @@ impl ToolInvocationService {
             }
         };
 
+        // ADR-087: Validate that all declared tools exist in the tool catalog.
+        if let Some(catalog) = &self.tool_catalog {
+            let declared_tools = &manifest.spec.tools;
+            if !declared_tools.is_empty() {
+                let available = catalog
+                    .list_tools(
+                        &["*".to_string()],
+                        crate::application::tool_catalog::ToolListQuery {
+                            source: None,
+                            category: None,
+                            limit: Some(1000),
+                            offset: Some(0),
+                        },
+                    )
+                    .await;
+                let available_names: std::collections::HashSet<&str> =
+                    available.tools.iter().map(|t| t.name.as_str()).collect();
+                let unknown: Vec<&str> = declared_tools
+                    .iter()
+                    .filter(|t| !available_names.contains(t.as_str()))
+                    .map(|t| t.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.create",
+                        "validated": false,
+                        "deployed": false,
+                        "errors": [format!(
+                            "Agent manifest references tools not registered on this platform: [{}]. Call aegis.tools.list to see available tools.",
+                            unknown.join(", ")
+                        )]
+                    })));
+                }
+            }
+        }
+
         match self
             .agent_lifecycle
             .deploy_agent_for_tenant(&tenant_id, manifest.clone(), force)
@@ -268,6 +304,42 @@ impl ToolInvocationService {
                         "name": manifest.metadata.name,
                         "version": manifest.metadata.version,
                         "error": format!("Agent '{}' with version '{}' already exists. Create a new version or use 'force' to overwrite.", manifest.metadata.name, manifest.metadata.version)
+                    })));
+                }
+            }
+        }
+
+        // ADR-087: Validate that all declared tools exist in the tool catalog.
+        if let Some(catalog) = &self.tool_catalog {
+            let declared_tools = &manifest.spec.tools;
+            if !declared_tools.is_empty() {
+                let available = catalog
+                    .list_tools(
+                        &["*".to_string()],
+                        crate::application::tool_catalog::ToolListQuery {
+                            source: None,
+                            category: None,
+                            limit: Some(1000),
+                            offset: Some(0),
+                        },
+                    )
+                    .await;
+                let available_names: std::collections::HashSet<&str> =
+                    available.tools.iter().map(|t| t.name.as_str()).collect();
+                let unknown: Vec<&str> = declared_tools
+                    .iter()
+                    .filter(|t| !available_names.contains(t.as_str()))
+                    .map(|t| t.as_str())
+                    .collect();
+                if !unknown.is_empty() {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.update",
+                        "validated": false,
+                        "updated": false,
+                        "errors": [format!(
+                            "Agent manifest references tools not registered on this platform: [{}]. Call aegis.tools.list to see available tools.",
+                            unknown.join(", ")
+                        )]
                     })));
                 }
             }

@@ -4,6 +4,7 @@
 mod agents;
 mod audit;
 mod discovery;
+mod execute;
 mod facade;
 mod gateway;
 mod system;

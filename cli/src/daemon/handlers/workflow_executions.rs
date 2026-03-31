@@ -142,6 +142,15 @@ pub(crate) fn workflow_event_message(event: &WorkflowEvent) -> String {
             reason,
             ..
         } => format!("Subworkflow execution {child_execution_id} failed: {reason}"),
+        WorkflowEvent::IntentExecutionPipelineStarted { intent, .. } => {
+            format!("Intent execution pipeline started: {intent}")
+        }
+        WorkflowEvent::IntentExecutionPipelineCompleted { final_result, .. } => {
+            format!("Intent execution pipeline completed: {final_result}")
+        }
+        WorkflowEvent::IntentExecutionPipelineFailed { reason, .. } => {
+            format!("Intent execution pipeline failed: {reason}")
+        }
     }
 }
 
@@ -161,6 +170,11 @@ pub(crate) fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
         WorkflowEvent::SubworkflowTriggered { .. } => "SubworkflowTriggered",
         WorkflowEvent::SubworkflowCompleted { .. } => "SubworkflowCompleted",
         WorkflowEvent::SubworkflowFailed { .. } => "SubworkflowFailed",
+        WorkflowEvent::IntentExecutionPipelineStarted { .. } => "IntentExecutionPipelineStarted",
+        WorkflowEvent::IntentExecutionPipelineCompleted { .. } => {
+            "IntentExecutionPipelineCompleted"
+        }
+        WorkflowEvent::IntentExecutionPipelineFailed { .. } => "IntentExecutionPipelineFailed",
     }
 }
 
@@ -315,6 +329,39 @@ pub(crate) fn workflow_event_view_from_domain(
             ..
         } => (
             parent_execution_id.0,
+            None,
+            None,
+            failed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::IntentExecutionPipelineStarted {
+            pipeline_execution_id,
+            started_at,
+            ..
+        } => (
+            pipeline_execution_id.0,
+            None,
+            None,
+            started_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::IntentExecutionPipelineCompleted {
+            pipeline_execution_id,
+            completed_at,
+            ..
+        } => (
+            pipeline_execution_id.0,
+            None,
+            None,
+            completed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::IntentExecutionPipelineFailed {
+            pipeline_execution_id,
+            failed_at,
+            ..
+        } => (
+            pipeline_execution_id.0,
             None,
             None,
             failed_at.to_rfc3339(),

@@ -76,6 +76,7 @@ fn build_workflow(name: &str) -> Workflow {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         },
     )
     .unwrap()

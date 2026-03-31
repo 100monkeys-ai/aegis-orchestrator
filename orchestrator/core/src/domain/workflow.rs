@@ -548,6 +548,76 @@ pub struct WorkflowVolumeSpec {
     pub size_limit_bytes: Option<u64>,
 }
 
+/// Specifies how a workflow execution manages its workspace volume (ADR-087).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowWorkspaceSpec {
+    pub kind: WorkspaceKind,
+    #[serde(default = "default_workspace_blackboard_key")]
+    pub blackboard_key: String,
+}
+
+fn default_workspace_blackboard_key() -> String {
+    "workspace_volume_id".to_string()
+}
+
+/// Workspace provisioning strategy for a workflow execution (ADR-087).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    /// Create ephemeral volume at workflow start; destroy at terminal state.
+    Ephemeral { ttl_hours: u32 },
+    /// Use a caller-supplied persistent volume. Rejected for Free tier at policy layer.
+    Persistent { volume_id: String },
+}
+
+/// Input schema for the aegis.execute.intent tool (ADR-087).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntentExecutionInput {
+    pub intent: String,
+    #[serde(default)]
+    pub inputs: serde_json::Value,
+    #[serde(default)]
+    pub volume_id: Option<String>,
+    #[serde(default)]
+    pub language: ExecutionLanguage,
+    #[serde(default)]
+    pub timeout_seconds: Option<u32>,
+}
+
+/// Supported execution languages for the intent-to-execution pipeline (ADR-087).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ExecutionLanguage {
+    #[default]
+    Python,
+    JavaScript,
+    Bash,
+}
+
+impl ExecutionLanguage {
+    pub fn container_image(&self) -> &'static str {
+        match self {
+            Self::Python => "python:3.11-slim",
+            Self::JavaScript => "node:20-slim",
+            Self::Bash => "ubuntu:22.04",
+        }
+    }
+    pub fn runner_command(&self) -> &'static str {
+        match self {
+            Self::Python => "python",
+            Self::JavaScript => "node",
+            Self::Bash => "bash",
+        }
+    }
+    pub fn file_extension(&self) -> &'static str {
+        match self {
+            Self::Python => "py",
+            Self::JavaScript => "js",
+            Self::Bash => "sh",
+        }
+    }
+}
+
 /// Workflow specification (state machine definition)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkflowSpec {
@@ -567,6 +637,10 @@ pub struct WorkflowSpec {
     /// resolve to a volume declared here (validated in `Workflow::new()`).
     #[serde(default)]
     pub volumes: Vec<WorkflowVolumeSpec>,
+
+    /// Optional workspace volume provisioning (ADR-087).
+    #[serde(default)]
+    pub workspace: Option<WorkflowWorkspaceSpec>,
 }
 
 /// Individual state in the workflow FSM
@@ -1518,6 +1592,7 @@ mod tests {
                 context: std::collections::HashMap::new(),
                 states,
                 volumes: vec![],
+                workspace: None,
             },
             created_at: Utc::now(),
         };
@@ -1549,6 +1624,7 @@ mod tests {
             context: HashMap::new(),
             states: HashMap::new(),
             volumes: vec![],
+            workspace: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1585,6 +1661,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1630,6 +1707,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1689,6 +1767,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1738,6 +1817,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1776,6 +1856,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1815,6 +1896,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1854,6 +1936,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -1888,6 +1971,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());

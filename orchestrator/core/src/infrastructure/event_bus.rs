@@ -185,7 +185,10 @@ impl DomainEvent {
                     ..
                 } => *parent_execution_id,
                 WorkflowEvent::WorkflowRegistered { .. }
-                | WorkflowEvent::WorkflowScopeChanged { .. } => return None,
+                | WorkflowEvent::WorkflowScopeChanged { .. }
+                | WorkflowEvent::IntentExecutionPipelineStarted { .. }
+                | WorkflowEvent::IntentExecutionPipelineCompleted { .. }
+                | WorkflowEvent::IntentExecutionPipelineFailed { .. } => return None,
             }),
             DomainEvent::Learning(event) => Some(match event {
                 LearningEvent::PatternDiscovered { execution_id, .. }
@@ -400,6 +403,11 @@ impl DomainEvent {
                 WorkflowEvent::SubworkflowCompleted { completed_at, .. } => *completed_at,
                 WorkflowEvent::SubworkflowFailed { failed_at, .. } => *failed_at,
                 WorkflowEvent::WorkflowScopeChanged { changed_at, .. } => *changed_at,
+                WorkflowEvent::IntentExecutionPipelineStarted { started_at, .. } => *started_at,
+                WorkflowEvent::IntentExecutionPipelineCompleted { completed_at, .. } => {
+                    *completed_at
+                }
+                WorkflowEvent::IntentExecutionPipelineFailed { failed_at, .. } => *failed_at,
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { discovered_at, .. } => *discovered_at,
@@ -571,6 +579,15 @@ impl DomainEvent {
                 WorkflowEvent::SubworkflowCompleted { .. } => "subworkflow_completed",
                 WorkflowEvent::SubworkflowFailed { .. } => "subworkflow_failed",
                 WorkflowEvent::WorkflowScopeChanged { .. } => "workflow_scope_changed",
+                WorkflowEvent::IntentExecutionPipelineStarted { .. } => {
+                    "intent_execution_pipeline_started"
+                }
+                WorkflowEvent::IntentExecutionPipelineCompleted { .. } => {
+                    "intent_execution_pipeline_completed"
+                }
+                WorkflowEvent::IntentExecutionPipelineFailed { .. } => {
+                    "intent_execution_pipeline_failed"
+                }
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { .. } => "pattern_discovered",

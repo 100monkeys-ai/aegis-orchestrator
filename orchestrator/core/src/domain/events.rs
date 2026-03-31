@@ -488,6 +488,33 @@ pub enum WorkflowEvent {
         changed_by: String,
         changed_at: DateTime<Utc>,
     },
+    /// Intent-to-execution pipeline started (ADR-087)
+    IntentExecutionPipelineStarted {
+        pipeline_execution_id: ExecutionId,
+        workflow_execution_id: ExecutionId,
+        intent: String,
+        language: crate::domain::workflow::ExecutionLanguage,
+        workspace_volume_id: VolumeId,
+        started_at: DateTime<Utc>,
+    },
+    /// Intent-to-execution pipeline completed successfully (ADR-087)
+    IntentExecutionPipelineCompleted {
+        pipeline_execution_id: ExecutionId,
+        workflow_execution_id: ExecutionId,
+        final_result: String,
+        duration_ms: u64,
+        reused_existing_agent: bool,
+        agent_similarity_score: Option<f32>,
+        completed_at: DateTime<Utc>,
+    },
+    /// Intent-to-execution pipeline failed (ADR-087)
+    IntentExecutionPipelineFailed {
+        pipeline_execution_id: ExecutionId,
+        workflow_execution_id: ExecutionId,
+        failed_at_state: String,
+        reason: String,
+        failed_at: DateTime<Utc>,
+    },
 }
 
 /// Cortex pattern weight change events (BC-5 Cortex / Learning & Memory Context).

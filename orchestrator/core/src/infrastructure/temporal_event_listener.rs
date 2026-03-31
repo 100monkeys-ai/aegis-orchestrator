@@ -636,6 +636,18 @@ impl TemporalEventListener {
                 parent_execution_id,
                 ..
             } => *parent_execution_id,
+            WorkflowEvent::IntentExecutionPipelineStarted {
+                pipeline_execution_id,
+                ..
+            }
+            | WorkflowEvent::IntentExecutionPipelineCompleted {
+                pipeline_execution_id,
+                ..
+            }
+            | WorkflowEvent::IntentExecutionPipelineFailed {
+                pipeline_execution_id,
+                ..
+            } => *pipeline_execution_id,
             WorkflowEvent::WorkflowRegistered { .. }
             | WorkflowEvent::WorkflowScopeChanged { .. } => {
                 return Err(anyhow!(
@@ -1119,6 +1131,7 @@ mod tests {
                 context: HashMap::new(),
                 states,
                 volumes: vec![],
+                workspace: None,
             },
         )
         .unwrap()

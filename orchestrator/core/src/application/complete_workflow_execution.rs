@@ -283,6 +283,7 @@ mod tests {
                 context: HashMap::new(),
                 states,
                 volumes: vec![],
+                workspace: None,
             },
         )
         .unwrap()

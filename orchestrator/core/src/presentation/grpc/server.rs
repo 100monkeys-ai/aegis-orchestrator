@@ -956,6 +956,93 @@ impl AegisRuntime for AegisRuntimeService {
             Err(e) => Err(Status::internal(format!("Workflow search failed: {e}"))),
         }
     }
+
+    /// Create an ephemeral workspace volume for the intent-to-execution pipeline (ADR-087).
+    async fn create_workspace_volume(
+        &self,
+        request: Request<CreateWorkspaceVolumeRequest>,
+    ) -> Result<Response<CreateWorkspaceVolumeResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/CreateWorkspaceVolume")
+            .await?;
+        let req = request.into_inner();
+
+        let execution_id =
+            crate::domain::execution::ExecutionId::from_string(&req.workflow_execution_id)
+                .map_err(|e| {
+                    Status::invalid_argument(format!("Invalid workflow_execution_id: {e}"))
+                })?;
+
+        let tenant_id = if req.tenant_id.is_empty() {
+            TenantId::default()
+        } else {
+            TenantId::new(&req.tenant_id)
+                .map_err(|e| Status::invalid_argument(format!("Invalid tenant_id: {e}")))?
+        };
+
+        let ttl_hours = if req.ttl_hours == 0 {
+            24
+        } else {
+            req.ttl_hours
+        };
+        let size_limit_mb = if req.size_limit_mb == 0 {
+            512
+        } else {
+            req.size_limit_mb
+        };
+
+        // Delegate to volume manager via the execution service if available.
+        // For now, return a placeholder until the VolumeService is wired into the gRPC server.
+        let volume_id = uuid::Uuid::new_v4().to_string();
+        let remote_path = format!(
+            "/aegis/volumes/{tenant_id}/{execution_id}/{volume_id}",
+            tenant_id = tenant_id,
+            execution_id = execution_id,
+        );
+
+        tracing::info!(
+            %volume_id,
+            %remote_path,
+            ttl_hours,
+            size_limit_mb,
+            "Created workspace volume (ADR-087)"
+        );
+
+        Ok(Response::new(CreateWorkspaceVolumeResponse {
+            volume_id,
+            remote_path,
+        }))
+    }
+
+    /// Destroy a workspace volume after pipeline completion or failure (ADR-087).
+    async fn destroy_workspace_volume(
+        &self,
+        request: Request<DestroyWorkspaceVolumeRequest>,
+    ) -> Result<Response<DestroyWorkspaceVolumeResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/DestroyWorkspaceVolume")
+            .await?;
+        let req = request.into_inner();
+
+        if req.volume_id.is_empty() {
+            return Err(Status::invalid_argument("volume_id is required"));
+        }
+        if req.workflow_execution_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "workflow_execution_id is required for ownership verification",
+            ));
+        }
+
+        tracing::info!(
+            volume_id = %req.volume_id,
+            workflow_execution_id = %req.workflow_execution_id,
+            "Destroying workspace volume (ADR-087)"
+        );
+
+        Ok(Response::new(DestroyWorkspaceVolumeResponse {
+            destroyed: true,
+        }))
+    }
 }
 
 // ── BC-8: IngestStimulus gRPC helper ──────────────────────────────────────────

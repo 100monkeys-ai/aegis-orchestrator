@@ -822,6 +822,11 @@ impl ToolInvocationService {
                 self.invoke_aegis_workflow_search_tool(args, security_context)
                     .await,
             ),
+            "aegis.execute.intent" => Some(
+                self.invoke_aegis_execute_intent_tool(args, security_context)
+                    .await,
+            ),
+            "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
             _ => None,
         }
     }

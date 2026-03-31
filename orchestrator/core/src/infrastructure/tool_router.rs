@@ -152,11 +152,13 @@ impl ToolRouter {
                 | "aegis.workflow.remove"
                 | "aegis.workflow.promote"
                 | "aegis.workflow.demote"
+                | "aegis.execute.intent"
+                | "aegis.execute.status"
         )
     }
 
     fn should_advertise_builtin_tool(tool_name: &str) -> bool {
-        if tool_name.starts_with("aegis.workflow.") {
+        if tool_name.starts_with("aegis.workflow.") || tool_name.starts_with("aegis.execute.") {
             return Self::is_supported_builtin_workflow_tool(tool_name);
         }
 
@@ -810,6 +812,51 @@ impl ToolRouter {
                             }
                         },
                         "required": ["name"]
+                    }),
+                    "aegis.execute.intent" => json!({
+                        "type": "object",
+                        "properties": {
+                            "intent": {
+                                "type": "string",
+                                "description": "Natural-language description of what to execute (e.g. 'resize images in /workspace to 800x600')."
+                            },
+                            "inputs": {
+                                "type": "object",
+                                "description": "Optional structured inputs passed to the pipeline."
+                            },
+                            "volume_id": {
+                                "type": "string",
+                                "description": "Optional persistent volume ID to use as workspace. When omitted, an ephemeral volume is created."
+                            },
+                            "language": {
+                                "type": "string",
+                                "enum": ["python", "javascript", "bash"],
+                                "description": "Execution language (default: python)."
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Optional execution timeout in seconds."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["intent"]
+                    }),
+                    "aegis.execute.status" => json!({
+                        "type": "object",
+                        "properties": {
+                            "pipeline_execution_id": {
+                                "type": "string",
+                                "description": "UUID of the pipeline execution to check."
+                            },
+                            "tenant_id": {
+                                "type": "string",
+                                "description": "Optional tenant identifier. Defaults to the local tenant."
+                            }
+                        },
+                        "required": ["pipeline_execution_id"]
                     }),
                     "aegis.task.execute" => json!({
                         "type": "object",

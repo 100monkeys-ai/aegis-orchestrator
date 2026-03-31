@@ -61,6 +61,7 @@ fn single_system_state_spec(state_name: &str) -> WorkflowSpec {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     }
 }
 
@@ -102,6 +103,7 @@ fn two_state_spec(from: &str, to: &str) -> WorkflowSpec {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     }
 }
 
@@ -171,6 +173,7 @@ fn workflow_rejects_empty_states() {
         context: HashMap::new(),
         states: HashMap::new(),
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad"), spec).unwrap_err();
     assert!(err.to_string().contains("at least one state"));
@@ -197,6 +200,7 @@ fn workflow_rejects_missing_initial_state() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad"), spec).unwrap_err();
     assert!(err.to_string().contains("not found"));
@@ -227,6 +231,7 @@ fn workflow_rejects_transition_to_nonexistent_state() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad"), spec).unwrap_err();
     assert!(err.to_string().contains("NOWHERE"));
@@ -269,6 +274,7 @@ fn workflow_allows_duplicate_state_name_inserts_overwrite_in_hashmap() {
             context: HashMap::new(),
             states,
             volumes: vec![],
+            workspace: None,
         },
     );
     assert!(wf.is_ok());
@@ -506,6 +512,7 @@ fn workflow_validates_all_transition_targets() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-transition"), spec).unwrap_err();
     assert!(err.to_string().contains("GHOST"));
@@ -951,6 +958,7 @@ fn container_run_rejects_empty_name() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-name"), spec).unwrap_err();
     assert!(err.to_string().contains("name cannot be empty"));
@@ -973,6 +981,7 @@ fn container_run_rejects_empty_image() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-image"), spec).unwrap_err();
     assert!(err.to_string().contains("image cannot be empty"));
@@ -995,6 +1004,7 @@ fn container_run_rejects_empty_command() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-cmd"), spec).unwrap_err();
     assert!(err.to_string().contains("at least one token"));
@@ -1026,6 +1036,7 @@ fn container_run_rejects_non_absolute_mount_path() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-mount"), spec).unwrap_err();
     assert!(err.to_string().contains("absolute path"));
@@ -1057,6 +1068,7 @@ fn container_run_accepts_valid_mount() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     assert!(Workflow::new(minimal_metadata("good-mount"), spec).is_ok());
 }
@@ -1085,6 +1097,7 @@ fn parallel_container_run_rejects_empty_steps() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("empty-par"), spec).unwrap_err();
     assert!(err.to_string().contains("at least one step"));
@@ -1121,6 +1134,7 @@ fn parallel_container_run_rejects_duplicate_step_names() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("dup-par"), spec).unwrap_err();
     assert!(err.to_string().contains("must be unique"));
@@ -1160,6 +1174,7 @@ fn parallel_container_run_rejects_non_absolute_step_mount() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-par-mount"), spec).unwrap_err();
     assert!(err.to_string().contains("non-absolute mount_path"));
@@ -1195,6 +1210,7 @@ fn parallel_container_run_rejects_empty_step_image() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("empty-img"), spec).unwrap_err();
     assert!(err.to_string().contains("empty image"));
@@ -1230,6 +1246,7 @@ fn parallel_container_run_rejects_empty_step_command() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("empty-cmd"), spec).unwrap_err();
     assert!(err.to_string().contains("at least one token"));
@@ -1261,6 +1278,7 @@ fn subworkflow_blocking_requires_result_key() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("sub-bad"), spec).unwrap_err();
     assert!(err.to_string().contains("result_key"));
@@ -1288,6 +1306,7 @@ fn subworkflow_fire_and_forget_forbids_result_key() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("sub-bad2"), spec).unwrap_err();
     assert!(err.to_string().contains("must not specify result_key"));
@@ -1315,6 +1334,7 @@ fn subworkflow_rejects_empty_workflow_id() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("sub-empty"), spec).unwrap_err();
     assert!(err.to_string().contains("workflow_id cannot be empty"));
@@ -1342,6 +1362,7 @@ fn subworkflow_blocking_with_result_key_accepted() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     assert!(Workflow::new(minimal_metadata("sub-ok"), spec).is_ok());
 }
@@ -1368,6 +1389,7 @@ fn subworkflow_fire_and_forget_without_result_key_accepted() {
         context: HashMap::new(),
         states,
         volumes: vec![],
+        workspace: None,
     };
     assert!(Workflow::new(minimal_metadata("sub-ok2"), spec).is_ok());
 }
@@ -1406,6 +1428,7 @@ fn volume_mount_rejects_undeclared_volume() {
             storage_class: Default::default(),
             size_limit_bytes: None,
         }],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-vol"), spec).unwrap_err();
     assert!(err.to_string().contains("ghost-vol"));
@@ -1442,6 +1465,7 @@ fn volume_mount_accepts_declared_volume() {
             storage_class: Default::default(),
             size_limit_bytes: Some(1_073_741_824),
         }],
+        workspace: None,
     };
     assert!(Workflow::new(minimal_metadata("good-vol"), spec).is_ok());
 }
@@ -1473,6 +1497,7 @@ fn volume_mount_skips_validation_when_no_volumes_declared() {
         context: HashMap::new(),
         states,
         volumes: vec![], // empty => skip resolution check
+        workspace: None,
     };
     assert!(Workflow::new(minimal_metadata("no-vol-decl"), spec).is_ok());
 }
@@ -1515,6 +1540,7 @@ fn parallel_container_run_mount_rejects_undeclared_volume() {
             storage_class: Default::default(),
             size_limit_bytes: None,
         }],
+        workspace: None,
     };
     let err = Workflow::new(minimal_metadata("bad-par-vol"), spec).unwrap_err();
     assert!(err.to_string().contains("missing-vol"));
