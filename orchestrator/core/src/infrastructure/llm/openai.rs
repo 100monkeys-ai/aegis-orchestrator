@@ -223,6 +223,8 @@ impl LLMProvider for OpenAIAdapter {
                 LLMError::RateLimit
             } else if status == 404 {
                 LLMError::ModelNotFound(self.model.clone())
+            } else if status == 503 {
+                LLMError::ServiceUnavailable(error_text)
             } else {
                 LLMError::Provider(format!("HTTP {status}: {error_text}"))
             });

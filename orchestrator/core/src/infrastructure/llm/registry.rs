@@ -304,6 +304,20 @@ impl ProviderRegistry {
                         self.max_retries,
                         e
                     );
+
+                    // Short-circuit: 503s won't recover with retries
+                    if matches!(e, LLMError::ServiceUnavailable(_)) {
+                        if let Some((fallback_model, fallback)) = &self.fallback_provider {
+                            info!(
+                                "Service unavailable, trying fallback provider (model='{}')",
+                                fallback_model
+                            );
+                            return fallback.generate_chat(messages, tools, options).await;
+                        }
+                        // No fallback — fail fast
+                        return Err(e);
+                    }
+
                     last_error = Some(e);
 
                     if attempt == self.max_retries - 1 {
