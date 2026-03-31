@@ -152,6 +152,7 @@ impl DiscoveryIndexEventHandler {
             status: "Active".to_string(),
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
+            tags: manifest.metadata.tags.clone(),
         };
 
         if let Err(e) = self.index_agent_with_retry(req).await {
@@ -263,6 +264,7 @@ impl DiscoveryIndexEventHandler {
             agent_names,
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
+            tags: workflow.metadata.tags.clone(),
         };
 
         if let Err(e) = self.index_workflow_with_retry(req).await {
