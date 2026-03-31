@@ -25,11 +25,16 @@ spec:
         use one of these, or proceed with generating a new workflow?" Only proceed with generation
         if no matches exceed the threshold or the user explicitly confirms.
       - If the call returns an error (e.g., discovery not configured), fall back to `aegis.workflow.list`.
+        When using the list fallback, each entry in the response includes `description`, `labels`, and
+        `tags` — use these fields to assess whether an existing workflow already satisfies the requested
+        need before deciding to generate a new one.
 
       Next, discover agents. For each required workflow step, call `aegis.agent.search` with a
       semantic query describing the needed capability.
       - If the call succeeds and returns results with `similarity_score >= 0.85`, map them as existing agents.
       - If the call returns an error, fall back to `aegis.agent.list` and inspect agents manually.
+        When using the list fallback, each entry in the response includes `description`, `labels`, and
+        `tags` — use these fields to assess capability fit before marking an agent as missing.
 
       Also call `aegis.tools.search` to discover available MCP tools.
 
@@ -52,7 +57,10 @@ spec:
       - missing_judge_agents: array of judge requirements that need generation
       - judge_generation_prompts: array of natural-language prompts to create each missing judge agent
       - workflow_prompt: a complete natural-language prompt for generating the final workflow,
-        explicitly referencing existing and newly generated agent names and judge names, and which step each serves.
+        explicitly referencing existing and newly generated agent names and judge names, and which step
+        each serves. The prompt must instruct the generator to include `metadata.tags` with 3 to 5
+        free-form lowercase hyphenated strings describing the workflow's capability domain (e.g.,
+        "ci-cd", "data-processing", "code-review", "kubernetes-deployment", "api-integration").
       - available_tools: array of tool names discovered via `aegis.tools.search` that are relevant to the workflow's agents
 
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are

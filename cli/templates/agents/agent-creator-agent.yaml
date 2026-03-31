@@ -48,6 +48,10 @@ spec:
          - Keep runtime and security settings explicit.
          - Prefer deterministic validation in execution.validation when feasible.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
+         - Populate `metadata.tags` with 3 to 5 free-form lowercase hyphenated strings describing the
+           agent's capability domain (e.g., "code-generation", "api-integration", "data-analysis",
+           "security-review", "infrastructure-automation"). Tags must reflect what the agent does,
+           not generic platform concepts. Do not reuse label values verbatim as tags.
       6. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
