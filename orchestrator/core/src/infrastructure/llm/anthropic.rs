@@ -126,6 +126,8 @@ impl AnthropicAdapter {
             } else {
                 LLMError::Provider(format!("HTTP {status}: {error_text}"))
             }
+        } else if status == StatusCode::SERVICE_UNAVAILABLE {
+            LLMError::ServiceUnavailable(error_text.to_string())
         } else {
             LLMError::Provider(format!("HTTP {status}: {error_text}"))
         }

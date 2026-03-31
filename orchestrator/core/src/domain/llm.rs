@@ -201,4 +201,7 @@ pub enum LLMError {
 
     #[error("Invalid input: {0}")]
     InvalidInput(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
 }
