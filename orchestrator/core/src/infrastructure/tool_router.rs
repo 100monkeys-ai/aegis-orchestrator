@@ -131,7 +131,125 @@ pub struct ToolRouter {
     builtin_dispatchers: Vec<BuiltinDispatcherConfig>,
 }
 
+/// Read-only / low-risk tools that bypass the inner-loop semantic judge.
+const SKIP_JUDGE_TOOLS: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.grep",
+    "fs.glob",
+    "web.search",
+    "web.fetch",
+    "aegis.schema.get",
+    "aegis.schema.validate",
+    "aegis.workflow.list",
+    "aegis.workflow.export",
+    "aegis.workflow.validate",
+    "aegis.workflow.status",
+    "aegis.workflow.logs",
+    "aegis.workflow.executions.list",
+    "aegis.workflow.executions.get",
+    "aegis.workflow.cancel",
+    "aegis.workflow.signal",
+    "aegis.workflow.remove",
+    "aegis.workflow.search",
+    "aegis.agent.list",
+    "aegis.agent.export",
+    "aegis.agent.logs",
+    "aegis.agent.search",
+    "aegis.task.status",
+    "aegis.task.list",
+    "aegis.task.logs",
+    "aegis.task.wait",
+    "aegis.execute.status",
+    "aegis.tools.list",
+    "aegis.tools.search",
+    "aegis.system.info",
+    "aegis.system.config",
+];
+
+/// Canonical registry of all builtin tool dispatchers.
+///
+/// Every tool name and its description live here. The daemon startup and
+/// all other consumers derive their dispatcher list from this function —
+/// no second list to keep in sync.
+const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
+    ("cmd.run", "Executes a shell command inside the agent's ephemeral container environment. Use this to build, run, or analyze code locally."),
+    ("fs.read", "Read the contents of a file at the given POSIX path from the mounted Workspace volume."),
+    ("fs.write", "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories."),
+    ("fs.list", "List the contents of a directory in the Workspace volume."),
+    ("fs.create_dir", "Creates a new directory along with any necessary parent directories."),
+    ("fs.delete", "Deletes a file or directory."),
+    ("fs.edit", "Performs an exact string replacement in a file."),
+    ("fs.multi_edit", "Performs multiple sequential string replacements in a file."),
+    ("fs.grep", "Recursively searches for a regex pattern within files in a given directory."),
+    ("fs.glob", "Recursively matches files against a glob pattern."),
+    ("web.search", "Performs an internet search query."),
+    ("web.fetch", "Fetches content from a URL, optionally converting HTML to Markdown."),
+    ("aegis.schema.get", "Returns the canonical JSON Schema for a manifest kind (agent or workflow)."),
+    ("aegis.schema.validate", "Validates a manifest YAML string against its canonical JSON Schema."),
+    ("aegis.agent.create", "Parses, validates, and deploys an Agent manifest to the registry."),
+    ("aegis.agent.list", "Lists currently deployed agents and metadata."),
+    ("aegis.agent.update", "Updates an existing Agent manifest in the registry."),
+    ("aegis.agent.export", "Exports an Agent manifest by name."),
+    ("aegis.agent.delete", "Removes a deployed agent from the registry by UUID."),
+    ("aegis.agent.generate", "Generates an Agent manifest from a natural-language intent."),
+    ("aegis.agent.logs", "Retrieve agent-level activity log snapshot."),
+    ("aegis.agent.search", "Semantic search over deployed agents by natural-language query."),
+    ("aegis.workflow.create", "Performs strict deterministic and semantic workflow validation, then registers on pass."),
+    ("aegis.workflow.list", "Lists currently registered workflows and metadata."),
+    ("aegis.workflow.validate", "Validate a workflow manifest against the schema."),
+    ("aegis.workflow.update", "Updates an existing Workflow manifest in the registry."),
+    ("aegis.workflow.export", "Exports a Workflow manifest by name."),
+    ("aegis.workflow.delete", "Removes a registered workflow from the registry by name."),
+    ("aegis.workflow.run", "Executes a registered workflow by name with optional input parameters."),
+    ("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
+    ("aegis.workflow.logs", "Returns paginated workflow execution events."),
+    ("aegis.workflow.cancel", "Cancel a running workflow execution."),
+    ("aegis.workflow.signal", "Send human input response to a paused workflow execution."),
+    ("aegis.workflow.remove", "Remove a workflow execution record."),
+    ("aegis.workflow.promote", "Promote a workflow from user scope to tenant scope."),
+    ("aegis.workflow.demote", "Demote a workflow from tenant scope to user scope."),
+    ("aegis.workflow.executions.list", "Lists workflow executions, optionally filtered."),
+    ("aegis.workflow.executions.get", "Returns details of a specific workflow execution."),
+    ("aegis.workflow.status", "Returns current status of a workflow execution."),
+    ("aegis.workflow.search", "Semantic search over registered workflows."),
+    ("aegis.task.execute", "Starts a new agent execution (task) by agent UUID or name."),
+    ("aegis.task.status", "Returns the current status and output of an execution by UUID."),
+    ("aegis.task.list", "Lists recent executions, optionally filtered by agent."),
+    ("aegis.task.cancel", "Cancels an active agent execution by UUID."),
+    ("aegis.task.remove", "Removes a completed or failed execution record by UUID."),
+    ("aegis.task.logs", "Returns paginated execution events for a task by UUID."),
+    ("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result."),
+    ("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
+    ("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run."),
+    ("aegis.tools.list", "List all MCP tools available to your security context with pagination and optional source/category filtering."),
+    ("aegis.tools.search", "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context."),
+    ("aegis.system.info", "Returns system version, status, and capabilities."),
+    ("aegis.system.config", "Returns the current node configuration."),
+];
+
 impl ToolRouter {
+    /// Returns the canonical list of all builtin tool dispatchers.
+    /// This is the single source of truth — the daemon startup and
+    /// all other consumers derive their dispatcher list from here.
+    pub fn builtin_dispatchers() -> Vec<BuiltinDispatcherConfig> {
+        BUILTIN_TOOL_DEFINITIONS
+            .iter()
+            .map(|(name, description)| {
+                let skip_judge = SKIP_JUDGE_TOOLS.contains(name);
+                BuiltinDispatcherConfig {
+                    name: name.to_string(),
+                    description: description.to_string(),
+                    enabled: true,
+                    capabilities: vec![crate::domain::node_config::CapabilityConfig {
+                        name: name.to_string(),
+                        skip_judge,
+                    }],
+                }
+            })
+            .collect()
+    }
+
     fn is_supported_builtin_workflow_tool(tool_name: &str) -> bool {
         matches!(
             tool_name,
