@@ -800,6 +800,7 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
+            "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
             _ => None,
         }
     }

@@ -162,6 +162,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.task.logs",
     "aegis.task.wait",
     "aegis.execute.status",
+    "aegis.execute.wait",
     "aegis.tools.list",
     "aegis.tools.search",
     "aegis.system.info",
@@ -224,6 +225,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result."),
     ("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
     ("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run."),
+    ("aegis.execute.wait", "Alias for aegis.workflow.wait. Blocks until pipeline execution completes."),
     ("aegis.tools.list", "List all MCP tools available to your security context with pagination and optional source/category filtering."),
     ("aegis.tools.search", "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context."),
     ("aegis.system.info", "Returns system version, status, and capabilities."),
@@ -275,6 +277,7 @@ impl ToolRouter {
                 | "aegis.workflow.demote"
                 | "aegis.execute.intent"
                 | "aegis.execute.status"
+                | "aegis.execute.wait"
         )
     }
 
@@ -996,6 +999,24 @@ impl ToolRouter {
                             }
                         },
                         "required": ["pipeline_execution_id"]
+                    }),
+                    "aegis.execute.wait" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow/pipeline execution to wait for."
+                            },
+                            "poll_interval_seconds": {
+                                "type": "integer",
+                                "description": "Seconds between polls (default: 5)."
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Maximum wait time in seconds (default: 300)."
+                            }
+                        },
+                        "required": ["execution_id"]
                     }),
                     "aegis.task.execute" => json!({
                         "type": "object",
