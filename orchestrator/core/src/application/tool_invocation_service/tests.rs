@@ -95,8 +95,8 @@ use crate::infrastructure::repositories::{
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
-use tokio::sync::RwLock;
 use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 fn test_agent_with_tools(tools: &[&str]) -> Agent {
     let manifest_yaml = format!(

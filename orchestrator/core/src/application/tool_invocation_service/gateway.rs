@@ -4,9 +4,10 @@ impl ToolInvocationService {
     pub async fn get_available_tools(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
-        let mut tools = self.tool_router.list_tools().await.map_err(|e| {
-            SmcpSessionError::InternalError(format!("Failed to list tools: {e}"))
-        })?;
+        let mut tools =
+            self.tool_router.list_tools().await.map_err(|e| {
+                SmcpSessionError::InternalError(format!("Failed to list tools: {e}"))
+            })?;
 
         if self.smcp_gateway_url.is_some() {
             if let Ok(gateway_tools) = self.fetch_gateway_tools_grpc().await {
@@ -91,9 +92,7 @@ impl ToolInvocationService {
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
         let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
-            SmcpSessionError::ConfigurationError(
-                "smcp_gateway.url is not configured".to_string(),
-            )
+            SmcpSessionError::ConfigurationError("smcp_gateway.url is not configured".to_string())
         })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await

@@ -405,7 +405,7 @@ impl ToolInvocationService {
                                 .start_child_execution(judge_id, input, execution_id)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::InvalidArguments(format!(
+                                    SmcpSessionError::InternalError(format!(
                                         "Failed to spawn judge child execution: {e}"
                                     ))
                                 })?;

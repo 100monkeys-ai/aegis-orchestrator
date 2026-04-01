@@ -893,6 +893,14 @@ async fn smcp_tool_invoke(
                     -32603_i32,
                     None,
                 ),
+                SmcpSessionError::NotFound(_) => {
+                    (axum::http::StatusCode::NOT_FOUND, -32001_i32, None)
+                }
+                SmcpSessionError::ConfigurationError(_) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    -32603_i32,
+                    None,
+                ),
             };
             let body = Json(json!({
                 "jsonrpc": "2.0",

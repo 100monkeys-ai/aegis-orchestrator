@@ -466,20 +466,22 @@ impl InnerLoopService {
                                 // Differentiate fatal policy/validation errors from
                                 // recoverable tool execution errors.
                                 //
-                                // SignatureVerificationFailed is used for:
-                                //   - Missing judge agent ("Judge agent '...' not found")
-                                //   - Validation rejection (score below threshold)
-                                //   - Policy violations from SecurityContext
-                                //
-                                // These are configuration or security errors that will
+                                // The following are configuration or security errors that will
                                 // never self-resolve by retrying. Fail the execution
                                 // immediately instead of looping forever (ADR-049).
+                                //   - SignatureVerificationFailed: Ed25519 crypto / validation rejection
+                                //   - PolicyViolation: security context denial
+                                //   - SessionInactive: session expired or revoked
+                                //   - NotFound: missing agent/resource (e.g. judge agent not found)
+                                //   - ConfigurationError: misconfigured security context or gateway
                                 use crate::domain::smcp_session::SmcpSessionError;
                                 let is_fatal = matches!(
                                     &e,
                                     SmcpSessionError::SignatureVerificationFailed(_)
                                         | SmcpSessionError::PolicyViolation(_)
                                         | SmcpSessionError::SessionInactive(_)
+                                        | SmcpSessionError::NotFound(_)
+                                        | SmcpSessionError::ConfigurationError(_)
                                 );
 
                                 if is_fatal {

@@ -37,9 +37,7 @@ async fn connect_temporal_with_retry(
     temporal_task_queue: &str,
     worker_http_endpoint: &str,
     max_retries: i32,
-) -> Result<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>> {
-    use aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient;
-
+) -> Result<Arc<TemporalClient>> {
     let mut retries: i32 = 0;
 
     loop {
@@ -2398,6 +2396,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // When the node's cluster role is Worker or Hybrid AND a controller
     // endpoint is configured, spawn a background task that performs
     // attestation, registration, heartbeat loop, and graceful deregistration.
+    //
+    // The sender is kept alive in this binding for the duration of `start_daemon`
+    // (i.e., until the HTTP server exits). Dropping it signals the lifecycle task
+    // to execute its graceful deregistration step.
+    let mut _worker_lifecycle_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
     if let Some(ref cluster_config) = config.spec.cluster {
         if cluster_config.enabled {
             let role = &cluster_config.role;
@@ -2528,11 +2531,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                         }
                                     });
 
-                                    // The shutdown sender is dropped when the daemon exits,
-                                    // which will trigger the watch::changed() branch in the
-                                    // heartbeat loop.
-                                    // Intentionally keep `shutdown_tx` alive for the daemon's lifetime.
-                                    std::mem::forget(shutdown_tx);
+                                    // Keep the sender alive until the daemon exits.
+                                    // Dropping it will signal the lifecycle task to
+                                    // execute its graceful deregistration step.
+                                    _worker_lifecycle_shutdown = Some(shutdown_tx);
                                 }
                                 Err(e) => {
                                     tracing::warn!(
