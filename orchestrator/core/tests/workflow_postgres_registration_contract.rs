@@ -124,8 +124,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         },
     )
     .unwrap()

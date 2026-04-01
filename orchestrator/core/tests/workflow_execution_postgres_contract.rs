@@ -75,8 +75,7 @@ fn build_workflow(name: &str) -> Workflow {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         },
     )
     .unwrap()

@@ -87,8 +87,7 @@ fn test_map_100monkeys_workflow() {
             initial_state: StateName::new("GENERATE").unwrap(),
             context: HashMap::from([("task".to_string(), serde_json::json!("Write fibonacci"))]),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         },
     )
     .unwrap();
@@ -150,8 +149,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         },
     )
     .unwrap();
