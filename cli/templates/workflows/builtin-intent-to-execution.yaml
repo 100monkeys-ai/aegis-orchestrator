@@ -18,10 +18,9 @@ spec:
   initial_state: DISCOVER_OR_GENERATE_AGENT
 
   workspace:
-    kind: ephemeral
-    size_limit_mb: 256
-    ttl_minutes: 60
-    mount_path: /workspace
+    kind:
+      ephemeral:
+        ttl_hours: 1
 
   states:
     DISCOVER_OR_GENERATE_AGENT:

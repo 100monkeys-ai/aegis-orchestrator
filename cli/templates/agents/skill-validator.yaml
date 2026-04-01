@@ -31,7 +31,7 @@ spec:
       Output format: Always respond with structured JSON or YAML as requested.
       Never include commentary outside the requested output format.
   execution:
-    mode: "OneShot"
+    mode: one-shot
     max_retries: 1
     llm_timeout_seconds: 120
   security:
