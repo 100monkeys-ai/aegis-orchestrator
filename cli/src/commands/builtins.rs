@@ -46,6 +46,18 @@ pub const SKILL_VALIDATOR_AGENT_TEMPLATE: &str =
 pub const SKILL_IMPORT_WORKFLOW_TEMPLATE: &str =
     include_str!("../../templates/workflows/skill-import.yaml");
 
+pub const INTENT_EXECUTION_WORKFLOW_NAME: &str = "builtin-intent-to-execution";
+pub const INTENT_EXECUTION_WORKFLOW_TEMPLATE: &str =
+    include_str!("../../templates/workflows/builtin-intent-to-execution.yaml");
+
+pub const INTENT_EXECUTOR_DISCOVERY_AGENT_NAME: &str = "intent-executor-discovery-agent";
+pub const INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/intent-executor-discovery-agent.yaml");
+
+pub const INTENT_RESULT_FORMATTER_AGENT_NAME: &str = "intent-result-formatter-agent";
+pub const INTENT_RESULT_FORMATTER_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/intent-result-formatter-agent.yaml");
+
 // ─── Deployment Logic ───────────────────────────────────────────────────────
 
 pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<()> {
@@ -107,6 +119,20 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
         force,
     )
     .await?;
+    deploy_builtin_agent(
+        client,
+        INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
+        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+        force,
+    )
+    .await?;
+    deploy_builtin_agent(
+        client,
+        INTENT_RESULT_FORMATTER_AGENT_NAME,
+        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+        force,
+    )
+    .await?;
 
     // Workflows
     deploy_builtin_workflow(
@@ -120,6 +146,13 @@ pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<(
         client,
         "skill-import",
         SKILL_IMPORT_WORKFLOW_TEMPLATE,
+        force,
+    )
+    .await?;
+    deploy_builtin_workflow(
+        client,
+        INTENT_EXECUTION_WORKFLOW_NAME,
+        INTENT_EXECUTION_WORKFLOW_TEMPLATE,
         force,
     )
     .await?;
@@ -196,6 +229,24 @@ pub fn sync_generator_templates_to_disk(templates_root: &std::path::Path) -> Res
         "workflows",
         "builtin-workflow-generator.yaml",
         WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "intent-executor-discovery-agent.yaml",
+        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "agents",
+        "intent-result-formatter-agent.yaml",
+        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+    )?;
+    persist_template(
+        templates_root,
+        "workflows",
+        "builtin-intent-to-execution.yaml",
+        INTENT_EXECUTION_WORKFLOW_TEMPLATE,
     )?;
     Ok(())
 }
