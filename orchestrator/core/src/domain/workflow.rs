@@ -548,6 +548,18 @@ pub struct WorkflowVolumeSpec {
     pub size_limit_bytes: Option<u64>,
 }
 
+/// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowStorageSpec {
+    /// Default shared workspace volume, auto-created at workflow start if defined.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkflowWorkspaceSpec>,
+
+    /// Additional named shared volumes accessible by multiple states.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub shared_volumes: Vec<WorkflowVolumeSpec>,
+}
+
 /// Specifies how a workflow execution manages its workspace volume (ADR-087).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowWorkspaceSpec {
@@ -638,9 +650,9 @@ pub struct WorkflowSpec {
     #[serde(default)]
     pub volumes: Vec<WorkflowVolumeSpec>,
 
-    /// Optional workspace volume provisioning (ADR-087).
-    #[serde(default)]
-    pub workspace: Option<WorkflowWorkspaceSpec>,
+    /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<WorkflowStorageSpec>,
 }
 
 /// Individual state in the workflow FSM
@@ -1592,7 +1604,7 @@ mod tests {
                 context: std::collections::HashMap::new(),
                 states,
                 volumes: vec![],
-                workspace: None,
+                storage: None,
             },
             created_at: Utc::now(),
         };

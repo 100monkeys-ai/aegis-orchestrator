@@ -2559,45 +2559,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     if config.spec.deploy_builtins {
         use crate::commands::builtins;
 
-        let builtin_templates: &[(&str, &str)] = &[
-            ("hello-world-agent", builtins::HELLO_WORLD_TEMPLATE),
-            ("code-quality-judge", builtins::CODE_QUALITY_JUDGE_TEMPLATE),
-            (
-                "tool-call-policy-judge",
-                builtins::TOOL_CALL_POLICY_JUDGE_TEMPLATE,
-            ),
-            (
-                builtins::WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
-                builtins::WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
-            ),
-            (
-                builtins::AGENT_GENERATOR_AGENT_NAME,
-                builtins::AGENT_GENERATOR_AGENT_TEMPLATE,
-            ),
-            (
-                builtins::AGENT_GENERATOR_JUDGE_NAME,
-                builtins::AGENT_GENERATOR_JUDGE_TEMPLATE,
-            ),
-            (
-                builtins::WORKFLOW_GENERATOR_JUDGE_NAME,
-                builtins::WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
-            ),
-            (
-                builtins::WORKFLOW_CREATOR_AGENT_NAME,
-                builtins::WORKFLOW_CREATOR_AGENT_TEMPLATE,
-            ),
-            ("skill-validator", builtins::SKILL_VALIDATOR_AGENT_TEMPLATE),
-            (
-                builtins::INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
-                builtins::INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
-            ),
-            (
-                builtins::INTENT_RESULT_FORMATTER_AGENT_NAME,
-                builtins::INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
-            ),
-        ];
-
-        for (name, yaml) in builtin_templates {
+        for (name, yaml) in builtins::BUILTIN_AGENTS {
             match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
                 Ok(manifest) => {
                     if agent_service
@@ -2619,20 +2581,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
 
-        // Deploy built-in workflows
-        let builtin_workflows: &[(&str, &str)] = &[
-            (
-                builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME,
-                builtins::WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
-            ),
-            ("skill-import", builtins::SKILL_IMPORT_WORKFLOW_TEMPLATE),
-            (
-                builtins::INTENT_EXECUTION_WORKFLOW_NAME,
-                builtins::INTENT_EXECUTION_WORKFLOW_TEMPLATE,
-            ),
-        ];
-
-        for (wf_name, wf_template) in builtin_workflows {
+        for (wf_name, wf_template) in builtins::BUILTIN_WORKFLOWS {
             if workflow_repo
                 .find_by_name(wf_name)
                 .await

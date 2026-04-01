@@ -98,9 +98,9 @@ pub struct WorkflowSpecYaml {
     /// Named volumes available to ContainerRun / ParallelContainerRun states (ADR-050)
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub volumes: Vec<crate::domain::workflow::WorkflowVolumeSpec>,
-    /// Optional workspace volume provisioning (ADR-087)
+    /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage)
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<crate::domain::workflow::WorkflowWorkspaceSpec>,
+    pub storage: Option<crate::domain::workflow::WorkflowStorageSpec>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -393,7 +393,7 @@ impl WorkflowParser {
             context: manifest.spec.context,
             states,
             volumes: manifest.spec.volumes,
-            workspace: manifest.spec.workspace,
+            storage: manifest.spec.storage,
         };
 
         // Create and validate workflow
@@ -630,7 +630,7 @@ impl WorkflowParser {
             context: workflow.spec.context.clone(),
             states,
             volumes: workflow.spec.volumes.clone(),
-            workspace: workflow.spec.workspace.clone(),
+            storage: workflow.spec.storage.clone(),
         };
 
         WorkflowManifest {

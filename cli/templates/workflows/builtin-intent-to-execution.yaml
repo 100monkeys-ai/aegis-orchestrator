@@ -17,10 +17,11 @@ metadata:
 spec:
   initial_state: DISCOVER_OR_GENERATE_AGENT
 
-  workspace:
-    kind:
-      ephemeral:
-        ttl_hours: 1
+  storage:
+    workspace:
+      kind:
+        ephemeral:
+          ttl_hours: 1
 
   states:
     DISCOVER_OR_GENERATE_AGENT:

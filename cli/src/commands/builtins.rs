@@ -58,105 +58,137 @@ pub const INTENT_RESULT_FORMATTER_AGENT_NAME: &str = "intent-result-formatter-ag
 pub const INTENT_RESULT_FORMATTER_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/intent-result-formatter-agent.yaml");
 
+// ─── Canonical Registries ───────────────────────────────────────────────────
+
+struct BuiltinTemplateSpec {
+    category: &'static str,
+    file_name: &'static str,
+    content: &'static str,
+}
+
+/// Canonical registry of all built-in agent templates for deployment.
+pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
+    ("hello-world-agent", HELLO_WORLD_TEMPLATE),
+    ("code-quality-judge", CODE_QUALITY_JUDGE_TEMPLATE),
+    ("tool-call-policy-judge", TOOL_CALL_POLICY_JUDGE_TEMPLATE),
+    (
+        WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
+        WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+    ),
+    (AGENT_GENERATOR_AGENT_NAME, AGENT_GENERATOR_AGENT_TEMPLATE),
+    (AGENT_GENERATOR_JUDGE_NAME, AGENT_GENERATOR_JUDGE_TEMPLATE),
+    (
+        WORKFLOW_GENERATOR_JUDGE_NAME,
+        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    ),
+    (WORKFLOW_CREATOR_AGENT_NAME, WORKFLOW_CREATOR_AGENT_TEMPLATE),
+    ("skill-validator", SKILL_VALIDATOR_AGENT_TEMPLATE),
+    (
+        INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
+        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+    ),
+    (
+        INTENT_RESULT_FORMATTER_AGENT_NAME,
+        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+    ),
+];
+
+/// Canonical registry of all built-in workflow templates.
+pub const BUILTIN_WORKFLOWS: &[(&str, &str)] = &[
+    (
+        WORKFLOW_GENERATOR_WORKFLOW_NAME,
+        WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+    ),
+    ("skill-import", SKILL_IMPORT_WORKFLOW_TEMPLATE),
+    (
+        INTENT_EXECUTION_WORKFLOW_NAME,
+        INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+    ),
+];
+
+/// All builtin templates that should be synced to disk.
+const BUILTIN_TEMPLATES: &[BuiltinTemplateSpec] = &[
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "hello-world-agent.yaml",
+        content: HELLO_WORLD_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "code-quality-judge.yaml",
+        content: CODE_QUALITY_JUDGE_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "tool-call-policy-judge.yaml",
+        content: TOOL_CALL_POLICY_JUDGE_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "workflow-generator-planner-agent.yaml",
+        content: WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "agent-creator-agent.yaml",
+        content: AGENT_GENERATOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "agent-generator-judge.yaml",
+        content: AGENT_GENERATOR_JUDGE_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "workflow-generator-judge.yaml",
+        content: WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "workflow-creator-validator-agent.yaml",
+        content: WORKFLOW_CREATOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "skill-validator.yaml",
+        content: SKILL_VALIDATOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "intent-executor-discovery-agent.yaml",
+        content: INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "intent-result-formatter-agent.yaml",
+        content: INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "workflows",
+        file_name: "builtin-workflow-generator.yaml",
+        content: WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "workflows",
+        file_name: "skill-import.yaml",
+        content: SKILL_IMPORT_WORKFLOW_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "workflows",
+        file_name: "builtin-intent-to-execution.yaml",
+        content: INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+    },
+];
+
 // ─── Deployment Logic ───────────────────────────────────────────────────────
 
 pub async fn deploy_all_builtins(client: &DaemonClient, force: bool) -> Result<()> {
-    // Agents
-    deploy_builtin_agent(client, "hello-world-agent", HELLO_WORLD_TEMPLATE, force).await?;
-    deploy_builtin_agent(
-        client,
-        "code-quality-judge",
-        CODE_QUALITY_JUDGE_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        "tool-call-policy-judge",
-        TOOL_CALL_POLICY_JUDGE_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        WORKFLOW_GENERATOR_PLANNER_AGENT_NAME,
-        WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        AGENT_GENERATOR_AGENT_NAME,
-        AGENT_GENERATOR_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        AGENT_GENERATOR_JUDGE_NAME,
-        AGENT_GENERATOR_JUDGE_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        WORKFLOW_GENERATOR_JUDGE_NAME,
-        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        WORKFLOW_CREATOR_AGENT_NAME,
-        WORKFLOW_CREATOR_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        "skill-validator",
-        SKILL_VALIDATOR_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
-        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_agent(
-        client,
-        INTENT_RESULT_FORMATTER_AGENT_NAME,
-        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
-        force,
-    )
-    .await?;
-
-    // Workflows
-    deploy_builtin_workflow(
-        client,
-        WORKFLOW_GENERATOR_WORKFLOW_NAME,
-        WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_workflow(
-        client,
-        "skill-import",
-        SKILL_IMPORT_WORKFLOW_TEMPLATE,
-        force,
-    )
-    .await?;
-    deploy_builtin_workflow(
-        client,
-        INTENT_EXECUTION_WORKFLOW_NAME,
-        INTENT_EXECUTION_WORKFLOW_TEMPLATE,
-        force,
-    )
-    .await?;
-
+    for (name, template) in BUILTIN_AGENTS {
+        deploy_builtin_agent(client, name, template, force).await?;
+    }
+    for (name, template) in BUILTIN_WORKFLOWS {
+        deploy_builtin_workflow(client, name, template, force).await?;
+    }
     Ok(())
 }
 
@@ -176,78 +208,9 @@ pub fn resolve_generated_root(config_path: Option<&std::path::PathBuf>) -> std::
 }
 
 pub fn sync_generator_templates_to_disk(templates_root: &std::path::Path) -> Result<()> {
-    persist_template(
-        templates_root,
-        "agents",
-        "workflow-generator-planner-agent.yaml",
-        WORKFLOW_GENERATOR_PLANNER_AGENT_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "agent-creator-agent.yaml",
-        AGENT_GENERATOR_AGENT_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "agent-generator-judge.yaml",
-        AGENT_GENERATOR_JUDGE_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "workflow-generator-judge.yaml",
-        WORKFLOW_GENERATOR_JUDGE_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "workflow-creator-validator-agent.yaml",
-        WORKFLOW_CREATOR_AGENT_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "hello-world-agent.yaml",
-        HELLO_WORLD_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "code-quality-judge.yaml",
-        CODE_QUALITY_JUDGE_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "tool-call-policy-judge.yaml",
-        TOOL_CALL_POLICY_JUDGE_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "workflows",
-        "builtin-workflow-generator.yaml",
-        WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "intent-executor-discovery-agent.yaml",
-        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "agents",
-        "intent-result-formatter-agent.yaml",
-        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
-    )?;
-    persist_template(
-        templates_root,
-        "workflows",
-        "builtin-intent-to-execution.yaml",
-        INTENT_EXECUTION_WORKFLOW_TEMPLATE,
-    )?;
+    for spec in BUILTIN_TEMPLATES {
+        persist_template(templates_root, spec.category, spec.file_name, spec.content)?;
+    }
     Ok(())
 }
 
@@ -487,6 +450,27 @@ mod tests {
         assert!(states.contains_key(&serde_yaml::Value::from("PLAN")));
         assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_MISSING_AGENTS")));
         assert!(states.contains_key(&serde_yaml::Value::from("GENERATE_AND_REGISTER_WORKFLOW")));
+    }
+
+    #[test]
+    fn all_builtin_agent_templates_parse_successfully() {
+        for (name, yaml) in BUILTIN_AGENTS {
+            let manifest: aegis_orchestrator_sdk::AgentManifest = serde_yaml::from_str(yaml)
+                .unwrap_or_else(|e| panic!("Failed to parse builtin agent '{}': {}", name, e));
+            manifest
+                .validate()
+                .unwrap_or_else(|e| panic!("Builtin agent '{}' failed validation: {}", name, e));
+        }
+    }
+
+    #[test]
+    fn all_builtin_workflow_templates_parse_successfully() {
+        for (name, yaml) in BUILTIN_WORKFLOWS {
+            aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser::parse_yaml(
+                yaml,
+            )
+            .unwrap_or_else(|e| panic!("Failed to parse builtin workflow '{}': {}", name, e));
+        }
     }
 
     #[test]
