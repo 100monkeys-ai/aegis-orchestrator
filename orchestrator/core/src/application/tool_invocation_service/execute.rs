@@ -92,9 +92,9 @@ impl ToolInvocationService {
         {
             Ok(started) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.execute.intent",
-                "pipeline_execution_id": started.workflow_id,
+                "pipeline_execution_id": started.execution_id,
                 "status": "started",
-                "stream_url": format!("/v1/executions/{}/stream", started.workflow_id)
+                "stream_url": format!("/v1/executions/{}/stream", started.execution_id)
             }))),
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.execute.intent",
