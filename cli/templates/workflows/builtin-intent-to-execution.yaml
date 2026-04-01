@@ -19,9 +19,9 @@ spec:
 
   storage:
     workspace:
-      kind:
-        ephemeral:
-          ttl_hours: 1
+      storage_class: ephemeral
+      ttl_hours: 1
+      size_limit_mb: 256
 
   states:
     DISCOVER_OR_GENERATE_AGENT:
