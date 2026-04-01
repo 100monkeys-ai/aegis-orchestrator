@@ -205,6 +205,10 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         for (state_name, state) in temporal_definition.states.iter_mut() {
             if state.kind == "Agent" {
                 if let Some(ref name) = state.agent.clone() {
+                    // Skip Handlebars template expressions — resolved at execution time
+                    if name.contains("{{") {
+                        continue;
+                    }
                     if uuid::Uuid::parse_str(name).is_err() {
                         let agent_id = self
                             .agent_service
