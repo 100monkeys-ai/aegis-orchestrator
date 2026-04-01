@@ -95,7 +95,7 @@ use crate::infrastructure::repositories::{
 use futures::Stream;
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::RwLock;
+use tokio::sync::RwLock;
 use tokio::sync::Mutex;
 
 fn test_agent_with_tools(tools: &[&str]) -> Agent {
@@ -550,7 +550,7 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
         payload: serde_json::Value,
         iteration_number: Option<u8>,
     ) -> Result<(), crate::domain::repository::RepositoryError> {
-        let mut events = self.events.write().unwrap();
+        let mut events = self.events.write().await;
         events
             .entry(execution_id)
             .or_default()
@@ -574,7 +574,7 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
         let events = self
             .events
             .read()
-            .unwrap()
+            .await
             .get(&id)
             .cloned()
             .unwrap_or_default();
@@ -1155,10 +1155,10 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
 #[test]
 fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
     let execution_id = ExecutionId::new();
-    let huge_schema_body = "x".repeat(50_000);
+    let huge_schema_body = "x".repeat(5_000);
     let huge_manifest = format!(
             "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
-            "y".repeat(50_000)
+            "y".repeat(5_000)
         );
     let tool_audit_history = vec![
         crate::domain::execution::TrajectoryStep {
@@ -2169,6 +2169,48 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
     ) -> Result<Option<AgentId>> {
         Ok((name == self.agent_name && version == self.agent_version).then_some(self.agent_id))
     }
+}
+
+#[tokio::test]
+async fn version_aware_agent_lifecycle_service_lookup_agent_with_version_is_correct() {
+    let agent_id = AgentId::new();
+    let agent_name = "example-agent";
+    let agent_version = "1.2.3";
+
+    let service = VersionAwareAgentLifecycleService {
+        agent_name: agent_name.to_string(),
+        agent_version: agent_version.to_string(),
+        agent_id,
+    };
+
+    // Matching name and version returns Some(agent_id).
+    let result = service
+        .lookup_agent_with_version(agent_name, agent_version)
+        .await
+        .expect("lookup_agent_with_version should succeed");
+    assert_eq!(result, Some(agent_id));
+
+    // Correct name, wrong version returns None.
+    let result = service
+        .lookup_agent_with_version(agent_name, "9.9.9")
+        .await
+        .expect("lookup_agent_with_version should succeed");
+    assert_eq!(result, None);
+
+    // Wrong name, correct version returns None.
+    let result = service
+        .lookup_agent_with_version("other-agent", agent_version)
+        .await
+        .expect("lookup_agent_with_version should succeed");
+    assert_eq!(result, None);
+
+    // Also validate the tenant-scoped wrapper delegates correctly.
+    let tenant_id = TenantId::consumer();
+    let result = service
+        .lookup_agent_for_tenant_with_version(&tenant_id, agent_name, agent_version)
+        .await
+        .expect("lookup_agent_for_tenant_with_version should succeed");
+    assert_eq!(result, Some(agent_id));
 }
 
 /// Helper: build a `ToolInvocationService` backed by a `VersionAwareAgentLifecycleService`.

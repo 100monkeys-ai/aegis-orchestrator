@@ -28,6 +28,56 @@ type RepositoryTuple = (
 use sqlx::postgres::PgPool;
 use std::path::PathBuf;
 use tokio::net::TcpListener;
+
+// Helper to establish a Temporal client connection with retry logic.
+// Extracted to module scope for improved testability and separation of concerns.
+async fn connect_temporal_with_retry(
+    temporal_address: &str,
+    temporal_namespace: &str,
+    temporal_task_queue: &str,
+    worker_http_endpoint: &str,
+    max_retries: i32,
+) -> Result<Arc<aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient>> {
+    use aegis_orchestrator_core::infrastructure::temporal_client::TemporalClient;
+
+    let mut retries: i32 = 0;
+
+    loop {
+        match TemporalClient::new(
+            temporal_address,
+            temporal_namespace,
+            temporal_task_queue,
+            worker_http_endpoint,
+        )
+        .await
+        {
+            Ok(client) => {
+                tracing::info!("Temporal Client connected successfully");
+                return Ok(Arc::new(client));
+            }
+            Err(e) => {
+                retries += 1;
+                if retries >= max_retries {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "Failed to connect to Temporal at {temporal_address} after {retries} attempts"
+                        )
+                    });
+                }
+
+                if retries % 5 == 0 {
+                    tracing::info!(
+                        attempt = retries,
+                        max_retries = max_retries,
+                        "Still verifying Temporal connection"
+                    );
+                }
+                tracing::debug!(error = %e, "Failed to connect to Temporal, retrying in 2s");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    }
+}
 use tokio::signal;
 use tracing::{debug, error, info, warn};
 
@@ -627,9 +677,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
         Err(e) => {
             return Err(anyhow::anyhow!(
-                "Failed to load StandardRuntime registry from '{registry_path}': {e}. \
+                "Failed to load StandardRuntime registry from '{}': {e}. \
                  Ensure runtime-registry.yaml exists at the configured path \
-                 (spec.runtime.runtime_registry_path in aegis-config.yaml)."
+                 (spec.runtime.runtime_registry_path in aegis-config.yaml).",
+                registry_path.display()
             ));
         }
     };
@@ -726,52 +777,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Clone for async task
     let temporal_address_clone = temporal_address.clone();
     let worker_http_endpoint_clone = worker_http_endpoint.clone();
-
-    async fn connect_temporal_with_retry(
-        temporal_address: &str,
-        temporal_namespace: &str,
-        temporal_task_queue: &str,
-        worker_http_endpoint: &str,
-        max_retries: i32,
-    ) -> Result<Arc<TemporalClient>> {
-        let mut retries: i32 = 0;
-
-        loop {
-            match TemporalClient::new(
-                temporal_address,
-                temporal_namespace,
-                temporal_task_queue,
-                worker_http_endpoint,
-            )
-            .await
-            {
-                Ok(client) => {
-                    tracing::info!("Temporal Client connected successfully");
-                    return Ok(Arc::new(client));
-                }
-                Err(e) => {
-                    retries += 1;
-                    if retries >= max_retries {
-                        return Err(e).with_context(|| {
-                            format!(
-                                "Failed to connect to Temporal at {temporal_address} after {retries} attempts"
-                            )
-                        });
-                    }
-
-                    if retries % 5 == 0 {
-                        tracing::info!(
-                            attempt = retries,
-                            max_retries = max_retries,
-                            "Still verifying Temporal connection"
-                        );
-                    }
-                    tracing::debug!(error = %e, "Failed to connect to Temporal, retrying in 2s");
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-        }
-    }
 
     if temporal_required {
         let client = connect_temporal_with_retry(
@@ -2526,7 +2531,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                     // The shutdown sender is dropped when the daemon exits,
                                     // which will trigger the watch::changed() branch in the
                                     // heartbeat loop.
-                                    std::mem::drop(shutdown_tx);
+                                    // Intentionally keep `shutdown_tx` alive for the daemon's lifetime.
+                                    std::mem::forget(shutdown_tx);
                                 }
                                 Err(e) => {
                                     tracing::warn!(

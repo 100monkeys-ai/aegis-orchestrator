@@ -5,7 +5,7 @@ impl ToolInvocationService {
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
         let mut tools = self.tool_router.list_tools().await.map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Failed to list tools: {e}"))
+            SmcpSessionError::InternalError(format!("Failed to list tools: {e}"))
         })?;
 
         if self.smcp_gateway_url.is_some() {
@@ -26,7 +26,7 @@ impl ToolInvocationService {
             .get_agent(agent_id)
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SmcpSessionError::InternalError(format!(
                     "Failed to load agent for tool scoping: {e}"
                 ))
             })?;
@@ -51,9 +51,9 @@ impl ToolInvocationService {
             .security_context_repo
             .find_by_name(security_context_name)
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+            .map_err(|e| SmcpSessionError::ConfigurationError(e.to_string()))?
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SmcpSessionError::ConfigurationError(format!(
                     "Security context '{security_context_name}' not found"
                 ))
             })?;
@@ -91,7 +91,7 @@ impl ToolInvocationService {
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
         let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SmcpSessionError::ConfigurationError(
                 "smcp_gateway.url is not configured".to_string(),
             )
         })?;

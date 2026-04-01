@@ -352,12 +352,12 @@ impl ToolInvocationService {
                                 .lookup_agent(judge_agent)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                    SmcpSessionError::InternalError(format!(
                                         "Failed to lookup judge: {e}"
                                     ))
                                 })?
                                 .ok_or_else(|| {
-                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                    SmcpSessionError::NotFound(format!(
                                         "Judge agent '{judge_agent}' not found"
                                     ))
                                 })?;
@@ -405,7 +405,7 @@ impl ToolInvocationService {
                                 .start_child_execution(judge_id, input, execution_id)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::SignatureVerificationFailed(format!(
+                                    SmcpSessionError::InvalidArguments(format!(
                                         "Failed to spawn judge child execution: {e}"
                                     ))
                                 })?;
@@ -446,14 +446,14 @@ impl ToolInvocationService {
                                     crate::domain::execution::ExecutionStatus::Completed => {
                                         let last_iter =
                                             exec.iterations().last().ok_or_else(|| {
-                                                SmcpSessionError::SignatureVerificationFailed(
+                                                SmcpSessionError::InternalError(
                                                     "Judge completed but has no iterations"
                                                         .to_string(),
                                                 )
                                             })?;
                                         let output_str =
                                             last_iter.output.as_ref().ok_or_else(|| {
-                                                SmcpSessionError::SignatureVerificationFailed(
+                                                SmcpSessionError::InternalError(
                                                     "Judge completed but has no output".to_string(),
                                                 )
                                             })?;
