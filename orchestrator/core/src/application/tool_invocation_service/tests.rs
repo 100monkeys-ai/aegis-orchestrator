@@ -1861,16 +1861,14 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         .save(crate::domain::security_context::SecurityContext {
             name: "zaru-free".to_string(),
             description: "Free tier".to_string(),
-            capabilities: vec![
-                crate::domain::security_context::Capability {
-                    tool_pattern: "aegis.workflow.status".to_string(),
-                    path_allowlist: None,
-                    command_allowlist: None,
-                    subcommand_allowlist: None,
-                    domain_allowlist: None,
-                    max_response_size: None,
-                },
-            ],
+            capabilities: vec![crate::domain::security_context::Capability {
+                tool_pattern: "aegis.workflow.status".to_string(),
+                path_allowlist: None,
+                command_allowlist: None,
+                subcommand_allowlist: None,
+                domain_allowlist: None,
+                max_response_size: None,
+            }],
             deny_list: vec!["aegis.workflow.delete".to_string()],
             metadata: crate::domain::security_context::SecurityContextMetadata {
                 created_at: chrono::Utc::now(),
