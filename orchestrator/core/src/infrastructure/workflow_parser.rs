@@ -115,7 +115,7 @@ pub struct WorkflowStateYaml {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind")]
+#[serde(tag = "kind", deny_unknown_fields)]
 pub enum StateKindYaml {
     Agent {
         agent: String,
