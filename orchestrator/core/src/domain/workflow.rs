@@ -1636,7 +1636,7 @@ mod tests {
             context: HashMap::new(),
             states: HashMap::new(),
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1673,7 +1673,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1719,7 +1719,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1779,7 +1779,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1829,7 +1829,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1868,7 +1868,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1908,7 +1908,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1948,7 +1948,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -1983,7 +1983,7 @@ mod tests {
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
