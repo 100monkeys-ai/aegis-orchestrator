@@ -561,25 +561,40 @@ pub struct WorkflowStorageSpec {
 }
 
 /// Specifies how a workflow execution manages its workspace volume (ADR-087).
+/// Follows the spec.storage.workspace schema from WORKFLOW_MANIFEST_SPEC_V1.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkflowWorkspaceSpec {
-    pub kind: WorkspaceKind,
+    /// Storage class: "ephemeral" (auto-deleted after TTL) or "persistent" (manual deletion).
+    #[serde(default)]
+    pub storage_class: WorkflowStorageClass,
+
+    /// Time-to-live in hours for ephemeral workspaces.
+    #[serde(default = "default_workspace_ttl_hours")]
+    pub ttl_hours: u32,
+
+    /// Maximum size in megabytes.
+    #[serde(default = "default_workspace_size_limit_mb")]
+    pub size_limit_mb: u64,
+
+    /// Pre-created volume UUID (persistent only). Rejected for Free tier at policy layer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume_id: Option<String>,
+
+    /// Blackboard key for the resolved volume ID.
     #[serde(default = "default_workspace_blackboard_key")]
     pub blackboard_key: String,
 }
 
-fn default_workspace_blackboard_key() -> String {
-    "workspace_volume_id".to_string()
+fn default_workspace_ttl_hours() -> u32 {
+    1
 }
 
-/// Workspace provisioning strategy for a workflow execution (ADR-087).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum WorkspaceKind {
-    /// Create ephemeral volume at workflow start; destroy at terminal state.
-    Ephemeral { ttl_hours: u32 },
-    /// Use a caller-supplied persistent volume. Rejected for Free tier at policy layer.
-    Persistent { volume_id: String },
+fn default_workspace_size_limit_mb() -> u64 {
+    256
+}
+
+fn default_workspace_blackboard_key() -> String {
+    "workspace_volume_id".to_string()
 }
 
 /// Input schema for the aegis.execute.intent tool (ADR-087).
