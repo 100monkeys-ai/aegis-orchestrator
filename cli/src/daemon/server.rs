@@ -2586,6 +2586,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 builtins::WORKFLOW_CREATOR_AGENT_NAME,
                 builtins::WORKFLOW_CREATOR_AGENT_TEMPLATE,
             ),
+            ("skill-validator", builtins::SKILL_VALIDATOR_AGENT_TEMPLATE),
+            (
+                builtins::INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
+                builtins::INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+            ),
+            (
+                builtins::INTENT_RESULT_FORMATTER_AGENT_NAME,
+                builtins::INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+            ),
         ];
 
         for (name, yaml) in builtin_templates {
@@ -2610,26 +2619,39 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
 
-        // Deploy built-in workflow
-        let wf_name = builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME;
-        if workflow_repo
-            .find_by_name(wf_name)
-            .await
-            .ok()
-            .flatten()
-            .is_some()
-        {
-            info!(
-                "Built-in workflow '{}' already registered, skipping",
-                wf_name
-            );
-        } else {
-            match register_workflow_use_case
-                .register_workflow(builtins::WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE, false)
+        // Deploy built-in workflows
+        let builtin_workflows: &[(&str, &str)] = &[
+            (
+                builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME,
+                builtins::WORKFLOW_GENERATOR_WORKFLOW_TEMPLATE,
+            ),
+            ("skill-import", builtins::SKILL_IMPORT_WORKFLOW_TEMPLATE),
+            (
+                builtins::INTENT_EXECUTION_WORKFLOW_NAME,
+                builtins::INTENT_EXECUTION_WORKFLOW_TEMPLATE,
+            ),
+        ];
+
+        for (wf_name, wf_template) in builtin_workflows {
+            if workflow_repo
+                .find_by_name(wf_name)
                 .await
+                .ok()
+                .flatten()
+                .is_some()
             {
-                Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
-                Err(e) => warn!("Failed to deploy built-in workflow '{}': {}", wf_name, e),
+                info!(
+                    "Built-in workflow '{}' already registered, skipping",
+                    wf_name
+                );
+            } else {
+                match register_workflow_use_case
+                    .register_workflow(wf_template, false)
+                    .await
+                {
+                    Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
+                    Err(e) => warn!("Failed to deploy built-in workflow '{}': {}", wf_name, e),
+                }
             }
         }
 
