@@ -95,12 +95,9 @@ pub struct WorkflowSpecYaml {
     #[serde(default)]
     pub context: HashMap<String, serde_json::Value>,
     pub states: HashMap<String, WorkflowStateYaml>,
-    /// Named volumes available to ContainerRun / ParallelContainerRun states (ADR-050)
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub volumes: Vec<crate::domain::workflow::WorkflowVolumeSpec>,
     /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<crate::domain::workflow::WorkflowStorageSpec>,
+    #[serde(default)]
+    pub storage: crate::domain::workflow::WorkflowStorageSpec,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -392,7 +389,6 @@ impl WorkflowParser {
             initial_state,
             context: manifest.spec.context,
             states,
-            volumes: manifest.spec.volumes,
             storage: manifest.spec.storage,
         };
 
@@ -629,7 +625,6 @@ impl WorkflowParser {
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states,
-            volumes: workflow.spec.volumes.clone(),
             storage: workflow.spec.storage.clone(),
         };
 
@@ -964,10 +959,11 @@ metadata:
   version: "1.0.0"
 spec:
   initial_state: build
-  volumes:
-    - name: cargo-cache
-      storage_class: persistent
-      size_limit_bytes: 2147483648
+  storage:
+    shared_volumes:
+      - name: cargo-cache
+        storage_class: persistent
+        size_limit_bytes: 2147483648
   states:
     build:
       kind: ContainerRun
@@ -997,8 +993,8 @@ spec:
 
         let workflow = result.unwrap();
         assert_eq!(workflow.metadata.name, "ci-build");
-        assert_eq!(workflow.spec.volumes.len(), 1);
-        assert_eq!(workflow.spec.volumes[0].name, "cargo-cache");
+        assert_eq!(workflow.spec.storage.shared_volumes.len(), 1);
+        assert_eq!(workflow.spec.storage.shared_volumes[0].name, "cargo-cache");
 
         let build_state = workflow
             .spec
@@ -1091,9 +1087,10 @@ metadata:
   name: container-roundtrip
 spec:
   initial_state: build
-  volumes:
-    - name: workspace
-      storage_class: ephemeral
+  storage:
+    shared_volumes:
+      - name: workspace
+        storage_class: ephemeral
   states:
     build:
       kind: ContainerRun
@@ -1114,10 +1111,13 @@ spec:
         let workflow2 = WorkflowParser::parse_yaml(&yaml_out).unwrap();
 
         assert_eq!(workflow.metadata.name, workflow2.metadata.name);
-        assert_eq!(workflow.spec.volumes.len(), workflow2.spec.volumes.len());
         assert_eq!(
-            workflow.spec.volumes[0].name,
-            workflow2.spec.volumes[0].name
+            workflow.spec.storage.shared_volumes.len(),
+            workflow2.spec.storage.shared_volumes.len()
+        );
+        assert_eq!(
+            workflow.spec.storage.shared_volumes[0].name,
+            workflow2.spec.storage.shared_volumes[0].name
         );
         assert_eq!(workflow.spec.states.len(), workflow2.spec.states.len());
 
@@ -1149,7 +1149,7 @@ spec:
 
     #[test]
     fn test_spec_volumes_validation_rejects_undeclared_mount() {
-        // volume name in ContainerVolumeMount does not exist in spec.volumes
+        // volume name in ContainerVolumeMount does not exist in spec.storage.shared_volumes
         let yaml = r#"
 apiVersion: 100monkeys.ai/v1
 kind: Workflow
@@ -1157,9 +1157,10 @@ metadata:
   name: bad-volume-ref
 spec:
   initial_state: build
-  volumes:
-    - name: declared-volume
-      storage_class: ephemeral
+  storage:
+    shared_volumes:
+      - name: declared-volume
+        storage_class: ephemeral
   states:
     build:
       kind: ContainerRun

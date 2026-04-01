@@ -297,8 +297,7 @@ mod tests {
             initial_state: start_name,
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let mut workflow =

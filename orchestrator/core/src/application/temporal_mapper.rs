@@ -52,7 +52,7 @@ pub struct TemporalWorkflowDefinition {
     pub initial_state: String,
     pub context: HashMap<String, serde_json::Value>,
     pub states: HashMap<String, TemporalWorkflowState>,
-    /// Named volume declarations from `spec.volumes` (ADR-050)
+    /// Named volume declarations from `spec.storage.shared_volumes`
     ///
     /// Forwarded to the TypeScript worker so it can surface volume metadata
     /// in the Synapse UI and pass storage-class information to provisioning hooks.
@@ -244,7 +244,7 @@ impl TemporalWorkflowMapper {
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states: temporal_states,
-            spec_volumes: workflow.spec.volumes.clone(),
+            spec_volumes: workflow.spec.storage.shared_volumes.clone(),
         })
     }
 
@@ -970,8 +970,7 @@ mod tests {
                 initial_state: StateName::new("START").unwrap(),
                 context: HashMap::new(),
                 states,
-                volumes: vec![],
-                storage: None,
+                storage: Default::default(),
             },
         )
         .unwrap();
@@ -1028,8 +1027,7 @@ mod tests {
                 initial_state: StateName::new("BUILD").unwrap(),
                 context: HashMap::new(),
                 states,
-                volumes: vec![],
-                storage: None,
+                storage: Default::default(),
             },
         )
         .unwrap();

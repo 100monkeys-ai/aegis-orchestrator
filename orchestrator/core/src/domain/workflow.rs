@@ -345,11 +345,15 @@ impl Workflow {
             }
         }
 
-        // Validate: All ContainerVolumeMount names resolve to declared spec.volumes
-        // (only enforced when spec.volumes is non-empty — opt-in per ADR-050)
-        if !spec.volumes.is_empty() {
-            let declared: std::collections::HashSet<&str> =
-                spec.volumes.iter().map(|v| v.name.as_str()).collect();
+        // Validate: All ContainerVolumeMount names resolve to declared spec.storage.shared_volumes
+        // (only enforced when spec.storage.shared_volumes is non-empty — opt-in per ADR-050)
+        if !spec.storage.shared_volumes.is_empty() {
+            let declared: std::collections::HashSet<&str> = spec
+                .storage
+                .shared_volumes
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect();
 
             for (state_name, state) in &spec.states {
                 let mounts: Vec<&str> = match &state.kind {
@@ -549,7 +553,7 @@ pub struct WorkflowVolumeSpec {
 }
 
 /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct WorkflowStorageSpec {
     /// Default shared workspace volume, auto-created at workflow start if defined.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -658,16 +662,16 @@ pub struct WorkflowSpec {
     /// State machine definition (state_name -> state)
     pub states: HashMap<StateName, WorkflowState>,
 
-    /// Named volumes available to `ContainerRun` and `ParallelContainerRun` states (ADR-050)
-    ///
-    /// When non-empty, every `ContainerVolumeMount.name` in any container state must
-    /// resolve to a volume declared here (validated in `Workflow::new()`).
-    #[serde(default)]
-    pub volumes: Vec<WorkflowVolumeSpec>,
-
     /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub storage: Option<WorkflowStorageSpec>,
+    ///
+    /// Named volumes for `ContainerRun` and `ParallelContainerRun` states are declared
+    /// under `storage.shared_volumes`.
+    #[serde(default, skip_serializing_if = "is_default_storage")]
+    pub storage: WorkflowStorageSpec,
+}
+
+fn is_default_storage(s: &WorkflowStorageSpec) -> bool {
+    s.workspace.is_none() && s.shared_volumes.is_empty()
 }
 
 /// Individual state in the workflow FSM
@@ -1394,7 +1398,7 @@ pub enum WorkflowError {
     TimeoutExceeded(StateName),
 
     #[error(
-        "Volume '{volume_name}' referenced in state '{state}' is not declared in spec.volumes"
+        "Volume '{volume_name}' referenced in state '{state}' is not declared in spec.storage.shared_volumes"
     )]
     UndeclaredVolume {
         state: StateName,
@@ -1618,8 +1622,7 @@ mod tests {
                 initial_state: StateName::new("START").unwrap(),
                 context: std::collections::HashMap::new(),
                 states,
-                volumes: vec![],
-                storage: None,
+                storage: Default::default(),
             },
             created_at: Utc::now(),
         };
@@ -1650,8 +1653,7 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states: HashMap::new(),
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1687,8 +1689,7 @@ mod tests {
             initial_state: StateName::new("START").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1733,8 +1734,7 @@ mod tests {
             initial_state: StateName::new("BUILD").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1793,8 +1793,7 @@ mod tests {
             initial_state: StateName::new("TEST").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1843,8 +1842,7 @@ mod tests {
             initial_state: StateName::new("BUILD").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1882,8 +1880,7 @@ mod tests {
             initial_state: StateName::new("TRIGGER").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1922,8 +1919,7 @@ mod tests {
             initial_state: StateName::new("TRIGGER").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1962,8 +1958,7 @@ mod tests {
             initial_state: StateName::new("TRIGGER").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -1997,8 +1992,7 @@ mod tests {
             initial_state: StateName::new("TRIGGER").unwrap(),
             context: HashMap::new(),
             states,
-            volumes: vec![],
-            storage: None,
+            storage: Default::default(),
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
