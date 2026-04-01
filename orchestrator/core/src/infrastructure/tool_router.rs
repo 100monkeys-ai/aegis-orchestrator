@@ -148,6 +148,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.workflow.logs",
     "aegis.workflow.executions.list",
     "aegis.workflow.executions.get",
+    "aegis.workflow.wait",
     "aegis.workflow.cancel",
     "aegis.workflow.signal",
     "aegis.workflow.remove",
@@ -204,6 +205,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.workflow.run", "Executes a registered workflow by name with optional input parameters."),
     ("aegis.workflow.generate", "Generates a Workflow manifest from a natural-language objective."),
     ("aegis.workflow.logs", "Returns paginated workflow execution events."),
+    ("aegis.workflow.wait", "Polls a workflow execution until it reaches a terminal state and returns the result."),
     ("aegis.workflow.cancel", "Cancel a running workflow execution."),
     ("aegis.workflow.signal", "Send human input response to a paused workflow execution."),
     ("aegis.workflow.remove", "Remove a workflow execution record."),
@@ -265,6 +267,7 @@ impl ToolRouter {
                 | "aegis.workflow.status"
                 | "aegis.workflow.generate"
                 | "aegis.workflow.logs"
+                | "aegis.workflow.wait"
                 | "aegis.workflow.cancel"
                 | "aegis.workflow.signal"
                 | "aegis.workflow.remove"
@@ -854,6 +857,24 @@ impl ToolRouter {
                             }
                         },
                         "required": ["input"]
+                    }),
+                    "aegis.workflow.wait" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the workflow execution to wait for."
+                            },
+                            "poll_interval_seconds": {
+                                "type": "integer",
+                                "description": "Seconds between polls (default: 5)."
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Maximum wait time in seconds (default: 300)."
+                            }
+                        },
+                        "required": ["execution_id"]
                     }),
                     "aegis.workflow.cancel" => json!({
                         "type": "object",

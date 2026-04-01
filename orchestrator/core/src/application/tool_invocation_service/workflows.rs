@@ -363,6 +363,103 @@ impl ToolInvocationService {
         })
     }
 
+    /// Handle `aegis.workflow.wait` — block until a workflow execution reaches a terminal state.
+    pub(super) async fn invoke_aegis_workflow_wait_tool(
+        &self,
+        args: &Value,
+    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        let execution_id_str = args
+            .get("execution_id")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| {
+                SmcpSessionError::InvalidArguments(
+                    "aegis.workflow.wait requires 'execution_id' string".to_string(),
+                )
+            })?;
+        let execution_id = crate::domain::execution::ExecutionId(
+            uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
+                SmcpSessionError::InvalidArguments(format!(
+                    "aegis.workflow.wait: invalid execution_id UUID: {error}"
+                ))
+            })?,
+        );
+
+        let repo = match &self.workflow_execution_repo {
+            Some(repo) => repo,
+            None => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.workflow.wait",
+                    "error": "Workflow execution repository not configured"
+                })));
+            }
+        };
+
+        let poll_interval = args
+            .get("poll_interval_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5);
+        let timeout = args
+            .get("timeout_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(300);
+
+        let poll_duration = std::time::Duration::from_secs(poll_interval);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+
+        loop {
+            match repo.find_by_id_for_tenant(&tenant_id, execution_id).await {
+                Ok(Some(execution)) => {
+                    let status_str = format!("{:?}", execution.status).to_lowercase();
+                    let is_terminal = matches!(
+                        execution.status,
+                        crate::domain::execution::ExecutionStatus::Completed
+                            | crate::domain::execution::ExecutionStatus::Failed
+                            | crate::domain::execution::ExecutionStatus::Cancelled
+                    );
+
+                    if is_terminal {
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.workflow.wait",
+                            "execution_id": execution_id_str,
+                            "workflow_id": execution.workflow_id.to_string(),
+                            "status": status_str,
+                            "current_state": execution.current_state.as_str(),
+                            "blackboard": execution.blackboard.data(),
+                            "started_at": execution.started_at,
+                            "last_transition_at": execution.last_transition_at,
+                        })));
+                    }
+
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                            "tool": "aegis.workflow.wait",
+                            "execution_id": execution_id_str,
+                            "status": status_str,
+                            "current_state": execution.current_state.as_str(),
+                            "timed_out": true,
+                            "message": format!("Workflow execution still {} after {}s timeout", status_str, timeout),
+                        })));
+                    }
+
+                    tokio::time::sleep(poll_duration).await;
+                }
+                Ok(None) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.wait",
+                        "error": format!("Workflow execution '{execution_id_str}' not found")
+                    })));
+                }
+                Err(error) => {
+                    return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.wait",
+                        "error": format!("Failed to query workflow execution: {error}")
+                    })));
+                }
+            }
+        }
+    }
+
     pub(super) async fn invoke_aegis_workflow_generate_tool(
         &self,
         args: &Value,

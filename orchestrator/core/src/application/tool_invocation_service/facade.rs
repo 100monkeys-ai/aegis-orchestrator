@@ -743,6 +743,7 @@ impl ToolInvocationService {
             "aegis.workflow.status" => Some(self.invoke_aegis_workflow_status_tool(args).await),
             "aegis.workflow.generate" => Some(self.invoke_aegis_workflow_generate_tool(args).await),
             "aegis.workflow.logs" => Some(self.invoke_aegis_workflow_logs_tool(args).await),
+            "aegis.workflow.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
             "aegis.workflow.cancel" => Some(self.invoke_aegis_workflow_cancel_tool(args).await),
             "aegis.workflow.signal" => Some(self.invoke_aegis_workflow_signal_tool(args).await),
             "aegis.workflow.remove" => Some(self.invoke_aegis_workflow_remove_tool(args).await),
