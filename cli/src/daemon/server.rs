@@ -678,7 +678,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 "Failed to load StandardRuntime registry from '{}': {e}. \
                  Ensure runtime-registry.yaml exists at the configured path \
                  (spec.runtime.runtime_registry_path in aegis-config.yaml).",
-                registry_path.display()
+                registry_path
             ));
         }
     };

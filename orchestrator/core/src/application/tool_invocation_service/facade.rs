@@ -462,9 +462,9 @@ impl ToolInvocationService {
                                             .unwrap_or_else(|| output_str.clone());
                                         let result: crate::domain::validation::GradientResult =
                                             serde_json::from_str(&json_str).map_err(|e| {
-                                                SmcpSessionError::SignatureVerificationFailed(
-                                                    format!("Failed to parse judge output: {e}"),
-                                                )
+                                                SmcpSessionError::InternalError(format!(
+                                                    "Failed to parse judge output: {e}"
+                                                ))
                                             })?;
 
                                         if !(result.score >= *min_score
@@ -480,7 +480,7 @@ impl ToolInvocationService {
                                                 result.score, min_score, result.reasoning
                                             ),
                                         );
-                                            return Err(SmcpSessionError::SignatureVerificationFailed(
+                                            return Err(SmcpSessionError::InternalError(
                                             format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
@@ -499,7 +499,7 @@ impl ToolInvocationService {
                                         "Inner-loop semantic judge execution failed or was cancelled"
                                             .to_string(),
                                     );
-                                        return Err(SmcpSessionError::SignatureVerificationFailed("Inner-loop semantic judge execution failed or was cancelled".to_string()));
+                                        return Err(SmcpSessionError::InternalError("Inner-loop semantic judge execution failed or was cancelled".to_string()));
                                     }
                                     _ => {
                                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -635,7 +635,7 @@ impl ToolInvocationService {
                     *agent_id,
                     format!("Routing error: {routing_err}"),
                 );
-                return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                return Err(SmcpSessionError::InternalError(format!(
                     "Routing error: {routing_err}"
                 )));
             }
@@ -644,9 +644,8 @@ impl ToolInvocationService {
         let server = match self.tool_router.get_server(server_id).await {
             Some(server) => server,
             None => {
-                let err = SmcpSessionError::SignatureVerificationFailed(
-                    "Server vanished after routing".to_string(),
-                );
+                let err =
+                    SmcpSessionError::InternalError("Server vanished after routing".to_string());
                 self.publish_invocation_failed(
                     invocation_id,
                     execution_id,

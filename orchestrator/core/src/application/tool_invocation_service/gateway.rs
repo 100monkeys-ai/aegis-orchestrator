@@ -96,11 +96,11 @@ impl ToolInvocationService {
         })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
         let response = client
             .list_tools(tonic::Request::new(ListToolsRequest {}))
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
 
         let mut converted = Vec::new();
         for item in response.into_inner().tools {
@@ -142,20 +142,18 @@ impl ToolInvocationService {
         args: serde_json::Value,
     ) -> Result<serde_json::Value, SmcpSessionError> {
         let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
-                "smcp_gateway.url is not configured".to_string(),
-            )
+            SmcpSessionError::ConfigurationError("smcp_gateway.url is not configured".to_string())
         })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?;
+            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
 
         if args.get("subcommand").is_some() {
             let subcommand = args
                 .get("subcommand")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    SmcpSessionError::SignatureVerificationFailed(
+                    SmcpSessionError::InvalidArguments(
                         "CLI tool invocation requires 'subcommand' string".to_string(),
                     )
                 })?
@@ -182,7 +180,7 @@ impl ToolInvocationService {
                 .collect::<Vec<FsalMount>>();
 
             if fsal_mounts.is_empty() {
-                return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                return Err(SmcpSessionError::InternalError(format!(
                     "No FSAL mounts registered for execution {execution_id}"
                 )));
             }
@@ -197,7 +195,7 @@ impl ToolInvocationService {
                     tenant_id: String::new(),
                 }))
                 .await
-                .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+                .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?
                 .into_inner();
 
             return Ok(serde_json::json!({
@@ -216,7 +214,7 @@ impl ToolInvocationService {
                 tenant_id: String::new(),
             }))
             .await
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))?
+            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?
             .into_inner();
 
         if response.result_json.is_empty() {
@@ -224,6 +222,6 @@ impl ToolInvocationService {
         }
 
         serde_json::from_str(&response.result_json)
-            .map_err(|e| SmcpSessionError::SignatureVerificationFailed(e.to_string()))
+            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))
     }
 }

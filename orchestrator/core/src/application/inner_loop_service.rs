@@ -502,7 +502,7 @@ impl InnerLoopService {
                                         failed_ctx.trajectory.push(step);
                                     }
                                     anyhow::bail!(
-                                        "Tool '{}' blocked by policy: {}",
+                                        "Tool '{}' terminated with fatal error: {}",
                                         tool_call.name,
                                         e
                                     );
