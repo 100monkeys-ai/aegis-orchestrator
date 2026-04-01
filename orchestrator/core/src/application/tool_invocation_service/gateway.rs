@@ -1,20 +1,6 @@
 use super::*;
 
 impl ToolInvocationService {
-    pub(super) fn is_low_trust_workflow_tool(tool_name: &str) -> bool {
-        matches!(tool_name, "aegis.workflow.delete")
-    }
-
-    pub(super) fn context_allows_tool_name(security_context_name: &str, tool_name: &str) -> bool {
-        if matches!(security_context_name, "zaru-free")
-            && Self::is_low_trust_workflow_tool(tool_name)
-        {
-            return false;
-        }
-
-        true
-    }
-
     pub async fn get_available_tools(
         &self,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
@@ -85,10 +71,8 @@ impl ToolInvocationService {
             .into_iter()
             .filter(|tool| {
                 let permitted = security_context.permits_tool_name(&tool.name);
-                let context_allowed =
-                    Self::context_allows_tool_name(security_context_name, &tool.name);
-                tracing::debug!(tool = %tool.name, permitted, context_allowed, "Tool filter check");
-                permitted && context_allowed
+                tracing::debug!(tool = %tool.name, permitted, "Tool filter check");
+                permitted
             })
             .collect();
 

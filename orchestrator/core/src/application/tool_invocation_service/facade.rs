@@ -317,34 +317,6 @@ impl ToolInvocationService {
             return Err(SmcpSessionError::PolicyViolation(violation));
         }
 
-        if !Self::context_allows_tool_name(&security_context.name, &tool_name) {
-            let violation = PolicyViolation::ToolExplicitlyDenied {
-                tool_name: tool_name.clone(),
-            };
-            self.event_bus
-                .publish_mcp_event(MCPToolEvent::PolicyViolation {
-                    execution_id,
-                    agent_id: *agent_id,
-                    tool_name: tool_name.clone(),
-                    violation_type: ViolationType::ToolExplicitlyDenied,
-                    details: format!(
-                        "Tool '{tool_name}' is not available in security context '{}'",
-                        security_context.name
-                    ),
-                    blocked_at: Utc::now(),
-                });
-            self.publish_invocation_failed(
-                invocation_id,
-                execution_id,
-                *agent_id,
-                format!(
-                    "Policy violation: tool '{tool_name}' is not available in security context '{}'",
-                    security_context.name
-                ),
-            );
-            return Err(SmcpSessionError::PolicyViolation(violation));
-        }
-
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
         // Agent lookup is optional — Zaru SMCP sessions use synthetic agent IDs
         // that don't correspond to registered agents. Skip the judge pipeline
