@@ -125,7 +125,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             context: HashMap::new(),
             states,
             volumes: vec![],
-            workspace: None,
+            storage: None,
         },
     )
     .unwrap()
