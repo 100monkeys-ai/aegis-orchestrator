@@ -42,11 +42,30 @@ impl ToolInvocationService {
             timeout_seconds,
         };
 
-        let input = serde_json::to_value(&pipeline_input).map_err(|e| {
+        let lang = pipeline_input.language;
+        let inputs_json = pipeline_input.inputs.to_string();
+        let mut input = serde_json::to_value(&pipeline_input).map_err(|e| {
             SmcpSessionError::InternalError(format!(
                 "Failed to serialize IntentExecutionInput: {e}"
             ))
         })?;
+
+        // Inject derived fields so Handlebars templates in the workflow YAML can resolve them
+        if let Some(obj) = input.as_object_mut() {
+            obj.insert(
+                "container_image".to_string(),
+                serde_json::json!(lang.container_image()),
+            );
+            obj.insert(
+                "runner".to_string(),
+                serde_json::json!(lang.runner_command()),
+            );
+            obj.insert(
+                "language_ext".to_string(),
+                serde_json::json!(lang.file_extension()),
+            );
+            obj.insert("inputs_json".to_string(), serde_json::json!(inputs_json));
+        }
 
         let start_use_case = match &self.start_workflow_execution_use_case {
             Some(uc) => uc,
