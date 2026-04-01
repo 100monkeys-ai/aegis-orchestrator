@@ -80,17 +80,14 @@ spec:
       env:
         INTENT_INPUTS: "{{workflow.inputs_json}}"
       volumes:
-        - volume_id: "{{blackboard.workspace_volume_id}}"
+        - name: workspace
           mount_path: /workspace
-          access_mode: ReadOnly
+          read_only: true
       resources:
-        cpu_millicores: "{{workflow.cpu_millicores}}"
-        memory_mb: "{{workflow.memory_mb}}"
-        timeout_seconds: "{{workflow.timeout_seconds}}"
-      security:
-        network: none
-        user: "65534:65534"
-        read_only_root_filesystem: true
+        cpu: 500
+        memory: "256Mi"
+        timeout: "30s"
+      shell: false
       transitions:
         - condition: exit_code_zero
           target: FORMAT_RESULT
@@ -113,25 +110,15 @@ spec:
 
     DISCOVERY_FAILED:
       kind: System
-      action: emit_event
-      event: IntentExecutionPipelineFailed
-      payload:
-        failed_state: "DISCOVER_OR_GENERATE_AGENT"
+      command: "echo 'Pipeline failed at DISCOVER_OR_GENERATE_AGENT'"
       transitions: []
 
     GENERATION_FAILED:
       kind: System
-      action: emit_event
-      event: IntentExecutionPipelineFailed
-      payload:
-        failed_state: "GENERATE_CODE"
+      command: "echo 'Pipeline failed at GENERATE_CODE'"
       transitions: []
 
     EXECUTION_FAILED:
       kind: System
-      action: emit_event
-      event: IntentExecutionPipelineFailed
-      payload:
-        failed_state: "EXECUTE_CODE"
-        exit_code: "{{blackboard.EXECUTE_CODE.exit_code}}"
+      command: "echo 'Pipeline failed at EXECUTE_CODE, exit_code={{blackboard.EXECUTE_CODE.exit_code}}'"
       transitions: []
