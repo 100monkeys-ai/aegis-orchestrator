@@ -1540,6 +1540,47 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
+    // aegis.execute tools (ADR-087: intent-to-execution pipeline)
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.execute.intent")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.execute.intent".to_string(),
+                description:
+                    "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."
+                        .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.execute.intent".to_string(),
+                        skip_judge: false,
+                    },
+                ],
+            },
+        );
+    }
+    if !builtin_dispatchers
+        .iter()
+        .any(|d| d.name == "aegis.execute.status")
+    {
+        builtin_dispatchers.push(
+            aegis_orchestrator_core::domain::node_config::BuiltinDispatcherConfig {
+                name: "aegis.execute.status".to_string(),
+                description: "Returns the current status of an intent-to-execution pipeline run."
+                    .to_string(),
+                enabled: true,
+                capabilities: vec![
+                    aegis_orchestrator_core::domain::node_config::CapabilityConfig {
+                        name: "aegis.execute.status".to_string(),
+                        skip_judge: true,
+                    },
+                ],
+            },
+        );
+    }
+
     // aegis.agent operational tools
     if !builtin_dispatchers
         .iter()
