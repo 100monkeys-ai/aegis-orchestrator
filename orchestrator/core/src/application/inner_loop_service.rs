@@ -84,6 +84,8 @@ struct ExecutionContext {
     user_identity: Option<UserIdentity>,
     /// Tenant identity for scoped rate limiting (ADR-072 Step 2).
     tenant_id: Option<TenantId>,
+    /// Security context name bound to this execution, used to scope available tools.
+    security_context_name: String,
 }
 
 pub struct InnerLoopService {
@@ -178,6 +180,15 @@ impl InnerLoopService {
                     );
                 }
 
+                let execution_id_uuid = uuid::Uuid::parse_str(&execution_id)?;
+                let exec_record = self
+                    .execution_service
+                    .get_execution(ExecutionId(execution_id_uuid))
+                    .await;
+                let security_context_name = exec_record
+                    .map(|e| e.security_context_name.clone())
+                    .unwrap_or_else(|_| "agent-runtime".to_string());
+
                 self.active_executions.write().await.insert(
                     execution_id.clone(),
                     ExecutionContext {
@@ -191,6 +202,7 @@ impl InnerLoopService {
                         trajectory: Vec::new(),
                         user_identity: user_identity.clone(),
                         tenant_id: tenant_id.clone(),
+                        security_context_name,
                     },
                 );
 
@@ -275,7 +287,7 @@ impl InnerLoopService {
 
             let available_tools = self
                 .tool_invocation_service
-                .get_available_tools_for_agent(ctx.agent_id)
+                .get_available_tools_for_agent_in_context(ctx.agent_id, &ctx.security_context_name)
                 .await
                 .unwrap_or_default();
 

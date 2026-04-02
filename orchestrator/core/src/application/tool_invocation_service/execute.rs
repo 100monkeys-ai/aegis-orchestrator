@@ -9,7 +9,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_execute_intent_tool(
         &self,
         args: &Value,
-        security_context: &crate::domain::security_context::SecurityContext,
+        _security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let intent = args.get("intent").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
@@ -85,7 +85,7 @@ impl ToolInvocationService {
                     blackboard: None,
                     version: None,
                     tenant_id: Some(tenant_id),
-                    security_context_name: Some(security_context.name.clone()),
+                    security_context_name: Some("agent-runtime".to_string()),
                 },
             )
             .await
