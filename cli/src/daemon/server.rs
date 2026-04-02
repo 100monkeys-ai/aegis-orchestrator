@@ -991,7 +991,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         });
 
         // Periodic reconciliation — catches index drift from event lag or transient Cortex failures
-        handler.clone().spawn_reconciler(std::time::Duration::from_secs(300));
+        handler
+            .clone()
+            .spawn_reconciler(std::time::Duration::from_secs(300));
 
         tracing::info!("Discovery service initialized (Cortex-backed)");
         svc as Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService>
