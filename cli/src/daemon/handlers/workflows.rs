@@ -184,11 +184,16 @@ pub(crate) async fn list_workflows_handler(
         .iter()
         .map(|w| {
             serde_json::json!({
+                "id": w.id.0,
                 "name": w.metadata.name,
                 "version": w.metadata.version,
                 "description": w.metadata.description,
                 "scope": w.scope.to_string(),
-                "status": "active"
+                "status": "active",
+                "tags": w.metadata.tags,
+                "labels": w.metadata.labels,
+                "created_at": w.created_at.to_rfc3339(),
+                "tenant_id": w.tenant_id.as_str(),
             })
         })
         .collect();
