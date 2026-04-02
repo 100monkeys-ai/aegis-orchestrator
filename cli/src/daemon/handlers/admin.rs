@@ -250,14 +250,21 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
 
     for default_policy in &all_policies {
         let resource_type = &default_policy.resource_type;
+        let resource_str = resource_type_to_db_str(resource_type);
         let policy = match resolver
             .resolve_policy(&identity, &tenant_id, resource_type)
             .await
         {
             Ok(p) => p,
-            Err(_) => continue,
+            Err(e) => {
+                tracing::warn!(
+                    resource_type = %resource_str,
+                    error = %e,
+                    "Failed to resolve rate-limit policy; skipping resource type"
+                );
+                continue;
+            }
         };
-        let resource_str = resource_type_to_db_str(resource_type);
         for (bucket, window) in &policy.windows {
             let bucket_str = bucket_to_str(bucket);
             let (current_count, resets_at) =
