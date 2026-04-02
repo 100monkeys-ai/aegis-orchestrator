@@ -517,8 +517,8 @@ mod tests {
     fn realm_from_config_system() {
         let config = IamRealmConfig {
             slug: "aegis-system".to_string(),
-            issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
-            jwks_uri: "https://auth.myzaru.com/realms/aegis-system/protocol/openid-connect/certs"
+            issuer_url: "https://auth.example.com/realms/aegis-system".to_string(),
+            jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
                 .to_string(),
             audience: "aegis-orchestrator".to_string(),
             kind: "system".to_string(),
@@ -532,8 +532,8 @@ mod tests {
     fn realm_from_config_consumer() {
         let config = IamRealmConfig {
             slug: "zaru-consumer".to_string(),
-            issuer_url: "https://auth.myzaru.com/realms/zaru-consumer".to_string(),
-            jwks_uri: "https://auth.myzaru.com/realms/zaru-consumer/protocol/openid-connect/certs"
+            issuer_url: "https://auth.example.com/realms/zaru-consumer".to_string(),
+            jwks_uri: "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
                 .to_string(),
             audience: "aegis-orchestrator".to_string(),
             kind: "consumer".to_string(),
@@ -546,8 +546,8 @@ mod tests {
     fn realm_from_config_tenant() {
         let config = IamRealmConfig {
             slug: "tenant-acme".to_string(),
-            issuer_url: "https://auth.myzaru.com/realms/tenant-acme".to_string(),
-            jwks_uri: "https://auth.myzaru.com/realms/tenant-acme/protocol/openid-connect/certs"
+            issuer_url: "https://auth.example.com/realms/tenant-acme".to_string(),
+            jwks_uri: "https://auth.example.com/realms/tenant-acme/protocol/openid-connect/certs"
                 .to_string(),
             audience: "aegis-orchestrator".to_string(),
             kind: "tenant".to_string(),
@@ -567,18 +567,18 @@ mod tests {
             realms: vec![
                 IamRealmConfig {
                     slug: "aegis-system".to_string(),
-                    issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
+                    issuer_url: "https://auth.example.com/realms/aegis-system".to_string(),
                     jwks_uri:
-                        "https://auth.myzaru.com/realms/aegis-system/protocol/openid-connect/certs"
+                        "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
                             .to_string(),
                     audience: "aegis-orchestrator".to_string(),
                     kind: "system".to_string(),
                 },
                 IamRealmConfig {
                     slug: "zaru-consumer".to_string(),
-                    issuer_url: "https://auth.myzaru.com/realms/zaru-consumer".to_string(),
+                    issuer_url: "https://auth.example.com/realms/zaru-consumer".to_string(),
                     jwks_uri:
-                        "https://auth.myzaru.com/realms/zaru-consumer/protocol/openid-connect/certs"
+                        "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
                             .to_string(),
                     audience: "aegis-orchestrator".to_string(),
                     kind: "consumer".to_string(),
@@ -592,10 +592,10 @@ mod tests {
 
         assert_eq!(service.known_realms().len(), 2);
         assert!(service
-            .find_realm_by_issuer("https://auth.myzaru.com/realms/aegis-system")
+            .find_realm_by_issuer("https://auth.example.com/realms/aegis-system")
             .is_some());
         assert!(service
-            .find_realm_by_issuer("https://auth.myzaru.com/realms/zaru-consumer")
+            .find_realm_by_issuer("https://auth.example.com/realms/zaru-consumer")
             .is_some());
         assert!(service
             .find_realm_by_issuer("https://unknown.com/realm")
