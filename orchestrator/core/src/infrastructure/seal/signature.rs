@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP JWT Signing Utilities (BC-12, ADR-035 §3.3)
+//! # SEAL JWT Signing Utilities (BC-12, ADR-035 §3.3)
 //!
-//! Provides RSA-256 JWT issuance and verification for SMCP SecurityTokens.
+//! Provides RSA-256 JWT issuance and verification for SEAL SecurityTokens.
 //! Two structs mirror the split between who creates tokens (orchestrator)
 //! and who verifies them (also orchestrator, but potentially from multiple
 //! code paths):
@@ -24,13 +24,13 @@
 //!
 //! See ADR-035 §3.3, AGENTS.md §SecurityToken.
 
-use crate::infrastructure::smcp::envelope::ContextClaims;
+use crate::infrastructure::seal::envelope::ContextClaims;
 use anyhow::Result;
 use jsonwebtoken::{
     decode, encode, Algorithm, DecodingKey, EncodingKey, Header, TokenData, Validation,
 };
 
-/// Validates RSA-256 signed SMCP SecurityTokens (JWTs).
+/// Validates RSA-256 signed SEAL SecurityTokens (JWTs).
 ///
 /// ⚠️ Phase 1 — Uses a static RSA public key loaded from PEM. Phase 3 will
 /// use OpenBao's Transit Engine so the key is never held in process memory.
@@ -81,7 +81,7 @@ impl SecurityTokenVerifier {
     }
 }
 
-/// Issues RSA-256 signed SMCP SecurityTokens (JWTs).
+/// Issues RSA-256 signed SEAL SecurityTokens (JWTs).
 ///
 /// ⚠️ Phase 1 — Uses a static RSA private key loaded from PEM. Phase 3 will
 /// use OpenBao's Transit Engine so the private key is never held in process memory.
@@ -106,7 +106,7 @@ impl SecurityTokenIssuer {
     ///
     /// Sets `claims.iss` to the configured issuer before encoding.
     /// The returned string is the raw JWT (three base64url-encoded segments
-    /// separated by `.`) suitable for embedding in an [`crate::infrastructure::smcp::envelope::SmcpEnvelope`].
+    /// separated by `.`) suitable for embedding in an [`crate::infrastructure::seal::envelope::SealEnvelope`].
     ///
     /// # Errors
     ///
@@ -122,7 +122,7 @@ impl SecurityTokenIssuer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::infrastructure::smcp::envelope::AudienceClaim;
+    use crate::infrastructure::seal::envelope::AudienceClaim;
 
     // Minimal 2048-bit RSA key pair for testing only – never use in production.
     const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAmWtpvUNARl+B9DenjbtDMcwfwkX4k7xYgkbLBJ7ON2VUPEfx\nHfOe50KqxX6AJzvHIaEWyOPM/J4YYIzO12nNzjKRElPSp5PDDigKYJePhxPl1bQn\nrY2A/L1GaVWx2rDjZqtldjJiuOI6CdsDT+GF+Twd1O4H2OMhYk6iATQqGzJQxKnd\nHEMdQqFa2NhDpuyEl9xhcUUVUboQR0+a8hfdoNTqhedK2ImTQ0JDFwt5e1c/XCLT\nj5PWfKJeHxqBYrt2hPgo8fjE0S6BX2fCOqUQ//4kPyI0ik5AZAOZ0o2RSEZn0Gei\nW3HiUl0kIMDuIMD12AMjzN5ePcHcl39zq96syQIDAQABAoIBAAEnNkNJUYPRDSzj\n6N6BEZeAp5WrVdIEhQLiR0dJXqhJ/4qD+CkWzpr2J0Lv6qmXIqYaLub+UzqqJBgp\nFdGIsFyK9T6egbTnilWcitSEXqM0zMdltix03/PQE4y+5bo/FkAvT3EEe5Kx4o8/\n64SDhqjwM3e/eRGRAJQVzOuiAIB5oy2JdDxa0JZXHU8ilKahu2GjpBAGajLD5T17\nZjHKsIfLJAQSqfxfCMnBIhqLVlUuWDoEIoBKv6bGHC7D6ElxvZRpb9JFuuigs/l5\n8rg+R7bv+7Uz9P0FVyyLFRt5puQJa1SuwgHhfK0KDnssWbeJhVXvmeSa3Z2cl0Wp\nbWT/XgECgYEA0iCyFhn3hnLlXBJHZGlTm/6qJpcSX9fIoLKMm1/GEXHJqSqyhWdE\nC7vJOkySHbNQ36sxxI+P2DteaEZMMwimzNFmw7Em1g334eTmXAhr/1qrFWzjysTN\nJWlsDfh7uDg/RO52P0kK723uvIrh82lf5Dva3wt99TH/R3TzLKXNbEsCgYEAuul/\nbE4glHKI9v4OZowrhBMnNCjpHMzS0aMLKpsu07ZVPn1HKnqxtt4IioiHQ9O0UcV6\nbXSYLhf42VxJYZ4xQ7uDGeB0Z84Pkd+d1S7ughV7QgweaIHmfAQAg+iSolOlcvyz\nM58zShVXiSaqzNp75Ai1tjkbuo/HWgLwvIDydrsCgYEAkwQXNYlzepkWykVrt+BN\nhD44lAls7KvQDkb+Q5NNxFTFkFt0TgwDOuZnEygRr0APnH5tsqXzMYnQMsrEc4xh\nD7qO2OowTuG1BlKdrdSioyWvv6zQ78Sj98H7vQaWoTyRX8wr5XlYck6LE1VkY2bd\nlZUfPKEQvqX9guRbY2iaAmMCgYA5Ptpv6V3BGXMpcpYmgjexs8wGBaGf2HuZCT6a\nRf0JioaBJQ1uzTUwtMAY7ce/1k8b3EeqzlLtixoEOGehJjogbIWynzQHtuy92KcW\na9FQthOSHvQRPffBc9hUjh6a6NN7bDnWTaP/xJmSv+z/4MqhBKnirYr4kKCVyODC\nWxvnkQKBgQDAL4bBoWRBtJJHLmMMgweY421W497kl4BvAiur36WT99fknp5ktqRU\nPxTp4+a+lU1gc393kfJvUeIVYX1vJs0tS+YkNVpCrC5hBmVaemd5Vav1q13+/sZ/\ncpc0iRy0EDCDXsAbf/guJdqShW1x1cB1moHFiM+8FsM80SsAZavjnQ==\n-----END RSA PRIVATE KEY-----";

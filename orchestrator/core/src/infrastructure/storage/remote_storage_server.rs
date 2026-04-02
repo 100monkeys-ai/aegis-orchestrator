@@ -4,7 +4,7 @@
 //!
 //! Receives authenticated gRPC calls from remote nodes and delegates
 //! to the local `StorageProvider`. Each RPC authenticates the caller
-//! via the `SmcpNodeEnvelope` carried in the request, then maps the
+//! via the `SealNodeEnvelope` carried in the request, then maps the
 //! proto request into a domain `StorageProvider` call and converts
 //! the result back into proto responses.
 //!
@@ -19,7 +19,7 @@ use tonic::{Request, Response, Status};
 
 use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeSecurityToken};
 use crate::domain::storage::{FileHandle, FileType, OpenMode, StorageError, StorageProvider};
-use crate::infrastructure::aegis_cluster_proto::SmcpNodeEnvelope as ProtoEnvelope;
+use crate::infrastructure::aegis_cluster_proto::SealNodeEnvelope as ProtoEnvelope;
 use crate::infrastructure::aegis_remote_storage_proto::{
     remote_storage_service_server::RemoteStorageService, CloseFileRequest, CreateFileRequest,
     DirEntryProto, GetUsageRequest, GetUsageResponse, HealthCheckRequest, OpenFileRequest,
@@ -31,7 +31,7 @@ use crate::infrastructure::aegis_remote_storage_proto::{
 /// gRPC handler for `RemoteStorageService`.
 ///
 /// Delegates every RPC to the local [`StorageProvider`] after verifying
-/// the SMCP node envelope.
+/// the SEAL node envelope.
 pub struct RemoteStorageServiceHandler {
     storage_provider: Arc<dyn StorageProvider>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
@@ -48,7 +48,7 @@ impl RemoteStorageServiceHandler {
         }
     }
 
-    /// Authenticate the caller by verifying the SMCP node envelope:
+    /// Authenticate the caller by verifying the SEAL node envelope:
     /// 1. Parse JWT to extract node_id
     /// 2. Look up registered public key
     /// 3. Verify Ed25519 signature over inner_payload

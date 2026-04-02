@@ -21,7 +21,7 @@
 
 use crate::application::schema_registry::SchemaRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -32,9 +32,9 @@ use std::sync::Arc;
 pub fn invoke_schema_get(
     registry: &Arc<SchemaRegistry>,
     args: &Value,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let key = args.get("key").and_then(Value::as_str).ok_or_else(|| {
-        SmcpSessionError::MalformedPayload(
+        SealSessionError::MalformedPayload(
             "schema.get: missing required field 'key' (string)".to_string(),
         )
     })?;
@@ -60,9 +60,9 @@ pub fn invoke_schema_get(
 pub fn invoke_schema_validate(
     registry: &Arc<SchemaRegistry>,
     args: &Value,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let kind = args.get("kind").and_then(Value::as_str).ok_or_else(|| {
-        SmcpSessionError::MalformedPayload(
+        SealSessionError::MalformedPayload(
             "schema.validate: missing required field 'kind' (string)".to_string(),
         )
     })?;
@@ -71,7 +71,7 @@ pub fn invoke_schema_validate(
         .get("manifest_yaml")
         .and_then(Value::as_str)
         .ok_or_else(|| {
-            SmcpSessionError::MalformedPayload(
+            SealSessionError::MalformedPayload(
                 "schema.validate: missing required field 'manifest_yaml' (string)".to_string(),
             )
         })?;

@@ -17,8 +17,8 @@ const RUNTIME_REGISTRY_TEMPLATE: &str =
     include_str!("../../../templates/stack/runtime-registry.yaml");
 const TEMPORAL_DYNAMIC_CONFIG_TEMPLATE: &str =
     include_str!("../../../templates/stack/development-sql.yaml");
-const SMCP_GATEWAY_CONFIG_TEMPLATE: &str =
-    include_str!("../../../templates/stack/smcp-gateway-config.yaml");
+const SEAL_GATEWAY_CONFIG_TEMPLATE: &str =
+    include_str!("../../../templates/stack/seal-gateway-config.yaml");
 
 /// Bundle of stack files used by `aegis init`.
 pub struct StackFiles {
@@ -26,7 +26,7 @@ pub struct StackFiles {
     pub init_db_script: String,
     pub runtime_registry: String,
     pub temporal_dynamic_config: String,
-    pub smcp_gateway_config: String,
+    pub seal_gateway_config: String,
 }
 
 /// Load stack files from bundled templates.
@@ -44,6 +44,6 @@ pub async fn fetch_stack(tag: &str) -> Result<StackFiles> {
         init_db_script: INIT_DB_SCRIPT_TEMPLATE.to_string(),
         runtime_registry: RUNTIME_REGISTRY_TEMPLATE.to_string(),
         temporal_dynamic_config: TEMPORAL_DYNAMIC_CONFIG_TEMPLATE.to_string(),
-        smcp_gateway_config: SMCP_GATEWAY_CONFIG_TEMPLATE.to_string(),
+        seal_gateway_config: SEAL_GATEWAY_CONFIG_TEMPLATE.to_string(),
     })
 }

@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! SMCP attestation, invocation, and tool listing handlers.
+//! SEAL attestation, invocation, and tool listing handlers.
 
 use std::sync::Arc;
 
@@ -27,7 +27,7 @@ pub struct HttpAttestationRequest {
 }
 
 #[derive(serde::Deserialize)]
-pub struct HttpSmcpEnvelope {
+pub struct HttpSealEnvelope {
     pub protocol: Option<String>,
     pub security_token: String,
     pub signature: String,
@@ -36,11 +36,11 @@ pub struct HttpSmcpEnvelope {
 }
 
 #[derive(serde::Deserialize, Default)]
-pub(crate) struct SmcpToolsQuery {
+pub(crate) struct SealToolsQuery {
     security_context: Option<String>,
 }
 
-pub(crate) async fn attest_smcp_handler(
+pub(crate) async fn attest_seal_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
@@ -51,7 +51,7 @@ pub(crate) async fn attest_smcp_handler(
         .unwrap_or_else(aegis_orchestrator_core::domain::tenant::TenantId::consumer);
 
     let internal_req =
-        aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationRequest {
+        aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {
             agent_id: request.agent_id.clone(),
             execution_id: request.execution_id.clone(),
             container_id: request.container_id.clone(),
@@ -82,13 +82,13 @@ pub(crate) async fn attest_smcp_handler(
     }
 }
 
-pub(crate) async fn invoke_smcp_handler(
+pub(crate) async fn invoke_seal_handler(
     State(state): State<Arc<AppState>>,
-    Json(request): Json<HttpSmcpEnvelope>,
+    Json(request): Json<HttpSealEnvelope>,
 ) -> impl IntoResponse {
     let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
 
-    let envelope = aegis_orchestrator_core::infrastructure::smcp::envelope::SmcpEnvelope {
+    let envelope = aegis_orchestrator_core::infrastructure::seal::envelope::SealEnvelope {
         protocol: request.protocol,
         security_token: request.security_token,
         signature: request.signature,
@@ -110,9 +110,9 @@ pub(crate) async fn invoke_smcp_handler(
     }
 }
 
-pub(crate) async fn list_smcp_tools_handler(
+pub(crate) async fn list_seal_tools_handler(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SmcpToolsQuery>,
+    Query(query): Query<SealToolsQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let security_context = headers
@@ -136,9 +136,9 @@ pub(crate) async fn list_smcp_tools_handler(
         Ok(tools) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "protocol": "smcp/v1",
-                "attestation_endpoint": "/v1/smcp/attest",
-                "invoke_endpoint": "/v1/smcp/invoke",
+                "protocol": "seal/v1",
+                "attestation_endpoint": "/v1/seal/attest",
+                "invoke_endpoint": "/v1/seal/invoke",
                 "security_context": security_context,
                 "tools": tools,
             })),

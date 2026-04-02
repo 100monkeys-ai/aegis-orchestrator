@@ -1,14 +1,14 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Session Aggregate (BC-12, ADR-035)
+//! # SEAL Session Aggregate (BC-12, ADR-035)
 //!
-//! `BC-12` refers to the bounded context that owns SMCP session lifecycle logic, and
+//! `BC-12` refers to the bounded context that owns SEAL session lifecycle logic, and
 //! `ADR-035` is the architecture decision record that defines the design of this
 //! aggregate and its invariants (see the project's architecture decision records).
 //!
-//! Domain model for the **Secure Model Context Protocol** session lifecycle.
+//! Domain model for the **Signed Envelope Attestation Layer** session lifecycle.
 //! Each agent execution that uses MCP tools goes through an attestation handshake
-//! (see [`crate::application::attestation_service`]) to receive a [`SmcpSession`],
+//! (see [`crate::application::attestation_service`]) to receive a [`SealSession`],
 //! which then authorises every subsequent tool call.
 //!
 //! ## Session Lifecycle
@@ -16,15 +16,15 @@
 //! ```text
 //! AttestationRequest (agent sends ephemeral Ed25519 public key + container ID)
 //!   └─ AttestationService validates container identity
-//!   └─ SmcpSession::new(agent_id, execution_id, public_key, jwt, security_context)
-//!         └─ SmcpSession::evaluate_call(envelope) ← called on every tool invocation
-//!         └─ SmcpSession::revoke(reason)           ← on execution end or security incident
+//!   └─ SealSession::new(agent_id, execution_id, public_key, jwt, security_context)
+//!         └─ SealSession::evaluate_call(envelope) ← called on every tool invocation
+//!         └─ SealSession::revoke(reason)           ← on execution end or security incident
 //! ```
 //!
 //! ## Invariants
 //!
 //! - There is at most **one** `Active` session per (`agent_id`, `execution_id`) pair.
-//! - A session is valid for 1 hour from creation; [`SmcpSession::evaluate_call`] rejects
+//! - A session is valid for 1 hour from creation; [`SealSession::evaluate_call`] rejects
 //!   calls after `expires_at`.
 //! - The agent's `agent_public_key` (Ed25519) is **ephemeral** — generated per-execution
 //!   and never written to persistent storage.
@@ -34,8 +34,8 @@
 //! ## Anti-Corruption Layer
 //!
 //! [`EnvelopeVerifier`] is a domain trait that abstracts over the cryptographic
-//! details of SMCP envelope parsing. The infrastructure implementation lives in
-//! [`crate::infrastructure::smcp::envelope`] and uses `ed25519-dalek` for verification.
+//! details of SEAL envelope parsing. The infrastructure implementation lives in
+//! [`crate::infrastructure::seal::envelope`] and uses `ed25519-dalek` for verification.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -47,11 +47,11 @@ use crate::domain::security_context::SecurityContext;
 
 /// Default session time-to-live in hours.
 ///
-/// Operators can adjust this constant to change how long SMCP sessions remain valid
+/// Operators can adjust this constant to change how long SEAL sessions remain valid
 /// after creation, without modifying the rest of the session lifecycle logic.
 const SESSION_TTL_HOURS: i64 = 1;
 
-/// Opaque identifier for a single SMCP session (one per agent execution).
+/// Opaque identifier for a single SEAL session (one per agent execution).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SessionId(pub Uuid);
 
@@ -79,7 +79,7 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-/// Lifecycle state of an [`SmcpSession`].
+/// Lifecycle state of an [`SealSession`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SessionStatus {
     /// The session is valid and can authorise tool calls.
@@ -90,16 +90,16 @@ pub enum SessionStatus {
     Revoked { reason: String },
 }
 
-/// Errors that can occur when evaluating an SMCP envelope against a session.
+/// Errors that can occur when evaluating an SEAL envelope against a session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum SmcpSessionError {
+pub enum SealSessionError {
     /// The session is not in `Active` state. Includes the current status for diagnostics.
     SessionInactive(SessionStatus),
     /// The session's TTL has elapsed (checked against `expires_at`).
     SessionExpired,
     /// The tool call was rejected by the agent's [`crate::domain::security_context::SecurityContext`].
     PolicyViolation(PolicyViolation),
-    /// The SMCP envelope could not be parsed (missing required fields).
+    /// The SEAL envelope could not be parsed (missing required fields).
     MalformedPayload(String),
     /// Replay protection rejected the envelope metadata.
     ReplayProtectionFailed(String),
@@ -122,7 +122,7 @@ pub enum SmcpSessionError {
     ConfigurationError(String),
 }
 
-impl std::fmt::Display for SmcpSessionError {
+impl std::fmt::Display for SealSessionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::SessionInactive(status) => write!(f, "Session is inactive: {status:?}"),
@@ -142,12 +142,12 @@ impl std::fmt::Display for SmcpSessionError {
     }
 }
 
-impl std::error::Error for SmcpSessionError {}
+impl std::error::Error for SealSessionError {}
 
-/// Domain-level abstraction over SMCP envelope cryptography.
+/// Domain-level abstraction over SEAL envelope cryptography.
 ///
 /// This trait keeps the domain layer free of `ed25519-dalek` and JSON-Web-Token
-/// dependencies. The infrastructure implementation ([`crate::infrastructure::smcp::envelope`])
+/// dependencies. The infrastructure implementation ([`crate::infrastructure::seal::envelope`])
 /// provides the concrete verification logic.
 ///
 /// # Security
@@ -155,16 +155,16 @@ impl std::error::Error for SmcpSessionError {}
 /// Implementations **must** perform constant-time signature verification. Timing
 /// side-channels on `verify_signature` can leak private key material.
 pub trait EnvelopeVerifier {
-    /// Return the raw SMCP security token carried by the envelope.
+    /// Return the raw SEAL security token carried by the envelope.
     fn security_token(&self) -> &str;
 
     /// Verify that the envelope's Ed25519 signature was produced by the holder of `public_key_bytes`.
     ///
     /// # Errors
     ///
-    /// Returns [`SmcpSessionError::SignatureVerificationFailed`] if the signature is invalid
+    /// Returns [`SealSessionError::SignatureVerificationFailed`] if the signature is invalid
     /// or `public_key_bytes` is not a valid Ed25519 public key.
-    fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SmcpSessionError>;
+    fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SealSessionError>;
 
     /// Extract the MCP tool name from the inner MCP payload of the envelope.
     ///
@@ -177,10 +177,10 @@ pub trait EnvelopeVerifier {
     fn extract_arguments(&self) -> Option<serde_json::Value>;
 }
 
-/// Aggregate root for the SMCP session lifecycle (BC-12, ADR-035).
+/// Aggregate root for the SEAL session lifecycle (BC-12, ADR-035).
 ///
 /// Represents the security contract between one agent execution and the orchestrator.
-/// Created during attestation; authorises every MCP tool call via [`SmcpSession::evaluate_call`].
+/// Created during attestation; authorises every MCP tool call via [`SealSession::evaluate_call`].
 ///
 /// # Invariants
 ///
@@ -188,9 +188,9 @@ pub trait EnvelopeVerifier {
 /// - `agent_public_key` is the ephemeral Ed25519 public key generated per-execution.
 /// - `expires_at` is set to 1 hour from `created_at` at construction time.
 /// - Only one `Active` session exists per `(agent_id, execution_id)` pair — enforced
-///   by [`crate::domain::smcp_session_repository::SmcpSessionRepository`].
+///   by [`crate::domain::seal_session_repository::SealSessionRepository`].
 #[derive(Debug, Clone)]
-pub struct SmcpSession {
+pub struct SealSession {
     /// Session ID (UUID)
     pub id: SessionId,
 
@@ -229,7 +229,7 @@ pub struct SmcpSession {
     pub expires_at: DateTime<Utc>,
 }
 
-impl SmcpSession {
+impl SealSession {
     /// Initialise a new session immediately following successful attestation.
     ///
     /// Sets `status` to `Active` and `expires_at` to 1 hour from now.
@@ -284,26 +284,26 @@ impl SmcpSession {
     ///
     /// # Errors
     ///
-    /// - [`SmcpSessionError::SessionInactive`] — session is `Expired` or `Revoked`
-    /// - [`SmcpSessionError::SessionExpired`] — TTL exceeded
-    /// - [`SmcpSessionError::SignatureVerificationFailed`] — bad Ed25519 signature
-    /// - [`SmcpSessionError::MalformedPayload`] — envelope missing tool name or args
-    /// - [`SmcpSessionError::PolicyViolation`] — `SecurityContext` denied the call
+    /// - [`SealSessionError::SessionInactive`] — session is `Expired` or `Revoked`
+    /// - [`SealSessionError::SessionExpired`] — TTL exceeded
+    /// - [`SealSessionError::SignatureVerificationFailed`] — bad Ed25519 signature
+    /// - [`SealSessionError::MalformedPayload`] — envelope missing tool name or args
+    /// - [`SealSessionError::PolicyViolation`] — `SecurityContext` denied the call
     ///
     /// # Security
     ///
-    /// This is the **single enforcement point** for all SMCP policy checks. Every
+    /// This is the **single enforcement point** for all SEAL policy checks. Every
     /// tool call from any agent must pass through this method before being forwarded
     /// to the MCP server. See ADR-035 §4 (Enforcement Architecture).
     pub fn evaluate_call(
         &mut self,
         envelope: &impl EnvelopeVerifier,
-    ) -> Result<(), SmcpSessionError> {
+    ) -> Result<(), SealSessionError> {
         let now = Utc::now();
 
         // 1. Check session is active
         if self.status != SessionStatus::Active {
-            return Err(SmcpSessionError::SessionInactive(self.status.clone()));
+            return Err(SealSessionError::SessionInactive(self.status.clone()));
         }
 
         // 2. Check not expired
@@ -311,13 +311,13 @@ impl SmcpSession {
             // Once the session is past its expiry time, transition it to a terminal
             // `Expired` state so that future calls observe a consistent status.
             self.status = SessionStatus::Expired;
-            return Err(SmcpSessionError::SessionExpired);
+            return Err(SealSessionError::SessionExpired);
         }
 
         // 3. Ensure the presented token matches the token issued for this session.
         if envelope.security_token() != self.security_token_raw {
-            return Err(SmcpSessionError::SignatureVerificationFailed(
-                "security token does not match the active SMCP session".to_string(),
+            return Err(SealSessionError::SignatureVerificationFailed(
+                "security token does not match the active SEAL session".to_string(),
             ));
         }
 
@@ -327,27 +327,27 @@ impl SmcpSession {
         // 5. Extract tool name from MCP payload
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload(
+            .ok_or(SealSessionError::MalformedPayload(
                 "missing tool name".to_string(),
             ))?;
 
         let args = envelope
             .extract_arguments()
-            .ok_or(SmcpSessionError::MalformedPayload(
+            .ok_or(SealSessionError::MalformedPayload(
                 "missing arguments".to_string(),
             ))?;
 
         // 6. Evaluate against SecurityContext
         self.security_context
             .evaluate(&tool_name, &args)
-            .map_err(SmcpSessionError::PolicyViolation)
+            .map_err(SealSessionError::PolicyViolation)
     }
 
     /// Revoke this session, preventing any further tool calls.
     ///
     /// Should be called when the associated execution terminates (normally or abnormally)
     /// or when a security incident requires immediate session termination.
-    /// After revocation, `evaluate_call` will return [`SmcpSessionError::SessionInactive`].
+    /// After revocation, `evaluate_call` will return [`SealSessionError::SessionInactive`].
     pub fn revoke(&mut self, reason: String) {
         // Make revocation idempotent: once the session has reached a terminal state
         // (`Expired` or `Revoked`), do not change its status again. This avoids

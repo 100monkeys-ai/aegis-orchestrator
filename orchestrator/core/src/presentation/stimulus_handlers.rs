@@ -399,7 +399,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
-            smcp_session_repo: None,
+            seal_session_repo: None,
             rate_limit_override_repo: None,
             config_layer_repo: None,
             node_cluster_repo: None,

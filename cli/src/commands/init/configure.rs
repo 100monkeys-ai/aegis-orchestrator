@@ -118,7 +118,7 @@ impl ConfigWizard {
         components: &SelectedComponents,
         compose_content: &str,
         runtime_registry_content: &str,
-        smcp_gateway_config_content: &str,
+        seal_gateway_config_content: &str,
     ) -> Result<NodeConfig> {
         println!();
         println!("{}", "Configure your AEGIS node:".bold());
@@ -257,7 +257,7 @@ impl ConfigWizard {
         let env_path = working_dir.join(".env");
         let compose_path = working_dir.join("docker-compose.yml");
         let runtime_registry_path = working_dir.join("runtime-registry.yaml");
-        let smcp_gateway_config_path = working_dir.join("smcp-gateway-config.yaml");
+        let seal_gateway_config_path = working_dir.join("seal-gateway-config.yaml");
 
         // Check for existing config *before* writing anything.
         if config_path.exists() && !self.yes {
@@ -313,14 +313,14 @@ impl ConfigWizard {
             .with_context(|| format!("Failed to write {}", compose_path.display()))?;
         std::fs::write(&runtime_registry_path, runtime_registry_content)
             .with_context(|| format!("Failed to write {}", runtime_registry_path.display()))?;
-        std::fs::write(&smcp_gateway_config_path, smcp_gateway_config_content)
-            .with_context(|| format!("Failed to write {}", smcp_gateway_config_path.display()))?;
+        std::fs::write(&seal_gateway_config_path, seal_gateway_config_content)
+            .with_context(|| format!("Failed to write {}", seal_gateway_config_path.display()))?;
 
         println!("  {} {}", "✓".green(), config_path.display());
         println!("  {} {}", "✓".green(), env_path.display());
         println!("  {} {}", "✓".green(), compose_path.display());
         println!("  {} {}", "✓".green(), runtime_registry_path.display());
-        println!("  {} {}", "✓".green(), smcp_gateway_config_path.display());
+        println!("  {} {}", "✓".green(), seal_gateway_config_path.display());
 
         Ok(node_config)
     }
@@ -1184,10 +1184,10 @@ impl ConfigWizard {
       mount_point: "/tmp/aegis-volumes"
 "#
         };
-        let smcp_gateway_section = if components.smcp_gateway {
+        let seal_gateway_section = if components.seal_gateway {
             r#"
-  smcp_gateway:
-    url: "env:SMCP_GATEWAY_URL"
+  seal_gateway:
+    url: "env:SEAL_GATEWAY_URL"
 "#
         } else {
             ""
@@ -1292,7 +1292,7 @@ spec:
     logging:
       level: "{log_level}"{otlp_section}{metrics_section}
 {cluster_section}
-{database_section}{temporal_section}{storage_section}{smcp_gateway_section}"#,
+{database_section}{temporal_section}{storage_section}{seal_gateway_section}"#,
             node_name = config.node_name,
             node_id = config.node_id,
             node_type = config.advanced.node_type,
@@ -1313,7 +1313,7 @@ spec:
             database_section = database_section,
             temporal_section = temporal_section,
             storage_section = storage_section,
-            smcp_gateway_section = smcp_gateway_section,
+            seal_gateway_section = seal_gateway_section,
             max_execution_list_limit = crate::daemon::server::DEFAULT_MAX_EXECUTION_LIST_LIMIT,
         )
     }
@@ -1325,9 +1325,9 @@ spec:
         components: &SelectedComponents,
     ) -> Result<String> {
         let profiles = components.compose_profiles();
-        let smcp_private_key = generate_smcp_private_key_env_value()?;
-        let smcp_gateway_url_section = if components.smcp_gateway {
-            "\n# ─── SMCP Tooling Gateway ─────────────────────────────────────────────────────\nSMCP_GATEWAY_URL=http://aegis-smcp-gateway:50055\n"
+        let seal_private_key = generate_seal_private_key_env_value()?;
+        let seal_gateway_url_section = if components.seal_gateway {
+            "\n# ─── SEAL Tooling Gateway ─────────────────────────────────────────────────────\nSEAL_GATEWAY_URL=http://aegis-seal-gateway:50055\n"
         } else {
             ""
         };
@@ -1432,8 +1432,8 @@ TEMPORAL_WORKER_SECRET={temporal_worker_secret}
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 AEGIS_KEEP_CONTAINER={keep_container}
-AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
-{smcp_gateway_url_section}{otlp_logging_section}{cluster_section}"#,
+AEGIS_SEAL_PRIVATE_KEY='{seal_private_key}'
+{seal_gateway_url_section}{otlp_logging_section}{cluster_section}"#,
             profiles = profiles,
             api_key_line = api_key_line,
             additional_provider_env = additional_provider_env,
@@ -1449,23 +1449,23 @@ AEGIS_SMCP_PRIVATE_KEY='{smcp_private_key}'
             } else {
                 "false"
             },
-            smcp_private_key = smcp_private_key,
-            smcp_gateway_url_section = smcp_gateway_url_section,
+            seal_private_key = seal_private_key,
+            seal_gateway_url_section = seal_gateway_url_section,
             otlp_logging_section = otlp_logging_section,
             cluster_section = cluster_section,
         ))
     }
 }
 
-/// Generate a 2048-bit RSA private key for SMCP token signing and encode it as
+/// Generate a 2048-bit RSA private key for SEAL token signing and encode it as
 /// PEM for multi-line single-quoted `.env` storage.
-fn generate_smcp_private_key_env_value() -> Result<String> {
+fn generate_seal_private_key_env_value() -> Result<String> {
     let mut rng = OsRng;
     let private_key =
-        RsaPrivateKey::new(&mut rng, 2048).context("Failed to generate SMCP RSA private key")?;
+        RsaPrivateKey::new(&mut rng, 2048).context("Failed to generate SEAL RSA private key")?;
     let pem = private_key
         .to_pkcs1_pem(LineEnding::LF)
-        .context("Failed to encode SMCP RSA private key as PEM")?;
+        .context("Failed to encode SEAL RSA private key as PEM")?;
     Ok(pem.trim_end().to_string())
 }
 
@@ -1626,7 +1626,7 @@ mod tests {
             storage: false,
             iam: false,
             secrets: false,
-            smcp_gateway: false,
+            seal_gateway: false,
             ollama_llm: false,
             observability: false,
             llm: LlmChoice::Ollama,
@@ -1703,7 +1703,7 @@ mod tests {
             storage: false,
             iam: false,
             secrets: false,
-            smcp_gateway: false,
+            seal_gateway: false,
             ollama_llm: false,
             observability: false,
             llm: LlmChoice::Anthropic,

@@ -39,9 +39,9 @@ use crate::domain::fsal::AegisFSAL;
 use crate::domain::mcp::{
     MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
 };
+use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
+use crate::domain::seal_session_repository::SealSessionRepository;
 use crate::domain::security_context::repository::SecurityContextRepository;
-use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
-use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::domain::tenant::TenantId;
 use crate::domain::validation::extract_json_from_text;
 use crate::domain::workflow::{
@@ -51,9 +51,9 @@ use crate::domain::workflow::{
 use crate::domain::{repository, validation::ValidationRequest};
 use crate::infrastructure::agent_manifest_parser::AgentManifestParser;
 use crate::infrastructure::event_bus::EventBus;
-use crate::infrastructure::smcp::middleware::SmcpMiddleware;
-use crate::infrastructure::smcp_gateway_proto::gateway_invocation_service_client::GatewayInvocationServiceClient;
-use crate::infrastructure::smcp_gateway_proto::{
+use crate::infrastructure::seal::middleware::SealMiddleware;
+use crate::infrastructure::seal_gateway_proto::gateway_invocation_service_client::GatewayInvocationServiceClient;
+use crate::infrastructure::seal_gateway_proto::{
     FsalMount, InvokeCliRequest, InvokeWorkflowRequest, ListToolsRequest,
 };
 use crate::infrastructure::tool_router::ToolRouter;
@@ -70,12 +70,12 @@ pub enum ToolInvocationResult {
 }
 
 pub struct ToolInvocationService {
-    smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+    seal_session_repo: Arc<dyn SealSessionRepository>,
     security_context_repo: Arc<dyn SecurityContextRepository>,
-    smcp_middleware: Arc<SmcpMiddleware>,
+    seal_middleware: Arc<SealMiddleware>,
     tool_router: Arc<ToolRouter>,
     /// AegisFSAL security boundary for all storage operations (ADR-033 Path 1, ADR-047)
-    /// Delegates to the appropriate StorageProvider (SeaweedFS, OpenDAL, SMCP, LocalHost)
+    /// Delegates to the appropriate StorageProvider (SeaweedFS, OpenDAL, SEAL, LocalHost)
     fsal: Arc<AegisFSAL>,
     /// Volume registry for resolving execution_id -> volume context
     volume_registry: NfsVolumeRegistry,
@@ -101,8 +101,8 @@ pub struct ToolInvocationService {
     generated_manifests_root: Option<PathBuf>,
     /// Optional path to node-config.yaml for system.config tool.
     node_config_path: Option<PathBuf>,
-    /// Optional ADR-053 SMCP gateway URL from node config.
-    smcp_gateway_url: Option<String>,
+    /// Optional ADR-053 SEAL gateway URL from node config.
+    seal_gateway_url: Option<String>,
     /// Schema registry for builtin schema.get / schema.validate tools.
     schema_registry: Arc<SchemaRegistry>,
     /// Optional port for workflow execution control (cancel, signal, remove).

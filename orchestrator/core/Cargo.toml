@@ -72,7 +72,7 @@ scraper = "0.25.0"
 html2md = "0.2"
 urlencoding = "2.1"
 
-# Cryptography & Security (SMCP)
+# Cryptography & Security (SEAL)
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
 base64 = "0.22"
 jsonwebtoken = { version = "10.3.0", default-features = false, features = ["aws_lc_rs", "use_pem"] }

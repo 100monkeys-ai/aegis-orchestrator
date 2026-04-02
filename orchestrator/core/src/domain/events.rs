@@ -19,7 +19,7 @@
 //! | [`VolumeEvent`] | BC-7 Storage Gateway | Volume lifecycle (create/attach/detach/delete/expire) |
 //! | [`PolicyEvent`] | BC-4 Security Policy | Runtime policy violation records |
 //! | [`ViolationType`] | BC-4 / BC-12 | Structured violation classification |
-//! | [`MCPToolEvent`] | BC-12 SMCP / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
+//! | [`MCPToolEvent`] | BC-12 SEAL / Tool Routing | MCP server lifecycle and tool invocation audit (ADR-033) |
 //! | [`ImageManagementEvent`] | BC-2 Execution | Container image pull lifecycle and cache status (ADR-045) |
 //! | [`CommandExecutionEvent`] | BC-2 Execution / Dispatch | In-container command execution via Dispatch Protocol (ADR-040) |
 //! | [`IamEvent`] | BC-13 IAM & Identity Federation | OIDC authentication, realm lifecycle, JWKS cache events (ADR-041) |
@@ -622,7 +622,7 @@ pub enum VolumeEvent {
 ///
 /// Published by the runtime policy enforcer when an agent container attempts to
 /// violate its manifest-declared [`crate::domain::policy::SecurityPolicy`].
-/// Distinct from [`MCPToolEvent::PolicyViolation`] which covers SMCP/MCP-level violations.
+/// Distinct from [`MCPToolEvent::PolicyViolation`] which covers SEAL/MCP-level violations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PolicyEvent {
     PolicyViolationAttempted {
@@ -640,7 +640,7 @@ pub enum PolicyEvent {
 }
 
 /// Structured classification of policy violation types used in [`MCPToolEvent::PolicyViolation`]
-/// and [`crate::domain::smcp_session::SmcpSessionError`] audit records.
+/// and [`crate::domain::seal_session::SealSessionError`] audit records.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ViolationType {
     /// The requested MCP tool is not declared in the agent's `SecurityContext` capabilities.
@@ -661,7 +661,7 @@ pub enum ViolationType {
     TimeoutExceeded,
 }
 
-/// MCP Tool server lifecycle and invocation audit events (BC-12 SMCP / Tool Routing, ADR-033).
+/// MCP Tool server lifecycle and invocation audit events (BC-12 SEAL / Tool Routing, ADR-033).
 ///
 /// Published by [`crate::application::tool_invocation_service::ToolInvocationService`] and
 /// [`crate::infrastructure::tool_router::ToolRouter`]. Consumed by:
@@ -860,24 +860,24 @@ pub enum CommandFailureReason {
     AgentConnectionLost,
 }
 
-/// SMCP session lifecycle and security events (BC-12 SMCP Protocol, ADR-035 §5).
+/// SEAL session lifecycle and security events (BC-12 SEAL Protocol, ADR-035 §5).
 ///
 /// Published by [`crate::application::attestation_service::AttestationServiceImpl`]
-/// and [`crate::infrastructure::smcp::audit::SmcpAuditLogger`].
+/// and [`crate::infrastructure::seal::audit::SealAuditLogger`].
 /// Consumed by:
 /// - Cortex for security pattern learning (e.g. detecting attestation storms)
 /// - Zaru client for real-time security dashboard
 /// - SOC 2 audit trail export (Phase 2)
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum SmcpEvent {
-    /// Agent completed the SMCP attestation handshake and received a SecurityToken.
+pub enum SealEvent {
+    /// Agent completed the SEAL attestation handshake and received a SecurityToken.
     AttestationCompleted {
         agent_id: AgentId,
         execution_id: ExecutionId,
         security_context_name: String,
         attested_at: DateTime<Utc>,
     },
-    /// A new SmcpSession was created for an agent execution.
+    /// A new SealSession was created for an agent execution.
     SessionCreated {
         session_id: String,
         agent_id: AgentId,
@@ -886,7 +886,7 @@ pub enum SmcpEvent {
         expires_at: DateTime<Utc>,
         created_at: DateTime<Utc>,
     },
-    /// An SmcpSession was revoked (execution complete or security incident).
+    /// An SealSession was revoked (execution complete or security incident).
     SessionRevoked {
         session_id: String,
         agent_id: AgentId,

@@ -17,14 +17,14 @@
 use crate::domain::storage::{
     DirEntry, FileAttributes, FileHandle, OpenMode, StorageError, StorageProvider,
 };
-use crate::infrastructure::storage::{LocalHostStorageProvider, SmcpStorageProvider};
+use crate::infrastructure::storage::{LocalHostStorageProvider, SealStorageProvider};
 use async_trait::async_trait;
 use std::sync::Arc;
 
 pub struct StorageRouter {
     local_provider: Arc<LocalHostStorageProvider>,
     #[allow(dead_code)]
-    smcp_provider: Arc<SmcpStorageProvider>,
+    seal_provider: Arc<SealStorageProvider>,
     default_provider: Arc<dyn StorageProvider>,
 }
 
@@ -32,18 +32,18 @@ impl StorageRouter {
     pub fn new(
         default_provider: Arc<dyn StorageProvider>,
         local_provider: Arc<LocalHostStorageProvider>,
-        smcp_provider: Arc<SmcpStorageProvider>,
+        seal_provider: Arc<SealStorageProvider>,
     ) -> Self {
         Self {
             default_provider,
             local_provider,
-            smcp_provider,
+            seal_provider,
         }
     }
 
     fn provider_for_path(&self, path: &str) -> Result<Arc<dyn StorageProvider>, StorageError> {
-        if path.starts_with("/aegis/smcp/") || path.starts_with("aegis/smcp/") {
-            return Ok(self.smcp_provider.clone());
+        if path.starts_with("/aegis/seal/") || path.starts_with("aegis/seal/") {
+            return Ok(self.seal_provider.clone());
         }
         if path.starts_with("/aegis/opendal/") || path.starts_with("aegis/opendal/") {
             return Ok(self.default_provider.clone());
@@ -155,12 +155,12 @@ mod tests {
         let default_provider = Arc::new(TestStorageProvider::new());
         // Since LocalHostStorageProvider relies on actual local path access, we bypass initializing failing path
         let local_provider = Arc::new(LocalHostStorageProvider::new("/tmp").unwrap());
-        let smcp_provider = Arc::new(SmcpStorageProvider::new());
+        let seal_provider = Arc::new(SealStorageProvider::new());
 
         let router = StorageRouter::new(
             default_provider.clone(),
             local_provider.clone(),
-            smcp_provider.clone(),
+            seal_provider.clone(),
         );
 
         // Default routing for standard AEGIS prefix
@@ -178,9 +178,9 @@ mod tests {
         ));
         assert!(Arc::ptr_eq(
             &router
-                .provider_for_path("/aegis/smcp/node-1/vol-1/file.txt")
+                .provider_for_path("/aegis/seal/node-1/vol-1/file.txt")
                 .unwrap(),
-            &(smcp_provider.clone() as Arc<dyn StorageProvider>)
+            &(seal_provider.clone() as Arc<dyn StorageProvider>)
         ));
 
         // Path should route to local

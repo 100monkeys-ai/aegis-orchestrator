@@ -237,11 +237,11 @@ pub struct NodeTokenClaims {
     pub exp: i64,
 }
 
-/// SmcpNodeEnvelope (Value Object)
+/// SealNodeEnvelope (Value Object)
 ///
 /// Outer wrapper for all authenticated cluster RPCs after initial attestation.
-/// Structurally mirrors `SmcpEnvelope` from ADR-035.
-pub struct SmcpNodeEnvelope {
+/// Structurally mirrors `SealEnvelope` from ADR-035.
+pub struct SealNodeEnvelope {
     pub node_security_token: NodeSecurityToken,
     /// Ed25519 signature over serialized `inner_payload` using node's persistent keypair
     pub signature: String,

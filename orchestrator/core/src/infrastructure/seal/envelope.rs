@@ -1,15 +1,15 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Envelope and JWT Claims (ADR-035 §3)
+//! # SEAL Envelope and JWT Claims (ADR-035 §3)
 //!
-//! Infrastructure implementation of the SMCP envelope format. An `SmcpEnvelope`
+//! Infrastructure implementation of the SEAL envelope format. An `SealEnvelope`
 //! is the outer wrapper that every MCP message from an agent must be wrapped in
 //! before the orchestrator will forward it to a tool server.
 //!
 //! ## Envelope Structure
 //!
 //! ```text
-//! SmcpEnvelope {
+//! SealEnvelope {
 //!     security_token: JWT (ContextClaims, signed by orchestrator)
 //!     signature:      base64(Ed25519_sign(inner_mcp, agent_private_key))
 //!     inner_mcp:      raw MCP JSON-RPC payload bytes
@@ -18,9 +18,9 @@
 //!
 //! ## Verification
 //!
-//! `SmcpEnvelope` implements [`crate::domain::smcp_session::EnvelopeVerifier`]:
+//! `SealEnvelope` implements [`crate::domain::seal_session::EnvelopeVerifier`]:
 //! - `verify_signature` decodes the signature and verifies it against `inner_mcp`
-//!   using the Ed25519 public key stored in the `SmcpSession`.
+//!   using the Ed25519 public key stored in the `SealSession`.
 //! - `extract_tool_name` / `extract_arguments` parse the `inner_mcp` JSON-RPC payload.
 //!
 //! See ADR-035 §3 (Protocol Wire Format).
@@ -31,9 +31,9 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
+use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
 
-/// The outer SMCP wrapper applied to every MCP message from an agent container.
+/// The outer SEAL wrapper applied to every MCP message from an agent container.
 ///
 /// An immutable value object: once constructed the fields must not be modified
 /// (the signature covers `inner_mcp` and would be invalidated by any change).
@@ -44,7 +44,7 @@ use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSessionError};
 /// a particular tool call because the `signature` is an Ed25519 signature over
 /// `inner_mcp` with a key that was bound during attestation. See ADR-035 §5.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmcpEnvelope {
+pub struct SealEnvelope {
     /// Protocol identifier for version negotiation. `None` is accepted only for
     /// internal legacy callers that still send the pre-spec envelope shape.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,10 +68,10 @@ pub enum AudienceClaim {
     Multiple(Vec<String>),
 }
 
-/// JWT claims payload used in SMCP `SecurityToken`s.
+/// JWT claims payload used in SEAL `SecurityToken`s.
 ///
 /// The `ContextClaims` are signed by the orchestrator during attestation and
-/// embedded in every `SmcpEnvelope.security_token`. They bind the token to a
+/// embedded in every `SealEnvelope.security_token`. They bind the token to a
 /// specific agent execution and `SecurityContext`.
 ///
 /// Standard JWT fields (`iss`, `aud`, `exp`, `iat`, `nbf`) follow RFC 7519.
@@ -100,28 +100,28 @@ pub struct ContextClaims {
     pub nbf: Option<i64>,
 }
 
-impl EnvelopeVerifier for SmcpEnvelope {
+impl EnvelopeVerifier for SealEnvelope {
     fn security_token(&self) -> &str {
         &self.security_token
     }
 
-    fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+    fn verify_signature(&self, public_key_bytes: &[u8]) -> Result<(), SealSessionError> {
         let public_key_bytes: [u8; 32] = public_key_bytes.try_into().map_err(|_| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "Invalid public key length (must be 32 bytes)".to_string(),
             )
         })?;
 
         let verifying_key = VerifyingKey::from_bytes(&public_key_bytes).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Invalid public key: {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Invalid public key: {e}"))
         })?;
 
         let decoded_sig = STANDARD.decode(&self.signature).map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Invalid base64 signature: {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Invalid base64 signature: {e}"))
         })?;
 
         let sig_bytes: [u8; 64] = decoded_sig.try_into().map_err(|_| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "Invalid signature length (must be 64 bytes)".to_string(),
             )
         })?;
@@ -132,7 +132,7 @@ impl EnvelopeVerifier for SmcpEnvelope {
         verifying_key
             .verify(&signed_message, &signature)
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SealSessionError::SignatureVerificationFailed(format!(
                     "Signature verification failed: {e}"
                 ))
             })
@@ -167,20 +167,20 @@ impl EnvelopeVerifier for SmcpEnvelope {
     }
 }
 
-impl SmcpEnvelope {
-    fn signed_message(&self) -> Result<Vec<u8>, SmcpSessionError> {
+impl SealEnvelope {
+    fn signed_message(&self) -> Result<Vec<u8>, SealSessionError> {
         match (&self.protocol, &self.timestamp) {
             (Some(protocol), Some(timestamp)) => {
-                if protocol != "smcp/v1" {
-                    return Err(SmcpSessionError::MalformedPayload(format!(
-                        "unsupported SMCP protocol '{protocol}'"
+                if protocol != "seal/v1" {
+                    return Err(SealSessionError::MalformedPayload(format!(
+                        "unsupported SEAL protocol '{protocol}'"
                     )));
                 }
 
                 let timestamp = parse_iso8601_timestamp(timestamp)?;
                 let age_seconds = (Utc::now() - timestamp).num_seconds().abs();
                 if age_seconds > 30 {
-                    return Err(SmcpSessionError::ReplayProtectionFailed(format!(
+                    return Err(SealSessionError::ReplayProtectionFailed(format!(
                         "envelope timestamp is outside the 30 second freshness window ({age_seconds}s)"
                     )));
                 }
@@ -188,21 +188,21 @@ impl SmcpEnvelope {
                 canonical_message(&self.security_token, &self.inner_mcp, timestamp)
             }
             (None, None) => Ok(self.inner_mcp.clone()),
-            _ => Err(SmcpSessionError::MalformedPayload(
-                "SMCP envelopes must provide both protocol and timestamp together".to_string(),
+            _ => Err(SealSessionError::MalformedPayload(
+                "SEAL envelopes must provide both protocol and timestamp together".to_string(),
             )),
         }
     }
 }
 
-/// Normalize an attested Ed25519 public key into the raw 32-byte form stored in SmcpSession.
+/// Normalize an attested Ed25519 public key into the raw 32-byte form stored in SealSession.
 ///
 /// Accepts:
 /// - raw 32-byte key material already present as bytes
 /// - base64-encoded raw 32-byte key material
 /// - PEM/SPKI public keys
 /// - base64-encoded Ed25519 SPKI DER public keys
-pub fn normalize_public_key_bytes(input: &str) -> Result<Vec<u8>, SmcpSessionError> {
+pub fn normalize_public_key_bytes(input: &str) -> Result<Vec<u8>, SealSessionError> {
     const ED25519_SPKI_PREFIX: [u8; 12] = [
         0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
     ];
@@ -230,16 +230,16 @@ pub fn normalize_public_key_bytes(input: &str) -> Result<Vec<u8>, SmcpSessionErr
         return Ok(decoded[ED25519_SPKI_PREFIX.len()..].to_vec());
     }
 
-    Err(SmcpSessionError::SignatureVerificationFailed(
+    Err(SealSessionError::SignatureVerificationFailed(
         "unsupported Ed25519 public key encoding".to_string(),
     ))
 }
 
-fn parse_iso8601_timestamp(input: &str) -> Result<DateTime<Utc>, SmcpSessionError> {
+fn parse_iso8601_timestamp(input: &str) -> Result<DateTime<Utc>, SealSessionError> {
     DateTime::parse_from_rfc3339(input)
         .map(|ts| ts.with_timezone(&Utc))
         .map_err(|e| {
-            SmcpSessionError::MalformedPayload(format!("invalid SMCP timestamp '{input}': {e}"))
+            SealSessionError::MalformedPayload(format!("invalid SEAL timestamp '{input}': {e}"))
         })
 }
 
@@ -247,9 +247,9 @@ fn canonical_message(
     security_token: &str,
     payload: &[u8],
     timestamp: DateTime<Utc>,
-) -> Result<Vec<u8>, SmcpSessionError> {
+) -> Result<Vec<u8>, SealSessionError> {
     let payload_json: Value = serde_json::from_slice(payload).map_err(|e| {
-        SmcpSessionError::MalformedPayload(format!("invalid inner MCP payload JSON: {e}"))
+        SealSessionError::MalformedPayload(format!("invalid inner MCP payload JSON: {e}"))
     })?;
     let canonical = serde_json::json!({
         "payload": payload_json,
@@ -258,8 +258,8 @@ fn canonical_message(
     });
 
     serde_json::to_vec(&canonical).map_err(|e| {
-        SmcpSessionError::MalformedPayload(format!(
-            "failed to serialize canonical SMCP message: {e}"
+        SealSessionError::MalformedPayload(format!(
+            "failed to serialize canonical SEAL message: {e}"
         ))
     })
 }
@@ -272,7 +272,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn test_smcp_envelope_verification() {
+    fn test_seal_envelope_verification() {
         // Deterministic test keypair (avoids rand_core version coupling in tests)
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let verifying_key = signing_key.verifying_key();
@@ -301,8 +301,8 @@ mod tests {
         );
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
-        let envelope = SmcpEnvelope {
-            protocol: Some("smcp/v1".to_string()),
+        let envelope = SealEnvelope {
+            protocol: Some("seal/v1".to_string()),
             security_token: "test-jwt.token.here".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes.clone(),
@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn test_smcp_envelope_verification_failure() {
+    fn test_seal_envelope_verification_failure() {
         // Two deterministic but different keypairs
         let signing_key1 = SigningKey::from_bytes(&[2u8; 32]);
         let signing_key2 = SigningKey::from_bytes(&[3u8; 32]);
@@ -342,8 +342,8 @@ mod tests {
         );
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
-        let envelope = SmcpEnvelope {
-            protocol: Some("smcp/v1".to_string()),
+        let envelope = SealEnvelope {
+            protocol: Some("seal/v1".to_string()),
             security_token: "test.jwt".to_string(),
             signature: signature_b64,
             inner_mcp: inner_mcp_bytes,
@@ -353,7 +353,7 @@ mod tests {
         // Verification with key 2 should fail
         assert!(matches!(
             envelope.verify_signature(verifying_key2.as_bytes()),
-            Err(SmcpSessionError::SignatureVerificationFailed(_))
+            Err(SealSessionError::SignatureVerificationFailed(_))
         ));
     }
 

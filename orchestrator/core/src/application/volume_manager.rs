@@ -440,7 +440,7 @@ impl VolumeService for StandardVolumeService {
         let path_to_delete = match &volume.backend {
             VolumeBackend::SeaweedFS { remote_path, .. } => Some(remote_path.clone()),
             VolumeBackend::HostPath { path } => Some(path.to_string_lossy().to_string()),
-            VolumeBackend::OpenDal { .. } | VolumeBackend::Smcp { .. } => None, // Handled implicitly or unmanaged natively here
+            VolumeBackend::OpenDal { .. } | VolumeBackend::Seal { .. } => None, // Handled implicitly or unmanaged natively here
         };
 
         if let Some(remote_path) = path_to_delete {
@@ -492,7 +492,7 @@ impl VolumeService for StandardVolumeService {
         let remote_path = match &volume.backend {
             VolumeBackend::SeaweedFS { remote_path, .. } => remote_path.clone(),
             VolumeBackend::HostPath { path } => path.to_string_lossy().to_string(),
-            VolumeBackend::OpenDal { .. } | VolumeBackend::Smcp { .. } => String::new(), // Not accurately supported purely via `get_usage` directly
+            VolumeBackend::OpenDal { .. } | VolumeBackend::Seal { .. } => String::new(), // Not accurately supported purely via `get_usage` directly
         };
 
         let usage_bytes = if remote_path.is_empty() {
@@ -640,7 +640,7 @@ impl VolumeService for StandardVolumeService {
                         }
                     }
                 }
-                "opendal" | "hostPath" | "smcp" => {
+                "opendal" | "hostPath" | "seal" => {
                     // Custom non-standard volume types.
                     // Construct backend directly and persist without the standard SeaweedFS routine.
                     let backend = match spec.volume_type.as_str() {
@@ -664,7 +664,7 @@ impl VolumeService for StandardVolumeService {
                                     }),
                             ),
                         },
-                        "smcp" => VolumeBackend::Smcp {
+                        "seal" => VolumeBackend::Seal {
                             node_id: spec
                                 .config
                                 .as_ref()
@@ -713,7 +713,7 @@ impl VolumeService for StandardVolumeService {
                 }
                 other => {
                     return Err(anyhow::anyhow!(
-                        "Invalid volume_type '{other}'. Expected 'seaweedfs', 'opendal', 'hostPath', 'smcp'"
+                        "Invalid volume_type '{other}'. Expected 'seaweedfs', 'opendal', 'hostPath', 'seal'"
                     ));
                 }
             };

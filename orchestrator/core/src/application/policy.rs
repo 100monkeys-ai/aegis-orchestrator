@@ -6,7 +6,7 @@
 //! Bridges the manifest's `spec.security` stanza to the infrastructure-level
 //! runtime enforcement (container network rules, filesystem mount constraints).
 //!
-//! Also acts as the orchestrator's entry point for **SMCP `SecurityContext`**
+//! Also acts as the orchestrator's entry point for **SEAL `SecurityContext`**
 //! management (create, update, list named permission boundaries).
 //!
 //! ## Relationships
@@ -14,7 +14,7 @@
 //! - Consumes `PolicyEnforcer` infrastructure service for runtime enforcement
 //! - Publishes `PolicyViolationAttempted` / `PolicyViolationBlocked` events
 //!
-//! See AGENTS.md §BC-4 Security Policy Context, ADR-035 (SMCP).
+//! See AGENTS.md §BC-4 Security Policy Context, ADR-035 (SEAL).
 
 use crate::domain::policy::{FilesystemPolicy, NetworkPolicy, ResourceLimits, SecurityPolicy};
 use anyhow::Result;

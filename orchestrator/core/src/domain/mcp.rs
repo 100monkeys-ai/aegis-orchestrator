@@ -26,7 +26,7 @@
 //! `SecretsManager` (ADR-034) just before spawning a tool server process;
 //! they are never written to agent container memory.
 //!
-//! See ADR-033 (Orchestrator-Mediated MCP Tool Routing), ADR-035 (SMCP),
+//! See ADR-033 (Orchestrator-Mediated MCP Tool Routing), ADR-035 (SEAL),
 //! AGENTS.md §Tools & Integration Domain.
 
 use crate::domain::agent::AgentId;
@@ -139,7 +139,7 @@ pub struct MCPError {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ExecutionMode {
     Local,  // Executed natively via FSAL on the agent's mounted volume
-    Remote, // Executed via SMCP envelope to an external MCP server
+    Remote, // Executed via SEAL envelope to an external MCP server
 }
 
 /// Tool server status (enum value object)
@@ -544,7 +544,7 @@ impl ToolPolicy {
         // 3. Rate limit check
         if current_call_count >= self.max_calls_per_execution {
             return Err(PolicyViolation::RateLimitExceeded {
-                resource_type: "SmcpToolCall".to_string(),
+                resource_type: "SealToolCall".to_string(),
                 bucket: "per_execution".to_string(),
                 limit: self.max_calls_per_execution as u64,
                 current: current_call_count as u64,
@@ -613,7 +613,7 @@ impl ToolPolicy {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Domain value object encoding the **required-argument contract** for every
-/// known built-in and management tool exposed via the SMCP tool path (ADR-055).
+/// known built-in and management tool exposed via the SEAL tool path (ADR-055).
 ///
 /// # Why this lives in the domain layer
 ///
@@ -627,7 +627,7 @@ impl ToolPolicy {
 ///
 /// ```rust,ignore
 /// ToolInputContract::validate("aegis.agent.create", &args)
-///     .map_err(|msg| SmcpSessionError::InvalidArguments(msg))?;
+///     .map_err(|msg| SealSessionError::InvalidArguments(msg))?;
 /// ```
 pub struct ToolInputContract;
 

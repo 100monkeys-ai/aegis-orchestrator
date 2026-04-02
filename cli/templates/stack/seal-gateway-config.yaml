@@ -1,0 +1,51 @@
+apiVersion: 100monkeys.ai/v1
+kind: SealGatewayConfig
+metadata:
+  name: aegis-seal-gateway
+  version: "1.0.0"
+
+spec:
+  network:
+    # Resolved from env at startup; falls back to SEAL_GATEWAY_BIND in docker-compose.
+    bind_addr: "env:SEAL_GATEWAY_BIND"
+    grpc_bind_addr: "env:SEAL_GATEWAY_GRPC_BIND"
+
+  database:
+    # Resolved from env at startup; SEAL_GATEWAY_DB is set in docker-compose.
+    # The named Docker volume mounts at /app/data — keep the path consistent.
+    url: "env:SEAL_GATEWAY_DB"
+
+  auth:
+    # bool — overridden at runtime via SEAL_GATEWAY_AUTH_DISABLED env var.
+    # Default true for local dev; set false (and provide JWT keys) for production.
+    disabled: true
+    # Set via SEAL_GATEWAY_OPERATOR_JWT_PUBLIC_KEY_PEM for production.
+    operator_jwt_public_key_pem: "env:SEAL_GATEWAY_OPERATOR_JWT_PUBLIC_KEY_PEM"
+    operator_jwt_issuer: "aegis-keycloak"
+    operator_jwt_audience: "aegis-seal-gateway"
+    # Set via SEAL_GATEWAY_SEAL_JWT_PUBLIC_KEY_PEM for production.
+    seal_jwt_public_key_pem: "env:SEAL_GATEWAY_SEAL_JWT_PUBLIC_KEY_PEM"
+    seal_jwt_issuer: "aegis-orchestrator"
+    seal_jwt_audience: "aegis-agents"
+
+  credentials:
+    # Set via SEAL_GATEWAY_OPENBAO_ADDR when secrets backend is deployed.
+    openbao_addr: "env:SEAL_GATEWAY_OPENBAO_ADDR"
+    openbao_token: "env:SEAL_GATEWAY_OPENBAO_TOKEN"
+    # KV mount path — override via SEAL_GATEWAY_OPENBAO_KV_MOUNT if non-standard.
+    openbao_kv_mount: "secret"
+    # Set via SEAL_GATEWAY_KEYCLOAK_* when IAM profile is deployed.
+    keycloak_token_exchange_url: "env:SEAL_GATEWAY_KEYCLOAK_TOKEN_EXCHANGE_URL"
+    keycloak_client_id: "env:SEAL_GATEWAY_KEYCLOAK_CLIENT_ID"
+    keycloak_client_secret: "env:SEAL_GATEWAY_KEYCLOAK_CLIENT_SECRET"
+
+  cli:
+    # Set via SEAL_GATEWAY_SEMANTIC_JUDGE_URL when judge is deployed.
+    semantic_judge_url: "env:SEAL_GATEWAY_SEMANTIC_JUDGE_URL"
+    # NFS host where agent volumes are served; matches AEGIS_NFS_HOST.
+    nfs_server_host: "env:SEAL_GATEWAY_NFS_HOST"
+    nfs_port: 2049
+    nfs_mount_port: 20048
+
+  ui:
+    enabled: true

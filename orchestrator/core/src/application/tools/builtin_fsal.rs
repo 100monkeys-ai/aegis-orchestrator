@@ -2,7 +2,7 @@ use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
 use std::path::Path;
 use std::sync::Arc;
@@ -35,7 +35,7 @@ pub async fn invoke_fs_tool(
     execution_id: ExecutionId,
     fsal: &Arc<AegisFSAL>,
     volume_registry: &NfsVolumeRegistry,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let path_arg = args
         .get("path")
         .and_then(|v| v.as_str())
@@ -44,7 +44,7 @@ pub async fn invoke_fs_tool(
         .find_by_execution_and_path(execution_id, path_arg)
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(format!(
+            SealSessionError::SignatureVerificationFailed(format!(
                 "No volume registered for execution {execution_id}"
             ))
         })?;
@@ -65,7 +65,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "FSAL create_file error: {e}"
                     ))
                 })?;
@@ -74,7 +74,7 @@ pub async fn invoke_fs_tool(
                 .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!("FSAL write error: {e}"))
+                    SealSessionError::SignatureVerificationFailed(format!("FSAL write error: {e}"))
                 })?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -90,7 +90,7 @@ pub async fn invoke_fs_tool(
                 .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!("FSAL read error: {e}"))
+                    SealSessionError::SignatureVerificationFailed(format!("FSAL read error: {e}"))
                 })?;
 
             let content = String::from_utf8_lossy(&data).to_string();
@@ -113,7 +113,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "FSAL readdir error: {e}"
                     ))
                 })?;
@@ -145,7 +145,7 @@ pub async fn invoke_fs_tool(
             )
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!("FSAL create_dir error: {e}"))
+                SealSessionError::SignatureVerificationFailed(format!("FSAL create_dir error: {e}"))
             })?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -169,7 +169,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "FSAL delete_directory error: {e}"
                     ))
                 })?;
@@ -182,7 +182,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "FSAL delete_file error: {e}"
                     ))
                 })?;
@@ -197,7 +197,7 @@ pub async fn invoke_fs_tool(
         "fs.multi_edit" => invoke_multi_edit(args, execution_id, fsal, vol_ctx).await,
         "fs.grep" => invoke_grep(args, execution_id, fsal, vol_ctx).await,
         "fs.glob" => invoke_glob(args, execution_id, fsal, vol_ctx).await,
-        _ => Err(SmcpSessionError::SignatureVerificationFailed(format!(
+        _ => Err(SealSessionError::SignatureVerificationFailed(format!(
             "Unknown fs tool: {tool_name}"
         ))),
     }
@@ -208,7 +208,7 @@ async fn invoke_edit(
     _execution_id: ExecutionId,
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
     let target = args
@@ -227,13 +227,13 @@ async fn invoke_edit(
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (read): {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Edit error (read): {e}"))
         })?;
 
     let content = String::from_utf8_lossy(&data).to_string();
 
     if !content.contains(target) {
-        return Err(SmcpSessionError::SignatureVerificationFailed(
+        return Err(SealSessionError::SignatureVerificationFailed(
             "Target content not found in file".to_string(),
         ));
     }
@@ -241,7 +241,7 @@ async fn invoke_edit(
     // Check for multiple occurrences
     let occurrences = content.matches(target).count();
     if occurrences > 1 {
-        return Err(SmcpSessionError::SignatureVerificationFailed(
+        return Err(SealSessionError::SignatureVerificationFailed(
             "Target content exists multiple times in file. Be more specific.".to_string(),
         ));
     }
@@ -253,7 +253,7 @@ async fn invoke_edit(
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Edit error (write): {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Edit error (write): {e}"))
         })?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -268,7 +268,7 @@ async fn invoke_multi_edit(
     _execution_id: ExecutionId,
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
@@ -277,18 +277,18 @@ async fn invoke_multi_edit(
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {e}"))
         })?;
 
     let mut content = String::from_utf8(data).map_err(|_| {
-        SmcpSessionError::SignatureVerificationFailed("File is not valid UTF-8".to_string())
+        SealSessionError::SignatureVerificationFailed("File is not valid UTF-8".to_string())
     })?;
 
     let edits = args
         .get("edits")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "Missing or invalid 'edits' array".to_string(),
             )
         })?;
@@ -311,12 +311,12 @@ async fn invoke_multi_edit(
                 content = content.replace(target, replacement);
                 success_count += 1;
             } else {
-                return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+                return Err(SealSessionError::SignatureVerificationFailed(format!(
                     "Target content '{target}' exists multiple times in file. Be more specific."
                 )));
             }
         } else {
-            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+            return Err(SealSessionError::SignatureVerificationFailed(format!(
                 "Target content '{target}' not found in file."
             )));
         }
@@ -336,7 +336,7 @@ async fn invoke_multi_edit(
         )
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!(
+            SealSessionError::SignatureVerificationFailed(format!(
                 "Multi-edit error (truncate): {e}"
             ))
         })?;
@@ -345,7 +345,7 @@ async fn invoke_multi_edit(
         .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
         .map_err(|e| {
-            SmcpSessionError::SignatureVerificationFailed(format!("Multi-edit error (write): {e}"))
+            SealSessionError::SignatureVerificationFailed(format!("Multi-edit error (write): {e}"))
         })?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -360,14 +360,14 @@ async fn invoke_grep(
     _execution_id: ExecutionId,
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let pattern_str = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("");
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
     // Parse regex
     let regex = regex::Regex::new(pattern_str).map_err(|e| {
-        SmcpSessionError::SignatureVerificationFailed(format!("Invalid regex pattern: {e}"))
+        SealSessionError::SignatureVerificationFailed(format!("Invalid regex pattern: {e}"))
     })?;
 
     // We will do a recursive walk using AegisFSAL
@@ -439,7 +439,7 @@ async fn invoke_glob(
     _execution_id: ExecutionId,
     fsal: &Arc<AegisFSAL>,
     vol_ctx: crate::infrastructure::nfs::server::NfsVolumeContext,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let pattern = args.get("pattern").and_then(|v| v.as_str()).unwrap_or("*");
     let path_arg = args.get("path").and_then(|v| v.as_str()).unwrap_or("/");
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
@@ -452,7 +452,7 @@ async fn invoke_glob(
         .replace("*", ".*")
         .replace("?", ".");
     let regex = regex::Regex::new(&format!("^{regex_pattern}$")).map_err(|e| {
-        SmcpSessionError::SignatureVerificationFailed(format!("Invalid glob pattern: {e}"))
+        SealSessionError::SignatureVerificationFailed(format!("Invalid glob pattern: {e}"))
     })?;
 
     let mut matches = Vec::new();

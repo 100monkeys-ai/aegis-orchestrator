@@ -12,10 +12,10 @@
 //! auth mechanisms):
 //! - `/health` — health check
 //! - `/v1/dispatch-gateway/*` — Dispatch Protocol (container ↔ orchestrator)
-//! - `/v1/executions/*` — execution SSE stream (uses SMCP SecurityToken)
-//! - `/v1/smcp/attest` — SMCP attestation handshake
-//! - `/v1/smcp/invoke` — SMCP tool invocation (uses SecurityToken)
-//! - `/v1/smcp/tools` — SMCP tool discovery metadata
+//! - `/v1/executions/*` — execution SSE stream (uses SEAL SecurityToken)
+//! - `/v1/seal/attest` — SEAL attestation handshake
+//! - `/v1/seal/invoke` — SEAL tool invocation (uses SecurityToken)
+//! - `/v1/seal/tools` — SEAL tool discovery metadata
 //! - `/v1/webhooks/*` — webhook ingestion (HMAC auth)
 //! - `/v1/temporal-events` — Temporal callbacks (HMAC auth)
 
@@ -30,14 +30,14 @@ use std::sync::Arc;
 use tracing::warn;
 
 /// Paths exempt from IAM/OIDC JWT auth.
-/// These endpoints use other auth mechanisms (SMCP attestation, HMAC, or are unauthenticated).
+/// These endpoints use other auth mechanisms (SEAL attestation, HMAC, or are unauthenticated).
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
     "/v1/dispatch-gateway",
     "/v1/executions",
-    "/v1/smcp/attest",
-    "/v1/smcp/invoke",
-    "/v1/smcp/tools",
+    "/v1/seal/attest",
+    "/v1/seal/invoke",
+    "/v1/seal/tools",
     "/v1/webhooks",
     "/v1/temporal-events",
 ];
@@ -127,9 +127,9 @@ mod tests {
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
         assert!(is_exempt("/v1/executions"));
         assert!(is_exempt("/v1/executions/some-id/stream"));
-        assert!(is_exempt("/v1/smcp/attest"));
-        assert!(is_exempt("/v1/smcp/invoke"));
-        assert!(is_exempt("/v1/smcp/tools"));
+        assert!(is_exempt("/v1/seal/attest"));
+        assert!(is_exempt("/v1/seal/invoke"));
+        assert!(is_exempt("/v1/seal/tools"));
         assert!(is_exempt("/v1/webhooks/github"));
         assert!(is_exempt("/v1/temporal-events"));
     }

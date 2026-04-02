@@ -52,8 +52,8 @@ impl HierarchicalPolicyResolver {
     /// stored in the `rate_limit_overrides.resource_type` column.
     fn resource_type_to_db(resource_type: &RateLimitResourceType) -> String {
         match resource_type {
-            RateLimitResourceType::SmcpToolCall { tool_pattern } => {
-                format!("smcp_tool:{tool_pattern}")
+            RateLimitResourceType::SealToolCall { tool_pattern } => {
+                format!("seal_tool:{tool_pattern}")
             }
             RateLimitResourceType::AgentExecution => "agent_execution".into(),
             RateLimitResourceType::WorkflowExecution => "workflow_execution".into(),
@@ -306,10 +306,10 @@ mod tests {
             "llm_token"
         );
         assert_eq!(
-            HierarchicalPolicyResolver::resource_type_to_db(&RateLimitResourceType::SmcpToolCall {
+            HierarchicalPolicyResolver::resource_type_to_db(&RateLimitResourceType::SealToolCall {
                 tool_pattern: "fs_*".into()
             }),
-            "smcp_tool:fs_*"
+            "seal_tool:fs_*"
         );
     }
 

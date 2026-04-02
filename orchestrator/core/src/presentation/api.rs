@@ -18,8 +18,8 @@
 //! | `GET` | `/v1/human-approvals/{id}` | get pending approval |
 //! | `POST` | `/v1/human-approvals/{id}/approve` | approve request |
 //! | `POST` | `/v1/human-approvals/{id}/reject` | reject request |
-//! | `POST` | `/v1/smcp/attest` | SMCP attestation handshake (ADR-035) |
-//! | `POST` | `/v1/smcp/invoke` | SMCP tool invocation (ADR-033) |
+//! | `POST` | `/v1/seal/attest` | SEAL attestation handshake (ADR-035) |
+//! | `POST` | `/v1/seal/invoke` | SEAL tool invocation (ADR-033) |
 //! | `POST` | `/v1/dispatch-gateway` | Dispatch gateway — inner loop orchestration (ADR-038) |
 //! | `POST` | `/v1/stimuli` | Stimulus ingestion — IAM/OIDC Bearer auth (ADR-021) |
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
@@ -38,10 +38,10 @@ use crate::domain::execution::ExecutionInput;
 use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::mcp::PolicyViolation;
 use crate::domain::repository::{TenantRepository, WorkflowExecutionRepository};
+use crate::domain::seal_session::SealSessionError;
+use crate::domain::seal_session_repository::SealSessionRepository;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::security_context::security_context::SecurityContext;
-use crate::domain::smcp_session::SmcpSessionError;
-use crate::domain::smcp_session_repository::SmcpSessionRepository;
 use crate::domain::tenancy::{Tenant, TenantQuotas, TenantStatus, TenantTier};
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
@@ -76,26 +76,26 @@ pub struct AppState {
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     /// BC-8: HMAC secret provider for webhook requests. Defaults to EnvWebhookSecretProvider.
     pub webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
-    /// SMCP tool invocation service (ADR-033). Optional until wired.
+    /// SEAL tool invocation service (ADR-033). Optional until wired.
     pub tool_invocation_service: Option<Arc<ToolInvocationService>>,
-    /// SMCP attestation service (ADR-035). Optional until wired by the daemon.
+    /// SEAL attestation service (ADR-035). Optional until wired by the daemon.
     pub attestation_service:
-        Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+        Option<Arc<dyn crate::infrastructure::seal::attestation::AttestationService>>,
     /// Workflow execution repository for event-log snapshots (BC-3). Optional until wired.
     pub workflow_execution_repo: Option<Arc<dyn WorkflowExecutionRepository>>,
     /// Event bus for workflow SSE streaming (ADR-030). Optional until wired.
     pub event_bus: Option<Arc<EventBus>>,
     /// Tenant repository for admin tenant management (ADR-056). Optional until wired.
     pub tenant_repo: Option<Arc<dyn TenantRepository>>,
-    /// SMCP session repository for token-based auth on SSE streams (ADR-035). Optional until wired.
-    pub smcp_session_repo: Option<Arc<dyn SmcpSessionRepository>>,
+    /// SEAL session repository for token-based auth on SSE streams (ADR-035). Optional until wired.
+    pub seal_session_repo: Option<Arc<dyn SealSessionRepository>>,
     /// Rate-limit override repository for admin CRUD (ADR-072). Optional until wired.
     pub rate_limit_override_repo: Option<Arc<RateLimitOverrideRepository>>,
     /// Config layer repository for hierarchical config admin (ADR-060). Optional until wired.
     pub config_layer_repo: Option<Arc<dyn ConfigLayerRepository>>,
     /// Node cluster repository for node registry admin (ADR-059). Optional until wired.
     pub node_cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
-    /// Security context repository for SMCP policy admin (ADR-035). Optional until wired.
+    /// Security context repository for SEAL policy admin (ADR-035). Optional until wired.
     pub security_context_repo: Option<Arc<dyn SecurityContextRepository>>,
     /// PostgreSQL pool for direct audit-log queries. Optional until wired.
     pub pg_pool: Option<Arc<sqlx::PgPool>>,
@@ -125,7 +125,7 @@ pub fn app(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
-        smcp_session_repo: None,
+        seal_session_repo: None,
         rate_limit_override_repo: None,
         config_layer_repo: None,
         node_cluster_repo: None,
@@ -140,10 +140,10 @@ pub fn app(
         .route("/v1/human-approvals/:id", get(get_pending_approval))
         .route("/v1/human-approvals/:id/approve", post(approve_request))
         .route("/v1/human-approvals/:id/reject", post(reject_request))
-        // SMCP endpoints (ADR-035 §4.1)
-        .route("/v1/smcp/attest", post(smcp_attestation))
-        .route("/v1/smcp/invoke", post(smcp_tool_invoke))
-        .route("/v1/smcp/tools", get(smcp_tools_list))
+        // SEAL endpoints (ADR-035 §4.1)
+        .route("/v1/seal/attest", post(seal_attestation))
+        .route("/v1/seal/invoke", post(seal_tool_invoke))
+        .route("/v1/seal/tools", get(seal_tools_list))
         // Dispatch gateway (ADR-038)
         .route("/v1/dispatch-gateway", post(dispatch_gateway))
         // BC-8 Stimulus-Response (ADR-021)
@@ -216,7 +216,7 @@ pub fn app(
         .with_state(state)
 }
 
-/// Build an Axum router with full SMCP service wiring.
+/// Build an Axum router with full SEAL service wiring.
 ///
 /// This is the preferred constructor when the inner loop gateway is available.
 pub fn app_with_inner_loop(
@@ -235,7 +235,7 @@ pub fn app_with_inner_loop(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
-        smcp_session_repo: None,
+        seal_session_repo: None,
         rate_limit_override_repo: None,
         config_layer_repo: None,
         node_cluster_repo: None,
@@ -250,9 +250,9 @@ pub fn app_with_inner_loop(
         .route("/v1/human-approvals/:id", get(get_pending_approval))
         .route("/v1/human-approvals/:id/approve", post(approve_request))
         .route("/v1/human-approvals/:id/reject", post(reject_request))
-        .route("/v1/smcp/attest", post(smcp_attestation))
-        .route("/v1/smcp/invoke", post(smcp_tool_invoke))
-        .route("/v1/smcp/tools", get(smcp_tools_list))
+        .route("/v1/seal/attest", post(seal_attestation))
+        .route("/v1/seal/invoke", post(seal_tool_invoke))
+        .route("/v1/seal/tools", get(seal_tools_list))
         .route("/v1/dispatch-gateway", post(dispatch_gateway))
         // BC-8 Stimulus-Response (ADR-021)
         .route("/v1/stimuli", post(ingest_stimulus_handler))
@@ -386,7 +386,7 @@ async fn stream_execution(
     Query(query): Query<StreamExecutionQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    // --- SMCP token authentication ---
+    // --- SEAL token authentication ---
     // Extract token from Authorization header or query parameter (for EventSource clients).
     let token = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -400,19 +400,19 @@ async fn stream_execution(
         None => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Missing SMCP security token"})),
+                Json(json!({"error": "Missing SEAL security token"})),
             )
                 .into_response();
         }
     };
 
-    // Validate the token against active SMCP sessions.
-    let session_repo = match &state.smcp_session_repo {
+    // Validate the token against active SEAL sessions.
+    let session_repo = match &state.seal_session_repo {
         Some(repo) => repo,
         None => {
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "SMCP session repository not configured"})),
+                Json(json!({"error": "SEAL session repository not configured"})),
             )
                 .into_response();
         }
@@ -426,12 +426,12 @@ async fn stream_execution(
         Ok(None) => {
             return (
                 axum::http::StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "Invalid or expired SMCP security token"})),
+                Json(json!({"error": "Invalid or expired SEAL security token"})),
             )
                 .into_response();
         }
         Err(e) => {
-            tracing::warn!(error = %e, "Failed to validate SMCP session token for SSE stream");
+            tracing::warn!(error = %e, "Failed to validate SEAL session token for SSE stream");
             return (
                 axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({"error": "Session validation failed"})),
@@ -712,15 +712,15 @@ async fn reject_request(
 }
 
 // ============================================================================
-// SMCP Endpoints (ADR-035 §4.1)
+// SEAL Endpoints (ADR-035 §4.1)
 // ============================================================================
 
 /// Agent attestation request payload (ADR-035 §4.1).
 ///
 /// Sent by the agent's `bootstrap.py` at the start of each execution to
-/// establish an SMCP session and receive a SecurityToken.
+/// establish an SEAL session and receive a SecurityToken.
 #[derive(serde::Deserialize)]
-pub struct SmcpAttestationRequest {
+pub struct SealAttestationRequest {
     /// Container ID or execution identifier.
     pub container_id: Option<String>,
     /// Base64-encoded ephemeral Ed25519 public key generated by the agent.
@@ -745,14 +745,14 @@ pub struct SmcpAttestationRequest {
     pub tenant_id: Option<String>,
 }
 
-/// Handle SMCP attestation handshake (ADR-035 §4.1).
+/// Handle SEAL attestation handshake (ADR-035 §4.1).
 ///
 /// The agent sends its ephemeral public key; the orchestrator verifies the
-/// container identity, looks up the SecurityContext, creates an SmcpSession,
+/// container identity, looks up the SecurityContext, creates an SealSession,
 /// and returns a signed SecurityToken (JWT).
-async fn smcp_attestation(
+async fn seal_attestation(
     State(state): State<Arc<AppState>>,
-    Json(payload): Json<SmcpAttestationRequest>,
+    Json(payload): Json<SealAttestationRequest>,
 ) -> impl IntoResponse {
     let attestation_service = match &state.attestation_service {
         Some(service) => service.clone(),
@@ -760,7 +760,7 @@ async fn smcp_attestation(
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "error": "SMCP attestation service not configured"
+                    "error": "SEAL attestation service not configured"
                 })),
             )
                 .into_response();
@@ -773,7 +773,7 @@ async fn smcp_attestation(
         .and_then(|s| TenantId::from_realm_slug(s).ok())
         .unwrap_or_else(TenantId::consumer);
 
-    let request = crate::infrastructure::smcp::attestation::AttestationRequest {
+    let request = crate::infrastructure::seal::attestation::AttestationRequest {
         agent_id: payload.agent_id,
         execution_id: payload.execution_id,
         container_id: payload.container_id,
@@ -804,16 +804,16 @@ async fn smcp_attestation(
     }
 }
 
-/// SMCP tool invocation request payload (ADR-033 §3).
+/// SEAL tool invocation request payload (ADR-033 §3).
 #[derive(serde::Deserialize)]
-pub struct SmcpToolInvokeRequest {
-    /// Signed SMCP security token (JWT issued at attestation).
+pub struct SealToolInvokeRequest {
+    /// Signed SEAL security token (JWT issued at attestation).
     pub security_token: String,
     /// Ed25519 signature over the serialized `payload`.
     pub signature: String,
     /// Inner MCP payload (tool name + arguments).
     pub payload: serde_json::Value,
-    /// SMCP protocol version (e.g. "smcp/1.0"); included in canonical signed message.
+    /// SEAL protocol version (e.g. "seal/1.0"); included in canonical signed message.
     #[serde(default)]
     pub protocol: Option<String>,
     /// ISO-8601 timestamp; included in canonical signed message.
@@ -821,16 +821,16 @@ pub struct SmcpToolInvokeRequest {
     pub timestamp: Option<String>,
 }
 
-/// Handle SMCP tool invocation (ADR-033 §3).
+/// Handle SEAL tool invocation (ADR-033 §3).
 ///
-/// The agent wraps each MCP tool call in an SMCP envelope signed with its
+/// The agent wraps each MCP tool call in an SEAL envelope signed with its
 /// ephemeral key. The orchestrator verifies the signature, evaluates the
 /// SecurityContext policy, and routes to the appropriate tool server.
-async fn smcp_tool_invoke(
+async fn seal_tool_invoke(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<SmcpToolInvokeRequest>,
+    Json(req): Json<SealToolInvokeRequest>,
 ) -> impl IntoResponse {
-    tracing::info!("SMCP tool invocation request received");
+    tracing::info!("SEAL tool invocation request received");
 
     let tool_svc = match &state.tool_invocation_service {
         Some(svc) => svc.clone(),
@@ -838,7 +838,7 @@ async fn smcp_tool_invoke(
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "error": "SMCP tool invocation service not wired in this configuration"
+                    "error": "SEAL tool invocation service not wired in this configuration"
                 })),
             )
                 .into_response();
@@ -846,7 +846,7 @@ async fn smcp_tool_invoke(
     };
 
     let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
-    let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
+    let envelope = crate::infrastructure::seal::envelope::SealEnvelope {
         protocol: req.protocol,
         security_token: req.security_token,
         signature: req.signature,
@@ -861,11 +861,11 @@ async fn smcp_tool_invoke(
             // Callers receive a standard `{"jsonrpc":"2.0","error":{"code":N,"message":"..."}}` body
             // so MCP clients can handle them uniformly regardless of transport.
             let (http_status, rpc_code, retry_after) = match &e {
-                SmcpSessionError::SessionExpired
-                | SmcpSessionError::SignatureVerificationFailed(_) => {
+                SealSessionError::SessionExpired
+                | SealSessionError::SignatureVerificationFailed(_) => {
                     (axum::http::StatusCode::UNAUTHORIZED, -32000_i32, None)
                 }
-                SmcpSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+                SealSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
                     retry_after_seconds,
                     ..
                 }) => (
@@ -873,30 +873,30 @@ async fn smcp_tool_invoke(
                     -32005_i32,
                     Some(*retry_after_seconds),
                 ),
-                SmcpSessionError::SessionInactive(
-                    crate::domain::smcp_session::SessionStatus::Expired,
+                SealSessionError::SessionInactive(
+                    crate::domain::seal_session::SessionStatus::Expired,
                 ) => (axum::http::StatusCode::UNAUTHORIZED, -32000_i32, None),
-                SmcpSessionError::PolicyViolation(_) | SmcpSessionError::SessionInactive(_) => {
+                SealSessionError::PolicyViolation(_) | SealSessionError::SessionInactive(_) => {
                     (axum::http::StatusCode::FORBIDDEN, -32000_i32, None)
                 }
-                SmcpSessionError::MalformedPayload(_)
-                | SmcpSessionError::ReplayProtectionFailed(_) => {
+                SealSessionError::MalformedPayload(_)
+                | SealSessionError::ReplayProtectionFailed(_) => {
                     (axum::http::StatusCode::BAD_REQUEST, -32600_i32, None)
                 }
-                SmcpSessionError::InvalidArguments(_) => (
+                SealSessionError::InvalidArguments(_) => (
                     axum::http::StatusCode::UNPROCESSABLE_ENTITY,
                     -32602_i32,
                     None,
                 ),
-                SmcpSessionError::JudgeTimeout(_) | SmcpSessionError::InternalError(_) => (
+                SealSessionError::JudgeTimeout(_) | SealSessionError::InternalError(_) => (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     -32603_i32,
                     None,
                 ),
-                SmcpSessionError::NotFound(_) => {
+                SealSessionError::NotFound(_) => {
                     (axum::http::StatusCode::NOT_FOUND, -32001_i32, None)
                 }
-                SmcpSessionError::ConfigurationError(_) => (
+                SealSessionError::ConfigurationError(_) => (
                     axum::http::StatusCode::INTERNAL_SERVER_ERROR,
                     -32603_i32,
                     None,
@@ -918,7 +918,7 @@ async fn smcp_tool_invoke(
                         .insert(axum::http::header::RETRY_AFTER, val);
                 }
             }
-            if let SmcpSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
+            if let SealSessionError::PolicyViolation(PolicyViolation::RateLimitExceeded {
                 limit,
                 current,
                 retry_after_seconds,
@@ -945,13 +945,13 @@ async fn smcp_tool_invoke(
 }
 
 #[derive(serde::Deserialize, Default)]
-struct SmcpToolsQuery {
+struct SealToolsQuery {
     security_context: Option<String>,
 }
 
-async fn smcp_tools_list(
+async fn seal_tools_list(
     State(state): State<Arc<AppState>>,
-    Query(query): Query<SmcpToolsQuery>,
+    Query(query): Query<SealToolsQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let tool_svc = match &state.tool_invocation_service {
@@ -960,7 +960,7 @@ async fn smcp_tools_list(
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({
-                    "error": "SMCP tool discovery service not wired in this configuration"
+                    "error": "SEAL tool discovery service not wired in this configuration"
                 })),
             )
                 .into_response();
@@ -987,9 +987,9 @@ async fn smcp_tools_list(
         Ok(tools) => (
             axum::http::StatusCode::OK,
             Json(json!({
-                "protocol": "smcp/v1",
-                "attestation_endpoint": "/v1/smcp/attest",
-                "invoke_endpoint": "/v1/smcp/invoke",
+                "protocol": "seal/v1",
+                "attestation_endpoint": "/v1/seal/attest",
+                "invoke_endpoint": "/v1/seal/invoke",
                 "security_context": security_context,
                 "tools": tools,
             })),
@@ -2713,7 +2713,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
-            smcp_session_repo: None,
+            seal_session_repo: None,
             rate_limit_override_repo: None,
             config_layer_repo: None,
             node_cluster_repo: None,
@@ -2723,10 +2723,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn smcp_tool_invoke_returns_service_unavailable_when_tool_service_is_missing() {
-        let response = smcp_tool_invoke(
+    async fn seal_tool_invoke_returns_service_unavailable_when_tool_service_is_missing() {
+        let response = seal_tool_invoke(
             State(test_state()),
-            Json(SmcpToolInvokeRequest {
+            Json(SealToolInvokeRequest {
                 security_token: "token".to_string(),
                 signature: "sig".to_string(),
                 payload: json!({
@@ -2750,16 +2750,16 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "error": "SMCP tool invocation service not wired in this configuration"
+                "error": "SEAL tool invocation service not wired in this configuration"
             })
         );
     }
 
     #[tokio::test]
-    async fn smcp_tools_list_returns_service_unavailable_when_tool_service_is_missing() {
-        let response = smcp_tools_list(
+    async fn seal_tools_list_returns_service_unavailable_when_tool_service_is_missing() {
+        let response = seal_tools_list(
             State(test_state()),
-            Query(SmcpToolsQuery::default()),
+            Query(SealToolsQuery::default()),
             axum::http::HeaderMap::new(),
         )
         .await
@@ -2774,7 +2774,7 @@ mod tests {
         assert_eq!(
             json,
             serde_json::json!({
-                "error": "SMCP tool discovery service not wired in this configuration"
+                "error": "SEAL tool discovery service not wired in this configuration"
             })
         );
     }

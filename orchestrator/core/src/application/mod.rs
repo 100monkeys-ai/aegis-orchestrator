@@ -15,9 +15,9 @@
 //! | [`lifecycle`] | BC-1 Agent Lifecycle | `StandardAgentLifecycleService` implementation |
 //! | [`execution`] | BC-2 Execution | `ExecutionService` trait, `StandardExecutionService` impl |
 //! | [`policy`] | BC-4 Security Policy | Policy validation use-cases |
-//! | [`attestation_service`] | BC-12 SMCP | Orchestrates SMCP attestation flow (ADR-035) |
-//! | [`tool_catalog`] | BC-14 SMCP Tooling Gateway | `StandardToolCatalog` — enriched tool discovery with source/category/tag classification |
-//! | [`tool_invocation_service`] | BC-12 SMCP | Mediates all MCP tool calls through the orchestrator proxy (ADR-033) |
+//! | [`attestation_service`] | BC-12 SEAL | Orchestrates SEAL attestation flow (ADR-035) |
+//! | [`tool_catalog`] | BC-14 SEAL Tooling Gateway | `StandardToolCatalog` — enriched tool discovery with source/category/tag classification |
+//! | [`tool_invocation_service`] | BC-12 SEAL | Mediates all MCP tool calls through the orchestrator proxy (ADR-033) |
 //! | [`validation_service`] | BC-2 Execution | Gradient validation application service (ADR-017) |
 //! | [`register_workflow`] | BC-3 Workflow | `RegisterWorkflowUseCase` — parse + persist workflow manifests |
 //! | [`start_workflow_execution`] | BC-3 Workflow | `StartWorkflowExecutionUseCase` — submit workflow to Temporal |

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Node Verifier
+//! # SEAL Node Verifier
 //!
-//! Verifies Ed25519 signatures and JWT tokens carried in `SmcpNodeEnvelope`s
+//! Verifies Ed25519 signatures and JWT tokens carried in `SealNodeEnvelope`s
 //! for inter-node cluster communication (ADR-059).
 
 use std::sync::Arc;
@@ -12,9 +12,9 @@ use base64::Engine;
 use chrono::Utc;
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 
-use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeTokenClaims, SmcpNodeEnvelope};
+use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeTokenClaims, SealNodeEnvelope};
 
-/// Verifies the authenticity and integrity of `SmcpNodeEnvelope`s.
+/// Verifies the authenticity and integrity of `SealNodeEnvelope`s.
 ///
 /// For every authenticated cluster RPC the gRPC server calls
 /// `verify_envelope` which:
@@ -22,17 +22,17 @@ use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeTokenClaims, Smc
 /// 2. Looks up the node's registered public key via `NodeClusterRepository`.
 /// 3. Verifies the Ed25519 signature over `inner_payload`.
 /// 4. Checks that the token has not expired.
-pub struct SmcpNodeVerifier {
+pub struct SealNodeVerifier {
     cluster_repo: Arc<dyn NodeClusterRepository>,
 }
 
-impl SmcpNodeVerifier {
+impl SealNodeVerifier {
     pub fn new(cluster_repo: Arc<dyn NodeClusterRepository>) -> Self {
         Self { cluster_repo }
     }
 
     /// Verify the envelope's token and signature, returning the authenticated `NodeId`.
-    pub async fn verify_envelope(&self, envelope: &SmcpNodeEnvelope) -> Result<NodeId> {
+    pub async fn verify_envelope(&self, envelope: &SealNodeEnvelope) -> Result<NodeId> {
         // 1. Parse and validate token claims (expiry check included)
         let claims = Self::verify_token_claims(&envelope.node_security_token.0)?;
         let node_id = claims.node_id;

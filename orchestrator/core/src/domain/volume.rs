@@ -332,8 +332,8 @@ pub enum VolumeBackend {
         /// Optional internal caching path
         cache_path: Option<String>,
     },
-    /// Remote Orchestrator Node via SMCP (ADR-047)
-    Smcp {
+    /// Remote Orchestrator Node via SEAL (ADR-047)
+    Seal {
         node_id: String,
         remote_volume_id: VolumeId,
     },

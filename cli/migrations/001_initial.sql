@@ -487,7 +487,7 @@ COMMENT ON COLUMN volumes.tenant_id IS 'Multi-tenant namespace isolation using c
 COMMENT ON COLUMN volumes.storage_class IS 'Ephemeral (TTL-based) or Persistent storage classification';
 COMMENT ON COLUMN volumes.ownership IS 'Execution-scoped, Workflow-scoped, or User-owned persistent';
 COMMENT ON COLUMN volumes.expires_at IS 'Auto-cleanup timestamp for ephemeral volumes (NULL for persistent)';
-COMMENT ON COLUMN volumes.backend IS 'Storage backend metadata mapping the volume (SeaweedFS, OpenDAL, SMCP, LocalHost)';
+COMMENT ON COLUMN volumes.backend IS 'Storage backend metadata mapping the volume (SeaweedFS, OpenDAL, SEAL, LocalHost)';
 
 -- =============================================================================
 -- Migration Rollback

@@ -4,12 +4,12 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_create_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.agent.create requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -78,7 +78,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SmcpSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::SignatureVerificationFailed(format!(
                             "Agent deployed but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -108,14 +108,14 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_list_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let agents = self
             .agent_lifecycle
             .list_agents_for_tenant(&tenant_id)
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
+                SealSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
             })?;
 
         let entries: Vec<serde_json::Value> = agents
@@ -143,12 +143,12 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_delete_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_id_str = args
             .get("agent_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.agent.delete requires 'agent_id' string".to_string(),
                 )
             })?;
@@ -156,7 +156,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let agent_id =
             crate::domain::agent::AgentId(uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
+                SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}"))
             })?);
 
         match self
@@ -181,9 +181,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.agent.generate requires 'input' string".to_string(),
             )
         })?;
@@ -231,13 +231,13 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_update_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.agent.update requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -359,7 +359,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SmcpSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::SignatureVerificationFailed(format!(
                             "Agent updated but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -388,10 +388,10 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_export_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.agent.export requires 'name' string".to_string(),
             )
         })?;
@@ -438,18 +438,18 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_logs_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_id_str = args
             .get("agent_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.agent.logs requires 'agent_id' string".to_string(),
                 )
             })?;
 
         let agent_id = uuid::Uuid::parse_str(agent_id_str).map_err(|e| {
-            SmcpSessionError::InvalidArguments(format!(
+            SealSessionError::InvalidArguments(format!(
                 "aegis.agent.logs: invalid agent_id UUID: {e}"
             ))
         })?;

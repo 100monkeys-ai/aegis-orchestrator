@@ -11,7 +11,7 @@ AEGIS is built for teams that want automation to be useful in production, not ju
 ## Why Teams Use AEGIS
 
 - **Deterministic control:** explicit workflows, typed manifests, and orchestrator-managed execution reduce hidden behavior and ad hoc agent sprawl.
-- **Built-in security controls:** network and filesystem access are policy-governed, runtimes are isolated, and production deployments can layer IAM and SMCP gateway controls on top of the orchestrator boundary.
+- **Built-in security controls:** network and filesystem access are policy-governed, runtimes are isolated, and production deployments can layer IAM and SEAL gateway controls on top of the orchestrator boundary.
 - **Reliable operator workflows:** the CLI provides repeatable stack bring-up, status, update, and shutdown paths with health checks and machine-readable output.
 - **Auditable automation:** structured logs, machine-readable CLI output, and orchestrator-mediated dispatch make agent activity easier to inspect and automate around.
 - **Clear path to production:** Docker supports local development, while Firecracker-backed isolation is the intended production direction.
@@ -88,7 +88,7 @@ AEGIS is designed to make automation easier to reason about. Workflows are expli
 
 ### Security and isolation
 
-AEGIS centers security controls in the orchestrator. Network and filesystem policy are defined in manifests, development runs use Docker-backed isolation, and the production architecture is aimed at Firecracker micro-VM isolation. At the protocol layer, SMCP verifies tool calls end to end, and orchestrator-mediated dispatch keeps agent actions behind a control boundary. Local stack templates prioritize fast setup, so IAM and SMCP gateway auth are not enabled in every local dev path by default.
+AEGIS centers security controls in the orchestrator. Network and filesystem policy are defined in manifests, development runs use Docker-backed isolation, and the production architecture is aimed at Firecracker micro-VM isolation. At the protocol layer, SEAL verifies tool calls end to end, and orchestrator-mediated dispatch keeps agent actions behind a control boundary. Local stack templates prioritize fast setup, so IAM and SEAL gateway auth are not enabled in every local dev path by default.
 
 ### Reliability and auditability
 

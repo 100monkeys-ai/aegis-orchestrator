@@ -23,9 +23,9 @@ pub use local_host_provider::LocalHostStorageProvider;
 pub use opendal_provider::OpenDalStorageProvider;
 pub use remote_storage_server::RemoteStorageServiceHandler;
 pub use seaweedfs::SeaweedFSAdapter;
-pub mod smcp_provider;
+pub mod seal_provider;
 use opendal::Operator;
-pub use smcp_provider::SmcpStorageProvider;
+pub use seal_provider::SealStorageProvider;
 
 use anyhow::Context as _;
 use std::sync::Arc;

@@ -16,7 +16,7 @@
 //! | **BC-4 Security Policy** | [`domain::policy`], [`domain::security_context`] | ADR-035 |
 //! | **BC-7 Storage Gateway** | [`domain::volume`], [`domain::fsal`] | ADR-032, ADR-036 |
 //! | **BC-11 Secrets & Identity** | [`infrastructure::secrets_manager`] | ADR-034 |
-//! | **BC-12 SMCP Protocol** | [`domain::smcp_session`] | ADR-035 |
+//! | **BC-12 SEAL Protocol** | [`domain::seal_session`] | ADR-035 |
 //!
 //! ## Layer Structure
 //!
@@ -27,7 +27,7 @@
 //!     ↓
 //! domain/         ← Aggregates, value objects, domain events, repository traits
 //!     ↓
-//! infrastructure/ ← Postgres repos, Docker runtime, NFS server, SMCP, LLM adapters
+//! infrastructure/ ← Postgres repos, Docker runtime, NFS server, SEAL, LLM adapters
 //! ```
 //!
 //! ## Integration Tests

@@ -1,30 +1,30 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Domain-layer unit tests for the **Security Policy** (BC-4) and **SMCP Protocol**
+//! Domain-layer unit tests for the **Security Policy** (BC-4) and **SEAL Protocol**
 //! (BC-12) bounded contexts.
 //!
 //! Covers:
 //! - `SecurityContext` aggregate: evaluate(), permits_tool_name(), deny-list precedence,
 //!   empty capabilities, tenant ownership validation
 //! - `Capability` value object: matches_tool_name(), allows(), path_in_allowlist()
-//! - `SmcpSession` aggregate: construction, evaluate_call(), revoke(), status transitions,
+//! - `SealSession` aggregate: construction, evaluate_call(), revoke(), status transitions,
 //!   expiry detection, principal metadata, serialization round-trips
 //!
 //! # Architecture
 //!
 //! - **Layer:** Domain (pure business logic, no I/O)
-//! - **Bounded Contexts:** BC-4 Security Policy, BC-12 SMCP Protocol
+//! - **Bounded Contexts:** BC-4 Security Policy, BC-12 SEAL Protocol
 
 use chrono::Utc;
 use serde_json::json;
 
+use aegis_orchestrator_core::domain::seal_session::{
+    EnvelopeVerifier, SealSession, SealSessionError, SessionStatus,
+};
 use aegis_orchestrator_core::domain::security_context::{
     Capability, PolicyViolation, SecurityContext, SecurityContextMetadata,
 };
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId, TenantId};
-use aegis_orchestrator_core::domain::smcp_session::{
-    EnvelopeVerifier, SessionStatus, SmcpSession, SmcpSessionError,
-};
 
 // ============================================================================
 // Test Helpers
@@ -96,8 +96,8 @@ fn make_context(
     }
 }
 
-fn make_session(context: SecurityContext) -> SmcpSession {
-    SmcpSession::new(
+fn make_session(context: SecurityContext) -> SealSession {
+    SealSession::new(
         AgentId::new(),
         ExecutionId::new(),
         vec![1, 2, 3, 4], // dummy public key bytes
@@ -106,7 +106,7 @@ fn make_session(context: SecurityContext) -> SmcpSession {
     )
 }
 
-/// Mock EnvelopeVerifier for SmcpSession::evaluate_call() tests.
+/// Mock EnvelopeVerifier for SealSession::evaluate_call() tests.
 struct MockEnvelope {
     token: String,
     signature_valid: bool,
@@ -130,11 +130,11 @@ impl EnvelopeVerifier for MockEnvelope {
         &self.token
     }
 
-    fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+    fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SealSessionError> {
         if self.signature_valid {
             Ok(())
         } else {
-            Err(SmcpSessionError::SignatureVerificationFailed(
+            Err(SealSessionError::SignatureVerificationFailed(
                 "mock: invalid signature".to_string(),
             ))
         }
@@ -492,7 +492,7 @@ fn tenant_ownership_bare_name_rejected_for_all() {
 }
 
 // ============================================================================
-// SmcpSession — new()
+// SealSession — new()
 // ============================================================================
 
 #[test]
@@ -517,7 +517,7 @@ fn session_new_initialises_active_with_one_hour_expiry() {
 }
 
 // ============================================================================
-// SmcpSession — evaluate_call()
+// SealSession — evaluate_call()
 // ============================================================================
 
 #[test]
@@ -536,7 +536,7 @@ fn evaluate_call_rejects_inactive_session() {
 
     let envelope = MockEnvelope::valid("fs.read", json!({"path": "/workspace/x"}));
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::SessionInactive(_)));
+    assert!(matches!(err, SealSessionError::SessionInactive(_)));
 }
 
 #[test]
@@ -548,7 +548,7 @@ fn evaluate_call_rejects_expired_session() {
 
     let envelope = MockEnvelope::valid("fs.read", json!({}));
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::SessionExpired));
+    assert!(matches!(err, SealSessionError::SessionExpired));
     // Status should now be Expired
     assert_eq!(session.status, SessionStatus::Expired);
 }
@@ -567,7 +567,7 @@ fn evaluate_call_rejects_token_mismatch() {
     let err = session.evaluate_call(&envelope).unwrap_err();
     assert!(matches!(
         err,
-        SmcpSessionError::SignatureVerificationFailed(_)
+        SealSessionError::SignatureVerificationFailed(_)
     ));
 }
 
@@ -585,7 +585,7 @@ fn evaluate_call_rejects_invalid_signature() {
     let err = session.evaluate_call(&envelope).unwrap_err();
     assert!(matches!(
         err,
-        SmcpSessionError::SignatureVerificationFailed(_)
+        SealSessionError::SignatureVerificationFailed(_)
     ));
 }
 
@@ -601,7 +601,7 @@ fn evaluate_call_rejects_missing_tool_name() {
         arguments: Some(json!({})),
     };
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::MalformedPayload(_)));
+    assert!(matches!(err, SealSessionError::MalformedPayload(_)));
 }
 
 #[test]
@@ -616,7 +616,7 @@ fn evaluate_call_rejects_missing_arguments() {
         arguments: None,
     };
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::MalformedPayload(_)));
+    assert!(matches!(err, SealSessionError::MalformedPayload(_)));
 }
 
 #[test]
@@ -627,7 +627,7 @@ fn evaluate_call_rejects_policy_violation() {
 
     let envelope = MockEnvelope::valid("cmd.run", json!({"command": "rm -rf /"}));
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::PolicyViolation(_)));
+    assert!(matches!(err, SealSessionError::PolicyViolation(_)));
 }
 
 #[test]
@@ -642,7 +642,7 @@ fn evaluate_call_rejects_denied_tool_via_policy() {
     let envelope = MockEnvelope::valid("fs.delete", json!({"path": "/workspace/x"}));
     let err = session.evaluate_call(&envelope).unwrap_err();
     match err {
-        SmcpSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied { tool_name }) => {
+        SealSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied { tool_name }) => {
             assert_eq!(tool_name, "fs.delete");
         }
         other => panic!("expected PolicyViolation(ToolExplicitlyDenied), got {other:?}"),
@@ -650,7 +650,7 @@ fn evaluate_call_rejects_denied_tool_via_policy() {
 }
 
 // ============================================================================
-// SmcpSession — revoke()
+// SealSession — revoke()
 // ============================================================================
 
 #[test]
@@ -700,7 +700,7 @@ fn revoke_is_idempotent_on_expired() {
 }
 
 // ============================================================================
-// SmcpSession — status transitions
+// SealSession — status transitions
 // ============================================================================
 
 #[test]
@@ -735,7 +735,7 @@ fn no_reversal_from_expired() {
 
     // Cannot revert to Active — subsequent evaluate_call still fails
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::SessionInactive(_)));
+    assert!(matches!(err, SealSessionError::SessionInactive(_)));
 }
 
 #[test]
@@ -746,11 +746,11 @@ fn no_reversal_from_revoked() {
 
     let envelope = MockEnvelope::valid("fs.read", json!({}));
     let err = session.evaluate_call(&envelope).unwrap_err();
-    assert!(matches!(err, SmcpSessionError::SessionInactive(_)));
+    assert!(matches!(err, SealSessionError::SessionInactive(_)));
 }
 
 // ============================================================================
-// SmcpSession — with_principal_metadata()
+// SealSession — with_principal_metadata()
 // ============================================================================
 
 #[test]
@@ -868,21 +868,21 @@ fn session_status_serialization_roundtrip() {
 }
 
 #[test]
-fn smcp_session_error_serialization_roundtrip() {
+fn seal_session_error_serialization_roundtrip() {
     let errors = vec![
-        SmcpSessionError::SessionInactive(SessionStatus::Expired),
-        SmcpSessionError::SessionExpired,
-        SmcpSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
+        SealSessionError::SessionInactive(SessionStatus::Expired),
+        SealSessionError::SessionExpired,
+        SealSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
             tool_name: "fs.delete".to_string(),
         }),
-        SmcpSessionError::MalformedPayload("missing tool name".to_string()),
-        SmcpSessionError::SignatureVerificationFailed("bad sig".to_string()),
+        SealSessionError::MalformedPayload("missing tool name".to_string()),
+        SealSessionError::SignatureVerificationFailed("bad sig".to_string()),
     ];
 
     for error in errors {
-        let json = serde_json::to_string(&error).expect("serialize SmcpSessionError");
-        let deserialized: SmcpSessionError =
-            serde_json::from_str(&json).expect("deserialize SmcpSessionError");
+        let json = serde_json::to_string(&error).expect("serialize SealSessionError");
+        let deserialized: SealSessionError =
+            serde_json::from_str(&json).expect("deserialize SealSessionError");
         assert_eq!(error, deserialized);
     }
 }

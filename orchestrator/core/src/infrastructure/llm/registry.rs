@@ -524,7 +524,7 @@ mod tests {
                 observability: None,
                 storage: None, // Optional storage configuration (ADR-032)
                 mcp_servers: None,
-                smcp: None,
+                seal: None,
                 security_contexts: None,
                 database: None,
                 temporal: None,
@@ -535,7 +535,7 @@ mod tests {
                 registry_credentials: vec![],
                 iam: None,
                 grpc_auth: None,
-                smcp_gateway: None,
+                seal_gateway: None,
                 image_tag: None,
                 deploy_builtins: false,
                 max_execution_list_limit: None,

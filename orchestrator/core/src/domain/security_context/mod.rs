@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Security Context Domain Module (BC-4/BC-12, ADR-035)
 //!
-//! Defines the **protocol-level** permission boundary used by the SMCP layer.
+//! Defines the **protocol-level** permission boundary used by the SEAL layer.
 //! Three sub-modules form the aggregate:
 //!
 //! | Module | Contents |
@@ -18,7 +18,7 @@
 //! `SecurityContext` controls **protocol-level** authorization (which MCP tools an agent
 //! may invoke). Both are enforced by the orchestrator; agents see neither directly.
 //!
-//! See ADR-035 (SMCP Implementation), AGENTS.md §Bounded Contexts §4.
+//! See ADR-035 (SEAL Implementation), AGENTS.md §Bounded Contexts §4.
 
 pub mod capability;
 pub mod repository;

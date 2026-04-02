@@ -3,13 +3,13 @@ use super::*;
 impl ToolInvocationService {
     pub async fn get_available_tools(
         &self,
-    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let mut tools =
             self.tool_router.list_tools().await.map_err(|e| {
-                SmcpSessionError::InternalError(format!("Failed to list tools: {e}"))
+                SealSessionError::InternalError(format!("Failed to list tools: {e}"))
             })?;
 
-        if self.smcp_gateway_url.is_some() {
+        if self.seal_gateway_url.is_some() {
             if let Ok(gateway_tools) = self.fetch_gateway_tools_grpc().await {
                 tools.extend(gateway_tools);
             }
@@ -21,13 +21,13 @@ impl ToolInvocationService {
     pub async fn get_available_tools_for_agent(
         &self,
         agent_id: AgentId,
-    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let agent = self
             .agent_lifecycle
             .get_agent(agent_id)
             .await
             .map_err(|e| {
-                SmcpSessionError::InternalError(format!(
+                SealSessionError::InternalError(format!(
                     "Failed to load agent for tool scoping: {e}"
                 ))
             })?;
@@ -47,14 +47,14 @@ impl ToolInvocationService {
     pub async fn get_available_tools_for_context(
         &self,
         security_context_name: &str,
-    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let security_context = self
             .security_context_repo
             .find_by_name(security_context_name)
             .await
-            .map_err(|e| SmcpSessionError::ConfigurationError(e.to_string()))?
+            .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?
             .ok_or_else(|| {
-                SmcpSessionError::ConfigurationError(format!(
+                SealSessionError::ConfigurationError(format!(
                     "Security context '{security_context_name}' not found"
                 ))
             })?;
@@ -90,17 +90,17 @@ impl ToolInvocationService {
 
     pub(super) async fn fetch_gateway_tools_grpc(
         &self,
-    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SmcpSessionError> {
-        let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
-            SmcpSessionError::ConfigurationError("smcp_gateway.url is not configured".to_string())
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let gateway_url = self.seal_gateway_url.as_deref().ok_or_else(|| {
+            SealSessionError::ConfigurationError("seal_gateway.url is not configured".to_string())
         })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
-            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))?;
         let response = client
             .list_tools(tonic::Request::new(ListToolsRequest {}))
             .await
-            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))?;
 
         let mut converted = Vec::new();
         for item in response.into_inner().tools {
@@ -135,25 +135,25 @@ impl ToolInvocationService {
         }
     }
 
-    pub(super) async fn invoke_smcp_gateway_internal_grpc(
+    pub(super) async fn invoke_seal_gateway_internal_grpc(
         &self,
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: &str,
         args: serde_json::Value,
-    ) -> Result<serde_json::Value, SmcpSessionError> {
-        let gateway_url = self.smcp_gateway_url.as_deref().ok_or_else(|| {
-            SmcpSessionError::ConfigurationError("smcp_gateway.url is not configured".to_string())
+    ) -> Result<serde_json::Value, SealSessionError> {
+        let gateway_url = self.seal_gateway_url.as_deref().ok_or_else(|| {
+            SealSessionError::ConfigurationError("seal_gateway.url is not configured".to_string())
         })?;
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
-            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?;
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))?;
 
         if args.get("subcommand").is_some() {
             let subcommand = args
                 .get("subcommand")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| {
-                    SmcpSessionError::InvalidArguments(
+                    SealSessionError::InvalidArguments(
                         "CLI tool invocation requires 'subcommand' string".to_string(),
                     )
                 })?
@@ -180,7 +180,7 @@ impl ToolInvocationService {
                 .collect::<Vec<FsalMount>>();
 
             if fsal_mounts.is_empty() {
-                return Err(SmcpSessionError::InternalError(format!(
+                return Err(SealSessionError::InternalError(format!(
                     "No FSAL mounts registered for execution {execution_id}"
                 )));
             }
@@ -195,7 +195,7 @@ impl ToolInvocationService {
                     tenant_id: String::new(),
                 }))
                 .await
-                .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?
+                .map_err(|e| SealSessionError::InternalError(e.to_string()))?
                 .into_inner();
 
             return Ok(serde_json::json!({
@@ -214,7 +214,7 @@ impl ToolInvocationService {
                 tenant_id: String::new(),
             }))
             .await
-            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))?
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))?
             .into_inner();
 
         if response.result_json.is_empty() {
@@ -222,6 +222,6 @@ impl ToolInvocationService {
         }
 
         serde_json::from_str(&response.result_json)
-            .map_err(|e| SmcpSessionError::InternalError(e.to_string()))
+            .map_err(|e| SealSessionError::InternalError(e.to_string()))
     }
 }

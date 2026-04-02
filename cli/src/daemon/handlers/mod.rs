@@ -16,7 +16,7 @@ pub(crate) mod dispatch;
 pub(crate) mod executions;
 pub(crate) mod health;
 pub(crate) mod observability;
-pub(crate) mod smcp;
+pub(crate) mod seal;
 pub(crate) mod swarms;
 pub(crate) mod workflow_executions;
 pub(crate) mod workflows;

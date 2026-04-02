@@ -1,13 +1,13 @@
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::dispatch::DispatchAction;
 use crate::domain::execution::ExecutionId;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
 
 pub fn invoke_cmd_run(
     args: &Value,
     _execution_id: ExecutionId,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     let command = args
         .get("command")
         .and_then(|v| v.as_str())

@@ -26,8 +26,8 @@ pub struct SelectedComponents {
     pub iam: bool,
     /// OpenBao (secrets management)
     pub secrets: bool,
-    /// Standalone SMCP tooling gateway (ADR-053)
-    pub smcp_gateway: bool,
+    /// Standalone SEAL tooling gateway (ADR-053)
+    pub seal_gateway: bool,
     /// Local Ollama LLM runtime
     pub ollama_llm: bool,
     /// Enable OTLP observability stack (Jaeger)
@@ -70,8 +70,8 @@ impl SelectedComponents {
         if self.secrets {
             profiles.push("secrets");
         }
-        if self.smcp_gateway {
-            profiles.push("smcp-gateway");
+        if self.seal_gateway {
+            profiles.push("seal-gateway");
         }
         if self.ollama_llm {
             profiles.push("llm");
@@ -112,7 +112,7 @@ impl ComponentSelector {
                 storage: false,
                 iam: false,
                 secrets: false,
-                smcp_gateway: false,
+                seal_gateway: false,
                 ollama_llm: true,
                 observability: false,
                 llm: LlmChoice::Ollama,
@@ -124,7 +124,7 @@ impl ComponentSelector {
             "SeaweedFS (distributed storage for agent volumes)",
             "IAM (Keycloak OIDC identity provider)        [required for multi-user / Zaru]",
             "Secrets (OpenBao secrets backend)            [required for secret manager integration]",
-            "SMCP Gateway (external tooling gateway)      [enables ToolWorkflows & secure external tool access]",
+            "SEAL Gateway (external tooling gateway)      [enables ToolWorkflows & secure external tool access]",
             "Ollama (local LLM runtime — no API key needed)",
             "Observability (Jaeger OTLP collector + UI)   [recommended for logging/tracing]",
         ];
@@ -141,7 +141,7 @@ impl ComponentSelector {
         let storage = selections.contains(&1);
         let iam = selections.contains(&2);
         let secrets = selections.contains(&3);
-        let smcp_gateway = selections.contains(&4);
+        let seal_gateway = selections.contains(&4);
         let ollama_llm = selections.contains(&5);
         let observability = selections.contains(&6);
 
@@ -194,10 +194,10 @@ impl ComponentSelector {
             } else {
                 "  · Secrets (skipped)"
             },
-            if smcp_gateway {
-                "  ✓ SMCP Gateway"
+            if seal_gateway {
+                "  ✓ SEAL Gateway"
             } else {
-                "  · SMCP Gateway (skipped)"
+                "  · SEAL Gateway (skipped)"
             },
             if observability {
                 "  ✓ Jaeger (Observability)"
@@ -224,7 +224,7 @@ impl ComponentSelector {
             storage,
             iam,
             secrets,
-            smcp_gateway,
+            seal_gateway,
             ollama_llm,
             observability,
             llm,

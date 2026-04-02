@@ -2,7 +2,7 @@ use super::*;
 
 #[allow(clippy::too_many_arguments)]
 impl ToolInvocationService {
-    pub(super) fn resolve_tenant_arg(args: &Value) -> Result<TenantId, SmcpSessionError> {
+    pub(super) fn resolve_tenant_arg(args: &Value) -> Result<TenantId, SealSessionError> {
         let tenant = args
             .get("tenant_id")
             .and_then(|v| v.as_str())
@@ -10,14 +10,14 @@ impl ToolInvocationService {
             .unwrap_or(crate::domain::tenant::CONSUMER_SLUG);
 
         TenantId::from_string(tenant).map_err(|e| {
-            SmcpSessionError::InvalidArguments(format!("invalid tenant identifier '{tenant}': {e}"))
+            SealSessionError::InvalidArguments(format!("invalid tenant identifier '{tenant}': {e}"))
         })
     }
 
     pub fn new(
-        smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+        seal_session_repo: Arc<dyn SealSessionRepository>,
         security_context_repo: Arc<dyn SecurityContextRepository>,
-        smcp_middleware: Arc<SmcpMiddleware>,
+        seal_middleware: Arc<SealMiddleware>,
         tool_router: Arc<ToolRouter>,
         fsal: Arc<AegisFSAL>,
         volume_registry: NfsVolumeRegistry,
@@ -25,12 +25,12 @@ impl ToolInvocationService {
         execution_service: Arc<dyn ExecutionService>,
         web_tool_port: Arc<dyn ExternalWebToolPort>,
         event_bus: Arc<EventBus>,
-        smcp_gateway_url: Option<String>,
+        seal_gateway_url: Option<String>,
     ) -> Self {
         Self {
-            smcp_session_repo,
+            seal_session_repo,
             security_context_repo,
-            smcp_middleware,
+            seal_middleware,
             tool_router,
             fsal,
             volume_registry,
@@ -45,7 +45,7 @@ impl ToolInvocationService {
             start_workflow_execution_use_case: None,
             generated_manifests_root: None,
             node_config_path: None,
-            smcp_gateway_url,
+            seal_gateway_url,
             schema_registry: Arc::new(SchemaRegistry::build()),
             workflow_execution_control: None,
             agent_activity: None,
@@ -133,23 +133,23 @@ impl ToolInvocationService {
         self
     }
 
-    /// SMCP envelope-based tool invocation (Path 1).
-    /// Verifies the SMCP envelope, validates tool input contracts, then delegates
+    /// SEAL envelope-based tool invocation (Path 1).
+    /// Verifies the SEAL envelope, validates tool input contracts, then delegates
     /// to `dispatch_tool_core` for unified tool dispatch.
     pub async fn invoke_tool(
         &self,
         envelope: &(impl EnvelopeVerifier + Send + Sync),
-    ) -> Result<Value, SmcpSessionError> {
+    ) -> Result<Value, SealSessionError> {
         // 1. Look up the active session by the opaque security_token string.
         let mut session = self
-            .smcp_session_repo
+            .seal_session_repo
             .find_active_by_security_token(envelope.security_token())
             .await
             .map_err(|e| {
-                SmcpSessionError::InternalError(format!("session repository lookup failed: {}", e))
+                SealSessionError::InternalError(format!("session repository lookup failed: {}", e))
             })?
-            .ok_or(SmcpSessionError::SessionInactive(
-                crate::domain::smcp_session::SessionStatus::Expired,
+            .ok_or(SealSessionError::SessionInactive(
+                crate::domain::seal_session::SessionStatus::Expired,
             ))?;
 
         let agent_id = session.agent_id;
@@ -157,23 +157,23 @@ impl ToolInvocationService {
 
         // 2. Middleware verifies signature and evaluates against SecurityContext
         let args = self
-            .smcp_middleware
+            .seal_middleware
             .verify_and_unwrap(&mut session, envelope)
             .await?;
         let tool_name = envelope
             .extract_tool_name()
-            .ok_or(SmcpSessionError::MalformedPayload(
+            .ok_or(SealSessionError::MalformedPayload(
                 "missing tool name".to_string(),
             ))?;
 
         // 2b. Validate required arguments against the tool's input contract (ADR-055).
         ToolInputContract::validate(&tool_name, &args)
-            .map_err(SmcpSessionError::InvalidArguments)?;
+            .map_err(SealSessionError::InvalidArguments)?;
 
         // 3. Get security context from the session.
         let security_context = session.security_context;
 
-        // 4. Delegate to unified dispatch core (iteration_number=0, empty audit history for SMCP path).
+        // 4. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
             .dispatch_tool_core(
                 &agent_id,
@@ -186,7 +186,7 @@ impl ToolInvocationService {
             )
             .await?;
 
-        // 5. Map ToolInvocationResult to Value for SMCP return type.
+        // 5. Map ToolInvocationResult to Value for SEAL return type.
         match result {
             ToolInvocationResult::Direct(value) => Ok(value),
             ToolInvocationResult::DispatchRequired(action) => Ok(serde_json::json!({
@@ -207,14 +207,14 @@ impl ToolInvocationService {
         tool_audit_history: Vec<TrajectoryStep>,
         tool_name: String,
         args: Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         // 1. Load the execution to obtain its security_context_name (ADR-083).
         let execution = self
             .execution_service
             .get_execution(execution_id)
             .await
             .map_err(|e| {
-                SmcpSessionError::MalformedPayload(format!(
+                SealSessionError::MalformedPayload(format!(
                     "Failed to load execution {execution_id}: {e}"
                 ))
             })?;
@@ -224,13 +224,13 @@ impl ToolInvocationService {
             .find_by_name(&execution.security_context_name)
             .await
             .map_err(|e| {
-                SmcpSessionError::MalformedPayload(format!(
+                SealSessionError::MalformedPayload(format!(
                     "Failed to load security context '{}': {e}",
                     execution.security_context_name
                 ))
             })?
             .ok_or_else(|| {
-                SmcpSessionError::MalformedPayload(format!(
+                SealSessionError::MalformedPayload(format!(
                     "Security context '{}' not found for execution {execution_id}",
                     execution.security_context_name
                 ))
@@ -249,7 +249,7 @@ impl ToolInvocationService {
         .await
     }
 
-    /// Unified tool dispatch core shared by both SMCP (`invoke_tool`) and
+    /// Unified tool dispatch core shared by both SEAL (`invoke_tool`) and
     /// container (`invoke_tool_internal`) paths. Contains ALL dispatch logic:
     /// - ADR-073 operator-only param stripping
     /// - SecurityContext policy enforcement
@@ -257,7 +257,7 @@ impl ToolInvocationService {
     /// - aegis.* built-in tool dispatch
     /// - try_invoke_builtin fallback (cmd.run, fs.*, web.*, aegis.schema.*)
     /// - ToolRouter dynamic routing
-    /// - SMCP gateway fallback
+    /// - SEAL gateway fallback
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_tool_core(
         &self,
@@ -268,7 +268,7 @@ impl ToolInvocationService {
         args: Value,
         iteration_number: u8,
         tool_audit_history: Vec<TrajectoryStep>,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let invocation_id = ToolInvocationId::new();
         let started_at = Instant::now();
         self.publish_invocation_requested(
@@ -314,11 +314,11 @@ impl ToolInvocationService {
                 *agent_id,
                 format!("Policy violation: {details}"),
             );
-            return Err(SmcpSessionError::PolicyViolation(violation));
+            return Err(SealSessionError::PolicyViolation(violation));
         }
 
         // --- Inner-Loop Semantic Pre-Execution Validation (ADR-049) ---
-        // Agent lookup is optional — Zaru SMCP sessions use synthetic agent IDs
+        // Agent lookup is optional — Zaru SEAL sessions use synthetic agent IDs
         // that don't correspond to registered agents. Skip the judge pipeline
         // when no agent manifest is available.
         let agent = self.agent_lifecycle.get_agent(*agent_id).await.ok();
@@ -352,12 +352,12 @@ impl ToolInvocationService {
                                 .lookup_agent(judge_agent)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::InternalError(format!(
+                                    SealSessionError::InternalError(format!(
                                         "Failed to lookup judge: {e}"
                                     ))
                                 })?
                                 .ok_or_else(|| {
-                                    SmcpSessionError::NotFound(format!(
+                                    SealSessionError::NotFound(format!(
                                         "Judge agent '{judge_agent}' not found"
                                     ))
                                 })?;
@@ -405,7 +405,7 @@ impl ToolInvocationService {
                                 .start_child_execution(judge_id, input, execution_id)
                                 .await
                                 .map_err(|e| {
-                                    SmcpSessionError::InternalError(format!(
+                                    SealSessionError::InternalError(format!(
                                         "Failed to spawn judge child execution: {e}"
                                     ))
                                 })?;
@@ -427,7 +427,7 @@ impl ToolInvocationService {
                                         "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds"
                                     ),
                                 );
-                                    return Err(SmcpSessionError::JudgeTimeout(format!(
+                                    return Err(SealSessionError::JudgeTimeout(format!(
                                     "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds."
                                 )));
                                 }
@@ -437,7 +437,7 @@ impl ToolInvocationService {
                                     .get_execution(exec_id)
                                     .await
                                     .map_err(|e| {
-                                        SmcpSessionError::InternalError(format!(
+                                        SealSessionError::InternalError(format!(
                                             "Failed to get judge execution {exec_id}: {e}"
                                         ))
                                     })?;
@@ -446,14 +446,14 @@ impl ToolInvocationService {
                                     crate::domain::execution::ExecutionStatus::Completed => {
                                         let last_iter =
                                             exec.iterations().last().ok_or_else(|| {
-                                                SmcpSessionError::InternalError(
+                                                SealSessionError::InternalError(
                                                     "Judge completed but has no iterations"
                                                         .to_string(),
                                                 )
                                             })?;
                                         let output_str =
                                             last_iter.output.as_ref().ok_or_else(|| {
-                                                SmcpSessionError::InternalError(
+                                                SealSessionError::InternalError(
                                                     "Judge completed but has no output".to_string(),
                                                 )
                                             })?;
@@ -462,7 +462,7 @@ impl ToolInvocationService {
                                             .unwrap_or_else(|| output_str.clone());
                                         let result: crate::domain::validation::GradientResult =
                                             serde_json::from_str(&json_str).map_err(|e| {
-                                                SmcpSessionError::InternalError(format!(
+                                                SealSessionError::InternalError(format!(
                                                     "Failed to parse judge output: {e}"
                                                 ))
                                             })?;
@@ -480,7 +480,7 @@ impl ToolInvocationService {
                                                 result.score, min_score, result.reasoning
                                             ),
                                         );
-                                            return Err(SmcpSessionError::InternalError(
+                                            return Err(SealSessionError::InternalError(
                                             format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
@@ -499,7 +499,7 @@ impl ToolInvocationService {
                                         "Inner-loop semantic judge execution failed or was cancelled"
                                             .to_string(),
                                     );
-                                        return Err(SmcpSessionError::InternalError("Inner-loop semantic judge execution failed or was cancelled".to_string()));
+                                        return Err(SealSessionError::InternalError("Inner-loop semantic judge execution failed or was cancelled".to_string()));
                                     }
                                     _ => {
                                         tokio::time::sleep(std::time::Duration::from_millis(
@@ -518,7 +518,7 @@ impl ToolInvocationService {
           // --- End Pre-Execution Validation ---
 
         // Helper closure to publish invocation events based on tool result.
-        let publish_result = |result: &Result<ToolInvocationResult, SmcpSessionError>| match result
+        let publish_result = |result: &Result<ToolInvocationResult, SealSessionError>| match result
         {
             Ok(ToolInvocationResult::Direct(value)) => self.publish_invocation_completed(
                 invocation_id,
@@ -614,9 +614,9 @@ impl ToolInvocationService {
                 id
             }
             Err(routing_err) => {
-                if self.smcp_gateway_url.is_some() {
+                if self.seal_gateway_url.is_some() {
                     let gateway_result = self
-                        .invoke_smcp_gateway_internal_grpc(execution_id, &tool_name, args.clone())
+                        .invoke_seal_gateway_internal_grpc(execution_id, &tool_name, args.clone())
                         .await;
                     if let Ok(value) = gateway_result {
                         self.publish_invocation_completed(
@@ -635,7 +635,7 @@ impl ToolInvocationService {
                     *agent_id,
                     format!("Routing error: {routing_err}"),
                 );
-                return Err(SmcpSessionError::InternalError(format!(
+                return Err(SealSessionError::InternalError(format!(
                     "Routing error: {routing_err}"
                 )));
             }
@@ -645,7 +645,7 @@ impl ToolInvocationService {
             Some(server) => server,
             None => {
                 let err =
-                    SmcpSessionError::InternalError("Server vanished after routing".to_string());
+                    SealSessionError::InternalError("Server vanished after routing".to_string());
                 self.publish_invocation_failed(
                     invocation_id,
                     execution_id,
@@ -715,7 +715,7 @@ impl ToolInvocationService {
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Option<Result<ToolInvocationResult, SmcpSessionError>> {
+    ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         match tool_name {
             "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
             "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),

@@ -3,7 +3,7 @@
 //! # gRPC Client for Cluster Coordination
 //!
 //! Implements the client side of the `NodeClusterService` protocol (ADR-059).
-//! Handles the two-step attestation handshake, SMCP envelope wrapping with
+//! Handles the two-step attestation handshake, SEAL envelope wrapping with
 //! Ed25519 signatures, and all authenticated lifecycle RPCs (register,
 //! heartbeat, deregister).
 
@@ -21,13 +21,13 @@ use crate::infrastructure::aegis_cluster_proto::{
     node_cluster_service_client::NodeClusterServiceClient, AttestNodeRequest, ChallengeNodeRequest,
     DeregisterNodeInner, DeregisterNodeRequest, ForwardExecutionInner, ForwardExecutionRequest,
     NodeCapabilities, NodeCommand, NodeHeartbeatInner, NodeHeartbeatRequest, NodeStatus,
-    RegisterNodeInner, RegisterNodeRequest, SmcpNodeEnvelope as ProtoEnvelope,
+    RegisterNodeInner, RegisterNodeRequest, SealNodeEnvelope as ProtoEnvelope,
 };
 use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
 
 /// gRPC client for inter-node cluster communication.
 ///
-/// Wraps the generated `NodeClusterServiceClient` and adds SMCP envelope
+/// Wraps the generated `NodeClusterServiceClient` and adds SEAL envelope
 /// signing using an Ed25519 keypair. The two-step attestation handshake
 /// (`attest_and_challenge`) must complete before any authenticated RPC.
 pub struct NodeClusterClient {
@@ -260,7 +260,7 @@ impl NodeClusterClient {
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    /// Build an `SmcpNodeEnvelope` around an already-serialised inner payload.
+    /// Build an `SealNodeEnvelope` around an already-serialised inner payload.
     async fn wrap_in_envelope(&self, inner_payload: &[u8]) -> Result<ProtoEnvelope> {
         let token = self.token.read().await;
         let token_str = token

@@ -580,11 +580,11 @@ fn volume_spec_with_opendal_provider() {
 }
 
 #[test]
-fn volume_spec_smcp_backend() {
+fn volume_spec_seal_backend() {
     let vol = VolumeSpec {
         name: "remote-vol".to_string(),
         storage_class: "persistent".to_string(),
-        volume_type: "smcp".to_string(),
+        volume_type: "seal".to_string(),
         provider: None,
         config: None,
         mount_path: "/mnt/remote".to_string(),
@@ -592,7 +592,7 @@ fn volume_spec_smcp_backend() {
         size_limit: "2Gi".to_string(),
         ttl_hours: None,
     };
-    assert_eq!(vol.volume_type, "smcp");
+    assert_eq!(vol.volume_type, "seal");
 }
 
 // ============================================================================

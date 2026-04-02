@@ -11,7 +11,7 @@
 //! ## Architecture
 //!
 //! - **Layer:** Application Layer
-//! - **Bounded Context:** BC-14 SMCP Tooling Gateway (discovery surface)
+//! - **Bounded Context:** BC-14 SEAL Tooling Gateway (discovery surface)
 //! - **Refresh model:** The catalog maintains an in-memory cache that is
 //!   populated externally via [`StandardToolCatalog::refresh_from`]. A
 //!   periodic refresh loop (owned by the host process) calls
@@ -20,7 +20,7 @@
 //! ## Related ADRs
 //!
 //! - ADR-033: Orchestrator-Mediated MCP Tool Routing
-//! - ADR-053: SMCP Tooling Gateway
+//! - ADR-053: SEAL Tooling Gateway
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,7 +37,7 @@ use tokio::sync::RwLock;
 pub enum ToolSource {
     Builtin,
     McpServer,
-    SmcpGateway,
+    SealGateway,
 }
 
 /// Category for grouping tools.
@@ -115,7 +115,7 @@ pub struct ToolSearchResponse {
 ///
 /// The catalog does **not** own the refresh schedule — the host process calls
 /// [`refresh_from`](Self::refresh_from) on a timer, feeding it the latest
-/// `Vec<ToolMetadata>` from the tool router + SMCP gateway.
+/// `Vec<ToolMetadata>` from the tool router + SEAL gateway.
 pub struct StandardToolCatalog {
     cache: Arc<RwLock<Vec<CatalogEntry>>>,
 }
@@ -262,9 +262,9 @@ impl StandardToolCatalog {
         } else if name.starts_with("web.") {
             ToolSource::McpServer
         } else {
-            // Default: tools from unknown prefixes are likely from the SMCP Gateway
+            // Default: tools from unknown prefixes are likely from the SEAL Gateway
             // (ToolWorkflows and EphemeralCliTools have arbitrary names).
-            ToolSource::SmcpGateway
+            ToolSource::SealGateway
         }
     }
 
@@ -428,14 +428,14 @@ mod tests {
     }
 
     #[test]
-    fn enrich_classifies_unknown_as_smcp_gateway() {
+    fn enrich_classifies_unknown_as_seal_gateway() {
         let meta = crate::infrastructure::tool_router::ToolMetadata {
             name: "custom-workflow-tool".to_string(),
             description: "Some external tool".to_string(),
             input_schema: json!({"type": "object"}),
         };
         let entry = StandardToolCatalog::enrich(meta);
-        assert_eq!(entry.source, ToolSource::SmcpGateway);
+        assert_eq!(entry.source, ToolSource::SealGateway);
         assert_eq!(entry.category, ToolCategory::External);
     }
 

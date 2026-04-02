@@ -231,11 +231,11 @@ impl AegisFSAL {
                 volume.id,
                 path.trim_start_matches('/')
             ),
-            crate::domain::volume::VolumeBackend::Smcp {
+            crate::domain::volume::VolumeBackend::Seal {
                 node_id,
                 remote_volume_id,
             } => format!(
-                "/aegis/smcp/{}/{}/{}",
+                "/aegis/seal/{}/{}/{}",
                 node_id,
                 remote_volume_id,
                 path.trim_start_matches('/')
@@ -254,10 +254,10 @@ impl AegisFSAL {
             crate::domain::volume::VolumeBackend::OpenDal { .. } => {
                 format!("/aegis/opendal/volumes/{}/{}", volume.tenant_id, volume.id)
             }
-            crate::domain::volume::VolumeBackend::Smcp {
+            crate::domain::volume::VolumeBackend::Seal {
                 node_id,
                 remote_volume_id,
-            } => format!("/aegis/smcp/{}/{}", node_id, remote_volume_id),
+            } => format!("/aegis/seal/{}/{}", node_id, remote_volume_id),
         }
     }
 

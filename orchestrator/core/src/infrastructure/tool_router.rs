@@ -14,7 +14,7 @@
 //! # Related ADRs
 //!
 //! - ADR-033: Orchestrator-Mediated MCP Tool Routing
-//! - ADR-035: Secure Model Context Protocol (SMCP)
+//! - ADR-035: Signed Envelope Attestation Layer (SEAL)
 //! - ADR-038: Agent Iteration and Tool Gateway
 
 use crate::domain::execution::ExecutionId;

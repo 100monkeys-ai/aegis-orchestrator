@@ -13,12 +13,12 @@
 //! | [`runtime`] | Docker runtime adapter implementing `AgentRuntime` trait | ADR-027 |
 //! | [`image_manager`] | `DockerImageManager` trait + `StandardDockerImageManager`, `CredentialResolver` | ADR-045 |
 //! | [`nfs`] | NFS Server Gateway: `AegisFSAL`, `NfsServer`, `AegisFileHandle` | ADR-036 |
-//! | [`smcp`] | SMCP: attestation, envelope, middleware, policy engine, signature | ADR-035 |
+//! | [`seal`] | SEAL: attestation, envelope, middleware, policy engine, signature | ADR-035 |
 //! | [`event_bus`] | In-memory pub/sub `EventBus` + `DomainEvent` unified enum | ADR-030 |
 //! | [`llm`] | LLM provider adapters (OpenAI, Anthropic, Ollama) anti-corruption layer | ADR-009 |
 //! | [`storage`] | `SeaweedFSAdapter` implementing `StorageProvider` | ADR-032 |
 //! | [`security_context`] | `InMemorySecurityContextRepository` | ADR-035 |
-//! | [`tool_router`] | `ToolRouter` MCP proxy + `InMemorySmcpSessionRepository` | ADR-033 |
+//! | [`tool_router`] | `ToolRouter` MCP proxy + `InMemorySealSessionRepository` | ADR-033 |
 //! | [`secrets_manager`] | `OpenBaoSecretStore`, `SecretsManager`, `MockSecretStore` | ADR-034 |
 //! | [`db`] | SQLx PostgreSQL connection pool | ADR-025 |
 //! | [`workflow_parser`] | YAML → `Workflow` aggregate deserializer | ADR-015/031 |
@@ -30,7 +30,7 @@
 
 //! | [`aegis_runtime_proto`] | Generated `aegis.runtime.v1` types shared by server | ADR-042 |
 //! | [`aegis_cortex_proto`] | Generated `aegis.cortex.v1` types for Cortex service | ADR-042 |
-//! | [`smcp_gateway_proto`] | Generated `aegis.smcp_gateway.v1` gRPC types | ADR-053 |
+//! | [`seal_gateway_proto`] | Generated `aegis.seal_gateway.v1` gRPC types | ADR-053 |
 //! | [`cortex_client`] | `CortexGrpcClient` — forwards Cortex RPCs to standalone `aegis-cortex` | ADR-042 |
 //! | [`sensor`] | `SensorService` + `StdinSensor` — always-on stimulus listeners (ADR-021) |
 //! | [`iam`] | `StandardIamService` — JWKS-based JWT validation | ADR-041 |
@@ -57,11 +57,11 @@ pub mod prompt_template_engine;
 pub mod rate_limit;
 pub mod repositories;
 pub mod runtime;
+pub mod seal;
+pub mod seal_gateway_proto;
 pub mod secrets_manager;
 pub mod security_context;
 pub mod sensor;
-pub mod smcp;
-pub mod smcp_gateway_proto;
 pub mod storage;
 pub mod telemetry;
 pub mod temporal_client;

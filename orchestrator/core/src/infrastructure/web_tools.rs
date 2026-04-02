@@ -1,11 +1,11 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 
-//! External web tool adapter (Path 2: SMCP External).
+//! External web tool adapter (Path 2: SEAL External).
 
 use crate::application::ports::{ExternalWebToolPort, WebFetchRequest, WebSearchRequest};
 use crate::application::tool_invocation_service::ToolInvocationResult;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use async_trait::async_trait;
 use std::time::Duration;
 use tracing::{debug, info};
@@ -26,7 +26,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
     async fn search(
         &self,
         request: WebSearchRequest,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let search_url = build_duckduckgo_url(&request.query, request.max_results);
 
         match perform_search(&search_url).await {
@@ -37,7 +37,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                 "result_count": results.len(),
                 "results": results
             }))),
-            Err(e) => Err(SmcpSessionError::SignatureVerificationFailed(format!(
+            Err(e) => Err(SealSessionError::SignatureVerificationFailed(format!(
                 "Web search failed: {e}"
             ))),
         }
@@ -46,9 +46,9 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
     async fn fetch(
         &self,
         request: WebFetchRequest,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         if !request.url.starts_with("http://") && !request.url.starts_with("https://") {
-            return Err(SmcpSessionError::SignatureVerificationFailed(format!(
+            return Err(SealSessionError::SignatureVerificationFailed(format!(
                 "Invalid URL: {}. Must start with http:// or https://",
                 request.url
             )));
@@ -76,7 +76,7 @@ impl ExternalWebToolPort for ReqwestWebToolAdapter {
                     "content": content
                 })))
             }
-            Err(e) => Err(SmcpSessionError::SignatureVerificationFailed(format!(
+            Err(e) => Err(SealSessionError::SignatureVerificationFailed(format!(
                 "Web fetch failed: {e}"
             ))),
         }

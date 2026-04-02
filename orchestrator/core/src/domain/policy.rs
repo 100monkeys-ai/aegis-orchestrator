@@ -4,7 +4,7 @@
 //!
 //! Value objects that define *infrastructure-level* security constraints enforced at
 //! runtime by the orchestrator. These types are distinct from the *protocol-level*
-//! SMCP `SecurityContext` (see [`crate::domain::security_context`]) — policy governs
+//! SEAL `SecurityContext` (see [`crate::domain::security_context`]) — policy governs
 //! what the container runtime is allowed to do; `SecurityContext` governs what MCP
 //! tool calls the agent is allowed to make.
 //!
@@ -26,7 +26,7 @@
 //! - Exact match: `"api.github.com"`
 //! - Wildcard subdomain: `"*.github.com"` (matches `api.github.com`, NOT `github.com`)
 //!
-//! See Also: ADR-035 (SMCP, protocol-level policy)
+//! See Also: ADR-035 (SEAL, protocol-level policy)
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;

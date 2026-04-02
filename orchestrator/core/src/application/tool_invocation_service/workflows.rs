@@ -12,7 +12,7 @@ impl ToolInvocationService {
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
         tenant_id: &TenantId,
-    ) -> Result<crate::application::workflow_scope::ScopeChangeRequester, SmcpSessionError> {
+    ) -> Result<crate::application::workflow_scope::ScopeChangeRequester, SealSessionError> {
         let user_id = args
             .get("user_id")
             .and_then(|v| v.as_str())
@@ -39,10 +39,10 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_delete_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.delete requires 'name' string".to_string(),
             )
         })?;
@@ -89,12 +89,12 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_validate_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.workflow.validate requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -142,10 +142,10 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.run requires 'name' string".to_string(),
             )
         })?;
@@ -195,7 +195,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_execution_list_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let limit: usize = args
             .get("limit")
@@ -290,19 +290,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_execution_get_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let execution_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.executions.get requires 'execution_id' string".to_string(),
                 )
             })?;
         let execution_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.executions.get: invalid execution_id UUID: {error}"
                 ))
             })?,
@@ -347,7 +347,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_status_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let result = self.invoke_aegis_workflow_execution_get_tool(args).await?;
         Ok(match result {
             ToolInvocationResult::Direct(payload) => {
@@ -367,19 +367,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_wait_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let execution_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.wait requires 'execution_id' string".to_string(),
                 )
             })?;
         let execution_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.wait: invalid execution_id UUID: {error}"
                 ))
             })?,
@@ -463,10 +463,10 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_generate_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.generate requires 'input' string".to_string(),
             )
         })?;
@@ -509,19 +509,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_logs_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.logs requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.logs: invalid execution_id UUID: {e}"
                 ))
             })?,
@@ -593,19 +593,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_cancel_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.cancel requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.cancel: invalid execution_id UUID: {e}"
                 ))
             })?,
@@ -639,19 +639,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_signal_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.signal requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.signal: invalid execution_id UUID: {e}"
                 ))
             })?,
@@ -661,7 +661,7 @@ impl ToolInvocationService {
             .get("response")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.signal requires 'response' string".to_string(),
                 )
             })?;
@@ -694,19 +694,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_remove_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.workflow.remove requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.workflow.remove: invalid execution_id UUID: {e}"
                 ))
             })?,
@@ -739,7 +739,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_list_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let repo = match &self.workflow_repository {
             Some(repo) => repo,
@@ -756,17 +756,17 @@ impl ToolInvocationService {
 
         let workflows = match scope_filter {
             Some("global") => repo.list_global().await.map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SealSessionError::SignatureVerificationFailed(format!(
                     "Failed to list workflows: {e}"
                 ))
             })?,
             Some("visible") => repo.list_visible(&tenant_id, user_id).await.map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SealSessionError::SignatureVerificationFailed(format!(
                     "Failed to list workflows: {e}"
                 ))
             })?,
             _ => repo.list_all_for_tenant(&tenant_id).await.map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SealSessionError::SignatureVerificationFailed(format!(
                     "Failed to list workflows: {e}"
                 ))
             })?,
@@ -799,10 +799,10 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.promote requires 'name' string".to_string(),
             )
         })?;
@@ -814,7 +814,7 @@ impl ToolInvocationService {
 
         let target_scope: crate::domain::workflow::WorkflowScope =
             target_scope_str.parse().map_err(|_| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "Invalid target_scope '{target_scope_str}': expected 'tenant' or 'global'"
                 ))
             })?;
@@ -889,10 +889,10 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.demote requires 'name' string".to_string(),
             )
         })?;
@@ -913,7 +913,7 @@ impl ToolInvocationService {
                 }
             }
             other => other.parse().map_err(|_| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "Invalid target_scope '{other}': expected 'tenant' or 'user'"
                 ))
             })?,
@@ -988,10 +988,10 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_export_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "aegis.workflow.export requires 'name' string".to_string(),
             )
         })?;
@@ -1047,13 +1047,13 @@ impl ToolInvocationService {
         args: &Value,
         _execution_id: crate::domain::execution::ExecutionId,
         _agent_id: AgentId,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.workflow.update requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -1137,7 +1137,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SmcpSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::SignatureVerificationFailed(format!(
                             "Workflow updated but failed to persist manifest: {e}"
                         ))
                     })?;
@@ -1167,12 +1167,12 @@ impl ToolInvocationService {
         agent_id: AgentId,
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let manifest_yaml = args
             .get("manifest_yaml")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.workflow.create requires 'manifest_yaml' string".to_string(),
                 )
             })?;
@@ -1237,13 +1237,13 @@ impl ToolInvocationService {
         }
 
         let validation_service = self.validation_service.as_ref().ok_or_else(|| {
-            SmcpSessionError::SignatureVerificationFailed(
+            SealSessionError::SignatureVerificationFailed(
                 "Workflow semantic validation service not configured".to_string(),
             )
         })?;
         let register_workflow_use_case =
             self.register_workflow_use_case.as_ref().ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "Workflow registration use case not configured".to_string(),
                 )
             })?;
@@ -1277,12 +1277,12 @@ impl ToolInvocationService {
                 .lookup_agent(judge_name)
                 .await
                 .map_err(|e| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "Failed to lookup judge agent '{judge_name}': {e}"
                     ))
                 })?
                 .ok_or_else(|| {
-                    SmcpSessionError::SignatureVerificationFailed(format!(
+                    SealSessionError::SignatureVerificationFailed(format!(
                         "Judge agent '{judge_name}' not found"
                     ))
                 })?;
@@ -1336,7 +1336,7 @@ impl ToolInvocationService {
             )
             .await
             .map_err(|e| {
-                SmcpSessionError::SignatureVerificationFailed(format!(
+                SealSessionError::SignatureVerificationFailed(format!(
                     "Workflow semantic validation failed: {e}"
                 ))
             })?;
@@ -1375,7 +1375,7 @@ impl ToolInvocationService {
                         manifest_yaml,
                     )
                     .map_err(|e| {
-                        SmcpSessionError::SignatureVerificationFailed(format!(
+                        SealSessionError::SignatureVerificationFailed(format!(
                             "Workflow deployed but failed to persist manifest: {e}"
                         ))
                     })?;

@@ -59,7 +59,7 @@ pub struct AegisRuntimeService {
     validation_service: Arc<ValidationService>,
     grpc_auth: Option<GrpcIamAuthInterceptor>,
     attestation_service:
-        Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+        Option<Arc<dyn crate::infrastructure::seal::attestation::AttestationService>>,
     tool_invocation_service:
         Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
     cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
@@ -115,10 +115,10 @@ impl AegisRuntimeService {
         }
     }
 
-    /// Set the SMCP services (optional)
-    pub fn with_smcp(
+    /// Set the SEAL services (optional)
+    pub fn with_seal(
         mut self,
-        attestation_service: Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>,
+        attestation_service: Arc<dyn crate::infrastructure::seal::attestation::AttestationService>,
         tool_invocation_service: Arc<
             crate::application::tool_invocation_service::ToolInvocationService,
         >,
@@ -597,7 +597,7 @@ impl AegisRuntime for AegisRuntimeService {
         }
     }
 
-    /// Attest an agent to receive an SMCP Security Token
+    /// Attest an agent to receive an SEAL Security Token
     async fn attest_agent(
         &self,
         request: Request<AttestAgentRequest>,
@@ -608,10 +608,10 @@ impl AegisRuntime for AegisRuntimeService {
         let req = request.into_inner();
 
         let attestation_service = self.attestation_service.as_ref().ok_or_else(|| {
-            Status::failed_precondition("SMCP attestation service is not configured")
+            Status::failed_precondition("SEAL attestation service is not configured")
         })?;
 
-        let attestation_req = crate::infrastructure::smcp::attestation::AttestationRequest {
+        let attestation_req = crate::infrastructure::seal::attestation::AttestationRequest {
             agent_id: Some(req.agent_id),
             execution_id: Some(req.execution_id),
             container_id: Some(req.container_id),
@@ -634,7 +634,7 @@ impl AegisRuntime for AegisRuntimeService {
         }
     }
 
-    /// Invoke a tool via orchestrator mediation (SMCP)
+    /// Invoke a tool via orchestrator mediation (SEAL)
     async fn invoke_tool(
         &self,
         request: Request<InvokeToolRequest>,
@@ -645,13 +645,13 @@ impl AegisRuntime for AegisRuntimeService {
         let req = request.into_inner();
 
         let tool_invocation_service = self.tool_invocation_service.as_ref().ok_or_else(|| {
-            Status::failed_precondition("SMCP tool invocation service is not configured")
+            Status::failed_precondition("SEAL tool invocation service is not configured")
         })?;
 
-        // Construct SmcpEnvelope. The ToolInvocationService is responsible for
+        // Construct SealEnvelope. The ToolInvocationService is responsible for
         // validating the security_token and handling extraction of any required
         // claims (such as agent_id) according to its own verification logic.
-        let envelope = crate::infrastructure::smcp::envelope::SmcpEnvelope {
+        let envelope = crate::infrastructure::seal::envelope::SealEnvelope {
             protocol: None,
             security_token: req.security_token,
             signature: req.signature,
@@ -1281,7 +1281,7 @@ pub struct GrpcServerConfig {
     pub validation_service: Arc<ValidationService>,
     pub grpc_auth: Option<GrpcIamAuthInterceptor>,
     pub attestation_service:
-        Option<Arc<dyn crate::infrastructure::smcp::attestation::AttestationService>>,
+        Option<Arc<dyn crate::infrastructure::seal::attestation::AttestationService>>,
     pub tool_invocation_service:
         Option<Arc<crate::application::tool_invocation_service::ToolInvocationService>>,
     pub cortex_client: Option<Arc<crate::infrastructure::CortexGrpcClient>>,
@@ -1299,7 +1299,7 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
     }
 
     if let (Some(a), Some(t)) = (config.attestation_service, config.tool_invocation_service) {
-        service = service.with_smcp(a, t);
+        service = service.with_seal(a, t);
     }
 
     if let Some(c) = config.cortex_client {
@@ -1657,7 +1657,7 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
         assert_eq!(
             err.message(),
-            "SMCP tool invocation service is not configured"
+            "SEAL tool invocation service is not configured"
         );
     }
 }

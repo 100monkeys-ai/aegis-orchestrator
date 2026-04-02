@@ -11,7 +11,7 @@
 //! - The Execution Context (BC-2) calls [`AgentLifecycleService::get_agent`] before
 //!   every execution to resolve the manifest and security policy.
 //! - The Zaru client (BC-12) calls `deploy_agent` / `list_agents` via the gRPC API.
-//! - Agent manifests drive the `SecurityContext` name used to initialise SMCP sessions.
+//! - Agent manifests drive the `SecurityContext` name used to initialise SEAL sessions.
 //!
 //! # Code Quality Principles
 //!

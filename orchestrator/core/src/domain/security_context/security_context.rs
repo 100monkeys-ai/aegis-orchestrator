@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # SecurityContext Aggregate (BC-4/BC-12, ADR-035)
 //!
-//! Defines the named permission boundary used by the SMCP protocol layer.
+//! Defines the named permission boundary used by the SEAL protocol layer.
 //! A `SecurityContext` is the **protocol-level** policy object — it controls which
 //! MCP tools an agent may invoke, with what arguments, from which paths/domains,
 //! and at what rate.
@@ -25,7 +25,7 @@
 //! looks it up via [`crate::domain::security_context::SecurityContextRepository`]
 //! during attestation.
 //!
-//! See ADR-035 (SMCP Implementation), AGENTS.md §SMCP Protocol Domain.
+//! See ADR-035 (SEAL Implementation), AGENTS.md §SEAL Protocol Domain.
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -83,10 +83,10 @@ pub struct SecurityContextMetadata {
     pub version: u32,
 }
 
-/// Named permission boundary for agent MCP tool access (BC-12 SMCP, ADR-035).
+/// Named permission boundary for agent MCP tool access (BC-12 SEAL, ADR-035).
 ///
 /// **Aggregate root** for the Security Context bounded context. Owned by the
-/// orchestrator; referenced in `SmcpSession` by value (cloned at attestation time
+/// orchestrator; referenced in `SealSession` by value (cloned at attestation time
 /// so per-execution policy snapshots are immune to runtime context updates).
 ///
 /// # Invariants
@@ -137,7 +137,7 @@ impl SecurityContext {
     ///
     /// # Security
     ///
-    /// This method is called by [`crate::domain::smcp_session::SmcpSession::evaluate_call`]
+    /// This method is called by [`crate::domain::seal_session::SealSession::evaluate_call`]
     /// on **every** MCP tool invocation. It must be O(n) in capabilities and
     /// must **not** panic or silently permit on unexpected input.
     pub fn evaluate(&self, tool_name: &str, args: &Value) -> Result<(), PolicyViolation> {

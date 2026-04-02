@@ -54,7 +54,7 @@ pub struct StartWorkflowExecutionRequest {
     #[serde(default)]
     pub tenant_id: Option<TenantId>,
 
-    /// Security context name resolved from the calling agent's SMCP session (ADR-083).
+    /// Security context name resolved from the calling agent's SEAL session (ADR-083).
     /// Propagated so the workflow engine can enforce the same security boundary on
     /// child agent executions spawned within workflow states.
     #[serde(default)]
