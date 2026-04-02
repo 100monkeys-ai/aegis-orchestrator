@@ -10,9 +10,9 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use crate::daemon::state::AppState;
-use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use aegis_orchestrator_core::domain::rate_limit::{
-    RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType,
+    tier_defaults, RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::rate_limit::policy_resolver::HierarchicalPolicyResolver;
@@ -213,6 +213,11 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => TenantId::system(),
     };
 
+    let tier = match &identity.identity_kind {
+        IdentityKind::ConsumerUser { zaru_tier } => zaru_tier.clone(),
+        _ => ZaruTier::Enterprise,
+    };
+
     let usage_rows = match repo.get_usage("user", &identity.sub).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -224,21 +229,27 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         }
     };
 
-    let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
-
-    let mut seen = std::collections::HashSet::new();
-    let mut resource_types: Vec<(String, RateLimitResourceType)> = Vec::new();
+    // Build lookup: (resource_type_str, bucket_str) -> (counter, window_start)
+    let mut counter_map: std::collections::HashMap<
+        (String, String),
+        (i64, chrono::DateTime<chrono::Utc>),
+    > = std::collections::HashMap::new();
     for row in &usage_rows {
-        if seen.insert(row.resource_type.clone()) {
-            resource_types.push((
-                row.resource_type.clone(),
-                parse_resource_type(&row.resource_type),
-            ));
-        }
+        counter_map.insert(
+            (row.resource_type.clone(), row.bucket.clone()),
+            (row.counter, row.window_start),
+        );
     }
 
+    let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
+    let now = chrono::Utc::now();
+
+    // Seed from full tier policy so new users see all limits at zero
+    let all_policies = tier_defaults(&tier);
     let mut items: Vec<UserRateLimitUsageItem> = Vec::new();
-    for (resource_type_str, resource_type) in &resource_types {
+
+    for default_policy in &all_policies {
+        let resource_type = &default_policy.resource_type;
         let policy = match resolver
             .resolve_policy(&identity, &tenant_id, resource_type)
             .await
@@ -246,22 +257,25 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
             Ok(p) => p,
             Err(_) => continue,
         };
-        for row in usage_rows
-            .iter()
-            .filter(|r| &r.resource_type == resource_type_str)
-        {
-            let Some(bucket) = bucket_from_str(&row.bucket) else {
-                continue;
-            };
-            let Some(window) = policy.windows.get(&bucket) else {
-                continue;
-            };
-            let resets_at =
-                row.window_start + chrono::Duration::seconds(window.window_seconds as i64);
+        let resource_str = resource_type_to_db_str(resource_type);
+        for (bucket, window) in &policy.windows {
+            let bucket_str = bucket_to_str(bucket);
+            let (current_count, resets_at) =
+                match counter_map.get(&(resource_str.clone(), bucket_str.clone())) {
+                    Some((count, window_start)) => {
+                        let resets_at =
+                            *window_start + chrono::Duration::seconds(window.window_seconds as i64);
+                        (*count, resets_at)
+                    }
+                    None => (
+                        0i64,
+                        now + chrono::Duration::seconds(window.window_seconds as i64),
+                    ),
+                };
             items.push(UserRateLimitUsageItem {
-                resource_type: row.resource_type.clone(),
-                bucket: row.bucket.clone(),
-                current_count: row.counter,
+                resource_type: resource_str.clone(),
+                bucket: bucket_str,
+                current_count,
                 limit_value: window.limit as i64,
                 window_seconds: window.window_seconds,
                 resets_at,
@@ -277,28 +291,24 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         .into_response()
 }
 
-fn bucket_from_str(s: &str) -> Option<RateLimitBucket> {
-    match s {
-        "per_minute" => Some(RateLimitBucket::PerMinute),
-        "hourly" => Some(RateLimitBucket::Hourly),
-        "daily" => Some(RateLimitBucket::Daily),
-        "weekly" => Some(RateLimitBucket::Weekly),
-        "monthly" => Some(RateLimitBucket::Monthly),
-        _ => None,
+fn bucket_to_str(bucket: &RateLimitBucket) -> String {
+    match bucket {
+        RateLimitBucket::PerMinute => "per_minute".into(),
+        RateLimitBucket::Hourly => "hourly".into(),
+        RateLimitBucket::Daily => "daily".into(),
+        RateLimitBucket::Weekly => "weekly".into(),
+        RateLimitBucket::Monthly => "monthly".into(),
     }
 }
 
-fn parse_resource_type(s: &str) -> RateLimitResourceType {
-    match s {
-        "agent_execution" => RateLimitResourceType::AgentExecution,
-        "workflow_execution" => RateLimitResourceType::WorkflowExecution,
-        "llm_call" => RateLimitResourceType::LlmCall,
-        "llm_token" => RateLimitResourceType::LlmToken,
-        other if other.starts_with("seal_tool:") => RateLimitResourceType::SealToolCall {
-            tool_pattern: other["seal_tool:".len()..].to_string(),
-        },
-        other => RateLimitResourceType::SealToolCall {
-            tool_pattern: other.to_string(),
-        },
+fn resource_type_to_db_str(rt: &RateLimitResourceType) -> String {
+    match rt {
+        RateLimitResourceType::AgentExecution => "agent_execution".into(),
+        RateLimitResourceType::WorkflowExecution => "workflow_execution".into(),
+        RateLimitResourceType::LlmCall => "llm_call".into(),
+        RateLimitResourceType::LlmToken => "llm_token".into(),
+        RateLimitResourceType::SealToolCall { tool_pattern } => {
+            format!("seal_tool:{tool_pattern}")
+        }
     }
 }
