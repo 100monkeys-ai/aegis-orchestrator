@@ -14,8 +14,9 @@ use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier}
 use aegis_orchestrator_core::domain::rate_limit::{
     tier_defaults, RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType,
 };
-use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::rate_limit::policy_resolver::HierarchicalPolicyResolver;
+
+use super::tenant_id_from_identity;
 use axum::Extension;
 use chrono::{DateTime, Utc};
 
@@ -192,8 +193,19 @@ pub(crate) struct UserRateLimitUsageItem {
 
 pub(crate) async fn get_user_rate_limit_usage_handler(
     State(state): State<Arc<AppState>>,
-    Extension(identity): Extension<UserIdentity>,
+    identity: Option<Extension<UserIdentity>>,
 ) -> axum::response::Response {
+    let identity = match identity {
+        Some(Extension(id)) => id,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Authentication required"})),
+            )
+                .into_response();
+        }
+    };
+
     let repo = match &state.rate_limit_override_repo {
         Some(r) => r.clone(),
         None => {
@@ -205,13 +217,7 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         }
     };
 
-    let tenant_id = match &identity.identity_kind {
-        IdentityKind::ConsumerUser { .. } => TenantId::consumer(),
-        IdentityKind::TenantUser { tenant_slug } => {
-            TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
-        }
-        IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => TenantId::system(),
-    };
+    let tenant_id = tenant_id_from_identity(Some(&identity));
 
     let tier = match &identity.identity_kind {
         IdentityKind::ConsumerUser { zaru_tier } => zaru_tier.clone(),
