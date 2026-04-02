@@ -214,6 +214,21 @@ pub trait ExecutionService: Send + Sync {
         iteration: u8,
         trajectory: Vec<crate::domain::execution::TrajectoryStep>,
     ) -> Result<()>;
+
+    /// Record a policy-blocked tool invocation on the current iteration.
+    ///
+    /// Called from the tool invocation service whenever a `PolicyViolation` is
+    /// raised so the validator can surface blocked tool names to the judge agent.
+    ///
+    /// The default implementation is a no-op; only `StandardExecutionService`
+    /// persists the violation.
+    async fn store_policy_violation(
+        &self,
+        _execution_id: ExecutionId,
+        _tool_name: String,
+    ) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct StandardExecutionService {
@@ -2897,6 +2912,18 @@ impl ExecutionService for StandardExecutionService {
             } else {
                 self.repository.save(&exec).await?;
             }
+        }
+        Ok(())
+    }
+
+    async fn store_policy_violation(
+        &self,
+        execution_id: ExecutionId,
+        tool_name: String,
+    ) -> Result<()> {
+        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+            exec.add_policy_violation(tool_name);
+            self.repository.save(&exec).await?;
         }
         Ok(())
     }

@@ -180,7 +180,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_agent_generate_tool(
         &self,
         args: &Value,
-        security_context: &crate::domain::security_context::SecurityContext,
+        _security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::SignatureVerificationFailed(
@@ -211,7 +211,7 @@ impl ToolInvocationService {
                     intent: Some(input.to_string()),
                     payload: serde_json::Value::String(input.to_string()),
                 },
-                security_context.name.clone(),
+                "default".to_string(),
                 None,
             )
             .await

@@ -218,6 +218,9 @@ pub struct Iteration {
     pub llm_interactions: Vec<LlmInteraction>,
     #[serde(default)]
     pub trajectory: Option<Vec<TrajectoryStep>>,
+    /// Tool names that were blocked by policy during this iteration.
+    #[serde(default)]
+    pub policy_violations: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -415,6 +418,7 @@ impl Execution {
             ended_at: None,
             llm_interactions: Vec::new(),
             trajectory: None,
+            policy_violations: Vec::new(),
         };
 
         self.iterations.push(iteration);
@@ -443,6 +447,13 @@ impl Execution {
             Ok(())
         } else {
             Err(ExecutionError::IterationNotFound(iteration_number))
+        }
+    }
+
+    /// Append a policy-blocked tool name to the current iteration.
+    pub fn add_policy_violation(&mut self, tool_name: String) {
+        if let Some(iter) = self.iterations.last_mut() {
+            iter.policy_violations.push(tool_name);
         }
     }
 

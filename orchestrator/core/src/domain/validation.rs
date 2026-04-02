@@ -147,6 +147,8 @@ pub struct ValidationContext {
     pub stderr: String,
     /// Mounted worker paths visible to judges (canonical `/workspace...` roots).
     pub worker_mounts: Vec<String>,
+    /// Tool names that were blocked by policy during this iteration.
+    pub policy_violations: Vec<String>,
 }
 
 /// Extract the first JSON value from `text`, stripping markdown code fences.
