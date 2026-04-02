@@ -245,3 +245,77 @@ fn test_builtin_intent_to_execution_yaml_maps_spec_storage() {
         "spec_storage must survive JSON round-trip"
     );
 }
+
+#[test]
+fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
+    let mut states = HashMap::new();
+    states.insert(
+        StateName::new("START").unwrap(),
+        WorkflowState {
+            kind: StateKind::System {
+                command: "echo start".to_string(),
+                env: HashMap::new(),
+                workdir: None,
+            },
+            transitions: vec![],
+            timeout: None,
+        },
+    );
+
+    // ── User scope: both scope and owner_user_id must be forwarded ──
+    let mut workflow = Workflow::new(
+        WorkflowMetadata {
+            name: "user-scoped-workflow".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            tags: vec![],
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        },
+        WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states: states.clone(),
+            storage: Default::default(),
+        },
+    )
+    .unwrap();
+    workflow.scope = WorkflowScope::User {
+        owner_user_id: "user-123".to_string(),
+    };
+
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+        .expect("Mapping failed");
+
+    assert_eq!(def.scope, Some("user".to_string()));
+    assert_eq!(def.owner_user_id, Some("user-123".to_string()));
+
+    // ── Tenant scope: scope is "tenant", owner_user_id is None ──
+    let tenant_workflow = Workflow::new(
+        WorkflowMetadata {
+            name: "tenant-scoped-workflow".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            tags: vec![],
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        },
+        WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            storage: Default::default(),
+        },
+    )
+    .unwrap();
+    // scope defaults to Tenant
+
+    let def = TemporalWorkflowMapper::to_temporal_definition(
+        &tenant_workflow,
+        &TenantId::local_default(),
+    )
+    .expect("Mapping failed");
+
+    assert_eq!(def.scope, Some("tenant".to_string()));
+    assert_eq!(def.owner_user_id, None);
+}

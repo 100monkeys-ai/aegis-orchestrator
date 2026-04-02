@@ -56,6 +56,12 @@ pub struct TemporalWorkflowDefinition {
     /// Includes workspace provisioning and shared volume declarations (WORKFLOW_MANIFEST_SPEC_V1).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub spec_storage: Option<crate::domain::workflow::WorkflowStorageSpec>,
+    /// Visibility scope for this workflow definition (ADR-076).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Owner user ID when scope is 'user' (ADR-076).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_user_id: Option<String>,
 }
 
 /// Individual state in Temporal workflow
@@ -243,6 +249,15 @@ impl TemporalWorkflowMapper {
             context: workflow.spec.context.clone(),
             states: temporal_states,
             spec_storage: Some(workflow.spec.storage.clone()),
+            scope: Some(match &workflow.scope {
+                WorkflowScope::Global => "global".to_string(),
+                WorkflowScope::Tenant => "tenant".to_string(),
+                WorkflowScope::User { .. } => "user".to_string(),
+            }),
+            owner_user_id: match &workflow.scope {
+                WorkflowScope::User { owner_user_id } => Some(owner_user_id.clone()),
+                _ => None,
+            },
         })
     }
 
