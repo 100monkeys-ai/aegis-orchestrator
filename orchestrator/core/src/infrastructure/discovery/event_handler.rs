@@ -330,8 +330,8 @@ impl DiscoveryIndexEventHandler {
     // Backfill / Reconcile
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Index all known agents and workflows into Cortex. Shared by [`backfill`]
-    /// and [`reconcile`].
+    /// Index all known agents and workflows into Cortex. Shared by [`Self::backfill`]
+    /// and [`Self::reconcile`].
     async fn index_all(&self) -> anyhow::Result<(usize, usize)> {
         // ── Agents ──────────────────────────────────────────────────────
         let agents = self
@@ -389,7 +389,7 @@ impl DiscoveryIndexEventHandler {
         self.index_all().await
     }
 
-    /// Spawn a background tokio task that calls [`reconcile`] on the given interval.
+    /// Spawn a background tokio task that calls [`Self::reconcile`] on the given interval.
     /// Errors are logged as warnings and never cause the loop to exit.
     pub fn spawn_reconciler(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
