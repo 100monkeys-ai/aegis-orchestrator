@@ -305,10 +305,16 @@ impl DaemonClient {
             anyhow::bail!("Failed to get agent: {error_text}");
         }
 
-        response
+        #[derive(Debug, Deserialize)]
+        struct GetAgentResponse {
+            manifest: AgentManifest,
+        }
+
+        let wrapper: GetAgentResponse = response
             .json()
             .await
-            .context("Failed to parse agent manifest")
+            .context("Failed to parse agent manifest")?;
+        Ok(wrapper.manifest)
     }
 
     pub async fn delete_agent(&self, agent_id: Uuid) -> Result<()> {
