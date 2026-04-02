@@ -10,6 +10,14 @@ use axum::response::IntoResponse;
 use axum::Json;
 
 use crate::daemon::state::AppState;
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::rate_limit::{
+    RateLimitBucket, RateLimitPolicyResolver, RateLimitResourceType,
+};
+use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::rate_limit::policy_resolver::HierarchicalPolicyResolver;
+use axum::Extension;
+use chrono::{DateTime, Utc};
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ListOverridesQuery {
@@ -169,5 +177,128 @@ pub(crate) async fn get_rate_limit_usage_handler(
             Json(serde_json::json!({"error": e.to_string()})),
         )
             .into_response(),
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct UserRateLimitUsageItem {
+    pub resource_type: String,
+    pub bucket: String,
+    pub current_count: i64,
+    pub limit_value: i64,
+    pub window_seconds: u64,
+    pub resets_at: DateTime<Utc>,
+}
+
+pub(crate) async fn get_user_rate_limit_usage_handler(
+    State(state): State<Arc<AppState>>,
+    Extension(identity): Extension<UserIdentity>,
+) -> axum::response::Response {
+    let repo = match &state.rate_limit_override_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({"error": "Rate-limit override repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
+    let tenant_id = match &identity.identity_kind {
+        IdentityKind::ConsumerUser { .. } => TenantId::consumer(),
+        IdentityKind::TenantUser { tenant_slug } => {
+            TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
+        }
+        IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => TenantId::system(),
+    };
+
+    let usage_rows = match repo.get_usage("user", &identity.sub).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    };
+
+    let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
+
+    let mut seen = std::collections::HashSet::new();
+    let mut resource_types: Vec<(String, RateLimitResourceType)> = Vec::new();
+    for row in &usage_rows {
+        if seen.insert(row.resource_type.clone()) {
+            resource_types.push((
+                row.resource_type.clone(),
+                parse_resource_type(&row.resource_type),
+            ));
+        }
+    }
+
+    let mut items: Vec<UserRateLimitUsageItem> = Vec::new();
+    for (resource_type_str, resource_type) in &resource_types {
+        let policy = match resolver
+            .resolve_policy(&identity, &tenant_id, resource_type)
+            .await
+        {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for row in usage_rows
+            .iter()
+            .filter(|r| &r.resource_type == resource_type_str)
+        {
+            let Some(bucket) = bucket_from_str(&row.bucket) else {
+                continue;
+            };
+            let Some(window) = policy.windows.get(&bucket) else {
+                continue;
+            };
+            let resets_at =
+                row.window_start + chrono::Duration::seconds(window.window_seconds as i64);
+            items.push(UserRateLimitUsageItem {
+                resource_type: row.resource_type.clone(),
+                bucket: row.bucket.clone(),
+                current_count: row.counter,
+                limit_value: window.limit as i64,
+                window_seconds: window.window_seconds,
+                resets_at,
+            });
+        }
+    }
+
+    let count = items.len();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "usage": items, "count": count })),
+    )
+        .into_response()
+}
+
+fn bucket_from_str(s: &str) -> Option<RateLimitBucket> {
+    match s {
+        "per_minute" => Some(RateLimitBucket::PerMinute),
+        "hourly" => Some(RateLimitBucket::Hourly),
+        "daily" => Some(RateLimitBucket::Daily),
+        "weekly" => Some(RateLimitBucket::Weekly),
+        "monthly" => Some(RateLimitBucket::Monthly),
+        _ => None,
+    }
+}
+
+fn parse_resource_type(s: &str) -> RateLimitResourceType {
+    match s {
+        "agent_execution" => RateLimitResourceType::AgentExecution,
+        "workflow_execution" => RateLimitResourceType::WorkflowExecution,
+        "llm_call" => RateLimitResourceType::LlmCall,
+        "llm_token" => RateLimitResourceType::LlmToken,
+        other if other.starts_with("seal_tool:") => RateLimitResourceType::SealToolCall {
+            tool_pattern: other["seal_tool:".len()..].to_string(),
+        },
+        other => RateLimitResourceType::SealToolCall {
+            tool_pattern: other.to_string(),
+        },
     }
 }

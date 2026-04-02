@@ -11,7 +11,8 @@ use aegis_orchestrator_core::domain::iam::IdentityProvider;
 
 use crate::daemon::handlers::admin::{
     delete_rate_limit_override_handler, get_rate_limit_usage_handler,
-    list_rate_limit_overrides_handler, upsert_rate_limit_override_handler,
+    get_user_rate_limit_usage_handler, list_rate_limit_overrides_handler,
+    upsert_rate_limit_override_handler,
 };
 use crate::daemon::handlers::agents::{
     delete_agent_handler, deploy_agent_handler, execute_agent_handler, get_agent_handler,
@@ -186,6 +187,10 @@ pub(crate) fn create_router(
         .route(
             "/v1/admin/rate-limits/usage",
             get(get_rate_limit_usage_handler),
+        )
+        .route(
+            "/v1/user/rate-limits/usage",
+            get(get_user_rate_limit_usage_handler),
         )
         .with_state(app_state);
 

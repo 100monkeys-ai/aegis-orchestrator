@@ -64,6 +64,10 @@ impl RateLimitOverrideRepository {
         Self { pool }
     }
 
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+
     /// Map a [`sqlx::postgres::PgRow`] into a [`RateLimitOverrideRow`].
     fn map_override_row(row: &sqlx::postgres::PgRow) -> RateLimitOverrideRow {
         RateLimitOverrideRow {
