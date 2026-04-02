@@ -582,15 +582,26 @@ impl AegisFSAL {
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
 
-        // 5. Create file via storage provider (using default mode 0o644)
+        // 5. Ensure parent directory exists (SeaweedFS does not auto-create parent dirs)
+        if let Some(parent) = std::path::Path::new(&full_path).parent() {
+            let parent_str = parent.to_string_lossy();
+            if !parent_str.is_empty() && parent_str != "/" {
+                self.storage_provider
+                    .create_directory(&parent_str)
+                    .await
+                    .map_err(FsalError::Storage)?;
+            }
+        }
+
+        // 6. Create file via storage provider (using default mode 0o644)
         let handle = self.storage_provider.create_file(&full_path, 0o644).await?;
         let _ = self.storage_provider.close_file(&handle).await; // Close immediately
 
-        // 6. Create Aegis file handle
+        // 7. Create Aegis file handle
         let aegis_handle = AegisFileHandle::new(execution_id, volume_id, path_str);
         aegis_handle.validate_size()?;
 
-        // 7. Publish event
+        // 8. Publish event
         self.event_publisher
             .publish_storage_event(StorageEvent::FileCreated {
                 execution_id,

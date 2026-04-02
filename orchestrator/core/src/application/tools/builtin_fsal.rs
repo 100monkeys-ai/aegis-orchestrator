@@ -122,7 +122,7 @@ pub async fn invoke_fs_tool(
                 "entries": entries_json
             })))
         }
-        "fs.create_dir" => {
+        "fs.create_dir" | "fs.create.dir" => {
             let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
             fsal.create_directory(
