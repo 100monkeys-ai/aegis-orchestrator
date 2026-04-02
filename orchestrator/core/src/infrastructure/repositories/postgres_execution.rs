@@ -374,6 +374,119 @@ impl ExecutionRepository for PostgresExecutionRepository {
         Ok(executions)
     }
 
+    async fn find_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                e.id, e.agent_id, e.input, e.status, e.iterations, e.max_iterations,
+                e.container_uid, e.container_gid,
+                e.started_at, e.completed_at, e.error_message, e.parent_execution_id,
+                e.security_context_name
+            FROM executions e
+            INNER JOIN workflow_executions we ON e.workflow_execution_id = we.id
+            WHERE e.tenant_id = $1 AND we.workflow_id = $2
+            ORDER BY e.started_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(workflow_id.0)
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut executions = Vec::new();
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            let agent_id: uuid::Uuid = row.get("agent_id");
+            let status_str: String = row.get("status");
+            let input_val: serde_json::Value = row.get("input");
+            let iterations_val: serde_json::Value = row.get("iterations");
+            let max_iterations: i32 = row.get("max_iterations");
+            let container_uid: i32 = row.get("container_uid");
+            let container_gid: i32 = row.get("container_gid");
+            let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
+            let completed_at: Option<chrono::DateTime<chrono::Utc>> = row.get("completed_at");
+            let error_message: Option<String> = row.get("error_message");
+            let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
+            let security_context_name: String = row.get("security_context_name");
+
+            let status = match status_str.as_str() {
+                "pending" => Ok(ExecutionStatus::Pending),
+                "running" => Ok(ExecutionStatus::Running),
+                "completed" => Ok(ExecutionStatus::Completed),
+                "failed" => Ok(ExecutionStatus::Failed),
+                "cancelled" => Ok(ExecutionStatus::Cancelled),
+                other => Err(RepositoryError::Serialization(format!(
+                    "Unknown execution status value from database: '{other}'"
+                ))),
+            }?;
+
+            let input: ExecutionInput = serde_json::from_value(input_val).map_err(|e| {
+                RepositoryError::Serialization(format!(
+                    "Failed to deserialize execution input: {e}"
+                ))
+            })?;
+            let iterations: Vec<Iteration> =
+                serde_json::from_value(iterations_val).map_err(|e| {
+                    RepositoryError::Serialization(format!("Failed to deserialize iterations: {e}"))
+                })?;
+
+            let max_iterations_u8 = u8::try_from(max_iterations).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid max_iterations value {max_iterations}: expected 0-255"
+                ))
+            })?;
+
+            let hierarchy = match parent_execution_id {
+                Some(parent_id) => ExecutionHierarchy {
+                    parent_execution_id: Some(ExecutionId(parent_id)),
+                    depth: 1,
+                    path: vec![ExecutionId(id)],
+                    swarm_id: None,
+                },
+                None => ExecutionHierarchy::root(ExecutionId(id)),
+            };
+
+            let container_uid_u32 = u32::try_from(container_uid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_uid value (expected non-negative i32): {container_uid}"
+                ))
+            })?;
+
+            let container_gid_u32 = u32::try_from(container_gid).map_err(|_| {
+                RepositoryError::Serialization(format!(
+                    "Invalid container_gid value (expected non-negative i32): {container_gid}"
+                ))
+            })?;
+
+            executions.push(Execution {
+                id: ExecutionId(id),
+                agent_id: AgentId(agent_id),
+                tenant_id: tenant_id.clone(),
+                status,
+                iterations,
+                max_iterations: max_iterations_u8,
+                container_uid: container_uid_u32,
+                container_gid: container_gid_u32,
+                input,
+                started_at,
+                ended_at: completed_at,
+                error: error_message,
+                hierarchy,
+                security_context_name,
+            });
+        }
+
+        Ok(executions)
+    }
+
     async fn find_recent_for_tenant(
         &self,
         tenant_id: &TenantId,

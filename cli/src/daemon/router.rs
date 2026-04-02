@@ -15,7 +15,8 @@ use crate::daemon::handlers::admin::{
 };
 use crate::daemon::handlers::agents::{
     delete_agent_handler, deploy_agent_handler, execute_agent_handler, get_agent_handler,
-    list_agents_handler, lookup_agent_handler, stream_agent_events_handler,
+    list_agent_versions_handler, list_agents_handler, lookup_agent_handler,
+    stream_agent_events_handler,
 };
 use crate::daemon::handlers::approvals::{
     approve_request_handler, get_pending_approval_handler, list_pending_approvals_handler,
@@ -46,8 +47,8 @@ use crate::daemon::handlers::workflow_executions::{
 };
 use crate::daemon::handlers::workflows::{
     delete_workflow_handler, execute_temporal_workflow_handler, get_workflow_handler,
-    list_workflows_handler, register_temporal_workflow_handler, run_workflow_legacy_handler,
-    update_workflow_scope_handler,
+    list_workflow_versions_handler, list_workflows_handler, register_temporal_workflow_handler,
+    run_workflow_legacy_handler, update_workflow_scope_handler,
 };
 use crate::daemon::state::AppState;
 
@@ -83,6 +84,7 @@ pub(crate) fn create_router(
             "/v1/agents",
             post(deploy_agent_handler).get(list_agents_handler),
         )
+        .route("/v1/agents/{id}/versions", get(list_agent_versions_handler))
         .route(
             "/v1/agents/{id}",
             get(get_agent_handler).delete(delete_agent_handler),
@@ -92,6 +94,10 @@ pub(crate) fn create_router(
         .route(
             "/v1/workflows",
             post(register_temporal_workflow_handler).get(list_workflows_handler),
+        )
+        .route(
+            "/v1/workflows/{name}/versions",
+            get(list_workflow_versions_handler),
         )
         .route(
             "/v1/workflows/{name}",

@@ -164,4 +164,15 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
     }
+
+    async fn list_versions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<Vec<crate::domain::repository::AgentVersion>> {
+        self.repository
+            .list_versions_for_tenant(tenant_id, agent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list agent versions: {e}"))
+    }
 }

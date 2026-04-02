@@ -58,6 +58,15 @@ pub struct PostgresConfig {
     pub connection_string: String,
 }
 
+/// A snapshot of a specific agent version from the append-only version history.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AgentVersion {
+    pub id: uuid::Uuid,
+    pub version: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub manifest_yaml: String,
+}
+
 /// Repository interface for Agent aggregates
 /// One repository per aggregate root (Agent Lifecycle Context)
 #[async_trait]
@@ -98,6 +107,12 @@ pub trait AgentRepository: Send + Sync {
         id: AgentId,
     ) -> Result<(), RepositoryError>;
 
+    async fn list_versions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<Vec<AgentVersion>, RepositoryError>;
+
     /// Save agent (create or update)
     async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
         self.save_for_tenant(&TenantId::local_default(), agent)
@@ -135,6 +150,12 @@ pub trait AgentRepository: Send + Sync {
     async fn delete(&self, id: AgentId) -> Result<(), RepositoryError> {
         self.delete_for_tenant(&TenantId::local_default(), id).await
     }
+
+    /// List all version history entries for an agent
+    async fn list_versions(&self, agent_id: AgentId) -> Result<Vec<AgentVersion>, RepositoryError> {
+        self.list_versions_for_tenant(&TenantId::local_default(), agent_id)
+            .await
+    }
 }
 
 /// Repository interface for Execution aggregates
@@ -157,6 +178,13 @@ pub trait ExecutionRepository: Send + Sync {
         &self,
         tenant_id: &TenantId,
         agent_id: AgentId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError>;
+
+    async fn find_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: WorkflowId,
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError>;
 
@@ -191,6 +219,16 @@ pub trait ExecutionRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Execution>, RepositoryError> {
         self.find_by_agent_for_tenant(&TenantId::local_default(), agent_id, limit)
+            .await
+    }
+
+    /// Find executions by workflow ID (newest first, capped at `limit`)
+    async fn find_by_workflow(
+        &self,
+        workflow_id: WorkflowId,
+        limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        self.find_by_workflow_for_tenant(&TenantId::local_default(), workflow_id, limit)
             .await
     }
 
@@ -234,6 +272,13 @@ pub trait WorkflowRepository: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError>;
+
+    /// List all versions of a workflow by name for a tenant (newest first).
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Workflow>, RepositoryError>;
 
     async fn list_all_for_tenant(
         &self,

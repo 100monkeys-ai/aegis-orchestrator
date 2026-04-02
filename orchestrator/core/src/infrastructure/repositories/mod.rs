@@ -171,6 +171,15 @@ impl AgentRepository for InMemoryAgentRepository {
         }
         Ok(())
     }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> Result<Vec<crate::domain::repository::AgentVersion>, RepositoryError> {
+        // In-memory repo does not track version history
+        Ok(Vec::new())
+    }
 }
 
 // AgentLifecycleService implementation for in-memory use
@@ -295,6 +304,15 @@ impl AgentLifecycleService for InMemoryAgentRepository {
             .find(|a| a.name == name && a.manifest.metadata.version == version)
             .map(|a| a.id))
     }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> anyhow::Result<Vec<crate::domain::repository::AgentVersion>> {
+        // In-memory repo does not track version history
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Clone)]
@@ -359,6 +377,16 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .collect();
         results.sort_by(|a, b| b.started_at.cmp(&a.started_at));
         Ok(results.into_iter().take(limit).collect())
+    }
+
+    async fn find_by_workflow_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: crate::domain::workflow::WorkflowId,
+        _limit: usize,
+    ) -> Result<Vec<Execution>, RepositoryError> {
+        // In-memory repo does not track workflow-to-execution relationships
+        Ok(Vec::new())
     }
 
     async fn find_recent_for_tenant(
@@ -463,6 +491,23 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
                 .find(|w| w.metadata.name == name && w.metadata.version.as_deref() == Some(version))
                 .cloned()
         }))
+    }
+
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let workflows = self.workflows.read().unwrap();
+        let mut results: Vec<Workflow> = workflows
+            .get(tenant_id)
+            .into_iter()
+            .flat_map(|tenant_workflows| tenant_workflows.values())
+            .filter(|w| w.metadata.name == name)
+            .cloned()
+            .collect();
+        results.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        Ok(results)
     }
 
     async fn list_all_for_tenant(
