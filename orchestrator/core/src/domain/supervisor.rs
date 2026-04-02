@@ -459,6 +459,7 @@ impl Supervisor {
                         .iter()
                         .map(|m| m.mount_point.to_string_lossy().to_string())
                         .collect(),
+                    policy_violations: vec![],
                 };
                 match pipeline.validate(&ctx).await {
                     Ok(pipeline_result) => {

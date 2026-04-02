@@ -308,6 +308,19 @@ impl ToolInvocationService {
                     details: details.clone(),
                     blocked_at: Utc::now(),
                 });
+            // Record the blocked tool name on the iteration so validators can
+            // surface policy violations to the judge agent (ADR-049).
+            let svc = self.execution_service.clone();
+            let blocked_tool = tool_name.clone();
+            tokio::spawn(async move {
+                if let Err(e) = svc.store_policy_violation(execution_id, blocked_tool).await {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "Failed to record policy violation on iteration"
+                    );
+                }
+            });
             self.publish_invocation_failed(
                 invocation_id,
                 execution_id,

@@ -86,7 +86,7 @@ impl RemoteStorageServiceHandler {
             .map_err(|e| Status::unauthenticated(format!("Invalid signature format: {e}")))?;
 
         verifying_key
-            .verify(&envelope.inner_payload, &signature)
+            .verify(&envelope.payload, &signature)
             .map_err(|e| Status::unauthenticated(format!("Signature verification failed: {e}")))?;
 
         Ok(node_id)

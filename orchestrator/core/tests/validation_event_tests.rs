@@ -108,6 +108,7 @@ impl ExecutionService for MockExecutionService {
             ended_at: Some(chrono::Utc::now()),
             llm_interactions: vec![],
             trajectory: None,
+            policy_violations: vec![],
         };
         Ok(vec![iteration])
     }

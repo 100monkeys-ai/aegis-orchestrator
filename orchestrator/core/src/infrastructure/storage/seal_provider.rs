@@ -180,7 +180,7 @@ impl SealStorageProvider {
         Ok(ProtoEnvelope {
             node_security_token: token_str.clone(),
             signature: signature.to_bytes().to_vec(),
-            inner_payload: payload.to_vec(),
+            payload: payload.to_vec(),
         })
     }
 

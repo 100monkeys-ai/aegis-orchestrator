@@ -273,7 +273,7 @@ impl NodeClusterClient {
         Ok(ProtoEnvelope {
             node_security_token: token_str,
             signature: signature.to_bytes().to_vec(),
-            inner_payload: inner_payload.to_vec(),
+            payload: inner_payload.to_vec(),
         })
     }
 

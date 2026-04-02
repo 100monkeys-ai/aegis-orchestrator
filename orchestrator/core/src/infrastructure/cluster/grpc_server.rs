@@ -109,13 +109,13 @@ impl NodeClusterServiceHandler {
             .map_err(|e| Status::unauthenticated(format!("Invalid signature format: {}", e)))?;
 
         verifying_key
-            .verify(&proto_envelope.inner_payload, &signature)
+            .verify(&proto_envelope.payload, &signature)
             .map_err(|e| {
                 Status::unauthenticated(format!("Signature verification failed: {}", e))
             })?;
 
-        // 4. Deserialize inner_payload
-        let inner = T::decode(&proto_envelope.inner_payload[..]).map_err(|e| {
+        // 4. Deserialize payload
+        let inner = T::decode(&proto_envelope.payload[..]).map_err(|e| {
             Status::invalid_argument(format!("Failed to deserialize inner payload: {}", e))
         })?;
 
