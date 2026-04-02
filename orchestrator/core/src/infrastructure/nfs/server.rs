@@ -826,6 +826,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 context.volume_id,
                 &file_path,
                 &context.policy,
+                true,
             )
             .await
             .map_err(|e| {

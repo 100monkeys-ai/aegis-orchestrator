@@ -567,6 +567,7 @@ impl AegisFSAL {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        emit_event: bool,
     ) -> Result<AegisFileHandle, FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -590,15 +591,17 @@ impl AegisFSAL {
         let aegis_handle = AegisFileHandle::new(execution_id, volume_id, path_str);
         aegis_handle.validate_size()?;
 
-        // 7. Publish event
-        self.event_publisher
-            .publish_storage_event(StorageEvent::FileCreated {
-                execution_id,
-                volume_id,
-                path: path_str.to_string(),
-                created_at: Utc::now(),
-            })
-            .await;
+        // 7. Publish event only when the caller confirms the overall write will not follow
+        if emit_event {
+            self.event_publisher
+                .publish_storage_event(StorageEvent::FileCreated {
+                    execution_id,
+                    volume_id,
+                    path: path_str.to_string(),
+                    created_at: Utc::now(),
+                })
+                .await;
+        }
 
         Ok(aegis_handle)
     }

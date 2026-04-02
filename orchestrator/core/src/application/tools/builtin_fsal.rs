@@ -60,6 +60,7 @@ pub async fn invoke_fs_tool(
                     vol_ctx.volume_id,
                     &path,
                     &vol_ctx.policy,
+                    false,
                 )
                 .await
                 .map_err(|e| {
@@ -306,6 +307,7 @@ async fn invoke_multi_edit(
             vol_ctx.volume_id,
             &path,
             &vol_ctx.policy,
+            false,
         )
         .await
         .map_err(|e| {
