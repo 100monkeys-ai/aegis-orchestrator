@@ -173,7 +173,7 @@ impl AttestationServiceImpl {
             iat: Some(chrono::Utc::now().timestamp()),
             nbf: None,
             jti: Some(uuid::Uuid::new_v4().to_string()),
-            sub: Some(agent_id.0.to_string()),
+            sub: agent_id.0.to_string(),
             scp: security_context.name.clone(),
             wid: request
                 .container_id
@@ -287,6 +287,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec![],
             metadata: SecurityContextMetadata {

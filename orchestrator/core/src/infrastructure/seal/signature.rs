@@ -136,7 +136,7 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         ContextClaims {
-            sub: None,
+            sub: "agent-1".to_string(),
             agent_id: "agent-1".to_string(),
             execution_id: "exec-1".to_string(),
             security_context: "test".to_string(),
@@ -164,7 +164,7 @@ mod tests {
             .unwrap()
             .as_secs() as i64;
         ContextClaims {
-            sub: None,
+            sub: "agent-1".to_string(),
             agent_id: "agent-1".to_string(),
             execution_id: "exec-1".to_string(),
             security_context: "test".to_string(),

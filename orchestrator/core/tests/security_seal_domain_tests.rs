@@ -46,6 +46,7 @@ fn fs_read_capability() -> Capability {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     }
 }
 
@@ -57,6 +58,7 @@ fn fs_wildcard_capability() -> Capability {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     }
 }
 
@@ -68,6 +70,7 @@ fn wildcard_capability() -> Capability {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     }
 }
 
@@ -79,6 +82,7 @@ fn web_capability_with_domains(domains: Vec<&str>) -> Capability {
         subcommand_allowlist: None,
         domain_allowlist: Some(domains.into_iter().map(String::from).collect()),
         max_response_size: None,
+        rate_limit: None,
     }
 }
 
@@ -342,6 +346,7 @@ fn capability_allows_when_no_path_constraint() {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     };
     // No path_allowlist means no path restriction
     assert!(cap
@@ -362,6 +367,7 @@ fn capability_allows_whitelisted_command() {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     };
     assert!(cap
         .allows("cmd.run", &json!({"command": "cargo build --release"}))
@@ -380,6 +386,7 @@ fn capability_rejects_non_whitelisted_command() {
         subcommand_allowlist: None,
         domain_allowlist: None,
         max_response_size: None,
+        rate_limit: None,
     };
     let err = cap
         .allows("cmd.run", &json!({"command": "rm -rf /"}))

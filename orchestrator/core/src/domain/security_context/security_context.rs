@@ -265,6 +265,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec![],
             metadata: test_metadata(),
@@ -298,6 +299,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             // Although fs.* is allowed, fs.delete is explicitly denied
             deny_list: vec!["fs.delete".to_string()],
@@ -368,6 +370,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec!["fs.delete".to_string()],
             metadata: test_metadata(),

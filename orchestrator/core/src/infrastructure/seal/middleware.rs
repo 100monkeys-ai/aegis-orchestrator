@@ -321,6 +321,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec![],
             metadata: SecurityContextMetadata {
@@ -440,6 +441,7 @@ mod tests {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec![],
             metadata: SecurityContextMetadata {

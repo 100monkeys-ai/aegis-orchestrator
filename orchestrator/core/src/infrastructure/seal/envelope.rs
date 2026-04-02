@@ -77,9 +77,8 @@ pub enum AudienceClaim {
 /// Standard JWT fields (`iss`, `aud`, `exp`, `iat`, `nbf`) follow RFC 7519.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClaims {
-    /// JWT subject claim — the agent principal identifier.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub sub: Option<String>,
+    /// JWT subject claim — the agent principal identifier (REQUIRED per spec).
+    pub sub: String,
     /// AEGIS `AgentId` (UUID string) — identifies the agent that was attested.
     pub agent_id: String,
     /// AEGIS `ExecutionId` (UUID string) — binds the token to a single execution.

@@ -1139,6 +1139,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         subcommand_allowlist: None,
                         domain_allowlist: cap.domain_allowlist.clone(),
                         max_response_size: None,
+                        rate_limit: None,
                     })
                     .collect();
 
