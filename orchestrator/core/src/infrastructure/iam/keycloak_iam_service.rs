@@ -256,7 +256,7 @@ impl StandardIamService {
                 {
                     Some(v) => v,
                     None => {
-                        tracing::warn!(
+                        tracing::debug!(
                             sub = %claims.sub,
                             claim = %self.claims_config.zaru_tier,
                             "zaru_tier claim absent from token; defaulting to free tier"
