@@ -312,6 +312,37 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         }
     }
 
+    async fn list_by_name_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT domain_json
+            FROM workflows
+            WHERE tenant_id = $1 AND name = $2
+            ORDER BY updated_at DESC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(name)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut workflows = Vec::new();
+        for row in rows {
+            let domain_json: serde_json::Value = row
+                .try_get("domain_json")
+                .map_err(|e| RepositoryError::Database(e.to_string()))?;
+            let workflow: Workflow = serde_json::from_value(domain_json)
+                .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
+            workflows.push(workflow);
+        }
+        Ok(workflows)
+    }
+
     async fn list_all_for_tenant(
         &self,
         tenant_id: &TenantId,

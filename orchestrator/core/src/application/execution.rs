@@ -468,9 +468,15 @@ impl StandardExecutionService {
         &self,
         tenant_id: &TenantId,
         agent_id: Option<AgentId>,
+        workflow_id: Option<crate::domain::workflow::WorkflowId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        if let Some(aid) = agent_id {
+        if let Some(wid) = workflow_id {
+            Ok(self
+                .repository
+                .find_by_workflow_for_tenant(tenant_id, wid, limit)
+                .await?)
+        } else if let Some(aid) = agent_id {
             Ok(self
                 .repository
                 .find_by_agent_for_tenant(tenant_id, aid, limit)
@@ -2323,7 +2329,7 @@ impl ExecutionService for StandardExecutionService {
         agent_id: Option<AgentId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        self.list_executions_for_tenant(&TenantId::local_default(), agent_id, limit)
+        self.list_executions_for_tenant(&TenantId::local_default(), agent_id, None, limit)
             .await
     }
 

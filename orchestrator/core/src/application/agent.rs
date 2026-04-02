@@ -20,6 +20,7 @@
 //! - Fail closed on malformed or incomplete agent definitions.
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest};
+use crate::domain::repository::AgentVersion;
 use crate::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
@@ -60,6 +61,12 @@ pub trait AgentLifecycleService: Send + Sync {
         tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<AgentId>>;
+
+    async fn list_versions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<Vec<AgentVersion>>;
 
     /// Parse, validate, and persist a new agent manifest, returning the assigned [`AgentId`].
     ///

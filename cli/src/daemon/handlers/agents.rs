@@ -245,6 +245,22 @@ pub(crate) async fn get_agent_handler(
     }
 }
 
+pub(crate) async fn list_agent_versions_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(agent_id): Path<Uuid>,
+) -> Json<serde_json::Value> {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .agent_service
+        .list_versions_for_tenant(&tenant_id, AgentId(agent_id))
+        .await
+    {
+        Ok(versions) => Json(serde_json::to_value(versions).unwrap_or_default()),
+        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+    }
+}
+
 pub(crate) async fn lookup_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,

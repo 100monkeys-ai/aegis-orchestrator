@@ -262,6 +262,42 @@ pub(crate) async fn delete_workflow_handler(
     }
 }
 
+/// GET /v1/workflows/:name/versions - List all versions of a workflow
+pub(crate) async fn list_workflow_versions_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    match state
+        .workflow_repo
+        .list_by_name_for_tenant(&tenant_id, &name)
+        .await
+    {
+        Ok(workflows) => {
+            let versions: Vec<serde_json::Value> = workflows
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "id": w.id.0,
+                        "name": w.metadata.name,
+                        "version": w.metadata.version,
+                        "description": w.metadata.description,
+                        "scope": w.scope.to_string(),
+                        "created_at": w.created_at.to_rfc3339(),
+                        "tenant_id": w.tenant_id.as_str(),
+                    })
+                })
+                .collect();
+            (StatusCode::OK, Json(serde_json::json!(versions)))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        ),
+    }
+}
+
 /// POST /v1/workflows/:id_or_name/scope - Change workflow scope (promote/demote)
 pub(crate) async fn update_workflow_scope_handler(
     State(state): State<Arc<AppState>>,

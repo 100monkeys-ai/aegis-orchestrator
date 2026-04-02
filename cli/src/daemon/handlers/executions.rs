@@ -23,6 +23,7 @@ pub(crate) use crate::daemon::handlers::DEFAULT_MAX_EXECUTION_LIST_LIMIT;
 #[derive(serde::Deserialize)]
 pub(crate) struct ListExecutionsQuery {
     pub(crate) agent_id: Option<Uuid>,
+    pub(crate) workflow_name: Option<String>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -134,9 +135,30 @@ pub(crate) async fn list_executions_handler(
     let limit = query.limit.unwrap_or(20).min(max_limit);
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
+    // Resolve workflow_name to a WorkflowId if provided
+    let workflow_id = if let Some(ref wf_name) = query.workflow_name {
+        match state
+            .workflow_repo
+            .find_by_name_for_tenant(&tenant_id, wf_name)
+            .await
+        {
+            Ok(Some(wf)) => Some(wf.id),
+            Ok(None) => {
+                return Json(
+                    serde_json::json!({"error": format!("Workflow '{}' not found", wf_name)}),
+                );
+            }
+            Err(e) => {
+                return Json(serde_json::json!({"error": e.to_string()}));
+            }
+        }
+    } else {
+        None
+    };
+
     match state
         .execution_service
-        .list_executions_for_tenant(&tenant_id, agent_id, limit)
+        .list_executions_for_tenant(&tenant_id, agent_id, workflow_id, limit)
         .await
     {
         Ok(executions) => {

@@ -79,8 +79,8 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(tenant_id.as_str())
         .bind(&agent.name)
         .bind(agent.manifest.metadata.version.clone())
-        .bind(manifest_yaml)
-        .bind(manifest_json)
+        .bind(&manifest_yaml)
+        .bind(&manifest_json)
         .bind(agent.manifest.runtime_string())
         .bind(300_i32) // Default timeout, can be extracted from spec.security.resources.timeout if present
         .bind(security_policy)
@@ -92,6 +92,28 @@ impl AgentRepository for PostgresAgentRepository {
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save agent: {e}")))?;
+
+        // Append to agent_versions history (append-only log of all deployed versions)
+        sqlx::query(
+            r#"
+            INSERT INTO agent_versions (agent_id, tenant_id, version, manifest_yaml, manifest_json)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (agent_id, version) DO UPDATE SET
+                manifest_yaml = EXCLUDED.manifest_yaml,
+                manifest_json = EXCLUDED.manifest_json,
+                created_at = now()
+            "#,
+        )
+        .bind(agent.id.0)
+        .bind(tenant_id.as_str())
+        .bind(&agent.manifest.metadata.version)
+        .bind(&manifest_yaml)
+        .bind(&manifest_json)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            RepositoryError::Database(format!("Failed to save agent version history: {e}"))
+        })?;
 
         Ok(())
     }
@@ -319,5 +341,40 @@ impl AgentRepository for PostgresAgentRepository {
             .await
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
+    }
+
+    async fn list_versions_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<Vec<crate::domain::repository::AgentVersion>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, version, created_at, manifest_yaml
+            FROM agent_versions
+            WHERE tenant_id = $1 AND agent_id = $2
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(agent_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut versions = Vec::new();
+        for row in rows {
+            let id: uuid::Uuid = row.get("id");
+            let version: String = row.get("version");
+            let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
+            let manifest_yaml: String = row.get("manifest_yaml");
+            versions.push(crate::domain::repository::AgentVersion {
+                id,
+                version,
+                created_at,
+                manifest_yaml,
+            });
+        }
+        Ok(versions)
     }
 }
