@@ -142,6 +142,28 @@ impl GeminiAdapter {
     fn desanitize_tool_name(name: &str) -> String {
         name.replace('_', ".")
     }
+
+    /// Recursively strip JSON Schema fields that Gemini's function calling API does not support.
+    fn strip_unsupported_schema_fields(schema: &serde_json::Value) -> serde_json::Value {
+        match schema {
+            serde_json::Value::Object(map) => {
+                let mut cleaned = serde_json::Map::new();
+                for (key, value) in map {
+                    if key == "additionalProperties" {
+                        continue;
+                    }
+                    cleaned.insert(key.clone(), Self::strip_unsupported_schema_fields(value));
+                }
+                serde_json::Value::Object(cleaned)
+            }
+            serde_json::Value::Array(arr) => serde_json::Value::Array(
+                arr.iter()
+                    .map(Self::strip_unsupported_schema_fields)
+                    .collect(),
+            ),
+            other => other.clone(),
+        }
+    }
 }
 
 #[async_trait]
@@ -262,7 +284,7 @@ impl LLMProvider for GeminiAdapter {
                         .map(|t| GeminiFunctionDeclaration {
                             name: Self::sanitize_tool_name(&t.name),
                             description: t.description.clone(),
-                            parameters: t.parameters.clone(),
+                            parameters: Self::strip_unsupported_schema_fields(&t.parameters),
                         })
                         .collect(),
                 }])

@@ -1177,7 +1177,8 @@ impl ToolRouter {
                             },
                             "labels": {
                                 "type": "object",
-                                "description": "Label key-value pairs to filter by. All must match. Values are strings."
+                                "description": "Label key-value pairs to filter by. All must match.",
+                                "additionalProperties": { "type": "string" }
                             },
                             "status": {
                                 "type": "string",
@@ -1212,7 +1213,8 @@ impl ToolRouter {
                             },
                             "labels": {
                                 "type": "object",
-                                "description": "Label key-value pairs to filter by. All must match. Values are strings."
+                                "description": "Label key-value pairs to filter by. All must match.",
+                                "additionalProperties": { "type": "string" }
                             },
                             "include_platform_templates": {
                                 "type": "boolean",
