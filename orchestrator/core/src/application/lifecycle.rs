@@ -167,6 +167,20 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         Ok(agent.map(|a| a.id))
     }
 
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        let agent = self
+            .repository
+            .resolve_by_name(tenant_id, user_id, name)
+            .await
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
+        Ok(agent.map(|a| a.id))
+    }
+
     async fn lookup_agent_for_tenant_with_version(
         &self,
         tenant_id: &TenantId,

@@ -117,6 +117,17 @@ impl AgentLifecycleService for MockAgentServiceInt {
         )))
     }
 
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        _name: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        Ok(Some(AgentId(
+            uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
+        )))
+    }
+
     async fn lookup_agent_for_tenant_with_version(
         &self,
         _tenant_id: &TenantId,

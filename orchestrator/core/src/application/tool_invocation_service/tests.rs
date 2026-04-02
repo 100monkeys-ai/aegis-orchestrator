@@ -201,6 +201,17 @@ impl AgentLifecycleService for TestAgentLifecycleService {
         anyhow::bail!("TestAgentLifecycleService::lookup_agent not exercised in this test")
     }
 
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        _name: &str,
+    ) -> Result<Option<AgentId>> {
+        anyhow::bail!(
+            "TestAgentLifecycleService::lookup_agent_visible_for_tenant not exercised in this test"
+        )
+    }
+
     async fn lookup_agent_for_tenant_with_version(
         &self,
         _tenant_id: &TenantId,
@@ -298,6 +309,15 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
 
     async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
         Ok((name == self.agent.name).then_some(self.agent.id))
+    }
+
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent(name).await
     }
 
     async fn lookup_agent_for_tenant_with_version(
@@ -2194,6 +2214,15 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
 
     async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
         Ok((name == self.agent_name).then_some(self.agent_id))
+    }
+
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<AgentId>> {
+        self.lookup_agent(name).await
     }
 
     async fn lookup_agent_for_tenant_with_version(

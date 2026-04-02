@@ -69,6 +69,13 @@ pub trait AgentLifecycleService: Send + Sync {
         name: &str,
     ) -> Result<Option<AgentId>>;
 
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<AgentId>>;
+
     async fn list_versions_for_tenant(
         &self,
         tenant_id: &TenantId,
