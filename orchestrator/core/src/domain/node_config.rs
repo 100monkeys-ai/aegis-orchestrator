@@ -184,6 +184,12 @@ pub struct NodeConfigSpec {
     #[serde(default)]
     pub deploy_builtins: bool,
 
+    /// Force re-deployment of all vendored built-in agents and workflows on startup,
+    /// even if they are already registered. Use after a platform upgrade to flush stale
+    /// definitions. Accepts `"true"` or `"env:VAR_NAME"`. Default: disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_deploy_builtins: Option<String>,
+
     /// Maximum number of executions returned by a single `list_executions` request.
     /// Protects against excessive memory usage. Defaults to 1000 if not configured.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1497,6 +1503,7 @@ impl Default for NodeConfigSpec {
             seal_gateway: None,
             image_tag: None,
             deploy_builtins: false,
+            force_deploy_builtins: None,
             max_execution_list_limit: None,
         }
     }
@@ -2008,6 +2015,7 @@ mod tests {
                 seal_gateway: None,
                 image_tag: None,
                 deploy_builtins: false,
+                force_deploy_builtins: None,
                 max_execution_list_limit: None,
             },
         };

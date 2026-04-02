@@ -1841,19 +1841,27 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     if config.spec.deploy_builtins {
         use crate::commands::builtins;
 
+        let force_builtins = config
+            .spec
+            .force_deploy_builtins
+            .as_deref()
+            .map(|v| resolve_env_value(v).unwrap_or_default())
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+
         for (name, yaml) in builtins::BUILTIN_AGENTS {
             match serde_yaml::from_str::<aegis_orchestrator_sdk::AgentManifest>(yaml) {
                 Ok(manifest) => {
-                    if agent_service
+                    let already_exists = agent_service
                         .lookup_agent(&manifest.metadata.name)
                         .await
                         .ok()
                         .flatten()
-                        .is_some()
-                    {
+                        .is_some();
+                    if already_exists && !force_builtins {
                         info!("Built-in agent '{}' already registered, skipping", name);
                     } else {
-                        match agent_service.deploy_agent(manifest, false).await {
+                        match agent_service.deploy_agent(manifest, force_builtins).await {
                             Ok(id) => info!("Deployed built-in agent '{}' (id: {})", name, id),
                             Err(e) => warn!("Failed to deploy built-in agent '{}': {}", name, e),
                         }
@@ -1864,20 +1872,20 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
 
         for (wf_name, wf_template) in builtins::BUILTIN_WORKFLOWS {
-            if workflow_repo
+            let already_exists = workflow_repo
                 .find_by_name(wf_name)
                 .await
                 .ok()
                 .flatten()
-                .is_some()
-            {
+                .is_some();
+            if already_exists && !force_builtins {
                 info!(
                     "Built-in workflow '{}' already registered, skipping",
                     wf_name
                 );
             } else {
                 match register_workflow_use_case
-                    .register_workflow(wf_template, false)
+                    .register_workflow(wf_template, force_builtins)
                     .await
                 {
                     Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),

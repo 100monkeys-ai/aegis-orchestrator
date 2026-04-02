@@ -82,6 +82,11 @@ spec:
   # Required for aegis.agent.generate and aegis.workflow.generate to function.
   # deploy_builtins: false
 
+  # Force re-deploy all built-in agents and workflows on startup, even if already registered.
+  # Use after a platform upgrade to flush stale definitions. Accepts "true" or "env:VAR_NAME".
+  # Default: disabled (omit or set to "false").
+  # force_deploy_builtins: "false"
+
   # storage:
   #   backend: "local_host"  # Local filesystem (default) or "seaweedfs" for distributed storage
   #   # For SeaweedFS configuration, see config-with-examples.yaml
