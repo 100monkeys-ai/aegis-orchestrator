@@ -51,7 +51,7 @@ impl RemoteStorageServiceHandler {
     /// Authenticate the caller by verifying the SEAL node envelope:
     /// 1. Parse JWT to extract node_id
     /// 2. Look up registered public key
-    /// 3. Verify Ed25519 signature over inner_payload
+    /// 3. Verify Ed25519 signature over payload
     async fn authenticate(&self, envelope: Option<ProtoEnvelope>) -> Result<NodeId, Status> {
         let envelope =
             envelope.ok_or_else(|| Status::unauthenticated("Missing security envelope"))?;
@@ -71,7 +71,7 @@ impl RemoteStorageServiceHandler {
             .map_err(|e| Status::internal(format!("Database error: {e}")))?
             .ok_or_else(|| Status::unauthenticated("Node not registered"))?;
 
-        // 3. Verify Ed25519 signature over inner_payload
+        // 3. Verify Ed25519 signature over payload
         use ed25519_dalek::{Signature, Verifier, VerifyingKey};
         let verifying_key = VerifyingKey::from_bytes(
             &peer
@@ -86,7 +86,7 @@ impl RemoteStorageServiceHandler {
             .map_err(|e| Status::unauthenticated(format!("Invalid signature format: {e}")))?;
 
         verifying_key
-            .verify(&envelope.inner_payload, &signature)
+            .verify(&envelope.payload, &signature)
             .map_err(|e| Status::unauthenticated(format!("Signature verification failed: {e}")))?;
 
         Ok(node_id)

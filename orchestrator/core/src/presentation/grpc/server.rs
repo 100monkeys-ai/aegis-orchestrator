@@ -655,7 +655,7 @@ impl AegisRuntime for AegisRuntimeService {
             protocol: None,
             security_token: req.security_token,
             signature: req.signature,
-            payload: req.inner_mcp,
+            payload: req.payload,
             timestamp: None,
         };
 
@@ -1649,7 +1649,7 @@ mod tests {
             .invoke_tool(Request::new(InvokeToolRequest {
                 security_token: String::new(),
                 signature: String::new(),
-                inner_mcp: Vec::new(),
+                payload: Vec::new(),
             }))
             .await
             .expect_err("invoke_tool should reject missing tool service");

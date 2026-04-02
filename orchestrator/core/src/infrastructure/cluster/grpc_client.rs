@@ -260,20 +260,20 @@ impl NodeClusterClient {
 
     // ── Private helpers ──────────────────────────────────────────────────
 
-    /// Build an `SealNodeEnvelope` around an already-serialised inner payload.
-    async fn wrap_in_envelope(&self, inner_payload: &[u8]) -> Result<ProtoEnvelope> {
+    /// Build an `SealNodeEnvelope` around an already-serialised payload.
+    async fn wrap_in_envelope(&self, payload: &[u8]) -> Result<ProtoEnvelope> {
         let token = self.token.read().await;
         let token_str = token
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("No security token -- call attest_and_challenge first"))?
             .clone();
 
-        let signature = self.signing_key.sign(inner_payload);
+        let signature = self.signing_key.sign(payload);
 
         Ok(ProtoEnvelope {
             node_security_token: token_str,
             signature: signature.to_bytes().to_vec(),
-            inner_payload: inner_payload.to_vec(),
+            payload: payload.to_vec(),
         })
     }
 
