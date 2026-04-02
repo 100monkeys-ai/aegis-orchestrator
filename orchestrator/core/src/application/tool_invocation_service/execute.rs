@@ -98,7 +98,7 @@ impl ToolInvocationService {
             }))),
             Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.execute.intent",
-                "error": format!("Failed to start intent execution pipeline: {e}")
+                "error": format!("Failed to start intent execution pipeline: {e:#}")
             }))),
         }
     }
