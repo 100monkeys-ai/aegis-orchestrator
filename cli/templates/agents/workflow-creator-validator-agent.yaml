@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-creator-validator-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Creates workflow manifests and enforces strict deterministic + semantic validation before registration.
   labels:
     role: worker
@@ -42,6 +42,11 @@ spec:
            transition for the low-score path.
          - Transition meaning must never depend on YAML ordering.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
+         - Any workflow state whose agent writes files MUST use volumes with mount_path
+           under /workspace and security.filesystem.write paths under /workspace.
+           Writing outside /workspace is not permitted and will cause runtime failure.
+           When authoring or referencing agents that produce file artifacts, verify their
+           volume and filesystem.write configuration uses /workspace/* paths.
       4. Call `aegis.schema.validate` with {"kind": "workflow", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding. Treat this as a shape check only.

@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-generator-judge
-  version: "1.0.0"
+  version: "1.1.0"
   description: Judge agent for validating generated workflow plans and workflow manifests.
   labels:
     role: judge
@@ -73,6 +73,16 @@ spec:
         fallback with an explicit `score_below` transition.
       - Prefer bounded refinement expressed through `Agent` state `judges` and `max_iterations` rather
         than workflow graph cycles; cycles should be treated as deployability defects.
+
+      FILESYSTEM WRITE PATH AUDIT — check all agent references and any inline volume/security
+      configuration in the workflow manifest:
+      - If any referenced or inline agent configuration declares filesystem.write paths outside
+        /workspace, reduce the `correctness` score by at least 0.3 and note "filesystem.write
+        path must be under /workspace".
+      - If any volume declared in the workflow has mount_path outside /workspace, reduce the
+        `correctness` score by at least 0.3 and note "volume mount_path must be under /workspace".
+      - Workflows that reference agents known to write files should verify those agents use
+        /workspace/* paths; if this cannot be verified, flag it in the `completeness` signal.
 
       Return JSON only:
       {

@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-generator-judge
-  version: "1.0.0"
+  version: "1.1.0"
   description: Judge agent for validating generated agent manifests and generation results.
   labels:
     role: judge
@@ -48,6 +48,18 @@ spec:
       - If the sequence was `aegis.schema.get` → `aegis.schema.validate` (valid: true) → `aegis.agent.create` / `update`,
         give full credit for schema compliance.
       - Ensure `force: true` was only used if requested, otherwise version increments are expected.
+
+      FILESYSTEM WRITE PATH AUDIT — check the generated manifest and apply:
+      - If the manifest declares security.filesystem.write with any path that is not /workspace
+        or a subdirectory of /workspace (e.g., /tmp, /var, /home, /output), reduce the `safety`
+        score by at least 0.3 and note "filesystem.write path must be under /workspace".
+      - If the manifest declares a volume with mount_path outside /workspace, reduce the `safety`
+        score by at least 0.3 and note "volume mount_path must be under /workspace".
+      - If the agent's task requires writing files but no volume or filesystem.write is declared,
+        reduce the `deployability` score by at least 0.2 and note "agent writes files but declares
+        no /workspace volume — it will fail at runtime".
+      - A manifest with correct /workspace paths and volumes should receive full `safety` credit
+        for filesystem configuration.
 
       Score output quality for:
       - correctness (includes schema compliance per the tool call audit above)

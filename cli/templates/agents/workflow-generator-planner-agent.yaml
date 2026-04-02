@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-generator-planner-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Plans workflow composition by discovering existing agents and identifying missing agent capabilities.
   labels:
     role: worker
@@ -65,6 +65,11 @@ spec:
 
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
       available unless `worker_mounts` in the evaluation payload explicitly says so.
+
+      When generating prompts for missing agents or judge agents that need to write files,
+      the generation_prompts and judge_generation_prompts MUST instruct the agent-creator-agent
+      to use /workspace/* for all filesystem write paths. Writing to /tmp, /var, /home, or
+      any path outside /workspace will cause runtime failure.
 
       Return JSON only.
     prompt_template: |

@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-creator-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
   labels:
     role: worker
@@ -52,6 +52,12 @@ spec:
            agent's capability domain (e.g., "code-generation", "api-integration", "data-analysis",
            "security-review", "infrastructure-automation"). Tags must reflect what the agent does,
            not generic platform concepts. Do not reuse label values verbatim as tags.
+         - Any agent that writes files MUST declare a volume with mount_path under /workspace
+           (e.g., /workspace, /workspace/output, /workspace/cache) and set
+           security.filesystem.write to that same path or a subdirectory of /workspace.
+           Writing to /tmp, /var, /home, or any path outside /workspace is not permitted —
+           agents that do so will fail at runtime. If the user's intent requires writing
+           files, always use /workspace/* as the write path.
       6. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
