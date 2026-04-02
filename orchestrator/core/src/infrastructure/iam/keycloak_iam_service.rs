@@ -22,7 +22,7 @@ use crate::domain::node_config::{IamClaimsConfig, IamConfig, IamRealmConfig};
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -591,21 +591,15 @@ mod tests {
         let service = StandardIamService::new(&config, event_bus);
 
         assert_eq!(service.known_realms().len(), 2);
-        assert!(
-            service
-                .find_realm_by_issuer("https://auth.myzaru.com/realms/aegis-system")
-                .is_some()
-        );
-        assert!(
-            service
-                .find_realm_by_issuer("https://auth.myzaru.com/realms/zaru-consumer")
-                .is_some()
-        );
-        assert!(
-            service
-                .find_realm_by_issuer("https://unknown.com/realm")
-                .is_none()
-        );
+        assert!(service
+            .find_realm_by_issuer("https://auth.myzaru.com/realms/aegis-system")
+            .is_some());
+        assert!(service
+            .find_realm_by_issuer("https://auth.myzaru.com/realms/zaru-consumer")
+            .is_some());
+        assert!(service
+            .find_realm_by_issuer("https://unknown.com/realm")
+            .is_none());
     }
 
     #[test]
