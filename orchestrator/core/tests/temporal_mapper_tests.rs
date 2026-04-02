@@ -14,6 +14,7 @@ use aegis_orchestrator_core::application::temporal_mapper::{
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::*;
+use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 use std::collections::HashMap;
 
 #[test]
@@ -158,4 +159,89 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
         .expect("Mapping failed");
 
     assert_eq!(def.version, DEFAULT_WORKFLOW_VERSION);
+}
+
+#[test]
+fn test_spec_storage_is_mapped_to_temporal_definition() {
+    let mut states = HashMap::new();
+    states.insert(
+        StateName::new("START").unwrap(),
+        WorkflowState {
+            kind: StateKind::System {
+                command: "echo start".to_string(),
+                env: HashMap::new(),
+                workdir: None,
+            },
+            transitions: vec![],
+            timeout: None,
+        },
+    );
+
+    let workflow = Workflow::new(
+        WorkflowMetadata {
+            name: "storage-test-workflow".to_string(),
+            version: Some("1.0.0".to_string()),
+            description: None,
+            tags: vec![],
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+        },
+        WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            storage: WorkflowStorageSpec {
+                workspace: Some(WorkflowWorkspaceSpec {
+                    storage_class: WorkflowStorageClass::Ephemeral,
+                    ttl_hours: 2,
+                    size_limit_mb: 512,
+                    volume_id: None,
+                    blackboard_key: "workspace_volume_id".to_string(),
+                }),
+                shared_volumes: vec![],
+            },
+        },
+    )
+    .unwrap();
+
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+        .expect("Mapping failed");
+
+    let spec_storage = def.spec_storage.expect("spec_storage must be Some");
+    let workspace = spec_storage.workspace.expect("workspace must be Some");
+    assert_eq!(workspace.storage_class, WorkflowStorageClass::Ephemeral);
+    assert_eq!(workspace.ttl_hours, 2);
+}
+
+#[test]
+fn test_builtin_intent_to_execution_yaml_maps_spec_storage() {
+    let yaml_content = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../cli/templates/workflows/builtin-intent-to-execution.yaml"
+    ))
+    .expect("builtin YAML must be readable");
+
+    let workflow = WorkflowParser::parse_yaml(&yaml_content).expect("builtin YAML must parse");
+
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+        .expect("Mapping failed");
+
+    let spec_storage = def
+        .spec_storage
+        .as_ref()
+        .expect("spec_storage must be Some for builtin workflow");
+    let workspace = spec_storage
+        .workspace
+        .as_ref()
+        .expect("workspace must be Some for builtin workflow");
+    assert_eq!(workspace.storage_class, WorkflowStorageClass::Ephemeral);
+
+    // Round-trip through JSON
+    let json = serde_json::to_string(&def).expect("must serialize to JSON");
+    let def2: aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowDefinition =
+        serde_json::from_str(&json).expect("must deserialize from JSON");
+    assert!(
+        def2.spec_storage.is_some(),
+        "spec_storage must survive JSON round-trip"
+    );
 }

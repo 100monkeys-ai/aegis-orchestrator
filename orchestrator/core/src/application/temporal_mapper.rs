@@ -52,12 +52,10 @@ pub struct TemporalWorkflowDefinition {
     pub initial_state: String,
     pub context: HashMap<String, serde_json::Value>,
     pub states: HashMap<String, TemporalWorkflowState>,
-    /// Named volume declarations from `spec.storage.shared_volumes`
-    ///
-    /// Forwarded to the TypeScript worker so it can surface volume metadata
-    /// in the Synapse UI and pass storage-class information to provisioning hooks.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub spec_volumes: Vec<crate::domain::workflow::WorkflowVolumeSpec>,
+    /// Full storage configuration forwarded to the TypeScript worker.
+    /// Includes workspace provisioning and shared volume declarations (WORKFLOW_MANIFEST_SPEC_V1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spec_storage: Option<crate::domain::workflow::WorkflowStorageSpec>,
 }
 
 /// Individual state in Temporal workflow
@@ -244,7 +242,7 @@ impl TemporalWorkflowMapper {
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states: temporal_states,
-            spec_volumes: workflow.spec.storage.shared_volumes.clone(),
+            spec_storage: Some(workflow.spec.storage.clone()),
         })
     }
 
