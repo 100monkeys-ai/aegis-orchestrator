@@ -181,6 +181,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("fs.write", "Write content to a file at the given POSIX path in the Workspace volume. Automatically creates missing parent directories."),
     ("fs.list", "List the contents of a directory in the Workspace volume."),
     ("fs.create_dir", "Creates a new directory along with any necessary parent directories."),
+    ("fs.create.dir", "Alias for fs.create_dir. Creates a new directory along with any necessary parent directories."),
     ("fs.delete", "Deletes a file or directory."),
     ("fs.edit", "Performs an exact string replacement in a file."),
     ("fs.multi_edit", "Performs multiple sequential string replacements in a file."),
@@ -496,7 +497,7 @@ impl ToolRouter {
                         },
                         "required": ["path"]
                     }),
-                    "fs.create_dir" => json!({
+                    "fs.create_dir" | "fs.create.dir" => json!({
                         "type": "object",
                         "properties": {
                             "path": {
