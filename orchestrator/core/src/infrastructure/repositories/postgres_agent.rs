@@ -100,8 +100,7 @@ impl AgentRepository for PostgresAgentRepository {
             VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT (agent_id, version) DO UPDATE SET
                 manifest_yaml = EXCLUDED.manifest_yaml,
-                manifest_json = EXCLUDED.manifest_json,
-                created_at = now()
+                manifest_json = EXCLUDED.manifest_json
             "#,
         )
         .bind(agent.id.0)
