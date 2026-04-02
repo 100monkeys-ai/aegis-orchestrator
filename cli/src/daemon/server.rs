@@ -416,7 +416,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Ok(resolved) if !resolved.is_empty() => Some(resolved),
             Ok(_) => None,
             Err(e) => {
-                tracing::warn!("Failed to resolve NFS server host: {}. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", e);
+                tracing::debug!("Failed to resolve NFS server host: {}. NFS mounts will default to '127.0.0.1' which works for native Linux/WSL2 deployments, but will fail with 'connection refused' in Docker Desktop unless set to 'host.docker.internal'.", e);
                 None
             }
         }
