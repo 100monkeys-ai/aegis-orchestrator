@@ -44,9 +44,7 @@ pub async fn invoke_fs_tool(
         .find_by_execution_and_path(execution_id, path_arg)
         .or_else(|| volume_registry.find_primary_workspace_by_execution(execution_id))
         .ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(format!(
-                "No volume registered for execution {execution_id}"
-            ))
+            SealSessionError::NotFound(format!("No volume registered for execution {execution_id}"))
         })?;
 
     let handle = AegisFileHandle::new(vol_ctx.execution_id, vol_ctx.volume_id, "/");
@@ -65,17 +63,13 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!(
-                        "FSAL create_file error: {e}"
-                    ))
+                    SealSessionError::InternalError(format!("FSAL create_file error: {e}"))
                 })?;
 
             let bytes_written = fsal
                 .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
                 .await
-                .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!("FSAL write error: {e}"))
-                })?;
+                .map_err(|e| SealSessionError::InternalError(format!("FSAL write error: {e}")))?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
@@ -89,9 +83,7 @@ pub async fn invoke_fs_tool(
             let data = fsal
                 .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
                 .await
-                .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!("FSAL read error: {e}"))
-                })?;
+                .map_err(|e| SealSessionError::InternalError(format!("FSAL read error: {e}")))?;
 
             let content = String::from_utf8_lossy(&data).to_string();
             Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -112,11 +104,7 @@ pub async fn invoke_fs_tool(
                     &vol_ctx.policy,
                 )
                 .await
-                .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!(
-                        "FSAL readdir error: {e}"
-                    ))
-                })?;
+                .map_err(|e| SealSessionError::InternalError(format!("FSAL readdir error: {e}")))?;
 
             let entries_json: Vec<serde_json::Value> = entries
                 .iter()
@@ -144,9 +132,7 @@ pub async fn invoke_fs_tool(
                 &vol_ctx.policy,
             )
             .await
-            .map_err(|e| {
-                SealSessionError::SignatureVerificationFailed(format!("FSAL create_dir error: {e}"))
-            })?;
+            .map_err(|e| SealSessionError::InternalError(format!("FSAL create_dir error: {e}")))?;
 
             Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "status": "success",
@@ -169,9 +155,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!(
-                        "FSAL delete_directory error: {e}"
-                    ))
+                    SealSessionError::InternalError(format!("FSAL delete_directory error: {e}"))
                 })?;
             } else {
                 fsal.delete_file(
@@ -182,9 +166,7 @@ pub async fn invoke_fs_tool(
                 )
                 .await
                 .map_err(|e| {
-                    SealSessionError::SignatureVerificationFailed(format!(
-                        "FSAL delete_file error: {e}"
-                    ))
+                    SealSessionError::InternalError(format!("FSAL delete_file error: {e}"))
                 })?;
             }
 
@@ -197,7 +179,7 @@ pub async fn invoke_fs_tool(
         "fs.multi_edit" => invoke_multi_edit(args, execution_id, fsal, vol_ctx).await,
         "fs.grep" => invoke_grep(args, execution_id, fsal, vol_ctx).await,
         "fs.glob" => invoke_glob(args, execution_id, fsal, vol_ctx).await,
-        _ => Err(SealSessionError::SignatureVerificationFailed(format!(
+        _ => Err(SealSessionError::InvalidArguments(format!(
             "Unknown fs tool: {tool_name}"
         ))),
     }
@@ -226,14 +208,12 @@ async fn invoke_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!("Edit error (read): {e}"))
-        })?;
+        .map_err(|e| SealSessionError::InternalError(format!("Edit error (read): {e}")))?;
 
     let content = String::from_utf8_lossy(&data).to_string();
 
     if !content.contains(target) {
-        return Err(SealSessionError::SignatureVerificationFailed(
+        return Err(SealSessionError::InvalidArguments(
             "Target content not found in file".to_string(),
         ));
     }
@@ -241,7 +221,7 @@ async fn invoke_edit(
     // Check for multiple occurrences
     let occurrences = content.matches(target).count();
     if occurrences > 1 {
-        return Err(SealSessionError::SignatureVerificationFailed(
+        return Err(SealSessionError::InvalidArguments(
             "Target content exists multiple times in file. Be more specific.".to_string(),
         ));
     }
@@ -252,9 +232,7 @@ async fn invoke_edit(
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, new_content.as_bytes())
         .await
-        .map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!("Edit error (write): {e}"))
-        })?;
+        .map_err(|e| SealSessionError::InternalError(format!("Edit error (write): {e}")))?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
@@ -276,21 +254,16 @@ async fn invoke_multi_edit(
     let data = fsal
         .read(&handle, &path, &vol_ctx.policy, 0, 10 * 1024 * 1024)
         .await
-        .map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!("Multi-edit error (read): {e}"))
-        })?;
+        .map_err(|e| SealSessionError::InternalError(format!("Multi-edit error (read): {e}")))?;
 
-    let mut content = String::from_utf8(data).map_err(|_| {
-        SealSessionError::SignatureVerificationFailed("File is not valid UTF-8".to_string())
-    })?;
+    let mut content = String::from_utf8(data)
+        .map_err(|_| SealSessionError::InvalidArguments("File is not valid UTF-8".to_string()))?;
 
     let edits = args
         .get("edits")
         .and_then(|v| v.as_array())
         .ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
-                "Missing or invalid 'edits' array".to_string(),
-            )
+            SealSessionError::InvalidArguments("Missing or invalid 'edits' array".to_string())
         })?;
 
     let mut success_count = 0;
@@ -311,12 +284,12 @@ async fn invoke_multi_edit(
                 content = content.replace(target, replacement);
                 success_count += 1;
             } else {
-                return Err(SealSessionError::SignatureVerificationFailed(format!(
+                return Err(SealSessionError::InvalidArguments(format!(
                     "Target content '{target}' exists multiple times in file. Be more specific."
                 )));
             }
         } else {
-            return Err(SealSessionError::SignatureVerificationFailed(format!(
+            return Err(SealSessionError::InvalidArguments(format!(
                 "Target content '{target}' not found in file."
             )));
         }
@@ -336,17 +309,13 @@ async fn invoke_multi_edit(
         )
         .await
         .map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!(
-                "Multi-edit error (truncate): {e}"
-            ))
+            SealSessionError::InternalError(format!("Multi-edit error (truncate): {e}"))
         })?;
 
     let _ = fsal
         .write(&handle, &path, &vol_ctx.policy, 0, content.as_bytes())
         .await
-        .map_err(|e| {
-            SealSessionError::SignatureVerificationFailed(format!("Multi-edit error (write): {e}"))
-        })?;
+        .map_err(|e| SealSessionError::InternalError(format!("Multi-edit error (write): {e}")))?;
 
     Ok(ToolInvocationResult::Direct(serde_json::json!({
         "status": "success",
@@ -366,9 +335,8 @@ async fn invoke_grep(
     let path = to_volume_relative(&vol_ctx.mount_point, path_arg);
 
     // Parse regex
-    let regex = regex::Regex::new(pattern_str).map_err(|e| {
-        SealSessionError::SignatureVerificationFailed(format!("Invalid regex pattern: {e}"))
-    })?;
+    let regex = regex::Regex::new(pattern_str)
+        .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid regex pattern: {e}")))?;
 
     // We will do a recursive walk using AegisFSAL
     let mut matches = Vec::new();
@@ -451,9 +419,8 @@ async fn invoke_glob(
         .replace(".", "\\.")
         .replace("*", ".*")
         .replace("?", ".");
-    let regex = regex::Regex::new(&format!("^{regex_pattern}$")).map_err(|e| {
-        SealSessionError::SignatureVerificationFailed(format!("Invalid glob pattern: {e}"))
-    })?;
+    let regex = regex::Regex::new(&format!("^{regex_pattern}$"))
+        .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid glob pattern: {e}")))?;
 
     let mut matches = Vec::new();
     let mut stack = vec![path];

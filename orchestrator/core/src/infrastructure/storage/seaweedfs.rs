@@ -377,7 +377,7 @@ impl StorageProvider for SeaweedFSAdapter {
         content[offset as usize..offset as usize + data.len()].copy_from_slice(data);
 
         // Write back to SeaweedFS
-        let response = self.client.post(&url).body(content).send().await?;
+        let response = self.client.put(&url).body(content).send().await?;
 
         if response.status().is_success() {
             Ok(data.len())
@@ -475,7 +475,7 @@ impl StorageProvider for SeaweedFSAdapter {
         let url = self.build_url(path);
 
         // Create empty file
-        let response = self.client.post(&url).body(Vec::<u8>::new()).send().await?;
+        let response = self.client.put(&url).body(Vec::<u8>::new()).send().await?;
 
         if response.status().is_success() {
             let handle_data = path.as_bytes().to_vec();
