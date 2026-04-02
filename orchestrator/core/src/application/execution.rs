@@ -246,6 +246,10 @@ pub struct StandardExecutionService {
     rate_limit_resolver: Option<Arc<dyn crate::domain::rate_limit::RateLimitPolicyResolver>>,
     /// Optional swarm cancellation port for cascade-cancelling child swarms (BC-6).
     swarm_cancellation: Option<Arc<dyn crate::application::ports::SwarmCancellationPort>>,
+    /// SEAL gateway client for pre-creating sessions before container spawn (ADR-088 §A8).
+    seal_gateway_client: Option<Arc<dyn crate::application::ports::SealGatewayClient>>,
+    /// Token issuer for minting JWTs during session pre-creation (ADR-088 §A8).
+    token_issuer: Option<Arc<dyn crate::application::ports::SecurityTokenIssuerPort>>,
 }
 
 impl StandardExecutionService {
@@ -512,6 +516,8 @@ impl StandardExecutionService {
             rate_limit_enforcer: None,
             rate_limit_resolver: None,
             swarm_cancellation: None,
+            seal_gateway_client: None,
+            token_issuer: None,
         }
     }
 
@@ -579,6 +585,21 @@ impl StandardExecutionService {
         port: Arc<dyn crate::application::ports::SwarmCancellationPort>,
     ) -> Self {
         self.swarm_cancellation = Some(port);
+        self
+    }
+
+    /// Attach SEAL gateway client and token issuer for session pre-creation (ADR-088 §A8).
+    ///
+    /// When both are provided, `do_start_execution()` generates an ephemeral Ed25519
+    /// keypair, mints a JWT, POSTs the session to the SEAL gateway, and injects
+    /// `AEGIS_SEAL_PRIVATE_KEY` + `AEGIS_SEAL_TOKEN` into the container environment.
+    pub fn with_seal_session_precreation(
+        mut self,
+        gateway_client: Arc<dyn crate::application::ports::SealGatewayClient>,
+        token_issuer: Arc<dyn crate::application::ports::SecurityTokenIssuerPort>,
+    ) -> Self {
+        self.seal_gateway_client = Some(gateway_client);
+        self.token_issuer = Some(token_issuer);
         self
     }
 }
@@ -1611,6 +1632,9 @@ impl StandardExecutionService {
             3 // Default
         };
 
+        // Retain a copy before `security_context_name` is moved into the Execution (ADR-088 §A8).
+        let seal_security_context = security_context_name.clone();
+
         let mut execution = match imported_id {
             Some(id) => Execution::new_with_id(
                 id,
@@ -1644,6 +1668,87 @@ impl StandardExecutionService {
         metrics::counter!("aegis_executions_total", "kind" => "root", "status" => "started")
             .increment(1);
         metrics::gauge!("aegis_execution_active").increment(1.0);
+
+        // --- SEAL session pre-creation (ADR-088 §A8) ---
+        //
+        // Generate an ephemeral Ed25519 keypair, mint a JWT with enriched claims,
+        // POST the session to the SEAL gateway, and capture credentials for injection
+        // into the container environment. If the gateway is unreachable or the token
+        // issuer is not configured the execution proceeds — the agent can still attest
+        // manually via POST /v1/seal/attest.
+        let seal_credentials: Option<(String, String)> = if let (
+            Some(gateway_client),
+            Some(token_issuer),
+        ) =
+            (&self.seal_gateway_client, &self.token_issuer)
+        {
+            use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
+            use ed25519_dalek::SigningKey;
+
+            // 1. Generate ephemeral Ed25519 keypair
+            let signing_key = SigningKey::generate(&mut rand_core::OsRng);
+            let public_key_bytes = signing_key.verifying_key().to_bytes();
+            let public_key_b64 = STANDARD.encode(public_key_bytes);
+            let private_key_b64 = STANDARD.encode(signing_key.to_bytes());
+
+            // 2. Build and mint JWT
+            let now = chrono::Utc::now();
+            let exp = now + chrono::Duration::hours(1);
+
+            let mut claims = crate::application::ports::AttestationTokenClaims {
+                agent_id: agent_id.0.to_string(),
+                execution_id: execution_id.0.to_string(),
+                security_context: seal_security_context.clone(),
+                iss: None,
+                aud: Some(crate::application::ports::TokenAudience::Single(
+                    "aegis-agents".to_string(),
+                )),
+                exp: Some(exp.timestamp()),
+                iat: Some(now.timestamp()),
+                nbf: None,
+                jti: Some(uuid::Uuid::new_v4().to_string()),
+                scp: Some(seal_security_context.clone()),
+                wid: None,
+                tenant_id: Some(tenant_id.as_str().to_string()),
+            };
+
+            match token_issuer.issue(&mut claims) {
+                Ok(token) => {
+                    // 3. POST session to gateway
+                    let session_request = crate::application::ports::SealSessionCreateRequest {
+                        execution_id: execution_id.0.to_string(),
+                        agent_id: agent_id.0.to_string(),
+                        security_context: seal_security_context.clone(),
+                        public_key_b64: public_key_b64.clone(),
+                        security_token: token.clone(),
+                        session_status: "Active".to_string(),
+                        expires_at: exp.to_rfc3339(),
+                        allowed_tool_patterns: vec!["*".to_string()],
+                    };
+
+                    if let Err(e) = gateway_client.create_session(session_request).await {
+                        tracing::warn!(
+                            execution_id = %execution_id,
+                            error = %e,
+                            "Failed to pre-create SEAL session on gateway; agent can still attest manually"
+                        );
+                    }
+
+                    Some((private_key_b64, token))
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        execution_id = %execution_id,
+                        error = %e,
+                        "Failed to mint SEAL token for session pre-creation; agent can still attest manually"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         // 4. Spawn Runtime
         let mut env = agent.manifest.spec.env.clone();
@@ -1704,6 +1809,12 @@ impl StandardExecutionService {
             "AEGIS_MODEL_ALIAS".to_string(),
             agent.manifest.spec.runtime.model.clone(),
         );
+
+        // Inject pre-created SEAL credentials into container environment (ADR-088 §A8)
+        if let Some((private_key, token)) = seal_credentials {
+            env.insert("AEGIS_SEAL_PRIVATE_KEY".to_string(), private_key);
+            env.insert("AEGIS_SEAL_TOKEN".to_string(), token);
+        }
 
         // Convert resource limits from domain format to runtime format
         let resources = if let Some(security) = &agent.manifest.spec.security {

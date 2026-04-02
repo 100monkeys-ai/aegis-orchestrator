@@ -37,6 +37,7 @@
 pub mod attestation;
 pub mod audit;
 pub mod envelope;
+pub mod gateway_client;
 pub mod middleware;
 pub mod policy_engine;
 pub mod session_repository;

@@ -152,3 +152,30 @@ pub trait SwarmCancellationPort: Send + Sync {
     /// Returns Ok(()) if no swarm is associated or the cancellation succeeds.
     async fn cascade_cancel_for_execution(&self, execution_id: ExecutionId) -> anyhow::Result<()>;
 }
+
+/// Client for communicating with the SEAL gateway's control plane (ADR-088 §A8).
+///
+/// Pre-creates SEAL sessions on the gateway before container start so that
+/// agents have valid credentials immediately, eliminating the shared-default
+/// security context fallback.
+#[async_trait]
+pub trait SealGatewayClient: Send + Sync {
+    /// Pre-create a SEAL session on the gateway before container start.
+    async fn create_session(
+        &self,
+        request: SealSessionCreateRequest,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+/// Request to pre-create a SEAL session on the gateway (ADR-088 §A8).
+#[derive(Debug, Clone, Serialize)]
+pub struct SealSessionCreateRequest {
+    pub execution_id: String,
+    pub agent_id: String,
+    pub security_context: String,
+    pub public_key_b64: String,
+    pub security_token: String,
+    pub session_status: String,
+    pub expires_at: String,
+    pub allowed_tool_patterns: Vec<String>,
+}

@@ -1002,6 +1002,44 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         svc as Arc<dyn aegis_orchestrator_core::application::discovery_service::DiscoveryService>
     });
 
+    // Token Issuer — create early so it can be shared with both ExecutionService and AttestationService (ADR-088 §A8).
+    // AEGIS_SEAL_PRIVATE_KEY must be set to a PEM-encoded RSA private key.
+    let private_key_for_issuer = std::env::var("AEGIS_SEAL_PRIVATE_KEY").map_err(|_| {
+        anyhow::anyhow!(
+            "SEAL private key not configured: set AEGIS_SEAL_PRIVATE_KEY \
+             (PEM-encoded RSA private key; see ADR-034/ADR-035)"
+        )
+    })?;
+    let private_key_for_issuer = normalize_seal_private_key(&private_key_for_issuer);
+    let token_issuer: Arc<
+        dyn aegis_orchestrator_core::application::ports::SecurityTokenIssuerPort,
+    > = Arc::new(
+        aegis_orchestrator_core::infrastructure::seal::signature::SecurityTokenIssuer::new(
+            &private_key_for_issuer,
+            "aegis-orchestrator",
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to initialize SEAL token issuer from AEGIS_SEAL_PRIVATE_KEY: {e}"
+            )
+        })?,
+    );
+
+    // SEAL gateway client for session pre-creation (ADR-088 §A8).
+    let seal_gateway_client: Arc<
+        dyn aegis_orchestrator_core::application::ports::SealGatewayClient,
+    > = {
+        let gateway_url = std::env::var("AEGIS_SEAL_GATEWAY_URL")
+            .unwrap_or_else(|_| "http://localhost:8443".to_string());
+        let operator_token = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN").ok();
+        Arc::new(
+            aegis_orchestrator_core::infrastructure::seal::gateway_client::HttpSealGatewayClient::new(
+                gateway_url,
+                operator_token,
+            ),
+        )
+    };
+
     // Finally initialize ExecutionService now that ToolRouter is ready
     let mut execution_service_builder = StandardExecutionService::new(
         agent_service.clone(),
@@ -1028,6 +1066,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     execution_service_builder = execution_service_builder
         .with_swarm_cancellation(swarm_service.clone()
             as Arc<dyn aegis_orchestrator_core::application::ports::SwarmCancellationPort>);
+
+    // Wire SEAL session pre-creation so containers get credentials at birth (ADR-088 §A8).
+    execution_service_builder = execution_service_builder
+        .with_seal_session_precreation(seal_gateway_client, token_issuer.clone());
 
     let execution_service = Arc::new(execution_service_builder);
     // Wire the self-reference so judge agents can be spawned as child executions (ADR-016).
@@ -1127,28 +1169,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new(),
     );
 
-    // Token Issuer — AEGIS_SEAL_PRIVATE_KEY must be set to a PEM-encoded RSA private key.
-    // See aegis-config.yaml and ADR-034/ADR-035 for configuration guidance.
-    let private_key = std::env::var("AEGIS_SEAL_PRIVATE_KEY").map_err(|_| {
-        anyhow::anyhow!(
-            "SEAL private key not configured: set AEGIS_SEAL_PRIVATE_KEY \
-             (PEM-encoded RSA private key; see ADR-034/ADR-035)"
-        )
-    })?;
-    let private_key = normalize_seal_private_key(&private_key);
-    let token_issuer = Arc::new(
-        aegis_orchestrator_core::infrastructure::seal::signature::SecurityTokenIssuer::new(
-            &private_key,
-            "aegis-orchestrator",
-        )
-        .map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to initialize SEAL token issuer from AEGIS_SEAL_PRIVATE_KEY: {e}"
-            )
-        })?,
-    );
-
-    // Application Services
+    // Application Services — token_issuer was created earlier (ADR-088 §A8) and shared with ExecutionService.
     let attestation_service: Arc<
         dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
     > = Arc::new(
