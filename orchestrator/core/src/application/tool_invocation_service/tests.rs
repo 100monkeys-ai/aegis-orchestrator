@@ -1257,6 +1257,7 @@ async fn workflow_run_tool_forwards_blackboard() {
             subcommand_allowlist: None,
             domain_allowlist: None,
             max_response_size: None,
+            rate_limit: None,
         }],
         deny_list: vec![],
         metadata: crate::domain::security_context::SecurityContextMetadata {
@@ -1566,6 +1567,7 @@ async fn test_invoke_tool_execution_modes() {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             },
             Capability {
                 tool_pattern: "test_tool_remote".to_string(),
@@ -1574,6 +1576,7 @@ async fn test_invoke_tool_execution_modes() {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             },
         ],
         deny_list: vec![],
@@ -1791,6 +1794,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec!["cmd.run".to_string()],
             metadata: crate::domain::security_context::SecurityContextMetadata {
@@ -1868,6 +1872,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
                 subcommand_allowlist: None,
                 domain_allowlist: None,
                 max_response_size: None,
+                rate_limit: None,
             }],
             deny_list: vec!["aegis.workflow.delete".to_string()],
             metadata: crate::domain::security_context::SecurityContextMetadata {
@@ -1923,6 +1928,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
             subcommand_allowlist: None,
             domain_allowlist: None,
             max_response_size: None,
+            rate_limit: None,
         }],
         deny_list: vec!["aegis.workflow.delete".to_string()],
         metadata: crate::domain::security_context::SecurityContextMetadata {
@@ -2415,6 +2421,7 @@ async fn workflow_run_with_version_passes_version_through() {
             subcommand_allowlist: None,
             domain_allowlist: None,
             max_response_size: None,
+            rate_limit: None,
         }],
         deny_list: vec![],
         metadata: crate::domain::security_context::SecurityContextMetadata {

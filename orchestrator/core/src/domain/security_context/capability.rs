@@ -27,6 +27,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 
+/// Per-capability rate limit configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RateLimit {
+    /// Maximum number of calls allowed within the window.
+    pub calls: u32,
+    /// Window duration in seconds.
+    pub per_seconds: u32,
+}
+
 /// Fine-grained MCP tool permission with optional constraints.
 ///
 /// A value object within the [`super::SecurityContext`] aggregate. Multiple
@@ -53,6 +62,9 @@ pub struct Capability {
     pub domain_allowlist: Option<Vec<String>>,
     /// Maximum allowed response body size in bytes. `None` means unlimited.
     pub max_response_size: Option<u64>,
+    /// Optional per-capability rate limit. Enforcement is deferred to a later phase.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimit>,
 }
 
 impl Capability {
@@ -192,6 +204,7 @@ mod tests {
             subcommand_allowlist: Some(vec!["build".to_string(), "check".to_string()]),
             domain_allowlist: None,
             max_response_size: None,
+            rate_limit: None,
         };
 
         // Allowed: cargo build
