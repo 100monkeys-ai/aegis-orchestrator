@@ -248,7 +248,13 @@ impl TemporalWorkflowMapper {
             initial_state: workflow.spec.initial_state.as_str().to_string(),
             context: workflow.spec.context.clone(),
             states: temporal_states,
-            spec_storage: Some(workflow.spec.storage.clone()),
+            spec_storage: if workflow.spec.storage.workspace.is_some()
+                || !workflow.spec.storage.shared_volumes.is_empty()
+            {
+                Some(workflow.spec.storage.clone())
+            } else {
+                None
+            },
             scope: Some(match &workflow.scope {
                 WorkflowScope::Global => "global".to_string(),
                 WorkflowScope::Tenant => "tenant".to_string(),
