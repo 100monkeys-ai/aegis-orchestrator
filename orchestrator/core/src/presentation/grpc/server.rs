@@ -655,7 +655,7 @@ impl AegisRuntime for AegisRuntimeService {
             protocol: None,
             security_token: req.security_token,
             signature: req.signature,
-            inner_mcp: req.inner_mcp,
+            payload: req.inner_mcp,
             timestamp: None,
         };
 

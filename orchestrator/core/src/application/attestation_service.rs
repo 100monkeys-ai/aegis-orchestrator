@@ -173,8 +173,12 @@ impl AttestationServiceImpl {
             iat: Some(chrono::Utc::now().timestamp()),
             nbf: None,
             jti: Some(uuid::Uuid::new_v4().to_string()),
-            scp: Some(security_context.name.clone()),
-            wid: request.container_id.clone(),
+            sub: Some(agent_id.0.to_string()),
+            scp: security_context.name.clone(),
+            wid: request
+                .container_id
+                .clone()
+                .unwrap_or_else(|| execution_id.0.to_string()),
             tenant_id: Some(request.tenant_id.to_string()),
         };
 
@@ -214,8 +218,16 @@ impl AttestationServiceImpl {
         metrics::gauge!("aegis_seal_sessions_active").increment(1.0);
 
         // 6. Return Response
+        let expires_at = chrono::DateTime::from_timestamp(claims.exp.unwrap_or(0), 0)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        let session_id = claims.jti.clone();
+
         Ok(AttestationResponse {
+            status: "success".to_string(),
             security_token: token,
+            expires_at,
+            session_id,
         })
     }
 }
@@ -228,6 +240,7 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
         });
 
         let mut inner_claims = ContextClaims {
+            sub: claims.sub.clone(),
             agent_id: claims.agent_id.clone(),
             execution_id: claims.execution_id.clone(),
             security_context: claims.security_context.clone(),

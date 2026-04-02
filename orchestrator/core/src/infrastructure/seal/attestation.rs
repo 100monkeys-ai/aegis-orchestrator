@@ -69,9 +69,15 @@ pub struct AttestationRequest {
 /// The orchestrator's response to a successful attestation handshake.
 #[derive(Debug, Clone)]
 pub struct AttestationResponse {
+    /// Overall result status (e.g. `"success"`).
+    pub status: String,
     /// Signed JWT (`SecurityToken`) encoding `ContextClaims`.
     /// The agent must include this token in every subsequent `SealEnvelope`.
     pub security_token: String,
+    /// ISO-8601 UTC timestamp at which the token expires.
+    pub expires_at: String,
+    /// Optional session identifier for audit correlation.
+    pub session_id: Option<String>,
 }
 
 /// Service responsible for completing the SEAL attestation handshake.
