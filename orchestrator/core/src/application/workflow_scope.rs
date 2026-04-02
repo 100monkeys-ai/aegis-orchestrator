@@ -5,6 +5,7 @@
 //! Application service for promoting and demoting workflow visibility scope.
 //! Enforces authorization rules and the two-hop prohibition.
 
+pub use crate::application::scope_requester::ScopeChangeRequester;
 use crate::domain::events::WorkflowEvent;
 use crate::domain::repository::{RepositoryError, WorkflowRepository};
 use crate::domain::tenant::TenantId;
@@ -34,27 +35,6 @@ pub enum ScopeChangeError {
 
     #[error("Repository error: {0}")]
     Repository(#[from] RepositoryError),
-}
-
-/// Requester identity for authorization checks.
-pub struct ScopeChangeRequester {
-    pub user_id: String,
-    pub roles: Vec<String>,
-    pub tenant_id: TenantId,
-}
-
-impl ScopeChangeRequester {
-    pub fn has_role(&self, role: &str) -> bool {
-        self.roles.iter().any(|r| r == role)
-    }
-
-    pub fn is_operator_or_admin(&self) -> bool {
-        self.has_role("aegis:operator") || self.has_role("aegis:admin")
-    }
-
-    pub fn is_tenant_admin(&self) -> bool {
-        self.has_role("tenant:admin") || self.is_operator_or_admin()
-    }
 }
 
 pub struct WorkflowScopeService {

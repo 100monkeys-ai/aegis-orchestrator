@@ -294,6 +294,7 @@ mod tests {
             _tenant_id: &TenantId,
             manifest: AgentManifest,
             force: bool,
+            _scope: crate::domain::agent::AgentScope,
         ) -> anyhow::Result<AgentId> {
             self.deploy_agent(manifest, force).await
         }
@@ -378,6 +379,14 @@ mod tests {
             _version: &str,
         ) -> anyhow::Result<Option<AgentId>> {
             self.lookup_agent(name).await
+        }
+
+        async fn list_agents_visible_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _user_id: Option<&str>,
+        ) -> anyhow::Result<Vec<Agent>> {
+            Ok(vec![])
         }
 
         async fn list_versions_for_tenant(

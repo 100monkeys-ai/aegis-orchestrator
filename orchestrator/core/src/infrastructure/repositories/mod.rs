@@ -56,7 +56,7 @@ pub mod postgres_volume;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 
-use crate::domain::agent::{Agent, AgentId};
+use crate::domain::agent::{Agent, AgentId, AgentScope};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::repository::{
     AgentRepository, ExecutionRepository, RepositoryError, StorageEventRepository,
@@ -180,6 +180,105 @@ impl AgentRepository for InMemoryAgentRepository {
         // In-memory repo does not track version history
         Ok(Vec::new())
     }
+
+    async fn list_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Agent>, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let system_tid = TenantId::system();
+        let mut result: Vec<Agent> = Vec::new();
+        for (tid, tenant_agents) in agents.iter() {
+            for a in tenant_agents.values() {
+                let visible = match &a.scope {
+                    AgentScope::User { owner_user_id } => {
+                        tid == tenant_id
+                            && user_id
+                                .map(|u| u == owner_user_id.as_str())
+                                .unwrap_or(false)
+                    }
+                    AgentScope::Tenant => tid == tenant_id,
+                    AgentScope::Global => tid == &system_tid,
+                };
+                if visible {
+                    result.push(a.clone());
+                }
+            }
+        }
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
+    }
+
+    async fn update_scope(
+        &self,
+        id: AgentId,
+        new_scope: AgentScope,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError> {
+        let mut agents = self.agents.write().unwrap();
+        // Find and remove the agent from its current tenant bucket
+        let mut found: Option<Agent> = None;
+        for tenant_agents in agents.values_mut() {
+            if let Some(agent) = tenant_agents.remove(&id) {
+                found = Some(agent);
+                break;
+            }
+        }
+        if let Some(mut agent) = found {
+            agent.scope = new_scope;
+            agent.tenant_id = new_tenant_id.clone();
+            agents
+                .entry(new_tenant_id.clone())
+                .or_default()
+                .insert(id, agent);
+        }
+        Ok(())
+    }
+
+    async fn resolve_by_name(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let system_tid = TenantId::system();
+
+        // Priority: user-scoped > tenant-scoped > global
+        let mut user_match: Option<Agent> = None;
+        let mut tenant_match: Option<Agent> = None;
+        let mut global_match: Option<Agent> = None;
+
+        for (tid, tenant_agents) in agents.iter() {
+            for agent in tenant_agents.values().filter(|a| a.name == name) {
+                match &agent.scope {
+                    AgentScope::User { owner_user_id } => {
+                        if tid == tenant_id
+                            && user_id
+                                .map(|u| u == owner_user_id.as_str())
+                                .unwrap_or(false)
+                            && user_match.is_none()
+                        {
+                            user_match = Some(agent.clone());
+                        }
+                    }
+                    AgentScope::Tenant => {
+                        if tid == tenant_id && tenant_match.is_none() {
+                            tenant_match = Some(agent.clone());
+                        }
+                    }
+                    AgentScope::Global => {
+                        if tid == &system_tid && global_match.is_none() {
+                            global_match = Some(agent.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(user_match.or(tenant_match).or(global_match))
+    }
 }
 
 // AgentLifecycleService implementation for in-memory use
@@ -193,6 +292,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        scope: AgentScope,
     ) -> anyhow::Result<AgentId> {
         if let Some(existing) = self
             .find_by_name_for_tenant(tenant_id, &manifest.metadata.name)
@@ -219,7 +319,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
                 return Ok(updated.id);
             }
 
-            // Different version — update in place.
+            // Different version — update in place (preserve existing scope).
             let mut updated = existing.clone();
             updated.update_manifest(manifest);
             self.save_for_tenant(tenant_id, &updated)
@@ -228,7 +328,9 @@ impl AgentLifecycleService for InMemoryAgentRepository {
             return Ok(updated.id);
         }
 
-        let agent = Agent::new(manifest);
+        let mut agent = Agent::new(manifest);
+        agent.scope = scope;
+        agent.tenant_id = tenant_id.clone();
         let id = agent.id;
         self.save_for_tenant(tenant_id, &agent)
             .await
@@ -274,6 +376,16 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         self.list_all_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> anyhow::Result<Vec<Agent>> {
+        self.list_visible_for_tenant(tenant_id, user_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list visible agents: {e}"))
     }
 
     async fn lookup_agent_for_tenant(

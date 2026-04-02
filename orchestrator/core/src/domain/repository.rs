@@ -37,7 +37,7 @@
 //
 // Follows DDD Repository Pattern from AGENTS.md
 
-use crate::domain::agent::{Agent, AgentId};
+use crate::domain::agent::{Agent, AgentId, AgentScope};
 use crate::domain::execution::{Execution, ExecutionId};
 use crate::domain::tenancy::Tenant;
 use crate::domain::tenant::TenantId;
@@ -112,6 +112,26 @@ pub trait AgentRepository: Send + Sync {
         tenant_id: &TenantId,
         agent_id: AgentId,
     ) -> Result<Vec<AgentVersion>, RepositoryError>;
+
+    async fn list_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Agent>, RepositoryError>;
+
+    async fn update_scope(
+        &self,
+        id: AgentId,
+        new_scope: AgentScope,
+        new_tenant_id: &TenantId,
+    ) -> Result<(), RepositoryError>;
+
+    async fn resolve_by_name(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+        name: &str,
+    ) -> Result<Option<Agent>, RepositoryError>;
 
     /// Save agent (create or update)
     async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {

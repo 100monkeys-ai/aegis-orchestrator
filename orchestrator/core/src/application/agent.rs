@@ -19,7 +19,7 @@
 //! - Keep the service interface transport-agnostic and side-effect free beyond its repository.
 //! - Fail closed on malformed or incomplete agent definitions.
 
-use crate::domain::agent::{Agent, AgentId, AgentManifest};
+use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
 use crate::domain::repository::AgentVersion;
 use crate::domain::tenant::TenantId;
 use anyhow::Result;
@@ -41,6 +41,7 @@ pub trait AgentLifecycleService: Send + Sync {
         tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        scope: AgentScope,
     ) -> Result<AgentId>;
 
     async fn get_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent>;
@@ -55,6 +56,12 @@ pub trait AgentLifecycleService: Send + Sync {
     async fn delete_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<()>;
 
     async fn list_agents_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>>;
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Agent>>;
 
     async fn lookup_agent_for_tenant(
         &self,
@@ -82,8 +89,13 @@ pub trait AgentLifecycleService: Send + Sync {
     /// - Same name + same version already deployed and `force = false`
     /// - Database write errors
     async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
-        self.deploy_agent_for_tenant(&TenantId::local_default(), manifest, force)
-            .await
+        self.deploy_agent_for_tenant(
+            &TenantId::local_default(),
+            manifest,
+            force,
+            AgentScope::Tenant,
+        )
+        .await
     }
 
     /// Retrieve a fully-hydrated [`Agent`] by its UUID.

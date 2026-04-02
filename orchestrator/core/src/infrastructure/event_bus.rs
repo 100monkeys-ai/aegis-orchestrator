@@ -283,7 +283,8 @@ impl DomainEvent {
                 | AgentLifecycleEvent::AgentResumed { agent_id, .. }
                 | AgentLifecycleEvent::AgentUpdated { agent_id, .. }
                 | AgentLifecycleEvent::AgentRemoved { agent_id, .. }
-                | AgentLifecycleEvent::AgentFailed { agent_id, .. } => *agent_id,
+                | AgentLifecycleEvent::AgentFailed { agent_id, .. }
+                | AgentLifecycleEvent::AgentScopeChanged { agent_id, .. } => *agent_id,
             }),
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { agent_id, .. }
@@ -364,6 +365,7 @@ impl DomainEvent {
                 AgentLifecycleEvent::AgentUpdated { updated_at, .. } => *updated_at,
                 AgentLifecycleEvent::AgentRemoved { removed_at, .. } => *removed_at,
                 AgentLifecycleEvent::AgentFailed { failed_at, .. } => *failed_at,
+                AgentLifecycleEvent::AgentScopeChanged { changed_at, .. } => *changed_at,
             },
             DomainEvent::Execution(event) => match event {
                 ExecutionEvent::ExecutionStarted { started_at, .. } => *started_at,
@@ -540,6 +542,7 @@ impl DomainEvent {
                 AgentLifecycleEvent::AgentUpdated { .. } => "agent_updated",
                 AgentLifecycleEvent::AgentRemoved { .. } => "agent_removed",
                 AgentLifecycleEvent::AgentFailed { .. } => "agent_failed",
+                AgentLifecycleEvent::AgentScopeChanged { .. } => "agent_scope_changed",
             },
             DomainEvent::Execution(event) => match event {
                 ExecutionEvent::ExecutionStarted { .. } => "execution_started",
@@ -1231,6 +1234,9 @@ impl AgentEventReceiver {
                 AgentLifecycleEvent::AgentUpdated { agent_id, .. } => agent_id == &self.agent_id,
                 AgentLifecycleEvent::AgentRemoved { agent_id, .. } => agent_id == &self.agent_id,
                 AgentLifecycleEvent::AgentFailed { agent_id, .. } => agent_id == &self.agent_id,
+                AgentLifecycleEvent::AgentScopeChanged { agent_id, .. } => {
+                    agent_id == &self.agent_id
+                }
             },
             DomainEvent::Execution(e) => match e {
                 ExecutionEvent::ExecutionStarted { agent_id, .. } => agent_id == &self.agent_id,

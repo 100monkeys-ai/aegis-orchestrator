@@ -1380,6 +1380,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    let agent_scope_service = Arc::new(
+        aegis_orchestrator_core::application::agent_scope::AgentScopeService::new(
+            agent_repo.clone(),
+            event_bus.clone(),
+        ),
+    );
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1399,6 +1406,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         workflow_repo: workflow_repo.clone(),
         workflow_execution_repo: workflow_execution_repo.clone(),
         workflow_scope_service,
+        agent_scope_service,
         temporal_client_container: temporal_client_container.clone(),
         storage_event_repo: storage_event_repo.clone(),
         tool_invocation_service: tool_invocation_service.clone(),

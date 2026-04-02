@@ -37,6 +37,7 @@
 //! drives all FSM execution; Rust interacts with it exclusively via gRPC (`TemporalClient`).
 
 pub mod agent;
+pub mod agent_scope;
 pub mod attestation_service;
 pub mod cluster;
 pub mod correlated_activity_stream;
@@ -44,6 +45,7 @@ pub mod discovery_service;
 pub mod execution;
 pub mod lifecycle;
 pub mod schema_registry;
+pub mod scope_requester;
 pub mod tool_catalog;
 pub mod tool_invocation_service;
 pub mod tools;

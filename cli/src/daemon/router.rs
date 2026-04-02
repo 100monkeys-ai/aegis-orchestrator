@@ -17,7 +17,7 @@ use crate::daemon::handlers::admin::{
 use crate::daemon::handlers::agents::{
     delete_agent_handler, deploy_agent_handler, execute_agent_handler, get_agent_handler,
     list_agent_versions_handler, list_agents_handler, lookup_agent_handler,
-    stream_agent_events_handler,
+    stream_agent_events_handler, update_agent_handler, update_agent_scope_handler,
 };
 use crate::daemon::handlers::approvals::{
     approve_request_handler, get_pending_approval_handler, list_pending_approvals_handler,
@@ -88,8 +88,11 @@ pub(crate) fn create_router(
         .route("/v1/agents/{id}/versions", get(list_agent_versions_handler))
         .route(
             "/v1/agents/{id}",
-            get(get_agent_handler).delete(delete_agent_handler),
+            get(get_agent_handler)
+                .delete(delete_agent_handler)
+                .patch(update_agent_handler),
         )
+        .route("/v1/agents/{id}/scope", post(update_agent_scope_handler))
         .route("/v1/agents/lookup/{name}", get(lookup_agent_handler))
         .route("/v1/dispatch-gateway", post(dispatch_gateway_handler))
         .route(

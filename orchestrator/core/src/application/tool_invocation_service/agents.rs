@@ -66,7 +66,12 @@ impl ToolInvocationService {
 
         match self
             .agent_lifecycle
-            .deploy_agent_for_tenant(&tenant_id, manifest.clone(), force)
+            .deploy_agent_for_tenant(
+                &tenant_id,
+                manifest.clone(),
+                force,
+                crate::domain::agent::AgentScope::Tenant,
+            )
             .await
         {
             Ok(agent_id) => {

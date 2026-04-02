@@ -33,7 +33,7 @@
 //! The EventBus is currently **in-memory only** (tokio broadcast channel). Persistent
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
-use crate::domain::agent::AgentManifest;
+use crate::domain::agent::{AgentManifest, AgentScope};
 use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
@@ -236,6 +236,16 @@ pub enum AgentLifecycleEvent {
         agent_id: AgentId,
         reason: String,
         failed_at: DateTime<Utc>,
+    },
+    AgentScopeChanged {
+        agent_id: AgentId,
+        agent_name: String,
+        previous_scope: AgentScope,
+        new_scope: AgentScope,
+        previous_tenant_id: crate::domain::tenant::TenantId,
+        new_tenant_id: crate::domain::tenant::TenantId,
+        changed_by: String,
+        changed_at: DateTime<Utc>,
     },
 }
 

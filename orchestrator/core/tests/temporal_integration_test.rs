@@ -45,6 +45,7 @@ impl AgentLifecycleService for MockAgentServiceInt {
         _tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        _scope: aegis_orchestrator_core::domain::agent::AgentScope,
     ) -> anyhow::Result<AgentId> {
         self.deploy_agent(manifest, force).await
     }
@@ -125,6 +126,14 @@ impl AgentLifecycleService for MockAgentServiceInt {
         Ok(Some(AgentId(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
         )))
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> anyhow::Result<Vec<Agent>> {
+        Ok(vec![])
     }
 
     async fn list_versions_for_tenant(

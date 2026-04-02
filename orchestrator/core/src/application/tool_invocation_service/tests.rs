@@ -126,6 +126,7 @@ spec:
     Agent {
         id: AgentId::new(),
         tenant_id: crate::domain::tenant::TenantId::default(),
+        scope: crate::domain::agent::AgentScope::default(),
         name: manifest.metadata.name.clone(),
         manifest,
         status: AgentStatus::Active,
@@ -142,6 +143,7 @@ impl AgentLifecycleService for TestAgentLifecycleService {
         _tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        _scope: crate::domain::agent::AgentScope,
     ) -> Result<AgentId> {
         self.deploy_agent(manifest, force).await
     }
@@ -208,6 +210,14 @@ impl AgentLifecycleService for TestAgentLifecycleService {
         anyhow::bail!("TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test")
     }
 
+    async fn list_agents_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+
     async fn list_versions_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -228,6 +238,7 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
         _tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        _scope: crate::domain::agent::AgentScope,
     ) -> Result<AgentId> {
         self.deploy_agent(manifest, force).await
     }
@@ -297,6 +308,14 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
     ) -> Result<Option<AgentId>> {
         // Delegate to name-only lookup for existing tests
         self.lookup_agent(name).await
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<Agent>> {
+        Ok(vec![])
     }
 
     async fn list_versions_for_tenant(
@@ -2119,6 +2138,7 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
         _tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        _scope: crate::domain::agent::AgentScope,
     ) -> Result<AgentId> {
         self.deploy_agent(manifest, force).await
     }
@@ -2191,6 +2211,14 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
         version: &str,
     ) -> Result<Option<AgentId>> {
         Ok((name == self.agent_name && version == self.agent_version).then_some(self.agent_id))
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> Result<Vec<Agent>> {
+        Ok(vec![])
     }
 
     async fn list_versions_for_tenant(

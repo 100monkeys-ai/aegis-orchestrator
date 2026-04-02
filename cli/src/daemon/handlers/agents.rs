@@ -14,10 +14,10 @@ use uuid::Uuid;
 
 use aegis_orchestrator_core::application::agent::AgentLifecycleService;
 use aegis_orchestrator_core::application::execution::ExecutionService;
-use aegis_orchestrator_core::domain::agent::AgentId;
+use aegis_orchestrator_core::application::scope_requester::ScopeChangeRequester;
+use aegis_orchestrator_core::domain::agent::{AgentId, AgentScope};
 use aegis_orchestrator_core::domain::execution::ExecutionInput;
-
-use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 
 use crate::daemon::handlers::tenant_id_from_identity;
 use crate::daemon::state::AppState;
@@ -27,6 +27,8 @@ pub(crate) struct DeployAgentQuery {
     /// Set to `true` to overwrite an existing agent that has the same name and version.
     #[serde(default)]
     force: bool,
+    /// Optional scope override (user, tenant, global). Default: tenant.
+    scope: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -48,10 +50,22 @@ pub(crate) async fn deploy_agent_handler(
     Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    // SDK now re-exports core types, so no conversion needed
+
+    let agent_scope = match query.scope.as_deref() {
+        Some("user") => {
+            let sub = identity
+                .as_ref()
+                .map(|ext| ext.0.sub.clone())
+                .unwrap_or_default();
+            AgentScope::User { owner_user_id: sub }
+        }
+        Some("global") => AgentScope::Global,
+        _ => AgentScope::Tenant,
+    };
+
     match state
         .agent_service
-        .deploy_agent_for_tenant(&tenant_id, manifest, query.force)
+        .deploy_agent_for_tenant(&tenant_id, manifest, query.force, agent_scope)
         .await
     {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
@@ -172,7 +186,13 @@ pub(crate) async fn list_agents_handler(
     identity: Option<Extension<UserIdentity>>,
 ) -> Json<serde_json::Value> {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    match state.agent_service.list_agents_for_tenant(&tenant_id).await {
+    let user_id = identity.as_ref().map(|ext| ext.0.sub.as_str());
+
+    match state
+        .agent_service
+        .list_agents_visible_for_tenant(&tenant_id, user_id)
+        .await
+    {
         Ok(agents) => {
             let json_agents: Vec<serde_json::Value> = agents
                 .into_iter()
@@ -185,6 +205,8 @@ pub(crate) async fn list_agents_handler(
                         "status": format!("{:?}", agent.status).to_lowercase(),
                         "tags": agent.manifest.metadata.tags,
                         "labels": agent.manifest.metadata.labels,
+                        "scope": agent.scope.to_string(),
+                        "owner_user_id": agent.scope.owner_user_id(),
                         "created_at": agent.created_at.to_rfc3339(),
                         "updated_at": agent.updated_at.to_rfc3339(),
                         "tenant_id": agent.tenant_id.as_str(),
@@ -201,16 +223,74 @@ pub(crate) async fn delete_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+
+    // Check scope authorization before deleting
+    let aid = AgentId(agent_id);
     match state
         .agent_service
-        .delete_agent_for_tenant(&tenant_id, AgentId(agent_id))
+        .get_agent_for_tenant(&tenant_id, aid)
         .await
     {
-        Ok(_) => Json(serde_json::json!({"success": true})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(agent) => {
+            let user_id = identity
+                .as_ref()
+                .map(|ext| ext.0.sub.clone())
+                .unwrap_or_default();
+            let roles = build_roles(&identity);
+            let requester = ScopeChangeRequester {
+                user_id: user_id.clone(),
+                roles,
+                tenant_id: tenant_id.clone(),
+            };
+
+            let authorized = match &agent.scope {
+                AgentScope::Global => requester.is_operator_or_admin(),
+                AgentScope::User { owner_user_id } => {
+                    user_id == *owner_user_id || requester.is_tenant_admin()
+                }
+                AgentScope::Tenant => true,
+            };
+
+            if !authorized {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(
+                        serde_json::json!({"error": "Unauthorized: insufficient permissions to delete this agent"}),
+                    ),
+                );
+            }
+
+            match state
+                .agent_service
+                .delete_agent_for_tenant(&tenant_id, aid)
+                .await
+            {
+                Ok(_) => (StatusCode::OK, Json(serde_json::json!({"success": true}))),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                ),
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        ),
     }
+}
+
+fn build_roles(identity: &Option<Extension<UserIdentity>>) -> Vec<String> {
+    identity
+        .as_ref()
+        .map(|ext| match &ext.0.identity_kind {
+            IdentityKind::Operator { aegis_role } => vec![aegis_role.as_claim_str().to_string()],
+            IdentityKind::ServiceAccount { .. } => vec!["aegis:operator".to_string()],
+            IdentityKind::TenantUser { .. } => vec!["tenant:admin".to_string()],
+            _ => vec!["user".to_string()],
+        })
+        .unwrap_or_else(|| vec!["aegis:operator".to_string()]) // local daemon defaults to operator
 }
 
 pub(crate) async fn get_agent_handler(
@@ -234,6 +314,8 @@ pub(crate) async fn get_agent_handler(
                 "status": format!("{:?}", agent.status).to_lowercase(),
                 "tags": agent.manifest.metadata.tags,
                 "labels": agent.manifest.metadata.labels,
+                "scope": agent.scope.to_string(),
+                "owner_user_id": agent.scope.owner_user_id(),
                 "created_at": agent.created_at.to_rfc3339(),
                 "updated_at": agent.updated_at.to_rfc3339(),
                 "tenant_id": agent.tenant_id.as_str(),
@@ -281,5 +363,164 @@ pub(crate) async fn lookup_agent_handler(
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         ),
+    }
+}
+
+/// PATCH /v1/agents/:id - Update agent manifest with scope authorization check
+pub(crate) async fn update_agent_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(agent_id): Path<Uuid>,
+    Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
+) -> impl IntoResponse {
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let aid = AgentId(agent_id);
+
+    // Load agent to check scope authorization
+    match state
+        .agent_service
+        .get_agent_for_tenant(&tenant_id, aid)
+        .await
+    {
+        Ok(agent) => {
+            let user_id = identity
+                .as_ref()
+                .map(|ext| ext.0.sub.clone())
+                .unwrap_or_default();
+            let roles = build_roles(&identity);
+            let requester = ScopeChangeRequester {
+                user_id: user_id.clone(),
+                roles,
+                tenant_id: tenant_id.clone(),
+            };
+
+            let authorized = match &agent.scope {
+                AgentScope::Global => requester.is_operator_or_admin(),
+                AgentScope::User { owner_user_id } => {
+                    user_id == *owner_user_id || requester.is_tenant_admin()
+                }
+                AgentScope::Tenant => true,
+            };
+
+            if !authorized {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "Unauthorized: insufficient permissions to update this agent"})),
+                )
+                    .into_response();
+            }
+
+            match state
+                .agent_service
+                .update_agent_for_tenant(&tenant_id, aid, manifest)
+                .await
+            {
+                Ok(_) => {
+                    (StatusCode::OK, Json(serde_json::json!({"success": true}))).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Err(_) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Agent not found"})),
+        )
+            .into_response(),
+    }
+}
+
+/// POST /v1/agents/:id/scope - Change agent scope (promote/demote)
+pub(crate) async fn update_agent_scope_handler(
+    State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
+    Path(agent_id): Path<Uuid>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    use aegis_orchestrator_core::application::agent_scope::AgentScopeChangeError;
+
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let user_id = identity
+        .as_ref()
+        .map(|ext| ext.0.sub.clone())
+        .unwrap_or_default();
+
+    let roles = build_roles(&identity);
+
+    // Parse target_scope from body
+    let target_scope_str = match body.get("target_scope").and_then(|v| v.as_str()) {
+        Some(s) => s.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "missing 'target_scope' field"})),
+            )
+                .into_response();
+        }
+    };
+
+    let target_scope = match target_scope_str.as_str() {
+        "global" => AgentScope::Global,
+        "tenant" => AgentScope::Tenant,
+        "user" => AgentScope::User {
+            owner_user_id: user_id.clone(),
+        },
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant, user")})),
+            )
+                .into_response();
+        }
+    };
+
+    let aid = AgentId(agent_id);
+    let requester = ScopeChangeRequester {
+        user_id,
+        roles,
+        tenant_id,
+    };
+
+    match state
+        .agent_scope_service
+        .change_scope(aid, target_scope.clone(), &requester)
+        .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "success": true,
+                "new_scope": target_scope.to_string(),
+            })),
+        )
+            .into_response(),
+        Err(AgentScopeChangeError::NotFound) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "agent not found"})),
+        )
+            .into_response(),
+        Err(AgentScopeChangeError::Unauthorized { reason }) => (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": reason})),
+        )
+            .into_response(),
+        Err(AgentScopeChangeError::InvalidTransition { from, to }) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("invalid transition from '{from}' to '{to}': must traverse through Tenant")})),
+        )
+            .into_response(),
+        Err(AgentScopeChangeError::NameCollision { name, .. }) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": format!("name collision: agent '{name}' already exists at target scope")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
     }
 }

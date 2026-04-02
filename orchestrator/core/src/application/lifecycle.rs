@@ -22,7 +22,7 @@
 //! - Publish lifecycle state changes explicitly instead of relying on implicit side effects.
 
 use crate::application::agent::AgentLifecycleService;
-use crate::domain::agent::{Agent, AgentId, AgentManifest};
+use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
 use crate::domain::repository::AgentRepository;
 use crate::domain::tenant::TenantId;
 use anyhow::Result;
@@ -46,6 +46,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         tenant_id: &TenantId,
         manifest: AgentManifest,
         force: bool,
+        scope: AgentScope,
     ) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
@@ -72,6 +73,7 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
                 }
                 // --force: overwrite the existing agent's manifest in place,
                 // preserving its AgentId so existing execution references remain valid.
+                // Preserve the existing scope on force-overwrite.
                 let mut updated = existing.clone();
                 updated.update_manifest(manifest);
                 self.repository.save_for_tenant(tenant_id, &updated).await?;
@@ -79,14 +81,17 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             }
 
             // Different version — treat as an in-place update (new version replaces old).
+            // Preserve existing scope when updating version.
             let mut updated = existing.clone();
             updated.update_manifest(manifest);
             self.repository.save_for_tenant(tenant_id, &updated).await?;
             return Ok(updated.id);
         }
 
-        // No existing agent with this name — create a fresh one
-        let agent = Agent::new(manifest);
+        // No existing agent with this name — create a fresh one with the requested scope
+        let mut agent = Agent::new(manifest);
+        agent.scope = scope;
+        agent.tenant_id = tenant_id.clone();
         self.repository.save_for_tenant(tenant_id, &agent).await?;
 
         metrics::counter!(
@@ -136,6 +141,17 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .list_all_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        user_id: Option<&str>,
+    ) -> Result<Vec<Agent>> {
+        self.repository
+            .list_visible_for_tenant(tenant_id, user_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to list visible agents: {e}"))
     }
 
     async fn lookup_agent_for_tenant(

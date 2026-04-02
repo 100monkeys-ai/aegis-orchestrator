@@ -41,6 +41,8 @@ pub(crate) struct AppState {
     pub(crate) workflow_execution_repo: Arc<dyn WorkflowExecutionRepository>,
     pub(crate) workflow_scope_service:
         Arc<aegis_orchestrator_core::application::workflow_scope::WorkflowScopeService>,
+    pub(crate) agent_scope_service:
+        Arc<aegis_orchestrator_core::application::agent_scope::AgentScopeService>,
     pub(crate) temporal_client_container: Arc<tokio::sync::RwLock<Option<Arc<TemporalClient>>>>,
     pub(crate) storage_event_repo: Arc<dyn StorageEventRepository>,
     pub(crate) tool_invocation_service:
