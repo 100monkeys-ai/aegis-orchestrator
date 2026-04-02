@@ -116,6 +116,10 @@ pub enum SmcpSessionError {
     /// when a parameter value is semantically invalid (e.g. `cmd.run` with an empty `command`).
     /// Maps to MCP JSON-RPC error code `-32602` (Invalid params).
     InvalidArguments(String),
+    /// A requested resource (e.g. agent, execution) could not be found.
+    NotFound(String),
+    /// A required configuration value is missing or invalid.
+    ConfigurationError(String),
 }
 
 impl std::fmt::Display for SmcpSessionError {
@@ -132,6 +136,8 @@ impl std::fmt::Display for SmcpSessionError {
             Self::JudgeTimeout(msg) => write!(f, "Judge timed out: {msg}"),
             Self::InternalError(msg) => write!(f, "Internal error: {msg}"),
             Self::InvalidArguments(msg) => write!(f, "Invalid tool arguments: {msg}"),
+            Self::NotFound(msg) => write!(f, "Not found: {msg}"),
+            Self::ConfigurationError(msg) => write!(f, "Configuration error: {msg}"),
         }
     }
 }
