@@ -22,7 +22,7 @@ use crate::domain::node_config::{IamClaimsConfig, IamConfig, IamRealmConfig};
 use crate::infrastructure::event_bus::EventBus;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -249,13 +249,21 @@ impl StandardIamService {
     ) -> Result<IdentityKind, IamError> {
         match &realm.realm_kind {
             RealmKind::Consumer => {
-                let tier_value = claims
+                let tier_value = match claims
                     .extra
                     .get(&self.claims_config.zaru_tier)
                     .and_then(|v| v.as_str())
-                    .ok_or(IamError::MissingClaim {
-                        claim: self.claims_config.zaru_tier.clone(),
-                    })?;
+                {
+                    Some(v) => v,
+                    None => {
+                        tracing::warn!(
+                            sub = %claims.sub,
+                            claim = %self.claims_config.zaru_tier,
+                            "zaru_tier claim absent from token; defaulting to free tier"
+                        );
+                        "free"
+                    }
+                };
 
                 let tier = ZaruTier::from_claim(tier_value).ok_or(IamError::InvalidClaimValue {
                     claim: self.claims_config.zaru_tier.clone(),
@@ -583,15 +591,21 @@ mod tests {
         let service = StandardIamService::new(&config, event_bus);
 
         assert_eq!(service.known_realms().len(), 2);
-        assert!(service
-            .find_realm_by_issuer("https://auth.myzaru.com/realms/aegis-system")
-            .is_some());
-        assert!(service
-            .find_realm_by_issuer("https://auth.myzaru.com/realms/zaru-consumer")
-            .is_some());
-        assert!(service
-            .find_realm_by_issuer("https://unknown.com/realm")
-            .is_none());
+        assert!(
+            service
+                .find_realm_by_issuer("https://auth.myzaru.com/realms/aegis-system")
+                .is_some()
+        );
+        assert!(
+            service
+                .find_realm_by_issuer("https://auth.myzaru.com/realms/zaru-consumer")
+                .is_some()
+        );
+        assert!(
+            service
+                .find_realm_by_issuer("https://unknown.com/realm")
+                .is_none()
+        );
     }
 
     #[test]
