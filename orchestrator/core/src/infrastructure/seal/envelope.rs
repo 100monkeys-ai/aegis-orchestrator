@@ -11,17 +11,17 @@
 //! ```text
 //! SealEnvelope {
 //!     security_token: JWT (ContextClaims, signed by orchestrator)
-//!     signature:      base64(Ed25519_sign(inner_mcp, agent_private_key))
-//!     inner_mcp:      raw MCP JSON-RPC payload bytes
+//!     signature:      base64(Ed25519_sign(payload, agent_private_key))
+//!     payload:        raw MCP JSON-RPC payload bytes
 //! }
 //! ```
 //!
 //! ## Verification
 //!
 //! `SealEnvelope` implements [`crate::domain::seal_session::EnvelopeVerifier`]:
-//! - `verify_signature` decodes the signature and verifies it against `inner_mcp`
+//! - `verify_signature` decodes the signature and verifies it against `payload`
 //!   using the Ed25519 public key stored in the `SealSession`.
-//! - `extract_tool_name` / `extract_arguments` parse the `inner_mcp` JSON-RPC payload.
+//! - `extract_tool_name` / `extract_arguments` parse the `payload` JSON-RPC payload.
 //!
 //! See ADR-035 §3 (Protocol Wire Format).
 use base64::engine::general_purpose::STANDARD;
@@ -36,13 +36,13 @@ use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
 /// The outer SEAL wrapper applied to every MCP message from an agent container.
 ///
 /// An immutable value object: once constructed the fields must not be modified
-/// (the signature covers `inner_mcp` and would be invalidated by any change).
+/// (the signature covers `payload` and would be invalidated by any change).
 ///
 /// # Security
 ///
 /// The envelope achieves **non-repudiation**: the agent cannot deny having sent
 /// a particular tool call because the `signature` is an Ed25519 signature over
-/// `inner_mcp` with a key that was bound during attestation. See ADR-035 §5.3.
+/// `payload` with a key that was bound during attestation. See ADR-035 §5.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SealEnvelope {
     /// Protocol identifier for version negotiation. `None` is accepted only for
@@ -51,10 +51,10 @@ pub struct SealEnvelope {
     pub protocol: Option<String>,
     /// Signed JWT (`SecurityToken`) issued during attestation. Encodes `ContextClaims`.
     pub security_token: String,
-    /// Base64-encoded Ed25519 signature over `inner_mcp` bytes.
+    /// Base64-encoded Ed25519 signature over `payload` bytes.
     pub signature: String,
     /// Raw MCP JSON-RPC payload bytes (method + params).
-    pub inner_mcp: Vec<u8>,
+    pub payload: Vec<u8>,
     /// ISO-8601 UTC timestamp used for replay protection and canonical signing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
@@ -77,6 +77,9 @@ pub enum AudienceClaim {
 /// Standard JWT fields (`iss`, `aud`, `exp`, `iat`, `nbf`) follow RFC 7519.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClaims {
+    /// JWT subject claim — the agent principal identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
     /// AEGIS `AgentId` (UUID string) — identifies the agent that was attested.
     pub agent_id: String,
     /// AEGIS `ExecutionId` (UUID string) — binds the token to a single execution.
@@ -102,11 +105,9 @@ pub struct ContextClaims {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jti: Option<String>,
     /// Security context name (spec alias for `security_context`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub scp: Option<String>,
+    pub scp: String,
     /// Workload/container ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub wid: Option<String>,
+    pub wid: String,
     /// Execution correlation identifier (spec alias for `execution_id`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_id: Option<String>,
@@ -154,7 +155,7 @@ impl EnvelopeVerifier for SealEnvelope {
     }
 
     fn extract_tool_name(&self) -> Option<String> {
-        let payload: Value = serde_json::from_slice(&self.inner_mcp).ok()?;
+        let payload: Value = serde_json::from_slice(&self.payload).ok()?;
 
         // standard MCP tool call is `{ "method": "tools/call", "params": { "name": "..." } }`
         let method = payload.get("method")?.as_str()?;
@@ -171,7 +172,7 @@ impl EnvelopeVerifier for SealEnvelope {
     }
 
     fn extract_arguments(&self) -> Option<Value> {
-        let payload: Value = serde_json::from_slice(&self.inner_mcp).ok()?;
+        let payload: Value = serde_json::from_slice(&self.payload).ok()?;
 
         let method = payload.get("method")?.as_str()?;
         if method == "tools/call" {
@@ -200,9 +201,9 @@ impl SealEnvelope {
                     )));
                 }
 
-                canonical_message(&self.security_token, &self.inner_mcp, timestamp)
+                canonical_message(&self.security_token, &self.payload, timestamp)
             }
-            (None, None) => Ok(self.inner_mcp.clone()),
+            (None, None) => Ok(self.payload.clone()),
             _ => Err(SealSessionError::MalformedPayload(
                 "SEAL envelopes must provide both protocol and timestamp together".to_string(),
             )),
@@ -292,7 +293,7 @@ mod tests {
         let signing_key = SigningKey::from_bytes(&[1u8; 32]);
         let verifying_key = signing_key.verifying_key();
 
-        let inner_mcp_json = json!({
+        let payload_json = json!({
             "method": "tools/call",
             "params": {
                 "name": "fs.read",
@@ -302,14 +303,14 @@ mod tests {
             }
         });
 
-        let inner_mcp_bytes = serde_json::to_vec(&inner_mcp_json).unwrap();
+        let payload_bytes = serde_json::to_vec(&payload_json).unwrap();
 
         // Sign the MCP message
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let signature = signing_key.sign(
             &canonical_message(
                 "test-jwt.token.here",
-                &inner_mcp_bytes,
+                &payload_bytes,
                 parse_iso8601_timestamp(&timestamp).unwrap(),
             )
             .unwrap(),
@@ -320,7 +321,7 @@ mod tests {
             protocol: Some("seal/v1".to_string()),
             security_token: "test-jwt.token.here".to_string(),
             signature: signature_b64,
-            inner_mcp: inner_mcp_bytes.clone(),
+            payload: payload_bytes.clone(),
             timestamp: Some(timestamp),
         };
 
@@ -343,14 +344,14 @@ mod tests {
         let signing_key2 = SigningKey::from_bytes(&[3u8; 32]);
         let verifying_key2 = signing_key2.verifying_key();
 
-        let inner_mcp_bytes = b"{\"method\": \"something\"}".to_vec();
+        let payload_bytes = b"{\"method\": \"something\"}".to_vec();
 
         // Sign with key 1
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let signature = signing_key1.sign(
             &canonical_message(
                 "test.jwt",
-                &inner_mcp_bytes,
+                &payload_bytes,
                 parse_iso8601_timestamp(&timestamp).unwrap(),
             )
             .unwrap(),
@@ -361,7 +362,7 @@ mod tests {
             protocol: Some("seal/v1".to_string()),
             security_token: "test.jwt".to_string(),
             signature: signature_b64,
-            inner_mcp: inner_mcp_bytes,
+            payload: payload_bytes,
             timestamp: Some(timestamp),
         };
 

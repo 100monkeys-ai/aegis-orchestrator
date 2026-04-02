@@ -1696,6 +1696,7 @@ impl StandardExecutionService {
             let now = chrono::Utc::now();
             let exp = now + chrono::Duration::hours(1);
 
+            let container_id_str = String::new(); // populated post-start if available
             let mut claims = crate::application::ports::AttestationTokenClaims {
                 agent_id: agent_id.0.to_string(),
                 execution_id: execution_id.0.to_string(),
@@ -1708,8 +1709,13 @@ impl StandardExecutionService {
                 iat: Some(now.timestamp()),
                 nbf: None,
                 jti: Some(uuid::Uuid::new_v4().to_string()),
-                scp: Some(seal_security_context.clone()),
-                wid: None,
+                sub: Some(agent_id.0.to_string()),
+                scp: seal_security_context.clone(),
+                wid: if container_id_str.is_empty() {
+                    execution_id.0.to_string()
+                } else {
+                    container_id_str
+                },
                 tenant_id: Some(tenant_id.as_str().to_string()),
             };
 

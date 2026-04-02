@@ -243,9 +243,9 @@ pub struct NodeTokenClaims {
 /// Structurally mirrors `SealEnvelope` from ADR-035.
 pub struct SealNodeEnvelope {
     pub node_security_token: NodeSecurityToken,
-    /// Ed25519 signature over serialized `inner_payload` using node's persistent keypair
+    /// Ed25519 signature over serialized `payload` using node's persistent keypair
     pub signature: String,
-    pub inner_payload: Bytes,
+    pub payload: Bytes,
 }
 
 /// NodeCapabilityAdvertisement (Value Object)

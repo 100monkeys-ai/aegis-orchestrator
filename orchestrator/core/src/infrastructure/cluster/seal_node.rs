@@ -20,7 +20,7 @@ use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeTokenClaims, Sea
 /// `verify_envelope` which:
 /// 1. Parses the JWT to extract the `node_id` claim.
 /// 2. Looks up the node's registered public key via `NodeClusterRepository`.
-/// 3. Verifies the Ed25519 signature over `inner_payload`.
+/// 3. Verifies the Ed25519 signature over `payload`.
 /// 4. Checks that the token has not expired.
 pub struct SealNodeVerifier {
     cluster_repo: Arc<dyn NodeClusterRepository>,
@@ -45,7 +45,7 @@ impl SealNodeVerifier {
             .context("Failed to query cluster repository for peer")?
             .ok_or_else(|| anyhow::anyhow!("Node {} is not registered", node_id))?;
 
-        // 3. Verify Ed25519 signature over inner_payload
+        // 3. Verify Ed25519 signature over payload
         let public_key_bytes: [u8; 32] = peer
             .public_key
             .as_slice()
@@ -60,7 +60,7 @@ impl SealNodeVerifier {
             Signature::from_slice(sig_bytes).context("Invalid Ed25519 signature format")?;
 
         verifying_key
-            .verify(&envelope.inner_payload, &signature)
+            .verify(&envelope.payload, &signature)
             .context("Ed25519 signature verification failed")?;
 
         Ok(node_id)

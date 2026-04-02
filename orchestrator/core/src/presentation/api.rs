@@ -845,12 +845,12 @@ async fn seal_tool_invoke(
         }
     };
 
-    let inner_mcp = serde_json::to_vec(&req.payload).unwrap_or_default();
+    let payload = serde_json::to_vec(&req.payload).unwrap_or_default();
     let envelope = crate::infrastructure::seal::envelope::SealEnvelope {
         protocol: req.protocol,
         security_token: req.security_token,
         signature: req.signature,
-        inner_mcp,
+        payload,
         timestamp: req.timestamp,
     };
 

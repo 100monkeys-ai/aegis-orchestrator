@@ -68,7 +68,10 @@ pub(crate) async fn attest_seal_handler(
         Ok(res) => (
             StatusCode::OK,
             Json(serde_json::json!({
-                "security_token": res.security_token
+                "status": res.status,
+                "security_token": res.security_token,
+                "expires_at": res.expires_at,
+                "session_id": res.session_id,
             })),
         )
             .into_response(),
@@ -92,7 +95,7 @@ pub(crate) async fn invoke_seal_handler(
         protocol: request.protocol,
         security_token: request.security_token,
         signature: request.signature,
-        inner_mcp: payload_bytes,
+        payload: payload_bytes,
         timestamp: request.timestamp,
     };
 

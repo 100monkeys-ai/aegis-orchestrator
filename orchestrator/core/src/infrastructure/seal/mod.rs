@@ -25,7 +25,7 @@
 //!   └─ AttestationRequest { public_key, container_id }
 //!         └─ AttestationService::attest() → SecurityToken (JWT)
 //! Agent container (per tool call)
-//!   └─ SealEnvelope { security_token, Ed25519(signature), inner_mcp }
+//!   └─ SealEnvelope { security_token, Ed25519(signature), payload }
 //!         └─ SealMiddleware::verify_and_unwrap()
 //!               └─ SealSession::evaluate_call()
 //!                     ├─ check session status

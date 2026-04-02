@@ -98,8 +98,9 @@ pub struct AttestationTokenClaims {
     pub iat: Option<i64>,
     pub nbf: Option<i64>,
     pub jti: Option<String>,
-    pub scp: Option<String>,
-    pub wid: Option<String>,
+    pub sub: Option<String>,
+    pub scp: String,
+    pub wid: String,
     pub tenant_id: Option<String>,
 }
 
