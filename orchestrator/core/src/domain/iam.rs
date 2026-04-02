@@ -22,7 +22,7 @@
 //! - `UserIdentity` is **never persisted** — reconstructed from JWT on every request.
 //! - `ZaruTier` is owned by BC-13 (IAM) and sourced from a OIDC custom claim.
 //!   Previously defined on `ZaruSession` in BC-12; the source of truth has moved.
-//! - SMCP agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
+//! - SEAL agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
 //!   OIDC is for human and service-account identities only.
 
 use async_trait::async_trait;
@@ -103,7 +103,7 @@ pub struct UserIdentity {
 }
 
 impl UserIdentity {
-    /// Derive the SMCP SecurityContext name from this identity (ADR-083).
+    /// Derive the SEAL SecurityContext name from this identity (ADR-083).
     ///
     /// - Consumer users map to their Zaru tier context (`zaru-free`, `zaru-pro`, …).
     /// - Operators and service accounts map to `aegis-system-operator`.
@@ -134,7 +134,7 @@ pub enum IdentityKind {
 }
 
 /// ZaruTier is owned by BC-13 (IAM) and sourced from a OIDC custom claim.
-/// Maps to SMCP SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
+/// Maps to SEAL SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ZaruTier {
     Free,
@@ -144,7 +144,7 @@ pub enum ZaruTier {
 }
 
 impl ZaruTier {
-    /// Map to SMCP SecurityContext name (consumed by ZaruAuthMiddleware → AttestationService).
+    /// Map to SEAL SecurityContext name (consumed by ZaruAuthMiddleware → AttestationService).
     pub fn to_security_context_name(&self) -> &'static str {
         match self {
             ZaruTier::Free => "zaru-free",
@@ -154,7 +154,7 @@ impl ZaruTier {
         }
     }
 
-    /// Derive from a SMCP SecurityContext name.
+    /// Derive from a SEAL SecurityContext name.
     ///
     /// Returns `None` for non-Zaru contexts (e.g. `aegis-system-operator`).
     pub fn from_security_context_name(name: &str) -> Option<ZaruTier> {

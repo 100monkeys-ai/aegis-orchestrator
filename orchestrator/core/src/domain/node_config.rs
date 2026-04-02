@@ -151,15 +151,15 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secrets: Option<SecretsConfig>,
 
-    /// SMCP protocol configuration (ADR-035)
+    /// SEAL protocol configuration (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub smcp: Option<SmcpConfig>,
+    pub seal: Option<SealConfig>,
 
     /// Cluster configuration (ADR-059)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cluster: Option<ClusterConfig>,
 
-    /// Named security contexts for SMCP (ADR-035)
+    /// Named security contexts for SEAL (ADR-035)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_contexts: Option<Vec<SecurityContextDefinition>>,
 
@@ -173,10 +173,10 @@ pub struct NodeConfigSpec {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_auth: Option<GrpcAuthConfig>,
 
-    /// External SMCP tooling gateway configuration (ADR-053).
+    /// External SEAL tooling gateway configuration (ADR-053).
     /// If omitted, orchestrator does not forward unknown tools to the gateway.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub smcp_gateway: Option<SmcpGatewayConfig>,
+    pub seal_gateway: Option<SealGatewayConfig>,
 
     /// Whether to deploy vendored built-in agent and workflow templates on startup.
     /// Includes agent-creator-agent, workflow-generator-planner-agent, judge agents, etc.
@@ -1057,39 +1057,39 @@ fn default_secret_backend_secret_id_env_var() -> String {
     "OPENBAO_SECRET_ID".to_string()
 }
 
-/// SMCP protocol configuration (ADR-035 §6)
+/// SEAL protocol configuration (ADR-035 §6)
 ///
 /// Defines the RSA key material used by the orchestrator to sign and verify
-/// SecurityTokens (JWTs) during the SMCP attestation handshake.
+/// SecurityTokens (JWTs) during the SEAL attestation handshake.
 ///
 /// Signing keys are loaded from PEM files on disk (paths specified by
 /// `private_key_path` and `public_key_path`). The private key material
 /// is read once at startup into process memory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmcpConfig {
+pub struct SealConfig {
     /// Path to RSA private key PEM file (for signing SecurityTokens).
     pub private_key_path: String,
     /// Path to RSA public key PEM file (for verifying SecurityTokens).
     pub public_key_path: String,
     /// JWT issuer claim (e.g. `"aegis-orchestrator"`).
-    #[serde(default = "default_smcp_issuer")]
+    #[serde(default = "default_seal_issuer")]
     pub issuer: String,
     /// JWT audience claim(s).
-    #[serde(default = "default_smcp_audiences")]
+    #[serde(default = "default_seal_audiences")]
     pub audiences: Vec<String>,
     /// SecurityToken TTL in seconds. Default: 3600 (1 hour).
-    #[serde(default = "default_smcp_token_ttl")]
+    #[serde(default = "default_seal_token_ttl")]
     pub token_ttl_seconds: u64,
 }
 
-impl Default for SmcpConfig {
+impl Default for SealConfig {
     fn default() -> Self {
         Self {
             private_key_path: String::new(),
             public_key_path: String::new(),
-            issuer: default_smcp_issuer(),
-            audiences: default_smcp_audiences(),
-            token_ttl_seconds: default_smcp_token_ttl(),
+            issuer: default_seal_issuer(),
+            audiences: default_seal_audiences(),
+            token_ttl_seconds: default_seal_token_ttl(),
         }
     }
 }
@@ -1293,11 +1293,11 @@ pub struct GrpcAuthConfig {
     pub exempt_methods: Vec<String>,
 }
 
-/// Standalone SMCP tooling gateway endpoint configuration (ADR-053).
+/// Standalone SEAL tooling gateway endpoint configuration (ADR-053).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SmcpGatewayConfig {
+pub struct SealGatewayConfig {
     /// gRPC endpoint URL of the gateway invocation service.
-    /// Example: "http://aegis-smcp-gateway:50055"
+    /// Example: "http://aegis-seal-gateway:50055"
     pub url: String,
 }
 
@@ -1413,13 +1413,13 @@ fn default_cpu_millicores() -> u32 {
 fn default_memory_mb() -> u32 {
     512
 }
-fn default_smcp_issuer() -> String {
+fn default_seal_issuer() -> String {
     "aegis-orchestrator".to_string()
 }
-fn default_smcp_audiences() -> Vec<String> {
+fn default_seal_audiences() -> Vec<String> {
     vec!["aegis-agents".to_string()]
 }
-fn default_smcp_token_ttl() -> u64 {
+fn default_seal_token_ttl() -> u64 {
     3600
 }
 fn default_db_max_connections() -> u32 {
@@ -1489,12 +1489,12 @@ impl Default for NodeConfigSpec {
             temporal: None,
             cortex: None,
             secrets: None,
-            smcp: None,
+            seal: None,
             cluster: None,
             security_contexts: None,
             iam: None,
             grpc_auth: None,
-            smcp_gateway: None,
+            seal_gateway: None,
             image_tag: None,
             deploy_builtins: false,
             max_execution_list_limit: None,
@@ -1868,8 +1868,8 @@ impl NodeConfigManifest {
                 anyhow::bail!("Production nodes must configure spec.database");
             }
 
-            if self.spec.smcp.is_none() {
-                anyhow::bail!("Production nodes must configure spec.smcp");
+            if self.spec.seal.is_none() {
+                anyhow::bail!("Production nodes must configure spec.seal");
             }
 
             if self.spec.iam.is_none() {
@@ -1999,13 +1999,13 @@ mod tests {
                 secrets: None,
                 mcp_servers: None,
                 builtin_dispatchers: None,
-                smcp: None,
+                seal: None,
                 cluster: None,
                 security_contexts: None,
                 registry_credentials: vec![],
                 iam: None,
                 grpc_auth: None,
-                smcp_gateway: None,
+                seal_gateway: None,
                 image_tag: None,
                 deploy_builtins: false,
                 max_execution_list_limit: None,

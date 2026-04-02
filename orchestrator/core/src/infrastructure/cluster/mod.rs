@@ -9,7 +9,7 @@ pub mod grpc_server;
 pub mod node_registry_repo;
 pub mod postgres_repo;
 pub mod round_robin_router;
-pub mod smcp_node;
+pub mod seal_node;
 
 pub use config_repo::PgConfigLayerRepository;
 pub use grpc_client::NodeClusterClient;
@@ -19,4 +19,4 @@ pub use postgres_repo::{
     PgNodeChallengeRepository, PgNodeClusterRepository, PgStimulusIdempotencyRepository,
 };
 pub use round_robin_router::RoundRobinNodeRouter;
-pub use smcp_node::SmcpNodeVerifier;
+pub use seal_node::SealNodeVerifier;

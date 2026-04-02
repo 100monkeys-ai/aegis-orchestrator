@@ -1,7 +1,7 @@
 use crate::application::ports::{ExternalWebToolPort, WebFetchRequest, WebSearchRequest};
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
 
 pub async fn invoke_web_tool(
@@ -9,7 +9,7 @@ pub async fn invoke_web_tool(
     args: &Value,
     _execution_id: ExecutionId,
     web_port: &dyn ExternalWebToolPort,
-) -> Result<ToolInvocationResult, SmcpSessionError> {
+) -> Result<ToolInvocationResult, SealSessionError> {
     match tool_name {
         "web.search" => {
             let query = args
@@ -54,7 +54,7 @@ pub async fn invoke_web_tool(
                 })
                 .await
         }
-        _ => Err(SmcpSessionError::SignatureVerificationFailed(format!(
+        _ => Err(SealSessionError::SignatureVerificationFailed(format!(
             "Unknown web tool: {tool_name}"
         ))),
     }

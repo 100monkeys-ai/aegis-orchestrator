@@ -644,12 +644,12 @@ mod tests {
     fn parse_compose_ps_output_supports_json_lines() {
         let rows = parse_compose_ps_output(
             "{\"Name\":\"aegis-postgres\",\"Service\":\"postgres\",\"State\":\"running\",\"Health\":\"healthy\"}\n\
-             {\"Name\":\"aegis-smcp-gateway\",\"Service\":\"aegis-smcp-gateway\",\"State\":\"running\",\"Health\":\"\"}",
+             {\"Name\":\"aegis-seal-gateway\",\"Service\":\"aegis-seal-gateway\",\"State\":\"running\",\"Health\":\"\"}",
         )
         .expect("parse json lines");
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1].service, "aegis-smcp-gateway");
+        assert_eq!(rows[1].service, "aegis-seal-gateway");
     }
 
     #[test]

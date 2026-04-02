@@ -65,7 +65,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
     AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
-    LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SecretEvent, SmcpEvent,
+    LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SealEvent, SecretEvent,
     StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent, VolumeEvent,
     WorkflowEvent,
 };
@@ -86,7 +86,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Volume(_) => "volume",
         DomainEvent::Storage(_) => "storage",
         DomainEvent::MCP(_) => "mcp",
-        DomainEvent::Smcp(_) => "smcp",
+        DomainEvent::Seal(_) => "seal",
         DomainEvent::Stimulus(_) => "stimulus",
         DomainEvent::ImageManagement(_) => "image_management",
         DomainEvent::Iam(_) => "iam",
@@ -112,7 +112,7 @@ pub enum DomainEvent {
     Volume(VolumeEvent),
     Storage(StorageEvent),
     MCP(MCPToolEvent),
-    Smcp(SmcpEvent),
+    Seal(SealEvent),
     /// BC-8 Stimulus-Response events (ADR-021)
     Stimulus(StimulusEvent),
     /// BC-2 container image pull lifecycle events (ADR-045)
@@ -230,11 +230,11 @@ impl DomainEvent {
                 | MCPToolEvent::ServerFailed { .. }
                 | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
-            DomainEvent::Smcp(event) => match event {
-                SmcpEvent::AttestationCompleted { execution_id, .. }
-                | SmcpEvent::SessionCreated { execution_id, .. }
-                | SmcpEvent::PolicyViolationBlocked { execution_id, .. } => Some(*execution_id),
-                SmcpEvent::SessionRevoked { .. } => None,
+            DomainEvent::Seal(event) => match event {
+                SealEvent::AttestationCompleted { execution_id, .. }
+                | SealEvent::SessionCreated { execution_id, .. }
+                | SealEvent::PolicyViolationBlocked { execution_id, .. } => Some(*execution_id),
+                SealEvent::SessionRevoked { .. } => None,
             },
             DomainEvent::ImageManagement(event) => Some(match event {
                 ImageManagementEvent::ImagePullStarted { execution_id, .. }
@@ -331,11 +331,11 @@ impl DomainEvent {
                 | MCPToolEvent::ServerFailed { .. }
                 | MCPToolEvent::ServerUnhealthy { .. } => None,
             },
-            DomainEvent::Smcp(event) => Some(match event {
-                SmcpEvent::AttestationCompleted { agent_id, .. }
-                | SmcpEvent::SessionCreated { agent_id, .. }
-                | SmcpEvent::SessionRevoked { agent_id, .. }
-                | SmcpEvent::PolicyViolationBlocked { agent_id, .. } => *agent_id,
+            DomainEvent::Seal(event) => Some(match event {
+                SealEvent::AttestationCompleted { agent_id, .. }
+                | SealEvent::SessionCreated { agent_id, .. }
+                | SealEvent::SessionRevoked { agent_id, .. }
+                | SealEvent::PolicyViolationBlocked { agent_id, .. } => *agent_id,
             }),
             DomainEvent::Stimulus(_) | DomainEvent::ImageManagement(_) | DomainEvent::Iam(_) => {
                 None
@@ -454,11 +454,11 @@ impl DomainEvent {
                 MCPToolEvent::InvocationFailed { failed_at, .. } => *failed_at,
                 MCPToolEvent::PolicyViolation { blocked_at, .. } => *blocked_at,
             },
-            DomainEvent::Smcp(event) => match event {
-                SmcpEvent::AttestationCompleted { attested_at, .. } => *attested_at,
-                SmcpEvent::SessionCreated { created_at, .. } => *created_at,
-                SmcpEvent::SessionRevoked { revoked_at, .. } => *revoked_at,
-                SmcpEvent::PolicyViolationBlocked { blocked_at, .. } => *blocked_at,
+            DomainEvent::Seal(event) => match event {
+                SealEvent::AttestationCompleted { attested_at, .. } => *attested_at,
+                SealEvent::SessionCreated { created_at, .. } => *created_at,
+                SealEvent::SessionRevoked { revoked_at, .. } => *revoked_at,
+                SealEvent::PolicyViolationBlocked { blocked_at, .. } => *blocked_at,
             },
             DomainEvent::Stimulus(event) => match event {
                 StimulusEvent::StimulusReceived { received_at, .. } => *received_at,
@@ -632,11 +632,11 @@ impl DomainEvent {
                 MCPToolEvent::InvocationFailed { .. } => "tool_invocation_failed",
                 MCPToolEvent::PolicyViolation { .. } => "tool_policy_violation",
             },
-            DomainEvent::Smcp(event) => match event {
-                SmcpEvent::AttestationCompleted { .. } => "smcp_attestation_completed",
-                SmcpEvent::SessionCreated { .. } => "smcp_session_created",
-                SmcpEvent::SessionRevoked { .. } => "smcp_session_revoked",
-                SmcpEvent::PolicyViolationBlocked { .. } => "smcp_policy_violation_blocked",
+            DomainEvent::Seal(event) => match event {
+                SealEvent::AttestationCompleted { .. } => "seal_attestation_completed",
+                SealEvent::SessionCreated { .. } => "seal_session_created",
+                SealEvent::SessionRevoked { .. } => "seal_session_revoked",
+                SealEvent::PolicyViolationBlocked { .. } => "seal_policy_violation_blocked",
             },
             DomainEvent::Stimulus(event) => match event {
                 StimulusEvent::StimulusReceived { .. } => "stimulus_received",
@@ -715,7 +715,7 @@ impl DomainEvent {
             DomainEvent::Volume(_) => "volume",
             DomainEvent::Storage(_) => "storage",
             DomainEvent::MCP(_) => "mcp",
-            DomainEvent::Smcp(_) => "smcp",
+            DomainEvent::Seal(_) => "seal",
             DomainEvent::Stimulus(_) => "stimulus",
             DomainEvent::ImageManagement(_) => "image_management",
             DomainEvent::Iam(_) => "iam",
@@ -809,7 +809,7 @@ impl DomainEvent {
             }),
             DomainEvent::Workflow(_) => Some("workflow"),
             DomainEvent::Learning(_) => Some("learning"),
-            DomainEvent::Policy(_) | DomainEvent::Smcp(_) => Some("security"),
+            DomainEvent::Policy(_) | DomainEvent::Seal(_) => Some("security"),
             DomainEvent::Volume(_) | DomainEvent::Storage(_) => Some("storage"),
             DomainEvent::MCP(_) => Some("tooling"),
             DomainEvent::Stimulus(_) => Some("stimulus"),
@@ -882,9 +882,9 @@ impl EventBus {
         self.publish(DomainEvent::MCP(event));
     }
 
-    /// Publish an SMCP session/security event (ADR-035)
-    pub fn publish_smcp_event(&self, event: SmcpEvent) {
-        self.publish(DomainEvent::Smcp(event));
+    /// Publish an SEAL session/security event (ADR-035)
+    pub fn publish_seal_event(&self, event: SealEvent) {
+        self.publish(DomainEvent::Seal(event));
     }
 
     /// Publish a stimulus ingestion/routing event (BC-8 ADR-021)
@@ -1288,11 +1288,11 @@ impl AgentEventReceiver {
                 | MCPToolEvent::ServerUnhealthy { .. }
                 | MCPToolEvent::InvocationStarted { .. } => false,
             },
-            DomainEvent::Smcp(e) => match e {
-                SmcpEvent::AttestationCompleted { agent_id, .. } => agent_id == &self.agent_id,
-                SmcpEvent::SessionCreated { agent_id, .. } => agent_id == &self.agent_id,
-                SmcpEvent::SessionRevoked { agent_id, .. } => agent_id == &self.agent_id,
-                SmcpEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
+            DomainEvent::Seal(e) => match e {
+                SealEvent::AttestationCompleted { agent_id, .. } => agent_id == &self.agent_id,
+                SealEvent::SessionCreated { agent_id, .. } => agent_id == &self.agent_id,
+                SealEvent::SessionRevoked { agent_id, .. } => agent_id == &self.agent_id,
+                SealEvent::PolicyViolationBlocked { agent_id, .. } => agent_id == &self.agent_id,
             },
             DomainEvent::Stimulus(_) => false, // Stimulus events are system-wide, not per-agent
             DomainEvent::ImageManagement(_) => false, // Image management events are system-wide, not per-agent

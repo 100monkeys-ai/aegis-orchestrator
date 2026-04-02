@@ -144,8 +144,8 @@ services:
       # - AEGIS_NFS_HOST=${AEGIS_NFS_HOST}
       # Keep agent container after execution (for debugging)
       - AEGIS_KEEP_CONTAINER=${AEGIS_KEEP_CONTAINER:-false}
-      # Orchestrator SMCP token signing key (PEM with \n escapes from .env)
-      - AEGIS_SMCP_PRIVATE_KEY=${AEGIS_SMCP_PRIVATE_KEY}
+      # Orchestrator SEAL token signing key (PEM with \n escapes from .env)
+      - AEGIS_SEAL_PRIVATE_KEY=${AEGIS_SEAL_PRIVATE_KEY}
       # Local-host storage mount point — must match the bind-mount target below
       - AEGIS_LOCAL_HOST_MOUNT_POINT=/tmp/aegis-volumes
       # LLM provider API keys (referenced by spec.llm_providers[*].api_key)
@@ -179,33 +179,33 @@ services:
     restart: unless-stopped
 
   # ============================================================================
-  # SMCP Tooling Gateway (ADR-053)
+  # SEAL Tooling Gateway (ADR-053)
   # ============================================================================
 
-  aegis-smcp-gateway:
-    image: ghcr.io/100monkeys-ai/aegis-smcp-gateway:{{AEGIS_IMAGE_TAG}}
-    container_name: aegis-smcp-gateway
-    profiles: [smcp-gateway]
+  aegis-seal-gateway:
+    image: ghcr.io/100monkeys-ai/aegis-seal-gateway:{{AEGIS_IMAGE_TAG}}
+    container_name: aegis-seal-gateway
+    profiles: [seal-gateway]
     depends_on:
       postgres:
         condition: service_healthy
     environment:
       - RUST_LOG=info
-      - SMCP_GATEWAY_BIND=0.0.0.0:8089
-      - SMCP_GATEWAY_GRPC_BIND=0.0.0.0:50055
-      - SMCP_GATEWAY_DB=sqlite:///app/data/gateway.db
-      - SMCP_GATEWAY_AUTH_DISABLED=true
+      - SEAL_GATEWAY_BIND=0.0.0.0:8089
+      - SEAL_GATEWAY_GRPC_BIND=0.0.0.0:50055
+      - SEAL_GATEWAY_DB=sqlite:///app/data/gateway.db
+      - SEAL_GATEWAY_AUTH_DISABLED=true
       # NFS host for the CliEngine — mirrors AEGIS_NFS_HOST set in .env.
       # Linux native / WSL2 → 127.0.0.1  |  Docker Desktop → host.docker.internal
-      - SMCP_GATEWAY_NFS_HOST=${AEGIS_NFS_HOST:-127.0.0.1}
+      - SEAL_GATEWAY_NFS_HOST=${AEGIS_NFS_HOST:-127.0.0.1}
     ports:
       - "8089:8089"   # HTTP REST API + Management UI (http://localhost:8089/)
       - "50055:50055" # gRPC API
     networks:
       - aegis-network
     volumes:
-      - smcp-gateway-data:/app/data
-      - ./smcp-gateway-config.yaml:/etc/aegis/smcp-gateway-config.yaml
+      - seal-gateway-data:/app/data
+      - ./seal-gateway-config.yaml:/etc/aegis/seal-gateway-config.yaml
     restart: unless-stopped
 
   # ============================================================================
@@ -419,5 +419,5 @@ volumes:
     driver: local
   keycloak-data:
     driver: local
-  smcp-gateway-data:
+  seal-gateway-data:
     driver: local

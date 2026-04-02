@@ -38,8 +38,8 @@ impl PostgresWindowEnforcer {
 
     fn resource_type_str(resource_type: &RateLimitResourceType) -> String {
         match resource_type {
-            RateLimitResourceType::SmcpToolCall { tool_pattern } => {
-                format!("smcp_tool:{tool_pattern}")
+            RateLimitResourceType::SealToolCall { tool_pattern } => {
+                format!("seal_tool:{tool_pattern}")
             }
             RateLimitResourceType::AgentExecution => "agent_execution".into(),
             RateLimitResourceType::WorkflowExecution => "workflow_execution".into(),

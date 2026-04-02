@@ -25,7 +25,7 @@ pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
 fn is_tenant_exempt(path: &str) -> bool {
     path == "/health"
         || path.starts_with("/v1/dispatch-gateway")
-        || path.starts_with("/v1/smcp/")
+        || path.starts_with("/v1/seal/")
         || path.starts_with("/v1/webhooks/")
         || path == "/v1/temporal-events"
 }
@@ -154,8 +154,8 @@ mod tests {
         assert!(is_tenant_exempt("/health"));
         assert!(is_tenant_exempt("/v1/dispatch-gateway"));
         assert!(is_tenant_exempt("/v1/dispatch-gateway/abc"));
-        assert!(is_tenant_exempt("/v1/smcp/attest"));
-        assert!(is_tenant_exempt("/v1/smcp/invoke"));
+        assert!(is_tenant_exempt("/v1/seal/attest"));
+        assert!(is_tenant_exempt("/v1/seal/invoke"));
         assert!(is_tenant_exempt("/v1/webhooks/github"));
         assert!(is_tenant_exempt("/v1/temporal-events"));
         assert!(!is_tenant_exempt("/v1/executions"));

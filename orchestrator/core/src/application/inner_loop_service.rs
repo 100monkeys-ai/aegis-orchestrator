@@ -474,14 +474,14 @@ impl InnerLoopService {
                                 //   - SessionInactive: session expired or revoked
                                 //   - NotFound: missing agent/resource (e.g. judge agent not found)
                                 //   - ConfigurationError: misconfigured security context or gateway
-                                use crate::domain::smcp_session::SmcpSessionError;
+                                use crate::domain::seal_session::SealSessionError;
                                 let is_fatal = matches!(
                                     &e,
-                                    SmcpSessionError::SignatureVerificationFailed(_)
-                                        | SmcpSessionError::PolicyViolation(_)
-                                        | SmcpSessionError::SessionInactive(_)
-                                        | SmcpSessionError::NotFound(_)
-                                        | SmcpSessionError::ConfigurationError(_)
+                                    SealSessionError::SignatureVerificationFailed(_)
+                                        | SealSessionError::PolicyViolation(_)
+                                        | SealSessionError::SessionInactive(_)
+                                        | SealSessionError::NotFound(_)
+                                        | SealSessionError::ConfigurationError(_)
                                 );
 
                                 if is_fatal {

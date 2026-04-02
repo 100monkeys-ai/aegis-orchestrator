@@ -43,7 +43,7 @@ impl RateLimitBucket {
 /// Resource types subject to rate limiting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RateLimitResourceType {
-    SmcpToolCall { tool_pattern: String },
+    SealToolCall { tool_pattern: String },
     AgentExecution,
     WorkflowExecution,
     LlmCall,
@@ -199,13 +199,13 @@ fn mk_policy(
 fn discovery_search_policies(searches_per_hour: u64) -> Vec<RateLimitPolicy> {
     vec![
         mk_policy(
-            RateLimitResourceType::SmcpToolCall {
+            RateLimitResourceType::SealToolCall {
                 tool_pattern: "aegis.agent.search".into(),
             },
             hourly_only(searches_per_hour),
         ),
         mk_policy(
-            RateLimitResourceType::SmcpToolCall {
+            RateLimitResourceType::SealToolCall {
                 tool_pattern: "aegis.workflow.search".into(),
             },
             hourly_only(searches_per_hour),
@@ -213,22 +213,22 @@ fn discovery_search_policies(searches_per_hour: u64) -> Vec<RateLimitPolicy> {
     ]
 }
 
-fn smcp_policies(fs: u64, web_search: u64, other: u64) -> Vec<RateLimitPolicy> {
+fn seal_policies(fs: u64, web_search: u64, other: u64) -> Vec<RateLimitPolicy> {
     vec![
         mk_policy(
-            RateLimitResourceType::SmcpToolCall {
+            RateLimitResourceType::SealToolCall {
                 tool_pattern: "fs_*".into(),
             },
             per_minute_only(fs),
         ),
         mk_policy(
-            RateLimitResourceType::SmcpToolCall {
+            RateLimitResourceType::SealToolCall {
                 tool_pattern: "web_search".into(),
             },
             per_minute_only(web_search),
         ),
         mk_policy(
-            RateLimitResourceType::SmcpToolCall {
+            RateLimitResourceType::SealToolCall {
                 tool_pattern: "*".into(),
             },
             per_minute_only(other),
@@ -255,7 +255,7 @@ fn free_defaults() -> Vec<RateLimitPolicy> {
             full_windows(20_000, 100_000, 500_000, 2_500_000, 5_000_000),
         ),
     ];
-    p.extend(smcp_policies(60, 20, 30));
+    p.extend(seal_policies(60, 20, 30));
     p.extend(discovery_search_policies(30));
     p
 }
@@ -279,7 +279,7 @@ fn pro_defaults() -> Vec<RateLimitPolicy> {
             full_windows(100_000, 500_000, 3_000_000, 15_000_000, 30_000_000),
         ),
     ];
-    p.extend(smcp_policies(300, 60, 120));
+    p.extend(seal_policies(300, 60, 120));
     p.extend(discovery_search_policies(300));
     p
 }
@@ -303,7 +303,7 @@ fn business_defaults() -> Vec<RateLimitPolicy> {
             full_windows(500_000, 2_500_000, 15_000_000, 75_000_000, 150_000_000),
         ),
     ];
-    p.extend(smcp_policies(600, 200, 300));
+    p.extend(seal_policies(600, 200, 300));
     p.extend(discovery_search_policies(1_000));
     p
 }
@@ -333,7 +333,7 @@ fn enterprise_defaults() -> Vec<RateLimitPolicy> {
             ),
         ),
     ];
-    p.extend(smcp_policies(1_200, 500, 600));
+    p.extend(seal_policies(1_200, 500, 600));
     p.extend(discovery_search_policies(5_000));
     p
 }
@@ -372,10 +372,10 @@ mod tests {
     }
 
     #[test]
-    fn smcp_tool_policies_use_single_window() {
+    fn seal_tool_policies_use_single_window() {
         let policies = tier_defaults(&ZaruTier::Pro);
         for p in &policies {
-            if let RateLimitResourceType::SmcpToolCall { tool_pattern } = &p.resource_type {
+            if let RateLimitResourceType::SealToolCall { tool_pattern } = &p.resource_type {
                 assert_eq!(
                     p.windows.len(),
                     1,

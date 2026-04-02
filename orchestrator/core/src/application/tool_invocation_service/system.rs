@@ -3,7 +3,7 @@ use super::*;
 impl ToolInvocationService {
     pub(super) async fn invoke_aegis_system_info_tool(
         &self,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         Ok(ToolInvocationResult::Direct(serde_json::json!({
             "tool": "aegis.system.info",
             "version": env!("CARGO_PKG_VERSION"),
@@ -12,7 +12,7 @@ impl ToolInvocationService {
                 "agent_lifecycle",
                 "workflow_orchestration",
                 "mcp_routing",
-                "smcp_attestation"
+                "seal_attestation"
             ]
         })))
     }
@@ -21,9 +21,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let catalog = self.tool_catalog.as_ref().ok_or_else(|| {
-            SmcpSessionError::InternalError("Tool catalog not configured on this node".to_string())
+            SealSessionError::InternalError("Tool catalog not configured on this node".to_string())
         })?;
 
         let permitted_tools: Vec<String> = security_context
@@ -60,9 +60,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let catalog = self.tool_catalog.as_ref().ok_or_else(|| {
-            SmcpSessionError::InternalError("Tool catalog not configured on this node".to_string())
+            SealSessionError::InternalError("Tool catalog not configured on this node".to_string())
         })?;
 
         let permitted_tools: Vec<String> = security_context
@@ -105,7 +105,7 @@ impl ToolInvocationService {
 
     pub(super) async fn invoke_aegis_system_config_tool(
         &self,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let path = match &self.node_config_path {
             Some(p) => p,
             None => {

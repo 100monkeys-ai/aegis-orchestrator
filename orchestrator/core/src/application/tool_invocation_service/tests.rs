@@ -5,10 +5,10 @@ use crate::domain::events::StorageEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, EventPublisher};
 use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
+use crate::domain::seal_session::SealSession;
 use crate::domain::security_context::SecurityContext;
-use crate::domain::smcp_session::SmcpSession;
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
-use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
+use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
 use crate::infrastructure::storage::LocalHostStorageProvider;
 use crate::infrastructure::tool_router::{InMemoryToolRegistry, ToolRouter};
 use async_trait::async_trait;
@@ -66,11 +66,11 @@ impl EnvelopeVerifier for DummyEnvelope {
         &self.token
     }
 
-    fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+    fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SealSessionError> {
         if self.valid {
             Ok(())
         } else {
-            Err(SmcpSessionError::SignatureVerificationFailed(
+            Err(SealSessionError::SignatureVerificationFailed(
                 "invalid sig".to_string(),
             ))
         }
@@ -707,11 +707,11 @@ spec:
 
 #[tokio::test]
 async fn test_invoke_tool_no_session() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
 
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -733,12 +733,12 @@ async fn test_invoke_tool_no_session() {
     let envelope = DummyEnvelope::for_agent(true, agent_id);
 
     let result = service.invoke_tool(&envelope).await;
-    assert!(matches!(result, Err(SmcpSessionError::SessionInactive(_))));
+    assert!(matches!(result, Err(SealSessionError::SessionInactive(_))));
 }
 
 #[tokio::test]
 async fn test_invoke_tool_bad_signature() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let agent_id = AgentId::new();
     let exec_id = ExecutionId::new();
 
@@ -755,13 +755,13 @@ async fn test_invoke_tool_bad_signature() {
     };
 
     let session_token = make_fake_token(agent_id);
-    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
+    let session = SealSession::new(agent_id, exec_id, vec![], session_token, context);
     let _ = repo.save(session).await;
 
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
 
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -784,7 +784,7 @@ async fn test_invoke_tool_bad_signature() {
     let result = service.invoke_tool(&envelope).await;
     assert!(matches!(
         result,
-        Err(SmcpSessionError::SignatureVerificationFailed(_))
+        Err(SealSessionError::SignatureVerificationFailed(_))
     ));
 }
 
@@ -793,8 +793,8 @@ async fn workflow_validate_tool_returns_success_for_valid_manifest() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -835,8 +835,8 @@ async fn workflow_update_tool_returns_failure_with_deterministic_validation_deta
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -935,8 +935,8 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1225,8 +1225,8 @@ async fn workflow_run_tool_forwards_blackboard() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1302,8 +1302,8 @@ async fn workflow_execution_tools_list_and_get() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1399,8 +1399,8 @@ async fn task_logs_tool_returns_paginated_execution_events() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1493,8 +1493,8 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1550,7 +1550,7 @@ async fn test_invoke_tool_execution_modes() {
     };
     use std::path::PathBuf;
 
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let agent_id = AgentId::new();
     let exec_id = ExecutionId::new();
 
@@ -1585,13 +1585,13 @@ async fn test_invoke_tool_execution_modes() {
     };
 
     let session_token = make_fake_token(agent_id);
-    let session = SmcpSession::new(agent_id, exec_id, vec![], session_token, context);
+    let session = SealSession::new(agent_id, exec_id, vec![], session_token, context);
     let _ = repo.save(session).await;
 
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers.clone(), vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1674,11 +1674,11 @@ async fn test_invoke_tool_execution_modes() {
             &self.token
         }
 
-        fn verify_signature(&self, _: &[u8]) -> Result<(), SmcpSessionError> {
+        fn verify_signature(&self, _: &[u8]) -> Result<(), SealSessionError> {
             if self.valid {
                 Ok(())
             } else {
-                Err(SmcpSessionError::SignatureVerificationFailed("".into()))
+                Err(SealSessionError::SignatureVerificationFailed("".into()))
             }
         }
         fn extract_tool_name(&self) -> Option<String> {
@@ -1704,7 +1704,7 @@ async fn test_invoke_tool_execution_modes() {
 
 #[tokio::test]
 async fn get_available_tools_returns_builtin_dispatcher_metadata() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(
@@ -1720,7 +1720,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
             }],
         }],
     ));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -1750,7 +1750,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
 
 #[tokio::test]
 async fn get_available_tools_for_context_filters_disallowed_tools() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(
@@ -1777,7 +1777,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
             },
         ],
     ));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     security_context_repo
@@ -1827,7 +1827,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
 
 #[tokio::test]
 async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_low_trust_tiers() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(
@@ -1854,7 +1854,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
             },
         ],
     ));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     security_context_repo
@@ -1908,7 +1908,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
 
 #[tokio::test]
 async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_tiers() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let agent = test_agent_with_tools(&["aegis.workflow.delete"]);
     let agent_id = agent.id;
     let exec_id = ExecutionId::new();
@@ -1933,7 +1933,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
     };
 
     // ADR-083: invoke_tool_internal now reads security context from the Execution record,
-    // not from the SMCP session. Seed the security_context_repo and provide an execution
+    // not from the SEAL session. Seed the security_context_repo and provide an execution
     // with the matching security_context_name.
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
@@ -1954,7 +1954,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let (fsal, volume_registry) = test_fsal_deps();
     let service = ToolInvocationService::new(
         repo,
@@ -1983,7 +1983,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
 
     assert!(matches!(
         result,
-        Err(SmcpSessionError::PolicyViolation(
+        Err(SealSessionError::PolicyViolation(
             crate::domain::mcp::PolicyViolation::ToolExplicitlyDenied { .. }
         ))
     ));
@@ -1991,7 +1991,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
 
 #[tokio::test]
 async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(
@@ -2018,7 +2018,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
             },
         ],
     ));
-    let middleware = Arc::new(SmcpMiddleware::new());
+    let middleware = Arc::new(SealMiddleware::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let agent = test_agent_with_tools(&["fs.read"]);
@@ -2222,8 +2222,8 @@ fn build_version_aware_service(
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();
@@ -2379,8 +2379,8 @@ async fn workflow_run_with_version_passes_version_through() {
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
     let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
-    let middleware = Arc::new(SmcpMiddleware::new());
-    let repo = Arc::new(InMemorySmcpSessionRepository::new());
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
     let security_context_repo =
         Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
     let (fsal, volume_registry) = test_fsal_deps();

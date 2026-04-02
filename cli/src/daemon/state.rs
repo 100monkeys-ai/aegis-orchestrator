@@ -46,7 +46,7 @@ pub(crate) struct AppState {
     pub(crate) tool_invocation_service:
         Arc<aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService>,
     pub(crate) attestation_service:
-        Arc<dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService>,
+        Arc<dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService>,
     pub(crate) swarm_service: Arc<StandardSwarmService>,
     pub(crate) operator_read_model: Arc<OperatorReadModelStore>,
     pub(crate) cortex_client:

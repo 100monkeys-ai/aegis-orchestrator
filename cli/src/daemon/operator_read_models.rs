@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use aegis_orchestrator_core::domain::events::{
-    PolicyEvent, SmcpEvent, StimulusEvent, StorageEvent,
+    PolicyEvent, SealEvent, StimulusEvent, StorageEvent,
 };
 use aegis_orchestrator_core::domain::stimulus::StimulusId;
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
@@ -90,8 +90,8 @@ impl OperatorReadModelStore {
             DomainEvent::Stimulus(stimulus_event) => {
                 apply_stimulus_event(&mut state.stimuli, &stimulus_event);
             }
-            DomainEvent::Smcp(smcp_event) => {
-                if let Some(incident) = security_incident_from_smcp(&smcp_event) {
+            DomainEvent::Seal(seal_event) => {
+                if let Some(incident) = security_incident_from_seal(&seal_event) {
                     push_bounded(&mut state.security_incidents, incident, self.capacity);
                 }
             }
@@ -299,9 +299,9 @@ fn apply_stimulus_event(stimuli: &mut HashMap<StimulusId, StimulusView>, event: 
     }
 }
 
-fn security_incident_from_smcp(event: &SmcpEvent) -> Option<SecurityIncidentView> {
+fn security_incident_from_seal(event: &SealEvent) -> Option<SecurityIncidentView> {
     match event {
-        SmcpEvent::PolicyViolationBlocked {
+        SealEvent::PolicyViolationBlocked {
             agent_id,
             execution_id,
             tool_name,
@@ -309,7 +309,7 @@ fn security_incident_from_smcp(event: &SmcpEvent) -> Option<SecurityIncidentView
             details,
             blocked_at,
         } => Some(SecurityIncidentView {
-            category: "smcp_policy_violation_blocked".to_string(),
+            category: "seal_policy_violation_blocked".to_string(),
             severity: "high".to_string(),
             agent_id: Some(agent_id.0.to_string()),
             execution_id: Some(execution_id.0.to_string()),
@@ -318,13 +318,13 @@ fn security_incident_from_smcp(event: &SmcpEvent) -> Option<SecurityIncidentView
             details: format!("{violation_type:?}: {details}"),
             occurred_at: *blocked_at,
         }),
-        SmcpEvent::SessionRevoked {
+        SealEvent::SessionRevoked {
             session_id,
             agent_id,
             reason,
             revoked_at,
         } => Some(SecurityIncidentView {
-            category: "smcp_session_revoked".to_string(),
+            category: "seal_session_revoked".to_string(),
             severity: "medium".to_string(),
             agent_id: Some(agent_id.0.to_string()),
             execution_id: None,

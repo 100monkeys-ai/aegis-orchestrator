@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Policy Engine (ADR-035 §4.4)
+//! # SEAL Policy Engine (ADR-035 §4.4)
 //!
 //! Thin application-layer shim that delegates all policy decisions to
 //! [`crate::domain::security_context::SecurityContext::evaluate`].
@@ -16,7 +16,7 @@ use crate::domain::mcp::PolicyViolation;
 use crate::domain::security_context::SecurityContext;
 use serde_json::Value;
 
-/// Evaluates SMCP tool call requests against a `SecurityContext`'s capability rules.
+/// Evaluates SEAL tool call requests against a `SecurityContext`'s capability rules.
 ///
 /// All policy decisions are fully delegated to the domain: this struct does not
 /// contain any policy logic itself. See [`SecurityContext::evaluate`] for the

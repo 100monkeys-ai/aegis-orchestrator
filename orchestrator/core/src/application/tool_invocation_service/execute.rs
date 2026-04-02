@@ -10,9 +10,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let intent = args.get("intent").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::InvalidArguments(
+            SealSessionError::InvalidArguments(
                 "aegis.execute.intent requires 'intent' string".to_string(),
             )
         })?;
@@ -45,7 +45,7 @@ impl ToolInvocationService {
         let lang = pipeline_input.language;
         let inputs_json = pipeline_input.inputs.to_string();
         let mut input = serde_json::to_value(&pipeline_input).map_err(|e| {
-            SmcpSessionError::InternalError(format!(
+            SealSessionError::InternalError(format!(
                 "Failed to serialize IntentExecutionInput: {e}"
             ))
         })?;
@@ -107,12 +107,12 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_execute_status_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let execution_id_str = args
             .get("pipeline_execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.execute.status requires 'pipeline_execution_id' string".to_string(),
                 )
             })?;
@@ -120,7 +120,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let execution_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(execution_id_str).map_err(|error| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.execute.status: invalid pipeline_execution_id UUID: {error}"
                 ))
             })?,

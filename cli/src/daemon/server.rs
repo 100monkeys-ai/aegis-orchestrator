@@ -241,11 +241,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         info!(port = metrics_cfg.port, "Metrics exporter initialized");
     }
 
-    if let Some(smcp_gateway) = &config.spec.smcp_gateway {
+    if let Some(seal_gateway) = &config.spec.seal_gateway {
         let resolved_url =
-            resolve_env_value(&smcp_gateway.url).unwrap_or_else(|_| smcp_gateway.url.clone());
+            resolve_env_value(&seal_gateway.url).unwrap_or_else(|_| seal_gateway.url.clone());
         tracing::info!(
-            "Configured SMCP tooling gateway URL from node config: {}",
+            "Configured SEAL tooling gateway URL from node config: {}",
             resolved_url
         );
     }
@@ -839,11 +839,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         info!("Rate limit counter cleanup background task spawned (interval: 1 hour)");
     }
 
-    // Initialize SMCP / Tool Routing Services (now hoisted for ExecutionService dependency)
-    info!("Initializing SMCP & Tool Routing services...");
+    // Initialize SEAL / Tool Routing Services (now hoisted for ExecutionService dependency)
+    info!("Initializing SEAL & Tool Routing services...");
 
-    let smcp_middleware = Arc::new(
-        aegis_orchestrator_core::infrastructure::smcp::middleware::SmcpMiddleware::with_rate_limiting(
+    let seal_middleware = Arc::new(
+        aegis_orchestrator_core::infrastructure::seal::middleware::SealMiddleware::with_rate_limiting(
             rate_limit_enforcer.clone(),
             rate_limit_resolver.clone(),
         ),
@@ -1073,8 +1073,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(uc)
     };
 
-    // --- Initialize SMCP / Tool Routing Services ---
-    info!("Configuring SMCP & Tool Routing repositories and services...");
+    // --- Initialize SEAL / Tool Routing Services ---
+    info!("Configuring SEAL & Tool Routing repositories and services...");
 
     // Repositories
     let security_context_repo: Arc<
@@ -1121,40 +1121,40 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc::new(repo)
     };
 
-    let smcp_session_repo: Arc<
-        dyn aegis_orchestrator_core::domain::smcp_session_repository::SmcpSessionRepository,
+    let seal_session_repo: Arc<
+        dyn aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository,
     > = Arc::new(
-        aegis_orchestrator_core::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository::new(),
+        aegis_orchestrator_core::infrastructure::seal::session_repository::InMemorySealSessionRepository::new(),
     );
 
-    // Token Issuer — AEGIS_SMCP_PRIVATE_KEY must be set to a PEM-encoded RSA private key.
+    // Token Issuer — AEGIS_SEAL_PRIVATE_KEY must be set to a PEM-encoded RSA private key.
     // See aegis-config.yaml and ADR-034/ADR-035 for configuration guidance.
-    let private_key = std::env::var("AEGIS_SMCP_PRIVATE_KEY").map_err(|_| {
+    let private_key = std::env::var("AEGIS_SEAL_PRIVATE_KEY").map_err(|_| {
         anyhow::anyhow!(
-            "SMCP private key not configured: set AEGIS_SMCP_PRIVATE_KEY \
+            "SEAL private key not configured: set AEGIS_SEAL_PRIVATE_KEY \
              (PEM-encoded RSA private key; see ADR-034/ADR-035)"
         )
     })?;
-    let private_key = normalize_smcp_private_key(&private_key);
+    let private_key = normalize_seal_private_key(&private_key);
     let token_issuer = Arc::new(
-        aegis_orchestrator_core::infrastructure::smcp::signature::SecurityTokenIssuer::new(
+        aegis_orchestrator_core::infrastructure::seal::signature::SecurityTokenIssuer::new(
             &private_key,
             "aegis-orchestrator",
         )
         .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to initialize SMCP token issuer from AEGIS_SMCP_PRIVATE_KEY: {e}"
+                "Failed to initialize SEAL token issuer from AEGIS_SEAL_PRIVATE_KEY: {e}"
             )
         })?,
     );
 
     // Application Services
     let attestation_service: Arc<
-        dyn aegis_orchestrator_core::infrastructure::smcp::attestation::AttestationService,
+        dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
     > = Arc::new(
         aegis_orchestrator_core::application::attestation_service::AttestationServiceImpl::new(
             security_context_repo.clone(),
-            smcp_session_repo.clone(),
+            seal_session_repo.clone(),
             token_issuer,
         ),
     );
@@ -1251,9 +1251,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
     let mut tool_invocation_service_builder =
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
-            smcp_session_repo.clone(),
+            seal_session_repo.clone(),
             security_context_repo.clone(),
-            smcp_middleware,
+            seal_middleware,
             tool_router.clone(),
             nfs_gateway.fsal().clone(),
             nfs_gateway.volume_registry().clone(),
@@ -1263,7 +1263,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
             ),
             event_bus.clone(),
-            config.spec.smcp_gateway.as_ref().map(|gateway| {
+            config.spec.seal_gateway.as_ref().map(|gateway| {
                 resolve_env_value(&gateway.url).unwrap_or_else(|_| gateway.url.clone())
             }),
         )
@@ -1860,7 +1860,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 }
 
 /// Support `.env` single-line PEM values where newlines are escaped as `\n`.
-fn normalize_smcp_private_key(raw: &str) -> String {
+fn normalize_seal_private_key(raw: &str) -> String {
     if raw.contains("\\n") && !raw.contains('\n') {
         raw.replace("\\n", "\n")
     } else {
@@ -1941,7 +1941,7 @@ async fn shutdown_signal() {
 // ============================================================================
 // Moved to handlers/approvals.rs
 
-// SMCP handlers moved to handlers/smcp.rs
+// SEAL handlers moved to handlers/seal.rs
 
 // ============================================================================
 // Admin Rate-Limit Override Handlers (ADR-072)

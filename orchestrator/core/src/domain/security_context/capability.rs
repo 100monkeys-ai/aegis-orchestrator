@@ -1,6 +1,6 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Capability Value Object (BC-12, ADR-035)
+//! # SEAL Capability Value Object (BC-12, ADR-035)
 //!
 //! A `Capability` is a fine-grained permission entry within a [`super::SecurityContext`].
 //! Each capability grants access to tools matching a pattern, optionally constrained
@@ -35,7 +35,7 @@ use std::path::PathBuf;
 ///
 /// # See Also
 ///
-/// ADR-035 §2 (Capability Model), AGENTS.md §SMCP Protocol Domain `Capability`.
+/// ADR-035 §2 (Capability Model), AGENTS.md §SEAL Protocol Domain `Capability`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Capability {
     /// Tool name pattern. Supports exact match and prefix wildcard (`"fs.*"`).

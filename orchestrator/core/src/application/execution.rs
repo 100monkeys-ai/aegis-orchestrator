@@ -916,8 +916,8 @@ mod tests {
         );
         assert_eq!(spawned.volumes[0].access_mode, AccessMode::ReadOnly);
         assert!(
-            !spawned.volumes[0].remote_path.starts_with("/aegis/smcp/"),
-            "judge should no longer mount via the SMCP proxy path"
+            !spawned.volumes[0].remote_path.starts_with("/aegis/seal/"),
+            "judge should no longer mount via the SEAL proxy path"
         );
 
         let child_mounts = nfs_gateway

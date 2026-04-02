@@ -9,7 +9,7 @@ use crate::application::schema_registry::SchemaRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::AegisFSAL;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
 use std::sync::Arc;
 
@@ -26,7 +26,7 @@ pub async fn try_invoke_builtin(
     volume_registry: &NfsVolumeRegistry,
     web_tool_port: &Arc<dyn ExternalWebToolPort>,
     schema_registry: &Arc<SchemaRegistry>,
-) -> Result<BuiltinToolResult, SmcpSessionError> {
+) -> Result<BuiltinToolResult, SealSessionError> {
     if tool_name == "cmd.run" {
         return builtin_dispatch::invoke_cmd_run(args, execution_id)
             .map(BuiltinToolResult::Handled);

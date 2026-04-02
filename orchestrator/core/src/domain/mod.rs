@@ -17,9 +17,9 @@
 //! | [`runtime`] | BC-2 Execution | `AgentRuntime` trait, `RuntimeConfig`, `InstanceId` |
 //! | [`runtime_registry`] | BC-2 Execution | `StandardRuntimeRegistry` — certified language+version → image mapping (ADR-043) |
 //! | [`policy`] | BC-4 Security Policy | `SecurityPolicy`, `NetworkPolicy`, `FilesystemPolicy`, `ResourceLimits` |
-//! | [`security_context`] | BC-4/BC-12 SMCP | `SecurityContext` aggregate, `Capability` value object |
-//! | [`smcp_session`] | BC-12 SMCP | `SmcpSession` aggregate, `EnvelopeVerifier` trait |
-//! | [`smcp_session_repository`] | BC-12 SMCP | `SmcpSessionRepository` trait |
+//! | [`security_context`] | BC-4/BC-12 SEAL | `SecurityContext` aggregate, `Capability` value object |
+//! | [`seal_session`] | BC-12 SEAL | `SealSession` aggregate, `EnvelopeVerifier` trait |
+//! | [`seal_session_repository`] | BC-12 SEAL | `SealSessionRepository` trait |
 //! | [`workflow`] | BC-3 Workflow | `Workflow` FSM aggregate, `WorkflowState`, `Blackboard` (ADR-015) |
 //! | [`workflow_registry`] | BC-8 Stimulus-Response | `WorkflowRegistry` aggregate root — routing table + RouterAgent ref (ADR-021) |
 //! | [`stimulus`] | BC-8 Stimulus-Response | `Stimulus`, `StimulusId`, `StimulusSource`, `RoutingDecision` value objects (ADR-021) |
@@ -27,7 +27,7 @@
 //! | [`storage`] | BC-7 Storage Gateway | `StorageProvider` trait, `OpenMode`, ACL for SeaweedFS |
 //! | [`fsal`] | BC-7 Storage Gateway | `AegisFSAL` transport-agnostic security boundary (ADR-036) |
 //! | [`path_sanitizer`] | BC-7 Storage Gateway | Path canonicalization and traversal-rejection |
-//! | [`mcp`] | BC-12 SMCP / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
+//! | [`mcp`] | BC-12 SEAL / Tool Routing | `ToolServer`, `MCPError`, MCP integration types (ADR-033) |
 //! | [`secrets`] | BC-11 Secrets & Identity | `SensitiveString`, `SecretPath`, `AccessContext`, `DomainDynamicSecret` (ADR-034) |
 //! | [`shared_kernel`] | Shared Kernel | Cross-context identity types — DDD Shared Kernel pattern |
 //! | [`discovery`] | BC-1/BC-3 Agent & Workflow Discovery | `DiscoveryQuery`, `DiscoveryResult`, `DiscoveryResponse` value objects (ADR-075) |
@@ -58,11 +58,11 @@ pub mod rate_limit;
 pub mod repository;
 pub mod runtime;
 pub mod runtime_registry;
+pub mod seal_session;
+pub mod seal_session_repository;
 pub mod secrets;
 pub mod security_context;
 pub mod shared_kernel;
-pub mod smcp_session;
-pub mod smcp_session_repository;
 pub mod stimulus;
 pub mod storage;
 pub mod supervisor;

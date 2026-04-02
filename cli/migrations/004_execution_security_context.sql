@@ -1,5 +1,5 @@
 -- ADR-083: Execution Security Context Propagation
--- Bind security context at execution creation time instead of SMCP session fallback.
+-- Bind security context at execution creation time instead of SEAL session fallback.
 
 ALTER TABLE executions
   ADD COLUMN security_context_name TEXT NOT NULL DEFAULT 'MIGRATION_PLACEHOLDER';

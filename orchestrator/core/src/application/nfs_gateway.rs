@@ -26,7 +26,7 @@ use crate::domain::{
     volume::{Volume, VolumeId},
 };
 use crate::infrastructure::nfs::server::{NfsServer, NfsServerError, NfsVolumeContext};
-use crate::infrastructure::storage::{LocalHostStorageProvider, SmcpStorageProvider};
+use crate::infrastructure::storage::{LocalHostStorageProvider, SealStorageProvider};
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
@@ -237,11 +237,11 @@ impl NfsGatewayService {
                 )
             }),
         );
-        let smcp_provider = Arc::new(SmcpStorageProvider::new());
+        let seal_provider = Arc::new(SealStorageProvider::new());
         let storage_router = Arc::new(StorageRouter::new(
             storage_provider,
             local_provider,
-            smcp_provider,
+            seal_provider,
         ));
         let borrowed_volumes = Arc::new(RwLock::new(HashMap::new()));
 

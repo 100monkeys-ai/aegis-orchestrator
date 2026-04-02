@@ -8,7 +8,7 @@
 //! for every major event group.
 
 use aegis_orchestrator_core::domain::events::{
-    AgentLifecycleEvent, ExecutionEvent, SmcpEvent, StimulusEvent, StorageEvent, ValidationEvent,
+    AgentLifecycleEvent, ExecutionEvent, SealEvent, StimulusEvent, StorageEvent, ValidationEvent,
     ViolationType, VolumeEvent, WorkflowEvent,
 };
 use aegis_orchestrator_core::domain::execution::{CodeDiff, IterationError};
@@ -130,10 +130,10 @@ fn execution_id_returns_some_for_storage_event() {
 }
 
 #[test]
-fn execution_id_returns_some_for_smcp_session_created() {
+fn execution_id_returns_some_for_seal_session_created() {
     let eid = ExecutionId::new();
     let aid = AgentId::new();
-    let event = DomainEvent::Smcp(SmcpEvent::SessionCreated {
+    let event = DomainEvent::Seal(SealEvent::SessionCreated {
         session_id: "sess-abc".to_string(),
         agent_id: aid,
         execution_id: eid,
@@ -145,9 +145,9 @@ fn execution_id_returns_some_for_smcp_session_created() {
 }
 
 #[test]
-fn execution_id_returns_none_for_smcp_session_revoked() {
+fn execution_id_returns_none_for_seal_session_revoked() {
     let aid = AgentId::new();
-    let event = DomainEvent::Smcp(SmcpEvent::SessionRevoked {
+    let event = DomainEvent::Seal(SealEvent::SessionRevoked {
         session_id: "sess-abc".to_string(),
         agent_id: aid,
         reason: "execution complete".to_string(),
@@ -202,10 +202,10 @@ fn agent_id_returns_some_for_execution_started() {
 }
 
 #[test]
-fn agent_id_returns_some_for_smcp_attestation_completed() {
+fn agent_id_returns_some_for_seal_attestation_completed() {
     let aid = AgentId::new();
     let eid = ExecutionId::new();
-    let event = DomainEvent::Smcp(SmcpEvent::AttestationCompleted {
+    let event = DomainEvent::Seal(SealEvent::AttestationCompleted {
         agent_id: aid,
         execution_id: eid,
         security_context_name: "restricted".to_string(),
@@ -880,14 +880,14 @@ fn stimulus_event_classification_failed_serde_roundtrip() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 10. SmcpEvent — SMCP session events.
+// 10. SealEvent — SEAL session events.
 // ═══════════════════════════════════════════════════════════════════════════════
 
 #[test]
-fn smcp_event_session_created_serde_roundtrip() {
+fn seal_event_session_created_serde_roundtrip() {
     let aid = AgentId::new();
     let eid = ExecutionId::new();
-    let event = SmcpEvent::SessionCreated {
+    let event = SealEvent::SessionCreated {
         session_id: "sess-123".to_string(),
         agent_id: aid,
         execution_id: eid,
@@ -896,9 +896,9 @@ fn smcp_event_session_created_serde_roundtrip() {
         created_at: Utc::now(),
     };
     let json = serde_json::to_string(&event).unwrap();
-    let deser: SmcpEvent = serde_json::from_str(&json).unwrap();
+    let deser: SealEvent = serde_json::from_str(&json).unwrap();
     match deser {
-        SmcpEvent::SessionCreated {
+        SealEvent::SessionCreated {
             session_id,
             agent_id,
             ..
@@ -911,18 +911,18 @@ fn smcp_event_session_created_serde_roundtrip() {
 }
 
 #[test]
-fn smcp_event_session_revoked_serde_roundtrip() {
+fn seal_event_session_revoked_serde_roundtrip() {
     let aid = AgentId::new();
-    let event = SmcpEvent::SessionRevoked {
+    let event = SealEvent::SessionRevoked {
         session_id: "sess-123".to_string(),
         agent_id: aid,
         reason: "security incident".to_string(),
         revoked_at: Utc::now(),
     };
     let json = serde_json::to_string(&event).unwrap();
-    let deser: SmcpEvent = serde_json::from_str(&json).unwrap();
+    let deser: SealEvent = serde_json::from_str(&json).unwrap();
     match deser {
-        SmcpEvent::SessionRevoked { reason, .. } => {
+        SealEvent::SessionRevoked { reason, .. } => {
             assert_eq!(reason, "security incident");
         }
         other => panic!("Expected SessionRevoked, got {other:?}"),
@@ -930,10 +930,10 @@ fn smcp_event_session_revoked_serde_roundtrip() {
 }
 
 #[test]
-fn smcp_event_policy_violation_blocked_serde_roundtrip() {
+fn seal_event_policy_violation_blocked_serde_roundtrip() {
     let aid = AgentId::new();
     let eid = ExecutionId::new();
-    let event = SmcpEvent::PolicyViolationBlocked {
+    let event = SealEvent::PolicyViolationBlocked {
         agent_id: aid,
         execution_id: eid,
         tool_name: "fs_write".to_string(),
@@ -942,9 +942,9 @@ fn smcp_event_policy_violation_blocked_serde_roundtrip() {
         blocked_at: Utc::now(),
     };
     let json = serde_json::to_string(&event).unwrap();
-    let deser: SmcpEvent = serde_json::from_str(&json).unwrap();
+    let deser: SealEvent = serde_json::from_str(&json).unwrap();
     match deser {
-        SmcpEvent::PolicyViolationBlocked {
+        SealEvent::PolicyViolationBlocked {
             tool_name, details, ..
         } => {
             assert_eq!(tool_name, "fs_write");
@@ -1021,17 +1021,17 @@ fn domain_event_volume_serde_roundtrip() {
 }
 
 #[test]
-fn domain_event_smcp_serde_roundtrip() {
+fn domain_event_seal_serde_roundtrip() {
     let aid = AgentId::new();
     let eid = ExecutionId::new();
-    let event = DomainEvent::Smcp(SmcpEvent::AttestationCompleted {
+    let event = DomainEvent::Seal(SealEvent::AttestationCompleted {
         agent_id: aid,
         execution_id: eid,
         security_context_name: "sandbox".to_string(),
         attested_at: Utc::now(),
     });
     let json = serde_json::to_string(&event).unwrap();
-    assert!(json.contains("\"type\":\"smcp\""));
+    assert!(json.contains("\"type\":\"seal\""));
     let deser: DomainEvent = serde_json::from_str(&json).unwrap();
     assert_eq!(deser.execution_id(), Some(eid));
     assert_eq!(deser.agent_id(), Some(aid));

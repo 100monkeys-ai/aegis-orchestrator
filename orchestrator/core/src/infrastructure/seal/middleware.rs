@@ -1,17 +1,17 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # SMCP Middleware (ADR-035 §4.3)
+//! # SEAL Middleware (ADR-035 §4.3)
 //!
 //! The orchestrator-side middleware that intercepts every MCP tool call from
-//! agent containers, verifies the SMCP envelope, and extracts the inner MCP
+//! agent containers, verifies the SEAL envelope, and extracts the inner MCP
 //! payload for forwarding to the appropriate tool server.
 //!
 //! ## Processing Pipeline
 //!
 //! ```text
-//! incoming SmcpEnvelope
-//!   └─ SmcpMiddleware::verify_and_unwrap(&session, &envelope)
-//!         └─ SmcpSession::evaluate_call(envelope)   ← all checks
+//! incoming SealEnvelope
+//!   └─ SealMiddleware::verify_and_unwrap(&session, &envelope)
+//!         └─ SealSession::evaluate_call(envelope)   ← all checks
 //!         └─ envelope.extract_arguments()            ← inner payload
 //!               └─ forwarded to ToolRouter / MCP server
 //! ```
@@ -27,19 +27,19 @@ use crate::domain::mcp::PolicyViolation;
 use crate::domain::rate_limit::{
     RateLimitEnforcer, RateLimitPolicyResolver, RateLimitResourceType, RateLimitScope,
 };
-use crate::domain::smcp_session::{EnvelopeVerifier, SmcpSession, SmcpSessionError};
+use crate::domain::seal_session::{EnvelopeVerifier, SealSession, SealSessionError};
 
-/// Orchestrator middleware that verifies and unwraps incoming SMCP envelopes.
+/// Orchestrator middleware that verifies and unwraps incoming SEAL envelopes.
 ///
 /// Holds optional rate-limit collaborators. When both `rate_limit_enforcer` and
 /// `rate_limit_resolver` are `Some`, the middleware performs an ADR-072 rate limit
 /// check after the `SecurityContext` policy evaluation succeeds.
-pub struct SmcpMiddleware {
+pub struct SealMiddleware {
     rate_limit_enforcer: Option<Arc<dyn RateLimitEnforcer>>,
     rate_limit_resolver: Option<Arc<dyn RateLimitPolicyResolver>>,
 }
 
-impl SmcpMiddleware {
+impl SealMiddleware {
     /// Create a new middleware instance without rate limiting.
     pub fn new() -> Self {
         Self {
@@ -62,7 +62,7 @@ impl SmcpMiddleware {
     /// Verify the envelope against the given session and extract the inner MCP arguments.
     ///
     /// This is the **single choke-point** through which all MCP tool calls must pass.
-    /// Calls [`crate::domain::smcp_session::SmcpSession::evaluate_call`] which enforces
+    /// Calls [`crate::domain::seal_session::SealSession::evaluate_call`] which enforces
     /// session status, TTL, Ed25519 signature, and `SecurityContext` policy in order.
     ///
     /// When rate limiting is configured, an additional ADR-072 rate limit check is
@@ -73,25 +73,25 @@ impl SmcpMiddleware {
     ///
     /// # Errors
     ///
-    /// Returns a [`crate::domain::smcp_session::SmcpSessionError`] variant on any
+    /// Returns a [`crate::domain::seal_session::SealSessionError`] variant on any
     /// enforcement failure. The caller should log the violation and return an MCP
     /// error response to the agent (do **not** forward the call).
     ///
     /// # Security
     ///
-    /// The returned `Value` contains only the tool arguments stripped of the SMCP
+    /// The returned `Value` contains only the tool arguments stripped of the SEAL
     /// wrapper. The `security_token` and `signature` fields are never forwarded to
     /// the tool server, preserving credential isolation (ADR-033).
     pub async fn verify_and_unwrap(
         &self,
-        session: &mut SmcpSession,
+        session: &mut SealSession,
         envelope: &(impl EnvelopeVerifier + Send + Sync),
-    ) -> Result<Value, SmcpSessionError> {
-        info!("Verifying SMCP envelope for session {}", session.id);
+    ) -> Result<Value, SealSessionError> {
+        info!("Verifying SEAL envelope for session {}", session.id);
 
         match session.evaluate_call(envelope) {
             Ok(()) => {
-                info!("SMCP envelope verified successfully");
+                info!("SEAL envelope verified successfully");
 
                 // ADR-072: Rate limit check after policy evaluation succeeds.
                 if let (Some(enforcer), Some(resolver)) =
@@ -110,11 +110,11 @@ impl SmcpMiddleware {
                             tool_name, violation
                         );
                         metrics::counter!(
-                            "aegis_smcp_policy_violations_total",
+                            "aegis_seal_policy_violations_total",
                             "violation_type" => "rate_limit_exceeded"
                         )
                         .increment(1);
-                        return Err(SmcpSessionError::PolicyViolation(violation));
+                        return Err(SealSessionError::PolicyViolation(violation));
                     }
                 }
 
@@ -128,20 +128,20 @@ impl SmcpMiddleware {
                     }
                     Ok(args)
                 } else {
-                    Err(SmcpSessionError::MalformedPayload(
+                    Err(SealSessionError::MalformedPayload(
                         "missing arguments after envelope verification".to_string(),
                     ))
                 }
             }
             Err(ref e) => {
-                warn!("SMCP envelope verification failed: {}", e);
+                warn!("SEAL envelope verification failed: {}", e);
 
                 // Emit ADR-058 BC-4 metrics for specific failure categories.
                 match e {
-                    SmcpSessionError::SignatureVerificationFailed(_) => {
-                        metrics::counter!("aegis_smcp_signature_failures_total").increment(1);
+                    SealSessionError::SignatureVerificationFailed(_) => {
+                        metrics::counter!("aegis_seal_signature_failures_total").increment(1);
                     }
-                    SmcpSessionError::PolicyViolation(violation) => {
+                    SealSessionError::PolicyViolation(violation) => {
                         let violation_type = match violation {
                             PolicyViolation::ToolNotAllowed { .. } => "tool_not_allowed",
                             PolicyViolation::ToolExplicitlyDenied { .. } => {
@@ -158,7 +158,7 @@ impl SmcpMiddleware {
                             }
                             PolicyViolation::TimeoutExceeded { .. } => "timeout_exceeded",
                         };
-                        metrics::counter!("aegis_smcp_policy_violations_total", "violation_type" => violation_type).increment(1);
+                        metrics::counter!("aegis_seal_policy_violations_total", "violation_type" => violation_type).increment(1);
                     }
                     _ => {}
                 }
@@ -169,19 +169,19 @@ impl SmcpMiddleware {
     }
 }
 
-/// Check rate limits for an SMCP tool call (ADR-072).
+/// Check rate limits for an SEAL tool call (ADR-072).
 ///
 /// Resolves the effective policy for the tool's resource type, then checks and
 /// increments the counter. Returns `Ok(())` if the call is within limits.
 async fn check_rate_limit(
     tool_name: &str,
     enforcer: &dyn RateLimitEnforcer,
-    session: &SmcpSession,
+    session: &SealSession,
     resolver: &dyn RateLimitPolicyResolver,
 ) -> Result<(), PolicyViolation> {
     use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 
-    let resource_type = RateLimitResourceType::SmcpToolCall {
+    let resource_type = RateLimitResourceType::SealToolCall {
         tool_pattern: tool_name.to_string(),
     };
 
@@ -271,7 +271,7 @@ fn strip_operator_only_params(args: &mut Value) {
     }
 }
 
-impl Default for SmcpMiddleware {
+impl Default for SealMiddleware {
     fn default() -> Self {
         Self::new()
     }
@@ -287,7 +287,7 @@ mod tests {
     use serde_json::json;
 
     struct DummyEnvelope {
-        signature_result: Result<(), SmcpSessionError>,
+        signature_result: Result<(), SealSessionError>,
         tool_name: Option<String>,
         arguments: Option<Value>,
     }
@@ -297,7 +297,7 @@ mod tests {
             "token"
         }
 
-        fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SmcpSessionError> {
+        fn verify_signature(&self, _public_key_bytes: &[u8]) -> Result<(), SealSessionError> {
             self.signature_result.clone()
         }
 
@@ -345,8 +345,8 @@ mod tests {
         }
     }
 
-    fn session_with_context(context: SecurityContext) -> SmcpSession {
-        SmcpSession::new(
+    fn session_with_context(context: SecurityContext) -> SealSession {
+        SealSession::new(
             AgentId::new(),
             ExecutionId::new(),
             vec![1, 2, 3],
@@ -357,7 +357,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_unwrap_returns_only_inner_arguments() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
             signature_result: Ok(()),
@@ -386,10 +386,10 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_unwrap_propagates_signature_failures() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
-            signature_result: Err(SmcpSessionError::SignatureVerificationFailed(
+            signature_result: Err(SealSessionError::SignatureVerificationFailed(
                 "bad signature".to_string(),
             )),
             tool_name: Some("tool.run".to_string()),
@@ -403,13 +403,13 @@ mod tests {
 
         assert_eq!(
             error,
-            SmcpSessionError::SignatureVerificationFailed("bad signature".to_string())
+            SealSessionError::SignatureVerificationFailed("bad signature".to_string())
         );
     }
 
     #[tokio::test]
     async fn verify_and_unwrap_rejects_missing_arguments_as_malformed_payload() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
             signature_result: Ok(()),
@@ -424,7 +424,7 @@ mod tests {
 
         assert_eq!(
             error,
-            SmcpSessionError::MalformedPayload("missing arguments".to_string())
+            SealSessionError::MalformedPayload("missing arguments".to_string())
         );
     }
 
@@ -452,7 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_tier_strips_force_and_version_from_args() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         let mut session = session_with_context(consumer_context("free"));
         let envelope = DummyEnvelope {
             signature_result: Ok(()),
@@ -486,7 +486,7 @@ mod tests {
 
     #[tokio::test]
     async fn consumer_tier_strips_params_across_all_tiers() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         for tier in &["free", "pro", "business", "enterprise"] {
             let mut session = session_with_context(consumer_context(tier));
             let envelope = DummyEnvelope {
@@ -521,7 +521,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_tier_preserves_force_and_version() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         // Non-zaru context (operator tier)
         let mut session = session_with_context(allow_all_context());
         let envelope = DummyEnvelope {
@@ -583,7 +583,7 @@ mod tests {
 
     #[tokio::test]
     async fn verify_and_unwrap_propagates_policy_violations() {
-        let middleware = SmcpMiddleware::new();
+        let middleware = SealMiddleware::new();
         let mut session = session_with_context(denied_context());
         let envelope = DummyEnvelope {
             signature_result: Ok(()),
@@ -598,7 +598,7 @@ mod tests {
 
         assert_eq!(
             error,
-            SmcpSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
+            SealSessionError::PolicyViolation(PolicyViolation::ToolExplicitlyDenied {
                 tool_name: "tool.run".to_string(),
             })
         );

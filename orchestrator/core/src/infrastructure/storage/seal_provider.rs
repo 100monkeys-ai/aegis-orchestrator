@@ -1,12 +1,12 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! SMCP Storage Provider — gRPC Client (ADR-064)
+//! SEAL Storage Provider — gRPC Client (ADR-064)
 //!
 //! Proxies `StorageProvider` calls to a remote node's `RemoteStorageService`
 //! via authenticated gRPC. Each call:
-//! 1. Parses the SMCP path to extract (node_id, volume_id, internal_path).
+//! 1. Parses the SEAL path to extract (node_id, volume_id, internal_path).
 //! 2. Obtains (or caches) a gRPC channel to the target node.
-//! 3. Wraps the request in an `SmcpNodeEnvelope` with an Ed25519 signature.
+//! 3. Wraps the request in an `SealNodeEnvelope` with an Ed25519 signature.
 //! 4. Invokes the corresponding RPC and maps the response back to domain types.
 //!
 //! # Architecture
@@ -25,7 +25,7 @@ use crate::domain::cluster::NodeClusterRepository;
 use crate::domain::storage::{
     DirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError, StorageProvider,
 };
-use crate::infrastructure::aegis_cluster_proto::SmcpNodeEnvelope as ProtoEnvelope;
+use crate::infrastructure::aegis_cluster_proto::SealNodeEnvelope as ProtoEnvelope;
 use crate::infrastructure::aegis_remote_storage_proto::{
     remote_storage_service_client::RemoteStorageServiceClient, CreateFileRequest, GetUsageRequest,
     OpenFileRequest, RemoteStorageRequest, RenameRequest, SetQuotaRequest,
@@ -36,23 +36,23 @@ use crate::infrastructure::aegis_remote_storage_proto::{
 /// Implements `StorageProvider` by forwarding every operation to the
 /// `RemoteStorageService` running on the node that owns the volume.
 ///
-/// When constructed without cluster credentials (via [`SmcpStorageProvider::new`]),
+/// When constructed without cluster credentials (via [`SealStorageProvider::new`]),
 /// all operations return `StorageError::Unavailable`. Use
-/// [`SmcpStorageProvider::with_cluster`] to enable real gRPC calls.
-pub struct SmcpStorageProvider {
+/// [`SealStorageProvider::with_cluster`] to enable real gRPC calls.
+pub struct SealStorageProvider {
     connections: Arc<tokio::sync::RwLock<HashMap<String, RemoteStorageServiceClient<Channel>>>>,
     cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
     signing_key: Option<Arc<ed25519_dalek::SigningKey>>,
     token: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
-impl Default for SmcpStorageProvider {
+impl Default for SealStorageProvider {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl SmcpStorageProvider {
+impl SealStorageProvider {
     /// Create an unconfigured provider that returns `Unavailable` for all RPCs.
     ///
     /// Useful as a placeholder when clustering is not enabled.
@@ -83,28 +83,28 @@ impl SmcpStorageProvider {
     fn require_cluster(&self) -> Result<(), StorageError> {
         if self.cluster_repo.is_none() || self.signing_key.is_none() {
             return Err(StorageError::Unavailable(
-                "SMCP storage provider not configured with cluster credentials".to_string(),
+                "SEAL storage provider not configured with cluster credentials".to_string(),
             ));
         }
         Ok(())
     }
 
-    /// Parse an SMCP-prefixed path into (node_id, volume_id, internal_path).
+    /// Parse an SEAL-prefixed path into (node_id, volume_id, internal_path).
     ///
-    /// Expected format: `/aegis/smcp/{node_id}/{volume_id}/{internal_path...}`
+    /// Expected format: `/aegis/seal/{node_id}/{volume_id}/{internal_path...}`
     fn extract_remote_metadata(
         &self,
         path: &str,
     ) -> Result<(String, String, String), StorageError> {
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-        if parts.len() >= 4 && parts[0] == "aegis" && parts[1] == "smcp" {
+        if parts.len() >= 4 && parts[0] == "aegis" && parts[1] == "seal" {
             let node_id = parts[2].to_string();
             let volume_id = parts[3].to_string();
             let internal_path = format!("/{}", parts[4..].join("/"));
             Ok((node_id, volume_id, internal_path))
         } else {
             Err(StorageError::InvalidPath(format!(
-                "Invalid SMCP path struct: {path}"
+                "Invalid SEAL path struct: {path}"
             )))
         }
     }
@@ -160,7 +160,7 @@ impl SmcpStorageProvider {
         Ok(client)
     }
 
-    /// Build an `SmcpNodeEnvelope` signing the given payload bytes.
+    /// Build an `SealNodeEnvelope` signing the given payload bytes.
     async fn make_envelope(&self, payload: &[u8]) -> Result<ProtoEnvelope, StorageError> {
         self.require_cluster()?;
         let signing_key = self
@@ -227,7 +227,7 @@ impl SmcpStorageProvider {
 }
 
 #[async_trait]
-impl StorageProvider for SmcpStorageProvider {
+impl StorageProvider for SealStorageProvider {
     async fn create_directory(&self, path: &str) -> Result<(), StorageError> {
         let (node_id, volume_id, internal_path) = self.extract_remote_metadata(path)?;
         let mut client = self.get_or_connect(&node_id).await?;
@@ -344,7 +344,7 @@ impl StorageProvider for SmcpStorageProvider {
         offset: u64,
         length: usize,
     ) -> Result<Vec<u8>, StorageError> {
-        // The file handle must encode routing information. We store the SMCP
+        // The file handle must encode routing information. We store the SEAL
         // path as the handle bytes for read_at/write_at/close_file, but the
         // remote server uses opaque handles. For remote operations, the handle
         // returned from open_file is already the server's opaque handle bytes.
@@ -352,7 +352,7 @@ impl StorageProvider for SmcpStorageProvider {
         // "{node_id}:{volume_id}:{server_handle_bytes}"
         //
         // However, the current handle is the raw server handle. To keep the API
-        // simple, we require callers to use the same SmcpStorageProvider that
+        // simple, we require callers to use the same SealStorageProvider that
         // opened the file. We store the routing info in a separate in-memory map
         // keyed by handle bytes.
         //
@@ -361,7 +361,7 @@ impl StorageProvider for SmcpStorageProvider {
         // A production implementation would use a handle registry.
         let _ = (handle, offset, length);
         Err(StorageError::Unavailable(
-            "read_at via SMCP requires handle routing context; use open_file first".to_string(),
+            "read_at via SEAL requires handle routing context; use open_file first".to_string(),
         ))
     }
 
@@ -373,14 +373,14 @@ impl StorageProvider for SmcpStorageProvider {
     ) -> Result<usize, StorageError> {
         let _ = (handle, offset, data);
         Err(StorageError::Unavailable(
-            "write_at via SMCP requires handle routing context; use open_file first".to_string(),
+            "write_at via SEAL requires handle routing context; use open_file first".to_string(),
         ))
     }
 
     async fn close_file(&self, handle: &FileHandle) -> Result<(), StorageError> {
         let _ = handle;
         Err(StorageError::Unavailable(
-            "close_file via SMCP requires handle routing context; use open_file first".to_string(),
+            "close_file via SEAL requires handle routing context; use open_file first".to_string(),
         ))
     }
 

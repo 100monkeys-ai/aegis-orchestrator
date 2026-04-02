@@ -35,8 +35,8 @@ use crate::daemon::handlers::observability::{
     dashboard_summary_handler, get_stimulus_handler, list_security_incidents_handler,
     list_stimuli_handler, list_storage_violations_handler,
 };
-use crate::daemon::handlers::smcp::{
-    attest_smcp_handler, invoke_smcp_handler, list_smcp_tools_handler,
+use crate::daemon::handlers::seal::{
+    attest_seal_handler, invoke_seal_handler, list_seal_tools_handler,
 };
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
 use crate::daemon::handlers::workflow_executions::{
@@ -153,9 +153,9 @@ pub(crate) fn create_router(
             "/v1/human-approvals/{id}/reject",
             post(reject_request_handler),
         )
-        .route("/v1/smcp/attest", post(attest_smcp_handler))
-        .route("/v1/smcp/invoke", post(invoke_smcp_handler))
-        .route("/v1/smcp/tools", get(list_smcp_tools_handler))
+        .route("/v1/seal/attest", post(attest_seal_handler))
+        .route("/v1/seal/invoke", post(invoke_seal_handler))
+        .route("/v1/seal/tools", get(list_seal_tools_handler))
         .route("/v1/cluster/status", get(cluster_status_handler))
         .route("/v1/cluster/nodes", get(cluster_nodes_handler))
         .route("/v1/swarms", get(list_swarms_handler))

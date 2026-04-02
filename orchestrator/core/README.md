@@ -11,7 +11,7 @@ Core domain logic and runtime primitives for the [100monkeys.ai AEGIS](https://d
 
 | Layer | Contents |
 | --- | --- |
-| **Domain** | `Agent`, `Execution`, `Workflow`, `Swarm`, `SmcpSession`, `SecurityContext`, `Policy`, `NodeConfig`, `RuntimeRegistry` value objects and entities |
+| **Domain** | `Agent`, `Execution`, `Workflow`, `Swarm`, `SealSession`, `SecurityContext`, `Policy`, `NodeConfig`, `RuntimeRegistry` value objects and entities |
 | **Application** | Orchestration services: `InnerLoopService`, `LifecycleService`, `ToolInvocationService`, `ValidationService`, `StorageRouter`, `VolumeManager`, `NfsGateway` |
 | **Infrastructure** | Trait implementations for Docker runtime, LLM providers, Temporal client, Cortex/memory, gRPC (AEGIS Runtime Proto), SeaweedFS, OpenBao secrets |
 | **Presentation** | Axum HTTP handlers for the `/v1` REST API and gRPC service endpoints |
@@ -20,7 +20,7 @@ Core domain logic and runtime primitives for the [100monkeys.ai AEGIS](https://d
 
 - **Agent** — a stateless, containerised unit of autonomous work defined by an [`AgentManifest`](https://docs.100monkeys.ai/docs/reference/agent-manifest)
 - **Execution** — a single agent invocation; lifecycle: `Pending → Running → Succeeded | Failed | Cancelled`
-- **SMCP** — Secure Model Context Protocol (ADR-035); every tool call is signed with Ed25519 and validated end-to-end
+- **SEAL** — Signed Envelope Attestation Layer (ADR-035); every tool call is signed with Ed25519 and validated end-to-end
 - **Dispatch Gateway** — all tool calls route through the orchestrator proxy at `/v1/dispatch-gateway` (ADR-040); agents never call external APIs directly
 - **Security Policy** — default-deny network and filesystem policies enforced at container/VM boot time
 
@@ -45,7 +45,7 @@ use aegis_orchestrator_core::domain::execution::Execution;
 | Getting Started | [docs.100monkeys.ai/docs/getting-started](https://docs.100monkeys.ai/docs/getting-started) |
 | Architecture Overview | [docs.100monkeys.ai/docs/architecture](https://docs.100monkeys.ai/docs/architecture) |
 | Execution Engine | [docs.100monkeys.ai/docs/architecture/execution-engine](https://docs.100monkeys.ai/docs/architecture/execution-engine) |
-| SMCP | [docs.100monkeys.ai/docs/architecture/smcp](https://docs.100monkeys.ai/docs/architecture/smcp) |
+| SEAL | [docs.100monkeys.ai/docs/architecture/seal](https://docs.100monkeys.ai/docs/architecture/seal) |
 | Agent Manifest Reference | [docs.100monkeys.ai/docs/reference/agent-manifest](https://docs.100monkeys.ai/docs/reference/agent-manifest) |
 | Node Config Reference | [docs.100monkeys.ai/docs/reference/node-config](https://docs.100monkeys.ai/docs/reference/node-config) |
 | Security Model | [docs.100monkeys.ai/docs/concepts/security-model](https://docs.100monkeys.ai/docs/concepts/security-model) |

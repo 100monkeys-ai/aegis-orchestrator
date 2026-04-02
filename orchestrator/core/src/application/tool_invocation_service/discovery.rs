@@ -14,9 +14,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
-            SmcpSessionError::InternalError(
+            SealSessionError::InternalError(
                 "Discovery service not configured — this is an enterprise feature. \
                  Configure spec.discovery in aegis-config.yaml to enable semantic search."
                     .into(),
@@ -26,7 +26,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::InvalidArguments(
+            SealSessionError::InvalidArguments(
                 "aegis.agent.search requires 'query' parameter".into(),
             )
         })?;
@@ -73,7 +73,7 @@ impl ToolInvocationService {
         let response = discovery
             .search_agents(&tenant_id, &tier, query)
             .await
-            .map_err(|e| SmcpSessionError::InternalError(format!("Agent search failed: {e}")))?;
+            .map_err(|e| SealSessionError::InternalError(format!("Agent search failed: {e}")))?;
 
         let results: Vec<serde_json::Value> = response
             .results
@@ -108,9 +108,9 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let discovery = self.discovery_service.as_ref().ok_or_else(|| {
-            SmcpSessionError::InternalError(
+            SealSessionError::InternalError(
                 "Discovery service not configured — this is an enterprise feature. \
                  Configure spec.discovery in aegis-config.yaml to enable semantic search."
                     .into(),
@@ -120,7 +120,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
 
         let query_text = args.get("query").and_then(|v| v.as_str()).ok_or_else(|| {
-            SmcpSessionError::InvalidArguments(
+            SealSessionError::InvalidArguments(
                 "aegis.workflow.search requires 'query' parameter".into(),
             )
         })?;
@@ -163,7 +163,7 @@ impl ToolInvocationService {
         let response = discovery
             .search_workflows(&tenant_id, &tier, query)
             .await
-            .map_err(|e| SmcpSessionError::InternalError(format!("Workflow search failed: {e}")))?;
+            .map_err(|e| SealSessionError::InternalError(format!("Workflow search failed: {e}")))?;
 
         let results: Vec<serde_json::Value> = response
             .results

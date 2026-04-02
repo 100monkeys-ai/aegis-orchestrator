@@ -25,7 +25,7 @@ use crate::infrastructure::aegis_cluster_proto::{
     NodeHeartbeatInner, NodeHeartbeatRequest, NodeHeartbeatResponse, NodeInfo, PushConfigInner,
     PushConfigRequest, PushConfigResponse, RegisterNodeInner, RegisterNodeRequest,
     RegisterNodeResponse, RouteExecutionInner, RouteExecutionRequest, RouteExecutionResponse,
-    SmcpNodeEnvelope as ProtoEnvelope, SyncConfigInner, SyncConfigRequest, SyncConfigResponse,
+    SealNodeEnvelope as ProtoEnvelope, SyncConfigInner, SyncConfigRequest, SyncConfigResponse,
 };
 use crate::infrastructure::aegis_runtime_proto::ExecutionEvent;
 use prost::Message;

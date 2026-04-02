@@ -5,12 +5,12 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         security_context: &crate::domain::security_context::SecurityContext,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_ref = args
             .get("agent_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.task.execute requires 'agent_id' string".to_string(),
                 )
             })?;
@@ -86,19 +86,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_status_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.task.status requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id =
             crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SmcpSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
+                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
         match self.execution_service.get_execution(exec_id).await {
@@ -129,19 +129,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_wait_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.task.wait requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str)
-                .map_err(|e| SmcpSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
+                .map_err(|e| SealSessionError::InvalidArguments(format!("Invalid UUID: {e}")))?,
         );
 
         let poll_interval = args
@@ -209,19 +209,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_logs_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::InvalidArguments(
+                SealSessionError::InvalidArguments(
                     "aegis.task.logs requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id = crate::domain::execution::ExecutionId(
             uuid::Uuid::parse_str(exec_id_str).map_err(|e| {
-                SmcpSessionError::InvalidArguments(format!(
+                SealSessionError::InvalidArguments(format!(
                     "aegis.task.logs: invalid execution_id UUID: {e}"
                 ))
             })?,
@@ -283,7 +283,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_list_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_id = args
             .get("agent_id")
             .and_then(|v| v.as_str())
@@ -326,19 +326,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_cancel_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.task.cancel requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id =
             crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SmcpSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
+                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
         match self.execution_service.cancel_execution(exec_id).await {
@@ -358,19 +358,19 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_task_remove_tool(
         &self,
         args: &Value,
-    ) -> Result<ToolInvocationResult, SmcpSessionError> {
+    ) -> Result<ToolInvocationResult, SealSessionError> {
         let exec_id_str = args
             .get("execution_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
-                SmcpSessionError::SignatureVerificationFailed(
+                SealSessionError::SignatureVerificationFailed(
                     "aegis.task.remove requires 'execution_id' string".to_string(),
                 )
             })?;
 
         let exec_id =
             crate::domain::execution::ExecutionId(uuid::Uuid::parse_str(exec_id_str).map_err(
-                |e| SmcpSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
+                |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
         match self.execution_service.delete_execution(exec_id).await {

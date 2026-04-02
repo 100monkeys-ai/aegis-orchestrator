@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # Attestation Service (BC-12, ADR-035 §4.1)
 //!
-//! Application service that implements the SMCP attestation ceremony:
+//! Application service that implements the SEAL attestation ceremony:
 //! the one-time handshake by which an agent proves its identity and receives
 //! a `SecurityToken` that authorises future MCP tool calls.
 //!
@@ -16,18 +16,18 @@
 //!   1. Resolve SecurityContext for execution (loads from registry)
 //!   2. Build ContextClaims (agent/exec IDs, 1hr expiry)
 //!   3. SecurityTokenIssuer.issue()  →  RS256 JWT signed by orchestrator key
-//!   4. Create SmcpSession  (stores session + public key)
-//!   5. SmcpSessionRepository.save(session)
+//!   4. Create SealSession  (stores session + public key)
+//!   5. SealSessionRepository.save(session)
 //!   ──────────────────────────────────────────────────────────────────────────
 //!   AttestationResponse { security_token: JWT }
 //!   ▼
-//! Agent container  ← uses JWT in every subsequent SmcpEnvelope
+//! Agent container  ← uses JWT in every subsequent SealEnvelope
 //! ```
 //!
 //! ## Context Resolution
 //!
 //! Attestation must bind the issued token to a real execution-specific or
-//! manifest-specific SMCP `SecurityContext`. If that mapping is unavailable,
+//! manifest-specific SEAL `SecurityContext`. If that mapping is unavailable,
 //! attestation fails closed rather than minting a token against an inferred
 //! default context.
 //!
@@ -40,38 +40,38 @@ use std::sync::Arc;
 use crate::application::ports::{AttestationTokenClaims, SecurityTokenIssuerPort, TokenAudience};
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
+use crate::domain::seal_session::SealSession;
+use crate::domain::seal_session_repository::SealSessionRepository;
 use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::security_context::validate_context_ownership;
-use crate::domain::smcp_session::SmcpSession;
-use crate::domain::smcp_session_repository::SmcpSessionRepository;
-use crate::infrastructure::smcp::attestation::{
+use crate::infrastructure::seal::attestation::{
     AttestationRequest, AttestationResponse, AttestationService,
 };
-use crate::infrastructure::smcp::envelope::{
+use crate::infrastructure::seal::envelope::{
     normalize_public_key_bytes, AudienceClaim, ContextClaims,
 };
-use crate::infrastructure::smcp::signature::SecurityTokenIssuer;
+use crate::infrastructure::seal::signature::SecurityTokenIssuer;
 
-/// Concrete implementation of the SMCP attestation ceremony.
+/// Concrete implementation of the SEAL attestation ceremony.
 ///
 /// Orchestrates the three domain/infrastructure dependencies needed to
 /// complete a full attestation: context lookup, JWT issuance, and session
 /// persistence.
 pub struct AttestationServiceImpl {
     security_context_repo: Arc<dyn SecurityContextRepository>,
-    smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+    seal_session_repo: Arc<dyn SealSessionRepository>,
     token_issuer: Arc<dyn SecurityTokenIssuerPort>,
 }
 
 impl AttestationServiceImpl {
     pub fn new(
         security_context_repo: Arc<dyn SecurityContextRepository>,
-        smcp_session_repo: Arc<dyn SmcpSessionRepository>,
+        seal_session_repo: Arc<dyn SealSessionRepository>,
         token_issuer: Arc<dyn SecurityTokenIssuerPort>,
     ) -> Self {
         Self {
             security_context_repo,
-            smcp_session_repo,
+            seal_session_repo,
             token_issuer,
         }
     }
@@ -89,10 +89,10 @@ impl AttestationServiceImpl {
         tracing::warn!(
             agent_id = ?request.agent_id,
             execution_id = ?request.execution_id,
-            "Rejecting SMCP attestation because no execution-bound security context can be derived"
+            "Rejecting SEAL attestation because no execution-bound security context can be derived"
         );
         Err(anyhow::anyhow!(
-            "SMCP attestation requires an explicit security_context or an execution-bound security context; none can be derived for agent {:?} execution {:?}",
+            "SEAL attestation requires an explicit security_context or an execution-bound security context; none can be derived for agent {:?} execution {:?}",
             request.agent_id,
             request.execution_id
         ))
@@ -106,7 +106,7 @@ impl AttestationServiceImpl {
             )),
             _ if request.security_context.is_some() => Ok((AgentId::new(), ExecutionId::new())),
             _ => Err(anyhow::anyhow!(
-                "SMCP attestation requires both agent_id and execution_id unless security_context is explicitly provided"
+                "SEAL attestation requires both agent_id and execution_id unless security_context is explicitly provided"
             )),
         }
     }
@@ -127,7 +127,7 @@ impl AttestationService for AttestationServiceImpl {
     async fn attest(&self, request: AttestationRequest) -> Result<AttestationResponse> {
         let result = self.attest_inner(request).await;
         if result.is_err() {
-            metrics::counter!("aegis_smcp_attestations_total", "result" => "failure").increment(1);
+            metrics::counter!("aegis_seal_attestations_total", "result" => "failure").increment(1);
         }
         result
     }
@@ -177,9 +177,9 @@ impl AttestationServiceImpl {
         // 3. Issue Token
         let token = self.token_issuer.issue(&mut claims)?;
 
-        // 4. Create and persist SMCP Session
+        // 4. Create and persist SEAL Session
         let principal_subject = self.resolve_principal_subject(&request);
-        let session = SmcpSession::new(
+        let session = SealSession::new(
             agent_id,
             execution_id,
             normalize_public_key_bytes(&request.public_key_pem)?,
@@ -192,7 +192,7 @@ impl AttestationServiceImpl {
             request.workload_id.clone(),
             request.zaru_tier.clone(),
         );
-        self.smcp_session_repo.save(session).await?;
+        self.seal_session_repo.save(session).await?;
 
         tracing::info!(
             agent_id = %claims.agent_id,
@@ -202,12 +202,12 @@ impl AttestationServiceImpl {
             user_id = request.user_id.as_deref().unwrap_or(""),
             workload_id = request.workload_id.as_deref().unwrap_or(""),
             zaru_tier = request.zaru_tier.as_deref().unwrap_or(""),
-            "Issued SMCP session during attestation"
+            "Issued SEAL session during attestation"
         );
 
         // 5. Emit metrics (ADR-058 BC-4)
-        metrics::counter!("aegis_smcp_attestations_total", "result" => "success").increment(1);
-        metrics::gauge!("aegis_smcp_sessions_active").increment(1.0);
+        metrics::counter!("aegis_seal_attestations_total", "result" => "success").increment(1);
+        metrics::gauge!("aegis_seal_sessions_active").increment(1.0);
 
         // 6. Return Response
         Ok(AttestationResponse {
@@ -244,9 +244,9 @@ mod tests {
     use crate::domain::security_context::capability::Capability;
     use crate::domain::security_context::{SecurityContext, SecurityContextMetadata};
     use crate::domain::tenant::TenantId;
+    use crate::infrastructure::seal::session_repository::InMemorySealSessionRepository;
+    use crate::infrastructure::seal::signature::SecurityTokenVerifier;
     use crate::infrastructure::security_context::InMemorySecurityContextRepository;
-    use crate::infrastructure::smcp::session_repository::InMemorySmcpSessionRepository;
-    use crate::infrastructure::smcp::signature::SecurityTokenVerifier;
     use base64::engine::general_purpose::STANDARD;
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -282,7 +282,7 @@ mod tests {
             .save(test_context("zaru-pro"))
             .await
             .unwrap();
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
         let verifier = SecurityTokenVerifier::new(
@@ -292,7 +292,7 @@ mod tests {
         )
         .unwrap();
         let service =
-            AttestationServiceImpl::new(security_context_repo, smcp_session_repo.clone(), issuer);
+            AttestationServiceImpl::new(security_context_repo, seal_session_repo.clone(), issuer);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let response = service
@@ -315,7 +315,7 @@ mod tests {
         assert_eq!(token.claims.security_context, "zaru-pro");
         assert!(uuid::Uuid::parse_str(&token.claims.agent_id).is_ok());
         assert!(uuid::Uuid::parse_str(&token.claims.execution_id).is_ok());
-        let saved_session = smcp_session_repo
+        let saved_session = seal_session_repo
             .find_active_by_agent(&AgentId::from_string(&token.claims.agent_id).unwrap())
             .await
             .unwrap()
@@ -332,10 +332,10 @@ mod tests {
     #[tokio::test]
     async fn attest_rejects_unknown_explicit_security_context() {
         let security_context_repo = Arc::new(InMemorySecurityContextRepository::new());
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
-        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+        let service = AttestationServiceImpl::new(security_context_repo, seal_session_repo, issuer);
 
         let response = service
             .attest(AttestationRequest {
@@ -362,10 +362,10 @@ mod tests {
             .save(test_context("zaru-pro"))
             .await
             .unwrap();
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
-        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+        let service = AttestationServiceImpl::new(security_context_repo, seal_session_repo, issuer);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let response = service
@@ -398,10 +398,10 @@ mod tests {
             .save(test_context("research-safe"))
             .await
             .unwrap();
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
-        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+        let service = AttestationServiceImpl::new(security_context_repo, seal_session_repo, issuer);
 
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);
         let response = service
@@ -434,10 +434,10 @@ mod tests {
             .save(test_context("tenant-acme-corp-research"))
             .await
             .unwrap();
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
-        let service = AttestationServiceImpl::new(security_context_repo, smcp_session_repo, issuer);
+        let service = AttestationServiceImpl::new(security_context_repo, seal_session_repo, issuer);
 
         // Use a different tenant slug
         let wrong_tenant = TenantId::from_realm_slug("other-corp").unwrap();
@@ -472,11 +472,11 @@ mod tests {
             .save(test_context("tenant-acme-corp-research"))
             .await
             .unwrap();
-        let smcp_session_repo = Arc::new(InMemorySmcpSessionRepository::new());
+        let seal_session_repo = Arc::new(InMemorySealSessionRepository::new());
         let issuer =
             Arc::new(SecurityTokenIssuer::new(TEST_RSA_PRIVATE_PEM, "aegis-orchestrator").unwrap());
         let service =
-            AttestationServiceImpl::new(security_context_repo, smcp_session_repo.clone(), issuer);
+            AttestationServiceImpl::new(security_context_repo, seal_session_repo.clone(), issuer);
 
         let correct_tenant = TenantId::from_realm_slug("acme-corp").unwrap();
         let signing_key = SigningKey::from_bytes(&[9u8; 32]);

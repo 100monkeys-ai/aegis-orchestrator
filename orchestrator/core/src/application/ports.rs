@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use crate::application::temporal_mapper::TemporalWorkflowDefinition;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
-use crate::domain::smcp_session::SmcpSessionError;
+use crate::domain::seal_session::SealSessionError;
 
 #[async_trait]
 pub trait WorkflowEnginePort: Send + Sync {
@@ -73,12 +73,12 @@ pub trait ExternalWebToolPort: Send + Sync {
     async fn search(
         &self,
         request: WebSearchRequest,
-    ) -> Result<ToolInvocationResult, SmcpSessionError>;
+    ) -> Result<ToolInvocationResult, SealSessionError>;
 
     async fn fetch(
         &self,
         request: WebFetchRequest,
-    ) -> Result<ToolInvocationResult, SmcpSessionError>;
+    ) -> Result<ToolInvocationResult, SealSessionError>;
 }
 
 #[derive(Debug, Clone)]

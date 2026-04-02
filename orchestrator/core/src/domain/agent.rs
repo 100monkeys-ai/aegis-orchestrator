@@ -264,7 +264,7 @@ pub struct VolumeSpec {
     /// Storage class: "ephemeral" or "persistent"
     pub storage_class: String,
 
-    /// New volume backend type (e.g., "seaweedfs", "opendal", "hostPath", "smcp")
+    /// New volume backend type (e.g., "seaweedfs", "opendal", "hostPath", "seal")
     /// Defaults to "seaweedfs" if omitted for backward compatibility.
     #[serde(default = "default_volume_type", rename = "type")]
     pub volume_type: String,

@@ -422,11 +422,11 @@ spec:
   #       client_key: "/etc/ssl/private/client.key"
 
   # --------------------------------------------------------------------------
-  # SMCP Security (Optional)
+  # SEAL Security (Optional)
   # --------------------------------------------------------------------------
-  # smcp:
-  #   private_key_path: "/etc/aegis/smcp/private.pem"
-  #   public_key_path: "/etc/aegis/smcp/public.pem"
+  # seal:
+  #   private_key_path: "/etc/aegis/seal/private.pem"
+  #   public_key_path: "/etc/aegis/seal/public.pem"
   #   issuer: "aegis-orchestrator"
   #   audiences: ["aegis-runtime"]
   #   token_ttl_seconds: 3600
@@ -497,8 +497,8 @@ spec:
   #   exempt_methods:
   #     - "/aegis.orchestrator.v1.Health/Check"
   #
-  # smcp_gateway:
-  #   url: "http://aegis-smcp-gateway:50055"
+  # seal_gateway:
+  #   url: "http://aegis-seal-gateway:50055"
 
   # --------------------------------------------------------------------------
   # Execution Limits (Optional)
