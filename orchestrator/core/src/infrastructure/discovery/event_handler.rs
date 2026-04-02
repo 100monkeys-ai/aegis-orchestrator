@@ -327,27 +327,25 @@ impl DiscoveryIndexEventHandler {
     }
 
     // ──────────────────────────────────────────────────────────────────────
-    // Backfill
+    // Backfill / Reconcile
     // ──────────────────────────────────────────────────────────────────────
 
-    /// Backfill the Cortex discovery index from all existing agents and workflows.
-    /// Called once at startup.
-    pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
-        tracing::info!("Starting Cortex discovery index backfill");
-
+    /// Index all known agents and workflows into Cortex. Shared by [`backfill`]
+    /// and [`reconcile`].
+    async fn index_all(&self) -> anyhow::Result<(usize, usize)> {
         // ── Agents ──────────────────────────────────────────────────────
         let agents = self
             .agent_repo
             .list_all_for_tenant(&TenantId::local_default())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list agents for backfill: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to list agents for indexing: {e}"))?;
 
         let mut agent_count = 0usize;
         for agent in &agents {
             self.handle_agent_upsert(&agent.id, &agent.manifest).await;
             agent_count += 1;
             if agent_count.is_multiple_of(50) {
-                tracing::info!(agent_count, "Backfill progress: agents indexed");
+                tracing::info!(agent_count, "Index progress: agents indexed");
             }
         }
 
@@ -356,7 +354,7 @@ impl DiscoveryIndexEventHandler {
             .workflow_repo
             .list_all_for_tenant(&TenantId::local_default())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list workflows for backfill: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to list workflows for indexing: {e}"))?;
 
         let mut workflow_count = 0usize;
         for workflow in &workflows {
@@ -365,17 +363,54 @@ impl DiscoveryIndexEventHandler {
                 .await;
             workflow_count += 1;
             if workflow_count.is_multiple_of(50) {
-                tracing::info!(workflow_count, "Backfill progress: workflows indexed");
+                tracing::info!(workflow_count, "Index progress: workflows indexed");
             }
         }
 
+        Ok((agent_count, workflow_count))
+    }
+
+    /// Backfill the Cortex discovery index from all existing agents and workflows.
+    /// Called once at startup.
+    pub async fn backfill(&self) -> anyhow::Result<(usize, usize)> {
+        tracing::info!("Starting Cortex discovery index backfill");
+        let result = self.index_all().await?;
         tracing::info!(
-            agent_count,
-            workflow_count,
+            agent_count = result.0,
+            workflow_count = result.1,
             "Cortex discovery index backfill complete"
         );
+        Ok(result)
+    }
 
-        Ok((agent_count, workflow_count))
+    /// Reconcile the Cortex discovery index against all known agents and workflows.
+    /// Called periodically to correct any drift caused by event lag or transient failures.
+    pub async fn reconcile(&self) -> anyhow::Result<(usize, usize)> {
+        self.index_all().await
+    }
+
+    /// Spawn a background tokio task that calls [`reconcile`] on the given interval.
+    /// Errors are logged as warnings and never cause the loop to exit.
+    pub fn spawn_reconciler(self: Arc<Self>, interval: Duration) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                match self.reconcile().await {
+                    Ok((agents, workflows)) => {
+                        tracing::debug!(
+                            agents_indexed = agents,
+                            workflows_indexed = workflows,
+                            "Discovery reconciliation complete"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Discovery reconciliation failed");
+                    }
+                }
+            }
+        })
     }
 }
 
