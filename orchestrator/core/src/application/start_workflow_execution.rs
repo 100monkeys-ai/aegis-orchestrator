@@ -1023,6 +1023,14 @@ mod tests {
             ) -> Result<(), RepositoryError> {
                 Ok(())
             }
+
+            async fn list_by_name_for_tenant(
+                &self,
+                _tenant_id: &TenantId,
+                _name: &str,
+            ) -> Result<Vec<Workflow>, RepositoryError> {
+                Ok(vec![])
+            }
         }
 
         let service = StandardStartWorkflowExecutionUseCase::new(
