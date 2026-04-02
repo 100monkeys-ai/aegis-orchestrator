@@ -5,6 +5,7 @@ use crate::domain::events::StorageEvent;
 use crate::domain::execution::ExecutionId;
 use crate::domain::fsal::{AegisFSAL, EventPublisher};
 use crate::domain::node_config::{BuiltinDispatcherConfig, CapabilityConfig};
+use crate::domain::repository::AgentVersion;
 use crate::domain::seal_session::SealSession;
 use crate::domain::security_context::SecurityContext;
 use crate::infrastructure::repositories::InMemoryVolumeRepository;
@@ -206,6 +207,14 @@ impl AgentLifecycleService for TestAgentLifecycleService {
     ) -> Result<Option<AgentId>> {
         anyhow::bail!("TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test")
     }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> Result<Vec<AgentVersion>> {
+        Ok(vec![])
+    }
 }
 
 struct FilteringAgentLifecycleService {
@@ -288,6 +297,14 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
     ) -> Result<Option<AgentId>> {
         // Delegate to name-only lookup for existing tests
         self.lookup_agent(name).await
+    }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> Result<Vec<AgentVersion>> {
+        Ok(vec![])
     }
 }
 
@@ -2174,6 +2191,14 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
         version: &str,
     ) -> Result<Option<AgentId>> {
         Ok((name == self.agent_name && version == self.agent_version).then_some(self.agent_id))
+    }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> Result<Vec<AgentVersion>> {
+        Ok(vec![])
     }
 }
 

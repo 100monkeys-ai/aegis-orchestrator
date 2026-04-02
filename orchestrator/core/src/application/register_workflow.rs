@@ -275,7 +275,7 @@ mod tests {
     use crate::application::temporal_mapper::TemporalWorkflowDefinition;
     use crate::domain::agent::{Agent, AgentId, AgentManifest};
     use crate::domain::events::WorkflowEvent;
-    use crate::domain::repository::{RepositoryError, WorkflowRepository};
+    use crate::domain::repository::{AgentVersion, RepositoryError, WorkflowRepository};
     use crate::domain::workflow::{Workflow, WorkflowId};
     use crate::infrastructure::event_bus::{DomainEvent, EventBusError};
     use crate::infrastructure::repositories::InMemoryWorkflowRepository;
@@ -378,6 +378,14 @@ mod tests {
             _version: &str,
         ) -> anyhow::Result<Option<AgentId>> {
             self.lookup_agent(name).await
+        }
+
+        async fn list_versions_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _agent_id: AgentId,
+        ) -> anyhow::Result<Vec<AgentVersion>> {
+            Ok(vec![])
         }
     }
 
@@ -568,6 +576,14 @@ spec:
             _new_tenant_id: &TenantId,
         ) -> Result<(), RepositoryError> {
             Ok(())
+        }
+
+        async fn list_by_name_for_tenant(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+        ) -> Result<Vec<Workflow>, RepositoryError> {
+            Ok(vec![])
         }
     }
 

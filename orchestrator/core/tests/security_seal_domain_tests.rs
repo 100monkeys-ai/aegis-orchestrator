@@ -820,6 +820,7 @@ fn capability_serialization_roundtrip() {
         subcommand_allowlist: None,
         domain_allowlist: Some(vec!["github.com".to_string(), "crates.io".to_string()]),
         max_response_size: Some(1_048_576),
+        rate_limit: None,
     };
 
     let json = serde_json::to_string(&cap).expect("serialize Capability");

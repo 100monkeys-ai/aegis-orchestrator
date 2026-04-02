@@ -21,7 +21,7 @@ use aegis_orchestrator_core::application::start_workflow_execution::{
 use aegis_orchestrator_core::domain::agent::{Agent, AgentId, AgentManifest};
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::repository::{
-    RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
+    AgentVersion, RepositoryError, WorkflowExecutionRepository, WorkflowRepository,
 };
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{
@@ -125,6 +125,14 @@ impl AgentLifecycleService for MockAgentServiceInt {
         Ok(Some(AgentId(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap(),
         )))
+    }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> anyhow::Result<Vec<AgentVersion>> {
+        Ok(vec![])
     }
 }
 
@@ -234,6 +242,14 @@ impl WorkflowRepository for MockWorkflowRepo {
         _new_tenant_id: &TenantId,
     ) -> Result<(), RepositoryError> {
         Ok(())
+    }
+
+    async fn list_by_name_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
     }
 }
 
@@ -356,6 +372,14 @@ impl WorkflowRepository for StaticWorkflowRepo {
         _new_tenant_id: &TenantId,
     ) -> Result<(), RepositoryError> {
         Ok(())
+    }
+
+    async fn list_by_name_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+    ) -> Result<Vec<Workflow>, RepositoryError> {
+        Ok(vec![])
     }
 }
 
