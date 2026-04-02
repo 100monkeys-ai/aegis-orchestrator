@@ -44,6 +44,47 @@ impl ToolInvocationService {
             .collect())
     }
 
+    pub async fn get_available_tools_for_agent_in_context(
+        &self,
+        agent_id: AgentId,
+        security_context_name: &str,
+    ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
+        let agent = self
+            .agent_lifecycle
+            .get_agent(agent_id)
+            .await
+            .map_err(|e| {
+                SealSessionError::InternalError(format!(
+                    "Failed to load agent for tool scoping: {e}"
+                ))
+            })?;
+
+        let declared_tools = agent.manifest.spec.tools;
+        if declared_tools.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let security_context = self
+            .security_context_repo
+            .find_by_name(security_context_name)
+            .await
+            .map_err(|e| SealSessionError::ConfigurationError(e.to_string()))?
+            .ok_or_else(|| {
+                SealSessionError::ConfigurationError(format!(
+                    "Security context '{security_context_name}' not found"
+                ))
+            })?;
+
+        let tools = self.get_available_tools().await?;
+        Ok(tools
+            .into_iter()
+            .filter(|tool| {
+                declared_tools.iter().any(|name| name == &tool.name)
+                    && security_context.permits_tool_name(&tool.name)
+            })
+            .collect())
+    }
+
     pub async fn get_available_tools_for_context(
         &self,
         security_context_name: &str,

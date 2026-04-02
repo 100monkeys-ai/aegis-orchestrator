@@ -141,7 +141,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_workflow_run_tool(
         &self,
         args: &Value,
-        security_context: &crate::domain::security_context::SecurityContext,
+        _security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -175,7 +175,7 @@ impl ToolInvocationService {
                     blackboard,
                     version,
                     tenant_id: Some(tenant_id.clone()),
-                    security_context_name: Some(security_context.name.clone()),
+                    security_context_name: Some("agent-runtime".to_string()),
                 },
             )
             .await
@@ -489,7 +489,7 @@ impl ToolInvocationService {
                     blackboard: None,
                     version: None,
                     tenant_id: Some(tenant_id),
-                    security_context_name: None,
+                    security_context_name: Some("default".to_string()),
                 },
             )
             .await
