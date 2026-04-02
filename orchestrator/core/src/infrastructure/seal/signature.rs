@@ -144,6 +144,11 @@ mod tests {
             exp: Some(now + exp_offset),
             iat: Some(now),
             nbf: None,
+            jti: None,
+            scp: None,
+            wid: None,
+            exec_id: None,
+            tenant_id: None,
         }
     }
 
@@ -166,6 +171,11 @@ mod tests {
             exp: Some(now + exp_offset),
             iat: Some(now),
             nbf: None,
+            jti: None,
+            scp: None,
+            wid: None,
+            exec_id: None,
+            tenant_id: None,
         }
     }
 

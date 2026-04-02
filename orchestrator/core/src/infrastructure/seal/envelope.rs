@@ -98,6 +98,21 @@ pub struct ContextClaims {
     /// Not-before time (Unix epoch seconds).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nbf: Option<i64>,
+    /// JWT ID — unique nonce per token for replay detection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    /// Security context name (spec alias for `security_context`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scp: Option<String>,
+    /// Workload/container ID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wid: Option<String>,
+    /// Execution correlation identifier (spec alias for `execution_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exec_id: Option<String>,
+    /// Tenant routing identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tenant_id: Option<String>,
 }
 
 impl EnvelopeVerifier for SealEnvelope {

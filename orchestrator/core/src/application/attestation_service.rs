@@ -172,6 +172,10 @@ impl AttestationServiceImpl {
             exp: Some(chrono::Utc::now().timestamp() + 3600), // 1 hour expiration
             iat: Some(chrono::Utc::now().timestamp()),
             nbf: None,
+            jti: Some(uuid::Uuid::new_v4().to_string()),
+            scp: Some(security_context.name.clone()),
+            wid: request.container_id.clone(),
+            tenant_id: Some(request.tenant_id.to_string()),
         };
 
         // 3. Issue Token
@@ -232,6 +236,11 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
             exp: claims.exp,
             iat: claims.iat,
             nbf: claims.nbf,
+            jti: claims.jti.clone(),
+            scp: claims.scp.clone(),
+            wid: claims.wid.clone(),
+            exec_id: Some(claims.execution_id.clone()),
+            tenant_id: claims.tenant_id.clone(),
         };
 
         SecurityTokenIssuer::issue(self, &mut inner_claims)

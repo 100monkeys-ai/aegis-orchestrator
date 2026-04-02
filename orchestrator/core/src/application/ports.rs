@@ -97,6 +97,10 @@ pub struct AttestationTokenClaims {
     pub exp: Option<i64>,
     pub iat: Option<i64>,
     pub nbf: Option<i64>,
+    pub jti: Option<String>,
+    pub scp: Option<String>,
+    pub wid: Option<String>,
+    pub tenant_id: Option<String>,
 }
 
 pub trait SecurityTokenIssuerPort: Send + Sync {
