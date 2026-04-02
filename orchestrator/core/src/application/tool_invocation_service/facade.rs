@@ -776,7 +776,9 @@ impl ToolInvocationService {
                     .await,
             ),
             "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
-            "aegis.task.wait" => Some(self.invoke_aegis_task_wait_tool(args).await),
+            "aegis.task.wait" | "aegis.agent.wait" => {
+                Some(self.invoke_aegis_task_wait_tool(args).await)
+            }
             "aegis.task.logs" => Some(self.invoke_aegis_task_logs_tool(args).await),
             "aegis.task.list" => Some(self.invoke_aegis_task_list_tool(args).await),
             "aegis.task.cancel" => Some(self.invoke_aegis_task_cancel_tool(args).await),

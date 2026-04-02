@@ -161,6 +161,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.task.list",
     "aegis.task.logs",
     "aegis.task.wait",
+    "aegis.agent.wait",
     "aegis.execute.status",
     "aegis.execute.wait",
     "aegis.tools.list",
@@ -223,6 +224,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.task.remove", "Removes a completed or failed execution record by UUID."),
     ("aegis.task.logs", "Returns paginated execution events for a task by UUID."),
     ("aegis.task.wait", "Polls an execution until it reaches a terminal state and returns the result."),
+    ("aegis.agent.wait", "Alias for aegis.task.wait. Blocks until an agent execution completes."),
     ("aegis.execute.intent", "Starts the intent-to-execution pipeline: discovers or generates an agent, writes code, executes in a container, and returns the formatted result."),
     ("aegis.execute.status", "Returns the current status of an intent-to-execution pipeline run."),
     ("aegis.execute.wait", "Alias for aegis.workflow.wait. Blocks until pipeline execution completes."),
@@ -1053,6 +1055,26 @@ impl ToolRouter {
                         "required": ["execution_id"]
                     }),
                     "aegis.task.wait" => json!({
+                        "type": "object",
+                        "properties": {
+                            "execution_id": {
+                                "type": "string",
+                                "description": "UUID of the execution to wait for."
+                            },
+                            "poll_interval_seconds": {
+                                "type": "integer",
+                                "description": "Seconds between status polls (default 10).",
+                                "minimum": 1
+                            },
+                            "timeout_seconds": {
+                                "type": "integer",
+                                "description": "Maximum seconds to wait before returning a timeout (default 300).",
+                                "minimum": 1
+                            }
+                        },
+                        "required": ["execution_id"]
+                    }),
+                    "aegis.agent.wait" => json!({
                         "type": "object",
                         "properties": {
                             "execution_id": {
