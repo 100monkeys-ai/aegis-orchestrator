@@ -1237,7 +1237,7 @@ pub struct IamConfig {
 pub struct IamRealmConfig {
     /// Realm identifier: "aegis-system", "zaru-consumer", or "tenant-{slug}"
     pub slug: String,
-    /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
+    /// Full issuer URL: `https://auth.example.com/realms/{slug}`
     pub issuer_url: String,
     /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
     pub jwks_uri: String,

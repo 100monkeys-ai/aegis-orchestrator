@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 pub struct IdentityRealm {
     /// Realm identifier: "aegis-system" | "zaru-consumer" | "tenant-{slug}"
     pub realm_slug: String,
-    /// Full issuer URL: <https://auth.myzaru.com/realms/{slug}>
+    /// Full issuer URL: `https://auth.example.com/realms/{slug}`
     pub issuer_url: String,
     /// JWKS endpoint: {issuer_url}/protocol/openid-connect/certs
     pub jwks_uri: String,
@@ -437,8 +437,8 @@ mod tests {
     fn identity_realm_serialization_roundtrip() {
         let realm = IdentityRealm {
             realm_slug: "aegis-system".to_string(),
-            issuer_url: "https://auth.myzaru.com/realms/aegis-system".to_string(),
-            jwks_uri: "https://auth.myzaru.com/realms/aegis-system/protocol/openid-connect/certs"
+            issuer_url: "https://auth.example.com/realms/aegis-system".to_string(),
+            jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
                 .to_string(),
             audience: "aegis-orchestrator".to_string(),
             realm_kind: RealmKind::System,
