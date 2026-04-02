@@ -182,7 +182,12 @@ pub(crate) async fn list_agents_handler(
                         "name": agent.manifest.metadata.name,
                         "version": agent.manifest.metadata.version,
                         "description": agent.manifest.metadata.description.clone().unwrap_or_default(),
-                        "status": format!("{:?}", agent.status)
+                        "status": format!("{:?}", agent.status).to_lowercase(),
+                        "tags": agent.manifest.metadata.tags,
+                        "labels": agent.manifest.metadata.labels,
+                        "created_at": agent.created_at.to_rfc3339(),
+                        "updated_at": agent.updated_at.to_rfc3339(),
+                        "tenant_id": agent.tenant_id.as_str(),
                     })
                 })
                 .collect();
@@ -219,10 +224,23 @@ pub(crate) async fn get_agent_handler(
         .get_agent_for_tenant(&tenant_id, AgentId(id))
         .await
     {
-        Ok(agent) => Json(
-            serde_json::to_value(agent.manifest)
-                .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()})),
-        ),
+        Ok(agent) => {
+            let manifest_yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
+            Json(serde_json::json!({
+                "id": agent.id.0,
+                "name": agent.manifest.metadata.name,
+                "version": agent.manifest.metadata.version,
+                "description": agent.manifest.metadata.description.clone().unwrap_or_default(),
+                "status": format!("{:?}", agent.status).to_lowercase(),
+                "tags": agent.manifest.metadata.tags,
+                "labels": agent.manifest.metadata.labels,
+                "created_at": agent.created_at.to_rfc3339(),
+                "updated_at": agent.updated_at.to_rfc3339(),
+                "tenant_id": agent.tenant_id.as_str(),
+                "manifest": serde_json::to_value(&agent.manifest).unwrap_or_default(),
+                "manifest_yaml": manifest_yaml,
+            }))
+        }
         Err(e) => Json(serde_json::json!({"error": e.to_string()})),
     }
 }
