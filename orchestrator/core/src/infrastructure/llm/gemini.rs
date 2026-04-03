@@ -344,17 +344,19 @@ impl LLMProvider for GeminiAdapter {
         let gr: GeminiGenerateContentResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
-        let candidate = gr
-            .candidates
-            .first()
-            .ok_or_else(|| LLMError::Provider("No response candidates from model".into()))?;
+        if gr.candidates.is_empty() {
+            return Err(LLMError::Provider(
+                "No response candidates from model".into(),
+            ));
+        }
 
-        let tool_calls: Vec<ChatToolCall> = candidate
-            .content
-            .as_ref()
-            .map(|c| c.parts.iter())
-            .into_iter()
-            .flatten()
+        // Collect tool calls from all candidates, excluding thought parts
+        let tool_calls: Vec<ChatToolCall> = gr
+            .candidates
+            .iter()
+            .filter_map(|c| c.content.as_ref())
+            .flat_map(|c| c.parts.iter())
+            .filter(|p| !p.thought.unwrap_or(false))
             .filter_map(|p| {
                 p.function_call.as_ref().map(|fc| ChatToolCall {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -368,9 +370,13 @@ impl LLMProvider for GeminiAdapter {
             return Ok(ChatResponse::ToolCalls(tool_calls));
         }
 
-        let text = candidate
-            .content
-            .as_ref()
+        // Find the first candidate that yields non-empty text after filtering thought parts.
+        // Gemini 2.5 Pro thinking mode places thought parts in early candidates; the actual
+        // text response may appear in a later candidate.
+        let text = gr
+            .candidates
+            .iter()
+            .filter_map(|c| c.content.as_ref())
             .map(|c| {
                 c.parts
                     .iter()
@@ -379,7 +385,14 @@ impl LLMProvider for GeminiAdapter {
                     .collect::<Vec<_>>()
                     .join("")
             })
+            .find(|t| !t.is_empty())
             .unwrap_or_default();
+
+        // finish_reason from the first candidate (used for token counting etc.)
+        let finish_reason = gr
+            .candidates
+            .first()
+            .and_then(|c| c.finish_reason.as_deref());
 
         let usage = gr.usage_metadata.unwrap_or(GeminiUsageMetadata {
             prompt_token_count: 0,
@@ -396,7 +409,7 @@ impl LLMProvider for GeminiAdapter {
             },
             provider: "gemini".to_string(),
             model: self.model.clone(),
-            finish_reason: Self::map_finish_reason(candidate.finish_reason.as_deref()),
+            finish_reason: Self::map_finish_reason(finish_reason),
         }))
     }
 
