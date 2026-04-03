@@ -54,8 +54,6 @@ pub struct AdvancedConfig {
     pub docker_network: String,
     pub orchestrator_url: String,
     pub nfs_host: String,
-    pub keycloak_admin_password: String,
-    pub openbao_secret_id: String,
     pub database_url: String,
     pub temporal_worker_secret: String,
     pub keep_container: bool,
@@ -238,8 +236,6 @@ impl ConfigWizard {
         };
 
         let mut advanced = self.collect_advanced_config(components)?;
-        self.collect_iam_config(components, &mut advanced)?;
-        self.collect_secrets_config(components, &mut advanced)?;
 
         let node_config = NodeConfig {
             node_name,
@@ -334,8 +330,6 @@ impl ConfigWizard {
             docker_network: "aegis-network".to_string(),
             orchestrator_url: "http://aegis-runtime:8088".to_string(),
             nfs_host: "127.0.0.1".to_string(),
-            keycloak_admin_password: "admin".to_string(),
-            openbao_secret_id: "test-secret-id".to_string(),
             database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
             temporal_worker_secret: "dev-temporal-secret".to_string(),
             keep_container: false,
@@ -452,8 +446,6 @@ impl ConfigWizard {
                 .with_prompt("AEGIS_NFS_HOST")
                 .default(defaults.nfs_host.clone())
                 .interact_text()?,
-            keycloak_admin_password: defaults.keycloak_admin_password.clone(),
-            openbao_secret_id: defaults.openbao_secret_id.clone(),
             database_url: Input::new()
                 .with_prompt("AEGIS_DATABASE_URL")
                 .default(defaults.database_url.clone())
@@ -654,53 +646,6 @@ impl ConfigWizard {
                 .default(defaults.vram_gb)
                 .interact_text()?,
         })
-    }
-
-    /// Collect IAM-specific settings whenever IAM profile is enabled so users
-    /// can configure Keycloak without needing advanced mode.
-    fn collect_iam_config(
-        &self,
-        components: &SelectedComponents,
-        advanced: &mut AdvancedConfig,
-    ) -> Result<()> {
-        if self.yes || !components.iam {
-            return Ok(());
-        }
-
-        println!();
-        println!("{}", "IAM configuration (Keycloak):".bold());
-
-        let keycloak_password: String = Password::new()
-            .with_prompt("KEYCLOAK_ADMIN_PASSWORD (blank to keep default 'admin')")
-            .allow_empty_password(true)
-            .interact()?;
-        if !keycloak_password.is_empty() {
-            advanced.keycloak_admin_password = keycloak_password;
-        }
-
-        Ok(())
-    }
-
-    /// Collect secrets-backend settings whenever OpenBao profile is enabled so
-    /// users can configure secrets independently from IAM.
-    fn collect_secrets_config(
-        &self,
-        components: &SelectedComponents,
-        advanced: &mut AdvancedConfig,
-    ) -> Result<()> {
-        if self.yes || !components.secrets {
-            return Ok(());
-        }
-
-        println!();
-        println!("{}", "Secrets configuration (OpenBao):".bold());
-
-        advanced.openbao_secret_id = Input::new()
-            .with_prompt("OPENBAO_SECRET_ID")
-            .default(advanced.openbao_secret_id.clone())
-            .interact_text()?;
-
-        Ok(())
     }
 
     /// Render the `aegis-config.yaml` content from collected inputs.
@@ -1403,15 +1348,12 @@ spec:
 
 # ─── Compose Profiles ─────────────────────────────────────────────────────────
 # Controls which optional services are started.
-# Profiles: core (always), temporal, storage, iam, secrets, llm
+# Profiles: core (always), temporal, storage, seal-gateway, llm
 COMPOSE_PROFILES={profiles}
 
 # ─── LLM Provider ─────────────────────────────────────────────────────────────
 {api_key_line}
 {additional_provider_env}
-
-# ─── Keycloak ─────────────────────────────────────────────────────────────────
-KEYCLOAK_ADMIN_PASSWORD={keycloak_admin_password}
 
 # ─── AEGIS Runtime Networking ─────────────────────────────────────────────────
 AEGIS_CONTAINER_NETWORK={docker_network}
@@ -1421,9 +1363,6 @@ AEGIS_ORCHESTRATOR_URL={orchestrator_url}
 #   Linux native / WSL2  → 127.0.0.1
 #   Docker Desktop       → host.docker.internal
 AEGIS_NFS_HOST={nfs_host}
-
-# ─── Secrets Management (OpenBao) ─────────────────────────────────────────────
-OPENBAO_SECRET_ID={openbao_secret_id}
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 AEGIS_DATABASE_URL={database_url}
@@ -1436,11 +1375,9 @@ AEGIS_SEAL_PRIVATE_KEY='{seal_private_key}'
             profiles = profiles,
             api_key_line = api_key_line,
             additional_provider_env = additional_provider_env,
-            keycloak_admin_password = config.advanced.keycloak_admin_password,
             docker_network = config.advanced.docker_network,
             orchestrator_url = config.advanced.orchestrator_url,
             nfs_host = config.advanced.nfs_host,
-            openbao_secret_id = config.advanced.openbao_secret_id,
             database_url = config.advanced.database_url,
             temporal_worker_secret = config.advanced.temporal_worker_secret,
             keep_container = if config.advanced.keep_container {

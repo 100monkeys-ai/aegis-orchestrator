@@ -22,10 +22,6 @@ pub struct SelectedComponents {
     pub temporal: bool,
     /// SeaweedFS distributed storage (master, volume, filer, webdav)
     pub storage: bool,
-    /// Keycloak (OIDC IAM)
-    pub iam: bool,
-    /// OpenBao (secrets management)
-    pub secrets: bool,
     /// Standalone SEAL tooling gateway (ADR-053)
     pub seal_gateway: bool,
     /// Local Ollama LLM runtime
@@ -63,12 +59,6 @@ impl SelectedComponents {
         }
         if self.storage {
             profiles.push("storage");
-        }
-        if self.iam {
-            profiles.push("iam");
-        }
-        if self.secrets {
-            profiles.push("secrets");
         }
         if self.seal_gateway {
             profiles.push("seal-gateway");
@@ -110,8 +100,6 @@ impl ComponentSelector {
             return Ok(SelectedComponents {
                 temporal: true,
                 storage: false,
-                iam: false,
-                secrets: false,
                 seal_gateway: false,
                 ollama_llm: true,
                 observability: false,
@@ -122,14 +110,12 @@ impl ComponentSelector {
         let items = vec![
             "Temporal (workflow engine, UI, and worker)  [required for workflows]",
             "SeaweedFS (distributed storage for agent volumes)",
-            "IAM (Keycloak OIDC identity provider)        [required for multi-user / Zaru]",
-            "Secrets (OpenBao secrets backend)            [required for secret manager integration]",
             "SEAL Gateway (external tooling gateway)      [enables ToolWorkflows & secure external tool access]",
             "Ollama (local LLM runtime — no API key needed)",
             "Observability (Jaeger OTLP collector + UI)   [recommended for logging/tracing]",
         ];
 
-        let defaults = vec![true, false, false, false, false, false, false];
+        let defaults = vec![true, false, false, false, false];
 
         let selections = MultiSelect::new()
             .with_prompt("Use SPACE to toggle, ENTER to confirm")
@@ -139,11 +125,9 @@ impl ComponentSelector {
 
         let temporal = selections.contains(&0);
         let storage = selections.contains(&1);
-        let iam = selections.contains(&2);
-        let secrets = selections.contains(&3);
-        let seal_gateway = selections.contains(&4);
-        let ollama_llm = selections.contains(&5);
-        let observability = selections.contains(&6);
+        let seal_gateway = selections.contains(&2);
+        let ollama_llm = selections.contains(&3);
+        let observability = selections.contains(&4);
 
         // If Ollama was not selected, ask which cloud LLM to use
         let llm = if ollama_llm {
@@ -184,16 +168,6 @@ impl ComponentSelector {
             } else {
                 "  · SeaweedFS (skipped)"
             },
-            if iam {
-                "  ✓ Keycloak (IAM)"
-            } else {
-                "  · IAM (skipped)"
-            },
-            if secrets {
-                "  ✓ OpenBao (Secrets)"
-            } else {
-                "  · Secrets (skipped)"
-            },
             if seal_gateway {
                 "  ✓ SEAL Gateway"
             } else {
@@ -222,8 +196,6 @@ impl ComponentSelector {
         Ok(SelectedComponents {
             temporal,
             storage,
-            iam,
-            secrets,
             seal_gateway,
             ollama_llm,
             observability,
