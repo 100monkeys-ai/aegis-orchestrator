@@ -196,7 +196,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.agent.update", "Updates an existing Agent manifest in the registry."),
     ("aegis.agent.export", "Exports an Agent manifest by name."),
     ("aegis.agent.delete", "Removes a deployed agent from the registry by UUID."),
-    ("aegis.agent.generate", "Creates a new agent from a natural language description. The `input` must describe what the agent should do, not a task to execute — e.g. 'Create an agent that adds two numbers in Python'. To run a task directly, use aegis.task.execute or aegis.execute.intent instead."),
+    ("aegis.agent.generate", "Generates an Agent manifest from a natural-language intent."),
     ("aegis.agent.logs", "Retrieve agent-level activity log snapshot."),
     ("aegis.agent.search", "Semantic search over deployed agents by natural-language query."),
     ("aegis.workflow.create", "Performs strict deterministic and semantic workflow validation, then registers on pass."),
@@ -690,7 +690,7 @@ impl ToolRouter {
                         "properties": {
                             "input": {
                                 "type": "string",
-                                "description": "Description of the agent to create — e.g. 'Create an agent that adds two numbers in Python'. Must be an agent creation request, not a task to execute directly."
+                                "description": "Natural-language intent for the agent to create."
                             }
                         },
                         "required": ["input"]
