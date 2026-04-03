@@ -209,6 +209,20 @@ impl ToolInvocationService {
             }
         };
 
+        let agent_tenant_id = match self
+            .agent_lifecycle
+            .get_agent_visible(&tenant_id, agent_id)
+            .await
+        {
+            Ok(agent) => agent.tenant_id,
+            Err(e) => {
+                return Ok(ToolInvocationResult::Direct(serde_json::json!({
+                    "tool": "aegis.agent.generate",
+                    "error": format!("Failed to resolve agent tenant: {e}")
+                })));
+            }
+        };
+
         match self
             .execution_service
             .start_execution(
@@ -216,7 +230,7 @@ impl ToolInvocationService {
                 crate::domain::execution::ExecutionInput {
                     intent: Some(input.to_string()),
                     payload: serde_json::json!({
-                        "tenant_id": tenant_id.to_string()
+                        "tenant_id": agent_tenant_id.to_string()
                     }),
                 },
                 "agent-runtime".to_string(),
