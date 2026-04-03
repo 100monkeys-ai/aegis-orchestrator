@@ -134,6 +134,7 @@ impl ToolInvocationService {
                     "description": a.manifest.metadata.description,
                     "labels": a.manifest.metadata.labels,
                     "tags": a.manifest.metadata.tags,
+                    "input_schema": a.manifest.spec.input_schema,
                 })
             })
             .collect();

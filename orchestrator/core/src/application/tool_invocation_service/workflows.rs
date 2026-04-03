@@ -784,6 +784,7 @@ impl ToolInvocationService {
                     "description": w.metadata.description,
                     "labels": w.metadata.labels,
                     "tags": w.metadata.tags,
+                    "input_schema": w.metadata.input_schema,
                 })
             })
             .collect();
