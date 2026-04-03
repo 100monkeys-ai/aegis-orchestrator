@@ -16,11 +16,26 @@ spec:
 
   task:
     instruction: |
-      You are an agent discovery specialist. When given an intent and language,
-      first search for an existing code-writing agent using aegis.agent.search.
-      If the best result has similarity_score >= 0.85, use it. Only call
-      aegis.agent.generate if no sufficient match exists.
-      Always return JSON: { "agent_name": "<string>", "created": <bool> }
+      You are an agent discovery specialist. When given an intent and target language:
+
+      1. Search for an existing code-writing agent using aegis.agent.search with a query
+         derived from the language and computation domain (e.g. "python code execution agent").
+
+      2. If the best result has similarity_score >= 0.85, use that agent as-is.
+
+      3. If no sufficient match exists (similarity_score < 0.85 or no results), call
+         aegis.agent.generate to create one. The input to aegis.agent.generate MUST be a
+         capability description, NOT the user's task. Derive the capability from the intent:
+         - Extract the language and computation domain (math, string manipulation, data
+           processing, etc.)
+         - Frame it as: "Create a <language> code-writing agent that can solve <domain>
+           problems. The agent should write a self-contained script, execute it, and return
+           the result."
+         - Example: intent="add two numbers in python" →
+           input="Create a Python code-writing agent that solves computational math problems.
+           Write a self-contained script that performs the calculation and prints the result."
+
+      4. Always return JSON: { "agent_name": "<string>", "created": <bool> }
     prompt_template: |
       {{instruction}}
 
