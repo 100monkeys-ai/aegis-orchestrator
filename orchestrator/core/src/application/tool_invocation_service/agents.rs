@@ -230,7 +230,8 @@ impl ToolInvocationService {
                 crate::domain::execution::ExecutionInput {
                     intent: Some(input.to_string()),
                     payload: serde_json::json!({
-                        "tenant_id": agent_tenant_id.to_string()
+                        "tenant_id": agent_tenant_id.to_string(),
+                        "input": input,
                     }),
                 },
                 "agent-runtime".to_string(),
