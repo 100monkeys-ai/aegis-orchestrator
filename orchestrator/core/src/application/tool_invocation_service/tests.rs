@@ -576,6 +576,14 @@ impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
         Ok(vec![])
     }
 
+    async fn count_by_workflow_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _workflow_id: crate::domain::workflow::WorkflowId,
+    ) -> Result<i64, crate::domain::repository::RepositoryError> {
+        Ok(0)
+    }
+
     async fn list_paginated_for_tenant(
         &self,
         _tenant_id: &TenantId,
