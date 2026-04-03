@@ -84,6 +84,17 @@ spec:
       - Workflows that reference agents known to write files should verify those agents use
         /workspace/* paths; if this cannot be verified, flag it in the `completeness` signal.
 
+      INPUT SCHEMA AUDIT — check the generated workflow manifest for appropriate input_schema usage:
+      - If the workflow's states reference named input fields (e.g., `{{input.intent}}`,
+        `{{input.language}}`) but no `metadata.input_schema` is declared, reduce the `completeness`
+        score by at least 0.15 and note "workflow references named input fields but declares no metadata.input_schema".
+      - If `metadata.input_schema` is declared and the workflow's states reference matching named
+        fields via `{{input.FIELD_NAME}}`, give full `completeness` credit for input schema alignment.
+      - If `metadata.input_schema` is declared but the workflow only passes a free-form string
+        with no named field access, reduce `completeness` by at least 0.1 and note
+        "input_schema declared but workflow uses only free-form input — consider omitting".
+      - Do not penalise omission of `input_schema` when the workflow accepts only a free-form string.
+
       Return JSON only:
       {
         "score": 0.0-1.0,
