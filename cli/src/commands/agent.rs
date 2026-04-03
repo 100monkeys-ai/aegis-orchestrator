@@ -333,7 +333,7 @@ async fn deploy_agent(
             .as_deref()
             .unwrap_or("unknown")
     ));
-    let agent_id = client.deploy_agent(agent_manifest, force).await?;
+    let agent_id = client.deploy_agent(agent_manifest, force, None).await?;
 
     if output_format.is_structured() {
         return render_serialized(

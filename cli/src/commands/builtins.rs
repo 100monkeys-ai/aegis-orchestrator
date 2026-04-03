@@ -261,7 +261,7 @@ async fn deploy_builtin_agent(
     );
 
     client
-        .deploy_agent(manifest, force)
+        .deploy_agent(manifest, force, Some("global"))
         .await
         .context("Failed to deploy built-in template")
 }
@@ -298,7 +298,7 @@ async fn deploy_builtin_workflow(
         .context("Built-in workflow template failed cycle validation")?;
 
     client
-        .deploy_workflow_manifest_with_force(template_yaml, force)
+        .deploy_workflow_manifest_with_force_and_scope(template_yaml, force, Some("global"))
         .await
         .context("Failed to deploy built-in workflow template")
 }

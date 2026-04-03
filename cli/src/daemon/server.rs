@@ -1861,7 +1861,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     if already_exists && !force_builtins {
                         info!("Built-in agent '{}' already registered, skipping", name);
                     } else {
-                        match agent_service.deploy_agent(manifest, force_builtins).await {
+                        match agent_service
+                            .deploy_agent_for_tenant(
+                                &aegis_orchestrator_core::domain::tenant::TenantId::system(),
+                                manifest,
+                                force_builtins,
+                                aegis_orchestrator_core::domain::agent::AgentScope::Global,
+                            )
+                            .await
+                        {
                             Ok(id) => info!("Deployed built-in agent '{}' (id: {})", name, id),
                             Err(e) => warn!("Failed to deploy built-in agent '{}': {}", name, e),
                         }
@@ -1884,11 +1892,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     wf_name
                 );
             } else {
+                let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
                 match register_workflow_use_case
-                    .register_workflow(wf_template, force_builtins)
+                    .register_workflow_for_tenant(&system_tenant, wf_template, force_builtins)
                     .await
                 {
-                    Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
+                    Ok(registered) => {
+                        // Set scope to Global with aegis-system tenant after registration.
+                        if let Ok(Some(workflow)) = workflow_repo
+                            .find_by_name_for_tenant(&system_tenant, &registered.name)
+                            .await
+                        {
+                            if let Err(e) = workflow_repo
+                                .update_scope(
+                                    workflow.id,
+                                    aegis_orchestrator_core::domain::workflow::WorkflowScope::Global,
+                                    &system_tenant,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "Failed to set global scope for built-in workflow '{}': {}",
+                                    wf_name, e
+                                );
+                            }
+                        }
+                        info!("Deployed built-in workflow '{}'", wf_name);
+                    }
                     Err(e) => warn!("Failed to deploy built-in workflow '{}': {}", wf_name, e),
                 }
             }

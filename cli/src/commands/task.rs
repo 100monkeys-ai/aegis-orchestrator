@@ -243,7 +243,7 @@ async fn execute_daemon(
                     serde_yaml::from_str(&manifest_content).context("Failed to parse manifest")?;
 
                 // Deploy (will fail if name exists, so user sees error, which is good)
-                match client.deploy_agent(agent_manifest, false).await {
+                match client.deploy_agent(agent_manifest, false, None).await {
                     Ok(id) => id,
                     Err(e) => {
                         // Simplify error for user

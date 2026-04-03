@@ -18,6 +18,7 @@ use aegis_orchestrator_core::application::scope_requester::ScopeChangeRequester;
 use aegis_orchestrator_core::domain::agent::{AgentId, AgentScope};
 use aegis_orchestrator_core::domain::execution::ExecutionInput;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 
 use crate::daemon::handlers::tenant_id_from_identity;
 use crate::daemon::state::AppState;
@@ -63,9 +64,15 @@ pub(crate) async fn deploy_agent_handler(
         _ => AgentScope::Tenant,
     };
 
+    let effective_tenant_id = if matches!(agent_scope, AgentScope::Global) {
+        TenantId::system()
+    } else {
+        tenant_id
+    };
+
     match state
         .agent_service
-        .deploy_agent_for_tenant(&tenant_id, manifest, query.force, agent_scope)
+        .deploy_agent_for_tenant(&effective_tenant_id, manifest, query.force, agent_scope)
         .await
     {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),
