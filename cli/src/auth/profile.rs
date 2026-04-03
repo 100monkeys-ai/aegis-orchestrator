@@ -19,16 +19,6 @@ pub struct AegisProfile {
     pub scopes: Vec<String>,
 }
 
-impl AegisProfile {
-    pub fn auth_url(&self) -> String {
-        format!("https://auth.{}/realms/aegis-system", self.env)
-    }
-
-    pub fn api_url(&self) -> String {
-        format!("https://api.{}", self.env)
-    }
-}
-
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct AuthStore {
     pub active_profile: String,

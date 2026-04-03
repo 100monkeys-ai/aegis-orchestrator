@@ -5,7 +5,7 @@ mod env;
 mod profile;
 mod refresh;
 
-pub use profile::{load_store, save_store, AegisProfile, AuthStore};
+pub use profile::{load_store, save_store, AegisProfile};
 
 use anyhow::Result;
 
