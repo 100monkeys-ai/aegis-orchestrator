@@ -197,7 +197,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let agent_id = match self
             .agent_lifecycle
-            .lookup_agent_for_tenant(&tenant_id, "agent-creator-agent")
+            .lookup_agent_visible_for_tenant(&tenant_id, None, "agent-creator-agent")
             .await
         {
             Ok(Some(id)) => id,
