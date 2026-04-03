@@ -57,6 +57,9 @@ pub(crate) struct AppState {
     pub(crate) rate_limit_override_repo: Option<
         Arc<aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository>,
     >,
+    pub(crate) api_key_repo: Option<
+        Arc<aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository>,
+    >,
     pub(crate) iam_service: Option<Arc<dyn IdentityProvider>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,

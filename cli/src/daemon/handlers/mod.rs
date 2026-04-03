@@ -9,6 +9,7 @@ use aegis_orchestrator_core::domain::{
 
 pub(crate) mod admin;
 pub(crate) mod agents;
+pub(crate) mod api_keys;
 pub(crate) mod approvals;
 pub(crate) mod cluster;
 pub(crate) mod cortex;

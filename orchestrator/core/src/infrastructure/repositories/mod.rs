@@ -49,10 +49,12 @@
 //! 4. **Connection Pooling**: Efficient database connection management
 
 pub mod postgres_agent;
+pub mod postgres_api_key;
 pub mod postgres_execution;
 pub mod postgres_storage_event;
 pub mod postgres_tenant;
 pub mod postgres_volume;
+pub use postgres_api_key::PostgresApiKeyRepository;
 pub mod postgres_workflow;
 pub mod postgres_workflow_execution;
 

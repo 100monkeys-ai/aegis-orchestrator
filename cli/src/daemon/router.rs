@@ -19,6 +19,9 @@ use crate::daemon::handlers::agents::{
     list_agent_versions_handler, list_agents_handler, lookup_agent_handler,
     stream_agent_events_handler, update_agent_handler, update_agent_scope_handler,
 };
+use crate::daemon::handlers::api_keys::{
+    create_api_key_handler, list_api_keys_handler, revoke_api_key_handler,
+};
 use crate::daemon::handlers::approvals::{
     approve_request_handler, get_pending_approval_handler, list_pending_approvals_handler,
     reject_request_handler,
@@ -201,6 +204,12 @@ pub(crate) fn create_router(
             "/v1/user/rate-limits/usage",
             get(get_user_rate_limit_usage_handler),
         )
+        // API key management (ADR-093)
+        .route(
+            "/v1/api-keys",
+            get(list_api_keys_handler).post(create_api_key_handler),
+        )
+        .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
