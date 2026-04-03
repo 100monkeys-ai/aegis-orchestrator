@@ -308,7 +308,7 @@ pub(crate) async fn get_agent_handler(
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .agent_service
-        .get_agent_for_tenant(&tenant_id, AgentId(id))
+        .get_agent_visible(&tenant_id, AgentId(id))
         .await
     {
         Ok(agent) => {

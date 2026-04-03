@@ -279,6 +279,21 @@ impl AgentRepository for InMemoryAgentRepository {
 
         Ok(user_match.or(tenant_match).or(global_match))
     }
+
+    async fn find_by_id_visible(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        if let Some(agent) = self.find_by_id_for_tenant(tenant_id, id).await? {
+            return Ok(Some(agent));
+        }
+        let system_tenant = TenantId::system();
+        if tenant_id.as_str() != "aegis-system" {
+            return self.find_by_id_for_tenant(&system_tenant, id).await;
+        }
+        Ok(None)
+    }
 }
 
 // AgentLifecycleService implementation for in-memory use
@@ -437,6 +452,13 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     ) -> anyhow::Result<Vec<crate::domain::repository::AgentVersion>> {
         // In-memory repo does not track version history
         Ok(Vec::new())
+    }
+
+    async fn get_agent_visible(&self, tenant_id: &TenantId, id: AgentId) -> anyhow::Result<Agent> {
+        self.find_by_id_visible(tenant_id, id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("Agent not found"))
     }
 }
 

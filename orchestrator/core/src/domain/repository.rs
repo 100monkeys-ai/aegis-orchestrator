@@ -133,6 +133,13 @@ pub trait AgentRepository: Send + Sync {
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError>;
 
+    /// Fetch an agent by ID, falling through to the global tenant if not found in the requesting tenant.
+    async fn find_by_id_visible(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<Option<Agent>, RepositoryError>;
+
     /// Save agent (create or update)
     async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
         self.save_for_tenant(&TenantId::local_default(), agent)
