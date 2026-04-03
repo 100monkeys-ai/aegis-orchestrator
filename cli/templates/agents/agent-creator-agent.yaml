@@ -139,6 +139,15 @@ spec:
         min_confidence: 0.7
         timeout_seconds: 90
 
+  input_schema:
+    type: object
+    properties:
+      input:
+        type: string
+        description: Natural language description of the agent to create
+    required:
+      - input
+
   tools:
     - aegis.agent.search
     - aegis.agent.list

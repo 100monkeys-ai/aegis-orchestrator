@@ -188,13 +188,22 @@ impl ToolInvocationService {
         args: &Value,
         _security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        let input = args.get("input").and_then(|v| v.as_str()).ok_or_else(|| {
-            SealSessionError::SignatureVerificationFailed(
-                "aegis.agent.generate requires 'input' string".to_string(),
-            )
-        })?;
+        let raw_input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
 
         let tenant_id = Self::resolve_tenant_arg(args)?;
+
+        // Normalize: if the caller passed a plain string, wrap it as { "input": <str> }.
+        // Then inject tenant_id using the same pattern as invoke_aegis_task_execute_tool.
+        let mut payload = if raw_input.is_object() {
+            raw_input
+        } else {
+            serde_json::json!({ "input": raw_input })
+        };
+        if let Some(map) = payload.as_object_mut() {
+            map.entry("tenant_id")
+                .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
+        }
+
         let agent_id = match self
             .agent_lifecycle
             .lookup_agent_visible_for_tenant(&tenant_id, None, "agent-creator-agent")
@@ -209,30 +218,13 @@ impl ToolInvocationService {
             }
         };
 
-        let agent_tenant_id = match self
-            .agent_lifecycle
-            .get_agent_visible(&tenant_id, agent_id)
-            .await
-        {
-            Ok(agent) => agent.tenant_id,
-            Err(e) => {
-                return Ok(ToolInvocationResult::Direct(serde_json::json!({
-                    "tool": "aegis.agent.generate",
-                    "error": format!("Failed to resolve agent tenant: {e}")
-                })));
-            }
-        };
-
         match self
             .execution_service
             .start_execution(
                 agent_id,
                 crate::domain::execution::ExecutionInput {
-                    intent: Some(input.to_string()),
-                    payload: serde_json::json!({
-                        "tenant_id": agent_tenant_id.to_string(),
-                        "input": input,
-                    }),
+                    intent: None,
+                    payload,
                 },
                 "agent-runtime".to_string(),
                 None,
