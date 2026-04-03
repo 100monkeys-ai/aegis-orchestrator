@@ -11,7 +11,7 @@ use axum::Json;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::execution::ExecutionService;
-use aegis_orchestrator_core::domain::node_config::resolve_env_value;
+use aegis_orchestrator_core::domain::iam::IdentityKind;
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 
 use crate::daemon::state::AppState;
@@ -174,33 +174,60 @@ pub(crate) async fn temporal_events_handler(
     headers: HeaderMap,
     Json(payload): Json<TemporalEventPayload>,
 ) -> impl IntoResponse {
-    // Validate shared secret from X-Temporal-Worker-Secret header
-    // Read from config (spec.temporal.worker_secret) instead of direct env var
-    let temporal_config_for_secret = state.config.spec.temporal.as_ref();
-    let expected_secret = temporal_config_for_secret
-        .and_then(|tc| tc.worker_secret.as_ref())
-        .and_then(|s| resolve_env_value(s).ok());
-    if let Some(secret) = expected_secret {
-        let provided = headers
-            .get("x-temporal-worker-secret")
-            .and_then(|v| v.to_str().ok());
-        match provided {
-            Some(value) if value == secret => {}
-            _ => {
+    // Authenticate via Bearer JWT from the aegis-temporal-worker service account.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    let token = match auth_header.and_then(|h| h.strip_prefix("Bearer ")) {
+        Some(t) => t,
+        None => {
+            tracing::warn!("temporal-events: missing or malformed Authorization header");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            )
+                .into_response();
+        }
+    };
+
+    let iam = match state.iam_service.as_ref() {
+        Some(svc) => svc,
+        None => {
+            tracing::error!(
+                "temporal-events: IAM service not configured; cannot authenticate request"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            )
+                .into_response();
+        }
+    };
+
+    match iam.validate_token(token).await {
+        Ok(validated) => match &validated.identity.identity_kind {
+            IdentityKind::ServiceAccount { client_id } if client_id == "aegis-temporal-worker" => {}
+            other => {
+                tracing::warn!(
+                    identity_kind = ?other,
+                    "temporal-events: token is valid but not from aegis-temporal-worker"
+                );
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(serde_json::json!({
-                        "error": "Unauthorized: invalid or missing X-Temporal-Worker-Secret header"
-                    })),
+                    Json(serde_json::json!({"error": "Unauthorized"})),
                 )
                     .into_response();
             }
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "temporal-events: JWT validation failed");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            )
+                .into_response();
         }
-    } else {
-        tracing::warn!(
-            "spec.temporal.worker_secret not configured; /v1/temporal-events endpoint is unauthenticated. \
-             Set spec.temporal.worker_secret in aegis-config.yaml for production."
-        );
     }
 
     match state.temporal_event_listener.handle_event(payload).await {

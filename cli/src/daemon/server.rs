@@ -198,18 +198,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .validate()
         .context("Configuration validation failed")?;
 
-    if config.is_production()
-        && config
-            .spec
-            .temporal
-            .as_ref()
-            .is_some_and(|temporal| temporal.worker_secret.is_none())
-    {
-        anyhow::bail!(
-            "Production nodes with spec.temporal configured must set spec.temporal.worker_secret"
-        );
-    }
-
     // Initialize metrics if enabled (ADR-058 Step 2)
     if config
         .spec
@@ -1427,6 +1415,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         rate_limit_override_repo: db_pool.as_ref().map(|pool| {
             Arc::new(aegis_orchestrator_core::infrastructure::rate_limit::RateLimitOverrideRepository::new(pool.clone()))
         }),
+        iam_service: iam_service.clone(),
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };

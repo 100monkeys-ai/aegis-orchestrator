@@ -17,7 +17,9 @@
 //! - `/v1/seal/invoke` — SEAL tool invocation (uses SecurityToken)
 //! - `/v1/seal/tools` — SEAL tool discovery metadata
 //! - `/v1/webhooks/*` — webhook ingestion (HMAC auth)
-//! - `/v1/temporal-events` — Temporal callbacks (HMAC auth)
+//!
+//! Note: `/v1/temporal-events` is NOT exempt — it validates its own Bearer JWT
+//! from the `aegis-temporal-worker` service account directly in the handler.
 
 use crate::domain::iam::IdentityProvider;
 use axum::{
@@ -82,7 +84,6 @@ const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/v1/seal/invoke",
     "/v1/seal/tools",
     "/v1/webhooks",
-    "/v1/temporal-events",
 ];
 
 /// Check whether a request path is exempt from IAM/OIDC auth.
@@ -182,7 +183,6 @@ mod tests {
         assert!(is_exempt("/v1/seal/invoke"));
         assert!(is_exempt("/v1/seal/tools"));
         assert!(is_exempt("/v1/webhooks/github"));
-        assert!(is_exempt("/v1/temporal-events"));
     }
 
     #[test]
@@ -190,5 +190,7 @@ mod tests {
         assert!(!is_exempt("/v1/stimuli"));
         assert!(!is_exempt("/v1/agents"));
         assert!(!is_exempt("/api/v1/status"));
+        // temporal-events authenticates via JWT in the handler itself
+        assert!(!is_exempt("/v1/temporal-events"));
     }
 }

@@ -55,7 +55,6 @@ pub struct AdvancedConfig {
     pub orchestrator_url: String,
     pub nfs_host: String,
     pub database_url: String,
-    pub temporal_worker_secret: String,
     pub keep_container: bool,
     pub enable_lmstudio: bool,
     pub lmstudio_endpoint: String,
@@ -331,7 +330,7 @@ impl ConfigWizard {
             orchestrator_url: "http://aegis-runtime:8088".to_string(),
             nfs_host: "127.0.0.1".to_string(),
             database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
-            temporal_worker_secret: "dev-temporal-secret".to_string(),
+
             keep_container: false,
             enable_lmstudio: false,
             lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
@@ -450,11 +449,6 @@ impl ConfigWizard {
                 .with_prompt("AEGIS_DATABASE_URL")
                 .default(defaults.database_url.clone())
                 .interact_text()?,
-            temporal_worker_secret: Password::new()
-                .with_prompt("TEMPORAL_WORKER_SECRET")
-                .with_confirmation("Confirm TEMPORAL_WORKER_SECRET", "Secrets mismatch")
-                .allow_empty_password(true)
-                .interact()?,
             keep_container: Confirm::new()
                 .with_prompt("Set AEGIS_KEEP_CONTAINER=true for debugging?")
                 .default(defaults.keep_container)
@@ -1105,7 +1099,6 @@ impl ConfigWizard {
   temporal:
     address: "temporal:7233"
     worker_http_endpoint: "http://temporal-worker:3000"
-    worker_secret: "env:TEMPORAL_WORKER_SECRET"
     namespace: "default"
     task_queue: "aegis-agents"
     max_connection_retries: 30
@@ -1366,7 +1359,6 @@ AEGIS_NFS_HOST={nfs_host}
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 AEGIS_DATABASE_URL={database_url}
-TEMPORAL_WORKER_SECRET={temporal_worker_secret}
 
 # ─── Runtime ──────────────────────────────────────────────────────────────────
 AEGIS_KEEP_CONTAINER={keep_container}
@@ -1379,7 +1371,6 @@ AEGIS_SEAL_PRIVATE_KEY='{seal_private_key}'
             orchestrator_url = config.advanced.orchestrator_url,
             nfs_host = config.advanced.nfs_host,
             database_url = config.advanced.database_url,
-            temporal_worker_secret = config.advanced.temporal_worker_secret,
             keep_container = if config.advanced.keep_container {
                 "true"
             } else {
@@ -1516,7 +1507,7 @@ mod tests {
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
                 database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
-                temporal_worker_secret: "dev-temporal-secret".to_string(),
+
                 keep_container: false,
                 enable_lmstudio: false,
                 lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
@@ -1591,7 +1582,7 @@ mod tests {
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
                 database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
-                temporal_worker_secret: "dev-temporal-secret".to_string(),
+
                 keep_container: false,
                 enable_lmstudio: false,
                 lmstudio_endpoint: "http://host.docker.internal:1234/v1".to_string(),
