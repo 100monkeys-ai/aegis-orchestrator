@@ -528,6 +528,22 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         Ok(records)
     }
 
+    async fn count_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+    ) -> Result<i64, RepositoryError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM workflow_executions WHERE tenant_id = $1 AND workflow_id = $2",
+        )
+        .bind(tenant_id.as_str())
+        .bind(workflow_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
+
     async fn list_paginated_for_tenant(
         &self,
         tenant_id: &TenantId,

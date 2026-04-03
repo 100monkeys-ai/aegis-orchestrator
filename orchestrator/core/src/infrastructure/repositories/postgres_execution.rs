@@ -609,4 +609,20 @@ impl ExecutionRepository for PostgresExecutionRepository {
             .map_err(|e| RepositoryError::Database(e.to_string()))?;
         Ok(())
     }
+
+    async fn count_by_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<i64, RepositoryError> {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM executions WHERE tenant_id = $1 AND agent_id = $2",
+        )
+        .bind(tenant_id.as_str())
+        .bind(agent_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count)
+    }
 }

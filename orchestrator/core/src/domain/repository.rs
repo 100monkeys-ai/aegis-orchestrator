@@ -227,6 +227,12 @@ pub trait ExecutionRepository: Send + Sync {
         id: ExecutionId,
     ) -> Result<(), RepositoryError>;
 
+    async fn count_by_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<i64, RepositoryError>;
+
     /// Save execution (create or update)
     async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
         self.save_for_tenant(&TenantId::local_default(), execution)
@@ -268,6 +274,11 @@ pub trait ExecutionRepository: Send + Sync {
     /// Delete execution by ID
     async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError> {
         self.delete_for_tenant(&TenantId::local_default(), id).await
+    }
+
+    async fn count_by_agent(&self, agent_id: AgentId) -> Result<i64, RepositoryError> {
+        self.count_by_agent_for_tenant(&TenantId::local_default(), agent_id)
+            .await
     }
 }
 
@@ -481,6 +492,12 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         self.find_by_workflow_for_tenant(&TenantId::local_default(), workflow_id, limit, offset)
             .await
     }
+
+    async fn count_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+    ) -> Result<i64, RepositoryError>;
 
     /// Persist Temporal workflow/run linkage for an already-created workflow execution.
     async fn update_temporal_linkage_for_tenant(

@@ -181,9 +181,26 @@ pub(crate) async fn list_workflows_handler(
             .unwrap_or_default()
     };
 
+    let counts: Vec<i64> = {
+        let futs: Vec<_> = workflows
+            .iter()
+            .map(|w| {
+                let repo = state.workflow_execution_repo.clone();
+                let tid = w.tenant_id.clone();
+                let wid = w.id;
+                async move {
+                    repo.count_by_workflow_for_tenant(&tid, wid)
+                        .await
+                        .unwrap_or(0)
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await
+    };
     let workflow_list: Vec<serde_json::Value> = workflows
         .iter()
-        .map(|w| {
+        .enumerate()
+        .map(|(idx, w)| {
             serde_json::json!({
                 "id": w.id.0,
                 "name": w.metadata.name,
@@ -197,6 +214,7 @@ pub(crate) async fn list_workflows_handler(
                 "updated_at": w.updated_at.map(|t| t.to_rfc3339()),
                 "tenant_id": w.tenant_id.as_str(),
                 "input_schema": w.metadata.input_schema,
+                "execution_count": counts[idx],
             })
         })
         .collect();

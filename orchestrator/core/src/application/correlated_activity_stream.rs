@@ -689,6 +689,14 @@ mod tests {
             Ok(())
         }
 
+        async fn count_by_workflow_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _workflow_id: WorkflowId,
+        ) -> std::result::Result<i64, RepositoryError> {
+            Ok(0)
+        }
+
         async fn find_events_by_execution(
             &self,
             _id: ExecutionId,

@@ -946,6 +946,14 @@ mod tests {
             Ok(vec![])
         }
 
+        async fn count_by_workflow_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _workflow_id: crate::domain::workflow::WorkflowId,
+        ) -> Result<i64, RepositoryError> {
+            Ok(0)
+        }
+
         async fn list_paginated(
             &self,
             _limit: usize,

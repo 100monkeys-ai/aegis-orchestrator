@@ -562,6 +562,24 @@ impl ExecutionRepository for InMemoryExecutionRepository {
         }
         Ok(())
     }
+
+    async fn count_by_agent_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        agent_id: AgentId,
+    ) -> Result<i64, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let count = executions
+            .get(tenant_id)
+            .map(|tenant_execs| {
+                tenant_execs
+                    .values()
+                    .filter(|e| e.agent_id == agent_id)
+                    .count() as i64
+            })
+            .unwrap_or(0);
+        Ok(count)
+    }
 }
 
 #[derive(Clone)]
@@ -1043,6 +1061,24 @@ impl crate::domain::repository::WorkflowExecutionRepository
         _offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError> {
         Ok(vec![])
+    }
+
+    async fn count_by_workflow_for_tenant(
+        &self,
+        tenant_id: &TenantId,
+        workflow_id: crate::domain::workflow::WorkflowId,
+    ) -> Result<i64, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let count = executions
+            .get(tenant_id)
+            .map(|tenant_execs| {
+                tenant_execs
+                    .values()
+                    .filter(|e| e.workflow_id == workflow_id)
+                    .count() as i64
+            })
+            .unwrap_or(0);
+        Ok(count)
     }
 
     async fn list_paginated_for_tenant(

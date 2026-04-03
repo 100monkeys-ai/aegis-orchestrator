@@ -201,9 +201,22 @@ pub(crate) async fn list_agents_handler(
         .await
     {
         Ok(agents) => {
+            let counts: Vec<i64> = {
+                let futs: Vec<_> = agents
+                    .iter()
+                    .map(|agent| {
+                        let repo = state.execution_repo.clone();
+                        let tid = agent.tenant_id.clone();
+                        let aid = agent.id;
+                        async move { repo.count_by_agent_for_tenant(&tid, aid).await.unwrap_or(0) }
+                    })
+                    .collect();
+                futures::future::join_all(futs).await
+            };
             let json_agents: Vec<serde_json::Value> = agents
-                .into_iter()
-                .map(|agent| {
+                .iter()
+                .enumerate()
+                .map(|(idx, agent)| {
                     serde_json::json!({
                         "id": agent.id.0,
                         "name": agent.manifest.metadata.name,
@@ -218,6 +231,7 @@ pub(crate) async fn list_agents_handler(
                         "updated_at": agent.updated_at.to_rfc3339(),
                         "tenant_id": agent.tenant_id.as_str(),
                         "input_schema": agent.manifest.spec.input_schema,
+                        "execution_count": counts[idx],
                     })
                 })
                 .collect();
