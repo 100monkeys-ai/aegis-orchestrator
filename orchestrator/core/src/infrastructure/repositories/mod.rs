@@ -882,6 +882,21 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(())
     }
 
+    async fn find_by_name_visible(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        if let Some(workflow) = self.find_by_name_for_tenant(tenant_id, name).await? {
+            return Ok(Some(workflow));
+        }
+        let system_tenant = TenantId::system();
+        if tenant_id.as_str() != "aegis-system" {
+            return self.find_by_name_for_tenant(&system_tenant, name).await;
+        }
+        Ok(None)
+    }
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,

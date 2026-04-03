@@ -348,6 +348,13 @@ pub trait WorkflowRepository: Send + Sync {
     /// List only global-scope workflows.
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError>;
 
+    /// Fetch a workflow by name, falling through to the global tenant if not found in the requesting tenant.
+    async fn find_by_name_visible(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError>;
+
     /// Update the scope of an existing workflow (for promote/demote).
     async fn update_scope(
         &self,

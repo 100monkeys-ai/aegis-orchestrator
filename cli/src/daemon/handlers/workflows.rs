@@ -215,7 +215,7 @@ pub(crate) async fn get_workflow_handler(
 
     match state
         .workflow_repo
-        .find_by_name_for_tenant(&tenant_id, &name)
+        .find_by_name_visible(&tenant_id, &name)
         .await
     {
         Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {

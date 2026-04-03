@@ -1032,6 +1032,14 @@ mod tests {
             ) -> Result<Vec<Workflow>, RepositoryError> {
                 Ok(vec![])
             }
+
+            async fn find_by_name_visible(
+                &self,
+                _tenant_id: &TenantId,
+                _name: &str,
+            ) -> Result<Option<Workflow>, RepositoryError> {
+                Ok(None)
+            }
         }
 
         let service = StandardStartWorkflowExecutionUseCase::new(
