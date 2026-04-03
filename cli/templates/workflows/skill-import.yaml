@@ -8,6 +8,17 @@ metadata:
     category: "agent-management"
     pattern: "import-pipeline"
     stability: "builtin"
+  input_schema:
+    type: object
+    properties:
+      skill_url:
+        type: string
+        description: URL of the SKILL.md file to import
+      agent_name_override:
+        type: string
+        description: Optional override for the agent name derived from the skill
+    required:
+      - skill_url
 spec:
   initial_state: FETCH
   context:

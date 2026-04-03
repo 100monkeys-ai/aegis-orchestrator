@@ -170,3 +170,25 @@ spec:
       cpu: 1000        # 1.0 CPU core
       memory: "512Mi"
       timeout: "300s"   # Must respond within the timeout; LLM calls can take 90–120 s
+
+  input_schema:
+    type: object
+    properties:
+      task:
+        type: string
+        description: The original task or objective given to the worker agent
+      output:
+        type: string
+        description: The code or output produced by the worker agent
+      worker_mounts:
+        type: object
+        description: Mounted filesystem artifacts from the worker execution
+      criteria:
+        type: string
+        description: Specific quality criteria to evaluate against
+      validation_context:
+        type: string
+        description: Additional context for the validation evaluation
+    required:
+      - task
+      - output

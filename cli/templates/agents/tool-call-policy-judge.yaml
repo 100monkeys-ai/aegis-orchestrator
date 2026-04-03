@@ -172,3 +172,23 @@ spec:
       cpu: 1000
       memory: "256Mi"  # Tool checking is lightweight, requires less memory
       timeout: "60s"   # Must be fast since it blocks execution
+
+  input_schema:
+    type: object
+    properties:
+      task:
+        type: string
+        description: The agent's task or objective being evaluated
+      proposed_tool_call:
+        type: object
+        description: The tool call being evaluated for policy compliance
+      available_tools:
+        type: array
+        description: List of tools available to the agent
+      validation_context:
+        type: string
+        description: Additional context for the validation evaluation
+    required:
+      - task
+      - proposed_tool_call
+      - available_tools

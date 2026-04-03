@@ -8,6 +8,33 @@ metadata:
     role: judge
     category: validation
     capability: agent-generation-judging
+  input_schema:
+    type: object
+    properties:
+      user_objective:
+        type: string
+        description: The original user request that triggered agent generation
+      generated_manifest:
+        type: string
+        description: The generated agent manifest YAML to evaluate
+      deployment_result:
+        type: string
+        description: Summary of the deployment attempt result
+      tool_call_history:
+        type: array
+        description: History of tool calls made during generation
+      worker_mounts:
+        type: object
+        description: Mounted filesystem artifacts from the worker execution
+      criteria:
+        type: string
+        description: Specific criteria to evaluate against
+      validation_context:
+        type: string
+        description: Additional context for the validation evaluation
+    required:
+      - user_objective
+      - generated_manifest
 spec:
   runtime:
     language: python
