@@ -48,7 +48,7 @@ pub trait AgentLifecycleService: Send + Sync {
 
     /// Fetch an agent by ID, checking the requesting tenant first then falling through to aegis-system.
     ///
-    /// The default implementation delegates to [`get_agent_for_tenant`] — concrete repository-backed
+    /// The default implementation delegates to [`AgentRepository::get_agent_for_tenant`] — concrete repository-backed
     /// implementations override this to perform an efficient single-pass fallthrough query.
     async fn get_agent_visible(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
         self.get_agent_for_tenant(tenant_id, id).await
