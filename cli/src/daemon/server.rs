@@ -1890,8 +1890,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
 
         for (wf_name, wf_template) in builtins::BUILTIN_WORKFLOWS {
+            let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
             let already_exists = workflow_repo
-                .find_by_name(wf_name)
+                .find_by_name_for_tenant(&system_tenant, wf_name)
                 .await
                 .ok()
                 .flatten()
@@ -1902,7 +1903,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     wf_name
                 );
             } else {
-                let system_tenant = aegis_orchestrator_core::domain::tenant::TenantId::system();
                 match register_workflow_use_case
                     .register_workflow_for_tenant(&system_tenant, wf_template, force_builtins)
                     .await
@@ -1929,7 +1929,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         }
                         info!("Deployed built-in workflow '{}'", wf_name);
                     }
-                    Err(e) => warn!("Failed to deploy built-in workflow '{}': {}", wf_name, e),
+                    Err(e) => warn!("Failed to deploy built-in workflow '{}': {:#}", wf_name, e),
                 }
             }
         }
