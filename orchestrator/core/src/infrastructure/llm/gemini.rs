@@ -124,8 +124,6 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default)]
     total_token_count: u32,
-    #[serde(default)]
-    thoughts_token_count: u32,
 }
 
 impl GeminiAdapter {
@@ -379,7 +377,7 @@ impl LLMProvider for GeminiAdapter {
             .content
             .parts
             .iter()
-            .filter(|p| p.thought.unwrap_or(false) == false)
+            .filter(|p| !p.thought.unwrap_or(false))
             .filter_map(|p| p.text.clone())
             .collect::<Vec<_>>()
             .join("");
