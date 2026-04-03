@@ -215,9 +215,11 @@ impl ToolInvocationService {
                 agent_id,
                 crate::domain::execution::ExecutionInput {
                     intent: Some(input.to_string()),
-                    payload: serde_json::Value::String(input.to_string()),
+                    payload: serde_json::json!({
+                        "tenant_id": tenant_id.to_string()
+                    }),
                 },
-                "default".to_string(),
+                "agent-runtime".to_string(),
                 None,
             )
             .await
