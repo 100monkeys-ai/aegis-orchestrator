@@ -64,6 +64,7 @@ use crate::application::agent::AgentLifecycleService;
 use crate::application::execution::ExecutionService;
 use crate::domain::agent::{AgentId, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
+use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
     extract_json_from_text, GradientResult, GradientValidator, MultiJudgeConsensus,
     OutputGradientValidator, SystemGradientValidator, ValidationContext, ValidationPipeline,
@@ -463,6 +464,7 @@ pub struct SemanticAgentValidator {
     agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
     execution_service: Arc<dyn ExecutionService>,
     parent_execution_id: ExecutionId,
+    tenant_id: TenantId,
 }
 
 impl SemanticAgentValidator {
@@ -474,6 +476,7 @@ impl SemanticAgentValidator {
         agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
         parent_execution_id: ExecutionId,
+        tenant_id: TenantId,
     ) -> Self {
         Self {
             judge_agent_name,
@@ -483,6 +486,7 @@ impl SemanticAgentValidator {
             agent_lifecycle_service,
             execution_service,
             parent_execution_id,
+            tenant_id,
         }
     }
 }
@@ -490,10 +494,12 @@ impl SemanticAgentValidator {
 #[async_trait::async_trait]
 impl GradientValidator for SemanticAgentValidator {
     async fn validate(&self, ctx: &ValidationContext) -> Result<GradientResult> {
-        // 1. Resolve judge agent id by name.
+        // 1. Resolve judge agent id by name — use visible (cross-tenant) lookup so
+        //    aegis-system scoped judges (e.g. agent-generator-judge) are found even
+        //    when the caller's tenant is not aegis-system.
         let judge_id = self
             .agent_lifecycle_service
-            .lookup_agent(&self.judge_agent_name)
+            .lookup_agent_visible_for_tenant(&self.tenant_id, None, &self.judge_agent_name)
             .await?
             .ok_or_else(|| anyhow!("Judge agent '{}' not found", self.judge_agent_name))?;
 
@@ -602,6 +608,7 @@ pub struct MultiJudgeAgentValidator {
     execution_service: Arc<dyn ExecutionService>,
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     parent_execution_id: ExecutionId,
+    tenant_id: TenantId,
 }
 
 impl MultiJudgeAgentValidator {
@@ -617,6 +624,7 @@ impl MultiJudgeAgentValidator {
         execution_service: Arc<dyn ExecutionService>,
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
         parent_execution_id: ExecutionId,
+        tenant_id: TenantId,
     ) -> Self {
         Self {
             judges,
@@ -629,6 +637,7 @@ impl MultiJudgeAgentValidator {
             execution_service,
             event_bus,
             parent_execution_id,
+            tenant_id,
         }
     }
 }
@@ -640,12 +649,14 @@ impl GradientValidator for MultiJudgeAgentValidator {
             return Err(anyhow!("MultiJudge validator has no judges configured"));
         }
 
-        // 1. Resolve all judge agent ids.
+        // 1. Resolve all judge agent ids — use visible (cross-tenant) lookup so
+        //    aegis-system scoped judges are found even when the caller's tenant
+        //    is not aegis-system.
         let mut judge_ids: Vec<(AgentId, f64)> = Vec::new();
         for name in &self.judges {
             let id = self
                 .agent_lifecycle_service
-                .lookup_agent(name)
+                .lookup_agent_visible_for_tenant(&self.tenant_id, None, name)
                 .await?
                 .ok_or_else(|| anyhow!("Judge agent '{name}' not found"))?;
             judge_ids.push((id, 1.0)); // Equal weight by default.
@@ -790,6 +801,7 @@ pub fn build_validation_pipeline(
     execution_service: Arc<dyn ExecutionService>,
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     parent_execution_id: ExecutionId,
+    tenant_id: TenantId,
 ) -> ValidationPipeline {
     let mut entries: Vec<ValidatorEntry> = Vec::new();
 
@@ -851,6 +863,7 @@ pub fn build_validation_pipeline(
                         agent_lifecycle_service.clone(),
                         execution_service.clone(),
                         parent_execution_id,
+                        tenant_id.clone(),
                     )),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
@@ -886,6 +899,7 @@ pub fn build_validation_pipeline(
                         execution_service.clone(),
                         event_bus.clone(),
                         parent_execution_id,
+                        tenant_id.clone(),
                     )),
                     min_score: *min_score,
                     min_confidence: *min_confidence,

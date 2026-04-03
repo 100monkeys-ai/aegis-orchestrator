@@ -2100,6 +2100,7 @@ impl StandardExecutionService {
                     child_svc,
                     self.event_bus.clone(),
                     execution_id,
+                    tenant_id.clone(),
                 ))
             });
 
@@ -2768,6 +2769,7 @@ impl ExecutionService for StandardExecutionService {
                     child_svc,
                     self.event_bus.clone(),
                     child_execution_id,
+                    tenant_id.clone(),
                 ))
             });
 
