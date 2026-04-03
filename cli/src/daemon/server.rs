@@ -83,6 +83,7 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
+        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -90,17 +91,17 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
-        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{NodeClusterRepository, NodeRole},
         iam::IdentityProvider,
-        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
+        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
+        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -112,9 +113,8 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{connect_container_runtime, ContainerRuntime},
+        runtime::{ContainerRuntime, connect_container_runtime},
         temporal_client::TemporalClient,
-        TemporalEventListener,
     },
 };
 
@@ -251,7 +251,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
 
     if config.spec.llm_providers.is_empty() {
-        warn!("No LLM providers configured. Agents will fail to generate text. Please check your config file or ensure one is discovered.");
+        warn!(
+            "No LLM providers configured. Agents will fail to generate text. Please check your config file or ensure one is discovered."
+        );
     }
 
     info!("Configuration loaded. Initializing services...");
@@ -746,7 +748,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                             n,
                         ),
                     ) => {
-                        tracing::warn!("NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed", n);
+                        tracing::warn!(
+                            "NFS deregistration listener lagged by {} events — some volume deregistrations may have been missed",
+                            n
+                        );
                     }
                     Err(
                         aegis_orchestrator_core::infrastructure::event_bus::EventBusError::Closed,
@@ -969,7 +974,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         }
         None => {
-            tracing::info!("Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode");
+            tracing::info!(
+                "Cortex gRPC URL not configured (spec.cortex omitted) — Orchestrator running in memoryless mode"
+            );
             None
         }
     };

@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::commands::builtins;
-use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
-use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
+use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
+use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
 
 const AGENT_GENERATOR_NAME: &str = builtins::AGENT_GENERATOR_AGENT_NAME;
 
@@ -121,7 +121,8 @@ pub async fn handle_command(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
 
     match command {
         AgentCommand::List => list_agents(client, output_format).await,

@@ -74,9 +74,7 @@ use thiserror::Error;
 /// AegisFSAL errors
 #[derive(Debug, Error)]
 pub enum FsalError {
-    #[error(
-        "Unauthorized volume access: execution {execution_id} does not own volume {volume_id}"
-    )]
+    #[error("Unauthorized volume access: execution {execution_id} does not own volume {volume_id}")]
     UnauthorizedAccess {
         execution_id: ExecutionId,
         volume_id: VolumeId,
@@ -103,7 +101,9 @@ pub enum FsalError {
     #[error("File handle deserialization error: {0}")]
     HandleDeserialization(String),
 
-    #[error("Volume quota exceeded: requested {requested_bytes} bytes, available {available_bytes} bytes")]
+    #[error(
+        "Volume quota exceeded: requested {requested_bytes} bytes, available {available_bytes} bytes"
+    )]
     QuotaExceeded {
         requested_bytes: u64,
         available_bytes: u64,

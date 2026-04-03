@@ -29,8 +29,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::commands::builtins;
-use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
-use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
+use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
+use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
 
 const WORKFLOW_GENERATOR_WORKFLOW_NAME: &str = builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME;
 
@@ -555,7 +555,8 @@ async fn deploy_workflow(
     let workflow_name = workflow.metadata.name.clone();
 
     // Deploy via daemon API
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     client
         .deploy_workflow_with_force_and_scope(&file, force, scope.as_deref())
         .await
@@ -646,7 +647,8 @@ async fn run_workflow(
     }
 
     // Start execution via daemon API
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let blackboard = parse_optional_object_input(request.blackboard, "workflow blackboard").await?;
     let execution_id = client
         .run_workflow(
@@ -825,7 +827,8 @@ async fn generate_workflow(
     let generated_agents_root = generated_root.join("agents");
     builtins::sync_generator_templates_to_disk(&templates_root)?;
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     // Ensure built-ins are deployed (but don't force overwrite unless it's an update)
     builtins::deploy_all_builtins(&client, false).await?;
 
@@ -914,7 +917,8 @@ async fn list_workflows(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let workflows = client
         .list_workflows_with_scope(scope.as_deref(), visible)
         .await
@@ -1032,7 +1036,8 @@ async fn change_workflow_scope(
         println!();
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let result = client
         .change_workflow_scope(&name_or_id, &to)
         .await
@@ -1088,7 +1093,8 @@ async fn list_workflow_executions(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let workflow_id = match workflow {
         Some(ref raw) if Uuid::parse_str(raw).is_ok() => Some(Uuid::parse_str(raw)?),
         Some(raw) => client
@@ -1187,7 +1193,8 @@ async fn describe_workflow(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let workflow_yaml = client
         .describe_workflow(&name)
         .await
@@ -1242,7 +1249,8 @@ async fn stream_workflow_logs(
     }
     println!();
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let options = crate::daemon::client::WorkflowLogOptions {
         transitions_only,
         errors_only,
@@ -1289,7 +1297,8 @@ async fn get_workflow_execution(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     let execution = client
         .get_workflow_execution(execution_id)
         .await
@@ -1326,7 +1335,8 @@ async fn signal_workflow_execution(
     port: u16,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     client
         .signal_workflow_execution(execution_id, &response)
         .await
@@ -1355,7 +1365,8 @@ async fn cancel_workflow_execution(
     port: u16,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     client
         .cancel_workflow_execution(execution_id)
         .await
@@ -1384,7 +1395,8 @@ async fn remove_workflow_execution(
     port: u16,
     output_format: OutputFormat,
 ) -> Result<()> {
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     client
         .remove_workflow_execution(execution_id)
         .await
@@ -1466,7 +1478,8 @@ async fn delete_workflow(
         }
     }
 
-    let client = DaemonClient::new(host, port)?;
+    let auth_key = crate::auth::require_key().await?;
+    let client = DaemonClient::new(host, port)?.with_auth(auth_key);
     client
         .delete_workflow(&name)
         .await
@@ -1534,8 +1547,9 @@ mod tests {
         let err = parse_optional_object_input(Some("hello".to_string()), "workflow blackboard")
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("workflow blackboard must be a JSON/YAML object"));
+        assert!(
+            err.to_string()
+                .contains("workflow blackboard must be a JSON/YAML object")
+        );
     }
 }

@@ -29,6 +29,7 @@ enum WorkflowListResponse {
 pub struct DaemonClient {
     client: Client,
     base_url: String,
+    auth_key: Option<String>,
 }
 
 impl DaemonClient {
@@ -44,7 +45,29 @@ impl DaemonClient {
             format!("http://{host}:{port}")
         };
 
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            auth_key: None,
+        })
+    }
+
+    pub fn with_auth(mut self, key: String) -> Self {
+        self.auth_key = Some(key);
+        self
+    }
+
+    fn request(
+        &self,
+        method: reqwest::Method,
+        url: impl reqwest::IntoUrl,
+    ) -> reqwest::RequestBuilder {
+        let builder = self.client.request(method, url);
+        if let Some(ref key) = self.auth_key {
+            builder.header(reqwest::header::AUTHORIZATION, format!("Bearer {key}"))
+        } else {
+            builder
+        }
     }
 
     pub async fn deploy_agent(
@@ -67,8 +90,7 @@ impl DaemonClient {
         };
         let url = format!("{}/v1/agents{}", self.base_url, query);
         let response = self
-            .client
-            .post(url)
+            .request(reqwest::Method::POST, url)
             .json(&manifest)
             .send()
             .await
@@ -112,8 +134,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .post(url)
+            .request(reqwest::Method::POST, url)
             .json(&ExecuteRequest {
                 input,
                 context_overrides,
@@ -142,8 +163,10 @@ impl DaemonClient {
 
     pub async fn get_execution(&self, execution_id: Uuid) -> Result<ExecutionInfo> {
         let response = self
-            .client
-            .get(format!("{}/v1/executions/{}", self.base_url, execution_id))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/executions/{}", self.base_url, execution_id),
+            )
             .send()
             .await
             .context("Failed to get execution")?;
@@ -161,11 +184,10 @@ impl DaemonClient {
 
     pub async fn cancel_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
-            .client
-            .post(format!(
-                "{}/v1/executions/{}/cancel",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!("{}/v1/executions/{}/cancel", self.base_url, execution_id),
+            )
             .send()
             .await
             .context("Failed to cancel execution")?;
@@ -189,8 +211,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .get(&url)
+            .request(reqwest::Method::GET, &url)
             .send()
             .await
             .context("Failed to list executions")?;
@@ -224,8 +245,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .get(&url)
+            .request(reqwest::Method::GET, &url)
             .send()
             .await
             .context("Failed to connect to event stream")?;
@@ -256,8 +276,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .get(&url)
+            .request(reqwest::Method::GET, &url)
             .send()
             .await
             .context("Failed to connect to agent event stream")?;
@@ -272,8 +291,10 @@ impl DaemonClient {
 
     pub async fn delete_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
-            .client
-            .delete(format!("{}/v1/executions/{}", self.base_url, execution_id))
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}/v1/executions/{}", self.base_url, execution_id),
+            )
             .send()
             .await
             .context("Failed to delete execution")?;
@@ -288,8 +309,7 @@ impl DaemonClient {
 
     pub async fn list_agents(&self) -> Result<Vec<AgentInfo>> {
         let response = self
-            .client
-            .get(format!("{}/v1/agents", self.base_url))
+            .request(reqwest::Method::GET, format!("{}/v1/agents", self.base_url))
             .send()
             .await
             .context("Failed to list agents")?;
@@ -307,8 +327,10 @@ impl DaemonClient {
 
     pub async fn get_agent(&self, agent_id: Uuid) -> Result<AgentManifest> {
         let response = self
-            .client
-            .get(format!("{}/v1/agents/{}", self.base_url, agent_id))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/agents/{}", self.base_url, agent_id),
+            )
             .send()
             .await
             .context("Failed to get agent")?;
@@ -332,8 +354,10 @@ impl DaemonClient {
 
     pub async fn delete_agent(&self, agent_id: Uuid) -> Result<()> {
         let response = self
-            .client
-            .delete(format!("{}/v1/agents/{}", self.base_url, agent_id))
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}/v1/agents/{}", self.base_url, agent_id),
+            )
             .send()
             .await
             .context("Failed to delete agent")?;
@@ -347,8 +371,10 @@ impl DaemonClient {
     }
     pub async fn lookup_agent(&self, name: &str) -> Result<Option<Uuid>> {
         let response = self
-            .client
-            .get(format!("{}/v1/agents/lookup/{}", self.base_url, name))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/agents/lookup/{}", self.base_url, name),
+            )
             .send()
             .await
             .context("Failed to lookup agent")?;
@@ -816,8 +842,7 @@ impl DaemonClient {
         let url = format!("{}/v1/workflows{query}", self.base_url);
 
         let response = self
-            .client
-            .post(url)
+            .request(reqwest::Method::POST, url)
             .header("Content-Type", "application/x-yaml")
             .body(workflow_yaml.to_string())
             .send()
@@ -853,8 +878,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .post(url)
+            .request(reqwest::Method::POST, url)
             .json(&RunRequest { input, blackboard })
             .send()
             .await
@@ -881,8 +905,10 @@ impl DaemonClient {
     /// List all workflows
     pub async fn list_workflows(&self) -> Result<Vec<serde_json::Value>> {
         let response = self
-            .client
-            .get(format!("{}/v1/workflows", self.base_url))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/workflows", self.base_url),
+            )
             .send()
             .await
             .context("Failed to list workflows")?;
@@ -926,8 +952,7 @@ impl DaemonClient {
         let url = format!("{}/v1/workflows{query}", self.base_url);
 
         let response = self
-            .client
-            .get(url)
+            .request(reqwest::Method::GET, url)
             .send()
             .await
             .context("Failed to list workflows")?;
@@ -960,8 +985,7 @@ impl DaemonClient {
         let body = serde_json::json!({ "target_scope": target_scope });
 
         let response = self
-            .client
-            .post(&url)
+            .request(reqwest::Method::POST, &url)
             .json(&body)
             .send()
             .await
@@ -992,8 +1016,7 @@ impl DaemonClient {
         }
 
         let response = self
-            .client
-            .get(url)
+            .request(reqwest::Method::GET, url)
             .send()
             .await
             .context("Failed to list workflow executions")?;
@@ -1014,8 +1037,10 @@ impl DaemonClient {
     /// Describe a workflow (get YAML definition)
     pub async fn describe_workflow(&self, name: &str) -> Result<String> {
         let response = self
-            .client
-            .get(format!("{}/v1/workflows/{}", self.base_url, name))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/workflows/{}", self.base_url, name),
+            )
             .send()
             .await
             .context("Failed to describe workflow")?;
@@ -1036,8 +1061,10 @@ impl DaemonClient {
     /// Delete a workflow
     pub async fn delete_workflow(&self, name: &str) -> Result<()> {
         let response = self
-            .client
-            .delete(format!("{}/v1/workflows/{}", self.base_url, name))
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}/v1/workflows/{}", self.base_url, name),
+            )
             .send()
             .await
             .context("Failed to delete workflow")?;
@@ -1055,11 +1082,10 @@ impl DaemonClient {
         execution_id: Uuid,
     ) -> Result<WorkflowExecutionInfo> {
         let response = self
-            .client
-            .get(format!(
-                "{}/v1/workflows/executions/{}",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!("{}/v1/workflows/executions/{}", self.base_url, execution_id),
+            )
             .send()
             .await
             .context("Failed to get workflow execution")?;
@@ -1081,11 +1107,13 @@ impl DaemonClient {
         response_text: &str,
     ) -> Result<()> {
         let response = self
-            .client
-            .post(format!(
-                "{}/v1/workflows/executions/{}/signal",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/workflows/executions/{}/signal",
+                    self.base_url, execution_id
+                ),
+            )
             .json(&serde_json::json!({ "response": response_text }))
             .send()
             .await
@@ -1101,11 +1129,13 @@ impl DaemonClient {
 
     pub async fn cancel_workflow_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
-            .client
-            .post(format!(
-                "{}/v1/workflows/executions/{}/cancel",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::POST,
+                format!(
+                    "{}/v1/workflows/executions/{}/cancel",
+                    self.base_url, execution_id
+                ),
+            )
             .send()
             .await
             .context("Failed to cancel workflow execution")?;
@@ -1120,11 +1150,10 @@ impl DaemonClient {
 
     pub async fn remove_workflow_execution(&self, execution_id: Uuid) -> Result<()> {
         let response = self
-            .client
-            .delete(format!(
-                "{}/v1/workflows/executions/{}",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::DELETE,
+                format!("{}/v1/workflows/executions/{}", self.base_url, execution_id),
+            )
             .send()
             .await
             .context("Failed to remove workflow execution")?;
@@ -1143,11 +1172,13 @@ impl DaemonClient {
         options: WorkflowLogOptions,
     ) -> Result<()> {
         let response = self
-            .client
-            .get(format!(
-                "{}/v1/workflows/executions/{}/logs/stream",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/workflows/executions/{}/logs/stream",
+                    self.base_url, execution_id
+                ),
+            )
             .send()
             .await
             .context("Failed to connect to workflow log stream")?;
@@ -1166,11 +1197,13 @@ impl DaemonClient {
         options: WorkflowLogOptions,
     ) -> Result<Vec<WorkflowLogEvent>> {
         let response = self
-            .client
-            .get(format!(
-                "{}/v1/workflows/executions/{}/logs",
-                self.base_url, execution_id
-            ))
+            .request(
+                reqwest::Method::GET,
+                format!(
+                    "{}/v1/workflows/executions/{}/logs",
+                    self.base_url, execution_id
+                ),
+            )
             .send()
             .await
             .context("Failed to get workflow logs")?;
@@ -1196,11 +1229,11 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_iteration_error_message, format_event, is_error_event, CorrelatedActivityEvent,
-        WorkflowListResponse,
+        CorrelatedActivityEvent, WorkflowListResponse, extract_iteration_error_message,
+        format_event, is_error_event,
     };
     use chrono::Utc;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
     use uuid::Uuid;
 
     #[test]

@@ -41,6 +41,8 @@
 //! | [`iam`] | BC-13 IAM & Identity Federation | `IdentityRealm`, `UserIdentity`, `IdentityProvider` trait (ADR-041) |
 
 pub mod agent;
+pub mod api_key;
+pub mod api_scope;
 pub mod cluster;
 pub mod discovery;
 pub mod dispatch;

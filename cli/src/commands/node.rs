@@ -17,11 +17,11 @@ use std::fs;
 use std::path::PathBuf;
 use tonic::Request;
 
-use crate::output::{render_serialized, OutputFormat};
+use crate::output::{OutputFormat, render_serialized};
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
-    node_cluster_service_client::NodeClusterServiceClient, AttestNodeRequest, ChallengeNodeRequest,
-    ListPeersRequest, NodeCapabilities, NodeRole,
+    AttestNodeRequest, ChallengeNodeRequest, ListPeersRequest, NodeCapabilities, NodeRole,
+    node_cluster_service_client::NodeClusterServiceClient,
 };
 
 #[derive(Subcommand)]

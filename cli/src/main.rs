@@ -40,17 +40,19 @@ use opentelemetry_sdk::logs::LoggerProvider;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
+use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod auth;
 mod commands;
 mod daemon;
 mod output;
 
+use commands::auth::AuthCommand;
 use commands::{
     AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
     StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
-use output::{structured_output_unsupported, OutputFormat};
+use output::{OutputFormat, structured_output_unsupported};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -134,6 +136,13 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Authenticate with an AEGIS environment.
+    #[command(name = "auth")]
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+
     /// Update AEGIS database
     #[command(name = "update")]
     Update {
@@ -233,6 +242,9 @@ async fn main() -> Result<()> {
         Some(Commands::Workflow { command }) => {
             commands::workflow::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
                 .await
+        }
+        Some(Commands::Auth { command }) => {
+            commands::auth::handle_command(command, cli.output).await
         }
         Some(Commands::Update { command }) => {
             commands::update::execute(command, cli.config, cli.output).await

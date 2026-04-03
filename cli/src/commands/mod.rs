@@ -8,6 +8,7 @@
 //! - **Purpose:** Implements internal responsibilities for mod
 
 pub mod agent;
+pub mod auth;
 pub mod builtins;
 pub mod config;
 pub mod daemon;
