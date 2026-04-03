@@ -225,7 +225,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -242,7 +242,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            Ok(Some(workflow))
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            Ok(Some(Workflow {
+                updated_at,
+                ..workflow
+            }))
         } else {
             Ok(None)
         }
@@ -255,7 +259,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE tenant_id = $1 AND name = $2
             ORDER BY version DESC
@@ -274,7 +278,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            Ok(Some(workflow))
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            Ok(Some(Workflow {
+                updated_at,
+                ..workflow
+            }))
         } else {
             Ok(None)
         }
@@ -288,7 +296,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE tenant_id = $1 AND name = $2 AND version = $3
             "#,
@@ -306,7 +314,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            Ok(Some(workflow))
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            Ok(Some(Workflow {
+                updated_at,
+                ..workflow
+            }))
         } else {
             Ok(None)
         }
@@ -319,7 +331,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE tenant_id = $1 AND name = $2
             ORDER BY updated_at DESC
@@ -338,7 +350,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            workflows.push(workflow);
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            workflows.push(Workflow {
+                updated_at,
+                ..workflow
+            });
         }
         Ok(workflows)
     }
@@ -349,7 +365,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE tenant_id = $1
             ORDER BY name ASC
@@ -367,7 +383,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            workflows.push(workflow);
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            workflows.push(Workflow {
+                updated_at,
+                ..workflow
+            });
         }
         Ok(workflows)
     }
@@ -382,7 +402,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         // Priority: user (0) > tenant (1) > global (2)
         let row = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE name = $1
               AND (
@@ -413,7 +433,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            Ok(Some(workflow))
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            Ok(Some(Workflow {
+                updated_at,
+                ..workflow
+            }))
         } else {
             Ok(None)
         }
@@ -428,7 +452,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Option<Workflow>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE name = $1 AND version = $2
               AND (
@@ -459,7 +483,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            Ok(Some(workflow))
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            Ok(Some(Workflow {
+                updated_at,
+                ..workflow
+            }))
         } else {
             Ok(None)
         }
@@ -472,7 +500,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     ) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE
                 (scope = 'user' AND tenant_id = $1 AND owner_user_id = $2)
@@ -494,7 +522,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            workflows.push(workflow);
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            workflows.push(Workflow {
+                updated_at,
+                ..workflow
+            });
         }
         Ok(workflows)
     }
@@ -502,7 +534,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT domain_json
+            SELECT domain_json, updated_at
             FROM workflows
             WHERE scope = 'global'
             ORDER BY name ASC, version DESC
@@ -519,7 +551,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 .map_err(|e| RepositoryError::Database(e.to_string()))?;
             let workflow: Workflow = serde_json::from_value(domain_json)
                 .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
-            workflows.push(workflow);
+            let updated_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("updated_at").ok();
+            workflows.push(Workflow {
+                updated_at,
+                ..workflow
+            });
         }
         Ok(workflows)
     }

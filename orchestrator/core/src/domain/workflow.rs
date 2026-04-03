@@ -160,6 +160,8 @@ pub struct Workflow {
     pub metadata: WorkflowMetadata,
     pub spec: WorkflowSpec,
     pub created_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 impl Workflow {
@@ -385,6 +387,7 @@ impl Workflow {
             metadata,
             spec,
             created_at: Utc::now(),
+            updated_at: None,
         })
     }
 
@@ -1630,6 +1633,7 @@ mod tests {
                 storage: Default::default(),
             },
             created_at: Utc::now(),
+            updated_at: None,
         };
 
         assert_eq!(
