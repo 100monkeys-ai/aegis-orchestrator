@@ -47,12 +47,25 @@ impl DaemonClient {
         Ok(Self { client, base_url })
     }
 
-    pub async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<Uuid> {
-        let url = if force {
-            format!("{}/v1/agents?force=true", self.base_url)
+    pub async fn deploy_agent(
+        &self,
+        manifest: AgentManifest,
+        force: bool,
+        scope: Option<&str>,
+    ) -> Result<Uuid> {
+        let mut params = vec![];
+        if force {
+            params.push("force=true".to_string());
+        }
+        if let Some(s) = scope {
+            params.push(format!("scope={s}"));
+        }
+        let query = if params.is_empty() {
+            String::new()
         } else {
-            format!("{}/v1/agents", self.base_url)
+            format!("?{}", params.join("&"))
         };
+        let url = format!("{}/v1/agents{}", self.base_url, query);
         let response = self
             .client
             .post(url)
@@ -817,16 +830,6 @@ impl DaemonClient {
         }
 
         Ok(())
-    }
-
-    /// Deploy a workflow from YAML content with optional force overwrite.
-    pub async fn deploy_workflow_manifest_with_force(
-        &self,
-        workflow_yaml: &str,
-        force: bool,
-    ) -> Result<()> {
-        self.deploy_workflow_manifest_with_force_and_scope(workflow_yaml, force, None)
-            .await
     }
 
     /// Run a workflow
