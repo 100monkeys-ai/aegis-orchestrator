@@ -35,9 +35,14 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use std::sync::Arc;
 
-use crate::application::ports::{AttestationTokenClaims, SecurityTokenIssuerPort, TokenAudience};
+use crate::application::ports::{
+    AttestationTokenClaims, SealGatewayClient, SealSessionCreateRequest, SecurityTokenIssuerPort,
+    TokenAudience,
+};
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::seal_session::SealSession;
@@ -61,6 +66,7 @@ pub struct AttestationServiceImpl {
     security_context_repo: Arc<dyn SecurityContextRepository>,
     seal_session_repo: Arc<dyn SealSessionRepository>,
     token_issuer: Arc<dyn SecurityTokenIssuerPort>,
+    seal_gateway_client: Option<Arc<dyn SealGatewayClient>>,
 }
 
 impl AttestationServiceImpl {
@@ -73,7 +79,13 @@ impl AttestationServiceImpl {
             security_context_repo,
             seal_session_repo,
             token_issuer,
+            seal_gateway_client: None,
         }
+    }
+
+    pub fn with_gateway_client(mut self, gateway_client: Arc<dyn SealGatewayClient>) -> Self {
+        self.seal_gateway_client = Some(gateway_client);
+        self
     }
 
     fn resolve_security_context_name(&self, request: &AttestationRequest) -> Result<String> {
@@ -186,11 +198,19 @@ impl AttestationServiceImpl {
         let token = self.token_issuer.issue(&mut claims)?;
 
         // 4. Create and persist SEAL Session
+        let public_key_bytes = normalize_public_key_bytes(&request.public_key_pem)?;
+        let public_key_b64 = STANDARD.encode(&public_key_bytes);
+        let allowed_tool_patterns: Vec<String> = security_context
+            .capabilities
+            .iter()
+            .map(|c| c.tool_pattern.clone())
+            .collect();
+        let session_security_context_name = security_context.name.clone();
         let principal_subject = self.resolve_principal_subject(&request);
         let session = SealSession::new(
             agent_id,
             execution_id,
-            normalize_public_key_bytes(&request.public_key_pem)?,
+            public_key_bytes,
             token.clone(),
             security_context,
         )
@@ -201,6 +221,32 @@ impl AttestationServiceImpl {
             request.zaru_tier.clone(),
         );
         self.seal_session_repo.save(session).await?;
+
+        // 4b. Pre-register session at the SEAL gateway (ADR-088 §A8).
+        let expires_at = chrono::DateTime::from_timestamp(claims.exp.unwrap_or(0), 0)
+            .unwrap_or_else(chrono::Utc::now)
+            .to_rfc3339();
+        if let Some(ref gateway_client) = self.seal_gateway_client {
+            if let Err(e) = gateway_client
+                .create_session(SealSessionCreateRequest {
+                    execution_id: execution_id.0.to_string(),
+                    agent_id: agent_id.0.to_string(),
+                    security_context: session_security_context_name,
+                    public_key_b64,
+                    security_token: token.clone(),
+                    session_status: "Active".to_string(),
+                    expires_at: expires_at.clone(),
+                    allowed_tool_patterns,
+                })
+                .await
+            {
+                tracing::warn!(
+                    execution_id = %execution_id,
+                    error = %e,
+                    "Failed to pre-register SEAL session at gateway during attestation; agent can still proceed"
+                );
+            }
+        }
 
         tracing::info!(
             agent_id = %claims.agent_id,
@@ -218,9 +264,6 @@ impl AttestationServiceImpl {
         metrics::gauge!("aegis_seal_sessions_active").increment(1.0);
 
         // 6. Return Response
-        let expires_at = chrono::DateTime::from_timestamp(claims.exp.unwrap_or(0), 0)
-            .unwrap_or_else(chrono::Utc::now)
-            .to_rfc3339();
         let session_id = claims.jti.clone();
 
         Ok(AttestationResponse {

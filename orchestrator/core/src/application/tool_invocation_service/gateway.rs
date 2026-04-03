@@ -181,6 +181,8 @@ impl ToolInvocationService {
         execution_id: crate::domain::execution::ExecutionId,
         tool_name: &str,
         args: serde_json::Value,
+        tenant_id: Option<&str>,
+        zaru_user_token: Option<&str>,
     ) -> Result<serde_json::Value, SealSessionError> {
         let gateway_url = self.seal_gateway_url.as_deref().ok_or_else(|| {
             SealSessionError::ConfigurationError("seal_gateway.url is not configured".to_string())
@@ -233,7 +235,7 @@ impl ToolInvocationService {
                     subcommand,
                     args: cli_args,
                     fsal_mounts,
-                    tenant_id: String::new(),
+                    tenant_id: tenant_id.unwrap_or("").to_string(),
                 }))
                 .await
                 .map_err(|e| SealSessionError::InternalError(e.to_string()))?
@@ -251,8 +253,8 @@ impl ToolInvocationService {
                 execution_id: execution_id.to_string(),
                 workflow_name: tool_name.to_string(),
                 input_json: args.to_string(),
-                zaru_user_token: String::new(),
-                tenant_id: String::new(),
+                zaru_user_token: zaru_user_token.unwrap_or("").to_string(),
+                tenant_id: tenant_id.unwrap_or("").to_string(),
             }))
             .await
             .map_err(|e| SealSessionError::InternalError(e.to_string()))?

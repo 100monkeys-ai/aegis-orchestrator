@@ -629,7 +629,13 @@ impl ToolInvocationService {
             Err(routing_err) => {
                 if self.seal_gateway_url.is_some() {
                     let gateway_result = self
-                        .invoke_seal_gateway_internal_grpc(execution_id, &tool_name, args.clone())
+                        .invoke_seal_gateway_internal_grpc(
+                            execution_id,
+                            &tool_name,
+                            args.clone(),
+                            None,
+                            None,
+                        )
                         .await;
                     if let Ok(value) = gateway_result {
                         self.publish_invocation_completed(

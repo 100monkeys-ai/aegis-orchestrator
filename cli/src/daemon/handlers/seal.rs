@@ -89,14 +89,25 @@ pub(crate) async fn invoke_seal_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpSealEnvelope>,
 ) -> impl IntoResponse {
-    let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
+    let (protocol, timestamp) = match (request.protocol, request.timestamp) {
+        (Some(p), Some(t)) => (p, t),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "SEAL envelope requires both 'protocol' and 'timestamp' fields"
+                })),
+            )
+                .into_response();
+        }
+    };
 
     let envelope = aegis_orchestrator_core::infrastructure::seal::envelope::SealEnvelope {
-        protocol: request.protocol,
+        protocol,
         security_token: request.security_token,
         signature: request.signature,
-        payload: payload_bytes,
-        timestamp: request.timestamp,
+        payload: request.payload,
+        timestamp,
     };
 
     // The ToolInvocationService is responsible for validating the security_token

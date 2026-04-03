@@ -12,7 +12,7 @@
 //! SealEnvelope {
 //!     security_token: JWT (ContextClaims, signed by orchestrator)
 //!     signature:      base64(Ed25519_sign(payload, agent_private_key))
-//!     payload:        raw MCP JSON-RPC payload bytes
+//!     payload:        MCP JSON-RPC payload (serde_json::Value)
 //! }
 //! ```
 //!
@@ -45,19 +45,16 @@ use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
 /// `payload` with a key that was bound during attestation. See ADR-035 §5.3.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SealEnvelope {
-    /// Protocol identifier for version negotiation. `None` is accepted only for
-    /// internal legacy callers that still send the pre-spec envelope shape.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub protocol: Option<String>,
+    /// Protocol identifier and version (`"seal/v1"`).
+    pub protocol: String,
     /// Signed JWT (`SecurityToken`) issued during attestation. Encodes `ContextClaims`.
     pub security_token: String,
-    /// Base64-encoded Ed25519 signature over `payload` bytes.
+    /// Base64-encoded Ed25519 signature over the canonical message.
     pub signature: String,
-    /// Raw MCP JSON-RPC payload bytes (method + params).
-    pub payload: Vec<u8>,
+    /// MCP JSON-RPC payload (method + params).
+    pub payload: serde_json::Value,
     /// ISO-8601 UTC timestamp used for replay protection and canonical signing.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub timestamp: Option<String>,
+    pub timestamp: String,
 }
 
 /// Represents the JWT `aud` claim, which may be either a single string or an array of strings.
@@ -154,59 +151,45 @@ impl EnvelopeVerifier for SealEnvelope {
     }
 
     fn extract_tool_name(&self) -> Option<String> {
-        let payload: Value = serde_json::from_slice(&self.payload).ok()?;
-
         // standard MCP tool call is `{ "method": "tools/call", "params": { "name": "..." } }`
-        let method = payload.get("method")?.as_str()?;
+        let method = self.payload.get("method")?.as_str()?;
         if method == "tools/call" {
-            payload
+            self.payload
                 .get("params")?
                 .get("name")?
                 .as_str()
                 .map(|s| s.to_string())
         } else {
-            // For older specs or simpler variants
             Some(method.to_string())
         }
     }
 
     fn extract_arguments(&self) -> Option<Value> {
-        let payload: Value = serde_json::from_slice(&self.payload).ok()?;
-
-        let method = payload.get("method")?.as_str()?;
+        let method = self.payload.get("method")?.as_str()?;
         if method == "tools/call" {
-            payload.get("params")?.get("arguments").cloned()
+            self.payload.get("params")?.get("arguments").cloned()
         } else {
-            payload.get("params").cloned()
+            self.payload.get("params").cloned()
         }
     }
 }
 
 impl SealEnvelope {
     fn signed_message(&self) -> Result<Vec<u8>, SealSessionError> {
-        match (&self.protocol, &self.timestamp) {
-            (Some(protocol), Some(timestamp)) => {
-                if protocol != "seal/v1" {
-                    return Err(SealSessionError::MalformedPayload(format!(
-                        "unsupported SEAL protocol '{protocol}'"
-                    )));
-                }
-
-                let timestamp = parse_iso8601_timestamp(timestamp)?;
-                let age_seconds = (Utc::now() - timestamp).num_seconds().abs();
-                if age_seconds > 30 {
-                    return Err(SealSessionError::ReplayProtectionFailed(format!(
-                        "envelope timestamp is outside the 30 second freshness window ({age_seconds}s)"
-                    )));
-                }
-
-                canonical_message(&self.security_token, &self.payload, timestamp)
-            }
-            (None, None) => Ok(self.payload.clone()),
-            _ => Err(SealSessionError::MalformedPayload(
-                "SEAL envelopes must provide both protocol and timestamp together".to_string(),
-            )),
+        if self.protocol != "seal/v1" {
+            return Err(SealSessionError::MalformedPayload(format!(
+                "unsupported SEAL protocol '{}'",
+                self.protocol
+            )));
         }
+        let timestamp = parse_iso8601_timestamp(&self.timestamp)?;
+        let age_seconds = (Utc::now() - timestamp).num_seconds().abs();
+        if age_seconds > 30 {
+            return Err(SealSessionError::ReplayProtectionFailed(format!(
+                "envelope timestamp is outside the 30 second freshness window ({age_seconds}s)"
+            )));
+        }
+        canonical_message(&self.security_token, &self.payload, timestamp)
     }
 }
 
@@ -260,14 +243,11 @@ fn parse_iso8601_timestamp(input: &str) -> Result<DateTime<Utc>, SealSessionErro
 
 fn canonical_message(
     security_token: &str,
-    payload: &[u8],
+    payload: &serde_json::Value,
     timestamp: DateTime<Utc>,
 ) -> Result<Vec<u8>, SealSessionError> {
-    let payload_json: Value = serde_json::from_slice(payload).map_err(|e| {
-        SealSessionError::MalformedPayload(format!("invalid inner MCP payload JSON: {e}"))
-    })?;
     let canonical = serde_json::json!({
-        "payload": payload_json,
+        "payload": payload,
         "security_token": security_token,
         "timestamp": timestamp.timestamp(),
     });
@@ -302,14 +282,12 @@ mod tests {
             }
         });
 
-        let payload_bytes = serde_json::to_vec(&payload_json).unwrap();
-
         // Sign the MCP message
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let signature = signing_key.sign(
             &canonical_message(
                 "test-jwt.token.here",
-                &payload_bytes,
+                &payload_json,
                 parse_iso8601_timestamp(&timestamp).unwrap(),
             )
             .unwrap(),
@@ -317,11 +295,11 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SealEnvelope {
-            protocol: Some("seal/v1".to_string()),
+            protocol: "seal/v1".to_string(),
             security_token: "test-jwt.token.here".to_string(),
             signature: signature_b64,
-            payload: payload_bytes.clone(),
-            timestamp: Some(timestamp),
+            payload: payload_json.clone(),
+            timestamp,
         };
 
         // Should verify successfully with the public key
@@ -343,14 +321,14 @@ mod tests {
         let signing_key2 = SigningKey::from_bytes(&[3u8; 32]);
         let verifying_key2 = signing_key2.verifying_key();
 
-        let payload_bytes = b"{\"method\": \"something\"}".to_vec();
+        let payload_json = json!({"method": "something"});
 
         // Sign with key 1
         let timestamp = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
         let signature = signing_key1.sign(
             &canonical_message(
                 "test.jwt",
-                &payload_bytes,
+                &payload_json,
                 parse_iso8601_timestamp(&timestamp).unwrap(),
             )
             .unwrap(),
@@ -358,11 +336,11 @@ mod tests {
         let signature_b64 = STANDARD.encode(signature.to_bytes());
 
         let envelope = SealEnvelope {
-            protocol: Some("seal/v1".to_string()),
+            protocol: "seal/v1".to_string(),
             security_token: "test.jwt".to_string(),
             signature: signature_b64,
-            payload: payload_bytes,
-            timestamp: Some(timestamp),
+            payload: payload_json,
+            timestamp,
         };
 
         // Verification with key 2 should fail

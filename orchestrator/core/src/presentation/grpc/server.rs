@@ -642,34 +642,15 @@ impl AegisRuntime for AegisRuntimeService {
         let _identity = self
             .authorize(&request, "/aegis.v1.AegisRuntime/InvokeTool")
             .await?;
-        let req = request.into_inner();
 
-        let tool_invocation_service = self.tool_invocation_service.as_ref().ok_or_else(|| {
-            Status::failed_precondition("SEAL tool invocation service is not configured")
-        })?;
-
-        // Construct SealEnvelope. The ToolInvocationService is responsible for
-        // validating the security_token and handling extraction of any required
-        // claims (such as agent_id) according to its own verification logic.
-        let envelope = crate::infrastructure::seal::envelope::SealEnvelope {
-            protocol: None,
-            security_token: req.security_token,
-            signature: req.signature,
-            payload: req.payload,
-            timestamp: None,
-        };
-
-        match tool_invocation_service.invoke_tool(&envelope).await {
-            Ok(result) => {
-                let bytes = serde_json::to_vec(&result).map_err(|e| {
-                    Status::internal(format!("Failed to serialize tool result: {e}"))
-                })?;
-                Ok(Response::new(InvokeToolResponse { result_json: bytes }))
-            }
-            Err(e) => Err(Status::permission_denied(format!(
-                "Tool invocation rejected: {e}"
-            ))),
-        }
+        // The SEAL protocol requires 'protocol' and 'timestamp' fields for replay
+        // protection and canonical signing (ADR-035 §3). The current protobuf schema
+        // for InvokeToolRequest does not carry these fields. Agents must use the HTTP
+        // POST /v1/seal/tool/invoke endpoint until the proto is updated.
+        Err(Status::unimplemented(
+            "SEAL InvokeTool via gRPC requires protocol and timestamp fields \
+             not present in this protobuf version; use the HTTP SEAL endpoint",
+        ))
     }
 
     /// Ingest an external stimulus and route it to a workflow (BC-8 — ADR-021).

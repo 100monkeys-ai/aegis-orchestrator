@@ -845,13 +845,24 @@ async fn seal_tool_invoke(
         }
     };
 
-    let payload = serde_json::to_vec(&req.payload).unwrap_or_default();
+    let (protocol, timestamp) = match (req.protocol, req.timestamp) {
+        (Some(p), Some(t)) => (p, t),
+        _ => {
+            return (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": "SEAL envelope requires both 'protocol' and 'timestamp' fields"
+                })),
+            )
+                .into_response();
+        }
+    };
     let envelope = crate::infrastructure::seal::envelope::SealEnvelope {
-        protocol: req.protocol,
+        protocol,
         security_token: req.security_token,
         signature: req.signature,
-        payload,
-        timestamp: req.timestamp,
+        payload: req.payload,
+        timestamp,
     };
 
     match tool_svc.invoke_tool(&envelope).await {

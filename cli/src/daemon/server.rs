@@ -1088,6 +1088,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             as Arc<dyn aegis_orchestrator_core::application::ports::SwarmCancellationPort>);
 
     // Wire SEAL session pre-creation so containers get credentials at birth (ADR-088 §A8).
+    // Clone before consuming — attestation_service also needs a reference.
+    let attestation_gateway_client = seal_gateway_client.clone();
     execution_service_builder = execution_service_builder
         .with_seal_session_precreation(seal_gateway_client, token_issuer.clone());
 
@@ -1198,7 +1200,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             security_context_repo.clone(),
             seal_session_repo.clone(),
             token_issuer,
-        ),
+        )
+        .with_gateway_client(attestation_gateway_client),
     );
 
     // Secrets manager: initialize from `spec.secrets.backend`, otherwise use an in-memory store for local development/testing.
