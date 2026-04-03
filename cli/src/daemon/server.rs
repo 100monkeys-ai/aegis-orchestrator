@@ -83,7 +83,6 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
-        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -91,17 +90,17 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
+        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{NodeClusterRepository, NodeRole},
         iam::IdentityProvider,
-        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
+        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
-        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -113,8 +112,9 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{ContainerRuntime, connect_container_runtime},
+        runtime::{connect_container_runtime, ContainerRuntime},
         temporal_client::TemporalClient,
+        TemporalEventListener,
     },
 };
 

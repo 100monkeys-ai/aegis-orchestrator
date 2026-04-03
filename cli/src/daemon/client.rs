@@ -1229,11 +1229,11 @@ impl DaemonClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        CorrelatedActivityEvent, WorkflowListResponse, extract_iteration_error_message,
-        format_event, is_error_event,
+        extract_iteration_error_message, format_event, is_error_event, CorrelatedActivityEvent,
+        WorkflowListResponse,
     };
     use chrono::Utc;
-    use serde_json::{Value, json};
+    use serde_json::{json, Value};
     use uuid::Uuid;
 
     #[test]

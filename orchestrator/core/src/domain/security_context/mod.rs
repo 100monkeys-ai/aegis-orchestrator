@@ -28,7 +28,7 @@ pub mod security_context;
 pub use capability::Capability;
 pub use repository::SecurityContextRepository;
 pub use security_context::{
-    PolicyViolation, SecurityContext, SecurityContextMetadata, validate_context_ownership,
+    validate_context_ownership, PolicyViolation, SecurityContext, SecurityContextMetadata,
 };
 
 pub use crate::domain::rate_limit::{

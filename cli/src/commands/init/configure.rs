@@ -16,9 +16,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use colored::Colorize;
 use dialoguer::{Confirm, Input, Password};
-use rsa::RsaPrivateKey;
 use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
 use rsa::rand_core::OsRng;
+use rsa::RsaPrivateKey;
 use uuid::Uuid;
 
 use super::components::{LlmChoice, SelectedComponents};
@@ -228,7 +228,11 @@ impl ConfigWizard {
                     openai_compatible_endpoint = Some(endpoint);
                     openai_compatible_model = Some(model);
 
-                    if key.is_empty() { None } else { Some(key) }
+                    if key.is_empty() {
+                        None
+                    } else {
+                        Some(key)
+                    }
                 }
             }
         };

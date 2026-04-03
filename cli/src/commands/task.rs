@@ -18,8 +18,8 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
-use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
+use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
@@ -545,9 +545,8 @@ mod tests {
         let err = parse_object_input(Some("hello".to_string()), "context override")
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("context override must be a JSON/YAML object")
-        );
+        assert!(err
+            .to_string()
+            .contains("context override must be a JSON/YAML object"));
     }
 }

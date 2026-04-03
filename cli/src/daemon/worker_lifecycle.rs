@@ -29,7 +29,7 @@ use tracing;
 
 use aegis_orchestrator_core::domain::cluster::NodeId;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
-    NodeCapabilities, NodeCommand, node_command::Command,
+    node_command::Command, NodeCapabilities, NodeCommand,
 };
 use aegis_orchestrator_core::infrastructure::cluster::NodeClusterClient;
 

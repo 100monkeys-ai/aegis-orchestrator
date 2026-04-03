@@ -11,7 +11,7 @@ use anyhow::Result;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::{
-    domain::node_config::{NodeConfigManifest, resolve_env_value},
+    domain::node_config::{resolve_env_value, NodeConfigManifest},
     infrastructure::temporal_proto::temporal::api::{
         common::v1::WorkflowExecution as TemporalWorkflowExecution,
         workflowservice::v1::{

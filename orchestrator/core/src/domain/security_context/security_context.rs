@@ -272,22 +272,19 @@ mod tests {
         };
 
         // Allowed
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
-                .is_ok()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied by capability limits (path)
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/etc/passwd"}))
-                .is_err()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/etc/passwd"}))
+            .is_err());
 
         // Denied implicitly (not in capabilities)
-        assert!(
-            ctx.evaluate("fs.write", &json!({"path": "/workspace/test.txt"}))
-                .is_err()
-        );
+        assert!(ctx
+            .evaluate("fs.write", &json!({"path": "/workspace/test.txt"}))
+            .is_err());
     }
 
     #[test]
@@ -310,10 +307,9 @@ mod tests {
         };
 
         // Allowed due to wildcard
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
-                .is_ok()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied due to explicit deny list
         assert!(matches!(

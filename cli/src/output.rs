@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! Shared output rendering helpers for scriptable CLI commands.
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use clap::ValueEnum;
 use serde::Serialize;
 

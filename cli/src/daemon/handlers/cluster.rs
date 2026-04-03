@@ -4,11 +4,11 @@
 
 use std::sync::Arc;
 
-use axum::Json;
 use axum::extract::{Query, State};
+use axum::Json;
 
-use crate::daemon::cluster_helpers::{ClusterStatusView, cluster_status_view, load_cluster_nodes};
-use crate::daemon::handlers::{LimitQuery, bounded_limit};
+use crate::daemon::cluster_helpers::{cluster_status_view, load_cluster_nodes, ClusterStatusView};
+use crate::daemon::handlers::{bounded_limit, LimitQuery};
 use crate::daemon::state::AppState;
 
 pub(crate) async fn cluster_status_handler(

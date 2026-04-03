@@ -208,28 +208,24 @@ mod tests {
         };
 
         // Allowed: cargo build
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo build"}))
-                .is_ok()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo build"}))
+            .is_ok());
 
         // Allowed: cargo check
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo check"}))
-                .is_ok()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo check"}))
+            .is_ok());
 
         // Denied: incorrect command base
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "npm install"}))
-                .is_err()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "npm install"}))
+            .is_err());
 
         // Denied: incorrect subcommand
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo publish"}))
-                .is_err()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo publish"}))
+            .is_err());
 
         // Denied: missing subcommand
         assert!(cap.allows("cmd.run", &json!({"command": "cargo"})).is_err());

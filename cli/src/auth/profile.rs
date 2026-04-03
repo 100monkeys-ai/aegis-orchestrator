@@ -94,8 +94,8 @@ fn encryption_key() -> [u8; 32] {
 
 fn encrypt_store(plaintext: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::{
+        aead::{rand_core::RngCore, Aead, KeyInit, OsRng},
         Aes256Gcm, Nonce,
-        aead::{Aead, KeyInit, OsRng, rand_core::RngCore},
     };
 
     let key_bytes = encryption_key();
@@ -117,8 +117,8 @@ fn encrypt_store(plaintext: &[u8]) -> Result<Vec<u8>> {
 
 fn decrypt_store(data: &[u8]) -> Result<Vec<u8>> {
     use aes_gcm::{
-        Aes256Gcm, Nonce,
         aead::{Aead, KeyInit},
+        Aes256Gcm, Nonce,
     };
 
     if data.len() < 12 {

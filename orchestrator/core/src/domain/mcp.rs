@@ -724,11 +724,9 @@ mod tests {
         };
 
         let args_read = json!({"path": "/workspace/test.txt"});
-        assert!(
-            policy
-                .validate_invocation("filesystem.read", &args_read, 0)
-                .is_ok()
-        );
+        assert!(policy
+            .validate_invocation("filesystem.read", &args_read, 0)
+            .is_ok());
 
         let args_delete = json!({"path": "/workspace/test.txt"});
         let result = policy.validate_invocation("filesystem.delete", &args_delete, 0);
@@ -824,13 +822,11 @@ mod tests {
             "required field 'execution_id' is missing or null for tool 'aegis.task.logs'"
         );
 
-        assert!(
-            ToolInputContract::validate(
-                "aegis.task.logs",
-                &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
-            )
-            .is_ok()
-        );
+        assert!(ToolInputContract::validate(
+            "aegis.task.logs",
+            &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -847,13 +843,11 @@ mod tests {
             "required field 'execution_id' is missing or null for tool 'aegis.workflow.status'"
         );
 
-        assert!(
-            ToolInputContract::validate(
-                "aegis.workflow.status",
-                &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
-            )
-            .is_ok()
-        );
+        assert!(ToolInputContract::validate(
+            "aegis.workflow.status",
+            &json!({"execution_id":"00000000-0000-0000-0000-000000000000"})
+        )
+        .is_ok());
     }
 
     #[test]
@@ -886,14 +880,12 @@ mod tests {
         assert!(invocation.duration_ms.is_some());
 
         // Cannot fail if already completed
-        assert!(
-            invocation
-                .fail(MCPError {
-                    code: 1,
-                    message: "err".to_string(),
-                    data: None
-                })
-                .is_err()
-        );
+        assert!(invocation
+            .fail(MCPError {
+                code: 1,
+                message: "err".to_string(),
+                data: None
+            })
+            .is_err());
     }
 }

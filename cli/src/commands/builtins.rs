@@ -325,10 +325,10 @@ mod tests {
             "GENERATE_MISSING_AGENTS should mention missing judge agents"
         );
 
-        let generate_and_register_workflow_input =
-            states["GENERATE_AND_REGISTER_WORKFLOW"]["input"]
-                .as_str()
-                .expect("GENERATE_AND_REGISTER_WORKFLOW input should be a string");
+        let generate_and_register_workflow_input = states["GENERATE_AND_REGISTER_WORKFLOW"]
+            ["input"]
+            .as_str()
+            .expect("GENERATE_AND_REGISTER_WORKFLOW input should be a string");
         assert!(
             generate_and_register_workflow_input.contains("{{PLAN.output}}"),
             "GENERATE_AND_REGISTER_WORKFLOW should reference the planner state's output payload"

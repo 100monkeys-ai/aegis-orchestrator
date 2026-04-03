@@ -18,8 +18,8 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::commands::builtins;
-use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
-use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
+use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 
 const AGENT_GENERATOR_NAME: &str = builtins::AGENT_GENERATOR_AGENT_NAME;
 

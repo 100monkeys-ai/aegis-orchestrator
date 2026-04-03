@@ -29,8 +29,8 @@ use std::time::Duration;
 use uuid::Uuid;
 
 use crate::commands::builtins;
-use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
-use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
+use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
+use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
 
 const WORKFLOW_GENERATOR_WORKFLOW_NAME: &str = builtins::WORKFLOW_GENERATOR_WORKFLOW_NAME;
 
@@ -1547,9 +1547,8 @@ mod tests {
         let err = parse_optional_object_input(Some("hello".to_string()), "workflow blackboard")
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("workflow blackboard must be a JSON/YAML object")
-        );
+        assert!(err
+            .to_string()
+            .contains("workflow blackboard must be a JSON/YAML object"));
     }
 }

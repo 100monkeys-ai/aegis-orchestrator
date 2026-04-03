@@ -6,17 +6,17 @@ use std::sync::Arc;
 
 use aegis_orchestrator_core::{
     application::{
-        CorrelatedActivityStreamService, execution::StandardExecutionService,
-        lifecycle::StandardAgentLifecycleService,
+        execution::StandardExecutionService, lifecycle::StandardAgentLifecycleService,
         register_workflow::StandardRegisterWorkflowUseCase,
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
+        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::NodeClusterRepository,
         node_config::NodeConfigManifest,
         repository::{StorageEventRepository, WorkflowExecutionRepository, WorkflowRepository},
     },
-    infrastructure::{TemporalEventListener, event_bus::EventBus, temporal_client::TemporalClient},
+    infrastructure::{event_bus::EventBus, temporal_client::TemporalClient, TemporalEventListener},
 };
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
 

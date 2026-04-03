@@ -40,7 +40,7 @@ use opentelemetry_sdk::logs::LoggerProvider;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 mod auth;
 mod commands;
@@ -52,7 +52,7 @@ use commands::{
     AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
     StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
-use output::{OutputFormat, structured_output_unsupported};
+use output::{structured_output_unsupported, OutputFormat};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]

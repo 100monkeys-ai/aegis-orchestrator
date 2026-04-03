@@ -17,7 +17,7 @@ use std::path::PathBuf;
 
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 
-use crate::output::{OutputFormat, render_serialized};
+use crate::output::{render_serialized, OutputFormat};
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {

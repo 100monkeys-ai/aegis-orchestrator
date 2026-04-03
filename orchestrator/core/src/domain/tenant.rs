@@ -5,7 +5,7 @@
 //! This module re-exports [`TenantId`] and related types from the
 //! [`shared_kernel`](super::shared_kernel) module for backward compatibility.
 
-pub use crate::domain::shared_kernel::{CONSUMER_SLUG, SYSTEM_SLUG, TenantId, TenantIdError};
+pub use crate::domain::shared_kernel::{TenantId, TenantIdError, CONSUMER_SLUG, SYSTEM_SLUG};
 
 #[cfg(test)]
 mod tests {
