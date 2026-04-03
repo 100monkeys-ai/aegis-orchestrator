@@ -227,7 +227,10 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             SELECT domain_json, updated_at
             FROM workflows
-            WHERE tenant_id = $1 AND id = $2
+            WHERE id = $2
+              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+            ORDER BY CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END
+            LIMIT 1
             "#,
         )
         .bind(tenant_id.as_str())
@@ -261,8 +264,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             SELECT domain_json, updated_at
             FROM workflows
-            WHERE tenant_id = $1 AND name = $2
-            ORDER BY version DESC
+            WHERE name = $2
+              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+            ORDER BY
+              CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END,
+              version DESC
             LIMIT 1
             "#,
         )
@@ -298,7 +304,10 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             SELECT domain_json, updated_at
             FROM workflows
-            WHERE tenant_id = $1 AND name = $2 AND version = $3
+            WHERE name = $2 AND version = $3
+              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+            ORDER BY CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END
+            LIMIT 1
             "#,
         )
         .bind(tenant_id.as_str())
