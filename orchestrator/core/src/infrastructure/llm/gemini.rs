@@ -25,6 +25,8 @@ struct GeminiGenerateContentRequest {
     system_instruction: Option<GeminiSystemInstruction>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<GeminiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "toolConfig")]
+    tool_config: Option<GeminiToolConfig>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "generationConfig")]
     generation_config: Option<GeminiGenerationConfig>,
 }
@@ -45,6 +47,17 @@ struct GeminiFunctionDeclaration {
     name: String,
     description: String,
     parameters: serde_json::Value,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiToolConfig {
+    function_calling_config: GeminiFunctionCallingConfig,
+}
+
+#[derive(Serialize)]
+struct GeminiFunctionCallingConfig {
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -297,6 +310,15 @@ impl LLMProvider for GeminiAdapter {
                         .collect(),
                 }])
             },
+            tool_config: if tools.is_empty() {
+                None
+            } else {
+                Some(GeminiToolConfig {
+                    function_calling_config: GeminiFunctionCallingConfig {
+                        mode: "AUTO".to_string(),
+                    },
+                })
+            },
             generation_config: Some(GeminiGenerationConfig {
                 max_output_tokens: options.max_tokens,
                 temperature: options.temperature,
@@ -433,6 +455,13 @@ impl LLMProvider for GeminiAdapter {
             .candidates
             .first()
             .and_then(|c| c.finish_reason.as_deref());
+
+        if finish_reason == Some("UNEXPECTED_TOOL_CALL") {
+            return Err(LLMError::Provider(
+                "Gemini rejected tool call generation (UNEXPECTED_TOOL_CALL) — check tool schemas"
+                    .into(),
+            ));
+        }
 
         let usage = gr.usage_metadata.unwrap_or(GeminiUsageMetadata {
             prompt_token_count: 0,
