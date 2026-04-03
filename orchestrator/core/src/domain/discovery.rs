@@ -112,6 +112,10 @@ pub struct DiscoveryResult {
 
     /// Whether this resource is a platform-provided template.
     pub is_platform_template: bool,
+
+    /// JSON Schema for the resource's input, serialised as a JSON string.
+    /// `None` when the resource declares no input schema.
+    pub input_schema: Option<String>,
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

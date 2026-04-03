@@ -121,6 +121,7 @@ fn map_result_item(
         tenant_id: item.tenant_id,
         updated_at,
         is_platform_template: item.is_platform_template,
+        input_schema: item.input_schema,
     }
 }
 
