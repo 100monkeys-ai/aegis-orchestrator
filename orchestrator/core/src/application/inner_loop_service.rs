@@ -584,6 +584,10 @@ impl InnerLoopService {
             })
             .collect();
 
+        tracing::debug!(
+            tool_count = tool_schemas.len(),
+            "Converting tool schemas for LLM call"
+        );
         let schemas: Vec<ToolSchema> = tool_schemas
             .iter()
             .filter_map(|v| {
@@ -595,7 +599,10 @@ impl InnerLoopService {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
-                    parameters: f.get("parameters")?.clone(),
+                    parameters: f
+                        .get("parameters")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({"type": "object", "properties": {}})),
                 })
             })
             .collect();
