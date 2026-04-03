@@ -124,6 +124,9 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default)]
     total_token_count: u32,
+    #[allow(dead_code)]
+    #[serde(default)]
+    thoughts_token_count: u32,
 }
 
 impl GeminiAdapter {
