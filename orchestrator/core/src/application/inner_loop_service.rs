@@ -39,14 +39,23 @@ const MAX_INNER_LOOP_ITERATIONS: usize = 50;
 const TOOL_USE_POLICY_SYSTEM_MESSAGE: &str = "\
 You are an autonomous agent. Use the tools available in your context to complete your task.\n\
 \n\
-Always prefer purpose-built tools over general shell execution when a suitable tool is \
-available. If a purpose-built tool for an operation is absent from your context, that \
-operation is blocked by security policy and must not be attempted through any other means.\n\
+Purpose-built tools are provided for common operations. When a dedicated tool exists for a \
+task, you MUST use it. Using a general shell execution tool to perform an operation that a \
+dedicated tool covers is a policy violation and will terminate the execution. Specifically:\n\
+- To read file contents, use the dedicated file-read tool — never shell commands like cat or head.\n\
+- To write or create files, use the dedicated file-write tool — never shell redirection.\n\
+- To search file contents, use the dedicated search tool — never shell commands like grep.\n\
+- To find files by name, use the dedicated glob tool — never shell commands like find or ls.\n\
+- To create directories, use the dedicated directory-creation tool — never shell mkdir.\n\
+- To delete files, use the dedicated delete tool — never shell rm.\n\
+- Reserve general shell execution strictly for tasks that no dedicated tool can accomplish.\n\
 \n\
-Additional tools may be present in your context, provided by MCP servers configured for this \
-execution. Always prefer the most specific tool available for any given task.\n\
+If a dedicated tool for an operation is absent from your context, that operation is blocked \
+by security policy. Do not attempt it via shell execution or any other workaround — doing so \
+is a policy violation and will terminate the execution.\n\
 \n\
-Do not attempt operations that are not permitted by your security policy.";
+Additional tools may be present from MCP servers configured for this execution. Always prefer \
+the most specific tool available.";
 
 #[derive(Debug, Clone)]
 pub enum LlmOutput {
