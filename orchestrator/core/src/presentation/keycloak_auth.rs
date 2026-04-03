@@ -22,7 +22,7 @@
 use crate::domain::iam::IdentityProvider;
 use axum::{
     extract::Request,
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -53,22 +53,22 @@ impl ScopeGuard {
     }
 }
 
-#[async_trait::async_trait]
 impl<S> axum::extract::FromRequestParts<S> for ScopeGuard
 where
     S: Send + Sync,
 {
     type Rejection = (axum::http::StatusCode, axum::Json<serde_json::Value>);
 
-    async fn from_request_parts(
+    fn from_request_parts(
         parts: &mut axum::http::request::Parts,
         _state: &S,
-    ) -> Result<Self, Self::Rejection> {
-        Ok(parts
+    ) -> impl std::future::Future<Output = Result<Self, Self::Rejection>> + Send {
+        let guard = parts
             .extensions
             .get::<ScopeGuard>()
             .cloned()
-            .unwrap_or_default())
+            .unwrap_or_default();
+        std::future::ready(Ok(guard))
     }
 }
 
