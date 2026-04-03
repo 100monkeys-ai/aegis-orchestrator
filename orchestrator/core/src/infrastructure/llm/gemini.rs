@@ -124,9 +124,6 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default)]
     total_token_count: u32,
-    #[allow(dead_code)]
-    #[serde(default)]
-    thoughts_token_count: u32,
 }
 
 impl GeminiAdapter {
@@ -389,7 +386,6 @@ impl LLMProvider for GeminiAdapter {
             prompt_token_count: 0,
             candidates_token_count: 0,
             total_token_count: 0,
-            thoughts_token_count: 0,
         });
 
         Ok(ChatResponse::FinalText(GenerationResponse {
