@@ -161,7 +161,7 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             INSERT INTO workflows (id, tenant_id, name, version, scope, owner_user_id, description, tags, yaml_source, domain_json, temporal_def_json, updated_at)
             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
-            ON CONFLICT (tenant_id, name, version, scope, COALESCE(owner_user_id, '')) DO UPDATE SET
+            ON CONFLICT (id) DO UPDATE SET
                 description = EXCLUDED.description,
                 tags = EXCLUDED.tags,
                 yaml_source = EXCLUDED.yaml_source,
