@@ -48,11 +48,6 @@ struct GeminiFunctionDeclaration {
 }
 
 #[derive(Serialize)]
-struct GeminiThinkingConfig {
-    thinking_budget: u32,
-}
-
-#[derive(Serialize)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
     max_output_tokens: Option<u32>,
@@ -60,8 +55,6 @@ struct GeminiGenerationConfig {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "stopSequences")]
     stop_sequences: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
-    thinking_config: Option<GeminiThinkingConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -307,7 +300,6 @@ impl LLMProvider for GeminiAdapter {
                 max_output_tokens: options.max_tokens,
                 temperature: options.temperature,
                 stop_sequences: options.stop_sequences.clone(),
-                thinking_config: Some(GeminiThinkingConfig { thinking_budget: 0 }),
             }),
         };
 
