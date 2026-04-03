@@ -189,7 +189,7 @@ mod tests {
     fn non_exempt_paths_require_auth() {
         assert!(!is_exempt("/v1/stimuli"));
         assert!(!is_exempt("/v1/agents"));
-        assert!(!is_exempt("/api/v1/status"));
+        assert!(!is_exempt("/v1/swarms"));
         // temporal-events authenticates via JWT in the handler itself
         assert!(!is_exempt("/v1/temporal-events"));
     }
