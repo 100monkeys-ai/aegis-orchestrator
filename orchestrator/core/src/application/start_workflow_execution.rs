@@ -651,6 +651,7 @@ mod tests {
                 tags: vec![],
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
+                input_schema: None,
             },
             WorkflowSpec {
                 initial_state: StateName::new("START").unwrap(),

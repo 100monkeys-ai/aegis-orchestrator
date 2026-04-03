@@ -14,6 +14,22 @@ metadata:
     type: builtin-execute
     builtin: "true"
     adr: "087"
+  input_schema:
+    type: object
+    properties:
+      intent:
+        type: string
+        description: Natural-language description of what to compute or produce
+      language:
+        type: string
+        description: Target programming language (e.g. python, javascript)
+        default: python
+      inputs:
+        type: object
+        description: Named input values embedded into the generated code
+        additionalProperties: true
+    required:
+      - intent
 spec:
   initial_state: DISCOVER_OR_GENERATE_AGENT
 

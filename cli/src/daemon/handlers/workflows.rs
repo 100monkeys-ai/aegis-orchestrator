@@ -194,6 +194,7 @@ pub(crate) async fn list_workflows_handler(
                 "labels": w.metadata.labels,
                 "created_at": w.created_at.to_rfc3339(),
                 "tenant_id": w.tenant_id.as_str(),
+                "input_schema": w.metadata.input_schema,
             })
         })
         .collect();

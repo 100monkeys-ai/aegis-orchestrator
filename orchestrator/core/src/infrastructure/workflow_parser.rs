@@ -87,6 +87,8 @@ pub struct WorkflowMetadataYaml {
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub annotations: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -355,6 +357,7 @@ impl WorkflowParser {
             tags: manifest.metadata.tags,
             labels: manifest.metadata.labels,
             annotations: manifest.metadata.annotations,
+            input_schema: manifest.metadata.input_schema,
         };
 
         // Convert states
@@ -603,6 +606,7 @@ impl WorkflowParser {
             tags: workflow.metadata.tags.clone(),
             labels: workflow.metadata.labels.clone(),
             annotations: workflow.metadata.annotations.clone(),
+            input_schema: workflow.metadata.input_schema.clone(),
         };
 
         let mut states = HashMap::new();

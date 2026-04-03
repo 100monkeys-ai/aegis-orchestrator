@@ -215,6 +215,11 @@ pub struct AgentSpec {
     /// Optional advanced configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub advanced: Option<AdvancedConfig>,
+
+    /// Optional JSON Schema describing execution inputs.
+    /// Used by the Zaru client context panel to render typed form fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 /// Runtime configuration
@@ -985,6 +990,7 @@ mod tests {
                 env: std::collections::HashMap::new(),
                 volumes: vec![],
                 advanced: None,
+                input_schema: None,
             },
         }
     }

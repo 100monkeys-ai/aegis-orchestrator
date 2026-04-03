@@ -1374,6 +1374,7 @@ mod tests {
                     env: std::collections::HashMap::new(),
                     volumes: vec![],
                     advanced: None,
+                    input_schema: None,
                 },
             },
             deployed_at: Utc::now(),

@@ -37,6 +37,7 @@ fn minimal_metadata(name: &str) -> WorkflowMetadata {
         tags: vec![],
         labels: HashMap::new(),
         annotations: HashMap::new(),
+        input_schema: None,
     }
 }
 
@@ -1547,6 +1548,7 @@ fn workflow_serde_roundtrip() {
                 m
             },
             annotations: HashMap::new(),
+            input_schema: None,
         },
         two_state_spec("GENERATE", "VALIDATE"),
     )

@@ -477,6 +477,10 @@ pub struct WorkflowMetadata {
     /// Arbitrary annotations (non-identifying metadata)
     #[serde(default)]
     pub annotations: HashMap<String, String>,
+
+    /// Optional JSON Schema describing workflow execution inputs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_schema: Option<serde_json::Value>,
 }
 
 impl WorkflowMetadata {
@@ -1617,6 +1621,7 @@ mod tests {
                 tags: vec![],
                 labels: std::collections::HashMap::new(),
                 annotations: std::collections::HashMap::new(),
+                input_schema: None,
             },
             spec: WorkflowSpec {
                 initial_state: StateName::new("START").unwrap(),
@@ -1647,6 +1652,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
 
         let spec = WorkflowSpec {
@@ -1669,6 +1675,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
 
         let mut states = HashMap::new();
@@ -1708,6 +1715,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1753,6 +1761,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1812,6 +1821,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1861,6 +1871,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1900,6 +1911,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1939,6 +1951,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1973,6 +1986,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
         let mut states = HashMap::new();
         states.insert(

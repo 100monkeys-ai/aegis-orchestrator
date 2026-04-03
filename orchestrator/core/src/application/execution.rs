@@ -834,6 +834,7 @@ mod tests {
                     })
                     .unwrap_or_default(),
                 advanced: None,
+                input_schema: None,
             },
         })
     }

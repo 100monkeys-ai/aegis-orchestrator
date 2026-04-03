@@ -83,6 +83,7 @@ fn test_map_100monkeys_workflow() {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("GENERATE").unwrap(),
@@ -145,6 +146,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),
@@ -185,6 +187,7 @@ fn test_spec_storage_is_mapped_to_temporal_definition() {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),
@@ -271,6 +274,7 @@ fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),
@@ -299,6 +303,7 @@ fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),
