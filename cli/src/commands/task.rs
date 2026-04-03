@@ -18,8 +18,8 @@ use std::time::Duration;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::daemon::{check_daemon_running, DaemonClient, DaemonStatus};
-use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
+use crate::daemon::{DaemonClient, DaemonStatus, check_daemon_running};
+use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
 
 #[derive(Subcommand)]
 pub enum TaskCommand {
@@ -126,7 +126,8 @@ pub async fn handle_command(
     match daemon_status {
         Ok(DaemonStatus::Running { .. }) => {
             info!("Delegating to daemon API");
-            let client = DaemonClient::new(host, port)?;
+            let auth_key = crate::auth::require_key().await?;
+            let client = DaemonClient::new(host, port)?.with_auth(auth_key);
             handle_command_daemon(command, client, output_format).await
         }
         _ => {
@@ -544,8 +545,9 @@ mod tests {
         let err = parse_object_input(Some("hello".to_string()), "context override")
             .await
             .unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("context override must be a JSON/YAML object"));
+        assert!(
+            err.to_string()
+                .contains("context override must be a JSON/YAML object")
+        );
     }
 }

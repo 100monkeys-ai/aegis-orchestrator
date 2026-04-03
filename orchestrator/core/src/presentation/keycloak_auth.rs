@@ -22,12 +22,55 @@
 use crate::domain::iam::IdentityProvider;
 use axum::{
     extract::Request,
-    http::{header, StatusCode},
+    http::{StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
 use std::sync::Arc;
 use tracing::warn;
+
+/// Scopes extracted from the validated JWT. Populated by `iam_auth_middleware`.
+/// Use `scope_guard.require("agent:execute")?` in handlers for fine-grained enforcement.
+#[derive(Clone, Debug, Default)]
+pub struct ScopeGuard(pub Vec<String>);
+
+impl ScopeGuard {
+    pub fn require(
+        &self,
+        scope: &str,
+    ) -> Result<(), (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+        if self.0.iter().any(|s| s == scope) {
+            Ok(())
+        } else {
+            Err((
+                axum::http::StatusCode::FORBIDDEN,
+                axum::Json(serde_json::json!({
+                    "error": "insufficient_scope",
+                    "required": scope
+                })),
+            ))
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S> axum::extract::FromRequestParts<S> for ScopeGuard
+where
+    S: Send + Sync,
+{
+    type Rejection = (axum::http::StatusCode, axum::Json<serde_json::Value>);
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        _state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(parts
+            .extensions
+            .get::<ScopeGuard>()
+            .cloned()
+            .unwrap_or_default())
+    }
+}
 
 /// Paths exempt from IAM/OIDC JWT auth.
 /// These endpoints use other auth mechanisms (SEAL attestation, HMAC, or are unauthenticated).
@@ -106,6 +149,14 @@ pub async fn iam_auth_middleware(
         Ok(validated) => {
             // Insert UserIdentity into request extensions for downstream handlers
             request.extensions_mut().insert(validated.identity);
+            // Extract resource:action scopes from the JWT "scope" claim
+            let scope_str = validated
+                .raw_claims
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let scopes: Vec<String> = scope_str.split_whitespace().map(String::from).collect();
+            request.extensions_mut().insert(ScopeGuard(scopes));
             next.run(request).await
         }
         Err(e) => {

@@ -7,6 +7,7 @@
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** Implements internal responsibilities for lib
 
+pub mod auth;
 pub mod commands;
 pub mod daemon;
 pub mod output;

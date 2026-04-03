@@ -75,6 +75,9 @@ base64 = "0.22.1"
 rsa = { version = "0.9", features = ["pem"] }
 rand = "0.8"
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+sha2 = "0.10"
+keyring = "3"
+aes-gcm = "0.10"
 tonic = { workspace = true }
 prost = { workspace = true }
 
