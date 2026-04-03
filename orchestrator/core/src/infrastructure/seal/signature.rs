@@ -137,8 +137,6 @@ mod tests {
             .as_secs() as i64;
         ContextClaims {
             sub: "agent-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            execution_id: "exec-1".to_string(),
             security_context: "test".to_string(),
             iss: iss.map(|s| s.to_string()),
             aud: aud.map(AudienceClaim::Multiple),
@@ -148,7 +146,7 @@ mod tests {
             jti: None,
             scp: "test".to_string(),
             wid: String::new(),
-            exec_id: None,
+            exec_id: "exec-1".to_string(),
             tenant_id: None,
         }
     }
@@ -165,8 +163,6 @@ mod tests {
             .as_secs() as i64;
         ContextClaims {
             sub: "agent-1".to_string(),
-            agent_id: "agent-1".to_string(),
-            execution_id: "exec-1".to_string(),
             security_context: "test".to_string(),
             iss: iss.map(|s| s.to_string()),
             aud: aud.map(|s| AudienceClaim::Single(s.to_string())),
@@ -176,7 +172,7 @@ mod tests {
             jti: None,
             scp: "test".to_string(),
             wid: String::new(),
-            exec_id: None,
+            exec_id: "exec-1".to_string(),
             tenant_id: None,
         }
     }

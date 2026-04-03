@@ -72,14 +72,12 @@ pub enum AudienceClaim {
 /// specific agent execution and `SecurityContext`.
 ///
 /// Standard JWT fields (`iss`, `aud`, `exp`, `iat`, `nbf`) follow RFC 7519.
+/// Per SEAL spec §4.2.2, `sub` carries the agent UUID and `exec_id` carries
+/// the execution UUID — no redundant aliases.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClaims {
-    /// JWT subject claim — the agent principal identifier (REQUIRED per spec).
+    /// JWT subject claim — the agent principal identifier (REQUIRED per SEAL spec §4.2.2).
     pub sub: String,
-    /// AEGIS `AgentId` (UUID string) — identifies the agent that was attested.
-    pub agent_id: String,
-    /// AEGIS `ExecutionId` (UUID string) — binds the token to a single execution.
-    pub execution_id: String,
     /// Name of the `SecurityContext` assigned to this execution (e.g. `"research-safe"`).
     pub security_context: String,
     /// Issuer of the token (e.g. the orchestrator instance).
@@ -104,9 +102,8 @@ pub struct ContextClaims {
     pub scp: String,
     /// Workload/container ID.
     pub wid: String,
-    /// Execution correlation identifier (spec alias for `execution_id`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub exec_id: Option<String>,
+    /// Execution correlation identifier — binds the token to a single execution (SEAL spec §4.2.2).
+    pub exec_id: String,
     /// Tenant routing identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,

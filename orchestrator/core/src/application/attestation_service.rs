@@ -284,8 +284,6 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
 
         let mut inner_claims = ContextClaims {
             sub: claims.sub.clone(),
-            agent_id: claims.agent_id.clone(),
-            execution_id: claims.execution_id.clone(),
             security_context: claims.security_context.clone(),
             iss: claims.iss.clone(),
             aud,
@@ -295,7 +293,7 @@ impl SecurityTokenIssuerPort for SecurityTokenIssuer {
             jti: claims.jti.clone(),
             scp: claims.scp.clone(),
             wid: claims.wid.clone(),
-            exec_id: Some(claims.execution_id.clone()),
+            exec_id: claims.execution_id.clone(),
             tenant_id: claims.tenant_id.clone(),
         };
 
@@ -379,10 +377,10 @@ mod tests {
 
         let token = verifier.verify(&response.security_token).unwrap();
         assert_eq!(token.claims.security_context, "zaru-pro");
-        assert!(uuid::Uuid::parse_str(&token.claims.agent_id).is_ok());
-        assert!(uuid::Uuid::parse_str(&token.claims.execution_id).is_ok());
+        assert!(uuid::Uuid::parse_str(&token.claims.sub).is_ok());
+        assert!(uuid::Uuid::parse_str(&token.claims.exec_id).is_ok());
         let saved_session = seal_session_repo
-            .find_active_by_agent(&AgentId::from_string(&token.claims.agent_id).unwrap())
+            .find_active_by_agent(&AgentId::from_string(&token.claims.sub).unwrap())
             .await
             .unwrap()
             .unwrap();

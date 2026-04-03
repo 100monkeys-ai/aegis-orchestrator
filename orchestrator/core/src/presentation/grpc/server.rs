@@ -1616,7 +1616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invoke_tool_returns_failed_precondition_when_tool_service_is_missing() {
+    async fn invoke_tool_returns_unimplemented_pending_proto_update() {
         let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
             execution_id: ExecutionId::new(),
             stream_events: Vec::new(),
@@ -1633,12 +1633,8 @@ mod tests {
                 payload: Vec::new(),
             }))
             .await
-            .expect_err("invoke_tool should reject missing tool service");
+            .expect_err("invoke_tool should be unimplemented via gRPC pending proto update");
 
-        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
-        assert_eq!(
-            err.message(),
-            "SEAL tool invocation service is not configured"
-        );
+        assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 }
