@@ -341,6 +341,11 @@ impl LLMProvider for GeminiAdapter {
             .await
             .map_err(|e| LLMError::Network(format!("Failed to read response body: {e}")))?;
 
+        tracing::debug!(
+            body = %String::from_utf8_lossy(&body_bytes),
+            "Gemini raw response body"
+        );
+
         let gr: GeminiGenerateContentResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
