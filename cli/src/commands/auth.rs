@@ -13,14 +13,14 @@ use colored::Colorize;
 use serde::Serialize;
 
 use crate::auth;
-use crate::output::{OutputFormat, render_serialized};
+use crate::output::{render_serialized, OutputFormat};
 
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Authenticate with an AEGIS environment using your browser.
     Login {
         /// Environment hostname (e.g. dev.100monkeys.ai).
-        /// Auth is derived as https://auth.<env>, API as https://api.<env>.
+        /// Auth endpoint is derived as `https://auth.<hostname>`, API as `https://api.<hostname>`.
         #[arg(long, default_value = "dev.100monkeys.ai")]
         env: String,
         /// Exit non-zero if not already authenticated (for CI/CD pipelines).
