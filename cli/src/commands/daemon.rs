@@ -16,8 +16,8 @@ use serde::Serialize;
 use std::path::PathBuf;
 use tracing::{info, warn};
 
-use crate::daemon::{check_daemon_running, stop_daemon, DaemonStatus};
-use crate::output::{render_serialized, structured_output_unsupported, OutputFormat};
+use crate::daemon::{DaemonStatus, check_daemon_running, stop_daemon};
+use crate::output::{OutputFormat, render_serialized, structured_output_unsupported};
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 
 #[derive(Subcommand)]

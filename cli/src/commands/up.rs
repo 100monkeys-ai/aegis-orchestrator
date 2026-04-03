@@ -22,7 +22,7 @@ use clap::Args;
 use colored::Colorize;
 use dialoguer::Confirm;
 
-use super::init::{self, compose::ComposeRunner, InitArgs};
+use super::init::{self, InitArgs, compose::ComposeRunner};
 use super::update::{persist_image_tag, refresh_compose, resolve_image_tag};
 
 /// Arguments for `aegis up`

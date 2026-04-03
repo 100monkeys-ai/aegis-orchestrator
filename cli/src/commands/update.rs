@@ -20,7 +20,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aegis_orchestrator_core::domain::node_config::{resolve_env_value, NodeConfigManifest};
+use aegis_orchestrator_core::domain::node_config::{NodeConfigManifest, resolve_env_value};
 use anyhow::{Context, Result};
 use clap::Args;
 use colored::Colorize;
@@ -28,7 +28,7 @@ use sqlx::postgres::PgPoolOptions;
 
 use super::init::compose::ComposeRunner;
 use super::init::download::fetch_stack;
-use crate::output::{structured_output_unsupported, OutputFormat};
+use crate::output::{OutputFormat, structured_output_unsupported};
 
 #[derive(Args)]
 pub struct UpdateCommand {

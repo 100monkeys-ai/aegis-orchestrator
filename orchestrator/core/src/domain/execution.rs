@@ -282,7 +282,9 @@ pub enum ExecutionError {
     PromptRenderFailed(String),
     #[error("Failed to extract user input from execution payload: {0}")]
     InvalidExecutionInput(String),
-    #[error("Cross-tenant spawn forbidden: parent tenant '{parent_tenant}' cannot spawn child in tenant '{child_tenant}'")]
+    #[error(
+        "Cross-tenant spawn forbidden: parent tenant '{parent_tenant}' cannot spawn child in tenant '{child_tenant}'"
+    )]
     CrossTenantSpawnForbidden {
         parent_tenant: String,
         child_tenant: String,

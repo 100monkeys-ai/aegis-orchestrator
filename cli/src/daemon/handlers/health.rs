@@ -4,8 +4,8 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
 use axum::Json;
+use axum::extract::State;
 
 use crate::daemon::state::AppState;
 

@@ -14,18 +14,18 @@ use std::process::Command;
 
 use aegis_orchestrator_core::domain::node_config::NodeConfigManifest;
 use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::{
-    node_cluster_service_client::NodeClusterServiceClient, ListPeersRequest, NodeStatus,
+    ListPeersRequest, NodeStatus, node_cluster_service_client::NodeClusterServiceClient,
 };
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use colored::Colorize;
 use serde::{Deserialize, Serialize};
 use tonic::Request;
 
 use crate::daemon::{
-    check_daemon_running, probe_health_endpoint, DaemonStatus, HealthEndpointStatus,
+    DaemonStatus, HealthEndpointStatus, check_daemon_running, probe_health_endpoint,
 };
-use crate::output::{render_serialized, OutputFormat};
+use crate::output::{OutputFormat, render_serialized};
 
 #[derive(Args, Debug, Clone)]
 pub struct StatusArgs {

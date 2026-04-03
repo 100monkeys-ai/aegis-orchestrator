@@ -11,7 +11,7 @@
 //! - **Layer:** Interface / Presentation Layer
 //! - **Purpose:** prereqs step inside the `aegis init` wizard
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use colored::Colorize;
 
 /// Whether a given prerequisite binary was found and is usable.
