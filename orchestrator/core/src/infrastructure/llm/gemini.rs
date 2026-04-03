@@ -48,6 +48,11 @@ struct GeminiFunctionDeclaration {
 }
 
 #[derive(Serialize)]
+struct GeminiThinkingConfig {
+    thinking_budget: u32,
+}
+
+#[derive(Serialize)]
 struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none", rename = "maxOutputTokens")]
     max_output_tokens: Option<u32>,
@@ -55,6 +60,8 @@ struct GeminiGenerationConfig {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "stopSequences")]
     stop_sequences: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "thinkingConfig")]
+    thinking_config: Option<GeminiThinkingConfig>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -72,6 +79,8 @@ struct GeminiPart {
     function_call: Option<GeminiFunctionCall>,
     #[serde(skip_serializing_if = "Option::is_none")]
     function_response: Option<GeminiFunctionResponse>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thought: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -115,6 +124,8 @@ struct GeminiUsageMetadata {
     candidates_token_count: u32,
     #[serde(default)]
     total_token_count: u32,
+    #[serde(default)]
+    thoughts_token_count: u32,
 }
 
 impl GeminiAdapter {
@@ -293,6 +304,7 @@ impl LLMProvider for GeminiAdapter {
                 max_output_tokens: options.max_tokens,
                 temperature: options.temperature,
                 stop_sequences: options.stop_sequences.clone(),
+                thinking_config: Some(GeminiThinkingConfig { thinking_budget: 0 }),
             }),
         };
 
@@ -328,9 +340,12 @@ impl LLMProvider for GeminiAdapter {
             });
         }
 
-        let gr: GeminiGenerateContentResponse = response
-            .json()
+        let body_bytes = response
+            .bytes()
             .await
+            .map_err(|e| LLMError::Network(format!("Failed to read response body: {e}")))?;
+
+        let gr: GeminiGenerateContentResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
         let candidate = gr
@@ -359,6 +374,7 @@ impl LLMProvider for GeminiAdapter {
             .content
             .parts
             .iter()
+            .filter(|p| p.thought.unwrap_or(false) == false)
             .filter_map(|p| p.text.clone())
             .collect::<Vec<_>>()
             .join("");
@@ -367,6 +383,7 @@ impl LLMProvider for GeminiAdapter {
             prompt_token_count: 0,
             candidates_token_count: 0,
             total_token_count: 0,
+            thoughts_token_count: 0,
         });
 
         Ok(ChatResponse::FinalText(GenerationResponse {
