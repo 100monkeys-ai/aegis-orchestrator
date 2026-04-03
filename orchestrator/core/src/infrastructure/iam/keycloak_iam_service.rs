@@ -221,17 +221,32 @@ impl StandardIamService {
             }
         }
 
-        // Cache miss or expired — refresh
-        self.refresh_jwks(realm).await?;
-
-        let cache = self.jwks_cache.read().await;
-        cache
-            .get(&realm.realm_slug)
-            .map(|c| c.keys.clone())
-            .ok_or_else(|| IamError::JwksFetchFailed {
-                realm: realm.realm_slug.clone(),
-                reason: "Cache empty after refresh".to_string(),
-            })
+        // Cache miss or expired — attempt refresh, fall back to stale keys on transient failure
+        match self.refresh_jwks(realm).await {
+            Ok(()) => {
+                let cache = self.jwks_cache.read().await;
+                cache
+                    .get(&realm.realm_slug)
+                    .map(|c| c.keys.clone())
+                    .ok_or_else(|| IamError::JwksFetchFailed {
+                        realm: realm.realm_slug.clone(),
+                        reason: "Cache empty after refresh".to_string(),
+                    })
+            }
+            Err(e) => {
+                let cache = self.jwks_cache.read().await;
+                if let Some(stale) = cache.get(&realm.realm_slug) {
+                    warn!(
+                        realm = %realm.realm_slug,
+                        error = %e,
+                        "JWKS refresh failed, serving stale keys"
+                    );
+                    Ok(stale.keys.clone())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Find the realm matching a JWT's issuer claim.
