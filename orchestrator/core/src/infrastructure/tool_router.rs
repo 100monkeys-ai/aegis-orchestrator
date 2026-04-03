@@ -168,6 +168,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.tools.search",
     "aegis.system.info",
     "aegis.system.config",
+    "aegis.runtime.list",
 ];
 
 /// Canonical registry of all builtin tool dispatchers.
@@ -233,6 +234,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.tools.search", "Search for MCP tools by keyword, name pattern, source, category, or tags. Returns tools matching your query within your security context."),
     ("aegis.system.info", "Returns system version, status, and capabilities."),
     ("aegis.system.config", "Returns the current node configuration."),
+    ("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid."),
 ];
 
 impl ToolRouter {
@@ -1254,6 +1256,15 @@ impl ToolRouter {
                             }
                         },
                         "required": ["manifest_yaml"]
+                    }),
+                    "aegis.runtime.list" => json!({
+                        "type": "object",
+                        "properties": {
+                            "language": {
+                                "type": "string",
+                                "description": "Optional: filter by language name (e.g. \"python\", \"go\")"
+                            }
+                        }
                     }),
                     _ => json!({ "type": "object" }),
                 };

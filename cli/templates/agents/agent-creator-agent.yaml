@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-creator-agent
-  version: "1.1.0"
+  version: "1.2.0"
   description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
   labels:
     role: worker
@@ -26,7 +26,13 @@ spec:
       returns invalid output, stop and return errors/skipped instead of trying to deploy anyway.
 
       REQUIRED WORKFLOW — follow this order on every agent creation or update request:
-      1. Call `aegis.agent.search` with a semantic query derived from the user's requested capability.
+      1. Call `aegis.runtime.list` with no arguments to retrieve all valid runtime environments.
+         Store the `runtimes` array from the response. You MUST use only `language`/`version` pairs
+         that appear in this array when composing `spec.runtime`. Do not guess, infer, or assume
+         any runtime exists — if it is not in the `runtimes` array, it is not valid and will fail
+         at execution time. Select the most appropriate language and version from the returned list
+         based on the agent's intended capability.
+      2. Call `aegis.agent.search` with a semantic query derived from the user's requested capability.
          - If the call succeeds and any result has `similarity_score >= 0.85`, present them to the user:
            "Found existing agents that may match your intent: [list with scores]. Would you like to
            use one of these, or proceed with generating a new agent?" Only proceed with generation
@@ -37,13 +43,13 @@ spec:
          In either case, if a sufficiently similar agent already exists, do not create a duplicate —
          instead return a skipped entry explaining which existing agent covers the requirement and why.
          Only proceed if no existing agent covers the requested capability.
-      2. Call `aegis.tools.search` with keywords and/or categories derived from the user's intent
+      3. Call `aegis.tools.search` with keywords and/or categories derived from the user's intent
          to discover which MCP tools are available on the platform. Use the results to inform
          which tool names to include in the generated manifest's `spec.tools` section. Only
          reference tool names that appear in search results or are otherwise known to exist.
-      3. If updating an existing agent, call `aegis.agent.export` with {"name": "<agent_name>"} to retrieve the current manifest.
-      4. Call `aegis.schema.get` with {"key": "agent/manifest/v1"} to retrieve the canonical manifest schema.
-      5. Compose the complete YAML manifest following the schema strictly.
+      4. If updating an existing agent, call `aegis.agent.export` with {"name": "<agent_name>"} to retrieve the current manifest.
+      5. Call `aegis.schema.get` with {"key": "agent/manifest/v1"} to retrieve the canonical manifest schema.
+      6. Compose the complete YAML manifest following the schema strictly.
          - Use lowercase DNS-safe metadata.name.
          - Keep runtime and security settings explicit.
          - Prefer deterministic validation in execution.validation when feasible.
@@ -64,16 +70,16 @@ spec:
            `required` for mandatory fields. Omit `input_schema` entirely when the agent
            only accepts a free-form string via `{{input}}` with no named fields. Do not
            invent an `input_schema` for agents that do not benefit from one.
-      6. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
+      7. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
-      7. Only after step 6 returns valid:true for the exact YAML you will submit:
+      8. Only after step 7 returns valid:true for the exact YAML you will submit:
          - For new agents: call `aegis.agent.create` with the validated manifest.
          - For updates: call `aegis.agent.update` with the validated manifest.
          - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
       Do not call `aegis.agent.create` or `aegis.agent.update` from a draft manifest, a partially
       composed manifest, or a manifest that has not been schema-validated in the current run.
-      Skipping, reordering, or collapsing steps 1–6 is a policy violation and will cause judge rejection.
+      Skipping, reordering, or collapsing steps 1–7 is a policy violation and will cause judge rejection.
 
       When generating multiple missing agents, handle each manifest independently and repeat the
       full sequence above for every agent. A previous successful validation does not authorize a
@@ -149,6 +155,7 @@ spec:
       - input
 
   tools:
+    - aegis.runtime.list
     - aegis.agent.search
     - aegis.agent.list
     - aegis.tools.search

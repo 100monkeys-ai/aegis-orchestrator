@@ -1323,7 +1323,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         .with_agent_activity(Arc::new(DaemonAgentActivity {
             execution_repo: execution_repo.clone(),
         }))
-        .with_tool_catalog(tool_catalog.clone());
+        .with_tool_catalog(tool_catalog.clone())
+        .with_runtime_registry(runtime_registry.clone());
 
     // Wire discovery service into ToolInvocationService if available (ADR-075)
     if let Some(ref disc_svc) = discovery_service {

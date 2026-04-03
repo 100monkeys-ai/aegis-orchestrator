@@ -51,6 +51,7 @@ impl ToolInvocationService {
             agent_activity: None,
             tool_catalog: None,
             discovery_service: None,
+            runtime_registry: None,
         }
     }
 
@@ -130,6 +131,15 @@ impl ToolInvocationService {
         svc: Arc<dyn crate::application::discovery_service::DiscoveryService>,
     ) -> Self {
         self.discovery_service = Some(svc);
+        self
+    }
+
+    /// Attach a `StandardRuntimeRegistry` to enable `aegis.runtime.list`.
+    pub fn with_runtime_registry(
+        mut self,
+        registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
+    ) -> Self {
+        self.runtime_registry = Some(registry);
         self
     }
 
@@ -838,6 +848,7 @@ impl ToolInvocationService {
             ),
             "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
             "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
+            "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
             _ => None,
         }
     }

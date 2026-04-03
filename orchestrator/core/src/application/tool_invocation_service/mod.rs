@@ -7,6 +7,7 @@ mod discovery;
 mod execute;
 mod facade;
 mod gateway;
+mod runtime;
 mod system;
 mod tasks;
 #[cfg(test)]
@@ -39,6 +40,7 @@ use crate::domain::fsal::AegisFSAL;
 use crate::domain::mcp::{
     MCPError, PolicyViolation, ToolInputContract, ToolInvocationId, ToolServerId,
 };
+use crate::domain::runtime_registry::StandardRuntimeRegistry;
 use crate::domain::seal_session::{EnvelopeVerifier, SealSessionError};
 use crate::domain::seal_session_repository::SealSessionRepository;
 use crate::domain::security_context::repository::SecurityContextRepository;
@@ -113,4 +115,6 @@ pub struct ToolInvocationService {
     tool_catalog: Option<Arc<StandardToolCatalog>>,
     /// Optional discovery service for semantic search over agents and workflows (ADR-075).
     discovery_service: Option<Arc<dyn crate::application::discovery_service::DiscoveryService>>,
+    /// Optional StandardRuntime registry for aegis.runtime.list tool.
+    runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
 }
