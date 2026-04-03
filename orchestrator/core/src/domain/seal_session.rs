@@ -44,6 +44,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::PolicyViolation;
 use crate::domain::security_context::SecurityContext;
+use crate::domain::tenant::TenantId;
 
 /// Default session time-to-live in hours.
 ///
@@ -221,6 +222,9 @@ pub struct SealSession {
     /// Optional Zaru subscription tier bound at attestation time.
     pub zaru_tier: Option<String>,
 
+    /// Tenant that owns this session, extracted from the JWT claims at attestation time.
+    pub tenant_id: TenantId,
+
     /// Session status
     pub status: SessionStatus,
 
@@ -239,6 +243,7 @@ impl SealSession {
         agent_public_key: Vec<u8>,
         security_token_raw: String,
         security_context: SecurityContext,
+        tenant_id: TenantId,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -252,6 +257,7 @@ impl SealSession {
             user_id: None,
             workload_id: None,
             zaru_tier: None,
+            tenant_id,
             status: SessionStatus::Active,
             created_at: now,
             expires_at: now + chrono::Duration::hours(SESSION_TTL_HOURS),

@@ -213,6 +213,7 @@ impl AttestationServiceImpl {
             public_key_bytes,
             token.clone(),
             security_context,
+            request.tenant_id.clone(),
         )
         .with_principal_metadata(
             principal_subject.clone(),

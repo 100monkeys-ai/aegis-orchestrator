@@ -411,6 +411,7 @@ impl InnerLoopService {
                             .invoke_tool_internal(
                                 &ctx.agent_id,
                                 ExecutionId(uuid::Uuid::parse_str(execution_id_str)?),
+                                ctx.tenant_id.clone(),
                                 ctx.iteration_number,
                                 ctx.trajectory.clone(),
                                 tool_call.name.clone(),

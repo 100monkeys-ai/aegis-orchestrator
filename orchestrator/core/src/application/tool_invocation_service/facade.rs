@@ -170,18 +170,11 @@ impl ToolInvocationService {
         ToolInputContract::validate(&tool_name, &args)
             .map_err(SealSessionError::InvalidArguments)?;
 
-        // 3. Get security context from the session.
+        // 3. Get security context and tenant_id from the session.
         let security_context = session.security_context;
 
-        // 4. Resolve tenant from the execution record so the agent lookup uses the correct tenant.
-        // Use the unscoped lookup — the SEAL session was already authenticated and the execution_id
-        // is trusted. The record's own tenant_id drives all downstream operations.
-        let tenant_id = self
-            .execution_service
-            .get_execution_unscoped(execution_id)
-            .await
-            .map(|e| e.tenant_id)
-            .unwrap_or_else(|_| TenantId::system());
+        // 4. Tenant is already carried on the session — no DB lookup needed.
+        let tenant_id = session.tenant_id.clone();
 
         // 5. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
@@ -210,19 +203,23 @@ impl ToolInvocationService {
     /// Internal orchestrator-driven tool invocation (Gateway pattern).
     /// Resolves the SecurityContext from the execution's `security_context_name`
     /// (ADR-083), then delegates to `dispatch_tool_core`.
+    ///
+    /// `tenant_id` is passed by the caller — for the inner loop path this comes from
+    /// `ExecutionContext::tenant_id` (sourced from the execution record at loop init),
+    /// avoiding a redundant per-call DB lookup just to recover the tenant.
     pub async fn invoke_tool_internal(
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: TenantId,
         iteration_number: u8,
         tool_audit_history: Vec<TrajectoryStep>,
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        // 1. Load the execution to obtain its security_context_name and tenant_id (ADR-083).
+        // 1. Load the execution to obtain its security_context_name (ADR-083).
         // Use the unscoped lookup — the caller holds a trusted orchestrator-provisioned
-        // ExecutionId, so tenant filtering is unnecessary here. The execution record's
-        // own tenant_id drives all downstream tenant-scoped operations.
+        // ExecutionId. tenant_id is already provided by the caller.
         let execution = self
             .execution_service
             .get_execution_unscoped(execution_id)
@@ -254,7 +251,7 @@ impl ToolInvocationService {
         self.dispatch_tool_core(
             agent_id,
             execution_id,
-            &execution.tenant_id,
+            &tenant_id,
             &security_context,
             tool_name,
             args,
@@ -653,7 +650,7 @@ impl ToolInvocationService {
                             execution_id,
                             &tool_name,
                             args.clone(),
-                            None,
+                            Some(tenant_id.as_str()),
                             None,
                         )
                         .await;

@@ -830,7 +830,14 @@ async fn test_invoke_tool_bad_signature() {
     };
 
     let session_token = make_fake_token(agent_id);
-    let session = SealSession::new(agent_id, exec_id, vec![], session_token, context);
+    let session = SealSession::new(
+        agent_id,
+        exec_id,
+        vec![],
+        session_token,
+        context,
+        crate::domain::tenant::TenantId::consumer(),
+    );
     let _ = repo.save(session).await;
 
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
@@ -1663,7 +1670,14 @@ async fn test_invoke_tool_execution_modes() {
     };
 
     let session_token = make_fake_token(agent_id);
-    let session = SealSession::new(agent_id, exec_id, vec![], session_token, context);
+    let session = SealSession::new(
+        agent_id,
+        exec_id,
+        vec![],
+        session_token,
+        context,
+        crate::domain::tenant::TenantId::consumer(),
+    );
     let _ = repo.save(session).await;
 
     let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
@@ -2055,6 +2069,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         .invoke_tool_internal(
             &agent_id,
             exec_id,
+            crate::domain::tenant::TenantId::consumer(),
             1,
             vec![],
             "aegis.workflow.delete".to_string(),
