@@ -85,6 +85,20 @@ pub async fn run(args: InitArgs) -> Result<()> {
 
     let dir = PathBuf::from(&args.dir);
 
+    eprintln!();
+    eprintln!(
+        "  {}  {} is for local testing and evaluation only.",
+        "⚠".yellow(),
+        "aegis init".bold()
+    );
+    eprintln!("     Keycloak (IAM) and OpenBao (secrets management) are NOT deployed.");
+    eprintln!("     For production deployments, use the aegis-deploy repository:");
+    eprintln!(
+        "     {}",
+        "https://github.com/100monkeys-ai/aegis-deploy".cyan()
+    );
+    eprintln!();
+
     // ─── Step 1: Select components ────────────────────────────────────────────
     print_step(1, 8, "Select components");
     let selector = ComponentSelector::new(args.yes);
@@ -191,12 +205,6 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
     if components.temporal {
         println!("  {}   http://localhost:8233", "Temporal UI".bold());
     }
-    if components.iam {
-        println!("  {}  http://localhost:8180", "Keycloak".bold());
-    }
-    if components.secrets {
-        println!("  {}    http://localhost:8200", "OpenBao".bold());
-    }
     if components.storage {
         println!("  {}  http://localhost:9333", "SeaweedFS".bold());
     }
@@ -224,5 +232,11 @@ fn print_success(host: &str, port: u16, components: &components::SelectedCompone
         "aegis task execute hello-world --input \"Hello, AEGIS!\"".cyan()
     );
     println!("    6. Stop the stack:          {}", "aegis down".cyan());
+    println!();
+    println!(
+        "  {} Production deployment (with IAM & secrets):  {}",
+        "→".bold(),
+        "https://github.com/100monkeys-ai/aegis-deploy".cyan()
+    );
     println!();
 }

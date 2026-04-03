@@ -209,64 +209,6 @@ services:
     restart: unless-stopped
 
   # ============================================================================
-  # Secrets Management (ADR-034)
-  # ============================================================================
-
-  # OpenBao (Secrets backend)
-  openbao:
-    image: openbao/openbao:latest
-    container_name: aegis-openbao
-    profiles: [secrets]
-    ports:
-      - "8200:8200"
-    environment:
-      BAO_DEV_ROOT_TOKEN_ID: "root"
-      BAO_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
-    networks:
-      - aegis-network
-    cap_add:
-      - IPC_LOCK
-    healthcheck:
-      test: ["CMD", "bao", "status"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: unless-stopped
-
-  # ============================================================================
-  # Identity & Access Management (ADR-041)
-  # ============================================================================
-
-  # Keycloak (Central IAM — OIDC issuer for all human and service-account auth)
-  # Dev mode: embedded H2 database, no external DB required.
-  # Admin console: http://localhost:8180/admin  (admin / ${KEYCLOAK_ADMIN_PASSWORD})
-  # Realm config: aegis-system and zaru-consumer realms auto-created by import.
-  keycloak:
-    image: quay.io/keycloak/keycloak:24.0
-    container_name: aegis-keycloak
-    profiles: [iam]
-    command: start-dev
-    environment:
-      KC_HTTP_PORT: "8180"
-      KEYCLOAK_ADMIN: admin
-      KEYCLOAK_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
-      KC_HEALTH_ENABLED: "true"
-      KC_METRICS_ENABLED: "true"
-    ports:
-      - "8180:8180"   # HTTP (dev mode, no TLS)
-    volumes:
-      - keycloak-data:/opt/keycloak/data
-    networks:
-      - aegis-network
-    healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/localhost/8180 && echo -e 'GET /health/ready HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n' >&3 && cat <&3 | grep -q '\"status\":\"UP\"'"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 30s
-    restart: unless-stopped
-
-  # ============================================================================
   # Observability & Monitoring (ADR-057)
   # ============================================================================
 
@@ -416,8 +358,6 @@ volumes:
   seaweedfs-volume-data:
     driver: local
   seaweedfs-filer-data:
-    driver: local
-  keycloak-data:
     driver: local
   seal-gateway-data:
     driver: local
