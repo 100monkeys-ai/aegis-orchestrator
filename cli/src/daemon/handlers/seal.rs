@@ -9,6 +9,9 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
 
+use aegis_orchestrator_core::application::execution::ExecutionService;
+use aegis_orchestrator_core::domain::shared_kernel::ExecutionId;
+
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize)]
@@ -44,11 +47,27 @@ pub(crate) async fn attest_seal_handler(
     State(state): State<Arc<AppState>>,
     Json(request): Json<HttpAttestationRequest>,
 ) -> impl IntoResponse {
-    let tenant_id = request
-        .tenant_id
-        .as_deref()
-        .and_then(|s| aegis_orchestrator_core::domain::tenant::TenantId::from_realm_slug(s).ok())
-        .unwrap_or_else(aegis_orchestrator_core::domain::tenant::TenantId::consumer);
+    let tenant_id =
+        if let Some(explicit) = request.tenant_id.as_deref().and_then(|s| {
+            aegis_orchestrator_core::domain::tenant::TenantId::from_realm_slug(s).ok()
+        }) {
+            explicit
+        } else if let Some(exec_id) = request
+            .execution_id
+            .as_deref()
+            .and_then(|s| ExecutionId::from_string(s).ok())
+        {
+            match state
+                .execution_service
+                .get_execution_unscoped(exec_id)
+                .await
+            {
+                Ok(execution) => execution.tenant_id,
+                Err(_) => aegis_orchestrator_core::domain::tenant::TenantId::consumer(),
+            }
+        } else {
+            aegis_orchestrator_core::domain::tenant::TenantId::consumer()
+        };
 
     let internal_req =
         aegis_orchestrator_core::infrastructure::seal::attestation::AttestationRequest {

@@ -40,7 +40,7 @@ pub(crate) async fn cleanup_orphaned_agent_containers(
 
         let execution_status = match container.execution_id.as_deref() {
             Some(raw_execution_id) => match ExecutionId::from_string(raw_execution_id) {
-                Ok(execution_id) => match execution_repo.find_by_id(execution_id).await {
+                Ok(execution_id) => match execution_repo.find_by_id_unscoped(execution_id).await {
                     Ok(Some(execution)) => Some(execution.status),
                     Ok(None) => None,
                     Err(error) => {
