@@ -228,6 +228,7 @@ impl LLMProvider for GeminiAdapter {
                             text: Some(m.content.clone()),
                             function_call: None,
                             function_response: None,
+                            thought: None,
                         });
                     }
                     for tc in m.tool_calls.as_ref().unwrap_or(&Vec::new()) {
@@ -238,6 +239,7 @@ impl LLMProvider for GeminiAdapter {
                                 args: tc.arguments.clone(),
                             }),
                             function_response: None,
+                            thought: None,
                         });
                     }
                     GeminiContent { role, parts }
@@ -258,6 +260,7 @@ impl LLMProvider for GeminiAdapter {
                                     "content": m.content,
                                 }),
                             }),
+                            thought: None,
                         }],
                     }
                 } else {
@@ -267,6 +270,7 @@ impl LLMProvider for GeminiAdapter {
                             text: Some(m.content.clone()),
                             function_call: None,
                             function_response: None,
+                            thought: None,
                         }],
                     }
                 }
@@ -283,6 +287,7 @@ impl LLMProvider for GeminiAdapter {
                         text: Some(system_text),
                         function_call: None,
                         function_response: None,
+                        thought: None,
                     }],
                 })
             },
