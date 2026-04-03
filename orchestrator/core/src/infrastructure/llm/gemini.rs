@@ -344,6 +344,41 @@ impl LLMProvider for GeminiAdapter {
         let gr: GeminiGenerateContentResponse = serde_json::from_slice(&body_bytes)
             .map_err(|e| LLMError::Provider(format!("Failed to parse response: {e}")))?;
 
+        tracing::debug!(
+            candidate_count = gr.candidates.len(),
+            "Gemini raw response candidates"
+        );
+        for (i, c) in gr.candidates.iter().enumerate() {
+            if let Some(ref content) = c.content {
+                let thought_parts = content
+                    .parts
+                    .iter()
+                    .filter(|p| p.thought.unwrap_or(false))
+                    .count();
+                let text_parts = content
+                    .parts
+                    .iter()
+                    .filter(|p| p.text.is_some() && !p.thought.unwrap_or(false))
+                    .count();
+                let all_text: String = content
+                    .parts
+                    .iter()
+                    .filter_map(|p| p.text.as_deref())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                tracing::debug!(
+                    candidate_idx = i,
+                    thought_parts,
+                    text_parts,
+                    part_count = content.parts.len(),
+                    all_text_preview = %&all_text[..all_text.len().min(200)],
+                    "Gemini candidate parts"
+                );
+            } else {
+                tracing::debug!(candidate_idx = i, "Gemini candidate has no content");
+            }
+        }
+
         if gr.candidates.is_empty() {
             return Err(LLMError::Provider(
                 "No response candidates from model".into(),
