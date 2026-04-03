@@ -332,6 +332,10 @@ impl LLMProvider for GeminiAdapter {
             self.model
         );
 
+        let request_body = serde_json::to_string(&request).unwrap_or_default();
+        tracing::debug!(body = %request_body, "Gemini request body");
+        tracing::debug!(url = %url, "Gemini API call");
+
         let response = self
             .client
             .post(&url)
