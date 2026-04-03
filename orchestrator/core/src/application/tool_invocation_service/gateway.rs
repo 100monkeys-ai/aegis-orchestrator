@@ -20,11 +20,12 @@ impl ToolInvocationService {
 
     pub async fn get_available_tools_for_agent(
         &self,
+        tenant_id: &TenantId,
         agent_id: AgentId,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let agent = self
             .agent_lifecycle
-            .get_agent(agent_id)
+            .get_agent_visible(tenant_id, agent_id)
             .await
             .map_err(|e| {
                 SealSessionError::InternalError(format!(
@@ -46,12 +47,13 @@ impl ToolInvocationService {
 
     pub async fn get_available_tools_for_agent_in_context(
         &self,
+        tenant_id: &TenantId,
         agent_id: AgentId,
         security_context_name: &str,
     ) -> Result<Vec<crate::infrastructure::tool_router::ToolMetadata>, SealSessionError> {
         let agent = self
             .agent_lifecycle
-            .get_agent(agent_id)
+            .get_agent_visible(tenant_id, agent_id)
             .await
             .map_err(|e| {
                 SealSessionError::InternalError(format!(

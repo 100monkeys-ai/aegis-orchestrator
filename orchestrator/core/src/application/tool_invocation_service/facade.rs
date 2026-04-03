@@ -173,11 +173,20 @@ impl ToolInvocationService {
         // 3. Get security context from the session.
         let security_context = session.security_context;
 
-        // 4. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
+        // 4. Resolve tenant from the execution record so the agent lookup uses the correct tenant.
+        let tenant_id = self
+            .execution_service
+            .get_execution(execution_id)
+            .await
+            .map(|e| e.tenant_id)
+            .unwrap_or_else(|_| TenantId::system());
+
+        // 5. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
             .dispatch_tool_core(
                 &agent_id,
                 execution_id,
+                &tenant_id,
                 &security_context,
                 tool_name,
                 args,
@@ -240,6 +249,7 @@ impl ToolInvocationService {
         self.dispatch_tool_core(
             agent_id,
             execution_id,
+            &execution.tenant_id,
             &security_context,
             tool_name,
             args,
@@ -263,6 +273,7 @@ impl ToolInvocationService {
         &self,
         agent_id: &AgentId,
         execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &TenantId,
         security_context: &crate::domain::security_context::SecurityContext,
         tool_name: String,
         args: Value,
@@ -334,7 +345,11 @@ impl ToolInvocationService {
         // Agent lookup is optional — Zaru SEAL sessions use synthetic agent IDs
         // that don't correspond to registered agents. Skip the judge pipeline
         // when no agent manifest is available.
-        let agent = self.agent_lifecycle.get_agent(*agent_id).await.ok();
+        let agent = self
+            .agent_lifecycle
+            .get_agent_visible(tenant_id, *agent_id)
+            .await
+            .ok();
 
         if let Some(ref agent) = agent {
             if let Some(exec_spec) = &agent.manifest.spec.execution {
@@ -383,7 +398,7 @@ impl ToolInvocationService {
                                 .and_then(|exec| exec.input.intent)
                                 .unwrap_or_else(|| "No objective available".to_string());
                             let available_tools = self
-                                .get_available_tools_for_agent(*agent_id)
+                                .get_available_tools_for_agent(tenant_id, *agent_id)
                                 .await
                                 .unwrap_or_default()
                                 .into_iter()

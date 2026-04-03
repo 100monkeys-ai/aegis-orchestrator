@@ -2109,7 +2109,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
     );
 
     let tools = service
-        .get_available_tools_for_agent(agent_id)
+        .get_available_tools_for_agent(&crate::domain::tenant::TenantId::system(), agent_id)
         .await
         .unwrap();
 

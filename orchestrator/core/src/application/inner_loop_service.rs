@@ -278,9 +278,14 @@ impl InnerLoopService {
                 anyhow::bail!("Inner loop exceeded max iterations ({MAX_INNER_LOOP_ITERATIONS})");
             }
 
+            let effective_tenant = ctx.tenant_id.clone().unwrap_or_else(TenantId::system);
             let available_tools = self
                 .tool_invocation_service
-                .get_available_tools_for_agent_in_context(ctx.agent_id, &ctx.security_context_name)
+                .get_available_tools_for_agent_in_context(
+                    &effective_tenant,
+                    ctx.agent_id,
+                    &ctx.security_context_name,
+                )
                 .await
                 .unwrap_or_default();
 
