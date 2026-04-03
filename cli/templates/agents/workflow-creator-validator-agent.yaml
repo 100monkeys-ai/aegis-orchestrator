@@ -47,6 +47,14 @@ spec:
            Writing outside /workspace is not permitted and will cause runtime failure.
            When authoring or referencing agents that produce file artifacts, verify their
            volume and filesystem.write configuration uses /workspace/* paths.
+         - If the workflow accepts named or structured inputs from callers, declare
+           `metadata.input_schema` as a JSON Schema `object` describing those inputs.
+           Use `type: object`, `properties` (with `type` and `description` per field),
+           and `required` for mandatory fields. Input fields declared here are accessible
+           in state templates as `{{input.FIELD_NAME}}`. Omit `metadata.input_schema`
+           entirely when the workflow only accepts a free-form string with no named fields.
+           When a planner output includes `workflow_inputs`, use it directly as the basis
+           for `metadata.input_schema`.
       4. Call `aegis.schema.validate` with {"kind": "workflow", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding. Treat this as a shape check only.

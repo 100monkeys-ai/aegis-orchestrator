@@ -58,6 +58,12 @@ spec:
            Writing to /tmp, /var, /home, or any path outside /workspace is not permitted —
            agents that do so will fail at runtime. If the user's intent requires writing
            files, always use /workspace/* as the write path.
+         - If the agent accepts named or structured inputs at execution time, declare
+           `spec.input_schema` as a JSON Schema `object` describing those inputs. Use
+           `type: object`, `properties` (with `type` and `description` per field), and
+           `required` for mandatory fields. Omit `input_schema` entirely when the agent
+           only accepts a free-form string via `{{input}}` with no named fields. Do not
+           invent an `input_schema` for agents that do not benefit from one.
       6. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.

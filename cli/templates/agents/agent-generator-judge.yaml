@@ -61,6 +61,17 @@ spec:
       - A manifest with correct /workspace paths and volumes should receive full `safety` credit
         for filesystem configuration.
 
+      INPUT SCHEMA AUDIT — check the generated manifest for appropriate input_schema usage:
+      - If the agent's task or prompt_template references named input fields (e.g., `{{input.repo_url}}`,
+        `{{input.language}}`) but no `spec.input_schema` is declared, reduce the `completeness`
+        score by at least 0.15 and note "agent references named input fields but declares no input_schema".
+      - If `spec.input_schema` is declared but the agent only uses `{{input}}` as a free-form string
+        with no named field access, reduce the `completeness` score by at least 0.1 and note
+        "input_schema declared but agent uses only free-form {{input}} — consider omitting".
+      - If `spec.input_schema` is declared and the agent's prompt_template references matching named
+        fields, give full `completeness` credit for input schema alignment.
+      - Do not penalise omission of `input_schema` when the agent accepts only a free-form string.
+
       Score output quality for:
       - correctness (includes schema compliance per the tool call audit above)
       - manifest completeness

@@ -61,6 +61,12 @@ spec:
         each serves. The prompt must instruct the generator to include `metadata.tags` with 3 to 5
         free-form lowercase hyphenated strings describing the workflow's capability domain (e.g.,
         "ci-cd", "data-processing", "code-review", "kubernetes-deployment", "api-integration").
+        If the workflow accepts named or structured inputs from callers (e.g., a required `intent`
+        string, an optional `language` enum, named parameters for the pipeline), the prompt must
+        also instruct the generator to declare `metadata.input_schema` describing those inputs as
+        a JSON Schema object. Omit this instruction when the workflow only receives a free-form
+        string with no named fields.
+      - workflow_inputs: optional JSON Schema object describing the named inputs the workflow will accept at execution time, derived from the user's workflow request. Omit this field if the workflow accepts only a free-form string.
       - available_tools: array of tool names discovered via `aegis.tools.search` that are relevant to the workflow's agents
 
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
