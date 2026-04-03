@@ -235,7 +235,7 @@ impl ConfigWizard {
             }
         };
 
-        let mut advanced = self.collect_advanced_config(components)?;
+        let advanced = self.collect_advanced_config(components)?;
 
         let node_config = NodeConfig {
             node_name,
@@ -1515,8 +1515,6 @@ mod tests {
                 docker_network: "aegis-network".to_string(),
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
-                keycloak_admin_password: "admin".to_string(),
-                openbao_secret_id: "test-secret-id".to_string(),
                 database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
                 temporal_worker_secret: "dev-temporal-secret".to_string(),
                 keep_container: false,
@@ -1560,8 +1558,6 @@ mod tests {
         let components = SelectedComponents {
             temporal: false,
             storage: false,
-            iam: false,
-            secrets: false,
             seal_gateway: false,
             ollama_llm: false,
             observability: false,
@@ -1594,8 +1590,6 @@ mod tests {
                 docker_network: "aegis-network".to_string(),
                 orchestrator_url: "http://aegis-runtime:8088".to_string(),
                 nfs_host: "127.0.0.1".to_string(),
-                keycloak_admin_password: "admin".to_string(),
-                openbao_secret_id: "test-secret-id".to_string(),
                 database_url: "postgresql://aegis:aegis@postgres:5432/aegis".to_string(),
                 temporal_worker_secret: "dev-temporal-secret".to_string(),
                 keep_container: false,
@@ -1637,8 +1631,6 @@ mod tests {
         let components = SelectedComponents {
             temporal: false,
             storage: false,
-            iam: false,
-            secrets: false,
             seal_gateway: false,
             ollama_llm: false,
             observability: false,
