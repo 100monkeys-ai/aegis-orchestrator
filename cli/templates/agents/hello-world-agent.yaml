@@ -87,3 +87,12 @@ spec:
     - "fs.delete"           # Delete files
     - "fs.edit"             # Edit files
     - "fs.multi_edit"       # Edit multiple items in file
+
+  input_schema:
+    type: object
+    properties:
+      name:
+        type: string
+        description: Name to greet
+    required:
+      - name

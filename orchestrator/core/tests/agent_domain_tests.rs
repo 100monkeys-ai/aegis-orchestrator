@@ -58,6 +58,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
             env: HashMap::new(),
             volumes: vec![],
             advanced: None,
+            input_schema: None,
         },
     }
 }

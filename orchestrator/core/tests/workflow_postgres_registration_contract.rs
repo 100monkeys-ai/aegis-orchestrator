@@ -119,6 +119,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),

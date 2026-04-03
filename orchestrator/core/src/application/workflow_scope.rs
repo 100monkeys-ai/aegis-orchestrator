@@ -255,6 +255,7 @@ mod tests {
             tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
+            input_schema: None,
         };
 
         let start_name = StateName::new("START").expect("valid state name");
