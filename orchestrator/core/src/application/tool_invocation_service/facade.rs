@@ -218,15 +218,20 @@ impl ToolInvocationService {
         args: Value,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         // 1. Load the execution to obtain its security_context_name (ADR-083).
-        let execution = self
-            .execution_service
-            .get_execution(execution_id)
-            .await
-            .map_err(|e| {
-                SealSessionError::MalformedPayload(format!(
-                    "Failed to load execution {execution_id}: {e}"
-                ))
-            })?;
+        // Workflow step executions are saved under the aegis-system tenant, so fall
+        // back to a system-tenant lookup when the default tenant lookup misses.
+        let execution = match self.execution_service.get_execution(execution_id).await {
+            Ok(exec) => exec,
+            Err(_) => self
+                .execution_service
+                .get_execution_for_tenant(&crate::domain::tenant::TenantId::system(), execution_id)
+                .await
+                .map_err(|e| {
+                    SealSessionError::MalformedPayload(format!(
+                        "Failed to load execution {execution_id}: {e}"
+                    ))
+                })?,
+        };
 
         let security_context = self
             .security_context_repo
