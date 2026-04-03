@@ -450,6 +450,16 @@ fn compute_best_of_n(
 
 // ── SemanticAgentValidator ────────────────────────────────────────────────────
 
+/// Configuration for [`SemanticAgentValidator`].
+pub struct SemanticAgentValidatorConfig {
+    pub judge_agent_name: String,
+    pub criteria: String,
+    pub timeout_seconds: u64,
+    pub poll_interval_ms: u64,
+    pub parent_execution_id: ExecutionId,
+    pub tenant_id: TenantId,
+}
+
 /// Gradient validator that runs a **judge agent** as a child execution (ADR-016) to
 /// semantically evaluate iteration output (ADR-017).
 ///
@@ -469,24 +479,19 @@ pub struct SemanticAgentValidator {
 
 impl SemanticAgentValidator {
     pub fn new(
-        judge_agent_name: String,
-        criteria: String,
-        timeout_seconds: u64,
-        poll_interval_ms: u64,
+        config: SemanticAgentValidatorConfig,
         agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
-        parent_execution_id: ExecutionId,
-        tenant_id: TenantId,
     ) -> Self {
         Self {
-            judge_agent_name,
-            criteria,
-            timeout_seconds,
-            poll_interval_ms,
+            judge_agent_name: config.judge_agent_name,
+            criteria: config.criteria,
+            timeout_seconds: config.timeout_seconds,
+            poll_interval_ms: config.poll_interval_ms,
             agent_lifecycle_service,
             execution_service,
-            parent_execution_id,
-            tenant_id,
+            parent_execution_id: config.parent_execution_id,
+            tenant_id: config.tenant_id,
         }
     }
 }
@@ -591,6 +596,18 @@ impl GradientValidator for SemanticAgentValidator {
 
 // ── MultiJudgeAgentValidator ──────────────────────────────────────────────────
 
+/// Configuration for [`MultiJudgeAgentValidator`].
+pub struct MultiJudgeAgentValidatorConfig {
+    pub judges: Vec<String>,
+    pub consensus_config: ConsensusConfig,
+    pub min_judges_required: usize,
+    pub criteria: String,
+    pub timeout_seconds: u64,
+    pub poll_interval_ms: u64,
+    pub parent_execution_id: ExecutionId,
+    pub tenant_id: TenantId,
+}
+
 /// Gradient validator that runs **multiple judge agents** as parallel child executions
 /// (ADR-016) and aggregates their [`GradientResult`]s via a [`ConsensusConfig`] (ADR-017).
 ///
@@ -612,32 +629,24 @@ pub struct MultiJudgeAgentValidator {
 }
 
 impl MultiJudgeAgentValidator {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        judges: Vec<String>,
-        consensus_config: ConsensusConfig,
-        min_judges_required: usize,
-        criteria: String,
-        timeout_seconds: u64,
-        poll_interval_ms: u64,
+        config: MultiJudgeAgentValidatorConfig,
         agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
         execution_service: Arc<dyn ExecutionService>,
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
-        parent_execution_id: ExecutionId,
-        tenant_id: TenantId,
     ) -> Self {
         Self {
-            judges,
-            consensus_config,
-            min_judges_required,
-            criteria,
-            timeout_seconds,
-            poll_interval_ms,
+            judges: config.judges,
+            consensus_config: config.consensus_config,
+            min_judges_required: config.min_judges_required,
+            criteria: config.criteria,
+            timeout_seconds: config.timeout_seconds,
+            poll_interval_ms: config.poll_interval_ms,
             agent_lifecycle_service,
             execution_service,
             event_bus,
-            parent_execution_id,
-            tenant_id,
+            parent_execution_id: config.parent_execution_id,
+            tenant_id: config.tenant_id,
         }
     }
 }
@@ -856,14 +865,16 @@ pub fn build_validation_pipeline(
                 entries.push(ValidatorEntry {
                     kind: ValidatorKind::Semantic,
                     validator: Box::new(SemanticAgentValidator::new(
-                        judge_agent.clone(),
-                        criteria.clone(),
-                        *timeout_seconds,
-                        500, // 500 ms poll interval
+                        SemanticAgentValidatorConfig {
+                            judge_agent_name: judge_agent.clone(),
+                            criteria: criteria.clone(),
+                            timeout_seconds: *timeout_seconds,
+                            poll_interval_ms: 500,
+                            parent_execution_id,
+                            tenant_id: tenant_id.clone(),
+                        },
                         agent_lifecycle_service.clone(),
                         execution_service.clone(),
-                        parent_execution_id,
-                        tenant_id.clone(),
                     )),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
@@ -889,17 +900,19 @@ pub fn build_validation_pipeline(
                 entries.push(ValidatorEntry {
                     kind: ValidatorKind::MultiJudge,
                     validator: Box::new(MultiJudgeAgentValidator::new(
-                        judges.clone(),
-                        consensus_config,
-                        *min_judges_required,
-                        criteria.clone(),
-                        *timeout_seconds,
-                        500, // 500 ms poll interval
+                        MultiJudgeAgentValidatorConfig {
+                            judges: judges.clone(),
+                            consensus_config,
+                            min_judges_required: *min_judges_required,
+                            criteria: criteria.clone(),
+                            timeout_seconds: *timeout_seconds,
+                            poll_interval_ms: 500,
+                            parent_execution_id,
+                            tenant_id: tenant_id.clone(),
+                        },
                         agent_lifecycle_service.clone(),
                         execution_service.clone(),
                         event_bus.clone(),
-                        parent_execution_id,
-                        tenant_id.clone(),
                     )),
                     min_score: *min_score,
                     min_confidence: *min_confidence,
