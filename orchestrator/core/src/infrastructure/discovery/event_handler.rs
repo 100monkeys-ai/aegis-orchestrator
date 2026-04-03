@@ -153,6 +153,11 @@ impl DiscoveryIndexEventHandler {
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
             tags: manifest.metadata.tags.clone(),
+            input_schema: manifest
+                .spec
+                .input_schema
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok()),
         };
 
         if let Err(e) = self.index_agent_with_retry(req).await {
@@ -265,6 +270,11 @@ impl DiscoveryIndexEventHandler {
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
             tags: workflow.metadata.tags.clone(),
+            input_schema: workflow
+                .metadata
+                .input_schema
+                .as_ref()
+                .and_then(|v| serde_json::to_string(v).ok()),
         };
 
         if let Err(e) = self.index_workflow_with_retry(req).await {

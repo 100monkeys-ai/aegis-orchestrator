@@ -90,6 +90,7 @@ impl ToolInvocationService {
                     "tenant_id": r.tenant_id,
                     "is_platform_template": r.is_platform_template,
                     "updated_at": r.updated_at.to_rfc3339(),
+                    "input_schema": r.input_schema.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                 })
             })
             .collect();
@@ -180,6 +181,7 @@ impl ToolInvocationService {
                     "tenant_id": r.tenant_id,
                     "is_platform_template": r.is_platform_template,
                     "updated_at": r.updated_at.to_rfc3339(),
+                    "input_schema": r.input_schema.as_ref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
                 })
             })
             .collect();
