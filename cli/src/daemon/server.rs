@@ -1045,7 +1045,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         dyn aegis_orchestrator_core::application::ports::SealGatewayClient,
     > = {
         let gateway_url = std::env::var("AEGIS_SEAL_GATEWAY_URL")
-            .unwrap_or_else(|_| "http://localhost:8443".to_string());
+            .unwrap_or_else(|_| "http://localhost:8089".to_string());
         let operator_token = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN").ok();
         Arc::new(
             aegis_orchestrator_core::infrastructure::seal::gateway_client::HttpSealGatewayClient::new(

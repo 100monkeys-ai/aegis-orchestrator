@@ -204,45 +204,102 @@ impl DiscoveryIndexEventHandler {
     // Workflow handlers
     // ──────────────────────────────────────────────────────────────────────
 
-    async fn handle_workflow_upsert(&self, workflow_id: &WorkflowId, name: &str, version: &str) {
-        // Look up full workflow from repo to get description, states, agents, labels
-        let workflow = match self
+    /// Search for a workflow by name+version and then by ID across both the
+    /// consumer tenant and the system tenant. Built-in workflows are registered
+    /// under `TenantId::system()`, so a single-tenant lookup always misses them.
+    /// Errors at each step are logged and treated as not-found so that subsequent
+    /// fallbacks are always attempted.
+    async fn find_workflow_across_tenants(
+        &self,
+        workflow_id: &WorkflowId,
+        name: &str,
+        version: &str,
+    ) -> Option<crate::domain::workflow::Workflow> {
+        // 1. name+version under local_default
+        match self
             .workflow_repo
             .find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
             .await
         {
-            Ok(Some(w)) => w,
-            Ok(None) => {
-                // Fallback: try by ID
-                match self
-                    .workflow_repo
-                    .find_by_id_for_tenant(&TenantId::local_default(), *workflow_id)
-                    .await
-                {
-                    Ok(Some(w)) => w,
-                    Ok(None) => {
-                        tracing::warn!(
-                            workflow_id = %workflow_id,
-                            name = name,
-                            "Workflow not found for index upsert, skipping"
-                        );
-                        return;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            workflow_id = %workflow_id,
-                            error = %e,
-                            "Failed to look up workflow by ID for index upsert"
-                        );
-                        return;
-                    }
-                }
-            }
+            Ok(Some(w)) => return Some(w),
+            Ok(None) => {}
             Err(e) => {
                 tracing::warn!(
                     workflow_id = %workflow_id,
                     error = %e,
-                    "Failed to look up workflow for index upsert"
+                    "Failed to look up workflow by name/version for local_default tenant"
+                );
+            }
+        }
+
+        // 2. name+version under system
+        match self
+            .workflow_repo
+            .find_by_name_and_version_for_tenant(&TenantId::system(), name, version)
+            .await
+        {
+            Ok(Some(w)) => return Some(w),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "Failed to look up workflow by name/version for system tenant"
+                );
+            }
+        }
+
+        // 3. ID under local_default
+        match self
+            .workflow_repo
+            .find_by_id_for_tenant(&TenantId::local_default(), *workflow_id)
+            .await
+        {
+            Ok(Some(w)) => return Some(w),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "Failed to look up workflow by ID for local_default tenant"
+                );
+            }
+        }
+
+        // 4. ID under system
+        match self
+            .workflow_repo
+            .find_by_id_for_tenant(&TenantId::system(), *workflow_id)
+            .await
+        {
+            Ok(Some(w)) => return Some(w),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "Failed to look up workflow by ID for system tenant"
+                );
+            }
+        }
+
+        None
+    }
+
+    async fn handle_workflow_upsert(&self, workflow_id: &WorkflowId, name: &str, version: &str) {
+        // Look up full workflow from repo to get description, states, agents, labels.
+        // Searches across both the consumer and system tenants so that built-in
+        // workflows (registered under TenantId::system()) are not silently skipped.
+        let workflow = match self
+            .find_workflow_across_tenants(workflow_id, name, version)
+            .await
+        {
+            Some(w) => w,
+            None => {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    name = name,
+                    "Workflow not found for index upsert, skipping"
                 );
                 return;
             }
