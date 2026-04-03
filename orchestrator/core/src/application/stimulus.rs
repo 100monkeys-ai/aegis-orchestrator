@@ -661,6 +661,14 @@ mod tests {
                 .ok_or_else(|| anyhow::anyhow!("execution not configured"))
         }
 
+        async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
+            self.execution
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("execution not configured"))
+        }
+
         async fn get_iterations(
             &self,
             _exec_id: ExecutionId,

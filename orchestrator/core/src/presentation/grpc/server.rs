@@ -1376,6 +1376,12 @@ mod tests {
             Err(anyhow!("get_execution not used in grpc server tests"))
         }
 
+        async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
+            Err(anyhow!(
+                "get_execution_unscoped not used in grpc server tests"
+            ))
+        }
+
         async fn get_execution_for_tenant(
             &self,
             tenant_id: &TenantId,

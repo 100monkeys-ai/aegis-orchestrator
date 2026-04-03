@@ -147,6 +147,13 @@ pub trait ExecutionService: Send + Sync {
         self.get_execution(id).await
     }
 
+    /// Retrieve an execution by ID without a tenant filter.
+    ///
+    /// Internal service-to-service use only. The caller holds a trusted orchestrator-
+    /// provisioned ExecutionId and must use the returned execution's `tenant_id` field
+    /// for all downstream tenant-scoped operations.
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution>;
+
     /// Return all [`Iteration`]s for a given execution in order.
     ///
     /// # Errors
@@ -2302,6 +2309,13 @@ impl ExecutionService for StandardExecutionService {
         id: ExecutionId,
     ) -> Result<Execution> {
         StandardExecutionService::get_execution_for_tenant(self, tenant_id, id).await
+    }
+
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+        self.repository
+            .find_by_id_unscoped(id)
+            .await?
+            .ok_or_else(|| anyhow!("Execution not found"))
     }
 
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {

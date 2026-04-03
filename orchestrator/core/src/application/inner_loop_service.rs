@@ -76,7 +76,7 @@ struct ExecutionContext {
     /// Real user identity for per-user rate limiting (ADR-072 Step 2).
     user_identity: Option<UserIdentity>,
     /// Tenant identity for scoped rate limiting (ADR-072 Step 2).
-    tenant_id: Option<TenantId>,
+    tenant_id: TenantId,
     /// Security context name bound to this execution, used to scope available tools.
     security_context_name: String,
 }
@@ -132,7 +132,7 @@ impl InnerLoopService {
         &self,
         message: AgentMessage,
         user_identity: Option<UserIdentity>,
-        tenant_id: Option<TenantId>,
+        tenant_id_hint: Option<TenantId>,
     ) -> anyhow::Result<OrchestratorMessage> {
         match message {
             AgentMessage::Generate {
@@ -174,13 +174,21 @@ impl InnerLoopService {
                 }
 
                 let execution_id_uuid = uuid::Uuid::parse_str(&execution_id)?;
+                // Load the execution record to extract both security_context_name and
+                // the canonical tenant_id stored on the record. The hint from the caller
+                // is used as a fallback when the unscoped lookup is unavailable (e.g.
+                // in-memory test doubles), but the record's own tenant_id is authoritative.
                 let exec_record = self
                     .execution_service
-                    .get_execution(ExecutionId(execution_id_uuid))
+                    .get_execution_unscoped(ExecutionId(execution_id_uuid))
                     .await;
-                let security_context_name = exec_record
-                    .map(|e| e.security_context_name.clone())
-                    .unwrap_or_else(|_| "agent-runtime".to_string());
+                let (security_context_name, tenant_id) = match exec_record {
+                    Ok(ref e) => (e.security_context_name.clone(), e.tenant_id.clone()),
+                    Err(_) => (
+                        "agent-runtime".to_string(),
+                        tenant_id_hint.unwrap_or_else(TenantId::system),
+                    ),
+                };
 
                 self.active_executions.write().await.insert(
                     execution_id.clone(),
@@ -194,7 +202,7 @@ impl InnerLoopService {
                         pending_tool_call_id: None,
                         trajectory: Vec::new(),
                         user_identity: user_identity.clone(),
-                        tenant_id: tenant_id.clone(),
+                        tenant_id,
                         security_context_name,
                     },
                 );
@@ -278,11 +286,10 @@ impl InnerLoopService {
                 anyhow::bail!("Inner loop exceeded max iterations ({MAX_INNER_LOOP_ITERATIONS})");
             }
 
-            let effective_tenant = ctx.tenant_id.clone().unwrap_or_else(TenantId::system);
             let available_tools = self
                 .tool_invocation_service
                 .get_available_tools_for_agent_in_context(
-                    &effective_tenant,
+                    &ctx.tenant_id,
                     ctx.agent_id,
                     &ctx.security_context_name,
                 )
@@ -309,7 +316,7 @@ impl InnerLoopService {
                     &ctx.conversation,
                     &tool_schemas,
                     ctx.user_identity.as_ref(),
-                    ctx.tenant_id.as_ref(),
+                    Some(&ctx.tenant_id),
                 )
                 .await?;
 

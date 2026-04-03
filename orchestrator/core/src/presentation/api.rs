@@ -2652,6 +2652,13 @@ mod tests {
             Err(anyhow!("not used in presentation api tests"))
         }
 
+        async fn get_execution_unscoped(
+            &self,
+            _id: crate::domain::execution::ExecutionId,
+        ) -> Result<crate::domain::execution::Execution> {
+            Err(anyhow!("not used in presentation api tests"))
+        }
+
         async fn get_iterations(
             &self,
             _exec_id: crate::domain::execution::ExecutionId,

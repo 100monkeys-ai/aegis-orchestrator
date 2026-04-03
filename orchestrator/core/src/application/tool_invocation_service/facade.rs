@@ -174,9 +174,11 @@ impl ToolInvocationService {
         let security_context = session.security_context;
 
         // 4. Resolve tenant from the execution record so the agent lookup uses the correct tenant.
+        // Use the unscoped lookup — the SEAL session was already authenticated and the execution_id
+        // is trusted. The record's own tenant_id drives all downstream operations.
         let tenant_id = self
             .execution_service
-            .get_execution(execution_id)
+            .get_execution_unscoped(execution_id)
             .await
             .map(|e| e.tenant_id)
             .unwrap_or_else(|_| TenantId::system());
@@ -217,21 +219,19 @@ impl ToolInvocationService {
         tool_name: String,
         args: Value,
     ) -> Result<ToolInvocationResult, SealSessionError> {
-        // 1. Load the execution to obtain its security_context_name (ADR-083).
-        // Workflow step executions are saved under the aegis-system tenant, so fall
-        // back to a system-tenant lookup when the default tenant lookup misses.
-        let execution = match self.execution_service.get_execution(execution_id).await {
-            Ok(exec) => exec,
-            Err(_) => self
-                .execution_service
-                .get_execution_for_tenant(&crate::domain::tenant::TenantId::system(), execution_id)
-                .await
-                .map_err(|e| {
-                    SealSessionError::MalformedPayload(format!(
-                        "Failed to load execution {execution_id}: {e}"
-                    ))
-                })?,
-        };
+        // 1. Load the execution to obtain its security_context_name and tenant_id (ADR-083).
+        // Use the unscoped lookup — the caller holds a trusted orchestrator-provisioned
+        // ExecutionId, so tenant filtering is unnecessary here. The execution record's
+        // own tenant_id drives all downstream tenant-scoped operations.
+        let execution = self
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+            .map_err(|e| {
+                SealSessionError::MalformedPayload(format!(
+                    "Failed to load execution {execution_id}: {e}"
+                ))
+            })?;
 
         let security_context = self
             .security_context_repo

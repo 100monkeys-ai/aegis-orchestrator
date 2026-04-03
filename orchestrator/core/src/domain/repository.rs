@@ -280,6 +280,17 @@ pub trait ExecutionRepository: Send + Sync {
         self.count_by_agent_for_tenant(&TenantId::local_default(), agent_id)
             .await
     }
+
+    /// Look up an execution by ID without a tenant filter.
+    ///
+    /// This is an internal service-to-service method. It intentionally bypasses tenant
+    /// isolation because the caller already holds a trusted `ExecutionId` (orchestrator-
+    /// provisioned, not user-supplied). The returned execution carries its own `tenant_id`
+    /// field which the caller MUST use for all downstream tenant-scoped operations.
+    async fn find_by_id_unscoped(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Option<Execution>, RepositoryError>;
 }
 
 /// Repository interface for Workflow aggregates

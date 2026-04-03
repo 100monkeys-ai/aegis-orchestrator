@@ -582,6 +582,22 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .unwrap_or(0);
         Ok(count)
     }
+
+    /// Look up an execution by ID across all tenants.
+    ///
+    /// Internal service-to-service use only. Returns the first execution matching
+    /// the given ID regardless of which tenant bucket it lives in.
+    async fn find_by_id_unscoped(
+        &self,
+        id: ExecutionId,
+    ) -> Result<Option<Execution>, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        Ok(executions
+            .values()
+            .flat_map(|tenant_execs| tenant_execs.get(&id))
+            .next()
+            .cloned())
+    }
 }
 
 #[derive(Clone)]

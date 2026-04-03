@@ -15,8 +15,16 @@ impl ToolInvocationService {
                 )
             })?;
 
-        let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let mut input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
         let version = args.get("version").and_then(|v| v.as_str());
+
+        // Resolve and inject the caller's tenant_id into the payload so that
+        // start_execution (and any cluster forwarding) picks up the correct tenant.
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+        if let Some(map) = input.as_object_mut() {
+            map.entry("tenant_id")
+                .or_insert_with(|| serde_json::Value::String(tenant_id.to_string()));
+        }
 
         let agent_id = if let Ok(uuid) = uuid::Uuid::parse_str(agent_ref) {
             if version.is_some() {
@@ -101,7 +109,7 @@ impl ToolInvocationService {
                 |e| SealSessionError::SignatureVerificationFailed(format!("Invalid UUID: {e}")),
             )?);
 
-        match self.execution_service.get_execution(exec_id).await {
+        match self.execution_service.get_execution_unscoped(exec_id).await {
             Ok(exec) => {
                 let last_iter = exec.iterations().last();
                 Ok(ToolInvocationResult::Direct(serde_json::json!({
@@ -157,7 +165,7 @@ impl ToolInvocationService {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
 
         loop {
-            match self.execution_service.get_execution(exec_id).await {
+            match self.execution_service.get_execution_unscoped(exec_id).await {
                 Ok(exec) => {
                     let status_str = format!("{:?}", exec.status).to_lowercase();
                     let is_terminal = matches!(
@@ -238,7 +246,7 @@ impl ToolInvocationService {
             .map(|n| n as usize)
             .unwrap_or(0);
 
-        let execution = match self.execution_service.get_execution(exec_id).await {
+        let execution = match self.execution_service.get_execution_unscoped(exec_id).await {
             Ok(execution) => execution,
             Err(error) => {
                 return Ok(ToolInvocationResult::Direct(serde_json::json!({

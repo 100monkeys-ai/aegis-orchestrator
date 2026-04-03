@@ -167,7 +167,16 @@ impl ExecutionService for ClusterAwareExecutionService {
             // Pre-generate an execution ID so it's consistent across routing
             // and potential local fallback.
             let execution_id = ExecutionId::new();
-            let tenant_id = TenantId::default();
+            let tenant_id = input
+                .payload
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| input.payload.get("tenant").and_then(|v| v.as_str()))
+                .and_then(|s| TenantId::from_string(s).ok())
+                .unwrap_or_else(|| {
+                    TenantId::from_string(crate::domain::tenant::CONSUMER_SLUG)
+                        .expect("CONSUMER_SLUG is a valid tenant identifier")
+                });
 
             match self
                 .try_forward(
@@ -215,7 +224,16 @@ impl ExecutionService for ClusterAwareExecutionService {
         identity: Option<&UserIdentity>,
     ) -> Result<ExecutionId> {
         if self.should_route() {
-            let tenant_id = TenantId::default();
+            let tenant_id = input
+                .payload
+                .get("tenant_id")
+                .and_then(|v| v.as_str())
+                .or_else(|| input.payload.get("tenant").and_then(|v| v.as_str()))
+                .and_then(|s| TenantId::from_string(s).ok())
+                .unwrap_or_else(|| {
+                    TenantId::from_string(crate::domain::tenant::CONSUMER_SLUG)
+                        .expect("CONSUMER_SLUG is a valid tenant identifier")
+                });
 
             match self
                 .try_forward(
@@ -272,6 +290,10 @@ impl ExecutionService for ClusterAwareExecutionService {
         id: ExecutionId,
     ) -> Result<Execution> {
         self.inner.get_execution_for_tenant(tenant_id, id).await
+    }
+
+    async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+        self.inner.get_execution_unscoped(id).await
     }
 
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {

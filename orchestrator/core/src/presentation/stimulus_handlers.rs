@@ -259,6 +259,10 @@ mod tests {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }
 
+        async fn get_execution_unscoped(&self, _id: ExecutionId) -> Result<Execution> {
+            anyhow::bail!("execution service should not be used by stimulus handler tests")
+        }
+
         async fn get_iterations(&self, _exec_id: ExecutionId) -> Result<Vec<Iteration>> {
             anyhow::bail!("execution service should not be used by stimulus handler tests")
         }
