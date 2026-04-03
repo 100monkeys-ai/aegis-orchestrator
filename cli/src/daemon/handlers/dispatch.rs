@@ -43,7 +43,11 @@ pub(crate) async fn dispatch_gateway_handler(
     // Resolve agent_id for event logging and inner loop request
     let agent_id = if let Some(exec_id) = exec_id_opt {
         let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
-        if let Ok(exec) = state.execution_service.get_execution(execution_id).await {
+        if let Ok(exec) = state
+            .execution_service
+            .get_execution_unscoped(execution_id)
+            .await
+        {
             exec.agent_id
         } else {
             tracing::warn!("Could not find execution {} for LLM event", exec_id);
