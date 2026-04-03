@@ -534,6 +534,21 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(())
     }
 
+    async fn find_by_id_visible(
+        &self,
+        tenant_id: &TenantId,
+        id: AgentId,
+    ) -> Result<Option<Agent>, RepositoryError> {
+        if let Some(agent) = self.find_by_id_for_tenant(tenant_id, id).await? {
+            return Ok(Some(agent));
+        }
+        let system_tenant = TenantId::system();
+        if tenant_id.as_str() != "aegis-system" {
+            return self.find_by_id_for_tenant(&system_tenant, id).await;
+        }
+        Ok(None)
+    }
+
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,

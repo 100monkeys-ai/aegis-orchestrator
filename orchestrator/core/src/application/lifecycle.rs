@@ -111,6 +111,14 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .ok_or_else(|| anyhow::anyhow!("Agent not found"))
     }
 
+    async fn get_agent_visible(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent> {
+        self.repository
+            .find_by_id_visible(tenant_id, id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("Agent not found"))
+    }
+
     async fn update_agent_for_tenant(
         &self,
         tenant_id: &TenantId,
