@@ -4,8 +4,3 @@
 pub fn aegis_key() -> Option<String> {
     std::env::var("AEGIS_KEY").ok().filter(|v| !v.is_empty())
 }
-
-/// Returns the value of AEGIS_ENV env var if set and non-empty.
-pub fn aegis_env() -> Option<String> {
-    std::env::var("AEGIS_ENV").ok().filter(|v| !v.is_empty())
-}
