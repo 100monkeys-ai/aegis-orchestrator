@@ -190,7 +190,14 @@ fn default_security_context_name() -> String {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionInput {
+    /// Optional free-text override used by the natural-language dispatch path.
+    /// Steers the LLM prompt directly. Complementary to `payload`, not an
+    /// alternative — when an agent declares `input_schema`, callers pass typed
+    /// data via `payload`; `intent` may be omitted or used alongside it.
     pub intent: Option<String>,
+    /// Typed input data for the agent, validated against the agent's
+    /// `input_schema` when one is declared. Supplies structured data to the
+    /// prompt template context and to tool calls that inspect the raw payload.
     pub payload: serde_json::Value,
 }
 

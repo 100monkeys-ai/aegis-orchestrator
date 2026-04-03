@@ -1433,62 +1433,72 @@ impl StandardExecutionService {
         }
     }
 
-    /// Prepare execution input by rendering prompt template
+    /// Prepare execution input by rendering the agent's prompt template.
     ///
-    /// ARCHITECTURAL PRINCIPLE: Always renders the agent's prompt_template to ensure
-    /// agents are deterministic black boxes. External callers provide data via payload,
-    /// but the agent controls how that data is formatted into an LLM prompt.
+    /// Three cases per ADR-092 §D7:
     ///
-    /// Any pre-existing intent value is ignored to enforce this boundary.
+    /// - **Only `payload`**: render prompt template with `{{input}}` substituted
+    ///   from payload; store result in `intent`.
+    /// - **Only `intent`**: use the caller's free-text directly; skip template
+    ///   rendering (no structured data to inject).
+    /// - **Both `intent` and `payload`**: render prompt template from payload,
+    ///   then prepend the caller's `intent` to the rendered result.
     fn prepare_execution_input(
         &self,
         mut input: ExecutionInput,
         agent: &crate::domain::agent::Agent,
     ) -> Result<ExecutionInput> {
-        const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}\n\nUser: {{input}}\nAgent:";
-
-        // Get task spec with prompt template
-        let task_spec = agent
-            .manifest
-            .spec
-            .task
-            .as_ref()
-            .ok_or(ExecutionError::MissingPromptTemplate)?;
-
-        let prompt_template = task_spec
-            .prompt_template
-            .as_deref()
-            .unwrap_or(DEFAULT_PROMPT_TEMPLATE);
-
-        // Get agent instruction
-        let agent_instruction = task_spec
-            .instruction
-            .as_ref()
-            .or(agent.manifest.metadata.description.as_ref())
-            .map(|s| s.as_str())
-            .unwrap_or("");
-
-        // Extract user input from payload
-        let user_input = Self::extract_user_input(&input.payload)?;
-
         let context_overrides = Self::extract_context_overrides(&input.payload)?;
 
-        // Build prompt context
-        let mut context = PromptContext::new()
-            .instruction(agent_instruction)
-            .input(user_input)
-            .iteration_number(1);
+        // Attempt to extract structured user input from payload.
+        let user_input_result = Self::extract_user_input(&input.payload);
+        let has_payload = user_input_result.is_ok();
 
-        context.extras = context_overrides.clone().into_iter().collect();
+        if has_payload {
+            const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}\n\nUser: {{input}}\nAgent:";
 
-        // Render template
-        let template_engine = PromptTemplateEngine::new();
-        let rendered_prompt = template_engine
-            .render(prompt_template, &context)
-            .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
+            let task_spec = agent
+                .manifest
+                .spec
+                .task
+                .as_ref()
+                .ok_or(ExecutionError::MissingPromptTemplate)?;
 
-        // Set the rendered prompt as intent (overwriting any pre-existing value)
-        input.intent = Some(rendered_prompt);
+            let prompt_template = task_spec
+                .prompt_template
+                .as_deref()
+                .unwrap_or(DEFAULT_PROMPT_TEMPLATE);
+
+            let agent_instruction = task_spec
+                .instruction
+                .as_ref()
+                .or(agent.manifest.metadata.description.as_ref())
+                .map(|s| s.as_str())
+                .unwrap_or("");
+
+            let user_input = user_input_result?;
+
+            let mut context = PromptContext::new()
+                .instruction(agent_instruction)
+                .input(user_input)
+                .iteration_number(1);
+
+            context.extras = context_overrides.clone().into_iter().collect();
+
+            let template_engine = PromptTemplateEngine::new();
+            let rendered_prompt = template_engine
+                .render(prompt_template, &context)
+                .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
+
+            // When both intent and payload are provided, prepend intent to the
+            // rendered prompt so the caller's natural-language steer is visible
+            // to the LLM before the structured content.
+            input.intent = Some(match input.intent.take() {
+                Some(caller_intent) => format!("{caller_intent}\n\n{rendered_prompt}"),
+                None => rendered_prompt,
+            });
+        }
+        // else: only intent was supplied — leave it unchanged; no template to render.
 
         if let serde_json::Value::Object(payload) = &mut input.payload {
             payload.insert(
