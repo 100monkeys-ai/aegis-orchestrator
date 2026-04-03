@@ -103,7 +103,8 @@ struct GeminiGenerateContentResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GeminiCandidate {
-    content: GeminiContent,
+    #[serde(default)]
+    content: Option<GeminiContent>,
     #[serde(default)]
     finish_reason: Option<String>,
 }
@@ -350,8 +351,10 @@ impl LLMProvider for GeminiAdapter {
 
         let tool_calls: Vec<ChatToolCall> = candidate
             .content
-            .parts
-            .iter()
+            .as_ref()
+            .map(|c| c.parts.iter())
+            .into_iter()
+            .flatten()
             .filter_map(|p| {
                 p.function_call.as_ref().map(|fc| ChatToolCall {
                     id: uuid::Uuid::new_v4().to_string(),
@@ -367,12 +370,16 @@ impl LLMProvider for GeminiAdapter {
 
         let text = candidate
             .content
-            .parts
-            .iter()
-            .filter(|p| !p.thought.unwrap_or(false))
-            .filter_map(|p| p.text.clone())
-            .collect::<Vec<_>>()
-            .join("");
+            .as_ref()
+            .map(|c| {
+                c.parts
+                    .iter()
+                    .filter(|p| !p.thought.unwrap_or(false))
+                    .filter_map(|p| p.text.clone())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .unwrap_or_default();
 
         let usage = gr.usage_metadata.unwrap_or(GeminiUsageMetadata {
             prompt_token_count: 0,
