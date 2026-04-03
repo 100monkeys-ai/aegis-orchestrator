@@ -87,31 +87,44 @@ impl StorageProvider for SeaweedFSAdapter {
             ));
         }
 
-        // SeaweedFS filer creates directories automatically when files are uploaded
-        // But we can explicitly create them via POST to /dir/
+        // SeaweedFS does NOT auto-create ancestor directories via the /dir/ API —
+        // it only does so when files are uploaded. We must explicitly create every
+        // ancestor from root down to the leaf so that intermediate paths exist
+        // before child directories are created.
+        let parts: Vec<&str> = path
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect();
+
         let url = self.build_url("/dir/");
 
-        let form = multipart::Form::new().text("path", path.to_string());
+        for depth in 1..=parts.len() {
+            let ancestor = format!("/{}", parts[..depth].join("/"));
 
-        let response = self.client.post(&url).multipart(form).send().await?;
+            let form = multipart::Form::new().text("path", ancestor.clone());
 
-        match response.status() {
-            StatusCode::CREATED | StatusCode::OK => Ok(()),
-            StatusCode::CONFLICT => {
-                // Directory already exists - treat as success (idempotent operation)
-                tracing::debug!("Directory {} already exists, treating as success", path);
-                Ok(())
-            }
-            status => {
-                let error_msg = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP {status}"));
-                Err(StorageError::Unknown(format!(
-                    "Failed to create directory {path}: {error_msg}"
-                )))
+            let response = self.client.post(&url).multipart(form).send().await?;
+
+            match response.status() {
+                StatusCode::CREATED | StatusCode::OK => {}
+                StatusCode::CONFLICT => {
+                    // Already exists — idempotent, continue
+                    tracing::debug!("Directory {} already exists, skipping", ancestor);
+                }
+                status => {
+                    let error_msg = response
+                        .text()
+                        .await
+                        .unwrap_or_else(|_| format!("HTTP {status}"));
+                    return Err(StorageError::Unknown(format!(
+                        "Failed to create directory {ancestor}: {error_msg}"
+                    )));
+                }
             }
         }
+
+        Ok(())
     }
 
     async fn delete_directory(&self, path: &str) -> Result<(), StorageError> {
