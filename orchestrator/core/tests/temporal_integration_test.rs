@@ -271,6 +271,14 @@ impl WorkflowRepository for MockWorkflowRepo {
     ) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
     }
+
+    async fn find_by_name_visible(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        Ok(None)
+    }
 }
 
 struct StaticWorkflowRepo {
@@ -400,6 +408,14 @@ impl WorkflowRepository for StaticWorkflowRepo {
         _name: &str,
     ) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
+    }
+
+    async fn find_by_name_visible(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        self.find_by_name_for_tenant(tenant_id, name).await
     }
 }
 
