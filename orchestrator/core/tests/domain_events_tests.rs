@@ -137,7 +137,7 @@ fn execution_id_returns_some_for_seal_session_created() {
         session_id: "sess-abc".to_string(),
         agent_id: aid,
         execution_id: eid,
-        security_context_name: "default".to_string(),
+        security_context_name: "aegis-system-operator".to_string(),
         expires_at: Utc::now(),
         created_at: Utc::now(),
     });
@@ -891,7 +891,7 @@ fn seal_event_session_created_serde_roundtrip() {
         session_id: "sess-123".to_string(),
         agent_id: aid,
         execution_id: eid,
-        security_context_name: "default".to_string(),
+        security_context_name: "aegis-system-operator".to_string(),
         expires_at: Utc::now(),
         created_at: Utc::now(),
     };
