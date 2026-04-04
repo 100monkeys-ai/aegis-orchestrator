@@ -59,6 +59,12 @@ pub struct StartWorkflowExecutionRequest {
     /// child agent executions spawned within workflow states.
     #[serde(default)]
     pub security_context_name: Option<String>,
+
+    /// Optional intent string passed as a top-level field in the Temporal workflow
+    /// input (sibling of `input`, not nested inside it).  The TypeScript worker
+    /// destructures `GenericWorkflowInput` as `{ intent, ...inputFields }`.
+    #[serde(default)]
+    pub intent: Option<String>,
 }
 
 /// Started workflow execution response
@@ -374,6 +380,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 },
                 normalized_blackboard,
                 request.security_context_name.clone(),
+                request.intent.clone(),
             )
             .await
             .context("Failed to start workflow execution in Temporal")?;
@@ -482,6 +489,7 @@ mod tests {
             input: HashMap<String, serde_json::Value>,
             blackboard: Option<HashMap<String, serde_json::Value>>,
             _security_context_name: Option<String>,
+            _intent: Option<String>,
         ) -> Result<String> {
             self.calls.lock().unwrap().push(StartCall {
                 workflow_id: workflow_id.to_string(),
@@ -699,6 +707,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap();
@@ -770,6 +779,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap_err();
@@ -806,6 +816,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap_err();
@@ -838,6 +849,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap_err();
@@ -868,6 +880,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap();
@@ -902,6 +915,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap();
@@ -1065,6 +1079,7 @@ mod tests {
                 version: None,
                 tenant_id: Some(TenantId::local_default()),
                 security_context_name: None,
+                intent: None,
             })
             .await
             .unwrap_err();

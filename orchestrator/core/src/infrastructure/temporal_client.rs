@@ -127,6 +127,7 @@ impl TemporalClient {
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
         security_context_name: Option<String>,
+        intent: Option<String>,
     ) -> Result<String> {
         let execution_workflow_id = execution_id.0.to_string();
 
@@ -134,13 +135,16 @@ impl TemporalClient {
         let workflow_type_name = "aegis_workflow";
 
         // Construct input payload matching GenericWorkflowInput interface in TS
-        // interface GenericWorkflowInput { workflow_id: string; input: Record<string, any>; }
-        let input_obj = serde_json::json!({
+        // interface GenericWorkflowInput { workflow_id: string; input: Record<string, any>; intent?: string; }
+        let mut input_obj = serde_json::json!({
             "workflow_id": workflow_id,
             "input": input,
             "blackboard": blackboard,
             "security_context_name": security_context_name,
         });
+        if let Some(intent_val) = intent {
+            input_obj["intent"] = serde_json::Value::String(intent_val);
+        }
 
         // Serialize to JSON payload
         let json_bytes = serde_json::to_vec(&input_obj)?;
@@ -333,6 +337,7 @@ impl WorkflowEnginePort for TemporalClient {
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
         security_context_name: Option<String>,
+        intent: Option<String>,
     ) -> Result<String> {
         TemporalClient::start_workflow(
             self,
@@ -341,6 +346,7 @@ impl WorkflowEnginePort for TemporalClient {
             input,
             blackboard,
             security_context_name,
+            intent,
         )
         .await
     }

@@ -145,6 +145,7 @@ pub(crate) async fn run_workflow_legacy_handler(
         security_context_name: identity
             .as_ref()
             .map(|ext| ext.0.to_security_context_name()),
+        intent: None,
     };
     execute_temporal_workflow_handler(State(state), identity, Json(req)).await
 }

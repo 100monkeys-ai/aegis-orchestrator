@@ -500,6 +500,7 @@ impl StimulusService for StandardStimulusService {
             // Stimulus-triggered workflows inherit the security context from the
             // route's bound context once ADR-083 Phase 2 lands.
             security_context_name: None,
+            intent: None,
         };
 
         let started = self
