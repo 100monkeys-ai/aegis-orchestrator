@@ -275,14 +275,8 @@ pub struct StandardExecutionService {
 }
 
 impl StandardExecutionService {
-    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 6] = [
-        "intent",
-        "instruction",
-        "input",
-        "iteration_number",
-        "previous_error",
-        "context",
-    ];
+    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 3] =
+        ["instruction", "iteration_number", "previous_error"];
 
     fn resolve_tenant_from_payload(payload: &serde_json::Value) -> Result<TenantId> {
         let tenant = payload
