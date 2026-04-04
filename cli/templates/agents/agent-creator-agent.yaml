@@ -58,6 +58,19 @@ spec:
            agent's capability domain (e.g., "code-generation", "api-integration", "data-analysis",
            "security-review", "infrastructure-automation"). Tags must reflect what the agent does,
            not generic platform concepts. Do not reuse label values verbatim as tags.
+         - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
+           Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
+           instruction text to prevent `cmd.run` misuse — give it the correct tools instead.
+           Agents that write and execute code require the complete `fs.*` inspection suite:
+             tools:
+               - fs.write
+               - fs.read
+               - fs.list
+               - fs.glob
+               - fs.grep
+               - cmd.run
+           Omitting `fs.read`, `fs.list`, `fs.glob`, or `fs.grep` from a code-writing agent forces the
+           LLM to misuse `cmd.run` for filesystem inspection, which will be rejected by the semantic judge.
          - Any agent that writes files MUST declare a volume with mount_path under /workspace
            (e.g., /workspace, /workspace/output, /workspace/cache) and set
            security.filesystem.write to that same path or a subdirectory of /workspace.
@@ -77,6 +90,11 @@ spec:
          - For new agents: call `aegis.agent.create` with the validated manifest.
          - For updates: call `aegis.agent.update` with the validated manifest.
          - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
+         - If `aegis.agent.create` or `aegis.agent.update` returns judge rejection feedback, read the
+           feedback carefully and fix the MANIFEST — specifically `spec.tools`, `spec.runtime`,
+           `security`, or whichever field the judge identified. Do NOT respond to judge rejection by
+           only tightening or adding instruction text; instruction text cannot override tool invocation
+           behavior. After fixing the manifest, restart from step 7 (re-validate) before retrying.
       Do not call `aegis.agent.create` or `aegis.agent.update` from a draft manifest, a partially
       composed manifest, or a manifest that has not been schema-validated in the current run.
       Skipping, reordering, or collapsing steps 1–7 is a policy violation and will cause judge rejection.
