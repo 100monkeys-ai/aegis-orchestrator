@@ -40,7 +40,7 @@ impl ToolInvocationService {
                             "version": version,
                             "image": entry.image,
                             "description": entry.metadata.description,
-                            "deprecated": false
+                            "deprecated": entry.metadata.deprecated
                         }));
                     }
                     Err(_) => {

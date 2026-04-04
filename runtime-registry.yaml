@@ -27,6 +27,7 @@ spec:
       "3.9":
         image: "python:3.9-slim"
         description: "Python 3.9 with slim Debian base"
+        deprecated: true
       "3.10":
         image: "python:3.10-slim"
         description: "Python 3.10 with slim Debian base"
