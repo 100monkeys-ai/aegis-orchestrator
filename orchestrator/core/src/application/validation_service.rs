@@ -206,8 +206,21 @@ impl ValidationService {
         timeout_seconds: u64,
         poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
-        // Prepare input — the judge agent's prompt_template renders against this payload.
-        let payload_data = serde_json::to_string(&request)?;
+        // Prepare input — map ValidationRequest fields to the judge's declared input_schema.
+        // The judge expects: user_objective, generated_manifest, deployment_result,
+        // tool_call_history, validation_context — NOT the raw ValidationRequest field names.
+        let judge_input = serde_json::json!({
+            "user_objective": request.criteria,
+            "generated_manifest": request.content,
+            "deployment_result": request.context.as_ref()
+                .and_then(|c| c.get("deployment_result"))
+                .unwrap_or(&serde_json::Value::Null),
+            "tool_call_history": request.context.as_ref()
+                .and_then(|c| c.get("tool_call_history"))
+                .unwrap_or(&serde_json::Value::Null),
+            "validation_context": "agent_generator_judge",
+        });
+        let payload_data = serde_json::to_string(&judge_input)?;
         let input = ExecutionInput {
             intent: None,
             input: serde_json::json!({
