@@ -786,6 +786,10 @@ impl ToolRouter {
                                 "type": "string",
                                 "description": "Name of the workflow to execute."
                             },
+                            "intent": {
+                                "type": "string",
+                                "description": "Natural-language description of the goal for this workflow run. Injected into the workflow input so task activities and agents can access it."
+                            },
                             "input": {
                                 "type": "object",
                                 "description": "Workflow input parameters."
@@ -1030,9 +1034,13 @@ impl ToolRouter {
                                 "type": "string",
                                 "description": "UUID or Name of the agent to execute."
                             },
+                            "intent": {
+                                "type": "string",
+                                "description": "Natural-language description of what the agent should accomplish. Steers the LLM prompt directly. Complementary to structured 'input'."
+                            },
                             "input": {
                                 "type": "object",
-                                "description": "Task instructions and data for the agent. Pass the user's request as { \"prompt\": \"<the full task description>\" }. Always include this field with the user's intent.",
+                                "description": "Structured data for the agent, validated against its input_schema when declared. Use alongside 'intent' for typed parameters.",
                                 "properties": {
                                     "prompt": {
                                         "type": "string",

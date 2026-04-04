@@ -16,6 +16,10 @@ impl ToolInvocationService {
             })?;
 
         let mut input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let intent = args
+            .get("intent")
+            .and_then(|v| v.as_str())
+            .map(String::from);
         let version = args.get("version").and_then(|v| v.as_str());
 
         // Resolve and inject the caller's tenant_id into the payload so that
@@ -70,10 +74,7 @@ impl ToolInvocationService {
             .execution_service
             .start_execution(
                 agent_id,
-                crate::domain::execution::ExecutionInput {
-                    intent: None,
-                    input,
-                },
+                crate::domain::execution::ExecutionInput { intent, input },
                 "agent-runtime".to_string(),
                 None,
             )

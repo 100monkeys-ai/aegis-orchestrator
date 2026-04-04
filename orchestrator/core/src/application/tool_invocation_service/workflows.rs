@@ -150,8 +150,17 @@ impl ToolInvocationService {
             )
         })?;
 
-        let input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
+        let mut input = args.get("input").cloned().unwrap_or(serde_json::json!({}));
         let blackboard = args.get("blackboard").cloned();
+
+        // Inject intent into the workflow input so task activities and agents
+        // can access it via {{input.intent}} in Handlebars templates.
+        if let Some(intent_str) = args.get("intent").and_then(|v| v.as_str()) {
+            if let Some(obj) = input.as_object_mut() {
+                obj.entry("intent")
+                    .or_insert_with(|| serde_json::Value::String(intent_str.to_string()));
+            }
+        }
         let version = args
             .get("version")
             .and_then(|v| v.as_str())
