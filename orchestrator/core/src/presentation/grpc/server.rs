@@ -1496,6 +1496,7 @@ mod tests {
                 security_policy: None,
                 tenant_id: String::new(),
                 security_context_name: Some("aegis-system-operator".to_string()),
+                intent: None,
             }))
             .await
             .expect("execute_agent should succeed");
@@ -1573,6 +1574,7 @@ mod tests {
                 security_policy: None,
                 tenant_id: String::new(),
                 security_context_name: Some("aegis-system-operator".to_string()),
+                intent: None,
             }))
             .await
             .expect("execute_agent should succeed");

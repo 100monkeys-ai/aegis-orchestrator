@@ -717,7 +717,7 @@ mod tests {
             agent_id,
             ExecutionInput {
                 intent: Some("test".to_string()),
-                payload: Value::Null,
+                input: Value::Null,
             },
             3,
             "aegis-system-operator".to_string(),
@@ -785,7 +785,7 @@ mod tests {
             agent_id,
             ExecutionInput {
                 intent: Some("agent stream".to_string()),
-                payload: Value::Null,
+                input: Value::Null,
             },
             2,
             "aegis-system-operator".to_string(),

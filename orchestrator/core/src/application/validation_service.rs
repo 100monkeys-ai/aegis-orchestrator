@@ -694,7 +694,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
             futures.push(tokio::spawn(async move {
                 let exec_input = ExecutionInput {
                     intent: None,
-                    payload,
+                    input: payload,
                 };
                 let exec_id = svc
                     .start_child_execution(jid, exec_input, parent_id)
