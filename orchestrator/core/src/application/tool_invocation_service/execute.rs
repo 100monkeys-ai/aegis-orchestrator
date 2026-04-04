@@ -85,7 +85,7 @@ impl ToolInvocationService {
                     blackboard: None,
                     version: None,
                     tenant_id: Some(tenant_id),
-                    security_context_name: Some("agent-runtime".to_string()),
+                    security_context_name: Some("aegis-system-agent-runtime".to_string()),
                     intent: Some(intent.to_string()),
                 },
             )

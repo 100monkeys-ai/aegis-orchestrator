@@ -185,7 +185,7 @@ impl InnerLoopService {
                 let (security_context_name, tenant_id) = match exec_record {
                     Ok(ref e) => (e.security_context_name.clone(), e.tenant_id.clone()),
                     Err(_) => (
-                        "agent-runtime".to_string(),
+                        "aegis-system-agent-runtime".to_string(),
                         tenant_id_hint.unwrap_or_else(TenantId::system),
                     ),
                 };

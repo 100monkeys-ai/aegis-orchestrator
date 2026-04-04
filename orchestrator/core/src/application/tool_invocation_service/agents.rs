@@ -226,7 +226,7 @@ impl ToolInvocationService {
                     intent: None,
                     input: payload,
                 },
-                "agent-runtime".to_string(),
+                "aegis-system-agent-runtime".to_string(),
                 None,
             )
             .await

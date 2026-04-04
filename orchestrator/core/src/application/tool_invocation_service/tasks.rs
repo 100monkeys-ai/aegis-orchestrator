@@ -79,7 +79,7 @@ impl ToolInvocationService {
             .start_execution(
                 agent_id,
                 crate::domain::execution::ExecutionInput { intent, input },
-                "agent-runtime".to_string(),
+                "aegis-system-agent-runtime".to_string(),
                 None,
             )
             .await
