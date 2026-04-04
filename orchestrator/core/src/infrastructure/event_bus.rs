@@ -186,6 +186,7 @@ impl DomainEvent {
                 } => *parent_execution_id,
                 WorkflowEvent::WorkflowRegistered { .. }
                 | WorkflowEvent::WorkflowScopeChanged { .. }
+                | WorkflowEvent::WorkflowRemoved { .. }
                 | WorkflowEvent::IntentExecutionPipelineStarted { .. }
                 | WorkflowEvent::IntentExecutionPipelineCompleted { .. }
                 | WorkflowEvent::IntentExecutionPipelineFailed { .. } => return None,
@@ -410,6 +411,7 @@ impl DomainEvent {
                     *completed_at
                 }
                 WorkflowEvent::IntentExecutionPipelineFailed { failed_at, .. } => *failed_at,
+                WorkflowEvent::WorkflowRemoved { removed_at, .. } => *removed_at,
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { discovered_at, .. } => *discovered_at,
@@ -591,6 +593,7 @@ impl DomainEvent {
                 WorkflowEvent::IntentExecutionPipelineFailed { .. } => {
                     "intent_execution_pipeline_failed"
                 }
+                WorkflowEvent::WorkflowRemoved { .. } => "workflow_removed",
             },
             DomainEvent::Learning(event) => match event {
                 LearningEvent::PatternDiscovered { .. } => "pattern_discovered",
