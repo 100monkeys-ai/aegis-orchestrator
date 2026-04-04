@@ -531,11 +531,15 @@ impl GradientValidator for SemanticAgentValidator {
         }
 
         // 2. Build input for judge.
+        // Parse ctx.output as JSON so the judge receives a proper JSON value
+        // rather than a double-encoded string when the agent emits valid JSON.
+        let output_value: serde_json::Value = serde_json::from_str(&ctx.output)
+            .unwrap_or_else(|_| serde_json::Value::String(ctx.output.clone()));
         let input = ExecutionInput {
             intent: None,
             input: serde_json::json!({
                 "task": ctx.task,
-                "output": ctx.output,
+                "output": output_value,
                 "generation_evidence": generation_evidence,
                 "tool_audit_history": tool_audit_history,
                 "worker_mounts": ctx.worker_mounts.clone(),

@@ -404,10 +404,27 @@ impl ToolInvocationService {
 
                             let execution_objective = self
                                 .execution_service
-                                .get_execution(execution_id)
+                                .get_execution_unscoped(execution_id)
                                 .await
                                 .ok()
-                                .and_then(|exec| exec.input.intent)
+                                .and_then(|exec| {
+                                    exec.input
+                                        .intent
+                                        .or_else(|| {
+                                            exec.input
+                                                .input
+                                                .get("input")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from)
+                                        })
+                                        .or_else(|| {
+                                            exec.input
+                                                .input
+                                                .get("workflow_input")
+                                                .and_then(|v| v.as_str())
+                                                .map(String::from)
+                                        })
+                                })
                                 .unwrap_or_else(|| "No objective available".to_string());
                             let available_tools = self
                                 .get_available_tools_for_agent(tenant_id, *agent_id)
