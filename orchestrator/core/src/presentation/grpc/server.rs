@@ -1461,12 +1461,110 @@ mod tests {
         }
     }
 
+    struct NoopAgentLifecycleService;
+
+    #[async_trait]
+    impl crate::application::agent::AgentLifecycleService for NoopAgentLifecycleService {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _manifest: crate::domain::agent::AgentManifest,
+            _force: bool,
+            _scope: crate::domain::agent::AgentScope,
+        ) -> Result<AgentId> {
+            Err(anyhow!(
+                "NoopAgentLifecycleService: deploy_agent_for_tenant not implemented"
+            ))
+        }
+
+        async fn get_agent_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _id: AgentId,
+        ) -> Result<crate::domain::agent::Agent> {
+            Err(anyhow!(
+                "NoopAgentLifecycleService: get_agent_for_tenant not implemented"
+            ))
+        }
+
+        async fn update_agent_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _id: AgentId,
+            _manifest: crate::domain::agent::AgentManifest,
+        ) -> Result<()> {
+            Err(anyhow!(
+                "NoopAgentLifecycleService: update_agent_for_tenant not implemented"
+            ))
+        }
+
+        async fn delete_agent_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _id: AgentId,
+        ) -> Result<()> {
+            Err(anyhow!(
+                "NoopAgentLifecycleService: delete_agent_for_tenant not implemented"
+            ))
+        }
+
+        async fn list_agents_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+        ) -> Result<Vec<crate::domain::agent::Agent>> {
+            Ok(vec![])
+        }
+
+        async fn list_agents_visible_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _user_id: Option<&str>,
+        ) -> Result<Vec<crate::domain::agent::Agent>> {
+            Ok(vec![])
+        }
+
+        async fn lookup_agent_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _name: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(None)
+        }
+
+        async fn lookup_agent_visible_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _user_id: Option<&str>,
+            _name: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(None)
+        }
+
+        async fn list_versions_for_tenant(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _agent_id: AgentId,
+        ) -> Result<Vec<crate::domain::repository::AgentVersion>> {
+            Ok(vec![])
+        }
+
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _name: &str,
+            _version: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(None)
+        }
+    }
+
     fn test_validation_service(
         execution_service: Arc<dyn ExecutionService>,
     ) -> Arc<ValidationService> {
         Arc::new(ValidationService::new(
             Arc::new(EventBus::new(8)),
             execution_service,
+            Arc::new(NoopAgentLifecycleService),
         ))
     }
 

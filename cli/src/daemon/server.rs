@@ -1098,6 +1098,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let validation_service = Arc::new(ValidationService::new(
         event_bus.clone(),
         execution_service.clone(),
+        agent_service.clone(),
     ));
 
     // Create human input service

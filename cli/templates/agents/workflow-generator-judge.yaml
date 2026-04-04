@@ -8,33 +8,6 @@ metadata:
     role: judge
     category: validation
     capability: workflow-generation-judging
-  input_schema:
-    type: object
-    properties:
-      user_objective:
-        type: string
-        description: The original user request that triggered workflow generation
-      generated_workflow:
-        type: string
-        description: The generated workflow plan or YAML to evaluate
-      artifact_metadata:
-        type: object
-        description: Metadata about generated artifacts
-      tool_call_history:
-        type: array
-        description: History of tool calls made during generation
-      worker_mounts:
-        type: object
-        description: Mounted filesystem artifacts from the worker execution
-      criteria:
-        type: string
-        description: Specific criteria to evaluate against
-      validation_context:
-        type: string
-        description: Additional context for the validation evaluation
-    required:
-      - user_objective
-      - generated_workflow
 spec:
   runtime:
     language: python
@@ -196,3 +169,31 @@ spec:
 
   tools:
     - aegis.workflow.export
+
+  input_schema:
+    type: object
+    properties:
+      user_objective:
+        type: string
+        description: The original user request that triggered workflow generation
+      generated_workflow:
+        type: string
+        description: The generated workflow plan or YAML to evaluate
+      artifact_metadata:
+        type: object
+        description: Metadata about generated artifacts
+      tool_call_history:
+        type: array
+        description: History of tool calls made during generation
+      worker_mounts:
+        type: object
+        description: Mounted filesystem artifacts from the worker execution
+      criteria:
+        type: string
+        description: Specific criteria to evaluate against
+      validation_context:
+        type: string
+        description: Additional context for the validation evaluation
+    required:
+      - user_objective
+      - generated_workflow

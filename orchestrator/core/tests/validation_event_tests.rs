@@ -9,13 +9,18 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements validation event tests
 
+use aegis_orchestrator_core::application::agent::AgentLifecycleService;
 use aegis_orchestrator_core::application::execution::ExecutionService;
 use aegis_orchestrator_core::application::validation_service::ValidationService;
-use aegis_orchestrator_core::domain::agent::AgentId;
+use aegis_orchestrator_core::domain::agent::{
+    Agent, AgentId, AgentManifest, AgentScope, AgentStatus,
+};
 use aegis_orchestrator_core::domain::events::{ExecutionEvent, ValidationEvent};
 use aegis_orchestrator_core::domain::execution::{
     Execution, ExecutionId, ExecutionInput, Iteration, LlmInteraction,
 };
+use aegis_orchestrator_core::domain::repository::AgentVersion;
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::infrastructure::event_bus::{DomainEvent, EventBus};
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -163,22 +168,148 @@ impl ExecutionService for MockExecutionService {
     }
 }
 
-// ValidationService::run_judge logic:
-// 1. calls get_execution -> checks status
-// 2. calls iterations().last() on the returned execution object
+struct MockAgentLifecycleService;
 
-// If the Execution struct stores iterations internally and we can't populate them via constructor,
-// then MockExecutionService::get_execution needs to return an Execution with iterations.
-// Let's assume Execution has a way to add iterations or we can represent it differently?
-// Or maybe we can rely on `get_iterations` being called?
-// No, `run_judge` calls `exec.iterations().last()`.
-// If `Execution` struct manages iterations, we need to populate them.
+#[async_trait]
+impl AgentLifecycleService for MockAgentLifecycleService {
+    async fn deploy_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _manifest: AgentManifest,
+        _force: bool,
+        _scope: AgentScope,
+    ) -> anyhow::Result<AgentId> {
+        anyhow::bail!("MockAgentLifecycleService: deploy_agent_for_tenant not exercised")
+    }
+
+    async fn get_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        id: AgentId,
+    ) -> anyhow::Result<Agent> {
+        use aegis_orchestrator_core::domain::agent::{AgentSpec, ManifestMetadata, RuntimeConfig};
+        use aegis_orchestrator_core::domain::shared_kernel::ImagePullPolicy;
+        let manifest = AgentManifest {
+            api_version: "100monkeys.ai/v1".to_string(),
+            kind: "Agent".to_string(),
+            metadata: ManifestMetadata {
+                name: "mock-judge".to_string(),
+                version: "1.0.0".to_string(),
+                description: None,
+                tags: vec![],
+                labels: std::collections::HashMap::new(),
+                annotations: std::collections::HashMap::new(),
+            },
+            spec: AgentSpec {
+                runtime: RuntimeConfig {
+                    language: Some("python".to_string()),
+                    version: Some("3.11".to_string()),
+                    image: None,
+                    image_pull_policy: ImagePullPolicy::IfNotPresent,
+                    isolation: "inherit".to_string(),
+                    model: "judge".to_string(),
+                },
+                task: None,
+                context: vec![],
+                execution: None,
+                security: None,
+                schedule: None,
+                tools: vec![],
+                env: std::collections::HashMap::new(),
+                volumes: vec![],
+                advanced: None,
+                // No input_schema — exercises the fallback path.
+                input_schema: None,
+            },
+        };
+        Ok(Agent {
+            id,
+            tenant_id: TenantId::system(),
+            name: "mock-judge".to_string(),
+            manifest,
+            status: AgentStatus::Active,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        })
+    }
+
+    async fn update_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: AgentId,
+        _manifest: AgentManifest,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("MockAgentLifecycleService: update_agent_for_tenant not exercised")
+    }
+
+    async fn delete_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _id: AgentId,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!("MockAgentLifecycleService: delete_agent_for_tenant not exercised")
+    }
+
+    async fn list_agents_for_tenant(&self, _tenant_id: &TenantId) -> anyhow::Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+
+    async fn list_agents_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+    ) -> anyhow::Result<Vec<Agent>> {
+        Ok(vec![])
+    }
+
+    async fn lookup_agent_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        Ok(None)
+    }
+
+    async fn lookup_agent_visible_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _user_id: Option<&str>,
+        _name: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        Ok(None)
+    }
+
+    async fn list_versions_for_tenant(
+        &self,
+        _tenant_id: &TenantId,
+        _agent_id: AgentId,
+    ) -> anyhow::Result<Vec<AgentVersion>> {
+        Ok(vec![])
+    }
+
+    async fn lookup_agent_for_tenant_with_version(
+        &self,
+        _tenant_id: &TenantId,
+        _name: &str,
+        _version: &str,
+    ) -> anyhow::Result<Option<AgentId>> {
+        Ok(None)
+    }
+}
+
+// ValidationService::run_judge logic:
+// 1. fetches judge agent manifest via AgentLifecycleService
+// 2. builds payload from spec.input_schema properties (or falls back for no-schema judges)
+// 3. calls get_execution -> checks status
+// 4. calls iterations().last() on the returned execution object
 
 #[tokio::test]
 async fn test_validation_event_streaming() {
     let event_bus = Arc::new(EventBus::with_default_capacity());
     let exec_service = Arc::new(MockExecutionService);
-    let val_service = ValidationService::new(event_bus.clone(), exec_service.clone());
+    let agent_service = Arc::new(MockAgentLifecycleService);
+    let val_service =
+        ValidationService::new(event_bus.clone(), exec_service.clone(), agent_service);
 
     let execution_id = ExecutionId::new();
     let mut receiver = event_bus.subscribe_execution(execution_id);

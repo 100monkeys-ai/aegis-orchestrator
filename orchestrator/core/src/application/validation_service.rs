@@ -78,16 +78,19 @@ use std::time::Duration;
 pub struct ValidationService {
     event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
     execution_service: Arc<dyn ExecutionService>,
+    agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
 }
 
 impl ValidationService {
     pub fn new(
         event_bus: Arc<crate::infrastructure::event_bus::EventBus>,
         execution_service: Arc<dyn ExecutionService>,
+        agent_lifecycle_service: Arc<dyn AgentLifecycleService>,
     ) -> Self {
         Self {
             event_bus,
             execution_service,
+            agent_lifecycle_service,
         }
     }
 
@@ -126,6 +129,7 @@ impl ValidationService {
         let mut futures = Vec::new();
         for (judge_id, weight) in &judges {
             let service = self.execution_service.clone();
+            let lifecycle = self.agent_lifecycle_service.clone();
             let req = request.clone();
             let judge = *judge_id;
             let w = *weight;
@@ -134,7 +138,16 @@ impl ValidationService {
             let parent_id = execution_id;
 
             futures.push(tokio::spawn(async move {
-                match Self::run_judge(service, judge, req, parent_id, timeout, poll_interval).await
+                match Self::run_judge(
+                    service,
+                    lifecycle,
+                    judge,
+                    req,
+                    parent_id,
+                    timeout,
+                    poll_interval,
+                )
+                .await
                 {
                     Ok((_agent_id, gradient_result)) => Ok((judge, gradient_result, w)),
                     Err(e) => Err(e),
@@ -200,33 +213,76 @@ impl ValidationService {
 
     async fn run_judge(
         service: Arc<dyn ExecutionService>,
+        lifecycle: Arc<dyn AgentLifecycleService>,
         judge_id: AgentId,
         request: ValidationRequest,
         parent_execution_id: ExecutionId,
         timeout_seconds: u64,
         poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
-        // Prepare input — map ValidationRequest fields to the judge's declared input_schema.
-        // The judge expects: user_objective, generated_manifest, deployment_result,
-        // tool_call_history, validation_context — NOT the raw ValidationRequest field names.
-        let judge_input = serde_json::json!({
-            "user_objective": request.criteria,
-            "generated_manifest": request.content,
-            "deployment_result": request.context.as_ref()
-                .and_then(|c| c.get("deployment_result"))
-                .unwrap_or(&serde_json::Value::Null),
-            "tool_call_history": request.context.as_ref()
-                .and_then(|c| c.get("tool_call_history"))
-                .unwrap_or(&serde_json::Value::Null),
-            "validation_context": "agent_generator_judge",
-        });
-        let payload_data = serde_json::to_string(&judge_input)?;
-        let input = ExecutionInput {
-            intent: None,
-            input: serde_json::json!({
-                "workflow_input": payload_data,
-                "validation_context": "judge_execution"
-            }),
+        // Fetch the judge agent manifest to read its declared input_schema.
+        // Use the system tenant so global judge agents (aegis-system scope) are always found.
+        let judge_agent = lifecycle
+            .get_agent_visible(&crate::domain::shared_kernel::TenantId::system(), judge_id)
+            .await?;
+        let judge_name = judge_agent.manifest.metadata.name.clone();
+
+        // Build the execution input by mapping ValidationRequest fields to the judge's
+        // declared spec.input_schema properties.  The mapping is canonical across all
+        // four built-in judge agents; any property not covered falls back to
+        // request.context[property_name] if present.
+        let input = if let Some(schema) = &judge_agent.manifest.spec.input_schema {
+            let properties = schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .cloned()
+                .unwrap_or_default();
+
+            let mut payload = serde_json::Map::new();
+
+            for prop_name in properties.keys() {
+                let value: serde_json::Value = match prop_name.as_str() {
+                    // content → primary output being evaluated
+                    "generated_manifest" | "output" => {
+                        serde_json::Value::String(request.content.clone())
+                    }
+                    "generated_workflow" => serde_json::Value::String(request.content.clone()),
+                    // criteria → the user objective / task goal
+                    "user_objective" | "task" => {
+                        serde_json::Value::String(request.criteria.clone())
+                    }
+                    // explicit criteria pass-through
+                    "criteria" => serde_json::Value::String(request.criteria.clone()),
+                    // context-sourced fields
+                    "deployment_result" | "tool_call_history" | "worker_mounts" => request
+                        .context
+                        .as_ref()
+                        .and_then(|c| c.get(prop_name.as_str()))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                    // validation_context is always the judge's own name
+                    "validation_context" => serde_json::Value::String(judge_name.clone()),
+                    // fallback: look up in request.context by property name
+                    other => request
+                        .context
+                        .as_ref()
+                        .and_then(|c| c.get(other))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                };
+                payload.insert(prop_name.clone(), value);
+            }
+
+            ExecutionInput {
+                intent: None,
+                input: serde_json::Value::Object(payload),
+            }
+        } else {
+            // No input_schema declared — pass content directly as a plain string.
+            ExecutionInput {
+                intent: Some(request.criteria.clone()),
+                input: serde_json::Value::String(request.content.clone()),
+            }
         };
 
         // Spawn as a child execution (ADR-016: judges are isolated peer agents).
