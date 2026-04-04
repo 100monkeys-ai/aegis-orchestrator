@@ -308,6 +308,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         }
 
         // Step 1: Load workflow from repository
+        let user_id_opt = identity.map(|id| id.sub.as_str());
         let workflow = if let Ok(uuid) = uuid::Uuid::parse_str(&request.workflow_id) {
             let id = WorkflowId::from_uuid(uuid);
             self.workflow_repository
@@ -315,11 +316,11 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                 .await
         } else if let Some(ref version) = request.version {
             self.workflow_repository
-                .find_by_name_and_version_for_tenant(tenant_id, &request.workflow_id, version)
+                .resolve_by_name_and_version(tenant_id, user_id_opt, &request.workflow_id, version)
                 .await
         } else {
             self.workflow_repository
-                .find_by_name_for_tenant(tenant_id, &request.workflow_id)
+                .resolve_by_name(tenant_id, user_id_opt, &request.workflow_id)
                 .await
         }
         .context("Failed to query workflow repository")?

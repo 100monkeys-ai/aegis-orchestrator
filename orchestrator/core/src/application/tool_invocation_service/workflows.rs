@@ -229,8 +229,9 @@ impl ToolInvocationService {
             let workflow_id = if let Ok(uuid) = uuid::Uuid::parse_str(workflow_ref) {
                 crate::domain::workflow::WorkflowId(uuid)
             } else if let Some(workflow_repo) = &self.workflow_repository {
+                let user_id = args.get("user_id").and_then(|v| v.as_str());
                 match workflow_repo
-                    .find_by_name_for_tenant(&tenant_id, workflow_ref)
+                    .resolve_by_name(&tenant_id, user_id, workflow_ref)
                     .await
                 {
                     Ok(Some(workflow)) => workflow.id,
@@ -1013,7 +1014,8 @@ impl ToolInvocationService {
             }
         };
 
-        let workflow = match repo.find_by_name_for_tenant(&tenant_id, name).await {
+        let user_id = args.get("user_id").and_then(|v| v.as_str());
+        let workflow = match repo.resolve_by_name(&tenant_id, user_id, name).await {
             Ok(Some(w)) => w,
             _ => {
                 if let Ok(uuid) = uuid::Uuid::parse_str(name) {
