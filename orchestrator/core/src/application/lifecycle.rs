@@ -23,19 +23,26 @@
 
 use crate::application::agent::AgentLifecycleService;
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
+use crate::domain::events::AgentLifecycleEvent;
 use crate::domain::repository::AgentRepository;
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::event_bus::EventBus;
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::Utc;
 use std::sync::Arc;
 
 pub struct StandardAgentLifecycleService {
     repository: Arc<dyn AgentRepository>,
+    event_bus: Arc<EventBus>,
 }
 
 impl StandardAgentLifecycleService {
-    pub fn new(repository: Arc<dyn AgentRepository>) -> Self {
-        Self { repository }
+    pub fn new(repository: Arc<dyn AgentRepository>, event_bus: Arc<EventBus>) -> Self {
+        Self {
+            repository,
+            event_bus,
+        }
     }
 }
 
@@ -133,6 +140,12 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
 
     async fn delete_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<()> {
         self.repository.delete_for_tenant(tenant_id, id).await?;
+
+        self.event_bus
+            .publish_agent_event(AgentLifecycleEvent::AgentRemoved {
+                agent_id: id,
+                removed_at: Utc::now(),
+            });
 
         metrics::counter!(
             "aegis_agent_lifecycle_operations_total",

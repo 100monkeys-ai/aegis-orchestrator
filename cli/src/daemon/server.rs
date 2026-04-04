@@ -674,7 +674,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
     info!(port = nfs_bind_port, "NFS Server Gateway started");
 
-    let agent_service = Arc::new(StandardAgentLifecycleService::new(agent_repo.clone()));
+    let agent_service = Arc::new(StandardAgentLifecycleService::new(
+        agent_repo.clone(),
+        event_bus.clone(),
+    ));
 
     // Load StandardRuntime registry (ADR-043)
     let registry_path = &config.spec.runtime.runtime_registry_path;
