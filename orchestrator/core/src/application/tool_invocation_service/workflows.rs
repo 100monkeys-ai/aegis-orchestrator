@@ -1201,6 +1201,8 @@ impl ToolInvocationService {
 
         let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
 
+        let tenant_id = Self::resolve_tenant_arg(args)?;
+
         let workflow = match WorkflowParser::parse_yaml(manifest_yaml) {
             Ok(w) => w,
             Err(e) => {
@@ -1281,7 +1283,7 @@ impl ToolInvocationService {
         for judge_name in &judge_names {
             let judge_id = self
                 .agent_lifecycle
-                .lookup_agent(judge_name)
+                .lookup_agent_visible_for_tenant(&tenant_id, None, judge_name)
                 .await
                 .map_err(|e| {
                     SealSessionError::SignatureVerificationFailed(format!(

@@ -41,7 +41,7 @@ impl ToolInvocationService {
         } else if let Some(ver) = version {
             match self
                 .agent_lifecycle
-                .lookup_agent_with_version(agent_ref, ver)
+                .lookup_agent_for_tenant_with_version(&tenant_id, agent_ref, ver)
                 .await
             {
                 Ok(Some(id)) => id,
@@ -59,7 +59,11 @@ impl ToolInvocationService {
                 }
             }
         } else {
-            match self.agent_lifecycle.lookup_agent(agent_ref).await {
+            match self
+                .agent_lifecycle
+                .lookup_agent_visible_for_tenant(&tenant_id, None, agent_ref)
+                .await
+            {
                 Ok(Some(id)) => id,
                 _ => {
                     return Ok(ToolInvocationResult::Direct(serde_json::json!({
