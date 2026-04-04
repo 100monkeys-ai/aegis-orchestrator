@@ -116,8 +116,9 @@ spec:
       Judge:
 
   execution:
-    mode: "iterative"  
-    max_iterations: 3  
+    mode: "iterative"
+    max_iterations: 3
+    llm_timeout_seconds: 240
 
     validation:
       - type: json_schema
@@ -171,7 +172,7 @@ spec:
     resources:
       cpu: 1000
       memory: "256Mi"  # Tool checking is lightweight, requires less memory
-      timeout: "60s"   # Must be fast since it blocks execution
+      timeout: "300s"  # Must be fast since it blocks execution
 
   input_schema:
     type: object

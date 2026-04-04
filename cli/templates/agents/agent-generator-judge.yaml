@@ -130,7 +130,7 @@ spec:
   execution:
     mode: iterative
     max_iterations: 3
-    llm_timeout_seconds: 180
+    llm_timeout_seconds: 240
     validation:
       - type: json_schema
         schema:
@@ -176,7 +176,7 @@ spec:
       cpu: 1000
       memory: 512Mi
       disk: 1Gi
-      timeout: 180s
+      timeout: 300s
 
   tools:
     - aegis.agent.export

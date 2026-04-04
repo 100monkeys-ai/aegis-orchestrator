@@ -54,7 +54,7 @@ spec:
   execution:
     mode: iterative
     max_iterations: 3
-    llm_timeout_seconds: 120
+    llm_timeout_seconds: 240
 
   tools:
     - aegis.agent.search
@@ -70,4 +70,4 @@ spec:
     resources:
       cpu: 500
       memory: 256Mi
-      timeout: 120s
+      timeout: 300s

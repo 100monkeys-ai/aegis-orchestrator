@@ -97,7 +97,7 @@ spec:
       resources:
         cpu: 500
         memory: "256Mi"
-        timeout: "30s"
+        timeout: "300s"
       shell: false
       transitions:
         - condition: exit_code_zero
