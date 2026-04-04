@@ -476,14 +476,20 @@ spec:
   # Node Access Policy and Protocol Security
   # --------------------------------------------------------------------------
   # security_contexts:
-  #   - name: "research-safe"
-  #     description: "Read-only tools and safe network access"
+  #   # Context names MUST start with zaru-, tenant-{slug}-, or aegis-system-.
+  #   # Bare names (e.g. "agent-runtime", "research-safe") will be rejected by
+  #   # validate_context_ownership during SEAL attestation.
+  #   - name: "aegis-system-agent-runtime"
+  #     description: "Orchestrator-spawned agent execution context."
   #     capabilities:
-  #       - tool_pattern: "fs.read"
+  #       - tool_pattern: "fs.*"
   #         path_allowlist:
   #           - "/workspace"
-  #     deny_list:
-  #       - "cmd.rm"
+  #       - tool_pattern: "cmd.run"
+  #       - tool_pattern: "aegis.agent.*"
+  #       - tool_pattern: "aegis.tools.*"
+  #       - tool_pattern: "aegis.runtime.list"
+  #     deny_list: []
   #
   # iam:
   #   realms:
