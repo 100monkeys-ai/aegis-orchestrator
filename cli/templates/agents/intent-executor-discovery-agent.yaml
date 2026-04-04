@@ -34,6 +34,13 @@ spec:
          - Example: intent="add two numbers in python" →
            input="Create a Python code-writing agent that solves computational math problems.
            Write a self-contained script that performs the calculation and prints the result."
+         - aegis.agent.generate returns { "status": "started", "execution_id": "<id>" }.
+           After calling it, immediately call aegis.agent.wait with that execution_id to
+           block until generation completes.
+         - If aegis.agent.wait returns a successful result, use the agent name from the
+           result for your final response.
+         - If aegis.agent.wait returns a failure, return:
+           { "agent_name": null, "created": false, "error": "<failure reason>" }
 
       4. Always return JSON: { "agent_name": "<string>", "created": <bool> }
     prompt_template: |
@@ -52,6 +59,7 @@ spec:
   tools:
     - aegis.agent.search
     - aegis.agent.generate
+    - aegis.agent.wait
 
   security:
     network:
