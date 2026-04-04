@@ -132,6 +132,18 @@ pub struct ToolRouter {
 }
 
 /// Read-only / low-risk tools that bypass the inner-loop semantic judge.
+///
+/// Manifest deployment tools (aegis.agent.create, aegis.agent.update, aegis.agent.delete,
+/// aegis.workflow.create, aegis.workflow.update) are included here because they accept a
+/// `manifest_yaml` payload that may contain tool names such as `cmd.run` or `fs.*` as part
+/// of the manifest's `spec.tools` array.  The tool-call-policy-judge evaluates tool usage
+/// semantics (is the agent misusing cmd.run instead of fs.* for filesystem inspection?), but
+/// manifest deployment tools are not execution tools — they carry a YAML document describing
+/// an agent, not a command to run.  Passing their payload through the policy judge causes
+/// hallucinated violations because the judge reads `cmd.run` in the text and incorrectly
+/// infers a policy breach.  Skipping the judge here is correct: these are registry-write
+/// operations, not inner-loop execution actions, and they have their own structural
+/// validation via aegis.schema.validate before they ever reach this point.
 const SKIP_JUDGE_TOOLS: &[&str] = &[
     "fs.read",
     "fs.list",
@@ -141,6 +153,13 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "web.fetch",
     "aegis.schema.get",
     "aegis.schema.validate",
+    // Manifest deployment tools — payload contains YAML with tool names; policy judge
+    // must not evaluate manifest content as if it were an execution tool invocation.
+    "aegis.agent.create",
+    "aegis.agent.update",
+    "aegis.agent.delete",
+    "aegis.workflow.create",
+    "aegis.workflow.update",
     "aegis.workflow.list",
     "aegis.workflow.export",
     "aegis.workflow.validate",
@@ -1770,7 +1789,7 @@ mod tests {
                 enabled: true,
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.agent.create".to_string(),
-                    skip_judge: false,
+                    skip_judge: true,
                 }],
             },
             BuiltinDispatcherConfig {
@@ -1779,7 +1798,7 @@ mod tests {
                 enabled: true,
                 capabilities: vec![CapabilityConfig {
                     name: "aegis.workflow.create".to_string(),
-                    skip_judge: false,
+                    skip_judge: true,
                 }],
             },
             BuiltinDispatcherConfig {
