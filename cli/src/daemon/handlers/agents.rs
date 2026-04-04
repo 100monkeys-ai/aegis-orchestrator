@@ -189,18 +189,36 @@ pub(crate) async fn stream_agent_events_handler(
     Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
 }
 
+#[derive(serde::Deserialize, Default)]
+pub(crate) struct ListAgentsQuery {
+    scope: Option<String>,
+    #[serde(default)]
+    visible: Option<bool>,
+}
+
 pub(crate) async fn list_agents_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    axum::extract::Query(query): axum::extract::Query<ListAgentsQuery>,
 ) -> Json<serde_json::Value> {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let user_id = identity.as_ref().map(|ext| ext.0.sub.as_str());
 
-    match state
-        .agent_service
-        .list_agents_visible_for_tenant(&tenant_id, user_id)
-        .await
-    {
+    let list_result = if query.scope.as_deref() == Some("global") {
+        state
+            .agent_service
+            .list_agents_for_tenant(&TenantId::system())
+            .await
+    } else if query.visible.unwrap_or(true) {
+        state
+            .agent_service
+            .list_agents_visible_for_tenant(&tenant_id, user_id)
+            .await
+    } else {
+        state.agent_service.list_agents_for_tenant(&tenant_id).await
+    };
+
+    match list_result {
         Ok(agents) => {
             let counts: Vec<i64> = {
                 let futs: Vec<_> = agents
