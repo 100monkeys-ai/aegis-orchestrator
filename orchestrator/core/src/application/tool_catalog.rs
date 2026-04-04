@@ -287,6 +287,9 @@ impl StandardToolCatalog {
         if name.starts_with("aegis.tools.") {
             return ToolCategory::ToolDiscovery;
         }
+        if name.starts_with("aegis.runtime.") {
+            return ToolCategory::AgentManagement;
+        }
         if name.starts_with("fs.") {
             return ToolCategory::Filesystem;
         }
