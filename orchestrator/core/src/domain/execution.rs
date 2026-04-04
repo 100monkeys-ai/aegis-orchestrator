@@ -191,14 +191,15 @@ fn default_security_context_name() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecutionInput {
     /// Optional free-text override used by the natural-language dispatch path.
-    /// Steers the LLM prompt directly. Complementary to `payload`, not an
+    /// Steers the LLM prompt directly. Complementary to `input`, not an
     /// alternative — when an agent declares `input_schema`, callers pass typed
-    /// data via `payload`; `intent` may be omitted or used alongside it.
+    /// data via `input`; `intent` may be omitted or used alongside it.
     pub intent: Option<String>,
     /// Typed input data for the agent, validated against the agent's
     /// `input_schema` when one is declared. Supplies structured data to the
-    /// prompt template context and to tool calls that inspect the raw payload.
-    pub payload: serde_json::Value,
+    /// prompt template context via `{{input}}` / `{{input.KEY}}` dot-notation
+    /// (ADR-092).
+    pub input: serde_json::Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +288,7 @@ pub enum ExecutionError {
     MissingPromptTemplate,
     #[error("Failed to render prompt template: {0}")]
     PromptRenderFailed(String),
-    #[error("Failed to extract user input from execution payload: {0}")]
+    #[error("Failed to extract user input from execution input: {0}")]
     InvalidExecutionInput(String),
     #[error(
         "Cross-tenant spawn forbidden: parent tenant '{parent_tenant}' cannot spawn child in tenant '{child_tenant}'"
@@ -555,7 +556,7 @@ mod tests {
     fn make_input(intent: &str) -> ExecutionInput {
         ExecutionInput {
             intent: Some(intent.to_string()),
-            payload: serde_json::json!({}),
+            input: serde_json::json!({}),
         }
     }
 

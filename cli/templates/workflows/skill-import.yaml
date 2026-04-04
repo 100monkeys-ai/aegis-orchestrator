@@ -26,13 +26,13 @@ spec:
   states:
     FETCH:
       kind: System
-      command: "curl -sfL '{{workflow.skill_url}}' -o /tmp/skill.md"
+      command: "curl -sfL '{{input.skill_url}}' -o /tmp/skill.md"
       transitions:
         - condition: exit_code_zero
           target: PARSE_AND_VALIDATE
         - condition: exit_code_non_zero
           target: FAILED
-          feedback: "Failed to fetch SKILL.md from {{workflow.skill_url}}: {{FETCH.output.stderr}}"
+          feedback: "Failed to fetch SKILL.md from {{input.skill_url}}: {{FETCH.output.stderr}}"
 
     PARSE_AND_VALIDATE:
       kind: Agent
@@ -73,7 +73,7 @@ spec:
         {{PARSE_AND_VALIDATE.output}}
 
         {{#if workflow.agent_name_override}}
-        Agent name override: {{workflow.agent_name_override}}
+        Agent name override: {{input.agent_name_override}}
         {{/if}}
 
         Security preset: {{workflow.context.security_preset}}
@@ -102,7 +102,7 @@ spec:
     #   prompt: |
     #     A community skill has been imported and converted to an AEGIS agent manifest.
     #
-    #     Source: {{workflow.skill_url}}
+    #     Source: {{input.skill_url}}
     #
     #     Composed manifest:
     #     {{COMPOSE_MANIFEST.output}}
@@ -134,7 +134,7 @@ spec:
       kind: System
       command: "echo 'Agent registered successfully from skill import'"
       env:
-        SOURCE: "{{workflow.skill_url}}"
+        SOURCE: "{{input.skill_url}}"
       transitions: []
 
     FAILED:

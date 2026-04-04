@@ -72,7 +72,7 @@ impl ToolInvocationService {
                 agent_id,
                 crate::domain::execution::ExecutionInput {
                     intent: None,
-                    payload: input,
+                    input,
                 },
                 "agent-runtime".to_string(),
                 None,

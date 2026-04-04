@@ -243,14 +243,11 @@ impl AegisRuntime for AegisRuntimeService {
                 .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {e}")))?
         };
 
-        // Let ExecutionService render the agent's prompt_template
-        // instead of bypassing it by setting intent directly. This ensures agents
-        // behave consistently regardless of API type (gRPC, REST, CLI).
         let input = ExecutionInput {
-            intent: None, // Let ExecutionService render agent's prompt_template
-            payload: serde_json::json!({
-                "input": req.input,  // User-provided input
-                "context_overrides": payload,  // Additional context if provided
+            intent: req.intent.filter(|s| !s.is_empty()),
+            input: serde_json::json!({
+                "input": req.input,
+                "context_overrides": payload,
                 "tenant_id": tenant_id.to_string(),
             }),
         };
@@ -1547,7 +1544,7 @@ mod tests {
             max_iterations: 10,
             input: ExecutionInput {
                 intent: Some("generate workflow".to_string()),
-                payload: serde_json::Value::Null,
+                input: serde_json::Value::Null,
             },
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),

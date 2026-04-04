@@ -210,7 +210,7 @@ impl ValidationService {
         let payload_data = serde_json::to_value(&request)?;
         let input = ExecutionInput {
             intent: None,
-            payload: serde_json::json!({
+            input: serde_json::json!({
                 "workflow_input": payload_data,
                 "validation_context": "judge_execution"
             }),
@@ -533,7 +533,7 @@ impl GradientValidator for SemanticAgentValidator {
         // 2. Build input for judge.
         let input = ExecutionInput {
             intent: None,
-            payload: serde_json::json!({
+            input: serde_json::json!({
                 "task": ctx.task,
                 "output": ctx.output,
                 "generation_evidence": generation_evidence,

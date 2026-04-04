@@ -35,6 +35,10 @@ pub enum TaskCommand {
         #[arg(short, long, value_name = "INPUT")]
         input: Option<String>,
 
+        /// Natural-language steering for the agent
+        #[arg(long)]
+        intent: Option<String>,
+
         /// Context override dictionary (JSON/YAML string or @file)
         #[arg(long, value_name = "DICT")]
         context: Option<String>,
@@ -167,6 +171,7 @@ async fn handle_command_daemon(
         TaskCommand::Execute {
             agent,
             input,
+            intent,
             context,
             version,
             wait,
@@ -175,6 +180,7 @@ async fn handle_command_daemon(
             execute_daemon(
                 agent,
                 input,
+                intent,
                 context,
                 version,
                 wait,
@@ -217,6 +223,7 @@ async fn handle_command_daemon(
 async fn execute_daemon(
     agent: String,
     input: Option<String>,
+    intent: Option<String>,
     context: Option<String>,
     version: Option<String>,
     wait: bool,
@@ -270,7 +277,13 @@ async fn execute_daemon(
     }
 
     let execution_id = client
-        .execute_agent(agent_id, input_data, context_overrides, version.as_deref())
+        .execute_agent(
+            agent_id,
+            input_data,
+            intent,
+            context_overrides,
+            version.as_deref(),
+        )
         .await?;
 
     if follow {

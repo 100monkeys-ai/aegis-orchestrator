@@ -15,7 +15,7 @@ use aegis_orchestrator_core::domain::execution::{
 fn make_input(intent: &str) -> ExecutionInput {
     ExecutionInput {
         intent: Some(intent.to_string()),
-        payload: serde_json::json!({}),
+        input: serde_json::json!({}),
     }
 }
 

@@ -315,7 +315,7 @@ impl StandardStimulusService {
 
         let input = ExecutionInput {
             intent: None,
-            payload: json!({
+            input: json!({
                 "stimulus": stimulus.content,
                 "tenant_id": Self::tenant_id_for_stimulus(stimulus).to_string(),
             }),
@@ -597,7 +597,7 @@ mod tests {
                 AgentId::new(),
                 ExecutionInput {
                     intent: None,
-                    payload: json!({}),
+                    input: json!({}),
                 },
                 1,
                 "aegis-system-operator".to_string(),
@@ -930,8 +930,8 @@ mod tests {
         let calls = execution_service.start_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].0, router_agent_id);
-        assert_eq!(calls[0].1.payload["stimulus"], stimulus.content);
-        assert_eq!(calls[0].1.payload["tenant_id"], "tenant-42");
+        assert_eq!(calls[0].1.input["stimulus"], stimulus.content);
+        assert_eq!(calls[0].1.input["tenant_id"], "tenant-42");
 
         assert!(matches!(
             recv_stimulus_event(&mut receiver).await,
@@ -976,7 +976,7 @@ mod tests {
         let execution_calls = execution_service.start_calls();
         assert_eq!(execution_calls.len(), 1);
         assert_eq!(execution_calls[0].0, router_agent_id);
-        assert_eq!(execution_calls[0].1.payload["tenant_id"], "tenant-99");
+        assert_eq!(execution_calls[0].1.input["tenant_id"], "tenant-99");
 
         let calls = starter.calls();
         assert_eq!(calls.len(), 1);

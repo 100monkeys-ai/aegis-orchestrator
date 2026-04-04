@@ -39,8 +39,8 @@ spec:
     prompt_template: |
       {{instruction}}
 
-      Intent: {{workflow.intent}}
-      Language: {{workflow.language}}
+      Intent: {{intent}}
+      Language: {{input.language}}
 
       Agent:
 

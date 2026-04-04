@@ -118,12 +118,15 @@ impl DaemonClient {
         &self,
         agent_id: Uuid,
         input: serde_json::Value,
+        intent: Option<String>,
         context_overrides: Option<serde_json::Value>,
         version: Option<&str>,
     ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct ExecuteRequest {
             input: serde_json::Value,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            intent: Option<String>,
             #[serde(skip_serializing_if = "Option::is_none")]
             context_overrides: Option<serde_json::Value>,
         }
@@ -137,6 +140,7 @@ impl DaemonClient {
             .request(reqwest::Method::POST, url)
             .json(&ExecuteRequest {
                 input,
+                intent,
                 context_overrides,
             })
             .send()

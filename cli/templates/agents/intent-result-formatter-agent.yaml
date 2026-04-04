@@ -23,7 +23,7 @@ spec:
     prompt_template: |
       {{instruction}}
 
-      User's original request: {{workflow.intent}}
+      User's original request: {{intent}}
 
       Code output:
       {{blackboard.EXECUTE_CODE.stdout}}

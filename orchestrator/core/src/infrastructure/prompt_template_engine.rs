@@ -13,8 +13,9 @@
 //!
 //! # Supported Placeholders
 //!
+//! - `{{intent}}` - Caller-supplied free-text intent (ADR-092)
 //! - `{{instruction}}` - Agent's task instruction
-//! - `{{input}}` - User input for this execution
+//! - `{{input}}` - User input (string or structured object supporting `{{input.KEY}}`)
 //! - `{{iteration_number}}` - Current iteration count
 //! - `{{previous_error}}` - Error from previous iteration
 //! - `{{context}}` - Concatenated context attachments
@@ -43,13 +44,20 @@ use std::collections::HashMap;
 /// Context data for prompt template rendering
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PromptContext {
+    /// Caller-supplied intent (free-text steering for the LLM). Rendered as
+    /// `{{intent}}` in the prompt template (ADR-092).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+
     /// Agent's task instruction
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 
-    /// User input for this execution
+    /// Structured user input for this execution.  When a `Value::Object`,
+    /// Handlebars resolves `{{input.KEY}}` via dot-notation natively.  When a
+    /// `Value::String`, `{{input}}` renders the string directly (ADR-092).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input: Option<String>,
+    pub input: Option<serde_json::Value>,
 
     /// Current iteration number (1-based)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -72,6 +80,7 @@ impl PromptContext {
     /// Create a new empty context
     pub fn new() -> Self {
         Self {
+            intent: None,
             instruction: None,
             input: None,
             iteration_number: None,
@@ -81,15 +90,25 @@ impl PromptContext {
         }
     }
 
+    /// Builder-style setter for intent (ADR-092)
+    pub fn intent(mut self, intent: impl Into<String>) -> Self {
+        self.intent = Some(intent.into());
+        self
+    }
+
     /// Builder-style setter for instruction
     pub fn instruction(mut self, instruction: impl Into<String>) -> Self {
         self.instruction = Some(instruction.into());
         self
     }
 
-    /// Builder-style setter for input
-    pub fn input(mut self, input: impl Into<String>) -> Self {
-        self.input = Some(input.into());
+    /// Builder-style setter for input.
+    ///
+    /// Accepts a `serde_json::Value`. When the value is an object, Handlebars
+    /// resolves `{{input.KEY}}` via dot-notation. When the value is a string,
+    /// `{{input}}` renders it directly.
+    pub fn input(mut self, input: serde_json::Value) -> Self {
+        self.input = Some(input);
         self
     }
 
@@ -158,7 +177,7 @@ impl PromptTemplateEngine {
     /// let engine = PromptTemplateEngine::new();
     /// let context = PromptContext::new()
     ///     .instruction("Summarize emails")
-    ///     .input("user@example.com");
+    ///     .input(serde_json::Value::String("user@example.com".to_string()));
     ///
     /// let prompt = engine.render("Task: {{instruction}}\nUser: {{input}}", &context)?;
     /// ```
@@ -182,7 +201,7 @@ impl PromptTemplateEngine {
 
     /// Get the default prompt template
     pub fn default_template() -> &'static str {
-        "{{#if instruction}}Task: {{instruction}}\n\n{{/if}}{{#if input}}Input: {{input}}{{/if}}"
+        "{{#if instruction}}Task: {{instruction}}\n\n{{/if}}{{#if intent}}Intent: {{intent}}\n\n{{/if}}{{#if input}}Input: {{input}}{{/if}}"
     }
 
     /// Validate template syntax without rendering
@@ -231,7 +250,7 @@ mod tests {
         let engine = PromptTemplateEngine::new();
         let context = PromptContext::new()
             .instruction("Write a function")
-            .input("add two numbers");
+            .input(serde_json::Value::String("add two numbers".to_string()));
 
         let template = "Task: {{instruction}}\nInput: {{input}}";
         let result = engine.render(template, &context).unwrap();
@@ -289,7 +308,7 @@ mod tests {
         let engine = PromptTemplateEngine::new();
         let context = PromptContext::new()
             .instruction("Test task")
-            .input("Test input");
+            .input(serde_json::Value::String("Test input".to_string()));
 
         let result = engine
             .render(PromptTemplateEngine::default_template(), &context)
@@ -302,7 +321,9 @@ mod tests {
     #[test]
     fn test_fallback_rendering() {
         let engine = PromptTemplateEngine::new();
-        let context = PromptContext::new().instruction("Test").input("input");
+        let context = PromptContext::new()
+            .instruction("Test")
+            .input(serde_json::Value::String("input".to_string()));
 
         // No template provided - should use default
         let result = engine.render_with_fallback(None, &context).unwrap();

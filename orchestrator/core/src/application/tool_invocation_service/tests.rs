@@ -1493,7 +1493,7 @@ async fn task_logs_tool_returns_paginated_execution_events() {
         agent_id,
         ExecutionInput {
             intent: None,
-            payload: serde_json::json!({"task":"demo"}),
+            input: serde_json::json!({"task":"demo"}),
         },
         3,
         "aegis-system-operator".to_string(),
@@ -1585,7 +1585,7 @@ async fn task_logs_tool_returns_execution_fetch_error() {
         AgentId::new(),
         ExecutionInput {
             intent: None,
-            payload: serde_json::json!({}),
+            input: serde_json::json!({}),
         },
         1,
         "aegis-system-operator".to_string(),
@@ -2039,7 +2039,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         agent_id,
         ExecutionInput {
             intent: None,
-            payload: serde_json::json!({}),
+            input: serde_json::json!({}),
         },
         5,
         "zaru-free".to_string(),

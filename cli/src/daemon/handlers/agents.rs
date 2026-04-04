@@ -36,6 +36,8 @@ pub(crate) struct DeployAgentQuery {
 pub(crate) struct ExecuteRequest {
     input: serde_json::Value,
     #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
     context_overrides: Option<serde_json::Value>,
 }
 
@@ -121,14 +123,13 @@ pub(crate) async fn execute_agent_handler(
         }
     }
 
-    let payload = serde_json::json!({
-        "input": request.input,
-        "context_overrides": request.context_overrides,
-        "tenant_id": tenant_id.to_string(),
-    });
     let input = ExecutionInput {
-        intent: Some(payload.to_string()),
-        payload,
+        intent: request.intent,
+        input: serde_json::json!({
+            "input": request.input,
+            "context_overrides": request.context_overrides,
+            "tenant_id": tenant_id.to_string(),
+        }),
     };
 
     // ADR-083: derive security context from authenticated identity

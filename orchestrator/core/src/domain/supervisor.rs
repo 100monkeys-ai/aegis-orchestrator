@@ -258,7 +258,7 @@ impl Supervisor {
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
-        let execution_context = Self::extract_execution_context(&input.payload);
+        let execution_context = Self::extract_execution_context(&input.input);
 
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
@@ -740,7 +740,7 @@ mod tests {
     fn create_test_input() -> ExecutionInput {
         ExecutionInput {
             intent: Some("Test task".to_string()),
-            payload: serde_json::json!({}),
+            input: serde_json::json!({}),
         }
     }
 
@@ -833,7 +833,7 @@ mod tests {
                 create_test_config(),
                 ExecutionInput {
                     intent: Some("Test task".to_string()),
-                    payload: serde_json::json!({
+                    input: serde_json::json!({
                         "context_overrides": {
                             "repo": "aegis",
                             "owner": "100monkeys"

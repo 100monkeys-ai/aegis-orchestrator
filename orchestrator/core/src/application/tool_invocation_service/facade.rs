@@ -425,7 +425,7 @@ impl ToolInvocationService {
 
                             let input = ExecutionInput {
                                 intent: None,
-                                payload: Self::build_semantic_judge_payload(
+                                input: Self::build_semantic_judge_payload(
                                     execution_id,
                                     execution_objective,
                                     &tool_name,

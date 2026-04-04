@@ -337,7 +337,9 @@ async fn health_ready() -> impl IntoResponse {
 #[derive(serde::Deserialize)]
 pub struct StartExecutionRequest {
     pub agent_id: String,
-    pub input: String,
+    pub input: serde_json::Value,
+    #[serde(default)]
+    pub intent: Option<String>,
     #[serde(default)]
     pub context_overrides: Option<serde_json::Value>,
 }
@@ -351,13 +353,10 @@ async fn start_execution(
         Err(_) => return Json(json!({"error": "Invalid agent ID"})),
     };
 
-    // Let ExecutionService render the agent's prompt_template
-    // instead of bypassing it by setting intent directly. This ensures agents
-    // behave consistently regardless of API type (gRPC, REST, CLI).
     let input = ExecutionInput {
-        intent: None, // Let ExecutionService render agent's prompt_template
-        payload: serde_json::json!({
-            "input": payload.input,  // User-provided input from REST API
+        intent: payload.intent,
+        input: serde_json::json!({
+            "input": payload.input,
             "context_overrides": payload.context_overrides,
         }),
     };

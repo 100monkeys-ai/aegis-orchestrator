@@ -168,10 +168,10 @@ impl ExecutionService for ClusterAwareExecutionService {
             // and potential local fallback.
             let execution_id = ExecutionId::new();
             let tenant_id = input
-                .payload
+                .input
                 .get("tenant_id")
                 .and_then(|v| v.as_str())
-                .or_else(|| input.payload.get("tenant").and_then(|v| v.as_str()))
+                .or_else(|| input.input.get("tenant").and_then(|v| v.as_str()))
                 .and_then(|s| TenantId::from_string(s).ok())
                 .unwrap_or_else(|| {
                     TenantId::from_string(crate::domain::tenant::CONSUMER_SLUG)
@@ -225,10 +225,10 @@ impl ExecutionService for ClusterAwareExecutionService {
     ) -> Result<ExecutionId> {
         if self.should_route() {
             let tenant_id = input
-                .payload
+                .input
                 .get("tenant_id")
                 .and_then(|v| v.as_str())
-                .or_else(|| input.payload.get("tenant").and_then(|v| v.as_str()))
+                .or_else(|| input.input.get("tenant").and_then(|v| v.as_str()))
                 .and_then(|s| TenantId::from_string(s).ok())
                 .unwrap_or_else(|| {
                     TenantId::from_string(crate::domain::tenant::CONSUMER_SLUG)

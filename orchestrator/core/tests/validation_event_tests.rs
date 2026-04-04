@@ -59,7 +59,7 @@ impl ExecutionService for MockExecutionService {
             AgentId::new(),
             ExecutionInput {
                 intent: None,
-                payload: serde_json::Value::Null,
+                input: serde_json::Value::Null,
             },
             3,
             "aegis-system-operator".to_string(),

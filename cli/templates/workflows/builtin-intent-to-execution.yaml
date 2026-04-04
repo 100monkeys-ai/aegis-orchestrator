@@ -17,9 +17,6 @@ metadata:
   input_schema:
     type: object
     properties:
-      intent:
-        type: string
-        description: Natural-language description of what to compute or produce
       language:
         type: string
         description: Target programming language (e.g. python, javascript)
@@ -28,8 +25,6 @@ metadata:
         type: object
         description: Named input values embedded into the generated code
         additionalProperties: true
-    required:
-      - intent
 spec:
   initial_state: DISCOVER_OR_GENERATE_AGENT
 
@@ -46,15 +41,15 @@ spec:
       input: |
         Discover or generate a code-writing agent for this execution request.
 
-        Intent: {{workflow.intent}}
-        Language: {{workflow.language}}
+        Intent: {{intent}}
+        Language: {{input.language}}
 
         Step 1: Call aegis.agent.search with a query that captures the intent
         and target language. If any result has similarity_score >= 0.85, select it.
 
         Step 2: If no match found with sufficient confidence, call
         aegis.agent.generate to create a minimal code-writer agent for
-        {{workflow.language}} that writes working code to a given file path
+        {{input.language}} that writes working code to a given file path
         and prints the result to stdout.
 
         Return JSON: { "agent_name": "<string>", "created": <bool> }
@@ -68,18 +63,18 @@ spec:
       kind: Agent
       agent: "{{DISCOVER_OR_GENERATE_AGENT.output.agent_name}}"
       input: |
-        Write {{workflow.language}} code that fulfills this intent:
+        Write {{input.language}} code that fulfills this intent:
 
-        Intent: {{workflow.intent}}
-        Input values: {{workflow.inputs}}
+        Intent: {{intent}}
+        Input values: {{input.inputs}}
 
         Requirements:
-        1. Write the complete solution to /workspace/solution.{{workflow.language_ext}}
+        1. Write the complete solution to /workspace/solution.{{input.language_ext}}
         2. The solution MUST print its final result to stdout
         3. Embed the input values directly in the code
         4. Use only the standard library — no third-party packages
 
-        Use fs.write to write to /workspace/solution.{{workflow.language_ext}}
+        Use fs.write to write to /workspace/solution.{{input.language_ext}}
         Confirm the write succeeded before returning.
       transitions:
         - condition: on_success
@@ -90,11 +85,11 @@ spec:
     EXECUTE_CODE:
       kind: ContainerRun
       name: execute-user-code
-      image: "{{workflow.container_image}}"
-      command: ["{{workflow.runner}}", "/workspace/solution.{{workflow.language_ext}}"]
+      image: "{{input.container_image}}"
+      command: ["{{input.runner}}", "/workspace/solution.{{input.language_ext}}"]
       workdir: /workspace
       env:
-        INTENT_INPUTS: "{{workflow.inputs_json}}"
+        INTENT_INPUTS: "{{input.inputs_json}}"
       volumes:
         - name: workspace
           mount_path: /workspace
@@ -115,7 +110,7 @@ spec:
       agent: intent-result-formatter-agent
       max_iterations: 1
       input: |
-        The user's original request: {{workflow.intent}}
+        The user's original request: {{intent}}
 
         The code produced this output:
         {{blackboard.EXECUTE_CODE.stdout}}

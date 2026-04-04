@@ -25,14 +25,14 @@ use chrono::Utc;
 fn make_input(intent: &str) -> ExecutionInput {
     ExecutionInput {
         intent: Some(intent.to_string()),
-        payload: serde_json::json!({}),
+        input: serde_json::json!({}),
     }
 }
 
 fn make_input_with_payload(intent: &str, payload: serde_json::Value) -> ExecutionInput {
     ExecutionInput {
         intent: Some(intent.to_string()),
-        payload,
+        input: payload,
     }
 }
 
@@ -810,7 +810,7 @@ fn llm_interaction_preserves_all_fields() {
 fn execution_input_with_intent_and_empty_payload() {
     let input = make_input("deploy to prod");
     assert_eq!(input.intent.as_deref(), Some("deploy to prod"));
-    assert_eq!(input.payload, serde_json::json!({}));
+    assert_eq!(input.input, serde_json::json!({}));
 }
 
 #[test]
@@ -821,14 +821,14 @@ fn execution_input_with_rich_payload() {
     });
     let input = make_input_with_payload("generate code", payload.clone());
     assert_eq!(input.intent.as_deref(), Some("generate code"));
-    assert_eq!(input.payload, payload);
+    assert_eq!(input.input, payload);
 }
 
 #[test]
 fn execution_input_without_intent() {
     let input = ExecutionInput {
         intent: None,
-        payload: serde_json::json!({"raw": true}),
+        input: serde_json::json!({"raw": true}),
     };
     assert!(input.intent.is_none());
 }

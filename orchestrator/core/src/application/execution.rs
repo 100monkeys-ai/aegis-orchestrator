@@ -275,7 +275,8 @@ pub struct StandardExecutionService {
 }
 
 impl StandardExecutionService {
-    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 5] = [
+    const RESERVED_CONTEXT_OVERRIDE_KEYS: [&'static str; 6] = [
+        "intent",
         "instruction",
         "input",
         "iteration_number",
@@ -293,7 +294,7 @@ impl StandardExecutionService {
     }
 
     fn resolve_tenant_from_input(input: &ExecutionInput) -> Result<TenantId> {
-        Self::resolve_tenant_from_payload(&input.payload)
+        Self::resolve_tenant_from_payload(&input.input)
     }
 
     fn is_workspace_mount(path: &str) -> bool {
@@ -851,7 +852,7 @@ mod tests {
             agent_id,
             ExecutionInput {
                 intent: Some("parent".to_string()),
-                payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
             },
             1,
             "aegis-system-operator".to_string(),
@@ -951,7 +952,7 @@ mod tests {
                 judge_agent.id,
                 ExecutionInput {
                     intent: Some("judge".to_string()),
-                    payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                 },
                 parent_execution.id,
             )
@@ -1039,7 +1040,7 @@ mod tests {
                 judge_agent.id,
                 ExecutionInput {
                     intent: Some("judge".to_string()),
-                    payload: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                 },
                 parent_execution.id,
             )
@@ -1153,7 +1154,7 @@ mod tests {
                 child_agent.id,
                 ExecutionInput {
                     intent: Some("child-task".to_string()),
-                    payload: serde_json::json!({ "tenant_id": "other-tenant" }),
+                    input: serde_json::json!({ "tenant_id": "other-tenant" }),
                 },
                 parent_execution.id,
             )
@@ -1346,53 +1347,60 @@ impl SupervisorObserver for ExecutionMonitor {
 }
 
 impl StandardExecutionService {
-    /// Extract user input string from ExecutionInput payload
+    /// Extract structured user input from `ExecutionInput.input` (ADR-092).
     ///
-    /// Handles various input formats with priority order:
-    /// 1. Workflow data: `{"workflow_input": "..."}`  (from WorkflowEngine)
-    /// 2. Direct input: `{"input": "..."}`  (from CLI/API)
-    /// 3. Direct string: `"hello world"`
-    /// 4. Fallback: serialize entire object
-    fn extract_user_input(payload: &serde_json::Value) -> Result<String> {
-        match payload {
-            // Direct string value
-            serde_json::Value::String(s) => Ok(s.clone()),
+    /// Returns a `serde_json::Value` preserving the original structure so that
+    /// Handlebars can resolve `{{input}}` (string) or `{{input.KEY}}`
+    /// (dot-notation into objects) natively.
+    ///
+    /// Priority order:
+    /// 1. Direct string → return as `Value::String`
+    /// 2. Object with `workflow_input` key → return that value as-is
+    /// 3. Object with `input` key → return that value as-is
+    /// 4. Any other object → return the entire object as-is
+    /// 5. Null → error
+    /// 6. Other scalars → return as-is
+    fn extract_user_input(input: &serde_json::Value) -> Result<serde_json::Value> {
+        match input {
+            // Direct string value — pass through
+            serde_json::Value::String(_) => Ok(input.clone()),
 
-            // Object - check for special keys in priority order
+            // Object — check for special keys in priority order
             serde_json::Value::Object(map) => {
                 // Priority 1: workflow_input (from WorkflowEngine)
                 if let Some(value) = map.get("workflow_input") {
-                    return Self::stringify_user_input_value(value);
+                    if value.is_null() {
+                        return Err(ExecutionError::InvalidExecutionInput(
+                            "workflow_input value cannot be null".to_string(),
+                        )
+                        .into());
+                    }
+                    return Ok(value.clone());
                 }
 
                 // Priority 2: input (from CLI/direct calls)
                 if let Some(value) = map.get("input") {
-                    return Self::stringify_user_input_value(value);
+                    if value.is_null() {
+                        return Err(ExecutionError::InvalidExecutionInput(
+                            "Input value cannot be null".to_string(),
+                        )
+                        .into());
+                    }
+                    return Ok(value.clone());
                 }
 
-                // Fallback: serialize the whole object as JSON string
-                Ok(serde_json::to_string_pretty(payload)?)
+                // Fallback: return the entire object as-is (structured input)
+                Ok(input.clone())
             }
 
             // Null or empty
             serde_json::Value::Null => Err(ExecutionError::InvalidExecutionInput(
-                "Payload is null or empty".to_string(),
+                "Input is null or empty".to_string(),
             )
             .into()),
 
-            // Other types: serialize as string representation
-            _ => Ok(payload.to_string()),
-        }
-    }
-
-    fn stringify_user_input_value(value: &serde_json::Value) -> Result<String> {
-        match value {
-            serde_json::Value::String(s) => Ok(s.clone()),
-            serde_json::Value::Null => Err(ExecutionError::InvalidExecutionInput(
-                "Input value cannot be null".to_string(),
-            )
-            .into()),
-            _ => Ok(serde_json::to_string_pretty(value)?),
+            // Other types (bool, number, array): return as-is
+            _ => Ok(input.clone()),
         }
     }
 
@@ -1433,28 +1441,33 @@ impl StandardExecutionService {
         }
     }
 
-    /// Prepare execution input by rendering the agent's prompt template.
+    /// Prepare execution input by rendering the agent's prompt template (ADR-092).
     ///
-    /// Three cases per ADR-092 §D7:
+    /// The prompt template receives three first-class variables:
+    /// - `{{intent}}` — caller-supplied free-text (from `ExecutionInput.intent`)
+    /// - `{{input}}` / `{{input.KEY}}` — structured user input
+    /// - `{{instruction}}` — agent's task instruction from the manifest
     ///
-    /// - **Only `payload`**: render prompt template with `{{input}}` substituted
-    ///   from payload; store result in `intent`.
-    /// - **Only `intent`**: use the caller's free-text directly; skip template
-    ///   rendering (no structured data to inject).
-    /// - **Both `intent` and `payload`**: render prompt template from payload,
-    ///   then prepend the caller's `intent` to the rendered result.
+    /// The template controls layout; the caller's `intent` is passed through
+    /// unmodified (no hardcoded prepend logic).
+    ///
+    /// Three cases:
+    /// - **Only `input`**: render template; store result in `intent`.
+    /// - **Only `intent`**: use caller's free-text directly; skip rendering.
+    /// - **Both**: render template with both `{{intent}}` and `{{input}}`
+    ///   available; store result in `intent`.
     fn prepare_execution_input(
         &self,
         mut input: ExecutionInput,
         agent: &crate::domain::agent::Agent,
     ) -> Result<ExecutionInput> {
-        let context_overrides = Self::extract_context_overrides(&input.payload)?;
+        let context_overrides = Self::extract_context_overrides(&input.input)?;
 
-        // Attempt to extract structured user input from payload.
-        let user_input_result = Self::extract_user_input(&input.payload);
-        let has_payload = user_input_result.is_ok();
+        // Attempt to extract structured user input.
+        let user_input_result = Self::extract_user_input(&input.input);
+        let has_input = user_input_result.is_ok();
 
-        if has_payload {
+        if has_input {
             const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}\n\nUser: {{input}}\nAgent:";
 
             let task_spec = agent
@@ -1478,10 +1491,17 @@ impl StandardExecutionService {
 
             let user_input = user_input_result?;
 
+            // Build PromptContext with intent as a first-class template variable.
+            // The template controls layout — no hardcoded prepend logic.
             let mut context = PromptContext::new()
                 .instruction(agent_instruction)
                 .input(user_input)
                 .iteration_number(1);
+
+            // Pass caller's intent into the template context so `{{intent}}` resolves.
+            if let Some(ref caller_intent) = input.intent {
+                context = context.intent(caller_intent.clone());
+            }
 
             context.extras = context_overrides.clone().into_iter().collect();
 
@@ -1490,18 +1510,12 @@ impl StandardExecutionService {
                 .render(prompt_template, &context)
                 .map_err(|e| ExecutionError::PromptRenderFailed(e.to_string()))?;
 
-            // When both intent and payload are provided, prepend intent to the
-            // rendered prompt so the caller's natural-language steer is visible
-            // to the LLM before the structured content.
-            input.intent = Some(match input.intent.take() {
-                Some(caller_intent) => format!("{caller_intent}\n\n{rendered_prompt}"),
-                None => rendered_prompt,
-            });
+            input.intent = Some(rendered_prompt);
         }
         // else: only intent was supplied — leave it unchanged; no template to render.
 
-        if let serde_json::Value::Object(payload) = &mut input.payload {
-            payload.insert(
+        if let serde_json::Value::Object(input_obj) = &mut input.input {
+            input_obj.insert(
                 "context_overrides".to_string(),
                 JsonValue::Object(context_overrides),
             );
