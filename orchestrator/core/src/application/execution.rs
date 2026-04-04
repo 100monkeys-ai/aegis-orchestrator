@@ -1650,7 +1650,7 @@ impl StandardExecutionService {
         // 1. Fetch Agent
         let agent = self
             .agent_service
-            .get_agent_for_tenant(&tenant_id, agent_id)
+            .get_agent_visible(&tenant_id, agent_id)
             .await?;
 
         // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
@@ -2419,7 +2419,7 @@ impl ExecutionService for StandardExecutionService {
         // 2. Fetch judge agent.
         let agent = self
             .agent_service
-            .get_agent_for_tenant(&tenant_id, agent_id)
+            .get_agent_visible(&tenant_id, agent_id)
             .await?;
         // 3. Prepare input (render judge's prompt template).
         let prepared_input = self.prepare_execution_input(input, &agent)?;
