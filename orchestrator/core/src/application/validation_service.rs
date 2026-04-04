@@ -207,7 +207,7 @@ impl ValidationService {
         poll_interval_ms: u64,
     ) -> Result<(AgentId, GradientResult)> {
         // Prepare input — the judge agent's prompt_template renders against this payload.
-        let payload_data = serde_json::to_value(&request)?;
+        let payload_data = serde_json::Value::String(serde_json::to_string(&request)?);
         let input = ExecutionInput {
             intent: None,
             input: serde_json::json!({
