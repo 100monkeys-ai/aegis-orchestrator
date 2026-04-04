@@ -213,7 +213,10 @@ impl AegisRuntime for AegisRuntimeService {
         let agent_id = if let Ok(id) = AgentId::from_string(&req.agent_id) {
             id
         } else if let Some(ref svc) = self.agent_service {
-            match svc.lookup_agent_for_tenant(&tenant_id, &req.agent_id).await {
+            match svc
+                .lookup_agent_visible_for_tenant(&tenant_id, None, &req.agent_id)
+                .await
+            {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     return Err(Status::not_found(format!(

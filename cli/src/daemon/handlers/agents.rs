@@ -375,7 +375,7 @@ pub(crate) async fn lookup_agent_handler(
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .agent_service
-        .lookup_agent_for_tenant(&tenant_id, &name)
+        .lookup_agent_visible_for_tenant(&tenant_id, None, &name)
         .await
     {
         Ok(Some(id)) => (StatusCode::OK, Json(serde_json::json!({"id": id.0}))),
