@@ -1057,14 +1057,14 @@ mod tests {
     fn extract_context_overrides_rejects_reserved_keys() {
         let err = StandardExecutionService::extract_context_overrides(&serde_json::json!({
             "context_overrides": {
-                "input": "nope"
+                "instruction": "nope"
             }
         }))
         .unwrap_err();
 
         assert!(err
             .to_string()
-            .contains("Context override key 'input' is reserved"));
+            .contains("Context override key 'instruction' is reserved"));
     }
 
     #[test]
