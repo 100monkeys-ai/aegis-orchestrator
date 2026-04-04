@@ -525,6 +525,12 @@ pub enum WorkflowEvent {
         reason: String,
         failed_at: DateTime<Utc>,
     },
+    /// A workflow definition was permanently deleted from the registry.
+    WorkflowRemoved {
+        workflow_id: crate::domain::workflow::WorkflowId,
+        workflow_name: String,
+        removed_at: DateTime<Utc>,
+    },
 }
 
 /// Cortex pattern weight change events (BC-5 Cortex / Learning & Memory Context).

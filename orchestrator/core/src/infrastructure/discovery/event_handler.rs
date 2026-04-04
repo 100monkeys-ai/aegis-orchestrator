@@ -20,6 +20,7 @@ use crate::domain::tenant::TenantId;
 use crate::domain::workflow::WorkflowId;
 use crate::infrastructure::aegis_cortex_proto::{
     IndexAgentRequest, IndexWorkflowRequest, RemoveDiscoveryAgentRequest,
+    RemoveDiscoveryWorkflowRequest,
 };
 use crate::infrastructure::cortex_client::CortexGrpcClient;
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
@@ -104,6 +105,9 @@ impl DiscoveryIndexEventHandler {
             }) => {
                 self.handle_workflow_upsert(&workflow_id, &name, &version)
                     .await;
+            }
+            DomainEvent::Workflow(WorkflowEvent::WorkflowRemoved { workflow_id, .. }) => {
+                self.handle_workflow_remove(&workflow_id).await;
             }
             _ => {} // Ignore other events
         }
@@ -197,6 +201,19 @@ impl DiscoveryIndexEventHandler {
             tracing::warn!(agent_id = %agent_id, error = %e, "Failed to remove agent from Cortex index");
         } else {
             tracing::debug!(agent_id = %agent_id, "Removed agent from Cortex discovery index");
+        }
+    }
+
+    async fn handle_workflow_remove(&self, workflow_id: &WorkflowId) {
+        let req = RemoveDiscoveryWorkflowRequest {
+            workflow_id: workflow_id.to_string(),
+            tenant_id: TenantId::local_default().to_string(),
+        };
+
+        if let Err(e) = self.cortex_client.remove_discovery_workflow(req).await {
+            tracing::warn!(workflow_id = %workflow_id, error = %e, "Failed to remove workflow from Cortex index");
+        } else {
+            tracing::info!(workflow_id = %workflow_id, "Removed workflow from Cortex discovery index");
         }
     }
 

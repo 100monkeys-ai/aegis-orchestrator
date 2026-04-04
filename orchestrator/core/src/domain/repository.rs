@@ -385,6 +385,21 @@ pub trait WorkflowRepository: Send + Sync {
         new_tenant_id: &TenantId,
     ) -> Result<(), RepositoryError>;
 
+    /// Fetch a workflow by ID, falling through to the system tenant if not found in the requesting tenant.
+    ///
+    /// The default implementation performs two sequential `find_by_id_for_tenant` calls.
+    /// Repository implementations may override this with a single-pass query if desired.
+    async fn find_by_id_visible(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> Result<Option<Workflow>, RepositoryError> {
+        if let Some(workflow) = self.find_by_id_for_tenant(tenant_id, id).await? {
+            return Ok(Some(workflow));
+        }
+        self.find_by_id_for_tenant(&TenantId::system(), id).await
+    }
+
     /// Save workflow (create or update)
     async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError> {
         self.save_for_tenant(&TenantId::local_default(), workflow)
@@ -421,6 +436,20 @@ pub trait WorkflowRepository: Send + Sync {
     /// Delete workflow by ID
     async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError> {
         self.delete_for_tenant(&TenantId::local_default(), id).await
+    }
+
+    /// Fetch a workflow by ID, checking the requesting tenant first then falling through to the
+    /// system tenant. Returns `Ok(Some(...))` if found in either tenant, `Ok(None)` if absent
+    /// in both. Mirrors [`AgentLifecycleService::get_agent_visible`].
+    async fn get_workflow_visible(
+        &self,
+        tenant_id: &TenantId,
+        id: WorkflowId,
+    ) -> anyhow::Result<crate::domain::workflow::Workflow> {
+        self.find_by_id_visible(tenant_id, id)
+            .await
+            .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?
+            .ok_or_else(|| anyhow::anyhow!("Workflow not found"))
     }
 }
 

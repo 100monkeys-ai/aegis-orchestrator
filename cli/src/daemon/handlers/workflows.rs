@@ -8,6 +8,7 @@ use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
+use chrono::Utc;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::register_workflow::RegisterWorkflowUseCase;
@@ -265,9 +266,11 @@ pub(crate) async fn delete_workflow_handler(
         .await
     {
         Ok(Some(workflow)) => {
+            let workflow_id = workflow.id;
+            let workflow_name = workflow.metadata.name.clone();
             if let Err(e) = state
                 .workflow_repo
-                .delete_for_tenant(&tenant_id, workflow.id)
+                .delete_for_tenant(&tenant_id, workflow_id)
                 .await
             {
                 return (
@@ -275,6 +278,13 @@ pub(crate) async fn delete_workflow_handler(
                     Json(serde_json::json!({"error": e.to_string()})),
                 );
             }
+            state.event_bus.publish_workflow_event(
+                aegis_orchestrator_core::domain::events::WorkflowEvent::WorkflowRemoved {
+                    workflow_id,
+                    workflow_name,
+                    removed_at: Utc::now(),
+                },
+            );
             (StatusCode::OK, Json(serde_json::json!({"success": true})))
         }
         _ => (
