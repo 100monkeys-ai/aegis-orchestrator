@@ -59,6 +59,10 @@ pub struct RuntimeMetadata {
     /// Human-readable description of this runtime.
     #[serde(default)]
     pub description: String,
+    /// Whether this runtime is deprecated and should not be used for new agents.
+    /// Defaults to `false` when absent from the registry YAML.
+    #[serde(default)]
+    pub deprecated: bool,
 }
 
 /// A single language+version mapping in the registry.
