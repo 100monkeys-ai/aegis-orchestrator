@@ -164,7 +164,7 @@ impl ToolInvocationService {
         let timeout = args
             .get("timeout_seconds")
             .and_then(|v| v.as_u64())
-            .unwrap_or(300);
+            .unwrap_or(600);
 
         let poll_duration = std::time::Duration::from_secs(poll_interval);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
