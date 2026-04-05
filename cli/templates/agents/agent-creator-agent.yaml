@@ -54,6 +54,20 @@ spec:
          - Keep runtime and security settings explicit.
          - Prefer deterministic validation in execution.validation when feasible.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
+         REQUIRED FIELDS — every manifest MUST include ALL of the following or it will be rejected:
+         - spec.task                   (REQUIRED — the task block is mandatory; omitting it produces a hollow shell that cannot run)
+         - spec.task.instruction       (REQUIRED — the core steering instruction for this agent; must be non-empty)
+           The instruction is the system-level directive that defines what the agent does generically.
+           Write it as a complete, role-establishing directive in the imperative voice.
+           Example for a python-code-execution-agent:
+             spec:
+               task:
+                 instruction: |
+                   You are a Python code execution agent. Given a task, write Python code to solve
+                   it, save it to /workspace/solution.py, and execute it using cmd.run. Return the
+                   output along with a brief explanation of the approach.
+           A manifest without spec.task or with an empty spec.task.instruction is INVALID and will
+           be rejected by the schema validator and the manifest parser. Do not submit it.
          - Populate `metadata.tags` with 3 to 5 free-form lowercase hyphenated strings describing the
            agent's capability domain (e.g., "code-generation", "api-integration", "data-analysis",
            "security-review", "infrastructure-automation"). Tags must reflect what the agent does,

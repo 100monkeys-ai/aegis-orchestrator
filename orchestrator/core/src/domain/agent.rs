@@ -927,16 +927,29 @@ impl AgentManifest {
 
         // Execution strategy is optional and validated by its own invariants.
 
-        // Reject a present-but-empty task.instruction — absence of task or instruction is valid
-        if self
-            .spec
-            .task
-            .as_ref()
-            .and_then(|t| t.instruction.as_deref())
-            .map(|s| s.trim().is_empty())
-            .unwrap_or(false)
-        {
-            return Err("task.instruction must not be empty when present".to_string());
+        // spec.task is required — an agent without a task block has no instruction and cannot run
+        match &self.spec.task {
+            None => {
+                return Err(
+                    "spec.task is required — agent must have a non-empty task.instruction"
+                        .to_string(),
+                );
+            }
+            Some(task) => match &task.instruction {
+                None => {
+                    return Err(
+                        "spec.task.instruction is required — agent must have a non-empty task.instruction"
+                            .to_string(),
+                    );
+                }
+                Some(s) if s.trim().is_empty() => {
+                    return Err(
+                        "spec.task.instruction must not be empty — agent must have a non-empty task.instruction"
+                            .to_string(),
+                    );
+                }
+                _ => {}
+            },
         }
 
         Ok(())
