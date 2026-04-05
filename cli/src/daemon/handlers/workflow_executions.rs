@@ -704,7 +704,7 @@ pub(crate) async fn get_workflow_logs_handler(
 
     let workflow_name = match state
         .workflow_repo
-        .find_by_id_for_tenant(&tenant_id, execution.workflow_id)
+        .find_by_id_visible(&tenant_id, execution.workflow_id)
         .await
     {
         Ok(Some(workflow)) => Some(workflow.metadata.name),
@@ -813,7 +813,7 @@ pub(crate) async fn stream_workflow_logs_handler(
 
     let workflow_name = match state
         .workflow_repo
-        .find_by_id_for_tenant(&tenant_id, execution.workflow_id)
+        .find_by_id_visible(&tenant_id, execution.workflow_id)
         .await
     {
         Ok(Some(workflow)) => Some(workflow.metadata.name),

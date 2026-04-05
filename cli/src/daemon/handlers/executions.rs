@@ -139,7 +139,7 @@ pub(crate) async fn list_executions_handler(
     let workflow_id = if let Some(ref wf_name) = query.workflow_name {
         match state
             .workflow_repo
-            .find_by_name_for_tenant(&tenant_id, wf_name)
+            .find_by_name_visible(&tenant_id, wf_name)
             .await
         {
             Ok(Some(wf)) => Some(wf.id),
