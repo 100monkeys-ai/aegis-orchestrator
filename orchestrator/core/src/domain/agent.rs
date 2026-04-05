@@ -186,7 +186,6 @@ pub struct AgentSpec {
 
     /// Optional tools/MCP servers
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    #[schemars(extend("items" = {"type": "string", "minLength": 1}))]
     pub tools: Vec<String>,
 
     /// Optional environment variables
