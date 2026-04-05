@@ -1463,7 +1463,8 @@ impl StandardExecutionService {
         let has_input = user_input_result.is_ok();
 
         if has_input {
-            const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}\n\nUser: {{input}}\nAgent:";
+            const DEFAULT_PROMPT_TEMPLATE: &str =
+                "{{instruction}}{{#if intent}}\n\nTask: {{intent}}{{/if}}\n\nUser: {{input}}\nAgent:";
 
             let task_spec = agent
                 .manifest
