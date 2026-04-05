@@ -143,6 +143,28 @@ Use these when you are ready to configure and build:
 
 ## Development
 
+### Git hooks
+
+A pre-push hook lives in `.githooks/pre-push`. Activate it once after cloning:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+Every `git push` will then run:
+
+```bash
+cargo fmt --all && \
+  cargo clippy --workspace --locked -- -D warnings && \
+  cargo build --release && \
+  cargo test --workspace --locked && \
+  cargo doc --no-deps
+```
+
+The push is blocked if any step fails.
+
+### Building from source
+
 If you want to work from source instead of the install script:
 
 ```bash

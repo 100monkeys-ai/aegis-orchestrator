@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "==> Running pre-push checks..."
+
+cargo fmt --all && \
+  cargo clippy --workspace --locked -- -D warnings && \
+  cargo build --release && \
+  cargo test --workspace --locked && \
+  cargo doc --no-deps
+
+echo "==> Pre-push checks passed."
