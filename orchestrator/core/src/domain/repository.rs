@@ -440,7 +440,7 @@ pub trait WorkflowRepository: Send + Sync {
 
     /// Fetch a workflow by ID, checking the requesting tenant first then falling through to the
     /// system tenant. Returns `Ok(Some(...))` if found in either tenant, `Ok(None)` if absent
-    /// in both. Mirrors [`AgentLifecycleService::get_agent_visible`].
+    /// in both. Mirrors the agent visibility pattern.
     async fn get_workflow_visible(
         &self,
         tenant_id: &TenantId,
