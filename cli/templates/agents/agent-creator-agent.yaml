@@ -111,7 +111,24 @@ spec:
       7. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
-      8. Only after step 7 returns valid:true for the exact YAML you will submit:
+      8. PRE-CREATE NAME COLLISION CHECK — NON-NEGOTIABLE. This step is MANDATORY for every new agent
+         and MUST NOT be skipped, reordered, or collapsed into step 2. Failure to execute this step
+         before calling `aegis.agent.create` is a policy violation that will cause a 409 conflict.
+         - Call `aegis.agent.search` using the exact `metadata.name` of the agent you intend to create
+           as the query string (e.g., {"query": "copywriter-agent"}).
+         - Inspect every result returned: if ANY result has an exact or near-exact name match AND
+           `relevance_score >= 0.80`, you MUST NOT call `aegis.agent.create`. Instead:
+           1. Add a skipped entry to the output with the existing agent's ID and score.
+           2. Return the existing `agent_id` so the caller can use it immediately.
+           Example skipped entry:
+             {"requirement": "copywriter-agent",
+              "reason": "Agent 'copywriter-agent' already exists (id: <agent_id>, relevance_score: 0.95). Returning existing agent ID.",
+              "agent_id": "<agent_id>"}
+         - Only proceed to step 9 if the name search returns NO result with relevance_score >= 0.80
+           against the intended agent name.
+         If `aegis.agent.create` returns a 409 conflict, it means this step was not executed correctly.
+         Do NOT retry the create call — surface the existing agent via `aegis.agent.search` instead.
+      9. Only after step 8 confirms no name collision AND step 7 returns valid:true for the exact YAML you will submit:
          - For new agents: call `aegis.agent.create` with the validated manifest.
          - For updates: call `aegis.agent.update` with the validated manifest.
          - Preserve the exact validated YAML and any returned `manifest_path` from the tool response.
@@ -122,7 +139,7 @@ spec:
            behavior. After fixing the manifest, restart from step 7 (re-validate) before retrying.
       Do not call `aegis.agent.create` or `aegis.agent.update` from a draft manifest, a partially
       composed manifest, or a manifest that has not been schema-validated in the current run.
-      Skipping, reordering, or collapsing steps 1–7 is a policy violation and will cause judge rejection.
+      Skipping, reordering, or collapsing steps 1–8 is a policy violation and will cause judge rejection.
 
       When generating multiple missing agents, handle each manifest independently and repeat the
       full sequence above for every agent. A previous successful validation does not authorize a
