@@ -226,6 +226,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
             id,
             tenant_id: TenantId::system(),
             name: "mock-judge".to_string(),
+            scope: AgentScope::Tenant,
             manifest,
             status: AgentStatus::Active,
             created_at: chrono::Utc::now(),
