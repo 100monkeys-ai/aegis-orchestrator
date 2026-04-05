@@ -361,6 +361,7 @@ fn state_kind_agent_variant() {
         judges: vec![],
         max_iterations: Some(5),
         pre_execution_validator: None,
+        security_context_name: None,
     };
     assert!(matches!(kind, StateKind::Agent { .. }));
 }

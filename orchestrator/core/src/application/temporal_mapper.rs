@@ -154,6 +154,11 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subworkflow_input: Option<String>,
 
+    // Security context
+    /// Optional security context name applied to this state's execution environment
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_context_name: Option<String>,
+
     // Transitions
     pub transitions: Vec<TemporalTransitionRule>,
 }
@@ -278,6 +283,7 @@ impl TemporalWorkflowMapper {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                security_context_name,
             } => {
                 let mapped_judges = if judges.is_empty() {
                     None
@@ -328,6 +334,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    security_context_name: security_context_name.clone(),
                     transitions,
                 })
             }
@@ -370,6 +377,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_mode: None,
                 subworkflow_result_key: None,
                 subworkflow_input: None,
+                security_context_name: None,
                 transitions,
             }),
 
@@ -410,6 +418,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_mode: None,
                 subworkflow_result_key: None,
                 subworkflow_input: None,
+                security_context_name: None,
                 transitions,
             }),
 
@@ -483,6 +492,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    security_context_name: None,
                     transitions,
                 })
             }
@@ -548,6 +558,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    security_context_name: None,
                     transitions,
                 })
             }
@@ -596,6 +607,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    security_context_name: None,
                     transitions,
                 })
             }
@@ -651,6 +663,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: Some(mode_str.to_string()),
                     subworkflow_result_key: result_key.clone(),
                     subworkflow_input: input.clone(),
+                    security_context_name: None,
                     // Transitions
                     transitions,
                 })
@@ -946,6 +959,7 @@ mod tests {
                     judges: vec![],
                     max_iterations: None,
                     pre_execution_validator: None,
+                    security_context_name: None,
                 },
                 transitions: vec![TransitionRule {
                     condition: TransitionCondition::Always,

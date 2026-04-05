@@ -130,6 +130,9 @@ pub enum StateKindYaml {
         /// Optional pre-execution validator agent ID (ADR-049 Pillar 1)
         #[serde(default)]
         pre_execution_validator: Option<String>,
+        /// Optional security context name applied to this state's execution environment
+        #[serde(default)]
+        security_context_name: Option<String>,
     },
     System {
         command: String,
@@ -409,6 +412,7 @@ impl WorkflowParser {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                security_context_name,
             } => StateKind::Agent {
                 agent,
                 input,
@@ -423,6 +427,7 @@ impl WorkflowParser {
                     .collect(),
                 max_iterations,
                 pre_execution_validator,
+                security_context_name,
             },
             StateKindYaml::System {
                 command,
@@ -649,6 +654,7 @@ impl WorkflowParser {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                security_context_name,
             } => StateKindYaml::Agent {
                 agent: agent.clone(),
                 input: input.clone(),
@@ -663,6 +669,7 @@ impl WorkflowParser {
                     .collect(),
                 max_iterations: *max_iterations,
                 pre_execution_validator: pre_execution_validator.clone(),
+                security_context_name: security_context_name.clone(),
             },
             StateKind::System {
                 command,
