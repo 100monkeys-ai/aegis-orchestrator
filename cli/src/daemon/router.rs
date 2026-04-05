@@ -44,6 +44,7 @@ use crate::daemon::handlers::seal::{
     attest_seal_handler, invoke_seal_handler, list_seal_tools_handler,
 };
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
+use crate::daemon::handlers::tenant_provisioning::keycloak_event_handler;
 use crate::daemon::handlers::workflow_executions::{
     cancel_workflow_execution_handler, get_workflow_execution_handler, get_workflow_logs_handler,
     list_workflow_executions_handler, remove_workflow_execution_handler,
@@ -210,6 +211,8 @@ pub(crate) fn create_router(
             get(list_api_keys_handler).post(create_api_key_handler),
         )
         .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
+        // Keycloak webhook for tenant provisioning (ADR-097)
+        .route("/v1/webhooks/keycloak", post(keycloak_event_handler))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {

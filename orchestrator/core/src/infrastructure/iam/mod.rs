@@ -5,6 +5,7 @@
 //! Implements [`crate::domain::iam::IdentityProvider`] using JWKS endpoint
 //! fetching, JWT signature verification, and claim extraction.
 
+pub mod keycloak_admin_client;
 pub mod keycloak_iam_service;
 
 pub use keycloak_iam_service::StandardIamService;

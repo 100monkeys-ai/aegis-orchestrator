@@ -386,6 +386,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             realms: resolved_realms,
             jwks_cache_ttl_seconds: iam.jwks_cache_ttl_seconds,
             claims: iam.claims.clone(),
+            keycloak_admin: iam.keycloak_admin.clone(),
         };
         Arc::new(StandardIamService::new(&resolved_iam, event_bus.clone()))
             as Arc<dyn IdentityProvider>
@@ -1390,6 +1391,59 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    // Tenant Provisioning Service (ADR-097)
+    // Requires both a database pool (for TenantRepository) and Keycloak admin credentials.
+    let tenant_provisioning_service: Option<
+        Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
+    > = {
+        let tenant_repo: Option<Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>> =
+            db_pool.as_ref().map(|pool| {
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::repositories::postgres_tenant::PostgresTenantRepository::new(pool.clone()),
+                ) as Arc<dyn aegis_orchestrator_core::domain::repository::TenantRepository>
+            });
+
+        let keycloak_admin_client = config
+            .spec
+            .iam
+            .as_ref()
+            .and_then(|iam| iam.keycloak_admin.as_ref())
+            .map(|admin_cfg| {
+                let host = resolve_env_value(&admin_cfg.host)
+                    .unwrap_or_else(|_| admin_cfg.host.clone());
+                let username = resolve_env_value(&admin_cfg.admin_username)
+                    .unwrap_or_else(|_| admin_cfg.admin_username.clone());
+                let password = resolve_env_value(&admin_cfg.admin_password)
+                    .unwrap_or_else(|_| admin_cfg.admin_password.clone());
+                Arc::new(
+                    aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminClient::new(
+                        aegis_orchestrator_core::infrastructure::iam::keycloak_admin_client::KeycloakAdminConfig {
+                            host,
+                            admin_username: username,
+                            admin_password: password,
+                        },
+                    ),
+                )
+            });
+
+        match (tenant_repo, keycloak_admin_client) {
+            (Some(repo), Some(client)) => {
+                info!("Tenant provisioning service initialized (ADR-097)");
+                Some(Arc::new(
+                    aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService::new(
+                        repo,
+                        client,
+                        event_bus.clone(),
+                    ),
+                ))
+            }
+            _ => {
+                debug!("Tenant provisioning service disabled (requires database + keycloak_admin config)");
+                None
+            }
+        }
+    };
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1424,6 +1478,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             Arc::new(aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository::new(pool.clone()))
         }),
         iam_service: iam_service.clone(),
+        tenant_provisioning_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };
