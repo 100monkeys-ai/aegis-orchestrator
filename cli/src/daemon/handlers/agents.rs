@@ -73,7 +73,13 @@ pub(crate) async fn deploy_agent_handler(
 
     match state
         .agent_service
-        .deploy_agent_for_tenant(&effective_tenant_id, manifest, query.force, agent_scope)
+        .deploy_agent_for_tenant(
+            &effective_tenant_id,
+            manifest,
+            query.force,
+            agent_scope,
+            identity.as_ref().map(|e| &e.0),
+        )
         .await
     {
         Ok(id) => (StatusCode::OK, Json(serde_json::json!({"agent_id": id.0}))),

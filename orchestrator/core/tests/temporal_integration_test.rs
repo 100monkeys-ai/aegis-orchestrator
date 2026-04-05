@@ -46,6 +46,7 @@ impl AgentLifecycleService for MockAgentServiceInt {
         manifest: AgentManifest,
         force: bool,
         _scope: aegis_orchestrator_core::domain::agent::AgentScope,
+        _caller_identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
     ) -> anyhow::Result<AgentId> {
         self.deploy_agent(manifest, force).await
     }

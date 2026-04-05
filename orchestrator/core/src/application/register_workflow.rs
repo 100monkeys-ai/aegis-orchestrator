@@ -295,6 +295,7 @@ mod tests {
             manifest: AgentManifest,
             force: bool,
             _scope: crate::domain::agent::AgentScope,
+            _caller_identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> anyhow::Result<AgentId> {
             self.deploy_agent(manifest, force).await
         }

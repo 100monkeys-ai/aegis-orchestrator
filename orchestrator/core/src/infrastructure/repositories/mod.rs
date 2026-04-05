@@ -291,6 +291,7 @@ impl AgentLifecycleService for InMemoryAgentRepository {
         manifest: AgentManifest,
         force: bool,
         scope: AgentScope,
+        _caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> anyhow::Result<AgentId> {
         if let Some(existing) = self
             .find_by_name_for_tenant(tenant_id, &manifest.metadata.name)

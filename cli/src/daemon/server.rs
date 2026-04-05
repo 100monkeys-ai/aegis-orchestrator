@@ -677,9 +677,56 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     }
     info!(port = nfs_bind_port, "NFS Server Gateway started");
 
+    // Initialize security context repository early — needed by StandardAgentLifecycleService (ADR-102).
+    let security_context_repo: Arc<
+        dyn aegis_orchestrator_core::domain::security_context::repository::SecurityContextRepository,
+    > = {
+        let repo = aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new();
+
+        // Seed security contexts from aegis-config.yaml (ADR-071 §ZaruTier SecurityContext Definitions)
+        if let Some(definitions) = &config.spec.security_contexts {
+            for def in definitions {
+                let capabilities = def
+                    .capabilities
+                    .iter()
+                    .map(|cap| aegis_orchestrator_core::domain::security_context::Capability {
+                        tool_pattern: cap.tool_pattern.clone(),
+                        path_allowlist: cap.path_allowlist.as_ref().map(|paths| {
+                            paths.iter().map(std::path::PathBuf::from).collect()
+                        }),
+                        command_allowlist: cap.command_allowlist.clone(),
+                        subcommand_allowlist: None,
+                        domain_allowlist: cap.domain_allowlist.clone(),
+                        max_response_size: None,
+                        rate_limit: None,
+                    })
+                    .collect();
+
+                let context = aegis_orchestrator_core::domain::security_context::SecurityContext {
+                    name: def.name.clone(),
+                    description: def.description.clone(),
+                    capabilities,
+                    deny_list: def.deny_list.clone(),
+                    metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
+                        created_at: chrono::Utc::now(),
+                        updated_at: chrono::Utc::now(),
+                        version: 1,
+                    },
+                };
+
+                repo.save(context).await?;
+                info!("Loaded security context: {}", def.name);
+            }
+            info!("Loaded {} security contexts from config", definitions.len());
+        }
+
+        Arc::new(repo)
+    };
+
     let agent_service = Arc::new(StandardAgentLifecycleService::new(
         agent_repo.clone(),
         event_bus.clone(),
+        security_context_repo.clone(),
     ));
 
     // Load StandardRuntime registry (ADR-043)
@@ -1142,51 +1189,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // --- Initialize SEAL / Tool Routing Services ---
     info!("Configuring SEAL & Tool Routing repositories and services...");
 
-    // Repositories
-    let security_context_repo: Arc<
-        dyn aegis_orchestrator_core::domain::security_context::repository::SecurityContextRepository,
-    > = {
-        let repo = aegis_orchestrator_core::infrastructure::security_context::InMemorySecurityContextRepository::new();
-
-        // Seed security contexts from aegis-config.yaml (ADR-071 §ZaruTier SecurityContext Definitions)
-        if let Some(definitions) = &config.spec.security_contexts {
-            for def in definitions {
-                let capabilities = def
-                    .capabilities
-                    .iter()
-                    .map(|cap| aegis_orchestrator_core::domain::security_context::Capability {
-                        tool_pattern: cap.tool_pattern.clone(),
-                        path_allowlist: cap.path_allowlist.as_ref().map(|paths| {
-                            paths.iter().map(std::path::PathBuf::from).collect()
-                        }),
-                        command_allowlist: cap.command_allowlist.clone(),
-                        subcommand_allowlist: None,
-                        domain_allowlist: cap.domain_allowlist.clone(),
-                        max_response_size: None,
-                        rate_limit: None,
-                    })
-                    .collect();
-
-                let context = aegis_orchestrator_core::domain::security_context::SecurityContext {
-                    name: def.name.clone(),
-                    description: def.description.clone(),
-                    capabilities,
-                    deny_list: def.deny_list.clone(),
-                    metadata: aegis_orchestrator_core::domain::security_context::SecurityContextMetadata {
-                        created_at: chrono::Utc::now(),
-                        updated_at: chrono::Utc::now(),
-                        version: 1,
-                    },
-                };
-
-                repo.save(context).await?;
-                info!("Loaded security context: {}", def.name);
-            }
-            info!("Loaded {} security contexts from config", definitions.len());
-        }
-
-        Arc::new(repo)
-    };
+    // Note: security_context_repo was initialized earlier (before agent_service) — see above.
 
     let seal_session_repo: Arc<
         dyn aegis_orchestrator_core::domain::seal_session_repository::SealSessionRepository,
@@ -1935,6 +1938,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                                 manifest,
                                 force_builtins,
                                 aegis_orchestrator_core::domain::agent::AgentScope::Global,
+                                None,
                             )
                             .await
                         {

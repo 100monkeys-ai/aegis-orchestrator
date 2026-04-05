@@ -20,6 +20,7 @@
 //! - Fail closed on malformed or incomplete agent definitions.
 
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
+use crate::domain::iam::UserIdentity;
 use crate::domain::repository::AgentVersion;
 use crate::domain::tenant::TenantId;
 use anyhow::Result;
@@ -42,6 +43,7 @@ pub trait AgentLifecycleService: Send + Sync {
         manifest: AgentManifest,
         force: bool,
         scope: AgentScope,
+        caller_identity: Option<&UserIdentity>,
     ) -> Result<AgentId>;
 
     async fn get_agent_for_tenant(&self, tenant_id: &TenantId, id: AgentId) -> Result<Agent>;
@@ -104,6 +106,7 @@ pub trait AgentLifecycleService: Send + Sync {
             manifest,
             force,
             AgentScope::Tenant,
+            None,
         )
         .await
     }

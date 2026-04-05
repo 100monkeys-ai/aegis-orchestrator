@@ -9,7 +9,7 @@ metadata:
     category: platform
     capability: workflow-authoring
 spec:
-  type: system
+  security_context: aegis-system-agent-runtime
   runtime:
     language: python
     version: "3.11"

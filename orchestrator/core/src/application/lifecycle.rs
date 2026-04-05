@@ -24,7 +24,9 @@
 use crate::application::agent::AgentLifecycleService;
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
 use crate::domain::events::AgentLifecycleEvent;
+use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::repository::AgentRepository;
+use crate::domain::security_context::repository::SecurityContextRepository;
 use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::Result;
@@ -35,13 +37,19 @@ use std::sync::Arc;
 pub struct StandardAgentLifecycleService {
     repository: Arc<dyn AgentRepository>,
     event_bus: Arc<EventBus>,
+    security_context_repo: Arc<dyn SecurityContextRepository>,
 }
 
 impl StandardAgentLifecycleService {
-    pub fn new(repository: Arc<dyn AgentRepository>, event_bus: Arc<EventBus>) -> Self {
+    pub fn new(
+        repository: Arc<dyn AgentRepository>,
+        event_bus: Arc<EventBus>,
+        security_context_repo: Arc<dyn SecurityContextRepository>,
+    ) -> Self {
         Self {
             repository,
             event_bus,
+            security_context_repo,
         }
     }
 }
@@ -54,9 +62,35 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         manifest: AgentManifest,
         force: bool,
         scope: AgentScope,
+        caller_identity: Option<&UserIdentity>,
     ) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // ADR-102: Only Operators and ServiceAccounts may register agents with aegis-system-* contexts.
+        if let Some(ctx) = &manifest.spec.security_context {
+            if ctx.starts_with("aegis-system-") {
+                let permitted = matches!(
+                    caller_identity.map(|id| &id.identity_kind),
+                    Some(IdentityKind::Operator { .. }) | Some(IdentityKind::ServiceAccount { .. })
+                );
+                if !permitted {
+                    anyhow::bail!(
+                        "Forbidden: only platform operators may register agents \
+                         with an aegis-system-* security context"
+                    );
+                }
+            }
+            // Validate the named security context exists.
+            if self
+                .security_context_repo
+                .find_by_name(ctx)
+                .await?
+                .is_none()
+            {
+                anyhow::bail!("Unknown security context: '{ctx}'");
+            }
+        }
 
         // Check if an agent with the same name already exists
         if let Some(existing) = self

@@ -1500,6 +1500,7 @@ mod tests {
             _manifest: crate::domain::agent::AgentManifest,
             _force: bool,
             _scope: crate::domain::agent::AgentScope,
+            _caller_identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<AgentId> {
             Err(anyhow!(
                 "NoopAgentLifecycleService: deploy_agent_for_tenant not implemented"

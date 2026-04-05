@@ -178,6 +178,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
         _manifest: AgentManifest,
         _force: bool,
         _scope: AgentScope,
+        _caller_identity: Option<&aegis_orchestrator_core::domain::iam::UserIdentity>,
     ) -> anyhow::Result<AgentId> {
         anyhow::bail!("MockAgentLifecycleService: deploy_agent_for_tenant not exercised")
     }

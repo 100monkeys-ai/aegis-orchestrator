@@ -71,6 +71,7 @@ impl ToolInvocationService {
                 manifest.clone(),
                 force,
                 crate::domain::agent::AgentScope::Tenant,
+                None,
             )
             .await
         {

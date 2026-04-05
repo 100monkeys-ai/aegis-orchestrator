@@ -1658,11 +1658,14 @@ impl StandardExecutionService {
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
 
-        // ADR-101: System agents always run under aegis-system-agent-runtime regardless of caller tier.
-        let security_context_name = match agent.manifest.spec.agent_type {
-            crate::domain::agent::AgentType::System => "aegis-system-agent-runtime".to_string(),
-            crate::domain::agent::AgentType::User => security_context_name,
-        };
+        // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
+        let security_context_name = agent
+            .manifest
+            .spec
+            .security_context
+            .as_deref()
+            .map(|s| s.to_string())
+            .unwrap_or(security_context_name);
 
         // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
         if let Some(router) = &self.tool_router {

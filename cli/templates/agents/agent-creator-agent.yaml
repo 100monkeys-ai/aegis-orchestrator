@@ -9,7 +9,7 @@ metadata:
     category: platform
     capability: agent-authoring
 spec:
-  type: system
+  security_context: aegis-system-agent-runtime
   runtime:
     language: python
     version: "3.11"
@@ -121,6 +121,10 @@ spec:
            `required` for mandatory fields. Omit `input_schema` entirely when the agent
            only accepts a free-form string via `{{input}}` with no named fields. Do not
            invent an `input_schema` for agents that do not benefit from one.
+         SECURITY CONTEXT — STRICTLY FORBIDDEN IN GENERATED MANIFESTS:
+         - Generated manifests MUST NOT include `spec.security_context`. This field is
+           reserved for platform operators only (ADR-102). Including it in a generated
+           manifest is a policy violation and the deployment will be rejected.
       7. Call `aegis.schema.validate` with {"kind": "agent", "manifest_yaml": "<your yaml>"} and confirm
          the response is {"valid": true, "errors": []}. If valid is false, fix every listed error
          and re-validate before proceeding.
