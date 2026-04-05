@@ -61,11 +61,12 @@ spec:
         Language: {{input.language}}
 
         Step 1: Call aegis.agent.search with a query that captures the intent
-        and target language. If any result has similarity_score >= 0.85, select it.
+        and target language. If any result has relevance_score >= 0.75, you MUST
+        select it — do NOT call aegis.agent.generate.
 
-        Step 2: If no match found with sufficient confidence, call
-        aegis.agent.generate to create a minimal code-writer agent for
-        {{input.language}} that writes working code to a given file path
+        Step 2: Only if no result has relevance_score >= 0.75 (or search returns
+        zero results), call aegis.agent.generate to create a minimal code-writer
+        agent for {{input.language}} that writes working code to a given file path
         and prints the result to stdout.
 
         Return JSON: { "agent_name": "<string>", "created": <bool> }
