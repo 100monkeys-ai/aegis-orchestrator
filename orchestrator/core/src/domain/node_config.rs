@@ -1236,6 +1236,11 @@ pub struct IamConfig {
     /// Custom claim names for OIDC attribute mappers.
     #[serde(default)]
     pub claims: IamClaimsConfig,
+
+    /// Keycloak Admin REST API credentials for tenant provisioning (ADR-097).
+    /// If omitted, automatic tenant provisioning on user signup is disabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keycloak_admin: Option<KeycloakAdminConfig>,
 }
 
 /// Individual realm configuration entry within `spec.iam.realms`.
@@ -1265,6 +1270,20 @@ pub struct IamClaimsConfig {
     /// Custom claim mapper name for per-user tenant ID (ADR-097). Default: "tenant_id"
     #[serde(default = "default_tenant_id_claim")]
     pub tenant_id: String,
+}
+
+/// Keycloak Admin REST API credentials (ADR-097).
+///
+/// Used by [`crate::application::tenant_provisioning::TenantProvisioningService`]
+/// to stamp `tenant_id` user attributes on newly registered consumer users.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeycloakAdminConfig {
+    /// Keycloak base URL (e.g. `https://auth.aegis.local`). Supports `env:VAR` syntax.
+    pub host: String,
+    /// Admin username for the `master` realm. Supports `env:VAR` syntax.
+    pub admin_username: String,
+    /// Admin password for the `master` realm. Supports `env:VAR` syntax.
+    pub admin_password: String,
 }
 
 impl Default for IamClaimsConfig {

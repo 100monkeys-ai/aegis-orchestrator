@@ -61,6 +61,9 @@ pub(crate) struct AppState {
         Arc<aegis_orchestrator_core::infrastructure::repositories::PostgresApiKeyRepository>,
     >,
     pub(crate) iam_service: Option<Arc<dyn IdentityProvider>>,
+    pub(crate) tenant_provisioning_service: Option<
+        Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
+    >,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
 }

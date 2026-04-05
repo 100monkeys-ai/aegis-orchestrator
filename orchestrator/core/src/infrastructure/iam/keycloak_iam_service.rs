@@ -614,6 +614,7 @@ mod tests {
             ],
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus);
@@ -636,6 +637,7 @@ mod tests {
             realms: vec![],
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus);
@@ -665,6 +667,7 @@ mod tests {
             realms: vec![],
             jwks_cache_ttl_seconds: 300,
             claims: IamClaimsConfig::default(),
+            keycloak_admin: None,
         };
         let event_bus = Arc::new(EventBus::with_default_capacity());
         let service = StandardIamService::new(&config, event_bus);

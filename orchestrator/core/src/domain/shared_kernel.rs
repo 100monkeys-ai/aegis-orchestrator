@@ -218,6 +218,13 @@ impl TenantId {
         Self::consumer()
     }
 
+    /// Generate a per-user tenant slug from a Keycloak `sub` claim (ADR-097).
+    /// Format: `u-{uuid_without_hyphens}`
+    pub fn for_consumer_user(sub: &str) -> Result<Self, TenantIdError> {
+        let slug = format!("u-{}", sub.replace('-', ""));
+        Self::new(slug)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }

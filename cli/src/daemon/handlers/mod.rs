@@ -19,6 +19,7 @@ pub(crate) mod health;
 pub(crate) mod observability;
 pub(crate) mod seal;
 pub(crate) mod swarms;
+pub(crate) mod tenant_provisioning;
 pub(crate) mod workflow_executions;
 pub(crate) mod workflows;
 

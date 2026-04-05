@@ -1139,6 +1139,14 @@ pub enum TenantEvent {
         limit: u64,
         exceeded_at: DateTime<Utc>,
     },
+    /// Consumer user's per-user tenant provisioned at signup (ADR-097)
+    UserTenantProvisioned {
+        tenant_slug: String,
+        user_sub: String,
+        tier: String,
+        keycloak_realm: String,
+        provisioned_at: DateTime<Utc>,
+    },
 }
 
 /// Rate limit enforcement events (ADR-072).
