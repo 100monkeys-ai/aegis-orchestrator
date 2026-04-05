@@ -339,6 +339,7 @@ impl InnerLoopService {
                         content: text,
                         tool_calls_executed: ctx.iterations as u32,
                         conversation: ctx.conversation.clone(),
+                        trajectory: ctx.trajectory.clone(),
                     };
 
                     let execution_id = ExecutionId(uuid::Uuid::parse_str(execution_id_str)?);

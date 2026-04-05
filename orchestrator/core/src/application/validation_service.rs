@@ -580,16 +580,16 @@ impl GradientValidator for SemanticAgentValidator {
         let generation_evidence = extract_json_from_text(&ctx.output)
             .and_then(|json| serde_json::from_str::<serde_json::Value>(&json).ok())
             .or_else(|| serde_json::from_str::<serde_json::Value>(&ctx.output).ok());
+        // Use the live trajectory threaded through ValidationContext to avoid the
+        // DB fetch race where store_iteration_trajectory may not yet be visible
+        // when this validator runs.
+        let tool_audit_history = ctx.tool_trajectory.clone();
         let current_iter = self
             .execution_service
             .get_execution(self.parent_execution_id)
             .await
             .ok()
             .and_then(|execution| execution.current_iteration().cloned());
-        let tool_audit_history = current_iter
-            .as_ref()
-            .and_then(|iter| iter.trajectory.clone())
-            .unwrap_or_default();
         let mut policy_violations: Vec<String> = ctx.policy_violations.clone();
         if let Some(iter) = &current_iter {
             for v in &iter.policy_violations {

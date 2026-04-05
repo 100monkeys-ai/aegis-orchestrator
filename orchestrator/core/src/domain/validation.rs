@@ -149,6 +149,10 @@ pub struct ValidationContext {
     pub worker_mounts: Vec<String>,
     /// Tool names that were blocked by policy during this iteration.
     pub policy_violations: Vec<String>,
+    /// Live tool trajectory from the inner loop — threaded directly to avoid a
+    /// DB fetch race where `store_iteration_trajectory` may not yet be visible
+    /// when the judge reads the execution record.
+    pub tool_trajectory: Vec<crate::domain::execution::TrajectoryStep>,
 }
 
 /// Extract the first JSON value from `text`, stripping markdown code fences.

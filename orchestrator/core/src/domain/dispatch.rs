@@ -96,6 +96,10 @@ pub enum OrchestratorMessage {
         tool_calls_executed: u32,
         #[serde(default)]
         conversation: Vec<ConversationMessage>,
+        /// Live tool trajectory from the inner loop, carried out so callers
+        /// (e.g. validation pipeline) can use it without a DB fetch.
+        #[serde(default)]
+        trajectory: Vec<crate::domain::execution::TrajectoryStep>,
     },
     Dispatch {
         dispatch_id: DispatchId,

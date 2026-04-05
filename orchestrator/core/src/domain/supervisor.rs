@@ -460,6 +460,8 @@ impl Supervisor {
                         .map(|m| m.mount_point.to_string_lossy().to_string())
                         .collect(),
                     policy_violations: vec![],
+                    // Docker runtime path has no inner-loop trajectory.
+                    tool_trajectory: vec![],
                 };
                 match pipeline.validate(&ctx).await {
                     Ok(pipeline_result) => {
