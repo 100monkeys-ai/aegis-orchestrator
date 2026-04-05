@@ -408,6 +408,7 @@ impl StandardExecutionService {
                 1000,
                 read_policy.clone(),
                 mount.mount_point.clone(),
+                mount.remote_path.clone(),
             );
             mounts.push(mount);
         }
@@ -907,6 +908,7 @@ mod tests {
                 write: vec!["/*".to_string()],
             },
             PathBuf::from("/workspace/project"),
+            String::new(),
         );
 
         let agent_repo = Arc::new(InMemoryAgentRepository::new());
@@ -2700,6 +2702,7 @@ impl ExecutionService for StandardExecutionService {
                     1000, // container_gid
                     policy,
                     mount.mount_point.clone(),
+                    mount.remote_path.clone(),
                 );
                 tracing::info!(
                     "Registered own volume {} with NFS gateway for child execution {}",

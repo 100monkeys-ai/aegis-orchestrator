@@ -490,6 +490,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                         container_gid: 1000,
                         policy: FsalAccessPolicy::default(),
                         mount_point: PathBuf::from("/workspace"),
+                        remote_path: String::new(),
                     });
 
                 return Ok(fattr3 {
