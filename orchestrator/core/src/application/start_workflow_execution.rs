@@ -367,6 +367,7 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
             .start_workflow(
                 &workflow_id,
                 execution_id,
+                tenant_id.as_str(),
                 match &request.input {
                     serde_json::Value::Object(map) => {
                         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
@@ -486,6 +487,7 @@ mod tests {
             &self,
             workflow_id: &str,
             execution_id: ExecutionId,
+            _tenant_id: &str,
             input: HashMap<String, serde_json::Value>,
             blackboard: Option<HashMap<String, serde_json::Value>>,
             _security_context_name: Option<String>,

@@ -27,6 +27,7 @@ pub trait WorkflowEnginePort: Send + Sync {
         &self,
         workflow_id: &str,
         execution_id: ExecutionId,
+        tenant_id: &str,
         input: HashMap<String, Value>,
         blackboard: Option<HashMap<String, Value>>,
         security_context_name: Option<String>,

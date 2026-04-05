@@ -668,6 +668,7 @@ impl aegis_orchestrator_core::application::ports::WorkflowEnginePort for Recordi
         &self,
         workflow_id: &str,
         execution_id: ExecutionId,
+        _tenant_id: &str,
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
         _security_context_name: Option<String>,
@@ -848,6 +849,7 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
         .start_workflow(
             "workflow-alpha",
             execution_id.clone(),
+            "aegis-system",
             input.clone(),
             None,
             None,

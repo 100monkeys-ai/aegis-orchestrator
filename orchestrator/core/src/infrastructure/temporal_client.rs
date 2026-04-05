@@ -47,6 +47,7 @@
 //! let run_id = client.start_workflow(
 //!     "my-workflow",
 //!     execution_id,
+//!     "tenant-slug",
 //!     input_params
 //! ).await?;
 //! ```
@@ -124,6 +125,7 @@ impl TemporalClient {
         &self,
         workflow_id: &str,
         execution_id: ExecutionId,
+        tenant_id: &str,
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
         security_context_name: Option<String>,
@@ -141,6 +143,7 @@ impl TemporalClient {
             "input": input,
             "blackboard": blackboard,
             "security_context_name": security_context_name,
+            "tenant_id": tenant_id,
         });
         if let Some(intent_val) = intent {
             input_obj["intent"] = serde_json::Value::String(intent_val);
@@ -334,6 +337,7 @@ impl WorkflowEnginePort for TemporalClient {
         &self,
         workflow_id: &str,
         execution_id: ExecutionId,
+        tenant_id: &str,
         input: HashMap<String, serde_json::Value>,
         blackboard: Option<HashMap<String, serde_json::Value>>,
         security_context_name: Option<String>,
@@ -343,6 +347,7 @@ impl WorkflowEnginePort for TemporalClient {
             self,
             workflow_id,
             execution_id,
+            tenant_id,
             input,
             blackboard,
             security_context_name,
