@@ -124,6 +124,25 @@ impl StorageProvider for SeaweedFSAdapter {
             }
         }
 
+        // SeaweedFS metadata-only directories are not physically present in the
+        // backing store until a file exists inside them. Write a zero-byte
+        // sentinel so that subsequent PUT requests to the directory succeed
+        // instead of returning "Directory not found".
+        let keep_path = format!("{}/.keep", path.trim_end_matches('/'));
+        let keep_url = self.build_url(&keep_path);
+        let keep_response = self
+            .client
+            .put(&keep_url)
+            .body(Vec::<u8>::new())
+            .send()
+            .await?;
+        if !keep_response.status().is_success() {
+            let status = keep_response.status();
+            return Err(StorageError::Unknown(format!(
+                "Failed to write .keep sentinel to {keep_path}: HTTP {status}"
+            )));
+        }
+
         Ok(())
     }
 
