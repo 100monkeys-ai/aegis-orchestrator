@@ -24,16 +24,31 @@ spec:
       2. If the best result has similarity_score >= 0.85, use that agent as-is.
 
       3. If no sufficient match exists (similarity_score < 0.85 or no results), call
-         aegis.agent.generate to create one. The input to aegis.agent.generate MUST be a
-         capability description, NOT the user's task. Derive the capability from the intent:
-         - Extract the language and computation domain (math, string manipulation, data
-           processing, etc.)
-         - Frame it as: "Create a <language> code-writing agent that can solve <domain>
-           problems. The agent should write a self-contained script, execute it, and return
-           the result."
-         - Example: intent="add two numbers in python" →
-           input="Create a Python code-writing agent that solves computational math problems.
-           Write a self-contained script that performs the calculation and prints the result."
+         aegis.agent.generate to create one. The input to aegis.agent.generate MUST describe a reusable capability archetype,
+         NOT the specific task. Decompose the intent into its underlying capability domain.
+
+         RULE: Agent names and descriptions must reflect WHAT THE AGENT CAN DO, not WHAT
+         THE USER WANTS DONE RIGHT NOW. The specific task is carried by `intent` at execution
+         time — not baked into the agent definition.
+
+         CORRECT decomposition examples:
+         - intent="write a blog post about fast cars" → capability="copywriter-agent: writes
+           high-quality copy on any topic provided at execution time"
+         - intent="add two numbers in python" → capability="python-code-execution-agent:
+           writes and executes Python scripts for computational tasks"
+         - intent="summarize this PDF" → capability="document-summarizer-agent: summarizes
+           documents and text provided at execution time"
+         - intent="send a Slack message to #dev" → capability="slack-notifier-agent: sends
+           messages to Slack channels via the Slack API"
+
+         WRONG (too specific, never reuse):
+         - "blog-post-about-cars-agent"
+         - "add-two-numbers-agent"
+         - "summarize-quarterly-report-agent"
+
+         Derive the archetype: strip the specific subject/object from the intent, keep the
+         verb/capability domain, and name the agent after what it does generically.
+
          - aegis.agent.generate returns { "status": "started", "execution_id": "<id>" }.
            After calling it, immediately call aegis.agent.wait with that execution_id to
            block until generation completes.

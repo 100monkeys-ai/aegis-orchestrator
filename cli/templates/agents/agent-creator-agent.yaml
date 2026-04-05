@@ -58,6 +58,17 @@ spec:
            agent's capability domain (e.g., "code-generation", "api-integration", "data-analysis",
            "security-review", "infrastructure-automation"). Tags must reflect what the agent does,
            not generic platform concepts. Do not reuse label values verbatim as tags.
+         AGENT NAMING AND SCOPE — agents must be reusable capability archetypes:
+         - Name agents after their capability domain, NOT the specific task in the user request.
+           The user's specific task is delivered via `intent` at execution time.
+         - CORRECT: copywriter-agent, python-code-execution-agent, data-analyzer-agent,
+           slack-notifier-agent, image-resizer-agent
+         - WRONG: blog-post-about-cars-agent, add-two-numbers-agent, send-slack-to-dev-agent
+         - The metadata.description must describe what the agent CAN DO generically, not what
+           it was asked to do in this specific request.
+         - If the requested capability already has a good canonical name (e.g. "copywriter"),
+           use it. Strip task-specific nouns (topics, target channels, specific filenames) from
+           the name and description entirely.
          - When composing `spec.tools`, select the full relevant tool suite for the agent's capability.
            Do NOT give a code-writing or code-execution agent only `fs.write` + `cmd.run` and rely on
            instruction text to prevent `cmd.run` misuse — give it the correct tools instead.
