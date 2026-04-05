@@ -563,17 +563,57 @@ fn event_message(event: &DomainEvent) -> String {
         )) => format!(
             "Multi-judge consensus reached: score={final_score:.2}, confidence={confidence:.2}"
         ),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionStarted {
+            execution_id, ..
+        }) => format!("Workflow execution {execution_id} started"),
         DomainEvent::Workflow(WorkflowEvent::WorkflowStateEntered { state_name, .. }) => {
             format!("Entered workflow state {state_name}")
         }
         DomainEvent::Workflow(WorkflowEvent::WorkflowStateExited { state_name, .. }) => {
             format!("Exited workflow state {state_name}")
         }
+        DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
+            iteration_number,
+            ..
+        }) => format!("Workflow iteration {iteration_number} started"),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowIterationCompleted {
+            iteration_number,
+            ..
+        }) => format!("Workflow iteration {iteration_number} completed"),
         DomainEvent::Workflow(WorkflowEvent::WorkflowIterationFailed {
             iteration_number,
             error,
             ..
         }) => format!("Workflow iteration {iteration_number} failed: {error}"),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionCompleted {
+            execution_id, ..
+        }) => format!("Workflow execution {execution_id} completed"),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionFailed {
+            execution_id,
+            reason,
+            ..
+        }) => format!("Workflow execution {execution_id} failed: {reason}"),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionCancelled {
+            execution_id, ..
+        }) => format!("Workflow execution {execution_id} cancelled"),
+        DomainEvent::Workflow(WorkflowEvent::SubworkflowTriggered {
+            child_execution_id,
+            parent_state_name,
+            mode,
+            ..
+        }) => format!(
+            "Subworkflow {child_execution_id} triggered from state {parent_state_name} ({mode})"
+        ),
+        DomainEvent::Workflow(WorkflowEvent::SubworkflowCompleted {
+            child_execution_id,
+            result_key,
+            ..
+        }) => format!("Subworkflow {child_execution_id} completed, result at key '{result_key}'"),
+        DomainEvent::Workflow(WorkflowEvent::SubworkflowFailed {
+            child_execution_id,
+            reason,
+            ..
+        }) => format!("Subworkflow {child_execution_id} failed: {reason}"),
         DomainEvent::Storage(StorageEvent::FileOpened { path, open_mode, .. }) => {
             format!("Opened {path} with mode {open_mode}")
         }
