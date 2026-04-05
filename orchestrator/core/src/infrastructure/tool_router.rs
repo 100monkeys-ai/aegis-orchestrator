@@ -659,7 +659,7 @@ impl ToolRouter {
                         "properties": {
                             "manifest_yaml": {
                                 "type": "string",
-                                "description": "Full Agent manifest YAML to parse, validate, and deploy."
+                                "description": "Full Agent manifest YAML to parse, validate, and deploy. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
                             },
                             "force": {
                                 "type": "boolean",
@@ -677,7 +677,7 @@ impl ToolRouter {
                         "properties": {
                             "manifest_yaml": {
                                 "type": "string",
-                                "description": "Full Agent manifest YAML to update an existing agent."
+                                "description": "Full Agent manifest YAML to update an existing agent. Supports spec.type: 'user' (default) | 'system' — declares the agent's execution tier. 'user' agents run within the requesting tenant's context. 'system' agents run in the privileged platform tier with elevated access. Omit to default to 'user'."
                             },
                             "force": {
                                 "type": "boolean",
