@@ -758,7 +758,6 @@ impl ToolInvocationService {
         };
 
         let scope_filter = args.get("scope").and_then(|v| v.as_str());
-        let _user_id = args.get("user_id").and_then(|v| v.as_str());
 
         let workflows = match scope_filter {
             Some("global") => repo.list_global().await.map_err(|e| {
