@@ -366,7 +366,6 @@ pub enum ScheduleConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct TaskConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[schemars(extend("minLength" = 1))]
     pub instruction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_template: Option<String>,
