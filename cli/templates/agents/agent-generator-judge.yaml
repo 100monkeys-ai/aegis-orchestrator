@@ -72,6 +72,18 @@ spec:
         fields, give full `completeness` credit for input schema alignment.
       - Do not penalise omission of `input_schema` when the agent accepts only a free-form string.
 
+      AGENT REUSABILITY AUDIT — check the generated manifest name and description:
+      - If the agent name or description is task-specific rather than capability-generic
+        (e.g., "blog-post-about-cars-agent", "add-two-numbers-agent", "send-slack-to-dev-agent"),
+        reduce the `alignment` score by at least 0.3 and note "agent name/description is
+        task-specific — should be a reusable capability archetype (e.g. copywriter-agent,
+        python-code-execution-agent)".
+      - Correct archetype names describe WHAT THE AGENT CAN DO generically, not WHAT IT WAS
+        ASKED TO DO in this specific request. The specific task is carried by `intent` at
+        execution time.
+      - If the name and description are capability-generic (e.g. copywriter-agent,
+        data-analyzer-agent, slack-notifier-agent), give full `alignment` credit for naming.
+
       Score output quality for:
       - correctness (includes schema compliance per the tool call audit above)
       - manifest completeness
