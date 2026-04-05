@@ -1397,18 +1397,36 @@ impl ToolInvocationService {
                     "manifest_path": persisted_path
                 })))
             }
-            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.workflow.create",
-                "deterministic_validation": {"passed": true},
-                "semantic_validation": {
-                    "passed": true,
-                    "score": semantic_consensus.final_score,
-                    "confidence": semantic_consensus.consensus_confidence,
-                    "strategy": semantic_consensus.strategy,
-                },
-                "deployed": false,
-                "errors": [format!("Workflow registration failed: {}", e)]
-            }))),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("already exists") {
+                    let wf_version = workflow.metadata.version.clone().unwrap_or_default();
+                    Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.create",
+                        "status": "conflict",
+                        "error": format!(
+                            "Workflow '{}' version '{}' is already registered. Increment the version (e.g. to '{}.1') in the manifest and retry.",
+                            workflow.metadata.name,
+                            wf_version,
+                            wf_version,
+                        ),
+                        "hint": "increment_version"
+                    })))
+                } else {
+                    Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.workflow.create",
+                        "deterministic_validation": {"passed": true},
+                        "semantic_validation": {
+                            "passed": true,
+                            "score": semantic_consensus.final_score,
+                            "confidence": semantic_consensus.consensus_confidence,
+                            "strategy": semantic_consensus.strategy,
+                        },
+                        "deployed": false,
+                        "errors": [format!("Workflow registration failed: {}", e)]
+                    })))
+                }
+            }
         }
     }
 

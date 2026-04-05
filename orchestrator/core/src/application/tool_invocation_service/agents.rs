@@ -99,14 +99,31 @@ impl ToolInvocationService {
                     "manifest_path": persisted_path
                 })))
             }
-            Err(e) => Ok(ToolInvocationResult::Direct(serde_json::json!({
-                "tool": "aegis.agent.create",
-                "validated": true,
-                "deployed": false,
-                "name": manifest.metadata.name,
-                "version": manifest.metadata.version,
-                "errors": [format!("Agent deployment failed: {}", e)]
-            }))),
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("is already deployed") {
+                    Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.create",
+                        "status": "conflict",
+                        "error": format!(
+                            "Agent '{}' version '{}' is already deployed. Increment the version (e.g. to '{}.1') in the manifest and retry.",
+                            manifest.metadata.name,
+                            manifest.metadata.version,
+                            manifest.metadata.version,
+                        ),
+                        "hint": "increment_version"
+                    })))
+                } else {
+                    Ok(ToolInvocationResult::Direct(serde_json::json!({
+                        "tool": "aegis.agent.create",
+                        "validated": true,
+                        "deployed": false,
+                        "name": manifest.metadata.name,
+                        "version": manifest.metadata.version,
+                        "errors": [format!("Agent deployment failed: {}", e)]
+                    })))
+                }
+            }
         }
     }
 
