@@ -99,6 +99,25 @@ impl std::str::FromStr for AgentScope {
     }
 }
 
+/// Agent operational type (ADR-101).
+///
+/// Determines whether the execution service overrides the security context at
+/// runtime.  `System` agents always run under `aegis-system-agent-runtime`
+/// regardless of which tier initiated the execution.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentType {
+    #[default]
+    User,
+    System,
+}
+
+impl AgentType {
+    pub fn is_user(&self) -> bool {
+        matches!(self, AgentType::User)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
     pub id: AgentId,
@@ -204,6 +223,12 @@ pub struct AgentSpec {
     /// Used by the Zaru client context panel to render typed form fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+
+    /// Agent operational type (ADR-101).
+    /// `system` agents auto-elevate to `aegis-system-agent-runtime` at execution time.
+    /// Omitted from serialization when `user` (the default).
+    #[serde(rename = "type", default, skip_serializing_if = "AgentType::is_user")]
+    pub agent_type: AgentType,
 }
 
 /// Runtime configuration

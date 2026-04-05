@@ -78,7 +78,6 @@ spec:
 
     GENERATE_CODE:
       kind: Agent
-      security_context_name: aegis-system-agent-runtime
       agent: "{{DISCOVER_OR_GENERATE_AGENT.output.agent_name}}"
       input: |
         Write {{input.language}} code that fulfills this intent:
