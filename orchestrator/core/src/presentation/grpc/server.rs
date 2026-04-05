@@ -271,10 +271,14 @@ impl AegisRuntime for AegisRuntimeService {
                 .map_err(|e| Status::invalid_argument(format!("Invalid context_json: {e}")))?
         };
 
+        let resolved_intent = req
+            .intent
+            .filter(|s| !s.is_empty())
+            .or_else(|| Some(req.input.clone()).filter(|s| !s.is_empty()));
+
         let input = ExecutionInput {
-            intent: req.intent.filter(|s| !s.is_empty()),
+            intent: resolved_intent,
             input: serde_json::json!({
-                "input": req.input,
                 "context_overrides": payload,
                 "tenant_id": tenant_id.to_string(),
             }),
