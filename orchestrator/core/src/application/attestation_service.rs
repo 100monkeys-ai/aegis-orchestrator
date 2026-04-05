@@ -39,6 +39,8 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use std::sync::Arc;
 
+use crate::application::agent::AgentLifecycleService;
+use crate::application::execution::ExecutionService;
 use crate::application::ports::{
     AttestationTokenClaims, SealGatewayClient, SealSessionCreateRequest, SecurityTokenIssuerPort,
     TokenAudience,
@@ -62,11 +64,19 @@ use crate::infrastructure::seal::signature::SecurityTokenIssuer;
 /// Orchestrates the three domain/infrastructure dependencies needed to
 /// complete a full attestation: context lookup, JWT issuance, and session
 /// persistence.
+///
+/// When `execution_service` and `agent_lifecycle` are wired in, attestation
+/// derives `allowed_tool_patterns` from the agent manifest's `spec.tools`
+/// rather than from the named security context's capabilities. This ensures
+/// that generated agents are bound to exactly the tools declared in their
+/// manifest, not the broader system context that launched them.
 pub struct AttestationServiceImpl {
     security_context_repo: Arc<dyn SecurityContextRepository>,
     seal_session_repo: Arc<dyn SealSessionRepository>,
     token_issuer: Arc<dyn SecurityTokenIssuerPort>,
     seal_gateway_client: Option<Arc<dyn SealGatewayClient>>,
+    execution_service: Option<Arc<dyn ExecutionService>>,
+    agent_lifecycle: Option<Arc<dyn AgentLifecycleService>>,
 }
 
 impl AttestationServiceImpl {
@@ -80,11 +90,25 @@ impl AttestationServiceImpl {
             seal_session_repo,
             token_issuer,
             seal_gateway_client: None,
+            execution_service: None,
+            agent_lifecycle: None,
         }
     }
 
     pub fn with_gateway_client(mut self, gateway_client: Arc<dyn SealGatewayClient>) -> Self {
         self.seal_gateway_client = Some(gateway_client);
+        self
+    }
+
+    /// Wire in execution and agent lifecycle services so that attestation can
+    /// derive `allowed_tool_patterns` from the agent manifest's `spec.tools`.
+    pub fn with_agent_manifest_tools(
+        mut self,
+        execution_service: Arc<dyn ExecutionService>,
+        agent_lifecycle: Arc<dyn AgentLifecycleService>,
+    ) -> Self {
+        self.execution_service = Some(execution_service);
+        self.agent_lifecycle = Some(agent_lifecycle);
         self
     }
 
@@ -200,11 +224,93 @@ impl AttestationServiceImpl {
         // 4. Create and persist SEAL Session
         let public_key_bytes = normalize_public_key_bytes(&request.public_key_pem)?;
         let public_key_b64 = STANDARD.encode(&public_key_bytes);
-        let allowed_tool_patterns: Vec<String> = security_context
-            .capabilities
-            .iter()
-            .map(|c| c.tool_pattern.clone())
-            .collect();
+
+        // Derive allowed_tool_patterns from the agent manifest's spec.tools when
+        // execution and agent lifecycle services are available. This ensures generated
+        // agents are bound to exactly the tools declared in their manifest rather than
+        // the broader capabilities of the named system security context.
+        let allowed_tool_patterns: Vec<String> = if let (Some(exec_svc), Some(agent_svc)) =
+            (&self.execution_service, &self.agent_lifecycle)
+        {
+            // Only attempt manifest-derived patterns when an execution_id is present.
+            // Zaru consumer sessions (no execution_id) fall back to context capabilities.
+            if let (Some(exec_id_str), Ok(exec_uuid)) = (
+                request.execution_id.as_deref(),
+                uuid::Uuid::parse_str(request.execution_id.as_deref().unwrap_or("")),
+            ) {
+                match exec_svc
+                    .get_execution_unscoped(ExecutionId(exec_uuid))
+                    .await
+                {
+                    Ok(execution) => {
+                        match agent_svc
+                            .get_agent_visible(&execution.tenant_id, execution.agent_id)
+                            .await
+                        {
+                            Ok(agent) => {
+                                let tools = agent.manifest.spec.tools.clone();
+                                if tools.is_empty() {
+                                    tracing::debug!(
+                                        execution_id = %exec_id_str,
+                                        agent_id = %execution.agent_id,
+                                        "Agent manifest has empty tools list; falling back to security context capabilities"
+                                    );
+                                    security_context
+                                        .capabilities
+                                        .iter()
+                                        .map(|c| c.tool_pattern.clone())
+                                        .collect()
+                                } else {
+                                    tracing::debug!(
+                                        execution_id = %exec_id_str,
+                                        agent_id = %execution.agent_id,
+                                        tools = ?tools,
+                                        "Derived allowed_tool_patterns from agent manifest spec.tools"
+                                    );
+                                    tools
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    execution_id = %exec_id_str,
+                                    error = %e,
+                                    "Failed to load agent manifest for tool pattern derivation; falling back to security context capabilities"
+                                );
+                                security_context
+                                    .capabilities
+                                    .iter()
+                                    .map(|c| c.tool_pattern.clone())
+                                    .collect()
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %exec_id_str,
+                            error = %e,
+                            "Failed to load execution for tool pattern derivation; falling back to security context capabilities"
+                        );
+                        security_context
+                            .capabilities
+                            .iter()
+                            .map(|c| c.tool_pattern.clone())
+                            .collect()
+                    }
+                }
+            } else {
+                security_context
+                    .capabilities
+                    .iter()
+                    .map(|c| c.tool_pattern.clone())
+                    .collect()
+            }
+        } else {
+            security_context
+                .capabilities
+                .iter()
+                .map(|c| c.tool_pattern.clone())
+                .collect()
+        };
         let session_security_context_name = security_context.name.clone();
         let principal_subject = self.resolve_principal_subject(&request);
         let session = SealSession::new(

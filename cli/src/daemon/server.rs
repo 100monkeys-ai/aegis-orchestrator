@@ -1203,7 +1203,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             seal_session_repo.clone(),
             token_issuer,
         )
-        .with_gateway_client(attestation_gateway_client),
+        .with_gateway_client(attestation_gateway_client)
+        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone()),
     );
 
     // Secrets manager: initialize from `spec.secrets.backend`, otherwise use an in-memory store for local development/testing.

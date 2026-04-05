@@ -1771,6 +1771,15 @@ impl StandardExecutionService {
             match token_issuer.issue(&mut claims) {
                 Ok(token) => {
                     // 3. POST session to gateway
+                    // Derive allowed_tool_patterns from the agent manifest's spec.tools.
+                    // An empty tools list (system agents with no declared restrictions)
+                    // falls back to ["*"]. Attestation will overwrite this session with
+                    // manifest-derived patterns via the same logic; the two must agree.
+                    let pre_create_tool_patterns = if agent.manifest.spec.tools.is_empty() {
+                        vec!["*".to_string()]
+                    } else {
+                        agent.manifest.spec.tools.clone()
+                    };
                     let session_request = crate::application::ports::SealSessionCreateRequest {
                         execution_id: execution_id.0.to_string(),
                         agent_id: agent_id.0.to_string(),
@@ -1779,7 +1788,7 @@ impl StandardExecutionService {
                         security_token: token.clone(),
                         session_status: "Active".to_string(),
                         expires_at: exp.to_rfc3339(),
-                        allowed_tool_patterns: vec!["*".to_string()],
+                        allowed_tool_patterns: pre_create_tool_patterns,
                     };
 
                     if let Err(e) = gateway_client.create_session(session_request).await {
