@@ -509,6 +509,7 @@ impl DomainEvent {
                 TenantEvent::TenantSoftDeleted { deleted_at, .. } => *deleted_at,
                 TenantEvent::AdminCrossTenantAccess { accessed_at, .. } => *accessed_at,
                 TenantEvent::TenantQuotaExceeded { exceeded_at, .. } => *exceeded_at,
+                TenantEvent::UserTenantProvisioned { provisioned_at, .. } => *provisioned_at,
             },
             DomainEvent::Cluster(event) => match event {
                 ClusterEvent::NodeAttested { attested_at, .. } => *attested_at,
@@ -687,6 +688,7 @@ impl DomainEvent {
                 TenantEvent::TenantSoftDeleted { .. } => "tenant_soft_deleted",
                 TenantEvent::AdminCrossTenantAccess { .. } => "admin_cross_tenant_access",
                 TenantEvent::TenantQuotaExceeded { .. } => "tenant_quota_exceeded",
+                TenantEvent::UserTenantProvisioned { .. } => "user_tenant_provisioned",
             },
             DomainEvent::Cluster(event) => match event {
                 ClusterEvent::NodeAttested { .. } => "node_attested",
