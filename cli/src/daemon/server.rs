@@ -482,7 +482,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         );
     }
 
-    let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+    let supervisor = Arc::new(
+        Supervisor::new(runtime.clone()).with_execution_repository(execution_repo.clone()),
+    );
 
     // Initialize volume service (with SeaweedFS or fallback to local)
     info!("Initializing volume service...");

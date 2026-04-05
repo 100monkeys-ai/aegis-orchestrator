@@ -33,7 +33,8 @@
 // See: adrs/005-iterative-execution-strategy.md
 // ============================================================================
 
-use crate::domain::execution::ExecutionInput;
+use crate::domain::execution::{ExecutionId, ExecutionInput, TrajectoryStep};
+use crate::domain::repository::ExecutionRepository;
 use crate::domain::runtime::{AgentRuntime, InstanceId, RuntimeConfig, RuntimeError, TaskInput};
 use crate::domain::validation::{ValidationContext, ValidationPipeline, ValidationResults};
 use std::sync::Arc;
@@ -132,11 +133,26 @@ pub trait SupervisorObserver: Send + Sync {
 
 pub struct Supervisor {
     runtime: Arc<dyn AgentRuntime>,
+    /// Optional execution repository used to fetch the stored inner-loop trajectory
+    /// after a container iteration completes.  When set, the supervisor populates
+    /// `ValidationContext::tool_trajectory` from the persisted trajectory rather than
+    /// leaving it empty.
+    execution_repository: Option<Arc<dyn ExecutionRepository>>,
 }
 
 impl Supervisor {
     pub fn new(runtime: Arc<dyn AgentRuntime>) -> Self {
-        Self { runtime }
+        Self {
+            runtime,
+            execution_repository: None,
+        }
+    }
+
+    /// Attach an execution repository so the supervisor can fetch the inner-loop
+    /// trajectory for each iteration and thread it through `ValidationContext`.
+    pub fn with_execution_repository(mut self, repo: Arc<dyn ExecutionRepository>) -> Self {
+        self.execution_repository = Some(repo);
+        self
     }
 
     /// Run the 100monkeys loop with fresh instances per iteration
@@ -218,6 +234,7 @@ impl Supervisor {
                 per_iteration_timeout,
                 validation_pipeline,
                 current_instance.clone(),
+                self.execution_repository.clone(),
             ),
         )
         .await
@@ -255,10 +272,19 @@ impl Supervisor {
         per_iteration_timeout: Duration,
         validation_pipeline: Option<Arc<ValidationPipeline>>,
         current_instance: Arc<Mutex<Option<InstanceId>>>,
+        execution_repository: Option<Arc<dyn ExecutionRepository>>,
     ) -> Result<String, RuntimeError> {
         let mut attempts = 0;
         let original_intent = input.intent.clone().unwrap_or_default();
         let execution_context = Self::extract_execution_context(&input.input);
+
+        // Extract the execution ID from the runtime environment so we can look up the
+        // stored inner-loop trajectory after each container iteration completes.
+        let execution_id_for_trajectory: Option<ExecutionId> = runtime_config
+            .env
+            .get("AEGIS_EXECUTION_ID")
+            .and_then(|s| uuid::Uuid::parse_str(s).ok())
+            .map(ExecutionId);
 
         // Track iteration history for context in subsequent attempts
         let mut iteration_history: Vec<serde_json::Value> = Vec::new();
@@ -449,6 +475,40 @@ impl Supervisor {
                     .collect::<Vec<_>>()
                     .join("\n");
 
+                // Fetch the inner-loop trajectory stored by the dispatch gateway handler
+                // during this iteration.  By the time execute() returns the container has
+                // already exited, which means bootstrap.py has already received the Final
+                // response and store_iteration_trajectory has already completed.
+                let tool_trajectory: Vec<TrajectoryStep> = if let (Some(ref repo), Some(exec_id)) =
+                    (&execution_repository, execution_id_for_trajectory)
+                {
+                    match repo.find_by_id_unscoped(exec_id).await {
+                        Ok(Some(exec)) => exec
+                            .iterations()
+                            .iter()
+                            .find(|it| it.number == attempts as u8)
+                            .and_then(|it| it.trajectory.clone())
+                            .unwrap_or_default(),
+                        Ok(None) => {
+                            warn!(
+                                execution_id = %exec_id.0,
+                                "Execution not found when fetching trajectory for ValidationContext"
+                            );
+                            vec![]
+                        }
+                        Err(e) => {
+                            warn!(
+                                execution_id = %exec_id.0,
+                                error = %e,
+                                "Failed to fetch trajectory for ValidationContext"
+                            );
+                            vec![]
+                        }
+                    }
+                } else {
+                    vec![]
+                };
+
                 let ctx = ValidationContext {
                     task: original_intent.clone(),
                     output: stdout.clone(),
@@ -460,8 +520,7 @@ impl Supervisor {
                         .map(|m| m.mount_point.to_string_lossy().to_string())
                         .collect(),
                     policy_violations: vec![],
-                    // Docker runtime path has no inner-loop trajectory.
-                    tool_trajectory: vec![],
+                    tool_trajectory,
                 };
                 match pipeline.validate(&ctx).await {
                     Ok(pipeline_result) => {
@@ -616,6 +675,7 @@ mod tests {
                         logs: vec![],
                         tool_calls: vec![],
                         exit_code: 0,
+                        trajectory: vec![],
                     })
                 })
                 .collect();
@@ -798,6 +858,7 @@ mod tests {
             logs: vec![],
             tool_calls: vec![],
             exit_code: 0,
+            trajectory: vec![],
         }));
 
         let supervisor = Supervisor::new(runtime);

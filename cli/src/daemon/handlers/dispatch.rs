@@ -65,7 +65,8 @@ pub(crate) async fn dispatch_gateway_handler(
         Ok(OrchestratorMessage::Final {
             content,
             tool_calls_executed,
-            conversation,
+            trajectory,
+            ..
         }) => {
             // Publish LlmInteraction event for observability
             if agent_id.0 != Uuid::nil() {
@@ -105,24 +106,9 @@ pub(crate) async fn dispatch_gateway_handler(
                         )
                         .await;
 
-                    // ADR-049: Extract tool trajectory from conversation and store it
-                    let mut trajectory = Vec::new();
-                    for msg in conversation {
-                        if let Some(calls) = msg.tool_calls {
-                            for call in calls {
-                                trajectory.push(
-                                    aegis_orchestrator_core::domain::execution::TrajectoryStep {
-                                        tool_name: call.name.clone(),
-                                        arguments_json: serde_json::to_string(&call.arguments)
-                                            .unwrap_or_default(),
-                                        status: "pending".to_string(),
-                                        result_json: None,
-                                        error: None,
-                                    },
-                                );
-                            }
-                        }
-                    }
+                    // Store the live trajectory from the inner loop directly — it already
+                    // has correct statuses (succeeded/failed/dispatched) because
+                    // InnerLoopService builds it in real time as tool calls complete.
                     if !trajectory.is_empty() {
                         let _ = state
                             .execution_service

@@ -863,6 +863,10 @@ impl AgentRuntime for ContainerRuntime {
                 logs: stderr_logs,
                 tool_calls: vec![],
                 exit_code,
+                // Trajectory is populated by the supervisor after execute() returns by
+                // querying the execution repository.  The runtime itself has no access
+                // to the inner-loop trajectory.
+                trajectory: vec![],
             })
         };
 

@@ -678,6 +678,7 @@ mod tests {
                 logs: Vec::new(),
                 tool_calls: Vec::new(),
                 exit_code: 0,
+                trajectory: vec![],
             })
         }
 

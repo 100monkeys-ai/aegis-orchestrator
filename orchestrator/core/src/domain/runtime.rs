@@ -222,6 +222,12 @@ pub struct TaskOutput {
     pub tool_calls: Vec<ToolCall>,
     /// Container exit code. 0 indicates success; non-zero triggers iteration failure.
     pub exit_code: i64,
+    /// Live inner-loop tool trajectory for this iteration, populated by the supervisor
+    /// from the execution repository after the container exits.  Runtimes that do not
+    /// use the inner-loop gateway (e.g. direct shell execution) leave this empty; the
+    /// supervisor fills it in for inner-loop executions.
+    #[serde(default)]
+    pub trajectory: Vec<crate::domain::execution::TrajectoryStep>,
 }
 
 /// A single MCP tool invocation recorded during an iteration.
