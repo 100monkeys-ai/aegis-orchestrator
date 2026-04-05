@@ -15,7 +15,7 @@
 //!
 //! - `{{intent}}` - Caller-supplied free-text intent (ADR-092)
 //! - `{{instruction}}` - Agent's task instruction
-//! - `{{input}}` - User input (string or structured object supporting `{{input.KEY}}`)
+//! - `{{input}}` - User input (always rendered as a string; objects are JSON-serialized)
 //! - `{{iteration_number}}` - Current iteration count
 //! - `{{previous_error}}` - Error from previous iteration
 //! - `{{context}}` - Concatenated context attachments
@@ -53,9 +53,10 @@ pub struct PromptContext {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
 
-    /// Structured user input for this execution.  When a `Value::Object`,
-    /// Handlebars resolves `{{input.KEY}}` via dot-notation natively.  When a
-    /// `Value::String`, `{{input}}` renders the string directly (ADR-092).
+    /// Normalized user input for this execution.  Always a `Value::String`
+    /// after passing through `PromptContext::input()` — non-string values are
+    /// JSON-serialized at the builder layer so `{{input}}` renders the full
+    /// JSON text rather than Handlebars' `[object]` fallback (ADR-092).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<serde_json::Value>,
 
@@ -104,11 +105,19 @@ impl PromptContext {
 
     /// Builder-style setter for input.
     ///
-    /// Accepts a `serde_json::Value`. When the value is an object, Handlebars
-    /// resolves `{{input.KEY}}` via dot-notation. When the value is a string,
-    /// `{{input}}` renders it directly.
+    /// Accepts a `serde_json::Value`. Non-string values (objects, arrays,
+    /// numbers, booleans) are serialized to a JSON string so that `{{input}}`
+    /// renders the full JSON text rather than Handlebars' `[object]` fallback.
+    /// `Value::String` is passed through unchanged.
     pub fn input(mut self, input: serde_json::Value) -> Self {
-        self.input = Some(input);
+        let normalized = match input {
+            serde_json::Value::String(_) => input,
+            other => serde_json::Value::String(
+                serde_json::to_string(&other)
+                    .unwrap_or_else(|_| "[unserializable input]".to_string()),
+            ),
+        };
+        self.input = Some(normalized);
         self
     }
 
