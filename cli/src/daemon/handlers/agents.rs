@@ -266,19 +266,11 @@ pub(crate) async fn delete_agent_handler(
         .await
     {
         Ok(agent) => {
-            let user_id = identity
-                .as_ref()
-                .map(|ext| ext.0.sub.clone())
-                .unwrap_or_default();
             let roles = build_roles(&identity);
-            let requester = ScopeChangeRequester {
-                user_id: user_id.clone(),
-                roles,
-                tenant_id: tenant_id.clone(),
-            };
-
             let authorized = match &agent.scope {
-                AgentScope::Global => requester.is_operator_or_admin(),
+                AgentScope::Global => roles
+                    .iter()
+                    .any(|r| r == "aegis:operator" || r == "aegis:admin"),
                 AgentScope::Tenant => true,
             };
 
@@ -412,19 +404,11 @@ pub(crate) async fn update_agent_handler(
         .await
     {
         Ok(agent) => {
-            let user_id = identity
-                .as_ref()
-                .map(|ext| ext.0.sub.clone())
-                .unwrap_or_default();
             let roles = build_roles(&identity);
-            let requester = ScopeChangeRequester {
-                user_id: user_id.clone(),
-                roles,
-                tenant_id: tenant_id.clone(),
-            };
-
             let authorized = match &agent.scope {
-                AgentScope::Global => requester.is_operator_or_admin(),
+                AgentScope::Global => roles
+                    .iter()
+                    .any(|r| r == "aegis:operator" || r == "aegis:admin"),
                 AgentScope::Tenant => true,
             };
 
