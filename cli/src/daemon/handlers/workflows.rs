@@ -46,10 +46,6 @@ pub(crate) async fn register_temporal_workflow_handler(
             // If a scope was requested, update the workflow scope after registration
             if let Some(scope_str) = &query.scope {
                 use aegis_orchestrator_core::domain::workflow::WorkflowScope;
-                let user_id = identity
-                    .as_ref()
-                    .map(|ext| ext.0.sub.clone())
-                    .unwrap_or_default();
                 let target_scope = match scope_str.as_str() {
                     "global" => WorkflowScope::Global,
                     _ => WorkflowScope::Tenant, // default / "tenant"
