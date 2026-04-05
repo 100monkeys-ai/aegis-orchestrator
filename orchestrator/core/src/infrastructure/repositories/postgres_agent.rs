@@ -57,9 +57,9 @@ impl AgentRepository for PostgresAgentRepository {
             INSERT INTO agents (
                 id, tenant_id, name, version, manifest_yaml, manifest_json,
                 runtime, timeout_seconds, security_policy, status,
-                description, tags, scope, owner_user_id, created_at, updated_at
+                description, tags, scope, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 name = EXCLUDED.name,
@@ -73,7 +73,6 @@ impl AgentRepository for PostgresAgentRepository {
                 description = EXCLUDED.description,
                 tags = EXCLUDED.tags,
                 scope = EXCLUDED.scope,
-                owner_user_id = EXCLUDED.owner_user_id,
                 updated_at = EXCLUDED.updated_at
             "#,
         )
@@ -90,7 +89,6 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(agent.manifest.metadata.description.as_deref())
         .bind(&agent.manifest.metadata.tags)
         .bind(agent.scope.as_db_str())
-        .bind(agent.scope.owner_user_id())
         .bind(agent.created_at)
         .bind(agent.updated_at)
         .execute(&self.pool)
@@ -129,7 +127,7 @@ impl AgentRepository for PostgresAgentRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                id, name, manifest_json, status, scope, owner_user_id, created_at, updated_at
+                id, name, manifest_json, status, scope, created_at, updated_at
             FROM agents
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -146,7 +144,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
 
@@ -159,9 +156,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 
@@ -192,7 +186,7 @@ impl AgentRepository for PostgresAgentRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                id, name, manifest_json, status, scope, owner_user_id, created_at, updated_at
+                id, name, manifest_json, status, scope, created_at, updated_at
             FROM agents
             WHERE tenant_id = $1 AND name = $2
             ORDER BY version DESC
@@ -211,7 +205,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
 
@@ -224,9 +217,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 
@@ -258,7 +248,7 @@ impl AgentRepository for PostgresAgentRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                id, name, manifest_json, status, scope, owner_user_id, created_at, updated_at
+                id, name, manifest_json, status, scope, created_at, updated_at
             FROM agents
             WHERE tenant_id = $1 AND name = $2 AND version = $3
             "#,
@@ -276,7 +266,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
 
@@ -289,9 +278,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 
@@ -321,7 +307,7 @@ impl AgentRepository for PostgresAgentRepository {
         let rows = sqlx::query(
             r#"
             SELECT
-                id, name, manifest_json, status, scope, owner_user_id, created_at, updated_at
+                id, name, manifest_json, status, scope, created_at, updated_at
             FROM agents
             WHERE tenant_id = $1
             ORDER BY name ASC
@@ -339,7 +325,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
 
@@ -352,9 +337,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 
@@ -428,43 +410,22 @@ impl AgentRepository for PostgresAgentRepository {
     async fn list_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
     ) -> Result<Vec<Agent>, RepositoryError> {
-        let rows = if let Some(uid) = user_id {
-            sqlx::query(
-                r#"
-                SELECT
-                    id, name, manifest_json, status, scope, owner_user_id, tenant_id,
-                    created_at, updated_at
-                FROM agents
-                WHERE (scope = 'user' AND tenant_id = $1 AND owner_user_id = $2)
-                   OR (scope = 'tenant' AND tenant_id = $1)
-                   OR (scope = 'global' AND tenant_id = 'aegis-system')
-                ORDER BY name ASC
-                "#,
-            )
-            .bind(tenant_id.as_str())
-            .bind(uid)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        } else {
-            sqlx::query(
-                r#"
-                SELECT
-                    id, name, manifest_json, status, scope, owner_user_id, tenant_id,
-                    created_at, updated_at
-                FROM agents
-                WHERE (scope = 'tenant' AND tenant_id = $1)
-                   OR (scope = 'global' AND tenant_id = 'aegis-system')
-                ORDER BY name ASC
-                "#,
-            )
-            .bind(tenant_id.as_str())
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        };
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, name, manifest_json, status, scope, tenant_id,
+                created_at, updated_at
+            FROM agents
+            WHERE tenant_id = $1
+               OR (scope = 'global' AND tenant_id = 'aegis-system')
+            ORDER BY name ASC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         let mut agents = Vec::new();
         for row in rows {
@@ -473,7 +434,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let row_tenant_id: String = row.get("tenant_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
@@ -487,9 +447,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 
@@ -520,12 +477,11 @@ impl AgentRepository for PostgresAgentRepository {
     ) -> Result<(), RepositoryError> {
         sqlx::query(
             r#"
-            UPDATE agents SET scope = $1, owner_user_id = $2, tenant_id = $3, updated_at = NOW()
-            WHERE id = $4
+            UPDATE agents SET scope = $1, tenant_id = $2, updated_at = NOW()
+            WHERE id = $3
             "#,
         )
         .bind(new_scope.as_db_str())
-        .bind(new_scope.owner_user_id())
         .bind(new_tenant_id.as_str())
         .bind(id.0)
         .execute(&self.pool)
@@ -552,50 +508,26 @@ impl AgentRepository for PostgresAgentRepository {
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
-        let row = if let Some(uid) = user_id {
-            sqlx::query(
-                r#"
-                SELECT
-                    id, name, manifest_json, status, scope, owner_user_id, tenant_id,
-                    created_at, updated_at
-                FROM agents
-                WHERE name = $3
-                  AND ((scope = 'user' AND tenant_id = $1 AND owner_user_id = $2)
-                    OR (scope = 'tenant' AND tenant_id = $1)
-                    OR (scope = 'global' AND tenant_id = 'aegis-system'))
-                ORDER BY CASE WHEN scope='user' THEN 0 WHEN scope='tenant' THEN 1 ELSE 2 END
-                LIMIT 1
-                "#,
-            )
-            .bind(tenant_id.as_str())
-            .bind(uid)
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        } else {
-            sqlx::query(
-                r#"
-                SELECT
-                    id, name, manifest_json, status, scope, owner_user_id, tenant_id,
-                    created_at, updated_at
-                FROM agents
-                WHERE name = $2
-                  AND ((scope = 'tenant' AND tenant_id = $1)
-                    OR (scope = 'global' AND tenant_id = 'aegis-system'))
-                ORDER BY CASE WHEN scope='tenant' THEN 0 ELSE 1 END
-                LIMIT 1
-                "#,
-            )
-            .bind(tenant_id.as_str())
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| RepositoryError::Database(e.to_string()))?
-        };
+        let row = sqlx::query(
+            r#"
+            SELECT
+                id, name, manifest_json, status, scope, tenant_id,
+                created_at, updated_at
+            FROM agents
+            WHERE name = $2
+              AND ((scope = 'tenant' AND tenant_id = $1)
+                OR (scope = 'global' AND tenant_id = 'aegis-system'))
+            ORDER BY CASE WHEN scope='tenant' THEN 0 ELSE 1 END
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
 
         if let Some(row) = row {
             let id: uuid::Uuid = row.get("id");
@@ -603,7 +535,6 @@ impl AgentRepository for PostgresAgentRepository {
             let manifest_val: serde_json::Value = row.get("manifest_json");
             let status_str: String = row.get("status");
             let scope_str: String = row.get("scope");
-            let owner_user_id: Option<String> = row.get("owner_user_id");
             let row_tenant_id: String = row.get("tenant_id");
             let created_at: chrono::DateTime<chrono::Utc> = row.get("created_at");
             let updated_at: chrono::DateTime<chrono::Utc> = row.get("updated_at");
@@ -617,9 +548,6 @@ impl AgentRepository for PostgresAgentRepository {
 
             let scope = match scope_str.as_str() {
                 "global" => AgentScope::Global,
-                "user" => AgentScope::User {
-                    owner_user_id: owner_user_id.expect("user scope requires owner_user_id"),
-                },
                 _ => AgentScope::Tenant,
             };
 

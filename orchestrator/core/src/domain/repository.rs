@@ -116,7 +116,6 @@ pub trait AgentRepository: Send + Sync {
     async fn list_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
     ) -> Result<Vec<Agent>, RepositoryError>;
 
     async fn update_scope(
@@ -129,7 +128,6 @@ pub trait AgentRepository: Send + Sync {
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError>;
 
@@ -342,12 +340,11 @@ pub trait WorkflowRepository: Send + Sync {
 
     // --- Scope-aware methods (ADR-076) ---
 
-    /// Resolve a workflow by name using the scope hierarchy.
-    /// Priority: User > Tenant > Global (narrowest wins).
+    /// Resolve a workflow by name using the two-level scope hierarchy.
+    /// Priority: Tenant > Global (narrowest wins).
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError>;
 
@@ -355,17 +352,12 @@ pub trait WorkflowRepository: Send + Sync {
     async fn resolve_by_name_and_version(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError>;
 
-    /// List all workflows visible to a user (user-owned + tenant + global).
-    async fn list_visible(
-        &self,
-        tenant_id: &TenantId,
-        user_id: Option<&str>,
-    ) -> Result<Vec<Workflow>, RepositoryError>;
+    /// List all workflows visible within a tenant (tenant + global).
+    async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError>;
 
     /// List only global-scope workflows.
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError>;

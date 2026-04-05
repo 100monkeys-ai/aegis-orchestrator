@@ -59,9 +59,6 @@ pub struct TemporalWorkflowDefinition {
     /// Visibility scope for this workflow definition (ADR-076).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
-    /// Owner user ID when scope is 'user' (ADR-076).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub owner_user_id: Option<String>,
 }
 
 /// Individual state in Temporal workflow
@@ -258,12 +255,7 @@ impl TemporalWorkflowMapper {
             scope: Some(match &workflow.scope {
                 WorkflowScope::Global => "global".to_string(),
                 WorkflowScope::Tenant => "tenant".to_string(),
-                WorkflowScope::User { .. } => "user".to_string(),
             }),
-            owner_user_id: match &workflow.scope {
-                WorkflowScope::User { owner_user_id } => Some(owner_user_id.clone()),
-                _ => None,
-            },
         })
     }
 

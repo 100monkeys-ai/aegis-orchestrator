@@ -164,13 +164,9 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
             .map_err(|e| anyhow::anyhow!("Failed to list agents: {e}"))
     }
 
-    async fn list_agents_visible_for_tenant(
-        &self,
-        tenant_id: &TenantId,
-        user_id: Option<&str>,
-    ) -> Result<Vec<Agent>> {
+    async fn list_agents_visible_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>> {
         self.repository
-            .list_visible_for_tenant(tenant_id, user_id)
+            .list_visible_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list visible agents: {e}"))
     }
@@ -191,12 +187,11 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     async fn lookup_agent_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<AgentId>> {
         let agent = self
             .repository
-            .resolve_by_name(tenant_id, user_id, name)
+            .resolve_by_name(tenant_id, name)
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))

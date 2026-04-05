@@ -41,7 +41,7 @@ impl HierarchicalPolicyResolver {
     /// Enterprise for rate-limiting purposes.
     fn resolve_tier(identity: &UserIdentity) -> ZaruTier {
         match &identity.identity_kind {
-            IdentityKind::ConsumerUser { zaru_tier } => zaru_tier.clone(),
+            IdentityKind::ConsumerUser { zaru_tier, .. } => zaru_tier.clone(),
             IdentityKind::TenantUser { .. }
             | IdentityKind::Operator { .. }
             | IdentityKind::ServiceAccount { .. } => ZaruTier::Enterprise,
@@ -213,6 +213,7 @@ mod tests {
             email: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
+                tenant_id: crate::domain::tenant::TenantId::consumer(),
             },
         };
         assert_eq!(
@@ -229,6 +230,7 @@ mod tests {
             email: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
+                tenant_id: crate::domain::tenant::TenantId::consumer(),
             },
         };
         assert_eq!(

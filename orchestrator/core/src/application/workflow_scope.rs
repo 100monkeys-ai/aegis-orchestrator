@@ -113,66 +113,31 @@ impl WorkflowScopeService {
         from: &WorkflowScope,
         to: &WorkflowScope,
     ) -> Result<(), ScopeChangeError> {
-        // Two-hop prohibition: User <-> Global is not allowed
-        let is_user_scope = matches!(from, WorkflowScope::User { .. });
-        let is_global_scope = matches!(from, WorkflowScope::Global);
-        let target_is_user = matches!(to, WorkflowScope::User { .. });
-        let target_is_global = matches!(to, WorkflowScope::Global);
-
-        if (is_user_scope && target_is_global) || (is_global_scope && target_is_user) {
+        // Only Tenant <-> Global transitions are valid
+        if from == to {
             return Err(ScopeChangeError::InvalidTransition {
                 from: from.to_string(),
                 to: to.to_string(),
             });
         }
-
         Ok(())
     }
 
     fn check_authorization(
-        from: &WorkflowScope,
+        _from: &WorkflowScope,
         to: &WorkflowScope,
         requester: &ScopeChangeRequester,
     ) -> Result<(), ScopeChangeError> {
-        match (from, to) {
-            // User -> Tenant: tenant-admin or operator/admin
-            (WorkflowScope::User { .. }, WorkflowScope::Tenant) => {
-                if !requester.is_tenant_admin() {
-                    return Err(ScopeChangeError::Unauthorized {
-                        reason: "User->Tenant promotion requires tenant:admin, aegis:operator, or aegis:admin role".to_string(),
-                    });
-                }
-            }
-            // Tenant -> Global: operator/admin only
-            (WorkflowScope::Tenant, WorkflowScope::Global) => {
+        match to {
+            // Promoting to Global or demoting from Global: operator/admin only
+            WorkflowScope::Global | WorkflowScope::Tenant => {
                 if !requester.is_operator_or_admin() {
                     return Err(ScopeChangeError::Unauthorized {
-                        reason:
-                            "Tenant->Global promotion requires aegis:operator or aegis:admin role"
-                                .to_string(),
+                        reason: "Scope changes require aegis:operator or aegis:admin role"
+                            .to_string(),
                     });
                 }
             }
-            // Global -> Tenant: operator/admin only
-            (WorkflowScope::Global, WorkflowScope::Tenant) => {
-                if !requester.is_operator_or_admin() {
-                    return Err(ScopeChangeError::Unauthorized {
-                        reason:
-                            "Global->Tenant demotion requires aegis:operator or aegis:admin role"
-                                .to_string(),
-                    });
-                }
-            }
-            // Tenant -> User: tenant-admin or operator/admin
-            (WorkflowScope::Tenant, WorkflowScope::User { .. }) => {
-                if !requester.is_tenant_admin() {
-                    return Err(ScopeChangeError::Unauthorized {
-                        reason: "Tenant->User demotion requires tenant:admin, aegis:operator, or aegis:admin role".to_string(),
-                    });
-                }
-            }
-            // Same scope or no-op
-            _ => {}
         }
         Ok(())
     }
@@ -184,11 +149,9 @@ impl WorkflowScopeService {
         version: &str,
         target_scope: &WorkflowScope,
     ) -> Result<(), ScopeChangeError> {
-        // Check if there's already a workflow with the same name+version at the target scope
-        let user_id = target_scope.owner_user_id();
         let existing = self
             .workflow_repo
-            .resolve_by_name_and_version(target_tenant_id, user_id, name, version)
+            .resolve_by_name_and_version(target_tenant_id, name, version)
             .await?;
 
         if let Some(existing_workflow) = existing {
@@ -325,58 +288,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn two_hop_user_to_global_rejected() {
-        let tenant_id = TenantId::from_realm_slug("test-tenant").unwrap();
-        let repo = Arc::new(InMemoryWorkflowRepository::new());
-        let event_bus = test_event_bus();
-
-        let workflow = make_test_workflow(
-            "test-wf",
-            WorkflowScope::User {
-                owner_user_id: "user-1".to_string(),
-            },
-            &tenant_id,
-        );
-        let wf_id = workflow.id;
-        repo.save_for_tenant(&tenant_id, &workflow).await.unwrap();
-
-        let service = WorkflowScopeService::new(repo, event_bus);
-        let requester = operator_requester(&tenant_id);
-
-        let err = service
-            .change_scope(wf_id, WorkflowScope::Global, &requester)
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ScopeChangeError::InvalidTransition { .. }));
-    }
-
-    #[tokio::test]
-    async fn two_hop_global_to_user_rejected() {
-        let tenant_id = TenantId::from_realm_slug("test-tenant").unwrap();
-        let repo = Arc::new(InMemoryWorkflowRepository::new());
-        let event_bus = test_event_bus();
-
-        let workflow = make_test_workflow("test-wf", WorkflowScope::Global, &tenant_id);
-        let wf_id = workflow.id;
-        repo.save_for_tenant(&tenant_id, &workflow).await.unwrap();
-
-        let service = WorkflowScopeService::new(repo, event_bus);
-        let requester = operator_requester(&tenant_id);
-
-        let err = service
-            .change_scope(
-                wf_id,
-                WorkflowScope::User {
-                    owner_user_id: "user-1".to_string(),
-                },
-                &requester,
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, ScopeChangeError::InvalidTransition { .. }));
-    }
-
-    #[tokio::test]
     async fn unprivileged_user_cannot_promote_tenant_to_global() {
         let tenant_id = TenantId::from_realm_slug("test-tenant").unwrap();
         let repo = Arc::new(InMemoryWorkflowRepository::new());
@@ -394,31 +305,6 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ScopeChangeError::Unauthorized { .. }));
-    }
-
-    #[tokio::test]
-    async fn tenant_admin_can_promote_user_to_tenant() {
-        let tenant_id = TenantId::from_realm_slug("test-tenant").unwrap();
-        let repo = Arc::new(InMemoryWorkflowRepository::new());
-        let event_bus = test_event_bus();
-
-        let workflow = make_test_workflow(
-            "test-wf",
-            WorkflowScope::User {
-                owner_user_id: "user-1".to_string(),
-            },
-            &tenant_id,
-        );
-        let wf_id = workflow.id;
-        repo.save_for_tenant(&tenant_id, &workflow).await.unwrap();
-
-        let service = WorkflowScopeService::new(repo, event_bus);
-        let requester = tenant_admin_requester(&tenant_id);
-
-        service
-            .change_scope(wf_id, WorkflowScope::Tenant, &requester)
-            .await
-            .unwrap();
     }
 
     #[tokio::test]

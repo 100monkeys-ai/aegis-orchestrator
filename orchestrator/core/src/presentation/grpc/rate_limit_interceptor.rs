@@ -168,7 +168,7 @@ fn tenant_id_from_identity(identity: &UserIdentity) -> TenantId {
         IdentityKind::TenantUser { tenant_slug } => {
             TenantId::new(format!("tenant-{tenant_slug}")).unwrap_or_else(|_| TenantId::consumer())
         }
-        IdentityKind::ConsumerUser { .. } => TenantId::consumer(),
+        IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
         IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. } => TenantId::system(),
     }
 }
@@ -214,6 +214,7 @@ mod tests {
             email: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::consumer(),
             },
         };
         assert_eq!(tenant_id_from_identity(&identity), TenantId::consumer());

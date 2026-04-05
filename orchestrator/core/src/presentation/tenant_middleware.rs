@@ -12,7 +12,7 @@ use axum::{extract::Request, middleware::Next, response::Response};
 /// Derive TenantId from a UserIdentity
 pub fn derive_tenant_id(identity: &UserIdentity) -> TenantId {
     match &identity.identity_kind {
-        IdentityKind::ConsumerUser { .. } => TenantId::consumer(),
+        IdentityKind::ConsumerUser { tenant_id, .. } => tenant_id.clone(),
         IdentityKind::TenantUser { tenant_slug } => {
             TenantId::from_realm_slug(tenant_slug.clone()).unwrap_or_else(|_| TenantId::consumer())
         }
@@ -104,6 +104,7 @@ mod tests {
             email: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
+                tenant_id: TenantId::consumer(),
             },
         };
         assert_eq!(derive_tenant_id(&id), TenantId::consumer());

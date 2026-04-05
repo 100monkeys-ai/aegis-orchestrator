@@ -42,7 +42,7 @@ pub(crate) struct CortexQueryParams {
 
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     match identity.map(|identity| &identity.identity_kind) {
-        Some(IdentityKind::ConsumerUser { .. }) => TenantId::consumer(),
+        Some(IdentityKind::ConsumerUser { tenant_id, .. }) => tenant_id.clone(),
         Some(IdentityKind::TenantUser { tenant_slug }) => {
             TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
         }

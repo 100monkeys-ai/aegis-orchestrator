@@ -61,7 +61,7 @@ impl ToolInvocationService {
         } else {
             match self
                 .agent_lifecycle
-                .lookup_agent_visible_for_tenant(&tenant_id, None, agent_ref)
+                .lookup_agent_visible_for_tenant(&tenant_id, agent_ref)
                 .await
             {
                 Ok(Some(id)) => id,

@@ -204,7 +204,6 @@ impl AgentLifecycleService for TestAgentLifecycleService {
     async fn lookup_agent_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         _name: &str,
     ) -> Result<Option<AgentId>> {
         anyhow::bail!(
@@ -221,11 +220,7 @@ impl AgentLifecycleService for TestAgentLifecycleService {
         anyhow::bail!("TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test")
     }
 
-    async fn list_agents_visible_for_tenant(
-        &self,
-        _tenant_id: &TenantId,
-        _user_id: Option<&str>,
-    ) -> Result<Vec<Agent>> {
+    async fn list_agents_visible_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
         Ok(vec![])
     }
 
@@ -314,7 +309,6 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
     async fn lookup_agent_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<AgentId>> {
         self.lookup_agent(name).await
@@ -330,11 +324,7 @@ impl AgentLifecycleService for FilteringAgentLifecycleService {
         self.lookup_agent(name).await
     }
 
-    async fn list_agents_visible_for_tenant(
-        &self,
-        _tenant_id: &TenantId,
-        _user_id: Option<&str>,
-    ) -> Result<Vec<Agent>> {
+    async fn list_agents_visible_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
         Ok(vec![])
     }
 
@@ -2253,7 +2243,6 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
     async fn lookup_agent_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<AgentId>> {
         self.lookup_agent(name).await
@@ -2276,11 +2265,7 @@ impl AgentLifecycleService for VersionAwareAgentLifecycleService {
         Ok((name == self.agent_name && version == self.agent_version).then_some(self.agent_id))
     }
 
-    async fn list_agents_visible_for_tenant(
-        &self,
-        _tenant_id: &TenantId,
-        _user_id: Option<&str>,
-    ) -> Result<Vec<Agent>> {
+    async fn list_agents_visible_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
         Ok(vec![])
     }
 

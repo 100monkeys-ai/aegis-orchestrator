@@ -201,7 +201,10 @@ async fn check_rate_limit(
         sub: user_id.clone(),
         realm_slug: "zaru-consumer".to_string(),
         email: None,
-        identity_kind: IdentityKind::ConsumerUser { zaru_tier: tier },
+        identity_kind: IdentityKind::ConsumerUser {
+            zaru_tier: tier,
+            tenant_id: crate::domain::tenant::TenantId::consumer(),
+        },
     };
 
     // Use a default tenant for now; in production the session would carry the tenant.

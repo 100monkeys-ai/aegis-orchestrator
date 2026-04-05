@@ -18,11 +18,13 @@ pub enum TenantStatus {
     Deleted,
 }
 
-/// Tenant tier classification
+/// Tenant tier classification (ADR-097)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TenantTier {
-    Consumer,
+    Free,
+    Pro,
+    Business,
     Enterprise,
     System,
 }
@@ -33,6 +35,39 @@ pub struct TenantQuotas {
     pub max_concurrent_executions: u32,
     pub max_agents: u32,
     pub max_storage_gb: f64,
+}
+
+impl TenantQuotas {
+    /// Return tier-specific default quotas (ADR-097).
+    pub fn for_tier(tier: &TenantTier) -> Self {
+        match tier {
+            TenantTier::Free => Self {
+                max_concurrent_executions: 2,
+                max_agents: 5,
+                max_storage_gb: 1.0,
+            },
+            TenantTier::Pro => Self {
+                max_concurrent_executions: 10,
+                max_agents: 50,
+                max_storage_gb: 25.0,
+            },
+            TenantTier::Business => Self {
+                max_concurrent_executions: 25,
+                max_agents: 200,
+                max_storage_gb: 50.0,
+            },
+            TenantTier::Enterprise => Self {
+                max_concurrent_executions: 50,
+                max_agents: 500,
+                max_storage_gb: 100.0,
+            },
+            TenantTier::System => Self {
+                max_concurrent_executions: u32::MAX,
+                max_agents: u32::MAX,
+                max_storage_gb: f64::MAX,
+            },
+        }
+    }
 }
 
 impl Default for TenantQuotas {

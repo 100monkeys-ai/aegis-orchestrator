@@ -1262,6 +1262,9 @@ pub struct IamClaimsConfig {
     /// Role attribute name in aegis-system realm. Default: "aegis_role"
     #[serde(default = "default_aegis_role_claim")]
     pub aegis_role: String,
+    /// Custom claim mapper name for per-user tenant ID (ADR-097). Default: "tenant_id"
+    #[serde(default = "default_tenant_id_claim")]
+    pub tenant_id: String,
 }
 
 impl Default for IamClaimsConfig {
@@ -1269,6 +1272,7 @@ impl Default for IamClaimsConfig {
         Self {
             zaru_tier: default_zaru_tier_claim(),
             aegis_role: default_aegis_role_claim(),
+            tenant_id: default_tenant_id_claim(),
         }
     }
 }
@@ -1283,6 +1287,10 @@ fn default_zaru_tier_claim() -> String {
 
 fn default_aegis_role_claim() -> String {
     "aegis_role".to_string()
+}
+
+fn default_tenant_id_claim() -> String {
+    "tenant_id".to_string()
 }
 
 /// gRPC authentication configuration (ADR-041 §gRPC Authentication Amendment).

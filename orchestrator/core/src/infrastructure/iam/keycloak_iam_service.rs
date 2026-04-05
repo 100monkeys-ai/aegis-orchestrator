@@ -286,7 +286,19 @@ impl StandardIamService {
                     value: tier_value.to_string(),
                 })?;
 
-                Ok(IdentityKind::ConsumerUser { zaru_tier: tier })
+                // Extract per-user tenant_id from custom claim (ADR-097)
+                let tenant_id_str = claims
+                    .extra
+                    .get(&self.claims_config.tenant_id)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("zaru-consumer");
+                let tenant_id = crate::domain::tenant::TenantId::from_string(tenant_id_str)
+                    .unwrap_or_else(|_| crate::domain::tenant::TenantId::consumer());
+
+                Ok(IdentityKind::ConsumerUser {
+                    zaru_tier: tier,
+                    tenant_id,
+                })
             }
             RealmKind::System => {
                 // Check if this is a service account (has azp claim, no email typically)
@@ -459,7 +471,7 @@ impl IdentityProvider for StandardIamService {
 
     fn resolve_tier(&self, token: &ValidatedIdentityToken) -> Result<ZaruTier, IamError> {
         match &token.identity.identity_kind {
-            IdentityKind::ConsumerUser { zaru_tier } => Ok(zaru_tier.clone()),
+            IdentityKind::ConsumerUser { zaru_tier, .. } => Ok(zaru_tier.clone()),
             IdentityKind::TenantUser { .. } => {
                 // Tenant users always get enterprise tier
                 Ok(ZaruTier::Enterprise)
@@ -635,6 +647,7 @@ mod tests {
                 email: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Pro,
+                    tenant_id: crate::domain::tenant::TenantId::consumer(),
                 },
             },
             issued_at: Utc::now(),

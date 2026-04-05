@@ -72,17 +72,16 @@ impl std::fmt::Display for StateName {
     }
 }
 
-/// Visibility scope for a workflow definition (ADR-076).
+/// Visibility scope for a workflow definition (ADR-076 / ADR-097).
 ///
 /// Scope determines which principals can discover and execute a workflow.
 /// Scope is mutable via explicit promote/demote operations (not via save).
 ///
-/// Hierarchy (broadest to narrowest): Global > Tenant > User
+/// Two-level hierarchy (broadest to narrowest): Global > Tenant
 ///
 /// Invariants:
 /// - `Global` workflows MUST have `tenant_id == TenantId::system()`.
-/// - `Tenant` workflows have no `owner_user_id`.
-/// - `User` workflows MUST have a non-None `owner_user_id`.
+/// - `Tenant` workflows belong to a single tenant.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum WorkflowScope {
     /// Platform-wide: visible to all tenants, managed by operators.
@@ -92,12 +91,6 @@ pub enum WorkflowScope {
     /// Tenant-wide: visible to all users within the owning tenant.
     #[default]
     Tenant,
-
-    /// User-private: visible only to the owning user within their tenant.
-    User {
-        /// OIDC `sub` claim identifying the owning user.
-        owner_user_id: String,
-    },
 }
 
 impl WorkflowScope {
@@ -105,15 +98,6 @@ impl WorkflowScope {
         match self {
             WorkflowScope::Global => "global",
             WorkflowScope::Tenant => "tenant",
-            WorkflowScope::User { .. } => "user",
-        }
-    }
-
-    /// Extract the owner_user_id if this is a User scope, else None.
-    pub fn owner_user_id(&self) -> Option<&str> {
-        match self {
-            WorkflowScope::User { owner_user_id } => Some(owner_user_id.as_str()),
-            _ => None,
         }
     }
 }

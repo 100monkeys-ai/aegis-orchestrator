@@ -52,9 +52,6 @@ pub(crate) async fn register_temporal_workflow_handler(
                     .unwrap_or_default();
                 let target_scope = match scope_str.as_str() {
                     "global" => WorkflowScope::Global,
-                    "user" => WorkflowScope::User {
-                        owner_user_id: user_id,
-                    },
                     _ => WorkflowScope::Tenant, // default / "tenant"
                 };
                 if let Ok(Some(workflow)) = state
@@ -165,14 +162,13 @@ pub(crate) async fn list_workflows_handler(
     axum::extract::Query(query): axum::extract::Query<ListWorkflowsQuery>,
 ) -> impl IntoResponse {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    let user_id = identity.as_ref().map(|ext| ext.0.sub.as_str());
 
     let workflows = if query.scope.as_deref() == Some("global") {
         state.workflow_repo.list_global().await.unwrap_or_default()
     } else if query.visible.unwrap_or(false) {
         state
             .workflow_repo
-            .list_visible(&tenant_id, user_id)
+            .list_visible(&tenant_id)
             .await
             .unwrap_or_default()
     } else {
@@ -372,13 +368,10 @@ pub(crate) async fn update_workflow_scope_handler(
     let target_scope = match target_scope_str.as_str() {
         "global" => WorkflowScope::Global,
         "tenant" => WorkflowScope::Tenant,
-        "user" => WorkflowScope::User {
-            owner_user_id: user_id.clone(),
-        },
         other => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant, user")})),
+                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant")})),
             )
                 .into_response();
         }

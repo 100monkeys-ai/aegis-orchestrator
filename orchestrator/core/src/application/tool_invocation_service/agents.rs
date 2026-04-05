@@ -117,7 +117,7 @@ impl ToolInvocationService {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let agents = self
             .agent_lifecycle
-            .list_agents_visible_for_tenant(&tenant_id, None)
+            .list_agents_visible_for_tenant(&tenant_id)
             .await
             .map_err(|e| {
                 SealSessionError::SignatureVerificationFailed(format!("Failed to list agents: {e}"))
@@ -206,7 +206,7 @@ impl ToolInvocationService {
 
         let agent_id = match self
             .agent_lifecycle
-            .lookup_agent_visible_for_tenant(&tenant_id, None, "agent-creator-agent")
+            .lookup_agent_visible_for_tenant(&tenant_id, "agent-creator-agent")
             .await
         {
             Ok(Some(id)) => id,

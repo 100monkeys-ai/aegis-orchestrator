@@ -120,7 +120,6 @@ impl AgentLifecycleService for MockAgentServiceInt {
     async fn lookup_agent_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         _name: &str,
     ) -> anyhow::Result<Option<AgentId>> {
         Ok(Some(AgentId(
@@ -142,7 +141,6 @@ impl AgentLifecycleService for MockAgentServiceInt {
     async fn list_agents_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
     ) -> anyhow::Result<Vec<Agent>> {
         Ok(vec![])
     }
@@ -231,7 +229,6 @@ impl WorkflowRepository for MockWorkflowRepo {
     async fn resolve_by_name(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         _name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
@@ -239,17 +236,12 @@ impl WorkflowRepository for MockWorkflowRepo {
     async fn resolve_by_name_and_version(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         _name: &str,
         _version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
-    async fn list_visible(
-        &self,
-        _tenant_id: &TenantId,
-        _user_id: Option<&str>,
-    ) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn list_visible(&self, _tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
     }
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
@@ -367,7 +359,6 @@ impl WorkflowRepository for StaticWorkflowRepo {
     async fn resolve_by_name(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         self.find_by_name(name).await
@@ -375,7 +366,6 @@ impl WorkflowRepository for StaticWorkflowRepo {
     async fn resolve_by_name_and_version(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
@@ -383,11 +373,7 @@ impl WorkflowRepository for StaticWorkflowRepo {
             && self.workflow.metadata.version.as_deref() == Some(version))
         .then(|| self.workflow.clone()))
     }
-    async fn list_visible(
-        &self,
-        _tenant_id: &TenantId,
-        _user_id: Option<&str>,
-    ) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn list_visible(&self, _tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
         self.list_all().await
     }
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {

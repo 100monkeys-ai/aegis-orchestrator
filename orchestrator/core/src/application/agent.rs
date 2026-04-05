@@ -65,11 +65,7 @@ pub trait AgentLifecycleService: Send + Sync {
 
     async fn list_agents_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>>;
 
-    async fn list_agents_visible_for_tenant(
-        &self,
-        tenant_id: &TenantId,
-        user_id: Option<&str>,
-    ) -> Result<Vec<Agent>>;
+    async fn list_agents_visible_for_tenant(&self, tenant_id: &TenantId) -> Result<Vec<Agent>>;
 
     async fn lookup_agent_for_tenant(
         &self,
@@ -80,7 +76,6 @@ pub trait AgentLifecycleService: Send + Sync {
     async fn lookup_agent_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<AgentId>>;
 

@@ -573,7 +573,7 @@ impl GradientValidator for SemanticAgentValidator {
         //    when the caller's tenant is not aegis-system.
         let judge_id = self
             .agent_lifecycle_service
-            .lookup_agent_visible_for_tenant(&self.tenant_id, None, &self.judge_agent_name)
+            .lookup_agent_visible_for_tenant(&self.tenant_id, &self.judge_agent_name)
             .await?
             .ok_or_else(|| anyhow!("Judge agent '{}' not found", self.judge_agent_name))?;
 
@@ -738,7 +738,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
         for name in &self.judges {
             let id = self
                 .agent_lifecycle_service
-                .lookup_agent_visible_for_tenant(&self.tenant_id, None, name)
+                .lookup_agent_visible_for_tenant(&self.tenant_id, name)
                 .await?
                 .ok_or_else(|| anyhow!("Judge agent '{name}' not found"))?;
             judge_ids.push((id, 1.0)); // Equal weight by default.

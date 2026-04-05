@@ -220,7 +220,7 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
     let tenant_id = tenant_id_from_identity(Some(&identity));
 
     let tier = match &identity.identity_kind {
-        IdentityKind::ConsumerUser { zaru_tier } => zaru_tier.clone(),
+        IdentityKind::ConsumerUser { zaru_tier, .. } => zaru_tier.clone(),
         _ => ZaruTier::Enterprise,
     };
 

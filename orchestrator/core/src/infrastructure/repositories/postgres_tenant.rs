@@ -41,7 +41,9 @@ fn status_to_str(status: &TenantStatus) -> &'static str {
 
 fn parse_tier(s: &str) -> TenantTier {
     match s {
-        "consumer" => TenantTier::Consumer,
+        "free" => TenantTier::Free,
+        "pro" => TenantTier::Pro,
+        "business" => TenantTier::Business,
         "enterprise" => TenantTier::Enterprise,
         "system" => TenantTier::System,
         _ => TenantTier::Enterprise,
@@ -50,7 +52,9 @@ fn parse_tier(s: &str) -> TenantTier {
 
 fn tier_to_str(tier: &TenantTier) -> &'static str {
     match tier {
-        TenantTier::Consumer => "consumer",
+        TenantTier::Free => "free",
+        TenantTier::Pro => "pro",
+        TenantTier::Business => "business",
         TenantTier::Enterprise => "enterprise",
         TenantTier::System => "system",
     }

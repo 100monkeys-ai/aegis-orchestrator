@@ -150,7 +150,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
             for judge_name in judge_references {
                 let judge_id = self
                     .agent_service
-                    .lookup_agent_visible_for_tenant(tenant_id, None, &judge_name)
+                    .lookup_agent_visible_for_tenant(tenant_id, &judge_name)
                     .await
                     .with_context(|| {
                         format!(
@@ -212,7 +212,7 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
                     if uuid::Uuid::parse_str(name).is_err() {
                         let agent_id = self
                             .agent_service
-                            .lookup_agent_visible_for_tenant(tenant_id, None, name)
+                            .lookup_agent_visible_for_tenant(tenant_id, name)
                             .await
                             .with_context(|| {
                                 format!("Failed to resolve agent '{name}' in state '{state_name}'")
@@ -375,7 +375,6 @@ mod tests {
         async fn lookup_agent_visible_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            _user_id: Option<&str>,
             name: &str,
         ) -> anyhow::Result<Option<AgentId>> {
             self.lookup_agent(name).await
@@ -393,7 +392,6 @@ mod tests {
         async fn list_agents_visible_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            _user_id: Option<&str>,
         ) -> anyhow::Result<Vec<Agent>> {
             Ok(vec![])
         }
@@ -565,7 +563,6 @@ spec:
         async fn resolve_by_name(
             &self,
             _tenant_id: &TenantId,
-            _user_id: Option<&str>,
             _name: &str,
         ) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
@@ -573,7 +570,6 @@ spec:
         async fn resolve_by_name_and_version(
             &self,
             _tenant_id: &TenantId,
-            _user_id: Option<&str>,
             _name: &str,
             _version: &str,
         ) -> Result<Option<Workflow>, RepositoryError> {
@@ -582,7 +578,6 @@ spec:
         async fn list_visible(
             &self,
             _tenant_id: &TenantId,
-            _user_id: Option<&str>,
         ) -> Result<Vec<Workflow>, RepositoryError> {
             Ok(vec![])
         }
