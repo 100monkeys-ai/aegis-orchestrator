@@ -367,6 +367,7 @@ pub enum ScheduleConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct TaskConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("minLength" = 1))]
     pub instruction: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompt_template: Option<String>,
@@ -928,6 +929,18 @@ impl AgentManifest {
 
         // Execution strategy is optional and validated by its own invariants.
 
+        // Require a non-empty task.instruction — agents without one are hollow shells
+        if self
+            .spec
+            .task
+            .as_ref()
+            .and_then(|t| t.instruction.as_deref())
+            .map(|s| s.trim().is_empty())
+            .unwrap_or(true)
+        {
+            return Err("Agent manifest must include a non-empty task.instruction".to_string());
+        }
+
         Ok(())
     }
 
@@ -966,7 +979,11 @@ mod tests {
                     isolation: "inherit".to_string(),
                     model: "default".to_string(),
                 },
-                task: None,
+                task: Some(TaskConfig {
+                    instruction: Some("Do something useful".to_string()),
+                    prompt_template: None,
+                    input_data: None,
+                }),
                 context: vec![],
                 execution: None,
                 security: None,

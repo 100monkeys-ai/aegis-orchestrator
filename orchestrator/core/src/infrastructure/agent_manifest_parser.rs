@@ -92,6 +92,8 @@ spec:
   runtime:
     language: python
     version: "3.11"
+  task:
+    instruction: "Do something useful"
 "#;
 
         let manifest = AgentManifestParser::parse_yaml(yaml).unwrap();
@@ -172,6 +174,50 @@ spec:
         assert_eq!(security.network.mode, "allow");
         assert_eq!(security.network.allowlist.len(), 1);
         assert_eq!(security.resources.cpu, 1000);
+    }
+
+    #[test]
+    fn test_reject_missing_instruction() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+"#;
+        let result = AgentManifestParser::parse_yaml(yaml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty task.instruction"));
+    }
+
+    #[test]
+    fn test_reject_empty_instruction() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: test-agent
+  version: "1.0.0"
+spec:
+  runtime:
+    language: python
+    version: "3.11"
+  task:
+    instruction: "   "
+"#;
+        let result = AgentManifestParser::parse_yaml(yaml);
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("non-empty task.instruction"));
     }
 
     #[test]
@@ -261,7 +307,11 @@ spec:
                     isolation: "docker".to_string(),
                     model: "default".to_string(),
                 },
-                task: None,
+                task: Some(TaskConfig {
+                    instruction: Some("Do something useful".to_string()),
+                    prompt_template: None,
+                    input_data: None,
+                }),
                 context: vec![],
                 execution: None,
                 security: None,
