@@ -3,7 +3,7 @@
 //! # Keycloak Webhook Handler — Tenant Provisioning (ADR-097)
 //!
 //! Handles Keycloak Events SPI webhooks. On `REGISTER` events, provisions a
-//! per-user tenant via [`TenantProvisioningService`].
+//! per-user tenant via `TenantProvisioningService`.
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
 use serde::Deserialize;
@@ -18,8 +18,6 @@ pub(crate) struct KeycloakEvent {
     pub event_type: String,
     #[serde(rename = "userId")]
     pub user_id: String,
-    #[serde(rename = "realmId")]
-    pub realm_id: String,
 }
 
 /// Handle Keycloak event webhooks. Provisions a per-user tenant on REGISTER events.
