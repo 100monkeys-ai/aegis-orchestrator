@@ -747,6 +747,7 @@ pub(crate) async fn get_workflow_logs_handler(
                             result_key: None,
                             parent_state_name: None,
                             timestamp: record.recorded_at.to_rfc3339(),
+                            ..Default::default()
                         });
                     workflow_log_event_from_payload(
                         execution.id,
