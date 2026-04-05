@@ -9,6 +9,7 @@ metadata:
     category: platform
     capability: agent-authoring
 spec:
+  type: system
   runtime:
     language: python
     version: "3.11"

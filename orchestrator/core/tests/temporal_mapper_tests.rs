@@ -33,7 +33,6 @@ fn test_map_100monkeys_workflow() {
                 judges: vec![],
                 max_iterations: None,
                 pre_execution_validator: None,
-                security_context_name: None,
             },
             transitions: vec![TransitionRule {
                 condition: TransitionCondition::OnSuccess,

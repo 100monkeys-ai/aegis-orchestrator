@@ -792,10 +792,6 @@ pub enum StateKind {
         /// outputs after execution in the inner refinement loop.
         #[serde(default)]
         pre_execution_validator: Option<String>,
-
-        /// Optional security context name applied to this state's execution environment
-        #[serde(default)]
-        security_context_name: Option<String>,
     },
 
     /// Execute system command
@@ -1559,7 +1555,6 @@ mod tests {
                     ],
                     max_iterations: None,
                     pre_execution_validator: Some("validator-z".to_string()),
-                    security_context_name: None,
                 },
                 transitions: vec![],
                 timeout: None,

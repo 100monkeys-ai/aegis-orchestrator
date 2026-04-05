@@ -8,6 +8,7 @@ metadata:
     category: platform
     builtin: "true"
 spec:
+  type: system
   runtime:
     language: python
     version: "3.11"
