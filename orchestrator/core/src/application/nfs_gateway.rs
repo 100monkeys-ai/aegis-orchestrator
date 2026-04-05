@@ -82,6 +82,7 @@ impl NfsVolumeRegistry {
         container_gid: u32,
         policy: FsalAccessPolicy,
         mount_point: PathBuf,
+        remote_path: String,
     ) {
         let context = NfsVolumeContext {
             execution_id,
@@ -90,6 +91,7 @@ impl NfsVolumeRegistry {
             container_gid,
             policy,
             mount_point,
+            remote_path,
         };
         self.contexts.write().insert(volume_id, context);
         debug!(
@@ -378,6 +380,7 @@ impl NfsGatewayService {
         container_gid: u32,
         policy: FsalAccessPolicy,
         mount_point: PathBuf,
+        remote_path: String,
     ) {
         self.volume_registry.register(
             volume_id,
@@ -386,6 +389,7 @@ impl NfsGatewayService {
             container_gid,
             policy,
             mount_point,
+            remote_path,
         );
         metrics::gauge!("aegis_volumes_active").increment(1.0);
     }

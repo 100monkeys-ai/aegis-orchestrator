@@ -77,6 +77,9 @@ pub struct NfsVolumeContext {
     /// Used by FSAL tools to strip the container-absolute prefix from paths
     /// before forwarding to AegisFSAL (which operates on volume-relative paths).
     pub mount_point: PathBuf,
+    /// Remote path on the NFS server (e.g. `/aegis/volumes/{tenant_id}/{volume_id}`).
+    /// Used by container_step_runner to build the NFS device path for Docker mounts.
+    pub remote_path: String,
 }
 
 /// NFS server errors

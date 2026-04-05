@@ -2004,6 +2004,7 @@ impl StandardExecutionService {
                     1000, // container_gid
                     policy,
                     mount.mount_point.clone(),
+                    mount.remote_path.clone(),
                 );
                 tracing::info!(
                     "Registered volume {} with NFS gateway for execution {}",

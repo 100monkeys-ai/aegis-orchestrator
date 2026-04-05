@@ -18,11 +18,13 @@
 //! See ADR-050 (CI/CD Orchestration via Workflows), ADR-036 (NFS Server Gateway),
 //! ADR-027 (Docker Runtime Implementation Details).
 
+use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason};
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
 };
 use crate::domain::secrets::AccessContext;
+use crate::domain::volume::VolumeId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::image_manager::DockerImageManager;
 use crate::infrastructure::secrets_manager::SecretsManager;
@@ -66,6 +68,8 @@ pub struct ContainerStepRunnerImpl {
     /// the vault secret and passes them as a `DockerCredentials` override to
     /// [`DockerImageManager::ensure_image`].
     secrets_manager: Arc<SecretsManager>,
+    /// Volume registry for resolving the correct NFS remote_path for each volume mount.
+    volume_registry: Arc<NfsVolumeRegistry>,
 }
 
 impl ContainerStepRunnerImpl {
@@ -77,6 +81,7 @@ impl ContainerStepRunnerImpl {
         nfs_mountport: u16,
         event_bus: Arc<EventBus>,
         secrets_manager: Arc<SecretsManager>,
+        volume_registry: Arc<NfsVolumeRegistry>,
     ) -> Self {
         Self {
             docker,
@@ -86,6 +91,7 @@ impl ContainerStepRunnerImpl {
             nfs_mountport,
             event_bus,
             secrets_manager,
+            volume_registry,
         }
     }
 
@@ -357,12 +363,20 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                 nfs_host, self.nfs_port, self.nfs_mountport
                             ),
                         );
-                        // Device path: /{execution_id}/{volume_name}
-                        // The NFS Server Gateway (AegisFSAL) owns this namespace.
-                        driver_opts.insert(
-                            "device".to_string(),
-                            format!(":{}/{}", config.execution_id, vm.name),
-                        );
+                        // Device path: resolve the remote_path registered in the NFS volume
+                        // registry (e.g. /aegis/volumes/{tenant_id}/{volume_id}). Fall back
+                        // to the legacy :{execution_id}/{volume_name} form only when the
+                        // volume cannot be located in the registry.
+                        let device_path = uuid::Uuid::parse_str(&vm.name)
+                            .ok()
+                            .and_then(|uuid| {
+                                self.volume_registry.lookup(VolumeId(uuid))
+                            })
+                            .map(|ctx| format!(":{}", ctx.remote_path))
+                            .unwrap_or_else(|| {
+                                format!(":{}/{}", config.execution_id, vm.name)
+                            });
+                        driver_opts.insert("device".to_string(), device_path);
 
                         debug!(
                             step_name = %config.name,
