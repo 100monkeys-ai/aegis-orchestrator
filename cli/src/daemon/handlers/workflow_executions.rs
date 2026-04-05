@@ -151,6 +151,9 @@ pub(crate) fn workflow_event_message(event: &WorkflowEvent) -> String {
         WorkflowEvent::IntentExecutionPipelineFailed { reason, .. } => {
             format!("Intent execution pipeline failed: {reason}")
         }
+        WorkflowEvent::WorkflowRemoved { workflow_name, .. } => {
+            format!("Workflow {workflow_name} removed")
+        }
     }
 }
 
@@ -175,6 +178,7 @@ pub(crate) fn workflow_event_type_name(event: &WorkflowEvent) -> &'static str {
             "IntentExecutionPipelineCompleted"
         }
         WorkflowEvent::IntentExecutionPipelineFailed { .. } => "IntentExecutionPipelineFailed",
+        WorkflowEvent::WorkflowRemoved { .. } => "WorkflowRemoved",
     }
 }
 
@@ -365,6 +369,13 @@ pub(crate) fn workflow_event_view_from_domain(
             None,
             None,
             failed_at.to_rfc3339(),
+            serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
+        ),
+        WorkflowEvent::WorkflowRemoved { removed_at, .. } => (
+            Uuid::nil(),
+            None,
+            None,
+            removed_at.to_rfc3339(),
             serde_json::to_value(event).unwrap_or(serde_json::Value::Null),
         ),
     };
