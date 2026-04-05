@@ -666,19 +666,13 @@ impl aegis_orchestrator_core::application::ports::WorkflowEnginePort for Recordi
 
     async fn start_workflow(
         &self,
-        workflow_id: &str,
-        execution_id: ExecutionId,
-        _tenant_id: &str,
-        input: HashMap<String, serde_json::Value>,
-        blackboard: Option<HashMap<String, serde_json::Value>>,
-        _security_context_name: Option<String>,
-        _intent: Option<String>,
+        params: aegis_orchestrator_core::application::ports::StartWorkflowParams<'_>,
     ) -> anyhow::Result<String> {
         self.calls.lock().unwrap().push(StartCall {
-            workflow_id: workflow_id.to_string(),
-            execution_id,
-            input,
-            blackboard,
+            workflow_id: params.workflow_id.to_string(),
+            execution_id: params.execution_id,
+            input: params.input,
+            blackboard: params.blackboard,
         });
         Ok(self.run_id.clone())
     }
@@ -847,13 +841,15 @@ async fn recording_workflow_engine_captures_start_call_arguments() {
 
     let run_id = engine
         .start_workflow(
-            "workflow-alpha",
-            execution_id.clone(),
-            "aegis-system",
-            input.clone(),
-            None,
-            None,
-            None,
+            aegis_orchestrator_core::application::ports::StartWorkflowParams {
+                workflow_id: "workflow-alpha",
+                execution_id: execution_id.clone(),
+                tenant_id: "aegis-system",
+                input: input.clone(),
+                blackboard: None,
+                security_context_name: None,
+                intent: None,
+            },
         )
         .await
         .expect("recording engine should return its configured run id");

@@ -123,15 +123,9 @@ impl TemporalClient {
     /// Start a workflow execution using the Generic Interpreter pattern
     pub async fn start_workflow(
         &self,
-        workflow_id: &str,
-        execution_id: ExecutionId,
-        tenant_id: &str,
-        input: HashMap<String, serde_json::Value>,
-        blackboard: Option<HashMap<String, serde_json::Value>>,
-        security_context_name: Option<String>,
-        intent: Option<String>,
+        params: crate::application::ports::StartWorkflowParams<'_>,
     ) -> Result<String> {
-        let execution_workflow_id = execution_id.0.to_string();
+        let execution_workflow_id = params.execution_id.0.to_string();
 
         // Generic workflow type that the worker registers
         let workflow_type_name = "aegis_workflow";
@@ -139,13 +133,13 @@ impl TemporalClient {
         // Construct input payload matching GenericWorkflowInput interface in TS
         // interface GenericWorkflowInput { workflow_id: string; input: Record<string, any>; intent?: string; }
         let mut input_obj = serde_json::json!({
-            "workflow_id": workflow_id,
-            "input": input,
-            "blackboard": blackboard,
-            "security_context_name": security_context_name,
-            "tenant_id": tenant_id,
+            "workflow_id": params.workflow_id,
+            "input": params.input,
+            "blackboard": params.blackboard,
+            "security_context_name": params.security_context_name,
+            "tenant_id": params.tenant_id,
         });
-        if let Some(intent_val) = intent {
+        if let Some(intent_val) = params.intent {
             input_obj["intent"] = serde_json::Value::String(intent_val);
         }
 
@@ -335,24 +329,8 @@ impl WorkflowEnginePort for TemporalClient {
 
     async fn start_workflow(
         &self,
-        workflow_id: &str,
-        execution_id: ExecutionId,
-        tenant_id: &str,
-        input: HashMap<String, serde_json::Value>,
-        blackboard: Option<HashMap<String, serde_json::Value>>,
-        security_context_name: Option<String>,
-        intent: Option<String>,
+        params: crate::application::ports::StartWorkflowParams<'_>,
     ) -> Result<String> {
-        TemporalClient::start_workflow(
-            self,
-            workflow_id,
-            execution_id,
-            tenant_id,
-            input,
-            blackboard,
-            security_context_name,
-            intent,
-        )
-        .await
+        TemporalClient::start_workflow(self, params).await
     }
 }

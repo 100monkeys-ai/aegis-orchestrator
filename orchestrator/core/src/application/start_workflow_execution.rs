@@ -364,11 +364,11 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         let temporal_workflow_id = execution_id.0.to_string();
 
         let temporal_run_id = engine
-            .start_workflow(
-                &workflow_id,
+            .start_workflow(crate::application::ports::StartWorkflowParams {
+                workflow_id: &workflow_id,
                 execution_id,
-                tenant_id.as_str(),
-                match &request.input {
+                tenant_id: tenant_id.as_str(),
+                input: match &request.input {
                     serde_json::Value::Object(map) => {
                         map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
                     }
@@ -379,10 +379,10 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
                         map
                     }
                 },
-                normalized_blackboard,
-                request.security_context_name.clone(),
-                request.intent.clone(),
-            )
+                blackboard: normalized_blackboard,
+                security_context_name: request.security_context_name.clone(),
+                intent: request.intent.clone(),
+            })
             .await
             .context("Failed to start workflow execution in Temporal")?;
 

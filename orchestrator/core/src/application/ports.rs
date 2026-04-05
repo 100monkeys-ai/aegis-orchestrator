@@ -16,6 +16,20 @@ use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
 use crate::domain::seal_session::SealSessionError;
 
+/// Parameters for starting a workflow execution.
+///
+/// Bundles all arguments to [`WorkflowEnginePort::start_workflow`] into a single
+/// struct, keeping the trait method within clippy's `too_many_arguments` limit.
+pub struct StartWorkflowParams<'a> {
+    pub workflow_id: &'a str,
+    pub execution_id: ExecutionId,
+    pub tenant_id: &'a str,
+    pub input: HashMap<String, Value>,
+    pub blackboard: Option<HashMap<String, Value>>,
+    pub security_context_name: Option<String>,
+    pub intent: Option<String>,
+}
+
 #[async_trait]
 pub trait WorkflowEnginePort: Send + Sync {
     async fn register_workflow(
@@ -23,16 +37,7 @@ pub trait WorkflowEnginePort: Send + Sync {
         definition: &TemporalWorkflowDefinition,
     ) -> anyhow::Result<()>;
 
-    async fn start_workflow(
-        &self,
-        workflow_id: &str,
-        execution_id: ExecutionId,
-        tenant_id: &str,
-        input: HashMap<String, Value>,
-        blackboard: Option<HashMap<String, Value>>,
-        security_context_name: Option<String>,
-        intent: Option<String>,
-    ) -> anyhow::Result<String>;
+    async fn start_workflow(&self, params: StartWorkflowParams<'_>) -> anyhow::Result<String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

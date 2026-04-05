@@ -456,12 +456,7 @@ spec:
 
         async fn start_workflow(
             &self,
-            _workflow_name: &str,
-            _execution_id: crate::domain::execution::ExecutionId,
-            _input: std::collections::HashMap<String, serde_json::Value>,
-            _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
-            _security_context_name: Option<String>,
-            _intent: Option<String>,
+            _params: crate::application::ports::StartWorkflowParams<'_>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }
@@ -477,12 +472,7 @@ spec:
 
         async fn start_workflow(
             &self,
-            _workflow_name: &str,
-            _execution_id: crate::domain::execution::ExecutionId,
-            _input: std::collections::HashMap<String, serde_json::Value>,
-            _blackboard: Option<std::collections::HashMap<String, serde_json::Value>>,
-            _security_context_name: Option<String>,
-            _intent: Option<String>,
+            _params: crate::application::ports::StartWorkflowParams<'_>,
         ) -> Result<String> {
             Ok("unused".to_string())
         }
