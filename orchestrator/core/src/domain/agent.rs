@@ -927,16 +927,16 @@ impl AgentManifest {
 
         // Execution strategy is optional and validated by its own invariants.
 
-        // Require a non-empty task.instruction — agents without one are hollow shells
+        // Reject a present-but-empty task.instruction — absence of task or instruction is valid
         if self
             .spec
             .task
             .as_ref()
             .and_then(|t| t.instruction.as_deref())
             .map(|s| s.trim().is_empty())
-            .unwrap_or(true)
+            .unwrap_or(false)
         {
-            return Err("Agent manifest must include a non-empty task.instruction".to_string());
+            return Err("task.instruction must not be empty when present".to_string());
         }
 
         Ok(())
