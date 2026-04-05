@@ -204,14 +204,14 @@ impl Supervisor {
             .unwrap_or(DEFAULT_EXECUTION_TIMEOUT_SECONDS);
         let overall_timeout = Duration::from_secs(overall_timeout_secs);
 
-        // Per-iteration timeout: explicitly configured in manifest, or 300 seconds default.
+        // Per-iteration timeout: explicitly configured in manifest, or 600 seconds default.
         // This ensures each iteration has sufficient time for LLM calls + tool invocations.
         let per_iteration_timeout = runtime_config
             .execution
             .iteration_timeout
             .as_deref()
             .and_then(|s| parse_duration(s).ok())
-            .unwrap_or_else(|| Duration::from_secs(300));
+            .unwrap_or_else(|| Duration::from_secs(600));
 
         info!(
             overall_timeout_secs = overall_timeout_secs,

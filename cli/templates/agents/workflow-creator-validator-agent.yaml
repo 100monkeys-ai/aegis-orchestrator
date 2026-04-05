@@ -117,21 +117,21 @@ spec:
   execution:
     mode: iterative
     max_iterations: 5
-    llm_timeout_seconds: 300
+    llm_timeout_seconds: 600
     validation:
       - type: semantic
         judge_agent: workflow-generator-judge
         criteria: Ensure generated workflow manifests are correct, complete, safe, and aligned with the requested business objective.
         min_score: 0.85
         min_confidence: 0.75
-        timeout_seconds: 120
+        timeout_seconds: 600
     tool_validation:
       - type: semantic
         judge_agent: tool-call-policy-judge
         criteria: Ensure tool usage follows policy and arguments are valid for workflow authoring actions.
         min_score: 0.8
         min_confidence: 0.7
-        timeout_seconds: 90
+        timeout_seconds: 600
 
   tools:
     - aegis.schema.get

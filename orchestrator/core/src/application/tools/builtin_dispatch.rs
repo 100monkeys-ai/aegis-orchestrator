@@ -20,7 +20,7 @@ pub fn invoke_cmd_run(
             args: vec![],
             cwd: "/workspace".to_string(),
             env_additions: std::collections::HashMap::new(),
-            timeout_secs: 300,
+            timeout_secs: 600,
             max_output_bytes: 1048576,
         },
     ))

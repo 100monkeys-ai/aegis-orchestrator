@@ -33,7 +33,7 @@ spec:
   execution:
     mode: one-shot
     max_retries: 1
-    llm_timeout_seconds: 120
+    llm_timeout_seconds: 600
   security:
     network:
       mode: "deny"

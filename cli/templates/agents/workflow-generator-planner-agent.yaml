@@ -89,14 +89,14 @@ spec:
   execution:
     mode: iterative
     max_iterations: 4
-    llm_timeout_seconds: 300
+    llm_timeout_seconds: 600
     validation:
       - type: semantic
         judge_agent: workflow-generator-judge
         criteria: Ensure the workflow planning output correctly maps required steps to existing agents and identifies only genuinely missing agents.
         min_score: 0.85
         min_confidence: 0.75
-        timeout_seconds: 120
+        timeout_seconds: 600
 
   tools:
     - aegis.workflow.search

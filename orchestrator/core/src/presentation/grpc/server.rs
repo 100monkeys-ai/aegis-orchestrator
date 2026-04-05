@@ -26,9 +26,9 @@ use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus};
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::tenant::TenantId;
 
-const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_JUDGE_WEIGHT: f64 = 1.0;
-const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_VALIDATION_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
 const EXECUTION_TERMINAL_POLL_INTERVAL_MS: u64 = 250;
 use crate::domain::stimulus::{Stimulus, StimulusSource};

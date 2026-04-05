@@ -103,7 +103,7 @@ spec:
   execution:
     mode: iterative
     max_iterations: 3
-    llm_timeout_seconds: 240
+    llm_timeout_seconds: 600
     validation:
       - type: json_schema
         schema:
