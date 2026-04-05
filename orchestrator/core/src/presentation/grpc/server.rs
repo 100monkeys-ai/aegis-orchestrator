@@ -1625,6 +1625,8 @@ mod tests {
                 tenant_id: String::new(),
                 security_context_name: Some("aegis-system-operator".to_string()),
                 intent: None,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             }))
             .await
             .expect("execute_agent should succeed");
@@ -1703,6 +1705,8 @@ mod tests {
                 tenant_id: String::new(),
                 security_context_name: Some("aegis-system-operator".to_string()),
                 intent: None,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             }))
             .await
             .expect("execute_agent should succeed");
