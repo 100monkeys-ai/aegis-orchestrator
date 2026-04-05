@@ -57,6 +57,17 @@ pub enum NfsGatewayError {
     Io(#[from] std::io::Error),
 }
 
+/// Parameters for registering a volume with the NFS gateway.
+pub struct VolumeRegistration {
+    pub volume_id: VolumeId,
+    pub execution_id: ExecutionId,
+    pub container_uid: u32,
+    pub container_gid: u32,
+    pub policy: FsalAccessPolicy,
+    pub mount_point: PathBuf,
+    pub remote_path: String,
+}
+
 /// Volume context registry for NFS export path routing
 ///
 /// Maps VolumeId to execution context (execution_id, UID/GID, policy).
@@ -74,24 +85,17 @@ impl NfsVolumeRegistry {
     }
 
     /// Register a volume with its execution context
-    pub fn register(
-        &self,
-        volume_id: VolumeId,
-        execution_id: ExecutionId,
-        container_uid: u32,
-        container_gid: u32,
-        policy: FsalAccessPolicy,
-        mount_point: PathBuf,
-        remote_path: String,
-    ) {
+    pub fn register(&self, registration: VolumeRegistration) {
+        let volume_id = registration.volume_id;
+        let execution_id = registration.execution_id;
         let context = NfsVolumeContext {
             execution_id,
             volume_id,
-            container_uid,
-            container_gid,
-            policy,
-            mount_point,
-            remote_path,
+            container_uid: registration.container_uid,
+            container_gid: registration.container_gid,
+            policy: registration.policy,
+            mount_point: registration.mount_point,
+            remote_path: registration.remote_path,
         };
         self.contexts.write().insert(volume_id, context);
         debug!(
@@ -372,25 +376,8 @@ impl NfsGatewayService {
     }
 
     /// Register a volume with the NFS server for export path routing
-    pub fn register_volume(
-        &self,
-        volume_id: VolumeId,
-        execution_id: ExecutionId,
-        container_uid: u32,
-        container_gid: u32,
-        policy: FsalAccessPolicy,
-        mount_point: PathBuf,
-        remote_path: String,
-    ) {
-        self.volume_registry.register(
-            volume_id,
-            execution_id,
-            container_uid,
-            container_gid,
-            policy,
-            mount_point,
-            remote_path,
-        );
+    pub fn register_volume(&self, registration: VolumeRegistration) {
+        self.volume_registry.register(registration);
         metrics::gauge!("aegis_volumes_active").increment(1.0);
     }
 

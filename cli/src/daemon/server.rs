@@ -1262,9 +1262,11 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::infrastructure::container_step_runner::ContainerStepRunnerImpl::new(
             docker_for_steps,
             step_image_manager,
-            nfs_server_host,
-            config.spec.runtime.nfs_port,
-            config.spec.runtime.nfs_mountport,
+            aegis_orchestrator_core::infrastructure::container_step_runner::ContainerStepRunnerConfig {
+                nfs_server_host,
+                nfs_port: config.spec.runtime.nfs_port,
+                nfs_mountport: config.spec.runtime.nfs_mountport,
+            },
             event_bus.clone(),
             secrets_manager.clone(),
             Arc::new(nfs_gateway.volume_registry().clone()),

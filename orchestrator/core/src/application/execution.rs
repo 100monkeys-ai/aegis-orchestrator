@@ -37,7 +37,7 @@
 //! See Also: ADR-005 (Iterative Execution Strategy), ADR-036 (NFS Server Gateway)
 
 use crate::application::agent::AgentLifecycleService;
-use crate::application::nfs_gateway::NfsGatewayService;
+use crate::application::nfs_gateway::{NfsGatewayService, VolumeRegistration};
 use crate::application::ports::{
     CortexPatternPort, StoreTrajectoryPatternCommand, TrajectoryStepCommand,
 };
@@ -401,15 +401,15 @@ impl StandardExecutionService {
             gateway.register_borrowed_volume(alias_volume_id, child_execution_id, source_volume);
             let mount =
                 Self::build_borrowed_mount(tenant_id, alias_volume_id, mount_point, &filer_url);
-            gateway.register_volume(
-                alias_volume_id,
-                child_execution_id,
-                1000,
-                1000,
-                read_policy.clone(),
-                mount.mount_point.clone(),
-                mount.remote_path.clone(),
-            );
+            gateway.register_volume(VolumeRegistration {
+                volume_id: alias_volume_id,
+                execution_id: child_execution_id,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: read_policy.clone(),
+                mount_point: mount.mount_point.clone(),
+                remote_path: mount.remote_path.clone(),
+            });
             mounts.push(mount);
         }
 
@@ -898,18 +898,18 @@ mod tests {
         .unwrap();
         parent_volume.mark_available().unwrap();
 
-        nfs_gateway.register_volume(
-            parent_volume.id,
-            parent_execution.id,
-            1000,
-            1000,
-            FsalAccessPolicy {
+        nfs_gateway.register_volume(VolumeRegistration {
+            volume_id: parent_volume.id,
+            execution_id: parent_execution.id,
+            container_uid: 1000,
+            container_gid: 1000,
+            policy: FsalAccessPolicy {
                 read: vec!["/*".to_string()],
                 write: vec!["/*".to_string()],
             },
-            PathBuf::from("/workspace/project"),
-            String::new(),
-        );
+            mount_point: PathBuf::from("/workspace/project"),
+            remote_path: String::new(),
+        });
 
         let agent_repo = Arc::new(InMemoryAgentRepository::new());
         agent_repo
@@ -1999,15 +1999,15 @@ impl StandardExecutionService {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };
-                gw.register_volume(
-                    mount.volume_id,
+                gw.register_volume(VolumeRegistration {
+                    volume_id: mount.volume_id,
                     execution_id,
-                    1000, // container_uid
-                    1000, // container_gid
+                    container_uid: 1000,
+                    container_gid: 1000,
                     policy,
-                    mount.mount_point.clone(),
-                    mount.remote_path.clone(),
-                );
+                    mount_point: mount.mount_point.clone(),
+                    remote_path: mount.remote_path.clone(),
+                });
                 tracing::info!(
                     "Registered volume {} with NFS gateway for execution {}",
                     mount.volume_id,
@@ -2695,15 +2695,15 @@ impl ExecutionService for StandardExecutionService {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };
-                gw.register_volume(
-                    mount.volume_id,
-                    child_execution_id,
-                    1000, // container_uid
-                    1000, // container_gid
+                gw.register_volume(VolumeRegistration {
+                    volume_id: mount.volume_id,
+                    execution_id: child_execution_id,
+                    container_uid: 1000,
+                    container_gid: 1000,
                     policy,
-                    mount.mount_point.clone(),
-                    mount.remote_path.clone(),
-                );
+                    mount_point: mount.mount_point.clone(),
+                    remote_path: mount.remote_path.clone(),
+                });
                 tracing::info!(
                     "Registered own volume {} with NFS gateway for child execution {}",
                     mount.volume_id,

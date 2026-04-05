@@ -16,7 +16,9 @@
 //! - **Layer:** Core System
 //! - **Purpose:** Implements internal responsibilities for nfs gateway integration tests
 
-use aegis_orchestrator_core::application::nfs_gateway::{EventBusPublisher, NfsGatewayService};
+use aegis_orchestrator_core::application::nfs_gateway::{
+    EventBusPublisher, NfsGatewayService, VolumeRegistration,
+};
 use aegis_orchestrator_core::domain::events::StorageEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::fsal::{
@@ -310,15 +312,15 @@ async fn test_fsal_mode_validation() {
     };
 
     // Register the volume with the NFS gateway to establish export context
-    gateway.register_volume(
+    gateway.register_volume(VolumeRegistration {
         volume_id,
         execution_id,
-        0,
-        0,
-        policy.clone(),
-        std::path::PathBuf::from("/workspace"),
-        String::new(),
-    );
+        container_uid: 0,
+        container_gid: 0,
+        policy: policy.clone(),
+        mount_point: std::path::PathBuf::from("/workspace"),
+        remote_path: String::new(),
+    });
 
     let path = "/workspace/test.txt";
     let handle =
@@ -371,15 +373,15 @@ async fn test_fsal_path_traversal_prevention() {
     };
 
     // Register the attached volume with the NFS gateway before performing FSAL operations
-    nfs_gateway.register_volume(
+    nfs_gateway.register_volume(VolumeRegistration {
         volume_id,
         execution_id,
-        0,
-        0,
-        policy.clone(),
-        std::path::PathBuf::from("/workspace"),
-        String::new(),
-    );
+        container_uid: 0,
+        container_gid: 0,
+        policy: policy.clone(),
+        mount_point: std::path::PathBuf::from("/workspace"),
+        remote_path: String::new(),
+    });
 
     // Test: Attempt path traversal attack
     let handle = aegis_orchestrator_core::domain::fsal::AegisFileHandle::new(
@@ -636,18 +638,18 @@ async fn test_gateway_borrowed_volume_alias_allows_judge_read_only_access() {
     let borrowed_alias_id = VolumeId::new();
 
     gateway.register_borrowed_volume(borrowed_alias_id, judge_execution_id, source_volume.clone());
-    gateway.register_volume(
-        borrowed_alias_id,
-        judge_execution_id,
-        1000,
-        1000,
-        FsalAccessPolicy {
+    gateway.register_volume(VolumeRegistration {
+        volume_id: borrowed_alias_id,
+        execution_id: judge_execution_id,
+        container_uid: 1000,
+        container_gid: 1000,
+        policy: FsalAccessPolicy {
             read: vec!["/workspace/**".to_string()],
             write: vec![],
         },
-        "/workspace".into(),
-        String::new(),
-    );
+        mount_point: "/workspace".into(),
+        remote_path: String::new(),
+    });
 
     let policy = FsalAccessPolicy {
         read: vec!["/workspace/**".to_string()],
@@ -703,18 +705,18 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
     let borrowed_alias_id = VolumeId::new();
 
     gateway.register_borrowed_volume(borrowed_alias_id, judge_execution_id, source_volume);
-    gateway.register_volume(
-        borrowed_alias_id,
-        judge_execution_id,
-        1000,
-        1000,
-        FsalAccessPolicy {
+    gateway.register_volume(VolumeRegistration {
+        volume_id: borrowed_alias_id,
+        execution_id: judge_execution_id,
+        container_uid: 1000,
+        container_gid: 1000,
+        policy: FsalAccessPolicy {
             read: vec!["/workspace/**".to_string()],
             write: vec![],
         },
-        "/workspace".into(),
-        String::new(),
-    );
+        mount_point: "/workspace".into(),
+        remote_path: String::new(),
+    });
 
     let handle = AegisFileHandle::new(
         wrong_execution_id,

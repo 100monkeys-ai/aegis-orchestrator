@@ -50,6 +50,13 @@ use tracing::{debug, info, warn};
 // 1 MiB cap per stream (stdout/stderr) to prevent runaway output from flooding memory.
 const STREAM_BYTES_CAP: usize = 1_048_576;
 
+/// NFS and port configuration for [`ContainerStepRunnerImpl`].
+pub struct ContainerStepRunnerConfig {
+    pub nfs_server_host: Option<String>,
+    pub nfs_port: u16,
+    pub nfs_mountport: u16,
+}
+
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
 /// Docker Engine API (bollard). Shares image management and NFS configuration
 /// with [`crate::infrastructure::runtime::ContainerRuntime`].
@@ -76,9 +83,7 @@ impl ContainerStepRunnerImpl {
     pub fn new(
         docker: Docker,
         image_manager: Arc<dyn DockerImageManager>,
-        nfs_server_host: Option<String>,
-        nfs_port: u16,
-        nfs_mountport: u16,
+        config: ContainerStepRunnerConfig,
         event_bus: Arc<EventBus>,
         secrets_manager: Arc<SecretsManager>,
         volume_registry: Arc<NfsVolumeRegistry>,
@@ -86,9 +91,9 @@ impl ContainerStepRunnerImpl {
         Self {
             docker,
             image_manager,
-            nfs_server_host,
-            nfs_port,
-            nfs_mountport,
+            nfs_server_host: config.nfs_server_host,
+            nfs_port: config.nfs_port,
+            nfs_mountport: config.nfs_mountport,
             event_bus,
             secrets_manager,
             volume_registry,
