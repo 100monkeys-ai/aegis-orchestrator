@@ -59,7 +59,6 @@
 //! - **Task Queue**: Worker registration and task routing identifier
 
 use crate::application::ports::WorkflowEnginePort;
-use crate::domain::execution::ExecutionId;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use reqwest::Client as HttpClient;

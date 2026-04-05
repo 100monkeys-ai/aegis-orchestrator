@@ -485,19 +485,13 @@ mod tests {
 
         async fn start_workflow(
             &self,
-            workflow_id: &str,
-            execution_id: ExecutionId,
-            _tenant_id: &str,
-            input: HashMap<String, serde_json::Value>,
-            blackboard: Option<HashMap<String, serde_json::Value>>,
-            _security_context_name: Option<String>,
-            _intent: Option<String>,
+            params: crate::application::ports::StartWorkflowParams<'_>,
         ) -> Result<String> {
             self.calls.lock().unwrap().push(StartCall {
-                workflow_id: workflow_id.to_string(),
-                execution_id,
-                input,
-                blackboard,
+                workflow_id: params.workflow_id.to_string(),
+                execution_id: params.execution_id,
+                input: params.input,
+                blackboard: params.blackboard,
             });
             Ok(self.run_id.clone())
         }
