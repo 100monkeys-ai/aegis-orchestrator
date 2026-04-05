@@ -16,12 +16,7 @@ metadata:
     adr: "087"
   input_schema:
     type: object
-    required:
-      - intent
     properties:
-      intent:
-        type: string
-        description: Natural-language description of what the code should do
       language:
         type: string
         description: Target programming language (e.g. python, javascript)
@@ -62,7 +57,7 @@ spec:
       input: |
         Discover or generate a code-writing agent for this execution request.
 
-        Intent: {{input.intent}}
+        Intent: {{intent}}
         Language: {{input.language}}
 
         Step 1: Call aegis.agent.search with a query that captures the intent
@@ -86,7 +81,7 @@ spec:
       input: |
         Write {{input.language}} code that fulfills this intent:
 
-        Intent: {{input.intent}}
+        Intent: {{intent}}
         Input values: {{input.inputs}}
 
         Requirements:
@@ -131,7 +126,7 @@ spec:
       agent: intent-result-formatter-agent
       max_iterations: 1
       input: |
-        The user's original request: {{input.intent}}
+        The user's original request: {{intent}}
 
         The code produced this output:
         {{blackboard.EXECUTE_CODE.output.stdout}}
