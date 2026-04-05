@@ -1474,6 +1474,7 @@ impl StandardExecutionService {
             let prompt_template = task_spec
                 .prompt_template
                 .as_deref()
+                .filter(|s| !s.is_empty())
                 .unwrap_or(DEFAULT_PROMPT_TEMPLATE);
 
             let agent_instruction = task_spec
