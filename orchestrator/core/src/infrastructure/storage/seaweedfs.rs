@@ -143,19 +143,6 @@ impl StorageProvider for SeaweedFSAdapter {
             )));
         }
 
-        // The sentinel only needs to exist long enough for SeaweedFS to
-        // materialise the directory entry. Delete it immediately so it is
-        // never visible to agents.
-        let keep_delete_response = self.client.delete(&keep_url).send().await?;
-        if !keep_delete_response.status().is_success() {
-            tracing::warn!(
-                path = %keep_path,
-                status = %keep_delete_response.status(),
-                "Failed to delete .keep sentinel after directory materialisation; \
-                 directory is still usable but sentinel may be visible"
-            );
-        }
-
         Ok(())
     }
 
