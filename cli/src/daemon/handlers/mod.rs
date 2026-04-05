@@ -41,6 +41,8 @@ pub(crate) struct CortexQueryParams {
     pub(crate) limit: Option<usize>,
 }
 
+pub(crate) const TENANT_DELEGATION_HEADER: &str = "x-tenant-id";
+
 pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
     match identity.map(|identity| &identity.identity_kind) {
         Some(IdentityKind::ConsumerUser { tenant_id, .. }) => tenant_id.clone(),
@@ -50,6 +52,32 @@ pub(crate) fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> Tenant
         Some(IdentityKind::Operator { .. }) => TenantId::system(),
         Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
         None => TenantId::default(),
+    }
+}
+
+/// Resolve the effective tenant for a request, honoring `X-Tenant-Id` header
+/// delegation when the caller is a service account.
+///
+/// Service accounts authenticate as `aegis-system` by default. When they
+/// supply `X-Tenant-Id`, that value becomes the effective tenant so that the
+/// worker can operate on behalf of a user-owned tenant (e.g. when the
+/// Temporal worker looks up agents deployed in a user tenant).
+///
+/// All other identity kinds are unaffected — their tenant is always derived
+/// solely from the JWT claims via [`tenant_id_from_identity`].
+pub(crate) fn tenant_id_from_request(
+    identity: Option<&UserIdentity>,
+    delegation_tenant_id: Option<&str>,
+) -> TenantId {
+    match identity.map(|id| &id.identity_kind) {
+        Some(IdentityKind::ServiceAccount { .. }) => {
+            if let Some(t) = delegation_tenant_id.filter(|s| !s.is_empty()) {
+                TenantId::from_realm_slug(t).unwrap_or_else(|_| TenantId::system())
+            } else {
+                TenantId::system()
+            }
+        }
+        _ => tenant_id_from_identity(identity),
     }
 }
 

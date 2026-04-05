@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use axum::Json;
@@ -20,7 +20,9 @@ use aegis_orchestrator_core::domain::execution::ExecutionInput;
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 
-use crate::daemon::handlers::tenant_id_from_identity;
+use crate::daemon::handlers::{
+    tenant_id_from_identity, tenant_id_from_request, TENANT_DELEGATION_HEADER,
+};
 use crate::daemon::state::AppState;
 
 #[derive(serde::Deserialize, Default)]
@@ -49,10 +51,14 @@ pub(crate) struct ExecuteAgentQuery {
 pub(crate) async fn deploy_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<DeployAgentQuery>,
     Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
 
     let agent_scope = match query.scope.as_deref() {
         Some("global") => AgentScope::Global,
@@ -81,11 +87,15 @@ pub(crate) async fn deploy_agent_handler(
 pub(crate) async fn execute_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
     Query(query): Query<ExecuteAgentQuery>,
     Json(request): Json<ExecuteRequest>,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
 
     // If a version query parameter is provided, verify the agent's manifest version matches
     if let Some(ref requested_version) = query.version {
@@ -192,9 +202,13 @@ pub(crate) struct ListAgentsQuery {
 pub(crate) async fn list_agents_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<ListAgentsQuery>,
 ) -> Json<serde_json::Value> {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
 
     let list_result = if query.scope.as_deref() == Some("global") {
         state
@@ -254,9 +268,13 @@ pub(crate) async fn list_agents_handler(
 pub(crate) async fn delete_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
 
     // Check scope authorization before deleting
     let aid = AgentId(agent_id);
@@ -317,9 +335,13 @@ fn build_roles(identity: &Option<Extension<UserIdentity>>) -> Vec<String> {
 pub(crate) async fn get_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
     match state
         .agent_service
         .get_agent_visible(&tenant_id, AgentId(id))
@@ -351,9 +373,13 @@ pub(crate) async fn get_agent_handler(
 pub(crate) async fn list_agent_versions_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
 ) -> Json<serde_json::Value> {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
     match state
         .agent_service
         .list_versions_for_tenant(&tenant_id, AgentId(agent_id))
@@ -367,9 +393,13 @@ pub(crate) async fn list_agent_versions_handler(
 pub(crate) async fn lookup_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
     match state
         .agent_service
         .lookup_agent_visible_for_tenant(&tenant_id, &name)
@@ -391,10 +421,14 @@ pub(crate) async fn lookup_agent_handler(
 pub(crate) async fn update_agent_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
     Json(manifest): Json<aegis_orchestrator_sdk::AgentManifest>,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
     let aid = AgentId(agent_id);
 
     // Load agent to check scope authorization

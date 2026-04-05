@@ -86,6 +86,31 @@ impl AegisRuntimeService {
         }
     }
 
+    /// Resolve the effective tenant for a gRPC request, honoring the
+    /// `x-tenant-id` metadata key when the caller is a service account.
+    ///
+    /// Mirrors the HTTP `tenant_id_from_request` logic (ADR-100).
+    fn tenant_id_from_request<T>(
+        identity: Option<&UserIdentity>,
+        request: &Request<T>,
+    ) -> TenantId {
+        match identity.map(|id| &id.identity_kind) {
+            Some(IdentityKind::ServiceAccount { .. }) => {
+                let delegation = request
+                    .metadata()
+                    .get("x-tenant-id")
+                    .and_then(|v| v.to_str().ok())
+                    .filter(|s| !s.is_empty());
+                if let Some(t) = delegation {
+                    TenantId::from_realm_slug(t).unwrap_or_else(|_| TenantId::system())
+                } else {
+                    TenantId::system()
+                }
+            }
+            _ => Self::tenant_id_from_identity(identity),
+        }
+    }
+
     fn zaru_tier_from_identity(identity: Option<&UserIdentity>) -> ZaruTier {
         match identity.map(|id| &id.identity_kind) {
             Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
@@ -206,8 +231,8 @@ impl AegisRuntime for AegisRuntimeService {
         let identity = self
             .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteAgent")
             .await?;
+        let tenant_id = Self::tenant_id_from_request(identity.as_ref(), &request);
         let req = request.into_inner();
-        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
 
         // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
         let agent_id = if let Ok(id) = AgentId::from_string(&req.agent_id) {
@@ -661,8 +686,8 @@ impl AegisRuntime for AegisRuntimeService {
         let identity = self
             .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
             .await?;
+        let tenant_id = Self::tenant_id_from_request(identity.as_ref(), &request);
         let req = request.into_inner();
-        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
         let (stimulus_id, workflow_execution_id) = self
             .ingest_stimulus_rpc(
                 req.source_name,
