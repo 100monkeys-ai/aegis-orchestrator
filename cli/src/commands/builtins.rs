@@ -357,7 +357,7 @@ mod tests {
         );
         assert!(
             AGENT_GENERATOR_AGENT_TEMPLATE
-                .contains("Skipping, reordering, or collapsing steps 1–7 is a policy violation"),
+                .contains("Skipping, reordering, or collapsing steps 1–8 is a policy violation"),
             "agent creator template should reject shortcutting the required workflow"
         );
     }
