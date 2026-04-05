@@ -59,7 +59,7 @@ use crate::application::complete_workflow_execution::{
     CompleteWorkflowExecutionRequest, CompleteWorkflowExecutionUseCase, CompletionStatus,
     StandardCompleteWorkflowExecutionUseCase,
 };
-use crate::domain::events::WorkflowEvent;
+use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason, WorkflowEvent};
 use crate::domain::execution::ExecutionId;
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::workflow::WorkflowId;
@@ -71,6 +71,9 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const EVENT_TYPE_REFINEMENT_APPLIED: &str = "RefinementApplied";
+const EVENT_TYPE_CONTAINER_RUN_STARTED: &str = "ContainerRunStarted";
+const EVENT_TYPE_CONTAINER_RUN_COMPLETED: &str = "ContainerRunCompleted";
+const EVENT_TYPE_CONTAINER_RUN_FAILED: &str = "ContainerRunFailed";
 
 /// Canonical file name used to store validation feedback artifacts produced by refinement
 /// workflows.
@@ -81,7 +84,7 @@ const EVENT_TYPE_REFINEMENT_APPLIED: &str = "RefinementApplied";
 const VALIDATION_FEEDBACK_FILE_NAME: &str = "validation_feedback";
 
 /// External event payload from Temporal worker
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TemporalEventPayload {
     /// Event type (WorkflowExecutionStarted, StateEntered, etc.)
     pub event_type: String,
@@ -143,6 +146,42 @@ pub struct TemporalEventPayload {
     /// Parent state name for SubworkflowTriggered events (ADR-065)
     #[serde(default)]
     pub parent_state_name: Option<String>,
+
+    /// Step name / label for ContainerRun events
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// Container image for ContainerRunStarted events
+    #[serde(default)]
+    pub image: Option<String>,
+
+    /// Container exit code for ContainerRunCompleted/ContainerRunFailed events
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+
+    /// Duration in milliseconds for ContainerRun events
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+
+    /// Stderr output captured from container (ContainerRunFailed events)
+    #[serde(default)]
+    pub stderr: Option<String>,
+
+    /// Number of steps for ParallelContainerRun started events
+    #[serde(default)]
+    pub step_count: Option<u32>,
+
+    /// Completion strategy label (e.g. "all_succeed") for parallel events
+    #[serde(default)]
+    pub completion: Option<String>,
+
+    /// Number of succeeded steps (ParallelContainerRun aggregated events)
+    #[serde(default)]
+    pub succeeded: Option<u32>,
+
+    /// Number of failed steps (ParallelContainerRun aggregated events)
+    #[serde(default)]
+    pub failed: Option<u32>,
 
     /// Event timestamp
     pub timestamp: String,
@@ -609,6 +648,69 @@ impl TemporalEventListener {
             return Ok(payload.execution_id.clone());
         }
 
+        // Special case for ContainerRun events — these belong to ContainerRunEvent, not
+        // WorkflowEvent, so they bypass the TemporalEventMapper entirely and are published
+        // directly to the event bus via publish_container_run_event.
+        if matches!(
+            payload.event_type.as_str(),
+            EVENT_TYPE_CONTAINER_RUN_STARTED
+                | EVENT_TYPE_CONTAINER_RUN_COMPLETED
+                | EVENT_TYPE_CONTAINER_RUN_FAILED
+        ) {
+            let execution_id = ExecutionId(
+                Uuid::parse_str(&payload.execution_id)
+                    .context("Invalid execution_id for ContainerRun event")?,
+            );
+            let timestamp = DateTime::parse_from_rfc3339(&payload.timestamp)
+                .context("Invalid timestamp for ContainerRun event")?
+                .with_timezone(&Utc);
+            let state_name = payload.state_name.clone().unwrap_or_default();
+
+            let container_event = match payload.event_type.as_str() {
+                EVENT_TYPE_CONTAINER_RUN_STARTED => ContainerRunEvent::ContainerRunStarted {
+                    execution_id,
+                    state_name,
+                    step_name: payload.name.clone().unwrap_or_default(),
+                    image: payload.image.clone().unwrap_or_default(),
+                    command: vec![],
+                    started_at: timestamp,
+                },
+                EVENT_TYPE_CONTAINER_RUN_COMPLETED => ContainerRunEvent::ContainerRunCompleted {
+                    execution_id,
+                    state_name,
+                    step_name: payload.name.clone().unwrap_or_default(),
+                    exit_code: payload.exit_code.unwrap_or(0),
+                    stdout_bytes: 0,
+                    stderr_bytes: 0,
+                    duration_ms: payload.duration_ms.unwrap_or(0),
+                    completed_at: timestamp,
+                },
+                EVENT_TYPE_CONTAINER_RUN_FAILED => {
+                    let reason = match payload.exit_code {
+                        Some(code) => ContainerRunFailureReason::NonZeroExitCode { code },
+                        None => ContainerRunFailureReason::ResourceExhausted {
+                            detail: payload
+                                .error
+                                .clone()
+                                .or_else(|| payload.stderr.clone())
+                                .unwrap_or_default(),
+                        },
+                    };
+                    ContainerRunEvent::ContainerRunFailed {
+                        execution_id,
+                        state_name,
+                        step_name: payload.name.clone().unwrap_or_default(),
+                        reason,
+                        failed_at: timestamp,
+                    }
+                }
+                _ => unreachable!(),
+            };
+
+            self.event_bus.publish_container_run_event(container_event);
+            return Ok(payload.execution_id.clone());
+        }
+
         // Step 1: Map external event to domain event (ACL)
         let domain_event = TemporalEventMapper::to_domain_event(&payload)
             .context("Failed to map Temporal event to domain event")?;
@@ -724,6 +826,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
@@ -762,6 +865,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let result = TemporalEventMapper::to_domain_event(&payload);
@@ -790,6 +894,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let result = TemporalEventMapper::to_domain_event(&payload);
@@ -818,6 +923,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
@@ -846,6 +952,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
@@ -1000,6 +1107,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let result_id = listener.handle_event(payload).await.unwrap();
@@ -1042,6 +1150,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let result_id = listener.handle_event(payload).await.unwrap();
@@ -1086,6 +1195,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         let err = listener.handle_event(payload).await.unwrap_err();
@@ -1179,6 +1289,7 @@ mod tests {
             result_key: None,
             parent_state_name: None,
             timestamp: "2026-02-19T12:00:00Z".to_string(),
+            ..Default::default()
         };
 
         listener.handle_event(payload).await.unwrap();
