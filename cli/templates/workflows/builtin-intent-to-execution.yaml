@@ -16,15 +16,36 @@ metadata:
     adr: "087"
   input_schema:
     type: object
+    required:
+      - intent
     properties:
+      intent:
+        type: string
+        description: Natural-language description of what the code should do
       language:
         type: string
         description: Target programming language (e.g. python, javascript)
         default: python
+      language_ext:
+        type: string
+        description: File extension for the generated code file (e.g. py, js)
+        default: py
+      runner:
+        type: string
+        description: Executable used to run the generated code file (e.g. python3, node)
+        default: python3
+      container_image:
+        type: string
+        description: OCI container image used to execute the generated code
+        default: python:3.12-slim
       inputs:
         type: object
         description: Named input values embedded into the generated code
         additionalProperties: true
+      inputs_json:
+        type: string
+        description: JSON-serialized representation of inputs, injected as INTENT_INPUTS env var
+        default: "{}"
 spec:
   initial_state: DISCOVER_OR_GENERATE_AGENT
 
@@ -41,7 +62,7 @@ spec:
       input: |
         Discover or generate a code-writing agent for this execution request.
 
-        Intent: {{intent}}
+        Intent: {{input.intent}}
         Language: {{input.language}}
 
         Step 1: Call aegis.agent.search with a query that captures the intent
@@ -65,7 +86,7 @@ spec:
       input: |
         Write {{input.language}} code that fulfills this intent:
 
-        Intent: {{intent}}
+        Intent: {{input.intent}}
         Input values: {{input.inputs}}
 
         Requirements:
@@ -110,7 +131,7 @@ spec:
       agent: intent-result-formatter-agent
       max_iterations: 1
       input: |
-        The user's original request: {{intent}}
+        The user's original request: {{input.intent}}
 
         The code produced this output:
         {{blackboard.EXECUTE_CODE.output.stdout}}
