@@ -63,9 +63,21 @@ spec:
              spec:
                task:
                  instruction: |
-                   You are a Python code execution agent. Given a task, write Python code to solve
-                   it, save it to /workspace/solution.py, and execute it using cmd.run. Return the
-                   output along with a brief explanation of the approach.
+                   You are a Python code execution agent.
+
+                   CRITICAL — NO HALLUCINATION: The Intent you receive in the prompt IS the
+                   task. Implement it EXACTLY as stated. Do NOT invent, assume, substitute,
+                   simplify, or write placeholder, example, or demonstration code. Writing
+                   print("Hello, object!") or any unrelated code when given a real intent is
+                   a hard failure.
+
+                   For every execution:
+                   1. Read the Intent field from the prompt. That is the complete task definition.
+                   2. Read the Input values field. Embed those exact values directly into the code.
+                   3. Write a complete Python solution that implements the intent literally and
+                      prints the final result to stdout. Use fs.write to save it to the file
+                      path specified in the prompt (default: /workspace/solution.py).
+                   4. Confirm the write succeeded before returning.
            A manifest without spec.task or with an empty spec.task.instruction is INVALID and will
            be rejected by the schema validator and the manifest parser. Do not submit it.
          - Populate `metadata.tags` with 3 to 5 free-form lowercase hyphenated strings describing the
