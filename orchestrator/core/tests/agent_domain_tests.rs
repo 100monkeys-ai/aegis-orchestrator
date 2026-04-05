@@ -17,7 +17,7 @@ use aegis_orchestrator_core::domain::agent::{
     Agent, AgentManifest, AgentSpec, AgentStatus, ContextItem, DeliveryCondition, DeliveryConfig,
     DeliveryDestination, DeliveryType, EmailConfig, ExecutionMode, ExecutionStrategy,
     FilesystemPolicy, ManifestMetadata, NetworkPolicy, ResourceLimits, RuntimeConfig, RuntimeType,
-    ScheduleConfig, SecurityConfig, ValidatorSpec, VolumeSpec, WebhookConfig,
+    ScheduleConfig, SecurityConfig, TaskConfig, ValidatorSpec, VolumeSpec, WebhookConfig,
 };
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ImagePullPolicy};
 use aegis_orchestrator_core::domain::workflow::ConsensusStrategy;
@@ -49,7 +49,11 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
                 isolation: "inherit".to_string(),
                 model: "default".to_string(),
             },
-            task: None,
+            task: Some(TaskConfig {
+                instruction: Some("Test instruction".to_string()),
+                prompt_template: None,
+                input_data: None,
+            }),
             context: vec![],
             execution: None,
             security: None,
