@@ -176,14 +176,6 @@ mod tests {
         }
     }
 
-    fn tenant_admin_requester(tenant_id: &TenantId) -> ScopeChangeRequester {
-        ScopeChangeRequester {
-            user_id: "tenant-admin-user".to_string(),
-            roles: vec!["tenant:admin".to_string()],
-            tenant_id: tenant_id.clone(),
-        }
-    }
-
     fn unprivileged_requester(tenant_id: &TenantId) -> ScopeChangeRequester {
         ScopeChangeRequester {
             user_id: "regular-user".to_string(),
