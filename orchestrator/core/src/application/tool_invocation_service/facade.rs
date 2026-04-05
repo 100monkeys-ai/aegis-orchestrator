@@ -389,7 +389,7 @@ impl ToolInvocationService {
 
                             let judge_id = self
                                 .agent_lifecycle
-                                .lookup_agent_visible_for_tenant(tenant_id, None, judge_agent)
+                                .lookup_agent_visible_for_tenant(tenant_id, judge_agent)
                                 .await
                                 .map_err(|e| {
                                     SealSessionError::InternalError(format!(

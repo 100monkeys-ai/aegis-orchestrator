@@ -76,7 +76,7 @@ pub struct AegisRuntimeService {
 impl AegisRuntimeService {
     fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
         match identity.map(|identity| &identity.identity_kind) {
-            Some(IdentityKind::ConsumerUser { .. }) => TenantId::consumer(),
+            Some(IdentityKind::ConsumerUser { tenant_id, .. }) => tenant_id.clone(),
             Some(IdentityKind::TenantUser { tenant_slug }) => {
                 TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
             }
@@ -88,7 +88,7 @@ impl AegisRuntimeService {
 
     fn zaru_tier_from_identity(identity: Option<&UserIdentity>) -> ZaruTier {
         match identity.map(|id| &id.identity_kind) {
-            Some(IdentityKind::ConsumerUser { zaru_tier }) => zaru_tier.clone(),
+            Some(IdentityKind::ConsumerUser { zaru_tier, .. }) => zaru_tier.clone(),
             // Operators and service accounts get Enterprise-level discovery access.
             Some(IdentityKind::Operator { .. } | IdentityKind::ServiceAccount { .. }) => {
                 ZaruTier::Enterprise
@@ -214,7 +214,7 @@ impl AegisRuntime for AegisRuntimeService {
             id
         } else if let Some(ref svc) = self.agent_service {
             match svc
-                .lookup_agent_visible_for_tenant(&tenant_id, None, &req.agent_id)
+                .lookup_agent_visible_for_tenant(&tenant_id, &req.agent_id)
                 .await
             {
                 Ok(Some(id)) => id,
@@ -1518,7 +1518,6 @@ mod tests {
         async fn list_agents_visible_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,
-            _user_id: Option<&str>,
         ) -> Result<Vec<crate::domain::agent::Agent>> {
             Ok(vec![])
         }
@@ -1534,7 +1533,6 @@ mod tests {
         async fn lookup_agent_visible_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,
-            _user_id: Option<&str>,
             _name: &str,
         ) -> Result<Option<AgentId>> {
             Ok(None)

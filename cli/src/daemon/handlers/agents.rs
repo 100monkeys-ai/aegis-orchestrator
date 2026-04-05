@@ -55,13 +55,6 @@ pub(crate) async fn deploy_agent_handler(
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     let agent_scope = match query.scope.as_deref() {
-        Some("user") => {
-            let sub = identity
-                .as_ref()
-                .map(|ext| ext.0.sub.clone())
-                .unwrap_or_default();
-            AgentScope::User { owner_user_id: sub }
-        }
         Some("global") => AgentScope::Global,
         _ => AgentScope::Tenant,
     };
@@ -202,7 +195,6 @@ pub(crate) async fn list_agents_handler(
     axum::extract::Query(query): axum::extract::Query<ListAgentsQuery>,
 ) -> Json<serde_json::Value> {
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
-    let user_id = identity.as_ref().map(|ext| ext.0.sub.as_str());
 
     let list_result = if query.scope.as_deref() == Some("global") {
         state
@@ -212,7 +204,7 @@ pub(crate) async fn list_agents_handler(
     } else if query.visible.unwrap_or(true) {
         state
             .agent_service
-            .list_agents_visible_for_tenant(&tenant_id, user_id)
+            .list_agents_visible_for_tenant(&tenant_id)
             .await
     } else {
         state.agent_service.list_agents_for_tenant(&tenant_id).await
@@ -245,7 +237,6 @@ pub(crate) async fn list_agents_handler(
                         "tags": agent.manifest.metadata.tags,
                         "labels": agent.manifest.metadata.labels,
                         "scope": agent.scope.to_string(),
-                        "owner_user_id": agent.scope.owner_user_id(),
                         "created_at": agent.created_at.to_rfc3339(),
                         "updated_at": agent.updated_at.to_rfc3339(),
                         "tenant_id": agent.tenant_id.as_str(),
@@ -288,9 +279,6 @@ pub(crate) async fn delete_agent_handler(
 
             let authorized = match &agent.scope {
                 AgentScope::Global => requester.is_operator_or_admin(),
-                AgentScope::User { owner_user_id } => {
-                    user_id == *owner_user_id || requester.is_tenant_admin()
-                }
                 AgentScope::Tenant => true,
             };
 
@@ -356,7 +344,6 @@ pub(crate) async fn get_agent_handler(
                 "tags": agent.manifest.metadata.tags,
                 "labels": agent.manifest.metadata.labels,
                 "scope": agent.scope.to_string(),
-                "owner_user_id": agent.scope.owner_user_id(),
                 "created_at": agent.created_at.to_rfc3339(),
                 "updated_at": agent.updated_at.to_rfc3339(),
                 "tenant_id": agent.tenant_id.as_str(),
@@ -393,7 +380,7 @@ pub(crate) async fn lookup_agent_handler(
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .agent_service
-        .lookup_agent_visible_for_tenant(&tenant_id, None, &name)
+        .lookup_agent_visible_for_tenant(&tenant_id, &name)
         .await
     {
         Ok(Some(id)) => (StatusCode::OK, Json(serde_json::json!({"id": id.0}))),
@@ -438,9 +425,6 @@ pub(crate) async fn update_agent_handler(
 
             let authorized = match &agent.scope {
                 AgentScope::Global => requester.is_operator_or_admin(),
-                AgentScope::User { owner_user_id } => {
-                    user_id == *owner_user_id || requester.is_tenant_admin()
-                }
                 AgentScope::Tenant => true,
             };
 
@@ -507,13 +491,10 @@ pub(crate) async fn update_agent_scope_handler(
     let target_scope = match target_scope_str.as_str() {
         "global" => AgentScope::Global,
         "tenant" => AgentScope::Tenant,
-        "user" => AgentScope::User {
-            owner_user_id: user_id.clone(),
-        },
         other => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant, user")})),
+                Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant")})),
             )
                 .into_response();
         }

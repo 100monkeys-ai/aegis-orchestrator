@@ -25,6 +25,7 @@
 //! - SEAL agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
 //!   OIDC is for human and service-account identities only.
 
+use crate::domain::tenant::TenantId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -110,7 +111,7 @@ impl UserIdentity {
     /// - Tenant users map to `aegis-system-operator` (tenant-scoped contexts are a future extension).
     pub fn to_security_context_name(&self) -> String {
         match &self.identity_kind {
-            IdentityKind::ConsumerUser { zaru_tier } => {
+            IdentityKind::ConsumerUser { zaru_tier, .. } => {
                 zaru_tier.to_security_context_name().to_string()
             }
             IdentityKind::Operator { .. }
@@ -123,8 +124,11 @@ impl UserIdentity {
 /// Classification of the authenticated entity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IdentityKind {
-    /// zaru-consumer realm user
-    ConsumerUser { zaru_tier: ZaruTier },
+    /// zaru-consumer realm user (ADR-097: carries per-user tenant_id)
+    ConsumerUser {
+        zaru_tier: ZaruTier,
+        tenant_id: TenantId,
+    },
     /// aegis-system realm human operator
     Operator { aegis_role: AegisRole },
     /// aegis-system realm M2M client
@@ -426,6 +430,7 @@ mod tests {
             email: Some("user@example.com".to_string()),
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
+                tenant_id: TenantId::consumer(),
             },
         };
         let json = serde_json::to_string(&identity).unwrap();

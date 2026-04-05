@@ -1140,7 +1140,9 @@ async fn create_tenant(
     };
 
     let tier = match payload.tier.as_str() {
-        "consumer" => TenantTier::Consumer,
+        "free" => TenantTier::Free,
+        "pro" => TenantTier::Pro,
+        "business" => TenantTier::Business,
         "enterprise" => TenantTier::Enterprise,
         "system" => TenantTier::System,
         other => {

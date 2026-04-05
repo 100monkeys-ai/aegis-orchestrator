@@ -51,17 +51,16 @@ use chrono::{DateTime, Utc};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Visibility scope for an agent definition (ADR-076 mirror).
+/// Visibility scope for an agent definition (ADR-076 / ADR-097).
 ///
 /// Scope determines which principals can discover and execute an agent.
 /// Scope is mutable via explicit promote/demote operations (not via save).
 ///
-/// Hierarchy (broadest to narrowest): Global > Tenant > User
+/// Two-level hierarchy (broadest to narrowest): Global > Tenant
 ///
 /// Invariants:
 /// - `Global` agents MUST have `tenant_id == TenantId::system()`.
-/// - `Tenant` agents have no `owner_user_id`.
-/// - `User` agents MUST have a non-None `owner_user_id`.
+/// - `Tenant` agents belong to a single tenant.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum AgentScope {
     /// Platform-wide: visible to all tenants, managed by operators.
@@ -71,12 +70,6 @@ pub enum AgentScope {
     /// Tenant-wide: visible to all users within the owning tenant.
     #[default]
     Tenant,
-
-    /// User-private: visible only to the owning user within their tenant.
-    User {
-        /// OIDC `sub` claim identifying the owning user.
-        owner_user_id: String,
-    },
 }
 
 impl AgentScope {
@@ -84,15 +77,6 @@ impl AgentScope {
         match self {
             AgentScope::Global => "global",
             AgentScope::Tenant => "tenant",
-            AgentScope::User { .. } => "user",
-        }
-    }
-
-    /// Extract the owner_user_id if this is a User scope, else None.
-    pub fn owner_user_id(&self) -> Option<&str> {
-        match self {
-            AgentScope::User { owner_user_id } => Some(owner_user_id.as_str()),
-            _ => None,
         }
     }
 }

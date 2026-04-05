@@ -258,7 +258,6 @@ impl AgentLifecycleService for MockAgentLifecycleService {
     async fn list_agents_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
     ) -> anyhow::Result<Vec<Agent>> {
         Ok(vec![])
     }
@@ -274,7 +273,6 @@ impl AgentLifecycleService for MockAgentLifecycleService {
     async fn lookup_agent_visible_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _user_id: Option<&str>,
         _name: &str,
     ) -> anyhow::Result<Option<AgentId>> {
         Ok(None)

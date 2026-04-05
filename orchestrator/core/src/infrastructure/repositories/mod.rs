@@ -186,7 +186,6 @@ impl AgentRepository for InMemoryAgentRepository {
     async fn list_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
     ) -> Result<Vec<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
         let system_tid = TenantId::system();
@@ -194,12 +193,6 @@ impl AgentRepository for InMemoryAgentRepository {
         for (tid, tenant_agents) in agents.iter() {
             for a in tenant_agents.values() {
                 let visible = match &a.scope {
-                    AgentScope::User { owner_user_id } => {
-                        tid == tenant_id
-                            && user_id
-                                .map(|u| u == owner_user_id.as_str())
-                                .unwrap_or(false)
-                    }
                     AgentScope::Tenant => tid == tenant_id,
                     AgentScope::Global => tid == &system_tid,
                 };
@@ -241,30 +234,18 @@ impl AgentRepository for InMemoryAgentRepository {
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Agent>, RepositoryError> {
         let agents = self.agents.read().unwrap();
         let system_tid = TenantId::system();
 
-        // Priority: user-scoped > tenant-scoped > global
-        let mut user_match: Option<Agent> = None;
+        // Priority: tenant-scoped > global
         let mut tenant_match: Option<Agent> = None;
         let mut global_match: Option<Agent> = None;
 
         for (tid, tenant_agents) in agents.iter() {
             for agent in tenant_agents.values().filter(|a| a.name == name) {
                 match &agent.scope {
-                    AgentScope::User { owner_user_id } => {
-                        if tid == tenant_id
-                            && user_id
-                                .map(|u| u == owner_user_id.as_str())
-                                .unwrap_or(false)
-                            && user_match.is_none()
-                        {
-                            user_match = Some(agent.clone());
-                        }
-                    }
                     AgentScope::Tenant => {
                         if tid == tenant_id && tenant_match.is_none() {
                             tenant_match = Some(agent.clone());
@@ -279,7 +260,7 @@ impl AgentRepository for InMemoryAgentRepository {
             }
         }
 
-        Ok(user_match.or(tenant_match).or(global_match))
+        Ok(tenant_match.or(global_match))
     }
 
     async fn find_by_id_visible(
@@ -398,9 +379,8 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     async fn list_agents_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
     ) -> anyhow::Result<Vec<Agent>> {
-        self.list_visible_for_tenant(tenant_id, user_id)
+        self.list_visible_for_tenant(tenant_id)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list visible agents: {e}"))
     }
@@ -420,11 +400,10 @@ impl AgentLifecycleService for InMemoryAgentRepository {
     async fn lookup_agent_visible_for_tenant(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> anyhow::Result<Option<AgentId>> {
         let agent = self
-            .resolve_by_name(tenant_id, user_id, name)
+            .resolve_by_name(tenant_id, name)
             .await
             .map_err(|e| anyhow::anyhow!("Repository error: {e}"))?;
         Ok(agent.map(|a| a.id))
@@ -707,37 +686,20 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
         let system_tenant = TenantId::system();
 
-        // Scope priority: user=0 (best), tenant=1, global=2 (worst).
+        // Scope priority: tenant=0 (best), global=1 (worst).
         let scope_priority = |w: &Workflow| -> u8 {
             match &w.scope {
-                WorkflowScope::User { .. } => 0,
-                WorkflowScope::Tenant => 1,
-                WorkflowScope::Global => 2,
+                WorkflowScope::Tenant => 0,
+                WorkflowScope::Global => 1,
             }
         };
 
         let mut candidates: Vec<&Workflow> = Vec::new();
-
-        // User scope
-        if let Some(uid) = user_id {
-            if let Some(tenant_wfs) = workflows.get(tenant_id) {
-                for w in tenant_wfs.values() {
-                    if w.metadata.name == name {
-                        if let WorkflowScope::User { owner_user_id } = &w.scope {
-                            if owner_user_id == uid {
-                                candidates.push(w);
-                            }
-                        }
-                    }
-                }
-            }
-        }
 
         // Tenant scope
         if let Some(tenant_wfs) = workflows.get(tenant_id) {
@@ -770,29 +732,13 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
     async fn resolve_by_name_and_version(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
         let system_tenant = TenantId::system();
 
-        // User scope (highest priority)
-        if let Some(uid) = user_id {
-            if let Some(tenant_wfs) = workflows.get(tenant_id) {
-                for w in tenant_wfs.values() {
-                    if w.metadata.name == name && w.metadata.version.as_deref() == Some(version) {
-                        if let WorkflowScope::User { owner_user_id } = &w.scope {
-                            if owner_user_id == uid {
-                                return Ok(Some(w.clone()));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // Tenant scope
+        // Tenant scope (highest priority)
         if let Some(tenant_wfs) = workflows.get(tenant_id) {
             for w in tenant_wfs.values() {
                 if w.metadata.name == name
@@ -819,27 +765,10 @@ impl WorkflowRepository for InMemoryWorkflowRepository {
         Ok(None)
     }
 
-    async fn list_visible(
-        &self,
-        tenant_id: &TenantId,
-        user_id: Option<&str>,
-    ) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
         let workflows = self.workflows.read().unwrap();
         let system_tenant = TenantId::system();
         let mut result = Vec::new();
-
-        // User-scoped workflows
-        if let Some(uid) = user_id {
-            if let Some(tenant_wfs) = workflows.get(tenant_id) {
-                for w in tenant_wfs.values() {
-                    if let WorkflowScope::User { owner_user_id } = &w.scope {
-                        if owner_user_id == uid {
-                            result.push(w.clone());
-                        }
-                    }
-                }
-            }
-        }
 
         // Tenant-scoped workflows
         if let Some(tenant_wfs) = workflows.get(tenant_id) {

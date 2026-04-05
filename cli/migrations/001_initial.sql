@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS tenants (
     deleted_at      TIMESTAMPTZ  NULL,
     CONSTRAINT tenants_slug_format CHECK (slug ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT tenants_status_check CHECK (status IN ('active', 'suspended', 'deleted')),
-    CONSTRAINT tenants_tier_check CHECK (tier IN ('consumer', 'enterprise', 'system'))
+    CONSTRAINT tenants_tier_check CHECK (tier IN ('free', 'pro', 'business', 'enterprise', 'system'))
 );
 
 CREATE INDEX idx_tenants_status ON tenants(status);
@@ -44,7 +44,7 @@ CREATE INDEX idx_tenants_status ON tenants(status);
 -- Seed tenants
 INSERT INTO tenants (slug, display_name, tier, keycloak_realm, openbao_namespace)
 VALUES
-    ('zaru-consumer', 'Zaru Consumer Pool', 'consumer', 'zaru-consumer', 'tenant-zaru-consumer/'),
+    ('zaru-consumer', 'Zaru Consumer Pool', 'free', 'zaru-consumer', 'tenant-zaru-consumer/'),
     ('aegis-system',  'AEGIS Platform',     'system',   'aegis-system',  'tenant-aegis-system/')
 ON CONFLICT (slug) DO NOTHING;
 
@@ -58,7 +58,6 @@ CREATE TABLE workflows (
     name TEXT NOT NULL,
     version TEXT NOT NULL,
     scope TEXT NOT NULL DEFAULT 'tenant',
-    owner_user_id TEXT NULL,
     description TEXT,
 
     -- Source artifacts
@@ -77,11 +76,7 @@ CREATE TABLE workflows (
     -- Validation
     CONSTRAINT workflows_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
     CONSTRAINT workflows_tenant_format CHECK (tenant_id ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
-    CONSTRAINT workflows_scope_check CHECK (scope IN ('global', 'tenant', 'user')),
-    CONSTRAINT workflows_user_scope_requires_owner CHECK (
-        (scope = 'user' AND owner_user_id IS NOT NULL)
-        OR (scope != 'user' AND owner_user_id IS NULL)
-    ),
+    CONSTRAINT workflows_scope_check CHECK (scope IN ('global', 'tenant')),
     CONSTRAINT workflows_global_requires_system_tenant CHECK (
         scope != 'global' OR tenant_id = 'aegis-system'
     ),
@@ -90,10 +85,8 @@ CREATE TABLE workflows (
 );
 
 CREATE UNIQUE INDEX idx_workflows_scope_unique
-    ON workflows (tenant_id, name, version, scope, COALESCE(owner_user_id, ''));
+    ON workflows (tenant_id, name, version, scope);
 CREATE INDEX idx_workflows_scope ON workflows(scope);
-CREATE INDEX idx_workflows_owner ON workflows(owner_user_id)
-    WHERE owner_user_id IS NOT NULL;
 CREATE INDEX idx_workflows_global_lookup ON workflows(name, version)
     WHERE scope = 'global';
 CREATE INDEX idx_workflows_created_at ON workflows(created_at DESC);
@@ -318,7 +311,6 @@ CREATE TABLE workflow_definitions (
     name TEXT NOT NULL,
     definition JSONB NOT NULL,
     scope TEXT NOT NULL DEFAULT 'tenant',
-    owner_user_id TEXT NULL,
 
     -- Registration metadata
     registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -329,11 +321,7 @@ CREATE TABLE workflow_definitions (
     definition_hash TEXT NOT NULL,
 
     CONSTRAINT workflow_definitions_name_format CHECK (name ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'),
-    CONSTRAINT workflow_definitions_scope_check CHECK (scope IN ('global', 'tenant', 'user')),
-    CONSTRAINT workflow_definitions_user_scope_requires_owner CHECK (
-        (scope = 'user' AND owner_user_id IS NOT NULL)
-        OR (scope != 'user' AND owner_user_id IS NULL)
-    ),
+    CONSTRAINT workflow_definitions_scope_check CHECK (scope IN ('global', 'tenant')),
     CONSTRAINT workflow_definitions_global_requires_system_tenant CHECK (
         scope != 'global' OR tenant_id = 'aegis-system'
     ),
@@ -341,12 +329,10 @@ CREATE TABLE workflow_definitions (
 );
 
 CREATE UNIQUE INDEX idx_workflow_definitions_scope_unique
-    ON workflow_definitions(tenant_id, name, version, scope, COALESCE(owner_user_id, ''));
+    ON workflow_definitions(tenant_id, name, version, scope);
 
 CREATE INDEX idx_workflow_definitions_name ON workflow_definitions(name);
 CREATE INDEX idx_workflow_definitions_scope ON workflow_definitions(scope);
-CREATE INDEX idx_workflow_definitions_owner ON workflow_definitions(owner_user_id)
-    WHERE owner_user_id IS NOT NULL;
 CREATE INDEX idx_workflow_definitions_global_lookup ON workflow_definitions(name, version)
     WHERE scope = 'global';
 CREATE INDEX idx_workflow_definitions_registered_at ON workflow_definitions(registered_at DESC);

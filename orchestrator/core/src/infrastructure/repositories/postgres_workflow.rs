@@ -116,14 +116,13 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             SELECT id
             FROM workflows
             WHERE tenant_id = $1 AND name = $2 AND version = $3
-              AND scope = $4 AND COALESCE(owner_user_id, '') = $5
+              AND scope = $4
             "#,
         )
         .bind(tenant_id.as_str())
         .bind(&workflow.metadata.name)
         .bind(&version)
         .bind(workflow.scope.as_db_str())
-        .bind(workflow.scope.owner_user_id().unwrap_or(""))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to load existing workflow: {e}")))?
@@ -155,12 +154,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         let description = workflow.metadata.description.clone();
 
         let scope_str = workflow.scope.as_db_str();
-        let owner_user_id = workflow.scope.owner_user_id().map(|s| s.to_string());
 
         sqlx::query(
             r#"
-            INSERT INTO workflows (id, tenant_id, name, version, scope, owner_user_id, description, tags, yaml_source, domain_json, temporal_def_json, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
+            INSERT INTO workflows (id, tenant_id, name, version, scope, description, tags, yaml_source, domain_json, temporal_def_json, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 description = EXCLUDED.description,
                 tags = EXCLUDED.tags,
@@ -168,7 +166,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
                 domain_json = EXCLUDED.domain_json,
                 temporal_def_json = EXCLUDED.temporal_def_json,
                 scope = EXCLUDED.scope,
-                owner_user_id = EXCLUDED.owner_user_id,
                 updated_at = NOW()
             "#
         )
@@ -177,7 +174,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(&workflow.metadata.name)
         .bind(&version)
         .bind(scope_str)
-        .bind(&owner_user_id)
         .bind(&description)
         .bind(&workflow.metadata.tags)
         .bind(yaml_source)
@@ -192,14 +188,13 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflow_definitions (workflow_id, tenant_id, name, version, scope, owner_user_id, definition, definition_hash, registered_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
-            ON CONFLICT (tenant_id, name, version, scope, COALESCE(owner_user_id, '')) DO UPDATE SET
+            INSERT INTO workflow_definitions (workflow_id, tenant_id, name, version, scope, definition, definition_hash, registered_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
+            ON CONFLICT (tenant_id, name, version, scope) DO UPDATE SET
                 workflow_id = EXCLUDED.workflow_id,
                 definition = EXCLUDED.definition,
                 definition_hash = EXCLUDED.definition_hash,
                 scope = EXCLUDED.scope,
-                owner_user_id = EXCLUDED.owner_user_id,
                 registered_at = NOW()
             "#
         )
@@ -208,7 +203,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(&workflow.metadata.name)
         .bind(&version)
         .bind(scope_str)
-        .bind(&owner_user_id)
         .bind(&temporal_def_json)
         .bind(def_hash)
         .execute(&self.pool)
@@ -404,26 +398,22 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        // Build query that looks across user/tenant/global scopes
-        // Priority: user (0) > tenant (1) > global (2)
+        // Two-level scope resolution: tenant (0) > global (1)
         let row = sqlx::query(
             r#"
             SELECT domain_json, updated_at
             FROM workflows
             WHERE name = $1
               AND (
-                  (scope = 'user' AND tenant_id = $2 AND owner_user_id = $3)
-                  OR (scope = 'tenant' AND tenant_id = $2)
+                  (scope = 'tenant' AND tenant_id = $2)
                   OR (scope = 'global' AND tenant_id = 'aegis-system')
               )
             ORDER BY
                 CASE scope
-                    WHEN 'user' THEN 0
-                    WHEN 'tenant' THEN 1
-                    WHEN 'global' THEN 2
+                    WHEN 'tenant' THEN 0
+                    WHEN 'global' THEN 1
                 END,
                 version DESC
             LIMIT 1
@@ -431,7 +421,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         )
         .bind(name)
         .bind(tenant_id.as_str())
-        .bind(user_id.unwrap_or(""))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -455,7 +444,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
     async fn resolve_by_name_and_version(
         &self,
         tenant_id: &TenantId,
-        user_id: Option<&str>,
         name: &str,
         version: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
@@ -465,15 +453,13 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             FROM workflows
             WHERE name = $1 AND version = $2
               AND (
-                  (scope = 'user' AND tenant_id = $3 AND owner_user_id = $4)
-                  OR (scope = 'tenant' AND tenant_id = $3)
+                  (scope = 'tenant' AND tenant_id = $3)
                   OR (scope = 'global' AND tenant_id = 'aegis-system')
               )
             ORDER BY
                 CASE scope
-                    WHEN 'user' THEN 0
-                    WHEN 'tenant' THEN 1
-                    WHEN 'global' THEN 2
+                    WHEN 'tenant' THEN 0
+                    WHEN 'global' THEN 1
                 END
             LIMIT 1
             "#,
@@ -481,7 +467,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(name)
         .bind(version)
         .bind(tenant_id.as_str())
-        .bind(user_id.unwrap_or(""))
         .fetch_optional(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -502,24 +487,18 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         }
     }
 
-    async fn list_visible(
-        &self,
-        tenant_id: &TenantId,
-        user_id: Option<&str>,
-    ) -> Result<Vec<Workflow>, RepositoryError> {
+    async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
         let rows = sqlx::query(
             r#"
             SELECT domain_json, updated_at
             FROM workflows
             WHERE
-                (scope = 'user' AND tenant_id = $1 AND owner_user_id = $2)
-                OR (scope = 'tenant' AND tenant_id = $1)
+                (tenant_id = $1)
                 OR (scope = 'global' AND tenant_id = 'aegis-system')
             ORDER BY name ASC, version DESC
             "#,
         )
         .bind(tenant_id.as_str())
-        .bind(user_id.unwrap_or(""))
         .fetch_all(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(e.to_string()))?;
@@ -576,7 +555,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         new_tenant_id: &TenantId,
     ) -> Result<(), RepositoryError> {
         let scope_str = new_scope.as_db_str();
-        let owner_user_id = new_scope.owner_user_id().map(|s| s.to_string());
 
         let mut tx =
             self.pool.begin().await.map_err(|e| {
@@ -586,12 +564,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         sqlx::query(
             r#"
             UPDATE workflows
-            SET scope = $1, owner_user_id = $2, tenant_id = $3, updated_at = NOW()
-            WHERE id = $4
+            SET scope = $1, tenant_id = $2, updated_at = NOW()
+            WHERE id = $3
             "#,
         )
         .bind(scope_str)
-        .bind(&owner_user_id)
         .bind(new_tenant_id.as_str())
         .bind(id.0)
         .execute(&mut *tx)
@@ -601,12 +578,11 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         sqlx::query(
             r#"
             UPDATE workflow_definitions
-            SET scope = $1, owner_user_id = $2, tenant_id = $3
-            WHERE workflow_id = $4
+            SET scope = $1, tenant_id = $2
+            WHERE workflow_id = $3
             "#,
         )
         .bind(scope_str)
-        .bind(&owner_user_id)
         .bind(new_tenant_id.as_str())
         .bind(id.0)
         .execute(&mut *tx)

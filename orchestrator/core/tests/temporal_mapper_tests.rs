@@ -250,7 +250,7 @@ fn test_builtin_intent_to_execution_yaml_maps_spec_storage() {
 }
 
 #[test]
-fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
+fn test_scope_mapped_to_temporal_definition() {
     let mut states = HashMap::new();
     states.insert(
         StateName::new("START").unwrap(),
@@ -265,10 +265,10 @@ fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
         },
     );
 
-    // ── User scope: both scope and owner_user_id must be forwarded ──
-    let mut workflow = Workflow::new(
+    // ── Tenant scope ──
+    let tenant_workflow = Workflow::new(
         WorkflowMetadata {
-            name: "user-scoped-workflow".to_string(),
+            name: "tenant-scoped-workflow".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
             tags: vec![],
@@ -284,20 +284,20 @@ fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
         },
     )
     .unwrap();
-    workflow.scope = WorkflowScope::User {
-        owner_user_id: "user-123".to_string(),
-    };
+    // scope defaults to Tenant
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
-        .expect("Mapping failed");
+    let def = TemporalWorkflowMapper::to_temporal_definition(
+        &tenant_workflow,
+        &TenantId::local_default(),
+    )
+    .expect("Mapping failed");
 
-    assert_eq!(def.scope, Some("user".to_string()));
-    assert_eq!(def.owner_user_id, Some("user-123".to_string()));
+    assert_eq!(def.scope, Some("tenant".to_string()));
 
-    // ── Tenant scope: scope is "tenant", owner_user_id is None ──
-    let tenant_workflow = Workflow::new(
+    // ── Global scope ──
+    let mut global_workflow = Workflow::new(
         WorkflowMetadata {
-            name: "tenant-scoped-workflow".to_string(),
+            name: "global-scoped-workflow".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
             tags: vec![],
@@ -313,14 +313,13 @@ fn test_scope_and_owner_user_id_mapped_to_temporal_definition() {
         },
     )
     .unwrap();
-    // scope defaults to Tenant
+    global_workflow.scope = WorkflowScope::Global;
 
     let def = TemporalWorkflowMapper::to_temporal_definition(
-        &tenant_workflow,
+        &global_workflow,
         &TenantId::local_default(),
     )
     .expect("Mapping failed");
 
-    assert_eq!(def.scope, Some("tenant".to_string()));
-    assert_eq!(def.owner_user_id, None);
+    assert_eq!(def.scope, Some("global".to_string()));
 }

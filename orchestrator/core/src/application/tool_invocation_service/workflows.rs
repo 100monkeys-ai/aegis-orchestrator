@@ -229,9 +229,8 @@ impl ToolInvocationService {
             let workflow_id = if let Ok(uuid) = uuid::Uuid::parse_str(workflow_ref) {
                 crate::domain::workflow::WorkflowId(uuid)
             } else if let Some(workflow_repo) = &self.workflow_repository {
-                let user_id = args.get("user_id").and_then(|v| v.as_str());
                 match workflow_repo
-                    .resolve_by_name(&tenant_id, user_id, workflow_ref)
+                    .resolve_by_name(&tenant_id, workflow_ref)
                     .await
                 {
                     Ok(Some(workflow)) => workflow.id,
@@ -767,7 +766,7 @@ impl ToolInvocationService {
                     "Failed to list workflows: {e}"
                 ))
             })?,
-            Some("visible") => repo.list_visible(&tenant_id, user_id).await.map_err(|e| {
+            Some("visible") => repo.list_visible(&tenant_id).await.map_err(|e| {
                 SealSessionError::SignatureVerificationFailed(format!(
                     "Failed to list workflows: {e}"
                 ))
@@ -910,22 +909,12 @@ impl ToolInvocationService {
             .and_then(|v| v.as_str())
             .unwrap_or("tenant");
 
-        let target_scope: crate::domain::workflow::WorkflowScope = match target_scope_str {
-            "user" => {
-                let owner = args
-                    .get("user_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&security_context.name);
-                crate::domain::workflow::WorkflowScope::User {
-                    owner_user_id: owner.to_string(),
-                }
-            }
-            other => other.parse().map_err(|_| {
+        let target_scope: crate::domain::workflow::WorkflowScope =
+            target_scope_str.parse().map_err(|_| {
                 SealSessionError::InvalidArguments(format!(
-                    "Invalid target_scope '{other}': expected 'tenant' or 'user'"
+                    "Invalid target_scope '{target_scope_str}': expected 'tenant' or 'global'"
                 ))
-            })?,
-        };
+            })?;
 
         let repo = match &self.workflow_repository {
             Some(repo) => repo,
@@ -1014,8 +1003,7 @@ impl ToolInvocationService {
             }
         };
 
-        let user_id = args.get("user_id").and_then(|v| v.as_str());
-        let workflow = match repo.resolve_by_name(&tenant_id, user_id, name).await {
+        let workflow = match repo.resolve_by_name(&tenant_id, name).await {
             Ok(Some(w)) => w,
             _ => {
                 if let Ok(uuid) = uuid::Uuid::parse_str(name) {
@@ -1285,7 +1273,7 @@ impl ToolInvocationService {
         for judge_name in &judge_names {
             let judge_id = self
                 .agent_lifecycle
-                .lookup_agent_visible_for_tenant(&tenant_id, None, judge_name)
+                .lookup_agent_visible_for_tenant(&tenant_id, judge_name)
                 .await
                 .map_err(|e| {
                     SealSessionError::SignatureVerificationFailed(format!(
