@@ -8,6 +8,7 @@ metadata:
     role: worker
     category: platform
     capability: workflow-planning
+    builtin: "true"
 spec:
   security_context: aegis-system-agent-runtime
   runtime:

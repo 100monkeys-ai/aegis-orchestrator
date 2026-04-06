@@ -8,6 +8,7 @@ metadata:
     role: judge
     category: validation
     capability: workflow-generation-judging
+    builtin: "true"
 spec:
   runtime:
     language: python

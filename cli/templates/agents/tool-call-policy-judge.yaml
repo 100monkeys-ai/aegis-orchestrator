@@ -26,13 +26,7 @@ metadata:
     role: "judge"
     category: "security-and-policy"
     cognitive-function: "validation"
-
-  annotations:
-    judges: "tool_calls"
-    input_context: |
-      Receives: { task, proposed_tool_call, available_tools, validation_context }
-      where `proposed_tool_call` is the JSON object defining the tool name and arguments.
-    output_schema: "GradientResult — { score, confidence, reasoning, signals }"
+    builtin: "true"
 
 spec:
   runtime:

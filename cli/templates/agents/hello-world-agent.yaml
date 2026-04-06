@@ -8,6 +8,7 @@ metadata:
   labels:
     role: "worker"
     category: "demo"
+    builtin: "true"
 
 spec:
   runtime:

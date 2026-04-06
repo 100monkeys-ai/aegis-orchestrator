@@ -5,8 +5,10 @@ metadata:
   version: "1.0.0"
   description: "Parses, validates, and transforms SKILL.md definitions into AEGIS agent manifests"
   labels:
-    category: "builtin"
-    purpose: "skill-import"
+    role: worker
+    category: platform
+    capability: skill-import
+    builtin: "true"
 spec:
   runtime:
     language: "python"
@@ -38,7 +40,8 @@ spec:
     network:
       mode: "deny"
     filesystem:
-      read_only: true
+      read: []
+      write: []
     resources:
       cpu: 500
       memory: "256Mi"

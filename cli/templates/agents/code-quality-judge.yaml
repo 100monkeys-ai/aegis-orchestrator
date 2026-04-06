@@ -22,14 +22,8 @@ metadata:
   labels:
     role: "judge"
     category: "validation"
-    cognitive-function: "evaluation"
-
-  annotations:
-    judges: "coder"
-    input_context: |
-      Receives: { task, output, criteria, validation_context }
-      where `output` is the code produced by the coder agent.
-    output_schema: "GradientResult — { score, confidence, reasoning, signals }"
+    capability: "code-quality-judging"
+    builtin: "true"
 
 spec:
   runtime:

@@ -5,6 +5,7 @@ metadata:
   version: "1.0.0"
   description: Single-shot result formatter. Takes raw code execution output and the user's original intent. Returns a clean one-sentence natural language answer.
   labels:
+    role: worker
     category: platform
     builtin: "true"
 spec:

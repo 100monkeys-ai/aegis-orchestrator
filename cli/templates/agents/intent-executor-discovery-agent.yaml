@@ -5,7 +5,9 @@ metadata:
   version: "1.0.0"
   description: Discovers or generates a code-writing agent. Searches via ADR-075 Discovery Service first; generates only if no match with relevance_score >= 0.75.
   labels:
+    role: worker
     category: platform
+    capability: agent-discovery
     builtin: "true"
 spec:
   security_context: aegis-system-agent-runtime
