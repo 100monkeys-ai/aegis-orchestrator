@@ -20,7 +20,9 @@ use crate::application::storage_router::StorageRouter;
 use crate::domain::{
     events::StorageEvent,
     execution::ExecutionId,
-    fsal::{AegisFSAL, BorrowedVolumeAccess, EventPublisher, FsalAccessPolicy},
+    fsal::{
+        AegisFSAL, BorrowedVolumeAccess, EphemeralVolumeRegistry, EventPublisher, FsalAccessPolicy,
+    },
     repository::VolumeRepository,
     storage::StorageProvider,
     volume::{Volume, VolumeId},
@@ -201,6 +203,22 @@ impl Default for NfsVolumeRegistry {
     }
 }
 
+impl EphemeralVolumeRegistry for NfsVolumeRegistry {
+    fn is_registered_for_execution(&self, volume_id: VolumeId, execution_id: ExecutionId) -> bool {
+        self.contexts
+            .read()
+            .get(&volume_id)
+            .is_some_and(|ctx| ctx.execution_id == execution_id)
+    }
+
+    fn remote_path_for_volume(&self, volume_id: VolumeId) -> Option<String> {
+        self.contexts
+            .read()
+            .get(&volume_id)
+            .map(|ctx| ctx.remote_path.clone())
+    }
+}
+
 /// NFS Gateway application service
 ///
 /// Provides lifecycle management for the NFS server gateway.
@@ -251,14 +269,15 @@ impl NfsGatewayService {
         ));
         let borrowed_volumes = Arc::new(RwLock::new(HashMap::new()));
 
+        let volume_registry = NfsVolumeRegistry::new();
         let fsal = Arc::new(AegisFSAL::new(
             storage_router,
             volume_repository,
+            Arc::new(volume_registry.clone()),
             borrowed_volumes.clone(),
             event_publisher,
         ));
 
-        let volume_registry = NfsVolumeRegistry::new();
         let bind_port = bind_port.unwrap_or(2049);
         let nfs_server = NfsServer::new(fsal, volume_registry.contexts.clone(), bind_port);
 

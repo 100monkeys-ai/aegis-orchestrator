@@ -17,7 +17,7 @@
 //! - **Purpose:** Implements internal responsibilities for nfs gateway integration tests
 
 use aegis_orchestrator_core::application::nfs_gateway::{
-    EventBusPublisher, NfsGatewayService, VolumeRegistration,
+    EventBusPublisher, NfsGatewayService, NfsVolumeRegistry, VolumeRegistration,
 };
 use aegis_orchestrator_core::domain::events::StorageEvent;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
@@ -290,6 +290,7 @@ async fn test_fsal_mode_validation() {
     let fsal = AegisFSAL::new(
         storage_provider.clone(),
         volume_repository.clone(),
+        Arc::new(NfsVolumeRegistry::new()),
         empty_borrowed_volume_registry(),
         event_publisher.clone(),
     );
@@ -350,6 +351,7 @@ async fn test_fsal_path_traversal_prevention() {
     let fsal = AegisFSAL::new(
         storage_provider.clone(),
         volume_repository.clone(),
+        Arc::new(NfsVolumeRegistry::new()),
         empty_borrowed_volume_registry(),
         event_publisher.clone(),
     );
@@ -418,6 +420,7 @@ async fn test_fsal_policy_enforcement() {
     let fsal = AegisFSAL::new(
         storage_provider.clone(),
         volume_repository.clone(),
+        Arc::new(NfsVolumeRegistry::new()),
         empty_borrowed_volume_registry(),
         event_publisher.clone(),
     );
@@ -479,6 +482,7 @@ async fn test_fsal_audit_events() {
     let fsal = AegisFSAL::new(
         storage_provider.clone(),
         volume_repository.clone(),
+        Arc::new(NfsVolumeRegistry::new()),
         empty_borrowed_volume_registry(),
         event_publisher.clone(),
     );
@@ -535,6 +539,7 @@ async fn test_fsal_quota_enforcement() {
     let fsal = AegisFSAL::new(
         storage_provider,
         volume_repository.clone(),
+        Arc::new(NfsVolumeRegistry::new()),
         empty_borrowed_volume_registry(),
         event_publisher,
     );
