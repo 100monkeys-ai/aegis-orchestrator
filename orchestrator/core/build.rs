@@ -114,5 +114,37 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // ── Proto-version assertion (Gap 042-1) ───────────────────────────────────
+    // Enforce that the aegis_cortex.proto consumed by the aegis-orchestrator-proto
+    // dependency matches the version this crate was written against.
+    const EXPECTED_PROTO_VERSION: u32 = 1;
+    let cortex_proto_path = crate_dir.join("../../../aegis-proto/proto/aegis_cortex.proto");
+    if cortex_proto_path.exists() {
+        let proto_src = std::fs::read_to_string(&cortex_proto_path)
+            .map_err(|e| format!("Failed to read aegis_cortex.proto: {e}"))?;
+        let declared_version: u32 = proto_src
+            .lines()
+            .find_map(|line| {
+                let trimmed = line.trim();
+                trimmed
+                    .strip_prefix("// proto-version:")
+                    .map(|v| v.trim().parse::<u32>().ok())
+                    .flatten()
+            })
+            .ok_or(
+                "aegis_cortex.proto is missing a '// proto-version: N' comment — \
+                 add one at the top of the file",
+            )?;
+        if declared_version != EXPECTED_PROTO_VERSION {
+            return Err(format!(
+                "aegis_cortex.proto version mismatch: expected {EXPECTED_PROTO_VERSION}, \
+                 found {declared_version}. Update EXPECTED_PROTO_VERSION in build.rs \
+                 and implement any new RPCs before bumping."
+            )
+            .into());
+        }
+        println!("cargo:rerun-if-changed={}", cortex_proto_path.display());
+    }
+
     Ok(())
 }
