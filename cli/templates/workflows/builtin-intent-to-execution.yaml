@@ -6,9 +6,10 @@ metadata:
   description: >-
     Seamless intent-to-execution pipeline. Accepts a natural-language intent and
     optional typed inputs, discovers or generates a code-writing agent, writes
-    code to an ephemeral workspace volume, executes it in an isolated container,
-    and returns a formatted result. Invoked via the aegis.execute.intent MCP tool
-    from Zaru Execute mode.
+    code to an ephemeral workspace volume, and executes it in an isolated
+    container. Output is formatted for display via the output_handler on
+    EXECUTE_CODE. Invoked via the aegis.execute.intent MCP tool from Zaru
+    Execute mode.
   labels:
     category: platform
     type: builtin-execute
@@ -116,25 +117,24 @@ spec:
         memory: "256Mi"
         timeout: "600s"
       shell: false
+      output_handler:
+        type: agent
+        agent_id: aegis-output-formatter-agent
+        input_template: |
+          The user's original request: {{intent}}
+
+          The code produced this output:
+          {{output}}
+
+          Format as a clean, human-readable answer in one sentence or less.
+          State the result directly. Do not include code. Just give the answer.
+        timeout_seconds: 60
+        required: true
       transitions:
         - condition: exit_code_zero
-          target: FORMAT_RESULT
+          target: null
         - condition: exit_code_non_zero
           target: EXECUTION_FAILED
-
-    FORMAT_RESULT:
-      kind: Agent
-      agent: intent-result-formatter-agent
-      max_iterations: 1
-      input: |
-        The user's original request: {{intent}}
-
-        The code produced this output:
-        {{blackboard.EXECUTE_CODE.output.stdout}}
-
-        Format as a clean, human-readable answer in one sentence or less.
-        State the result directly. Do not include code. Just give the answer.
-      transitions: []
 
     DISCOVERY_FAILED:
       kind: System
