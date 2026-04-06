@@ -27,7 +27,7 @@ use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::output_handler::OutputHandlerConfig;
 use crate::domain::shared_kernel::TenantId;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;

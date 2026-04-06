@@ -148,6 +148,7 @@ mod tests {
             wid: String::new(),
             exec_id: "exec-1".to_string(),
             tenant_id: None,
+            task_summary: None,
         }
     }
 
@@ -174,6 +175,7 @@ mod tests {
             wid: String::new(),
             exec_id: "exec-1".to_string(),
             tenant_id: None,
+            task_summary: None,
         }
     }
 

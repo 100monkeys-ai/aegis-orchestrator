@@ -742,6 +742,8 @@ pub struct SealAttestationRequest {
     ///
     /// When omitted, defaults to the consumer tenant (`zaru-consumer`).
     pub tenant_id: Option<String>,
+    /// Optional human-readable summary of the task this execution is performing.
+    pub task_summary: Option<String>,
 }
 
 /// Handle SEAL attestation handshake (ADR-035 §4.1).
@@ -783,6 +785,7 @@ async fn seal_attestation(
         workload_id: payload.workload_id,
         zaru_tier: payload.zaru_tier,
         tenant_id,
+        task_summary: payload.task_summary,
     };
 
     match attestation_service.attest(request).await {

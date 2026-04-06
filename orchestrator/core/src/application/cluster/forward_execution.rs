@@ -6,7 +6,7 @@ use crate::domain::agent::AgentId;
 use crate::domain::events::ExecutionEvent;
 use crate::domain::execution::{ExecutionId, ExecutionInput};
 use crate::domain::volume::TenantId;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio_stream::Stream;

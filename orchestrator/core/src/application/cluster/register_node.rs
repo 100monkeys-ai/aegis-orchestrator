@@ -4,7 +4,7 @@
 use crate::domain::cluster::{
     ClusterId, NodeCapabilityAdvertisement, NodeClusterRepository, NodeId, NodePeer, NodePeerStatus,
 };
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::sync::Arc;
 

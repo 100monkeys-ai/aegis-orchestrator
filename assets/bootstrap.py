@@ -17,6 +17,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
   - All policy enforcement is server-side; bootstrap.py is a trusted executor
   - Add complexity to the orchestrator, not here
 """
+import base64
 import json
 import os
 import subprocess
@@ -24,6 +25,126 @@ import sys
 import time
 import urllib.error
 import urllib.request
+
+# ---------------------------------------------------------------------------
+# SEAL configuration
+# ---------------------------------------------------------------------------
+
+SEAL_ENABLED = os.environ.get("AEGIS_SEAL_ENABLED", "").lower() in ("true", "1", "yes")
+SEAL_GATEWAY_URL = os.environ.get("AEGIS_SEAL_GATEWAY_URL", "http://host.docker.internal:8090")
+
+if SEAL_ENABLED:
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+    except ImportError:
+        print(
+            "Error: AEGIS_SEAL_ENABLED=1 but 'cryptography' package is not installed.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+class SealPolicyViolation(Exception):
+    """Raised when the SEAL gateway rejects a tool call due to a policy violation."""
+
+
+class SealClient:
+    """SEAL attestation client for agent bootstrap. Performs Ed25519 key generation,
+    attestation handshake with the orchestrator, and SEAL-wrapped tool invocation."""
+
+    def __init__(
+        self,
+        orchestrator_url: str,
+        seal_gateway_url: str,
+        agent_id: str,
+        execution_id: str,
+        container_id: str,
+        security_context: str,
+    ):
+        self.orchestrator_url = orchestrator_url.rstrip("/")
+        self.seal_gateway_url = seal_gateway_url.rstrip("/")
+        self.agent_id = agent_id
+        self.execution_id = execution_id
+        self.container_id = container_id
+        self.security_context = security_context
+        self._private_key = Ed25519PrivateKey.generate()
+        self._public_key_b64 = base64.b64encode(
+            self._private_key.public_key().public_bytes(Encoding.Raw, PublicFormat.Raw)
+        ).decode("utf-8")
+        self.security_token = None
+        self.session_id = None
+
+    def attest(self):
+        """Perform SEAL attestation handshake and store the returned SecurityToken."""
+        payload = json.dumps({
+            "public_key": self._public_key_b64,
+            "container_id": self.container_id,
+            "security_context": self.security_context,
+            "agent_id": self.agent_id,
+            "execution_id": self.execution_id,
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            f"{self.orchestrator_url}/v1/seal/attest",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+
+        self.security_token = data["security_token"]
+        self.session_id = data.get("session_id")
+
+    def call_tool(self, tool_name: str, arguments: dict) -> dict:
+        """Invoke a tool through the SEAL gateway with a signed envelope."""
+        if self.security_token is None:
+            raise RuntimeError("Must call attest() before call_tool()")
+
+        mcp_payload = {
+            "jsonrpc": "2.0",
+            "id": f"req-{int(time.time() * 1000)}",
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": arguments},
+        }
+        ts = int(time.time())
+
+        canonical = json.dumps(
+            {
+                "payload": mcp_payload,
+                "security_token": self.security_token,
+                "timestamp": ts,
+            },
+            sort_keys=True,
+        ).encode("utf-8")
+
+        signature_bytes = self._private_key.sign(canonical)
+        signature_b64 = base64.b64encode(signature_bytes).decode("utf-8")
+
+        envelope = {
+            "protocol": "seal/v1",
+            "security_token": self.security_token,
+            "signature": signature_b64,
+            "payload": mcp_payload,
+            "timestamp": ts,
+        }
+
+        req_data = json.dumps(envelope).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self.seal_gateway_url}/v1/seal/invoke",
+            data=req_data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+
+        if result.get("status") == "policy_violation":
+            raise SealPolicyViolation(result.get("error", "policy violation"))
+
+        return result.get("payload", {}).get("result", result)
+
 
 # ---------------------------------------------------------------------------
 # Debug helpers
@@ -296,6 +417,21 @@ def main():
         os.environ.get("AEGIS_ITERATION_HISTORY", "[]")
     )
     final_prompt = history_context + rendered_prompt if history_context else rendered_prompt
+
+    # -- SEAL attestation (optional) ------------------------------------------
+    seal_client = None
+    if SEAL_ENABLED:
+        orchestrator_url = _candidate_urls()[0] if _candidate_urls() else "http://host.docker.internal:8088"
+        seal_client = SealClient(
+            orchestrator_url=orchestrator_url,
+            seal_gateway_url=SEAL_GATEWAY_URL,
+            agent_id=agent_id,
+            execution_id=execution_id or "",
+            container_id=os.environ.get("HOSTNAME", ""),
+            security_context=os.environ.get("AEGIS_SECURITY_CONTEXT", ""),
+        )
+        seal_client.attest()
+        debug_print(f"SEAL attestation complete, session_id={seal_client.session_id}")
 
     # -- Dispatch loop (ADR-040) ----------------------------------------------
     # Send the initial generate request; the response may be a dispatch command

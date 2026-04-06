@@ -64,6 +64,11 @@ pub struct AttestationRequest {
     /// a consumer tenant, `tenant-{slug}-*` contexts require the matching
     /// enterprise tenant, and `aegis-system-*` contexts require the system tenant.
     pub tenant_id: TenantId,
+    /// Optional human-readable summary of the task this execution is performing.
+    ///
+    /// Embedded as the `task_summary` JWT claim in the issued `SecurityToken`.
+    /// Truncated to 256 characters if longer.
+    pub task_summary: Option<String>,
 }
 
 /// The orchestrator's response to a successful attestation handshake.

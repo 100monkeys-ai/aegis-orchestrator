@@ -1198,17 +1198,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     // Application Services — token_issuer was created earlier (ADR-088 §A8) and shared with ExecutionService.
-    let attestation_service: Arc<
-        dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
-    > = Arc::new(
+    let mut attestation_service_builder =
         aegis_orchestrator_core::application::attestation_service::AttestationServiceImpl::new(
             security_context_repo.clone(),
             seal_session_repo.clone(),
             token_issuer,
         )
         .with_gateway_client(attestation_gateway_client)
-        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone()),
-    );
+        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone());
+
+    match aegis_orchestrator_core::infrastructure::docker::BollardContainerVerifier::new() {
+        Ok(v) => {
+            attestation_service_builder =
+                attestation_service_builder.with_container_verifier(std::sync::Arc::new(v));
+        }
+        Err(e) => {
+            warn!("Docker socket unavailable; container identity verification disabled: {e}");
+        }
+    }
+
+    let attestation_service: Arc<
+        dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
+    > = Arc::new(attestation_service_builder);
 
     // Secrets manager: initialize from `spec.secrets.backend`, otherwise use an in-memory store for local development/testing.
     let secrets_manager: Arc<aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager> =

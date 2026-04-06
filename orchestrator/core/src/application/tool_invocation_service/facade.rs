@@ -570,7 +570,7 @@ impl ToolInvocationService {
                 }
             }
         } // end if let Some(ref agent)
-        // --- End Pre-Execution Validation ---
+          // --- End Pre-Execution Validation ---
 
         // Helper closure to publish invocation events based on tool result.
         let publish_result = |result: &Result<ToolInvocationResult, SealSessionError>| match result

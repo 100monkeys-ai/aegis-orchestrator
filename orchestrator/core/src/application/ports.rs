@@ -109,10 +109,28 @@ pub struct AttestationTokenClaims {
     pub scp: String,
     pub wid: String,
     pub tenant_id: Option<String>,
+    pub task_summary: Option<String>,
 }
 
 pub trait SecurityTokenIssuerPort: Send + Sync {
     fn issue(&self, claims: &mut AttestationTokenClaims) -> anyhow::Result<String>;
+}
+
+/// Port for verifying that a container is currently running.
+///
+/// Used during SEAL attestation (ADR-035 §4.1) to bind the issued
+/// `SecurityToken` to an actively-running workload, preventing replay
+/// attacks where a token is requested for a container that has already
+/// exited or never started.
+#[async_trait]
+pub trait ContainerVerificationPort: Send + Sync {
+    /// Returns `Ok(())` if the container with the given ID is currently running.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the container is not running, cannot be found,
+    /// or the container runtime is unreachable.
+    async fn verify_container_running(&self, container_id: &str) -> anyhow::Result<()>;
 }
 
 /// Port for workflow execution control operations (cancel, signal, remove).
