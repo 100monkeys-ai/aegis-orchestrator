@@ -50,13 +50,21 @@ pub const INTENT_EXECUTION_WORKFLOW_NAME: &str = "builtin-intent-to-execution";
 pub const INTENT_EXECUTION_WORKFLOW_TEMPLATE: &str =
     include_str!("../../templates/workflows/builtin-intent-to-execution.yaml");
 
-pub const INTENT_EXECUTOR_DISCOVERY_AGENT_NAME: &str = "intent-executor-discovery-agent";
-pub const INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE: &str =
-    include_str!("../../templates/agents/intent-executor-discovery-agent.yaml");
+pub const AEGIS_OUTPUT_FORMATTER_AGENT_NAME: &str = "aegis-output-formatter-agent";
+pub const AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-output-formatter-agent.yaml");
 
-pub const INTENT_RESULT_FORMATTER_AGENT_NAME: &str = "intent-result-formatter-agent";
-pub const INTENT_RESULT_FORMATTER_AGENT_TEMPLATE: &str =
-    include_str!("../../templates/agents/intent-result-formatter-agent.yaml");
+pub const AEGIS_PYTHON_EXECUTOR_AGENT_NAME: &str = "aegis-python-executor-agent";
+pub const AEGIS_PYTHON_EXECUTOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-python-executor-agent.yaml");
+
+pub const AEGIS_JAVASCRIPT_EXECUTOR_AGENT_NAME: &str = "aegis-javascript-executor-agent";
+pub const AEGIS_JAVASCRIPT_EXECUTOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-javascript-executor-agent.yaml");
+
+pub const AEGIS_BASH_EXECUTOR_AGENT_NAME: &str = "aegis-bash-executor-agent";
+pub const AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-bash-executor-agent.yaml");
 
 // ─── Canonical Registries ───────────────────────────────────────────────────
 
@@ -84,12 +92,20 @@ pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
     (WORKFLOW_CREATOR_AGENT_NAME, WORKFLOW_CREATOR_AGENT_TEMPLATE),
     ("skill-validator", SKILL_VALIDATOR_AGENT_TEMPLATE),
     (
-        INTENT_EXECUTOR_DISCOVERY_AGENT_NAME,
-        INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+        AEGIS_OUTPUT_FORMATTER_AGENT_NAME,
+        AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE,
     ),
     (
-        INTENT_RESULT_FORMATTER_AGENT_NAME,
-        INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+        AEGIS_PYTHON_EXECUTOR_AGENT_NAME,
+        AEGIS_PYTHON_EXECUTOR_AGENT_TEMPLATE,
+    ),
+    (
+        AEGIS_JAVASCRIPT_EXECUTOR_AGENT_NAME,
+        AEGIS_JAVASCRIPT_EXECUTOR_AGENT_TEMPLATE,
+    ),
+    (
+        AEGIS_BASH_EXECUTOR_AGENT_NAME,
+        AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE,
     ),
 ];
 
@@ -155,13 +171,23 @@ const BUILTIN_TEMPLATES: &[BuiltinTemplateSpec] = &[
     },
     BuiltinTemplateSpec {
         category: "agents",
-        file_name: "intent-executor-discovery-agent.yaml",
-        content: INTENT_EXECUTOR_DISCOVERY_AGENT_TEMPLATE,
+        file_name: "aegis-output-formatter-agent.yaml",
+        content: AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE,
     },
     BuiltinTemplateSpec {
         category: "agents",
-        file_name: "intent-result-formatter-agent.yaml",
-        content: INTENT_RESULT_FORMATTER_AGENT_TEMPLATE,
+        file_name: "aegis-python-executor-agent.yaml",
+        content: AEGIS_PYTHON_EXECUTOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "aegis-javascript-executor-agent.yaml",
+        content: AEGIS_JAVASCRIPT_EXECUTOR_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "aegis-bash-executor-agent.yaml",
+        content: AEGIS_BASH_EXECUTOR_AGENT_TEMPLATE,
     },
     BuiltinTemplateSpec {
         category: "workflows",

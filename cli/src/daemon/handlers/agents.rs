@@ -177,18 +177,18 @@ pub(crate) async fn stream_agent_events_handler(
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
     let verbose = params.get("verbose").map(|v| v == "true").unwrap_or(false);
     let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
-    let _tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let activity_service = state.correlated_activity_stream_service.clone();
 
     let stream = async_stream::stream! {
         if follow {
-            let mut activity_stream = activity_service.stream_agent_activity(aid, verbose).await?;
+            let mut activity_stream = activity_service.stream_agent_activity(aid, &tenant_id, verbose).await?;
             while let Some(activity) = activity_stream.next().await {
                 let payload = serde_json::to_string(&activity?)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
         } else {
-            for activity in activity_service.agent_history(aid, verbose).await? {
+            for activity in activity_service.agent_history(aid, &tenant_id, verbose).await? {
                 let payload = serde_json::to_string(&activity)?;
                 yield Ok::<_, anyhow::Error>(Event::default().data(payload));
             }
