@@ -864,38 +864,62 @@ pub enum ContainerRunEvent {
 }
 
 /// Commands executed inside the container via Dispatch Protocol (ADR-040).
+///
+/// Published at each phase of a `cmd.run` dispatch lifecycle. Consumed by Cortex
+/// for command-pattern learning and by operators via the event stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandExecutionEvent {
-    CommandDispatched {
+    /// The orchestrator dispatched an exec action to `bootstrap.py`.
+    CommandExecutionStarted {
         execution_id: ExecutionId,
-        agent_id: AgentId,
         dispatch_id: DispatchId,
         command: String,
-        dispatched_at: DateTime<Utc>,
+        args: Vec<String>,
+        cwd: String,
+        timeout_secs: u32,
+        started_at: DateTime<Utc>,
     },
-    CommandCompleted {
+    /// The bootstrap re-POSTed a completed dispatch result.
+    CommandExecutionCompleted {
         execution_id: ExecutionId,
-        agent_id: AgentId,
         dispatch_id: DispatchId,
+        command: String,
         exit_code: i32,
+        stdout_bytes: u64,
+        stderr_bytes: u64,
         duration_ms: u64,
+        truncated: bool,
         completed_at: DateTime<Utc>,
     },
-    CommandFailed {
+    /// The dispatch failed at the protocol layer.
+    CommandExecutionFailed {
         execution_id: ExecutionId,
-        agent_id: AgentId,
         dispatch_id: DispatchId,
+        command: String,
         reason: CommandFailureReason,
         failed_at: DateTime<Utc>,
+    },
+    /// A `cmd.run` tool call was blocked before dispatch by the security policy engine.
+    CommandPolicyViolation {
+        execution_id: ExecutionId,
+        tool_call_id: String,
+        command: String,
+        args: Vec<String>,
+        violation_type: crate::domain::security_context::PolicyViolation,
+        blocked_at: DateTime<Utc>,
     },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CommandFailureReason {
-    TimeoutExceeded,
-    OutputTruncated,
-    NonZeroExit(i32),
-    AgentConnectionLost,
+    /// The subprocess exited with a non-zero status code.
+    NonZeroExitCode { code: i32 },
+    /// The subprocess was killed because it exceeded the configured timeout.
+    TimeoutExpired { timeout_secs: u32 },
+    /// The orchestrator timed out waiting for `bootstrap.py` to re-POST the dispatch result.
+    DispatchTimeout { waited_secs: u32 },
+    /// `bootstrap.py` reported an unknown dispatch action type.
+    UnknownAction { action: String },
 }
 
 /// SEAL session lifecycle and security events (BC-12 SEAL Protocol, ADR-035 §5).

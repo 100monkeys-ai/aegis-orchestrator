@@ -17,6 +17,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
   - All policy enforcement is server-side; bootstrap.py is a trusted executor
   - Add complexity to the orchestrator, not here
 """
+
 import json
 import os
 import subprocess
@@ -41,6 +42,7 @@ def debug_print(*args, **kwargs):
 # ---------------------------------------------------------------------------
 # HTTP transport
 # ---------------------------------------------------------------------------
+
 
 def _candidate_urls() -> list:
     """Return deduplicated orchestrator base URLs to try, in priority order."""
@@ -104,6 +106,7 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
 # ---------------------------------------------------------------------------
 # Dispatch execution — Path 3 (ADR-040)
 # ---------------------------------------------------------------------------
+
 
 def run_dispatch(msg: dict, execution_id: str) -> dict:
     """Execute a dispatch action and return the dispatch_result payload.
@@ -197,6 +200,7 @@ def run_dispatch(msg: dict, execution_id: str) -> dict:
 # Iteration history context builder
 # ---------------------------------------------------------------------------
 
+
 def _clean_str(s):
     """Unwrap values that were double-encoded by Rust's Value::to_string()."""
     if isinstance(s, str) and s.startswith('"') and s.endswith('"'):
@@ -236,6 +240,7 @@ def build_history_context(history_json: str) -> str:
 # Config helpers
 # ---------------------------------------------------------------------------
 
+
 def _parse_timeout() -> int:
     """Parse AEGIS_LLM_TIMEOUT_SECONDS; return default 300 on invalid input."""
     raw = os.environ.get("AEGIS_LLM_TIMEOUT_SECONDS", "300")
@@ -251,6 +256,7 @@ def _parse_timeout() -> int:
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 def main():
     # -- Config ---------------------------------------------------------------
@@ -295,7 +301,9 @@ def main():
     history_context = build_history_context(
         os.environ.get("AEGIS_ITERATION_HISTORY", "[]")
     )
-    final_prompt = history_context + rendered_prompt if history_context else rendered_prompt
+    final_prompt = (
+        history_context + rendered_prompt if history_context else rendered_prompt
+    )
 
     # -- Dispatch loop (ADR-040) ----------------------------------------------
     # Send the initial generate request; the response may be a dispatch command
@@ -322,7 +330,7 @@ def main():
         result = run_dispatch(msg, execution_id)
         # Re-POST the result; the orchestrator will continue the LLM conversation
         # and may dispatch another command or issue the final response.
-        msg = post_json(result, timeout=llm_timeout_seconds)
+        msg = post_json(result)
 
     # type="final" — print the LLM response to stdout and exit cleanly.
     print(msg.get("content", ""))

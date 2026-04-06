@@ -215,8 +215,8 @@ impl InnerLoopService {
                 exit_code,
                 stdout,
                 stderr,
-                duration_ms: _,
-                truncated: _,
+                duration_ms,
+                truncated,
             } => {
                 let mut ctx = {
                     let mut lock = self.active_executions.write().await;
@@ -231,11 +231,18 @@ impl InnerLoopService {
 
                 let tool_call_id = ctx.pending_tool_call_id.clone().unwrap_or_default();
 
-                let result_json = serde_json::json!({
+                let mut result_json = serde_json::json!({
                     "exit_code": exit_code,
                     "stdout": stdout,
                     "stderr": stderr,
                 });
+                if truncated {
+                    result_json["truncated"] = serde_json::json!(true);
+                    result_json["notice"] = serde_json::json!(
+                        "[AEGIS] Output truncated at 512 KB. Full output available in execution logs."
+                    );
+                }
+                let _ = duration_ms; // used by future CommandExecutionCompleted event emission
 
                 if let Some(step) = ctx.trajectory.last_mut() {
                     step.status = if exit_code == 0 {
