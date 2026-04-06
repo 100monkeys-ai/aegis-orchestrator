@@ -59,7 +59,7 @@ use crate::domain::volume::{
 };
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
@@ -807,6 +807,18 @@ mod tests {
             _storage_mode: &str,
         ) -> Result<Vec<Volume>> {
             anyhow::bail!("not used in test")
+        }
+
+        async fn persist_external_volume(
+            &self,
+            _volume_id: VolumeId,
+            _name: String,
+            _tenant_id: TenantId,
+            _remote_path: String,
+            _size_limit_bytes: u64,
+            _ownership: VolumeOwnership,
+        ) -> Result<()> {
+            Ok(())
         }
     }
 
@@ -2123,17 +2135,20 @@ impl StandardExecutionService {
         // If a workspace volume was provisioned by the workflow orchestrator and passed
         // in the request, register it with the NFS gateway so fs.* tools can access it.
         // This volume already exists — we only need to register it, not create it.
+        // We also persist a Volume record to the DB so AegisFSAL::authorize() finds it
+        // on any replica (HA correctness — the NFS registry is in-memory/node-local).
         if let (Some(vol_id), mount_path) = (
             workspace_volume_id,
             workspace_volume_mount_path.unwrap_or_else(|| std::path::PathBuf::from("/workspace")),
         ) {
+            let remote_path = workspace_remote_path
+                .unwrap_or_else(|| format!("/aegis/volumes/{}/{}", tenant_id, vol_id));
+
             if let Some(ref gw) = self.nfs_gateway {
                 let policy = FsalAccessPolicy {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };
-                let remote_path = workspace_remote_path
-                    .unwrap_or_else(|| format!("/aegis/volumes/{}/{}", tenant_id, vol_id));
                 gw.register_volume(VolumeRegistration {
                     volume_id: vol_id,
                     execution_id,
@@ -2141,7 +2156,7 @@ impl StandardExecutionService {
                     container_gid: 1000,
                     policy,
                     mount_point: mount_path,
-                    remote_path,
+                    remote_path: remote_path.clone(),
                 });
                 tracing::info!(
                     "Registered workflow workspace volume {} for execution {}",
@@ -2149,6 +2164,21 @@ impl StandardExecutionService {
                     execution_id
                 );
             }
+
+            // Persist to DB regardless of NFS gateway presence so FSAL can
+            // authorize the volume on any replica.
+            const WORKSPACE_SIZE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB default
+            self.volume_service
+                .persist_external_volume(
+                    vol_id,
+                    format!("workspace-{}", execution_id),
+                    tenant_id.clone(),
+                    remote_path,
+                    WORKSPACE_SIZE_BYTES,
+                    VolumeOwnership::execution(execution_id),
+                )
+                .await
+                .context("Failed to persist workspace volume to DB")?;
         }
 
         let runtime_config = crate::domain::runtime::RuntimeConfig {

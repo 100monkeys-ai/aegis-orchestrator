@@ -154,6 +154,27 @@ pub trait VolumeService: Send + Sync {
         volume_specs: &[VolumeSpec],
         storage_mode: &str,
     ) -> Result<Vec<Volume>>;
+
+    /// Persist a pre-provisioned volume record to the database without
+    /// touching any storage backend.
+    ///
+    /// Used when a volume has already been provisioned externally (e.g. by the
+    /// workflow orchestrator via Temporal) and only needs to be recorded in the
+    /// DB so that `AegisFSAL::authorize()` can find it on any replica
+    /// (HA correctness).
+    ///
+    /// The `remote_path` is the storage-relative path (e.g.
+    /// `/aegis/volumes/{tenant_id}/{volume_id}`). The concrete `VolumeBackend`
+    /// is constructed from the service's own storage configuration.
+    async fn persist_external_volume(
+        &self,
+        volume_id: VolumeId,
+        name: String,
+        tenant_id: TenantId,
+        remote_path: String,
+        size_limit_bytes: u64,
+        ownership: VolumeOwnership,
+    ) -> Result<()>;
 }
 
 // ============================================================================
@@ -735,6 +756,55 @@ impl VolumeService for StandardVolumeService {
         );
 
         Ok(volumes)
+    }
+
+    async fn persist_external_volume(
+        &self,
+        volume_id: VolumeId,
+        name: String,
+        tenant_id: TenantId,
+        remote_path: String,
+        size_limit_bytes: u64,
+        ownership: VolumeOwnership,
+    ) -> Result<()> {
+        info!(
+            %volume_id,
+            %name,
+            %tenant_id,
+            %remote_path,
+            "Persisting pre-provisioned external volume to DB"
+        );
+
+        let storage_class = StorageClass::ephemeral_hours(1);
+        let backend = match self.storage_mode.as_str() {
+            "seaweedfs" => VolumeBackend::SeaweedFS {
+                filer_endpoint: self.filer_endpoint.clone(),
+                remote_path,
+            },
+            _ => VolumeBackend::HostPath {
+                path: std::path::PathBuf::from(remote_path),
+            },
+        };
+
+        let volume = Volume {
+            id: volume_id,
+            name,
+            tenant_id,
+            storage_class: storage_class.clone(),
+            backend,
+            size_limit_bytes,
+            status: crate::domain::volume::VolumeStatus::Available,
+            ownership,
+            created_at: Utc::now(),
+            attached_at: Some(Utc::now()),
+            detached_at: None,
+            expires_at: storage_class.calculate_expiry(Utc::now()),
+        };
+
+        self.repository
+            .save(&volume)
+            .await
+            .map_err(|e| anyhow::Error::new(e).context("Failed to persist external volume"))
     }
 }
 
