@@ -83,10 +83,15 @@ pub enum PolicyViolation {
     },
     ConcurrentExecLimitExceeded {
         limit: u32,
+        active: u32,
     },
     OutputSizeLimitExceeded {
         actual_bytes: u64,
         max_bytes: u64,
+    },
+    ExecTimeoutCeilingExceeded {
+        requested_secs: u32,
+        ceiling_secs: u32,
     },
 }
 
@@ -156,12 +161,16 @@ impl std::fmt::Display for PolicyViolation {
                 base_command,
                 allowed_subcommands.join(", ")
             ),
-            PolicyViolation::ConcurrentExecLimitExceeded { limit } => {
-                write!(f, "concurrent execution limit of {limit} exceeded")
+            PolicyViolation::ConcurrentExecLimitExceeded { limit, active } => {
+                write!(f, "concurrent execution limit of {limit} exceeded (active={active})")
             }
             PolicyViolation::OutputSizeLimitExceeded { actual_bytes, max_bytes } => write!(
                 f,
                 "output size {actual_bytes} bytes exceeds maximum of {max_bytes} bytes"
+            ),
+            PolicyViolation::ExecTimeoutCeilingExceeded { requested_secs, ceiling_secs } => write!(
+                f,
+                "exec timeout ceiling exceeded: requested={requested_secs}s, ceiling={ceiling_secs}s"
             ),
         }
     }
