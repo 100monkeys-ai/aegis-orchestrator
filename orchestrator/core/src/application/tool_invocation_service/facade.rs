@@ -338,6 +338,18 @@ impl ToolInvocationService {
             }
         }
 
+        // Normalize relative paths for fs.* tools to /workspace before policy check.
+        // The agent container's working directory is /workspace, so a relative path
+        // like "solution.py" is equivalent to "/workspace/solution.py".
+        if tool_name.starts_with("fs.") {
+            if let Some(path_val) = args.get("path").and_then(|v| v.as_str()) {
+                if !path_val.starts_with('/') {
+                    let normalized = format!("/workspace/{}", path_val);
+                    args["path"] = serde_json::Value::String(normalized);
+                }
+            }
+        }
+
         // Enforce SecurityContext constraints (e.g. subcommand_allowlist for cmd.run)
         if let Err(violation) = security_context.evaluate(&tool_name, &args) {
             let (violation_type, details) = Self::map_policy_violation(&violation);
