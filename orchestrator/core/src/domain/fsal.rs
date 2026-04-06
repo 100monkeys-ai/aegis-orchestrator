@@ -28,9 +28,7 @@ use crate::domain::{
     policy::FilesystemPolicy,
     repository::VolumeRepository,
     storage::{DirEntry, FileAttributes, OpenMode, StorageError, StorageProvider},
-    volume::{
-        StorageClass, TenantId, Volume, VolumeBackend, VolumeId, VolumeOwnership, VolumeStatus,
-    },
+    volume::{Volume, VolumeId, VolumeStatus},
 };
 
 /// Transport-agnostic access policy for FSAL operations.
@@ -182,10 +180,6 @@ pub struct AegisFSAL {
     storage_provider: Arc<dyn StorageProvider>,
     /// Volume repository for ownership validation
     volume_repository: Arc<dyn VolumeRepository>,
-    /// In-memory registry of ephemeral volumes registered but not persisted to
-    /// the database (e.g. workflow workspace volumes).  Used as a fallback in
-    /// `authorize()` when the repository returns `None`.
-    ephemeral_registry: Arc<dyn EphemeralVolumeRegistry>,
     /// Read-only borrowed volume aliases keyed by the alias volume ID.
     borrowed_volumes: Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>>,
     /// Path sanitizer for traversal prevention
@@ -200,21 +194,6 @@ pub trait EventPublisher: Send + Sync {
     async fn publish_storage_event(&self, event: StorageEvent);
 }
 
-/// Trait for looking up ephemeral volumes that are registered in-memory but not
-/// persisted to the database.
-///
-/// Implemented by `NfsVolumeRegistry` (application layer) and injected into
-/// `AegisFSAL` so that `authorize()` can fall back to the in-memory registry
-/// when the volume repository returns `None` for a workflow workspace volume.
-pub trait EphemeralVolumeRegistry: Send + Sync {
-    /// Returns `true` if `volume_id` is registered for `execution_id`.
-    fn is_registered_for_execution(&self, volume_id: VolumeId, execution_id: ExecutionId) -> bool;
-
-    /// Returns the storage remote path for a registered volume, used to
-    /// construct the routing key for storage operations.
-    fn remote_path_for_volume(&self, volume_id: VolumeId) -> Option<String>;
-}
-
 /// Borrowed read-only access to an existing volume, exposed under a distinct alias volume ID.
 #[derive(Debug, Clone)]
 pub struct BorrowedVolumeAccess {
@@ -227,14 +206,12 @@ impl AegisFSAL {
     pub fn new(
         storage_provider: Arc<dyn StorageProvider>,
         volume_repository: Arc<dyn VolumeRepository>,
-        ephemeral_registry: Arc<dyn EphemeralVolumeRegistry>,
         borrowed_volumes: Arc<RwLock<HashMap<VolumeId, BorrowedVolumeAccess>>>,
         event_publisher: Arc<dyn EventPublisher>,
     ) -> Self {
         Self {
             storage_provider,
             volume_repository,
-            ephemeral_registry,
             borrowed_volumes,
             path_sanitizer: PathSanitizer::new(),
             event_publisher,
@@ -320,49 +297,12 @@ impl AegisFSAL {
             return Ok(borrowed.source_volume);
         }
 
-        let db_result = self.volume_repository.find_by_id(volume_id).await;
-
-        // Only fall back to the ephemeral registry when the database has no record of
-        // the volume (None).  A repository error (Err) is still propagated — it means
-        // the database is unhealthy, not that the volume is ephemeral.
-        let volume = match db_result {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                // Volume not in the database.  Check whether it is an ephemeral workspace
-                // volume registered in the NFS registry for this execution.
-                if self
-                    .ephemeral_registry
-                    .is_registered_for_execution(volume_id, execution_id)
-                {
-                    let remote_path = self
-                        .ephemeral_registry
-                        .remote_path_for_volume(volume_id)
-                        .unwrap_or_default();
-                    // Construct a synthetic Volume so the rest of authorize() and the
-                    // routing helpers work without modification.  Ownership is
-                    // execution-scoped because the registry already confirmed the binding.
-                    Volume {
-                        id: volume_id,
-                        name: format!("ephemeral-{volume_id}"),
-                        tenant_id: TenantId::default(),
-                        storage_class: StorageClass::ephemeral_hours(24),
-                        backend: VolumeBackend::HostPath {
-                            path: std::path::PathBuf::from(&remote_path),
-                        },
-                        size_limit_bytes: u64::MAX,
-                        status: VolumeStatus::Available,
-                        ownership: VolumeOwnership::execution(execution_id),
-                        created_at: Utc::now(),
-                        attached_at: None,
-                        detached_at: None,
-                        expires_at: None,
-                    }
-                } else {
-                    return Err(FsalError::VolumeNotFound(volume_id));
-                }
-            }
-            Err(_) => return Err(FsalError::VolumeNotFound(volume_id)),
-        };
+        let volume = self
+            .volume_repository
+            .find_by_id(volume_id)
+            .await
+            .map_err(|_| FsalError::VolumeNotFound(volume_id))?
+            .ok_or(FsalError::VolumeNotFound(volume_id))?;
 
         // Check volume is in a usable state.
         // Volumes created for an execution start as Available and are never individually

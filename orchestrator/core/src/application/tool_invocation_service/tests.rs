@@ -30,14 +30,13 @@ fn test_fsal_deps() -> (Arc<AegisFSAL>, NfsVolumeRegistry) {
     );
     let vol_repo = Arc::new(InMemoryVolumeRepository::new());
     let publisher = Arc::new(NoOpEventPublisher);
-    let registry = NfsVolumeRegistry::new();
     let fsal = Arc::new(AegisFSAL::new(
         storage,
         vol_repo,
-        Arc::new(registry.clone()),
         Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
         publisher,
     ));
+    let registry = NfsVolumeRegistry::new();
     (fsal, registry)
 }
 
