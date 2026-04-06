@@ -140,8 +140,15 @@ impl ToolInvocationService {
         let mut client = GatewayInvocationServiceClient::connect(gateway_url.to_string())
             .await
             .map_err(|e| SealSessionError::InternalError(e.to_string()))?;
+        let mut request = tonic::Request::new(ListToolsRequest {});
+        if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
+            if let Ok(val) = token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            {
+                request.metadata_mut().insert("authorization", val);
+            }
+        }
         let response = client
-            .list_tools(tonic::Request::new(ListToolsRequest {}))
+            .list_tools(request)
             .await
             .map_err(|e| SealSessionError::InternalError(e.to_string()))?;
 
