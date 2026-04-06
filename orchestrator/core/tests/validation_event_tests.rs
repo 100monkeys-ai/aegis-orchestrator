@@ -220,6 +220,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
                 advanced: None,
                 // No input_schema — exercises the fallback path.
                 input_schema: None,
+                output_handler: None,
                 security_context: None,
             },
         };
