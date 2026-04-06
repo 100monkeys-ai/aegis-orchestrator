@@ -1770,7 +1770,7 @@ impl StandardExecutionService {
 
         // Extract workspace volume fields before input is consumed by prepare_execution_input.
         let workspace_volume_id = input.workspace_volume_id;
-        let workspace_volume_mount_path = input.workspace_volume_mount_path;
+        let workspace_volume_mount_path = input.workspace_volume_mount_path.clone();
 
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
