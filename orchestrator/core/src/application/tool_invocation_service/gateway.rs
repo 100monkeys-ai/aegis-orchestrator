@@ -230,15 +230,23 @@ impl ToolInvocationService {
                 )));
             }
 
+            let mut request = tonic::Request::new(InvokeCliRequest {
+                execution_id: execution_id.to_string(),
+                tool_name: tool_name.to_string(),
+                subcommand,
+                args: cli_args,
+                fsal_mounts,
+                tenant_id: tenant_id.unwrap_or("").to_string(),
+            });
+            if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
+                if let Ok(val) =
+                    token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+                {
+                    request.metadata_mut().insert("authorization", val);
+                }
+            }
             let response = client
-                .invoke_cli(tonic::Request::new(InvokeCliRequest {
-                    execution_id: execution_id.to_string(),
-                    tool_name: tool_name.to_string(),
-                    subcommand,
-                    args: cli_args,
-                    fsal_mounts,
-                    tenant_id: tenant_id.unwrap_or("").to_string(),
-                }))
+                .invoke_cli(request)
                 .await
                 .map_err(|e| SealSessionError::InternalError(e.to_string()))?
                 .into_inner();
@@ -250,14 +258,21 @@ impl ToolInvocationService {
             }));
         }
 
+        let mut request = tonic::Request::new(InvokeWorkflowRequest {
+            execution_id: execution_id.to_string(),
+            workflow_name: tool_name.to_string(),
+            input_json: args.to_string(),
+            zaru_user_token: zaru_user_token.unwrap_or("").to_string(),
+            tenant_id: tenant_id.unwrap_or("").to_string(),
+        });
+        if let Ok(token) = std::env::var("AEGIS_SEAL_OPERATOR_TOKEN") {
+            if let Ok(val) = token.parse::<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>()
+            {
+                request.metadata_mut().insert("authorization", val);
+            }
+        }
         let response = client
-            .invoke_workflow(tonic::Request::new(InvokeWorkflowRequest {
-                execution_id: execution_id.to_string(),
-                workflow_name: tool_name.to_string(),
-                input_json: args.to_string(),
-                zaru_user_token: zaru_user_token.unwrap_or("").to_string(),
-                tenant_id: tenant_id.unwrap_or("").to_string(),
-            }))
+            .invoke_workflow(request)
             .await
             .map_err(|e| SealSessionError::InternalError(e.to_string()))?
             .into_inner();
