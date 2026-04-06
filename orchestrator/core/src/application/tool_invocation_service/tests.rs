@@ -1500,6 +1500,8 @@ async fn task_logs_tool_returns_paginated_execution_events() {
         ExecutionInput {
             intent: None,
             input: serde_json::json!({"task":"demo"}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         },
         3,
         "aegis-system-operator".to_string(),
@@ -1592,6 +1594,8 @@ async fn task_logs_tool_returns_execution_fetch_error() {
         ExecutionInput {
             intent: None,
             input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         },
         1,
         "aegis-system-operator".to_string(),
@@ -2051,6 +2055,8 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         ExecutionInput {
             intent: None,
             input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         },
         5,
         "zaru-free".to_string(),

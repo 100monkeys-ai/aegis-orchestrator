@@ -775,6 +775,8 @@ mod tests {
             ExecutionInput {
                 intent: Some("test".to_string()),
                 input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             },
             3,
             "aegis-system-operator".to_string(),
@@ -846,6 +848,8 @@ mod tests {
             ExecutionInput {
                 intent: Some("agent stream".to_string()),
                 input: Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             },
             2,
             "aegis-system-operator".to_string(),

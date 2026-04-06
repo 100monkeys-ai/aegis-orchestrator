@@ -139,6 +139,8 @@ pub(crate) async fn execute_agent_handler(
             "context_overrides": request.context_overrides,
             "tenant_id": tenant_id.to_string(),
         }),
+        workspace_volume_id: None,
+        workspace_volume_mount_path: None,
     };
 
     // ADR-083: derive security context from authenticated identity

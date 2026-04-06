@@ -875,6 +875,8 @@ mod tests {
             ExecutionInput {
                 intent: Some("parent".to_string()),
                 input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             },
             1,
             "aegis-system-operator".to_string(),
@@ -976,6 +978,8 @@ mod tests {
                 ExecutionInput {
                     intent: Some("judge".to_string()),
                     input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 parent_execution.id,
             )
@@ -1064,6 +1068,8 @@ mod tests {
                 ExecutionInput {
                     intent: Some("judge".to_string()),
                     input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 parent_execution.id,
             )
@@ -1178,6 +1184,8 @@ mod tests {
                 ExecutionInput {
                     intent: Some("child-task".to_string()),
                     input: serde_json::json!({ "tenant_id": "other-tenant" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 parent_execution.id,
             )
@@ -1760,6 +1768,10 @@ impl StandardExecutionService {
             }
         }
 
+        // Extract workspace volume fields before input is consumed by prepare_execution_input.
+        let workspace_volume_id = input.workspace_volume_id;
+        let workspace_volume_mount_path = input.workspace_volume_mount_path;
+
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
 
@@ -2098,6 +2110,36 @@ impl StandardExecutionService {
                 tracing::info!(
                     "Registered volume {} with NFS gateway for execution {}",
                     mount.volume_id,
+                    execution_id
+                );
+            }
+        }
+
+        // If a workspace volume was provisioned by the workflow orchestrator and passed
+        // in the request, register it with the NFS gateway so fs.* tools can access it.
+        // This volume already exists — we only need to register it, not create it.
+        if let (Some(vol_id), mount_path) = (
+            workspace_volume_id,
+            workspace_volume_mount_path.unwrap_or_else(|| std::path::PathBuf::from("/workspace")),
+        ) {
+            if let Some(ref gw) = self.nfs_gateway {
+                let policy = FsalAccessPolicy {
+                    read: vec!["/*".to_string()],
+                    write: vec!["/*".to_string()],
+                };
+                let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, vol_id);
+                gw.register_volume(VolumeRegistration {
+                    volume_id: vol_id,
+                    execution_id,
+                    container_uid: 1000,
+                    container_gid: 1000,
+                    policy,
+                    mount_point: mount_path,
+                    remote_path,
+                });
+                tracing::info!(
+                    "Registered workflow workspace volume {} for execution {}",
+                    vol_id,
                     execution_id
                 );
             }

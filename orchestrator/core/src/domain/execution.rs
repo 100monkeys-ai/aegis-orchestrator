@@ -200,6 +200,12 @@ pub struct ExecutionInput {
     /// prompt template context via `{{input}}` / `{{input.KEY}}` dot-notation
     /// (ADR-092).
     pub input: serde_json::Value,
+    /// Workspace volume ID provisioned by the workflow orchestrator. When set,
+    /// the runtime registers this pre-existing volume against the execution so
+    /// fs.* tools can write to the shared workspace (ADR-087).
+    pub workspace_volume_id: Option<crate::domain::shared_kernel::VolumeId>,
+    /// Mount path for the workspace volume. Defaults to /workspace.
+    pub workspace_volume_mount_path: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,6 +570,8 @@ mod tests {
         ExecutionInput {
             intent: Some(intent.to_string()),
             input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         }
     }
 

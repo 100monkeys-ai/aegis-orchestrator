@@ -309,6 +309,16 @@ impl AegisRuntime for AegisRuntimeService {
                 "context_overrides": payload,
                 "tenant_id": tenant_id.to_string(),
             }),
+            workspace_volume_id: req
+                .workspace_volume_id
+                .filter(|s| !s.is_empty())
+                .and_then(|s| uuid::Uuid::parse_str(&s).ok())
+                .map(crate::domain::shared_kernel::VolumeId),
+            workspace_volume_mount_path: req
+                .workspace_volume_mount_path
+                .filter(|s| !s.is_empty())
+                .map(std::path::PathBuf::from)
+                .or_else(|| Some(std::path::PathBuf::from("/workspace"))),
         };
 
         // Channel for streaming events
@@ -1830,6 +1840,8 @@ mod tests {
             input: ExecutionInput {
                 intent: Some("generate workflow".to_string()),
                 input: serde_json::Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             },
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),

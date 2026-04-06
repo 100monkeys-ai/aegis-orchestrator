@@ -78,7 +78,12 @@ impl ToolInvocationService {
             .execution_service
             .start_execution(
                 agent_id,
-                crate::domain::execution::ExecutionInput { intent, input },
+                crate::domain::execution::ExecutionInput {
+                    intent,
+                    input,
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                },
                 "aegis-system-agent-runtime".to_string(),
                 None,
             )

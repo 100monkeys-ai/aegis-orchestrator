@@ -485,6 +485,8 @@ impl ToolInvocationService {
                                     iteration_number,
                                     &tool_audit_history,
                                 ),
+                                workspace_volume_id: None,
+                                workspace_volume_mount_path: None,
                             };
 
                             // Start the single iteration judge as child execution

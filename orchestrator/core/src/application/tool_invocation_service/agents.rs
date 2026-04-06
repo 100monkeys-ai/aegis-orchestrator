@@ -243,6 +243,8 @@ impl ToolInvocationService {
                 crate::domain::execution::ExecutionInput {
                     intent: None,
                     input: payload,
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 "aegis-system-agent-runtime".to_string(),
                 None,

@@ -201,6 +201,8 @@ async fn invoke_agent_handler(
     let exec_input = ExecutionInput {
         intent: None,
         input: input_value,
+        workspace_volume_id: None,
+        workspace_volume_mount_path: None,
     };
 
     let child_exec_id = execution_service

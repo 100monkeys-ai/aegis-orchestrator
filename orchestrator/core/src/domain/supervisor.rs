@@ -803,6 +803,8 @@ mod tests {
         ExecutionInput {
             intent: Some("Test task".to_string()),
             input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         }
     }
 
@@ -902,6 +904,8 @@ mod tests {
                             "owner": "100monkeys"
                         }
                     }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 1,
                 Arc::new(TestObserver::default()),

@@ -368,6 +368,8 @@ async fn start_execution(
             "input": payload.input,
             "context_overrides": payload.context_overrides,
         }),
+        workspace_volume_id: None,
+        workspace_volume_mount_path: None,
     };
 
     match state

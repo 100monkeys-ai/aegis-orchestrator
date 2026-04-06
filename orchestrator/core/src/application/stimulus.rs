@@ -329,6 +329,8 @@ impl StandardStimulusService {
                 "stimulus": stimulus.content,
                 "tenant_id": Self::tenant_id_for_stimulus(stimulus).to_string(),
             }),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
         };
 
         // Run the RouterAgent
@@ -615,6 +617,8 @@ mod tests {
                 ExecutionInput {
                     intent: None,
                     input: json!({}),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
                 },
                 1,
                 "aegis-system-operator".to_string(),

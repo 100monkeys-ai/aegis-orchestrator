@@ -16,6 +16,8 @@ fn make_input(intent: &str) -> ExecutionInput {
     ExecutionInput {
         intent: Some(intent.to_string()),
         input: serde_json::json!({}),
+        workspace_volume_id: None,
+        workspace_volume_mount_path: None,
     }
 }
 

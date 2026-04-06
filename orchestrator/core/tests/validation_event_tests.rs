@@ -65,6 +65,8 @@ impl ExecutionService for MockExecutionService {
             ExecutionInput {
                 intent: None,
                 input: serde_json::Value::Null,
+                workspace_volume_id: None,
+                workspace_volume_mount_path: None,
             },
             3,
             "aegis-system-operator".to_string(),
