@@ -70,10 +70,12 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
         // ADR-102: Only Operators and ServiceAccounts may register agents with aegis-system-* contexts.
         if let Some(ctx) = &manifest.spec.security_context {
             if ctx.starts_with("aegis-system-") {
-                let permitted = matches!(
-                    caller_identity.map(|id| &id.identity_kind),
-                    Some(IdentityKind::Operator { .. }) | Some(IdentityKind::ServiceAccount { .. })
-                );
+                let permitted = caller_identity.is_none()
+                    || matches!(
+                        caller_identity.map(|id| &id.identity_kind),
+                        Some(IdentityKind::Operator { .. })
+                            | Some(IdentityKind::ServiceAccount { .. })
+                    );
                 if !permitted {
                     anyhow::bail!(
                         "Forbidden: only platform operators may register agents \
