@@ -128,6 +128,9 @@ pub enum StateKindYaml {
         /// Optional pre-execution validator agent ID (ADR-049 Pillar 1)
         #[serde(default)]
         pre_execution_validator: Option<String>,
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default)]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
     System {
         command: String,
@@ -147,6 +150,9 @@ pub enum StateKindYaml {
         /// External judge agents for validating combined parallel output (ADR-016)
         #[serde(default)]
         judges_for_parallel: Vec<JudgeConfigYaml>,
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default)]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
     /// Deterministic CI/CD container step — no LLM loop (ADR-050)
     ContainerRun {
@@ -170,6 +176,9 @@ pub enum StateKindYaml {
         retry: Option<crate::domain::workflow::RetryConfig>,
         #[serde(default)]
         shell: bool,
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default)]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
     /// Parallel deterministic container steps — no LLM loop (ADR-050)
     ParallelContainerRun {
@@ -406,6 +415,7 @@ impl WorkflowParser {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                output_handler,
             } => StateKind::Agent {
                 agent,
                 input,
@@ -420,6 +430,7 @@ impl WorkflowParser {
                     .collect(),
                 max_iterations,
                 pre_execution_validator,
+                output_handler,
             },
             StateKindYaml::System {
                 command,
@@ -441,6 +452,7 @@ impl WorkflowParser {
                 agents,
                 consensus,
                 judges_for_parallel,
+                output_handler,
             } => {
                 let agent_configs = agents
                     .into_iter()
@@ -475,6 +487,7 @@ impl WorkflowParser {
                     agents: agent_configs,
                     consensus: consensus_config,
                     judges_for_parallel: judges_for_parallel_configs,
+                    output_handler,
                 }
             }
             StateKindYaml::ContainerRun {
@@ -489,6 +502,7 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                output_handler,
             } => StateKind::ContainerRun {
                 name,
                 image,
@@ -501,6 +515,7 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                output_handler,
             },
             StateKindYaml::ParallelContainerRun { steps, completion } => {
                 StateKind::ParallelContainerRun { steps, completion }
@@ -645,6 +660,7 @@ impl WorkflowParser {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                output_handler,
             } => StateKindYaml::Agent {
                 agent: agent.clone(),
                 input: input.clone(),
@@ -659,6 +675,7 @@ impl WorkflowParser {
                     .collect(),
                 max_iterations: *max_iterations,
                 pre_execution_validator: pre_execution_validator.clone(),
+                output_handler: output_handler.clone(),
             },
             StateKind::System {
                 command,
@@ -680,6 +697,7 @@ impl WorkflowParser {
                 agents,
                 consensus,
                 judges_for_parallel,
+                output_handler,
             } => StateKindYaml::ParallelAgents {
                 agents: agents
                     .iter()
@@ -707,6 +725,7 @@ impl WorkflowParser {
                         weight: j.weight,
                     })
                     .collect(),
+                output_handler: output_handler.clone(),
             },
             StateKind::ContainerRun {
                 name,
@@ -720,6 +739,7 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                output_handler,
             } => StateKindYaml::ContainerRun {
                 name: name.clone(),
                 image: image.clone(),
@@ -732,6 +752,7 @@ impl WorkflowParser {
                 registry_credentials: registry_credentials.clone(),
                 retry: retry.clone(),
                 shell: *shell,
+                output_handler: output_handler.clone(),
             },
             StateKind::ParallelContainerRun { steps, completion } => {
                 StateKindYaml::ParallelContainerRun {

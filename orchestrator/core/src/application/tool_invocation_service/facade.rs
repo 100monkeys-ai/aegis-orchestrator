@@ -382,10 +382,10 @@ impl ToolInvocationService {
                         } = validator
                         {
                             tracing::info!(
-                            "Running inner-loop semantic validation for tool '{}' via judge '{}'",
-                            tool_name,
-                            judge_agent
-                        );
+                                "Running inner-loop semantic validation for tool '{}' via judge '{}'",
+                                tool_name,
+                                judge_agent
+                            );
 
                             let judge_id = self
                                 .agent_lifecycle
@@ -485,8 +485,8 @@ impl ToolInvocationService {
                                     ),
                                 );
                                     return Err(SealSessionError::JudgeTimeout(format!(
-                                    "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds."
-                                )));
+                                        "Inner-loop semantic judge '{judge_agent}' timed out after {timeout_seconds} seconds."
+                                    )));
                                 }
 
                                 let exec = self
@@ -537,13 +537,11 @@ impl ToolInvocationService {
                                                 result.score, min_score, result.reasoning
                                             ),
                                         );
-                                            return Err(SealSessionError::InternalError(
-                                            format!(
+                                            return Err(SealSessionError::InternalError(format!(
                                                 "Inner-loop tool execution rejected by semantic judge \
                                                  (Score: {:.2}, criteria_min: {:.2}). Reasoning: {}",
                                                 result.score, min_score, result.reasoning,
-                                            ),
-                                        ));
+                                            )));
                                         }
                                         break;
                                     }
@@ -572,7 +570,7 @@ impl ToolInvocationService {
                 }
             }
         } // end if let Some(ref agent)
-          // --- End Pre-Execution Validation ---
+        // --- End Pre-Execution Validation ---
 
         // Helper closure to publish invocation events based on tool result.
         let publish_result = |result: &Result<ToolInvocationResult, SealSessionError>| match result

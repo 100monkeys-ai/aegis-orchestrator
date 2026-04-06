@@ -59,7 +59,7 @@ use crate::domain::volume::{
 };
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
@@ -272,6 +272,9 @@ pub struct StandardExecutionService {
     seal_gateway_client: Option<Arc<dyn crate::application::ports::SealGatewayClient>>,
     /// Token issuer for minting JWTs during session pre-creation (ADR-088 §A8).
     token_issuer: Option<Arc<dyn crate::application::ports::SecurityTokenIssuerPort>>,
+    /// Optional output handler service invoked after execution completes (ADR-103).
+    output_handler_service:
+        Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
 }
 
 impl StandardExecutionService {
@@ -542,6 +545,7 @@ impl StandardExecutionService {
             swarm_cancellation: None,
             seal_gateway_client: None,
             token_issuer: None,
+            output_handler_service: None,
         }
     }
 
@@ -624,6 +628,15 @@ impl StandardExecutionService {
     ) -> Self {
         self.seal_gateway_client = Some(gateway_client);
         self.token_issuer = Some(token_issuer);
+        self
+    }
+
+    /// Attach an output handler service for post-execution egress dispatch (ADR-103).
+    pub fn with_output_handler_service(
+        mut self,
+        service: Arc<dyn crate::application::output_handler_service::OutputHandlerService>,
+    ) -> Self {
+        self.output_handler_service = Some(service);
         self
     }
 }
@@ -839,6 +852,7 @@ mod tests {
                 advanced: None,
                 input_schema: None,
                 security_context: None,
+                output_handler: None,
             },
         })
     }
@@ -1065,9 +1079,10 @@ mod tests {
         }))
         .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Context override key 'instruction' is reserved"));
+        assert!(
+            err.to_string()
+                .contains("Context override key 'instruction' is reserved")
+        );
     }
 
     #[test]
@@ -1742,8 +1757,8 @@ impl StandardExecutionService {
         ) =
             (&self.seal_gateway_client, &self.token_issuer)
         {
-            use base64::engine::general_purpose::STANDARD;
             use base64::Engine;
+            use base64::engine::general_purpose::STANDARD;
             use ed25519_dalek::SigningKey;
 
             // 1. Generate ephemeral Ed25519 keypair
@@ -2154,6 +2169,11 @@ impl StandardExecutionService {
         let cortex_client = self.cortex_client.clone();
         let start_time = Utc::now();
 
+        // ADR-103: Capture output handler config and service for post-completion dispatch.
+        let agent_output_handler = agent.manifest.spec.output_handler.clone();
+        let output_handler_service = self.output_handler_service.clone();
+        let tenant_id_for_output_handler = tenant_id.clone();
+
         tokio::spawn(async move {
             let result = supervisor
                 .run_loop(
@@ -2205,6 +2225,40 @@ impl StandardExecutionService {
                             total_iterations,
                             completed_at: Utc::now(),
                         });
+
+                        // ADR-103: Invoke output handler if declared on agent manifest.
+                        if let (Some(handler), Some(svc)) =
+                            (&agent_output_handler, &output_handler_service)
+                        {
+                            let handler_result = svc
+                                .invoke(
+                                    handler,
+                                    &final_output,
+                                    &execution_id,
+                                    &tenant_id_for_output_handler,
+                                )
+                                .await;
+                            if let Err(e) = handler_result {
+                                if handler.is_required() {
+                                    tracing::error!(
+                                        execution_id = %execution_id,
+                                        "Required output handler failed — marking execution failed: {}",
+                                        e
+                                    );
+                                    let mut exec_to_fail = exec;
+                                    exec_to_fail.fail(format!("Output handler failed: {e}"));
+                                    let _ = repository
+                                        .save_for_tenant(&tenant_id_for_task, &exec_to_fail)
+                                        .await;
+                                } else {
+                                    tracing::warn!(
+                                        execution_id = %execution_id,
+                                        "Optional output handler failed (fire-and-forget): {}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {

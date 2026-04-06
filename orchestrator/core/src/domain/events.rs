@@ -395,6 +395,28 @@ pub enum ExecutionEvent {
         completed_at: DateTime<Utc>,
     },
     Validation(ValidationEvent),
+
+    /// Output handler was started after execution completed (ADR-103).
+    OutputHandlerStarted {
+        execution_id: ExecutionId,
+        /// Discriminant from [`crate::domain::output_handler::OutputHandlerConfig::handler_type_name`].
+        handler_type: String,
+    },
+
+    /// Output handler completed successfully (ADR-103).
+    OutputHandlerCompleted {
+        execution_id: ExecutionId,
+        handler_type: String,
+        /// Optional return value from the handler (e.g. child execution final output).
+        result: Option<String>,
+    },
+
+    /// Output handler failed (ADR-103).
+    OutputHandlerFailed {
+        execution_id: ExecutionId,
+        handler_type: String,
+        error: String,
+    },
 }
 
 /// Workflow FSM lifecycle events (BC-3 Workflow Orchestration Context).

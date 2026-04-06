@@ -9,7 +9,7 @@ use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus, Iteratio
 use crate::domain::repository::{ExecutionRepository, WorkflowExecutionRepository};
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::event_bus::{EventBus, EventBusError};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use serde_json::Value;
@@ -70,7 +70,7 @@ impl CorrelatedActivityStreamService {
                                 return Some((
                                     Err(anyhow!("Event bus error: {e}")),
                                     (receiver, exec_id),
-                                ))
+                                ));
                             }
                         }
                     }
@@ -509,12 +509,10 @@ fn event_message(event: &DomainEvent) -> String {
         DomainEvent::Execution(ExecutionEvent::ExecutionFailed { reason, .. }) => {
             format!("Execution failed: {reason}")
         }
-        DomainEvent::Execution(ExecutionEvent::ExecutionCancelled { reason, .. }) => {
-            match reason {
-                Some(reason) => format!("Execution cancelled: {reason}"),
-                None => "Execution cancelled".to_string(),
-            }
-        }
+        DomainEvent::Execution(ExecutionEvent::ExecutionCancelled { reason, .. }) => match reason {
+            Some(reason) => format!("Execution cancelled: {reason}"),
+            None => "Execution cancelled".to_string(),
+        },
         DomainEvent::Execution(ExecutionEvent::ExecutionTimedOut {
             timeout_seconds, ..
         }) => format!("Execution timed out after {timeout_seconds}s"),
@@ -528,14 +526,15 @@ fn event_message(event: &DomainEvent) -> String {
             provider,
             model,
             ..
-        }) => format!(
-            "LLM interaction on iteration {iteration_number} via {provider}/{model}"
-        ),
+        }) => format!("LLM interaction on iteration {iteration_number} via {provider}/{model}"),
         DomainEvent::Execution(ExecutionEvent::InstanceSpawned {
             iteration_number,
             instance_id,
             ..
-        }) => format!("Spawned instance {:?} for iteration {iteration_number}", instance_id),
+        }) => format!(
+            "Spawned instance {:?} for iteration {iteration_number}",
+            instance_id
+        ),
         DomainEvent::Execution(ExecutionEvent::InstanceTerminated {
             iteration_number,
             instance_id,
@@ -563,9 +562,9 @@ fn event_message(event: &DomainEvent) -> String {
         )) => format!(
             "Multi-judge consensus reached: score={final_score:.2}, confidence={confidence:.2}"
         ),
-        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionStarted {
-            execution_id, ..
-        }) => format!("Workflow execution {execution_id} started"),
+        DomainEvent::Workflow(WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }) => {
+            format!("Workflow execution {execution_id} started")
+        }
         DomainEvent::Workflow(WorkflowEvent::WorkflowStateEntered { state_name, .. }) => {
             format!("Entered workflow state {state_name}")
         }
@@ -573,8 +572,7 @@ fn event_message(event: &DomainEvent) -> String {
             format!("Exited workflow state {state_name}")
         }
         DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
-            iteration_number,
-            ..
+            iteration_number, ..
         }) => format!("Workflow iteration {iteration_number} started"),
         DomainEvent::Workflow(WorkflowEvent::WorkflowIterationCompleted {
             iteration_number,
@@ -614,7 +612,9 @@ fn event_message(event: &DomainEvent) -> String {
             reason,
             ..
         }) => format!("Subworkflow {child_execution_id} failed: {reason}"),
-        DomainEvent::Storage(StorageEvent::FileOpened { path, open_mode, .. }) => {
+        DomainEvent::Storage(StorageEvent::FileOpened {
+            path, open_mode, ..
+        }) => {
             format!("Opened {path} with mode {open_mode}")
         }
         DomainEvent::Storage(StorageEvent::FileWritten {

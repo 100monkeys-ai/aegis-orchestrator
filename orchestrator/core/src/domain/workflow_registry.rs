@@ -24,7 +24,7 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::workflow::WorkflowId;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;

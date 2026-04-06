@@ -218,7 +218,9 @@ impl AgentLifecycleService for TestAgentLifecycleService {
         _name: &str,
         _version: &str,
     ) -> Result<Option<AgentId>> {
-        anyhow::bail!("TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test")
+        anyhow::bail!(
+            "TestAgentLifecycleService::lookup_agent_for_tenant_with_version not exercised in this test"
+        )
     }
 
     async fn list_agents_visible_for_tenant(&self, _tenant_id: &TenantId) -> Result<Vec<Agent>> {
@@ -1066,12 +1068,16 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
         .as_array()
         .expect("violations should be an array");
     assert_eq!(violations.len(), 2);
-    assert!(violations.iter().any(|violation| violation
-        .as_str()
-        .is_some_and(|text| text.contains("mixes `on_success` with score-based transitions"))));
-    assert!(violations.iter().any(|violation| violation
-        .as_str()
-        .is_some_and(|text| text.contains("has no explicit `score_below` branch"))));
+    assert!(violations.iter().any(|violation| {
+        violation
+            .as_str()
+            .is_some_and(|text| text.contains("mixes `on_success` with score-based transitions"))
+    }));
+    assert!(violations.iter().any(|violation| {
+        violation
+            .as_str()
+            .is_some_and(|text| text.contains("has no explicit `score_below` branch"))
+    }));
 }
 
 #[test]
@@ -1221,9 +1227,11 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
         payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
         "aegis.schema.validate"
     );
-    assert!(payload["tool_audit_history"]
-        .get("schema_get_evidence")
-        .is_none());
+    assert!(
+        payload["tool_audit_history"]
+            .get("schema_get_evidence")
+            .is_none()
+    );
 }
 
 #[test]
@@ -1231,9 +1239,9 @@ fn build_semantic_judge_payload_stays_compact_with_large_schema_history() {
     let execution_id = ExecutionId::new();
     let huge_schema_body = "x".repeat(5_000);
     let huge_manifest = format!(
-            "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
-            "y".repeat(5_000)
-        );
+        "apiVersion: 100monkeys.ai/v1\nkind: Agent\nmetadata:\n  name: huge\n  version: 1.0.0\nspec:\n  runtime:\n    language: python\n    version: \"3.11\"\n  task:\n    prompt_template: |\n      {}\n",
+        "y".repeat(5_000)
+    );
     let tool_audit_history = vec![
         crate::domain::execution::TrajectoryStep {
             tool_name: "aegis.schema.get".to_string(),
@@ -1612,10 +1620,12 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     };
 
     assert_eq!(payload["tool"], "aegis.task.logs");
-    assert!(payload["error"]
-        .as_str()
-        .unwrap()
-        .contains("Failed to fetch execution"));
+    assert!(
+        payload["error"]
+            .as_str()
+            .unwrap()
+            .contains("Failed to fetch execution")
+    );
 }
 
 #[tokio::test]
@@ -1984,12 +1994,16 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         .await
         .unwrap();
 
-    assert!(tools
-        .iter()
-        .any(|tool| tool.name == "aegis.workflow.status"));
-    assert!(!tools
-        .iter()
-        .any(|tool| tool.name == "aegis.workflow.delete"));
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.status")
+    );
+    assert!(
+        !tools
+            .iter()
+            .any(|tool| tool.name == "aegis.workflow.delete")
+    );
 }
 
 #[tokio::test]

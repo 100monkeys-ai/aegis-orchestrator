@@ -6,7 +6,7 @@ use crate::domain::cluster::{
     NodeTokenClaims,
 };
 use crate::domain::secrets::SecretStore;
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use base64::Engine;
 use chrono::Utc;
 use std::sync::Arc;

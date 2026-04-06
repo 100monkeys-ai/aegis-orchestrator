@@ -154,6 +154,10 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub subworkflow_input: Option<String>,
 
+    // Output handler (ADR-103)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_handler: Option<serde_json::Value>,
+
     // Transitions
     pub transitions: Vec<TemporalTransitionRule>,
 }
@@ -278,6 +282,7 @@ impl TemporalWorkflowMapper {
                 judges,
                 max_iterations,
                 pre_execution_validator,
+                output_handler,
             } => {
                 let mapped_judges = if judges.is_empty() {
                     None
@@ -328,6 +333,9 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    output_handler: output_handler
+                        .as_ref()
+                        .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
                     transitions,
                 })
             }
@@ -370,6 +378,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_mode: None,
                 subworkflow_result_key: None,
                 subworkflow_input: None,
+                output_handler: None,
                 transitions,
             }),
 
@@ -410,6 +419,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_mode: None,
                 subworkflow_result_key: None,
                 subworkflow_input: None,
+                output_handler: None,
                 transitions,
             }),
 
@@ -417,6 +427,7 @@ impl TemporalWorkflowMapper {
                 agents,
                 consensus,
                 judges_for_parallel,
+                output_handler,
             } => {
                 let temporal_agents = agents
                     .iter()
@@ -483,6 +494,9 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    output_handler: output_handler
+                        .as_ref()
+                        .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
                     transitions,
                 })
             }
@@ -499,6 +513,7 @@ impl TemporalWorkflowMapper {
                 registry_credentials,
                 retry,
                 shell,
+                output_handler,
             } => {
                 let pull_policy_str = image_pull_policy.as_ref().map(|p| match p {
                     crate::domain::agent::ImagePullPolicy::Always => "always".to_string(),
@@ -548,6 +563,9 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    output_handler: output_handler
+                        .as_ref()
+                        .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
                     transitions,
                 })
             }
@@ -596,6 +614,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: None,
                     subworkflow_result_key: None,
                     subworkflow_input: None,
+                    output_handler: None,
                     transitions,
                 })
             }
@@ -651,6 +670,8 @@ impl TemporalWorkflowMapper {
                     subworkflow_mode: Some(mode_str.to_string()),
                     subworkflow_result_key: result_key.clone(),
                     subworkflow_input: input.clone(),
+                    // Output handler (ADR-103): Subworkflow states do not carry an output_handler
+                    output_handler: None,
                     // Transitions
                     transitions,
                 })
@@ -946,6 +967,7 @@ mod tests {
                     judges: vec![],
                     max_iterations: None,
                     pre_execution_validator: None,
+                    output_handler: None,
                 },
                 transitions: vec![TransitionRule {
                     condition: TransitionCondition::Always,
@@ -1019,6 +1041,7 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    output_handler: None,
                 },
                 transitions: vec![],
                 timeout: None,

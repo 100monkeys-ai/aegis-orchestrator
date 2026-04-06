@@ -1380,6 +1380,7 @@ mod tests {
                     advanced: None,
                     input_schema: None,
                     security_context: None,
+                    output_handler: None,
                 },
             },
             deployed_at: Utc::now(),

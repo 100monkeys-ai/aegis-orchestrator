@@ -66,12 +66,12 @@ use crate::domain::agent::{AgentId, ValidatorSpec};
 use crate::domain::execution::{ExecutionId, ExecutionInput, ExecutionStatus};
 use crate::domain::shared_kernel::TenantId;
 use crate::domain::validation::{
-    extract_json_from_text, GradientResult, GradientValidator, MultiJudgeConsensus,
-    OutputGradientValidator, SystemGradientValidator, ValidationContext, ValidationPipeline,
-    ValidationRequest, ValidatorEntry, ValidatorKind,
+    GradientResult, GradientValidator, MultiJudgeConsensus, OutputGradientValidator,
+    SystemGradientValidator, ValidationContext, ValidationPipeline, ValidationRequest,
+    ValidatorEntry, ValidatorKind, extract_json_from_text,
 };
 use crate::domain::workflow::{ConfidenceWeighting, ConsensusConfig, ConsensusStrategy};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1004,9 +1004,10 @@ mod tests {
     #[test]
     fn calculate_max_attempts_rejects_zero_poll_interval() {
         let err = calculate_max_attempts(30, 0).expect_err("zero interval should fail");
-        assert!(err
-            .to_string()
-            .contains("poll_interval_ms must be greater than 0"));
+        assert!(
+            err.to_string()
+                .contains("poll_interval_ms must be greater than 0")
+        );
     }
 
     #[test]

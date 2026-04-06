@@ -416,9 +416,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Invalid execution_id format (not a UUID)"));
+        assert!(
+            err.to_string()
+                .contains("Invalid execution_id format (not a UUID)")
+        );
     }
 
     #[tokio::test]
@@ -440,9 +441,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains(&format!("Workflow execution not found: {missing}")));
+        assert!(
+            err.to_string()
+                .contains(&format!("Workflow execution not found: {missing}"))
+        );
     }
 
     #[tokio::test]

@@ -32,7 +32,7 @@
 //! ```
 
 use crate::domain::agent::*;
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 
 // ============================================================================
@@ -191,10 +191,12 @@ spec:
 "#;
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("non-empty task.instruction"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty task.instruction")
+        );
     }
 
     #[test]
@@ -214,10 +216,12 @@ spec:
 "#;
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("non-empty task.instruction"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("non-empty task.instruction")
+        );
     }
 
     #[test]
@@ -236,10 +240,12 @@ spec:
 
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid apiVersion"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid apiVersion")
+        );
     }
 
     #[test]
@@ -277,10 +283,12 @@ spec:
 
         let result = AgentManifestParser::parse_yaml(yaml);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid metadata.name"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid metadata.name")
+        );
     }
 
     #[test]
@@ -321,6 +329,7 @@ spec:
                 advanced: None,
                 input_schema: None,
                 security_context: None,
+                output_handler: None,
             },
         };
 

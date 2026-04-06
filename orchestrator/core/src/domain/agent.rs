@@ -210,6 +210,18 @@ pub struct AgentSpec {
         skip_serializing_if = "Option::is_none"
     )]
     pub security_context: Option<String>,
+
+    /// Optional egress handler fired after execution completes (ADR-103).
+    ///
+    /// When set, the [`crate::application::output_handler_service::OutputHandlerService`]
+    /// invokes this handler immediately after `ExecutionCompleted` is published.
+    /// If `required` is `true` and the handler fails, the execution is marked failed.
+    #[serde(
+        rename = "output_handler",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
 }
 
 /// Runtime configuration
@@ -1010,6 +1022,7 @@ mod tests {
                 advanced: None,
                 input_schema: None,
                 security_context: None,
+                output_handler: None,
             },
         }
     }

@@ -44,7 +44,7 @@ pub struct ResourceUsage {
 pub trait PolicyService: Send + Sync {
     async fn validate_policy(&self, policy: &SecurityPolicy) -> Result<()>;
     async fn enforce_network(&self, policy: &NetworkPolicy, request: &NetworkRequest)
-        -> Result<()>;
+    -> Result<()>;
     async fn enforce_filesystem(
         &self,
         policy: &FilesystemPolicy,

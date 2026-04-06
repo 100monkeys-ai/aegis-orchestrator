@@ -907,8 +907,8 @@ mod tests {
         (service, repository, storage_provider)
     }
 
-    fn create_local_host_test_service(
-    ) -> (StandardVolumeService, Arc<TestVolumeRepository>, TempDir) {
+    fn create_local_host_test_service()
+    -> (StandardVolumeService, Arc<TestVolumeRepository>, TempDir) {
         let repository = Arc::new(TestVolumeRepository::new());
         let tempdir = TempDir::new().expect("Failed to create tempdir");
         let storage_provider = Arc::new(
@@ -1183,8 +1183,9 @@ mod tests {
 
         let err_text = err.to_string();
         assert!(err_text.contains("Failed to save volume to repository"));
-        assert!(err
-            .chain()
-            .any(|cause| cause.to_string().contains("synthetic repository failure")));
+        assert!(
+            err.chain()
+                .any(|cause| cause.to_string().contains("synthetic repository failure"))
+        );
     }
 }

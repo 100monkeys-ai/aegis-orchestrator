@@ -788,6 +788,10 @@ pub enum StateKind {
         /// outputs after execution in the inner refinement loop.
         #[serde(default)]
         pre_execution_validator: Option<String>,
+
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
 
     /// Execute system command
@@ -826,6 +830,10 @@ pub enum StateKind {
         /// These must be distinct from the workers in `agents` (agents cannot judge themselves)
         #[serde(default)]
         judges_for_parallel: Vec<JudgeConfig>,
+
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
 
     /// Execute a deterministic command in an isolated container without an LLM loop (ADR-050)
@@ -875,6 +883,10 @@ pub enum StateKind {
         /// When true the command entries are joined and passed to `sh -c`
         #[serde(default)]
         shell: bool,
+
+        /// Optional egress handler fired after this state completes (ADR-103).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
     },
 
     /// Execute multiple container steps concurrently within a single workflow state (ADR-050)
@@ -1551,6 +1563,7 @@ mod tests {
                     ],
                     max_iterations: None,
                     pre_execution_validator: Some("validator-z".to_string()),
+                    output_handler: None,
                 },
                 transitions: vec![],
                 timeout: None,
@@ -1587,6 +1600,7 @@ mod tests {
                             weight: 1.0,
                         },
                     ],
+                    output_handler: None,
                 },
                 transitions: vec![],
                 timeout: None,
@@ -1713,6 +1727,7 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    output_handler: None,
                 },
                 transitions: vec![],
                 timeout: None,
@@ -1821,6 +1836,7 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    output_handler: None,
                 },
                 transitions: vec![],
                 timeout: None,

@@ -779,9 +779,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Workflow engine not connected yet"));
+        assert!(
+            err.to_string()
+                .contains("Workflow engine not connected yet")
+        );
 
         let active = execution_repo.find_active().await.unwrap();
         assert_eq!(active.len(), 1);
@@ -816,9 +817,10 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Workflow blackboard overrides must be a JSON/YAML object"));
+        assert!(
+            err.to_string()
+                .contains("Workflow blackboard overrides must be a JSON/YAML object")
+        );
     }
 
     #[tokio::test]

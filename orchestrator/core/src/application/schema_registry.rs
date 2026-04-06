@@ -101,7 +101,7 @@ impl SchemaRegistry {
                         "Unknown kind '{}'. Supported kinds: agent, workflow",
                         other
                     )],
-                }
+                };
             }
         };
 
@@ -119,7 +119,7 @@ impl SchemaRegistry {
                 return ValidationResult {
                     valid: false,
                     errors: vec![format!("YAML parse error: {}", e)],
-                }
+                };
             }
         };
 
@@ -130,7 +130,7 @@ impl SchemaRegistry {
                 return ValidationResult {
                     valid: false,
                     errors: vec![format!("Schema compilation error: {}", e)],
-                }
+                };
             }
         };
 
