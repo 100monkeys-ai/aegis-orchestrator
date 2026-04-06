@@ -107,7 +107,7 @@ fn make_session(context: SecurityContext) -> SealSession {
         vec![1, 2, 3, 4], // dummy public key bytes
         "test-token-abc".to_string(),
         context,
-        TenantId::local_default(),
+        TenantId::consumer(),
     )
 }
 

@@ -223,7 +223,7 @@ impl TemporalWorkflowMapper {
     /// let workflow = Workflow::new(metadata, spec)?;
     /// let temporal_def = TemporalWorkflowMapper::to_temporal_definition(
     ///     &workflow,
-    ///     &TenantId::local_default(),
+    ///     &TenantId::consumer(),
     /// )?;
     /// ```
     pub fn to_temporal_definition(
@@ -1009,14 +1009,11 @@ mod tests {
         .unwrap();
 
         let temporal_def =
-            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
                 .unwrap();
 
         assert_eq!(temporal_def.name, "test-workflow");
-        assert_eq!(
-            temporal_def.tenant_id,
-            TenantId::local_default().to_string()
-        );
+        assert_eq!(temporal_def.tenant_id, TenantId::consumer().to_string());
         assert_eq!(temporal_def.initial_state, "START");
         assert_eq!(temporal_def.states.len(), 2);
         assert_eq!(temporal_def.states.get("START").unwrap().kind, "Agent");
@@ -1067,7 +1064,7 @@ mod tests {
         .unwrap();
 
         let temporal_def =
-            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
                 .unwrap();
         assert_eq!(
             temporal_def

@@ -13,6 +13,7 @@
 use crate::domain::swarm::SwarmChildSpec;
 use crate::domain::{CancellationReason, Swarm, SwarmId};
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use anyhow::Result;
 use async_trait::async_trait;
 use std::time::Duration;
@@ -41,7 +42,11 @@ pub trait SwarmService: Send + Sync {
     /// Create a new swarm with `parent_execution_id` as the root execution.
     ///
     /// Should be called before spawning the first child agent.
-    async fn create_swarm(&self, parent_execution_id: ExecutionId) -> Result<SwarmId>;
+    async fn create_swarm(
+        &self,
+        parent_execution_id: ExecutionId,
+        tenant_id: TenantId,
+    ) -> Result<SwarmId>;
 
     /// Spawn a child agent within an existing swarm.
     ///

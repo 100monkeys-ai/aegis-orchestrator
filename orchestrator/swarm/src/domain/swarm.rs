@@ -11,6 +11,7 @@
 //! See AGENTS.md §Swarm Coordination Context.
 
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -48,11 +49,24 @@ pub enum CancellationReason {
     SecurityViolation,
 }
 
+/// Error returned when a child spawn violates swarm invariants.
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnError {
+    #[error(
+        "cross-tenant spawn forbidden: swarm tenant {swarm_tenant} != child tenant {child_tenant}"
+    )]
+    CrossTenantSpawnForbidden {
+        swarm_tenant: String,
+        child_tenant: String,
+    },
+}
+
 /// Aggregate root for a group of coordinated agents (BC-6).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Swarm {
     pub id: SwarmId,
     pub parent_execution_id: ExecutionId,
+    pub tenant_id: TenantId,
     /// Tracks the current members keyed by their execution ID.
     pub members: HashMap<ExecutionId, AgentId>,
     pub status: SwarmStatus,
@@ -61,10 +75,11 @@ pub struct Swarm {
 }
 
 impl Swarm {
-    pub fn new(parent_execution_id: ExecutionId) -> Self {
+    pub fn new(parent_execution_id: ExecutionId, tenant_id: TenantId) -> Self {
         Self {
             id: SwarmId::new(),
             parent_execution_id,
+            tenant_id,
             members: HashMap::new(),
             status: SwarmStatus::Active,
             created_at: Utc::now(),
@@ -74,6 +89,22 @@ impl Swarm {
 
     pub fn add_member(&mut self, execution_id: ExecutionId, agent_id: AgentId) {
         self.members.insert(execution_id, agent_id);
+    }
+
+    /// Spawn a child agent into the swarm, enforcing the cross-tenant invariant.
+    ///
+    /// Returns `Err(SpawnError::CrossTenantSpawnForbidden)` if the child's tenant differs
+    /// from the swarm's tenant. Child executions must always belong to the same tenant
+    /// as their parent swarm (ADR-056).
+    pub fn spawn_child(&mut self, child_spec: SwarmChildSpec) -> Result<(), SpawnError> {
+        if child_spec.tenant_id != self.tenant_id {
+            return Err(SpawnError::CrossTenantSpawnForbidden {
+                swarm_tenant: self.tenant_id.as_str().to_string(),
+                child_tenant: child_spec.tenant_id.as_str().to_string(),
+            });
+        }
+        self.add_member(child_spec.execution_id, child_spec.agent_id);
+        Ok(())
     }
 
     pub fn contains(&self, agent_id: AgentId) -> bool {
@@ -128,6 +159,12 @@ pub struct MessageEnvelope {
 /// type before invoking swarm operations.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SwarmChildSpec {
+    /// The execution ID assigned to the child
+    pub execution_id: ExecutionId,
+    /// The agent definition the child will run
+    pub agent_id: AgentId,
+    /// Tenant that owns this child — must match the swarm's tenant_id
+    pub tenant_id: TenantId,
     /// Human-readable name for the child agent
     pub name: String,
     /// Runtime language (e.g., "python", "node")
@@ -158,7 +195,7 @@ mod tests {
     #[test]
     fn new_swarm_has_active_status() {
         let parent_exec = ExecutionId::new();
-        let swarm = Swarm::new(parent_exec);
+        let swarm = Swarm::new(parent_exec, TenantId::consumer());
         assert_eq!(swarm.status, SwarmStatus::Active);
         assert_eq!(swarm.parent_execution_id, parent_exec);
         assert!(swarm.members.is_empty());
@@ -168,7 +205,7 @@ mod tests {
     #[test]
     fn new_swarm_does_not_contain_arbitrary_agent() {
         let parent_exec = ExecutionId::new();
-        let swarm = Swarm::new(parent_exec);
+        let swarm = Swarm::new(parent_exec, TenantId::consumer());
         let other = AgentId::new();
         assert!(!swarm.contains(other));
     }
@@ -176,7 +213,7 @@ mod tests {
     #[test]
     fn new_swarm_member_ids_is_empty() {
         let parent_exec = ExecutionId::new();
-        let swarm = Swarm::new(parent_exec);
+        let swarm = Swarm::new(parent_exec, TenantId::consumer());
         let ids = swarm.member_ids();
         assert!(ids.is_empty());
     }
@@ -188,7 +225,7 @@ mod tests {
     #[test]
     fn add_member_makes_agent_contained() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let child = AgentId::new();
         let child_exec = ExecutionId::new();
         swarm.add_member(child_exec, child);
@@ -199,7 +236,7 @@ mod tests {
     #[test]
     fn add_member_increments_member_count() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         assert_eq!(swarm.members.len(), 0);
         swarm.add_member(ExecutionId::new(), AgentId::new());
         assert_eq!(swarm.members.len(), 1);
@@ -210,7 +247,7 @@ mod tests {
     #[test]
     fn member_ids_includes_all_children() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let child1 = AgentId::new();
         let child2 = AgentId::new();
         let child3 = AgentId::new();
@@ -228,7 +265,7 @@ mod tests {
     #[test]
     fn member_execution_ids_returns_all_execution_ids() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let exec1 = ExecutionId::new();
         let exec2 = ExecutionId::new();
         swarm.add_member(exec1, AgentId::new());
@@ -247,7 +284,7 @@ mod tests {
     #[test]
     fn multiple_members_all_contained() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let children: Vec<(ExecutionId, AgentId)> = (0..10)
             .map(|_| (ExecutionId::new(), AgentId::new()))
             .collect();
@@ -270,7 +307,7 @@ mod tests {
     #[test]
     fn duplicate_agent_with_different_executions_creates_separate_slots() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let child = AgentId::new();
         swarm.add_member(ExecutionId::new(), child);
         swarm.add_member(ExecutionId::new(), child);
@@ -288,7 +325,7 @@ mod tests {
     #[test]
     fn dissolve_sets_status_to_dissolved() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         swarm.add_member(ExecutionId::new(), AgentId::new());
         assert_eq!(swarm.status, SwarmStatus::Active);
         assert!(swarm.dissolved_at.is_none());
@@ -300,7 +337,7 @@ mod tests {
     #[test]
     fn dissolve_preserves_members() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let child = AgentId::new();
         swarm.add_member(ExecutionId::new(), child);
         swarm.dissolve();
@@ -404,6 +441,9 @@ mod tests {
     #[test]
     fn swarm_child_spec_construction_without_limits() {
         let spec = SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: TenantId::consumer(),
             name: "worker-1".to_string(),
             language: "python".to_string(),
             version: "3.11".to_string(),
@@ -418,6 +458,9 @@ mod tests {
     #[test]
     fn swarm_child_spec_construction_with_limits() {
         let spec = SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: TenantId::consumer(),
             name: "gpu-worker".to_string(),
             language: "node".to_string(),
             version: "20".to_string(),
@@ -435,6 +478,9 @@ mod tests {
     #[test]
     fn swarm_child_spec_serde_roundtrip() {
         let spec = SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: TenantId::consumer(),
             name: "analyzer".to_string(),
             language: "python".to_string(),
             version: "3.12".to_string(),
@@ -500,7 +546,7 @@ mod tests {
     #[test]
     fn swarm_serde_roundtrip() {
         let parent_exec = ExecutionId::new();
-        let mut swarm = Swarm::new(parent_exec);
+        let mut swarm = Swarm::new(parent_exec, TenantId::consumer());
         let child1 = AgentId::new();
         let child2 = AgentId::new();
         swarm.add_member(ExecutionId::new(), child1);
@@ -523,16 +569,62 @@ mod tests {
 
     #[test]
     fn contains_execution_returns_false_for_unknown() {
-        let swarm = Swarm::new(ExecutionId::new());
+        let swarm = Swarm::new(ExecutionId::new(), TenantId::consumer());
         let unknown = ExecutionId::new();
         assert!(!swarm.contains_execution(&unknown));
     }
 
     #[test]
     fn contains_execution_returns_true_for_member() {
-        let mut swarm = Swarm::new(ExecutionId::new());
+        let mut swarm = Swarm::new(ExecutionId::new(), TenantId::consumer());
         let exec_id = ExecutionId::new();
         swarm.add_member(exec_id, AgentId::new());
         assert!(swarm.contains_execution(&exec_id));
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // spawn_child() — cross-tenant invariant (Gap 056-2).
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn spawn_child_same_tenant_succeeds() {
+        let tenant = TenantId::consumer();
+        let mut swarm = Swarm::new(ExecutionId::new(), tenant.clone());
+        let spec = SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: tenant,
+            name: "worker".to_string(),
+            language: "python".to_string(),
+            version: "3.11".to_string(),
+            resource_limits: None,
+        };
+        assert!(swarm.spawn_child(spec).is_ok());
+        assert_eq!(swarm.members.len(), 1);
+    }
+
+    #[test]
+    fn spawn_child_cross_tenant_forbidden() {
+        let swarm_tenant = TenantId::consumer();
+        let child_tenant = TenantId::from_realm_slug("tenant-red").unwrap();
+        let mut swarm = Swarm::new(ExecutionId::new(), swarm_tenant);
+        let spec = SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: child_tenant,
+            name: "rogue-worker".to_string(),
+            language: "python".to_string(),
+            version: "3.11".to_string(),
+            resource_limits: None,
+        };
+        let result = swarm.spawn_child(spec);
+        assert!(matches!(
+            result,
+            Err(SpawnError::CrossTenantSpawnForbidden { .. })
+        ));
+        assert!(
+            swarm.members.is_empty(),
+            "member must not be added on cross-tenant error"
+        );
     }
 }

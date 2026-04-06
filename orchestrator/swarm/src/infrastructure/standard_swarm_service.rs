@@ -8,6 +8,7 @@ use crate::domain::{
 };
 use aegis_orchestrator_core::application::ports::SwarmCancellationPort;
 use aegis_orchestrator_core::domain::shared_kernel::{AgentId, ExecutionId};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use anyhow::{anyhow, bail, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -106,13 +107,17 @@ impl Default for StandardSwarmService {
 
 #[async_trait]
 impl SwarmService for StandardSwarmService {
-    async fn create_swarm(&self, parent_execution_id: ExecutionId) -> Result<SwarmId> {
+    async fn create_swarm(
+        &self,
+        parent_execution_id: ExecutionId,
+        tenant_id: TenantId,
+    ) -> Result<SwarmId> {
         let mut state = self.state.write().await;
         if state.execution_to_swarm.contains_key(&parent_execution_id) {
             bail!("parent execution {parent_execution_id:?} already belongs to a swarm");
         }
 
-        let swarm = Swarm::new(parent_execution_id);
+        let swarm = Swarm::new(parent_execution_id, tenant_id);
         let swarm_id = swarm.id;
         state
             .execution_to_swarm
@@ -344,6 +349,9 @@ mod tests {
 
     fn test_child_spec() -> SwarmChildSpec {
         SwarmChildSpec {
+            execution_id: ExecutionId::new(),
+            agent_id: AgentId::new(),
+            tenant_id: TenantId::consumer(),
             name: "child-agent".to_string(),
             language: "python".to_string(),
             version: "3.11".to_string(),
@@ -358,7 +366,10 @@ mod tests {
     async fn creates_swarm_spawns_child_and_records_message() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
         let spawned = service
             .spawn_child(swarm_id, test_child_spec(), None)
             .await
@@ -379,7 +390,10 @@ mod tests {
     async fn lock_acquire_release_and_contention() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
         let spawned = service
             .spawn_child(swarm_id, test_child_spec(), None)
             .await
@@ -425,7 +439,10 @@ mod tests {
     async fn acquire_lock_rejects_non_member() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
 
         let outsider = AgentId::new();
         let outsider_exec = ExecutionId::new();
@@ -440,7 +457,10 @@ mod tests {
     async fn cancel_swarm_releases_locks_and_cleans_execution_map() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
         let spawned = service
             .spawn_child(swarm_id, test_child_spec(), None)
             .await
@@ -477,7 +497,10 @@ mod tests {
     async fn list_child_executions_returns_correct_ids() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
 
         let spawned1 = service
             .spawn_child(swarm_id, test_child_spec(), None)
@@ -498,7 +521,10 @@ mod tests {
     async fn broadcast_message_delivers_to_all_except_sender() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
 
         let spawned1 = service
             .spawn_child(swarm_id, test_child_spec(), None)
@@ -533,7 +559,10 @@ mod tests {
     async fn spawn_child_returns_spawned_child_with_correct_swarm_id() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
 
         let spawned = service
             .spawn_child(swarm_id, test_child_spec(), None)
@@ -547,7 +576,10 @@ mod tests {
     async fn spawn_child_on_dissolved_swarm_fails() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        let swarm_id = service.create_swarm(parent_exec).await.unwrap();
+        let swarm_id = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
 
         service
             .cancel_swarm(swarm_id, CancellationReason::Manual)
@@ -576,8 +608,13 @@ mod tests {
     async fn duplicate_parent_execution_rejected() {
         let service = StandardSwarmService::new();
         let parent_exec = ExecutionId::new();
-        service.create_swarm(parent_exec).await.unwrap();
-        let result = service.create_swarm(parent_exec).await;
+        service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await
+            .unwrap();
+        let result = service
+            .create_swarm(parent_exec, TenantId::consumer())
+            .await;
         assert!(result.is_err());
     }
 }

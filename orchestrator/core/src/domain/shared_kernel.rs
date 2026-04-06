@@ -213,11 +213,6 @@ impl TenantId {
         Self(SYSTEM_SLUG.to_string())
     }
 
-    /// Transitional alias — delegates to [`Self::consumer()`].
-    pub fn local_default() -> Self {
-        Self::consumer()
-    }
-
     /// Generate a per-user tenant slug from a Keycloak `sub` claim (ADR-097).
     /// Format: `u-{uuid_without_hyphens}`
     pub fn for_consumer_user(sub: &str) -> Result<Self, TenantIdError> {

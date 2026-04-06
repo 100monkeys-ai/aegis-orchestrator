@@ -907,8 +907,8 @@ mod tests {
         (service, repository, storage_provider)
     }
 
-    fn create_local_host_test_service()
-    -> (StandardVolumeService, Arc<TestVolumeRepository>, TempDir) {
+    fn create_local_host_test_service(
+    ) -> (StandardVolumeService, Arc<TestVolumeRepository>, TempDir) {
         let repository = Arc::new(TestVolumeRepository::new());
         let tempdir = TempDir::new().expect("Failed to create tempdir");
         let storage_provider = Arc::new(
@@ -1106,7 +1106,7 @@ mod tests {
     async fn test_create_volumes_for_execution_local_host_with_local_tenant() {
         let (service, repository, tempdir) = create_local_host_test_service();
         let execution_id = ExecutionId::new();
-        let tenant_id = TenantId::local_default();
+        let tenant_id = TenantId::consumer();
         let volume_specs = vec![VolumeSpec {
             name: "workspace".to_string(),
             storage_class: "ephemeral".to_string(),
@@ -1139,11 +1139,11 @@ mod tests {
             .expect("Volume not found");
 
         assert_eq!(volume.name, "workspace");
-        assert_eq!(volume.tenant_id, TenantId::local_default());
+        assert_eq!(volume.tenant_id, TenantId::consumer());
 
         let expected_dir = tempdir.path().join(format!(
             "aegis/volumes/{}/{}",
-            TenantId::local_default(),
+            TenantId::consumer(),
             volume.id
         ));
         assert!(
@@ -1171,7 +1171,7 @@ mod tests {
         let err = service
             .create_volume(
                 "workspace".to_string(),
-                TenantId::local_default(),
+                TenantId::consumer(),
                 StorageClass::ephemeral_hours(1),
                 100,
                 VolumeOwnership::Execution {
@@ -1183,9 +1183,8 @@ mod tests {
 
         let err_text = err.to_string();
         assert!(err_text.contains("Failed to save volume to repository"));
-        assert!(
-            err.chain()
-                .any(|cause| cause.to_string().contains("synthetic repository failure"))
-        );
+        assert!(err
+            .chain()
+            .any(|cause| cause.to_string().contains("synthetic repository failure")));
     }
 }

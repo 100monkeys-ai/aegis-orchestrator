@@ -93,12 +93,12 @@ fn test_map_100monkeys_workflow() {
     )
     .unwrap();
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
         .expect("Mapping failed");
 
     // Assertions
     assert_eq!(def.name, "100monkeys-test");
-    assert_eq!(def.tenant_id, TenantId::local_default().to_string());
+    assert_eq!(def.tenant_id, TenantId::consumer().to_string());
     assert_eq!(def.initial_state, "GENERATE");
 
     // Verify GENERATE state
@@ -155,7 +155,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
     )
     .unwrap();
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
         .expect("Mapping failed");
 
     assert_eq!(def.version, DEFAULT_WORKFLOW_VERSION);
@@ -204,7 +204,7 @@ fn test_spec_storage_is_mapped_to_temporal_definition() {
     )
     .unwrap();
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
         .expect("Mapping failed");
 
     let spec_storage = def.spec_storage.expect("spec_storage must be Some");
@@ -223,7 +223,7 @@ fn test_builtin_intent_to_execution_yaml_maps_spec_storage() {
 
     let workflow = WorkflowParser::parse_yaml(&yaml_content).expect("builtin YAML must parse");
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::local_default())
+    let def = TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
         .expect("Mapping failed");
 
     let spec_storage = def
@@ -282,11 +282,9 @@ fn test_scope_mapped_to_temporal_definition() {
     .unwrap();
     // scope defaults to Tenant
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(
-        &tenant_workflow,
-        &TenantId::local_default(),
-    )
-    .expect("Mapping failed");
+    let def =
+        TemporalWorkflowMapper::to_temporal_definition(&tenant_workflow, &TenantId::consumer())
+            .expect("Mapping failed");
 
     assert_eq!(def.scope, Some("tenant".to_string()));
 
@@ -310,11 +308,9 @@ fn test_scope_mapped_to_temporal_definition() {
     .unwrap();
     global_workflow.scope = WorkflowScope::Global;
 
-    let def = TemporalWorkflowMapper::to_temporal_definition(
-        &global_workflow,
-        &TenantId::local_default(),
-    )
-    .expect("Mapping failed");
+    let def =
+        TemporalWorkflowMapper::to_temporal_definition(&global_workflow, &TenantId::consumer())
+            .expect("Mapping failed");
 
     assert_eq!(def.scope, Some("global".to_string()));
 }

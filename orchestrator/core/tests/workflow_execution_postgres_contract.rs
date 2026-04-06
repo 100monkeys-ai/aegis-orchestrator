@@ -127,7 +127,7 @@ async fn workflow_execution_repository_persists_expected_temporal_columns() {
     .await
     .expect("Failed to create temp workflow_executions table");
 
-    let tenant_id = TenantId::local_default();
+    let tenant_id = TenantId::consumer();
     let workflow = build_workflow("copy-generator");
     let execution = WorkflowExecution::new(
         &workflow,

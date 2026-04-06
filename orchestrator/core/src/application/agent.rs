@@ -102,7 +102,7 @@ pub trait AgentLifecycleService: Send + Sync {
     /// - Database write errors
     async fn deploy_agent(&self, manifest: AgentManifest, force: bool) -> Result<AgentId> {
         self.deploy_agent_for_tenant(
-            &TenantId::local_default(),
+            &TenantId::consumer(),
             manifest,
             force,
             AgentScope::Tenant,
@@ -117,8 +117,7 @@ pub trait AgentLifecycleService: Send + Sync {
     ///
     /// Returns an error if `id` does not exist in the registry.
     async fn get_agent(&self, id: AgentId) -> Result<Agent> {
-        self.get_agent_for_tenant(&TenantId::local_default(), id)
-            .await
+        self.get_agent_for_tenant(&TenantId::consumer(), id).await
     }
 
     /// Replace the manifest of an existing agent in-place.
@@ -131,7 +130,7 @@ pub trait AgentLifecycleService: Send + Sync {
     /// - `id` not found
     /// - New manifest fails schema validation
     async fn update_agent(&self, id: AgentId, manifest: AgentManifest) -> Result<()> {
-        self.update_agent_for_tenant(&TenantId::local_default(), id, manifest)
+        self.update_agent_for_tenant(&TenantId::consumer(), id, manifest)
             .await
     }
 
@@ -144,14 +143,13 @@ pub trait AgentLifecycleService: Send + Sync {
     ///
     /// Returns an error if `id` does not exist.
     async fn delete_agent(&self, id: AgentId) -> Result<()> {
-        self.delete_agent_for_tenant(&TenantId::local_default(), id)
+        self.delete_agent_for_tenant(&TenantId::consumer(), id)
             .await
     }
 
     /// Return all registered agents in unspecified order.
     async fn list_agents(&self) -> Result<Vec<Agent>> {
-        self.list_agents_for_tenant(&TenantId::local_default())
-            .await
+        self.list_agents_for_tenant(&TenantId::consumer()).await
     }
 
     /// Resolve an agent name string to its [`AgentId`], or `None` if not found.
@@ -159,7 +157,7 @@ pub trait AgentLifecycleService: Send + Sync {
     /// Used by workflow execution to dereference agent name references in workflow
     /// manifests (e.g. `agent: "code-reviewer"`).
     async fn lookup_agent(&self, name: &str) -> Result<Option<AgentId>> {
-        self.lookup_agent_for_tenant(&TenantId::local_default(), name)
+        self.lookup_agent_for_tenant(&TenantId::consumer(), name)
             .await
     }
 
@@ -177,7 +175,7 @@ pub trait AgentLifecycleService: Send + Sync {
         name: &str,
         version: &str,
     ) -> Result<Option<AgentId>> {
-        self.lookup_agent_for_tenant_with_version(&TenantId::local_default(), name, version)
+        self.lookup_agent_for_tenant_with_version(&TenantId::consumer(), name, version)
             .await
     }
 }

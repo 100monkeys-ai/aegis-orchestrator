@@ -539,6 +539,13 @@ impl StubWorkflowExecutionRepository {
 
 #[async_trait]
 impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
+    async fn find_tenant_id_by_execution(
+        &self,
+        _id: crate::domain::execution::ExecutionId,
+    ) -> Result<Option<TenantId>, crate::domain::repository::RepositoryError> {
+        Ok(None)
+    }
+
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -1227,11 +1234,9 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
         payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
         "aegis.schema.validate"
     );
-    assert!(
-        payload["tool_audit_history"]
-            .get("schema_get_evidence")
-            .is_none()
-    );
+    assert!(payload["tool_audit_history"]
+        .get("schema_get_evidence")
+        .is_none());
 }
 
 #[test]
@@ -1392,7 +1397,7 @@ async fn workflow_execution_tools_list_and_get() {
     let (fsal, volume_registry) = test_fsal_deps();
     let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
     let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
-    let tenant_id = TenantId::local_default();
+    let tenant_id = TenantId::consumer();
     let workflow = build_test_workflow("execution-list");
 
     workflow_repo
@@ -1620,12 +1625,10 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     };
 
     assert_eq!(payload["tool"], "aegis.task.logs");
-    assert!(
-        payload["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to fetch execution")
-    );
+    assert!(payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to fetch execution"));
 }
 
 #[tokio::test]
@@ -1994,16 +1997,12 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         .await
         .unwrap();
 
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool.name == "aegis.workflow.status")
-    );
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool.name == "aegis.workflow.delete")
-    );
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.status"));
+    assert!(!tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.delete"));
 }
 
 #[tokio::test]

@@ -172,7 +172,7 @@ impl StandardStimulusService {
             .get("x-aegis-tenant")
             .or_else(|| stimulus.headers.get("x-tenant-id"))
             .and_then(|value| TenantId::from_string(value).ok())
-            .unwrap_or_else(TenantId::local_default)
+            .unwrap_or_else(TenantId::consumer)
     }
 
     pub fn new(

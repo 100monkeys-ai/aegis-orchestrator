@@ -89,7 +89,7 @@ pub trait CompleteWorkflowExecutionUseCase: Send + Sync {
         &self,
         request: CompleteWorkflowExecutionRequest,
     ) -> Result<CompletedWorkflowExecution> {
-        self.complete_execution_for_tenant(&TenantId::local_default(), request)
+        self.complete_execution_for_tenant(&TenantId::consumer(), request)
             .await
     }
 }
@@ -304,7 +304,7 @@ mod tests {
     #[tokio::test]
     async fn complete_execution_updates_status_merges_blackboard_and_publishes_event() {
         let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
-        let tenant_id = TenantId::local_default();
+        let tenant_id = TenantId::consumer();
         let execution_id = seed_execution(&repo, &tenant_id, "complete-success").await;
         let event_bus = Arc::new(EventBus::new(32));
         let mut receiver = event_bus.subscribe();
@@ -356,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn complete_execution_handles_failed_status_and_non_object_blackboard() {
         let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
-        let tenant_id = TenantId::local_default();
+        let tenant_id = TenantId::consumer();
         let execution_id = seed_execution(&repo, &tenant_id, "complete-failure").await;
         let event_bus = Arc::new(EventBus::new(8));
         let mut receiver = event_bus.subscribe();
@@ -416,10 +416,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("Invalid execution_id format (not a UUID)")
-        );
+        assert!(err
+            .to_string()
+            .contains("Invalid execution_id format (not a UUID)"));
     }
 
     #[tokio::test]
@@ -441,10 +440,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains(&format!("Workflow execution not found: {missing}"))
-        );
+        assert!(err
+            .to_string()
+            .contains(&format!("Workflow execution not found: {missing}")));
     }
 
     #[tokio::test]
@@ -476,9 +474,13 @@ mod tests {
             .unwrap();
         assert_eq!(saved.status, ExecutionStatus::Cancelled);
         assert_eq!(saved.blackboard.get("tenant"), Some(&json!("alpha")));
+        let other_tenant = TenantId::from_string("tenant-beta").unwrap();
         assert!(
-            repo.find_by_id(execution_id).await.unwrap().is_none(),
-            "default tenant lookup should not see non-local executions"
+            repo.find_by_id_for_tenant(&other_tenant, execution_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "cross-tenant lookup should not see executions from a different tenant"
         );
     }
 }

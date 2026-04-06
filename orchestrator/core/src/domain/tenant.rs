@@ -5,7 +5,7 @@
 //! This module re-exports [`TenantId`] and related types from the
 //! [`shared_kernel`](super::shared_kernel) module for backward compatibility.
 
-pub use crate::domain::shared_kernel::{CONSUMER_SLUG, SYSTEM_SLUG, TenantId, TenantIdError};
+pub use crate::domain::shared_kernel::{TenantId, TenantIdError, CONSUMER_SLUG, SYSTEM_SLUG};
 
 #[cfg(test)]
 mod tests {
@@ -19,11 +19,6 @@ mod tests {
     #[test]
     fn system_returns_aegis_system() {
         assert_eq!(TenantId::system().as_str(), "aegis-system");
-    }
-
-    #[test]
-    fn local_default_delegates_to_consumer() {
-        assert_eq!(TenantId::local_default(), TenantId::consumer());
     }
 
     #[test]
