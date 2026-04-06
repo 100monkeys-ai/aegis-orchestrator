@@ -49,7 +49,7 @@ spec:
   tools: []
 
   security:
-    security_context: aegis-system-default
+    security_context: aegis-system-agent-runtime
     network:
       mode: none
     filesystem:
