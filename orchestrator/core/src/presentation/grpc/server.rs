@@ -1792,7 +1792,7 @@ mod tests {
                 intent: None,
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
-                workspace_remote_path: String::new(),
+                workspace_remote_path: None,
             }))
             .await
             .expect("execute_agent should succeed");
@@ -1876,7 +1876,7 @@ mod tests {
                 intent: None,
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
-                workspace_remote_path: String::new(),
+                workspace_remote_path: None,
             }))
             .await
             .expect("execute_agent should succeed");
