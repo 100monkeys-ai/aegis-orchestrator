@@ -2003,31 +2003,15 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 );
             } else {
                 match register_workflow_use_case
-                    .register_workflow_for_tenant(&system_tenant, wf_template, force_builtins)
+                    .register_workflow_for_tenant(
+                        &system_tenant,
+                        wf_template,
+                        force_builtins,
+                        aegis_orchestrator_core::domain::workflow::WorkflowScope::Global,
+                    )
                     .await
                 {
-                    Ok(registered) => {
-                        // Set scope to Global with aegis-system tenant after registration.
-                        if let Ok(Some(workflow)) = workflow_repo
-                            .find_by_name_for_tenant(&system_tenant, &registered.name)
-                            .await
-                        {
-                            if let Err(e) = workflow_repo
-                                .update_scope(
-                                    workflow.id,
-                                    aegis_orchestrator_core::domain::workflow::WorkflowScope::Global,
-                                    &system_tenant,
-                                )
-                                .await
-                            {
-                                warn!(
-                                    "Failed to set global scope for built-in workflow '{}': {}",
-                                    wf_name, e
-                                );
-                            }
-                        }
-                        info!("Deployed built-in workflow '{}'", wf_name);
-                    }
+                    Ok(_) => info!("Deployed built-in workflow '{}'", wf_name),
                     Err(e) => warn!("Failed to deploy built-in workflow '{}': {:#}", wf_name, e),
                 }
             }

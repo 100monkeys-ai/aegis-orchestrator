@@ -1120,7 +1120,12 @@ impl ToolInvocationService {
         };
 
         match register_workflow_use_case
-            .register_workflow_for_tenant(&tenant_id, manifest_yaml, force)
+            .register_workflow_for_tenant(
+                &tenant_id,
+                manifest_yaml,
+                force,
+                crate::domain::workflow::WorkflowScope::Tenant,
+            )
             .await
         {
             Ok(meta) => {

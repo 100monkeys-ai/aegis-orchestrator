@@ -36,40 +36,25 @@ pub(crate) async fn register_temporal_workflow_handler(
     axum::extract::Query(query): axum::extract::Query<RegisterWorkflowQuery>,
     body: String,
 ) -> impl IntoResponse {
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    use aegis_orchestrator_core::domain::workflow::WorkflowScope;
+
+    // Resolve scope and tenant_id together before registration so the correct
+    // values are baked into domain_json at INSERT time. The post-hoc update_scope
+    // pattern is removed because it left domain_json with the wrong scope.
+    let (tenant_id, scope) = match query.scope.as_deref() {
+        Some("global") => (TenantId::system(), WorkflowScope::Global),
+        _ => (
+            tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0)),
+            WorkflowScope::Tenant,
+        ),
+    };
+
     match state
         .register_workflow_use_case
-        .register_workflow_for_tenant(&tenant_id, &body, query.force)
+        .register_workflow_for_tenant(&tenant_id, &body, query.force, scope)
         .await
     {
-        Ok(res) => {
-            // If a scope was requested, update the workflow scope after registration
-            if let Some(scope_str) = &query.scope {
-                use aegis_orchestrator_core::domain::workflow::WorkflowScope;
-                let target_scope = match scope_str.as_str() {
-                    "global" => WorkflowScope::Global,
-                    _ => WorkflowScope::Tenant, // default / "tenant"
-                };
-                if let Ok(Some(workflow)) = state
-                    .workflow_repo
-                    .find_by_name_for_tenant(&tenant_id, &res.name)
-                    .await
-                {
-                    let new_tenant_id = match &target_scope {
-                        WorkflowScope::Global => TenantId::system(),
-                        _ => tenant_id.clone(),
-                    };
-                    if let Err(e) = state
-                        .workflow_repo
-                        .update_scope(workflow.id, target_scope, &new_tenant_id)
-                        .await
-                    {
-                        tracing::warn!("Failed to set workflow scope after registration: {e}");
-                    }
-                }
-            }
-            (StatusCode::OK, Json(res)).into_response()
-        }
+        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({

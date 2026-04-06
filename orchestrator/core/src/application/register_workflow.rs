@@ -41,6 +41,7 @@ use crate::application::ports::WorkflowEnginePort;
 use crate::application::temporal_mapper::DEFAULT_WORKFLOW_VERSION;
 use crate::domain::repository::WorkflowRepository;
 use crate::domain::tenant::TenantId;
+use crate::domain::workflow::WorkflowScope;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::workflow_parser::WorkflowParser;
 use anyhow::{Context, Result};
@@ -66,6 +67,7 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
         tenant_id: &TenantId,
         yaml_manifest: &str,
         force: bool,
+        scope: WorkflowScope,
     ) -> Result<RegisteredWorkflow>;
 
     /// Register a new workflow from YAML manifest
@@ -90,8 +92,13 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
         yaml_manifest: &str,
         force: bool,
     ) -> Result<RegisteredWorkflow> {
-        self.register_workflow_for_tenant(&TenantId::consumer(), yaml_manifest, force)
-            .await
+        self.register_workflow_for_tenant(
+            &TenantId::consumer(),
+            yaml_manifest,
+            force,
+            WorkflowScope::Tenant,
+        )
+        .await
     }
 }
 
@@ -128,12 +135,19 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         tenant_id: &TenantId,
         yaml_manifest: &str,
         force: bool,
+        scope: WorkflowScope,
     ) -> Result<RegisteredWorkflow> {
         info!("Registering workflow from manifest (force={force})");
 
         // Step 1: Parse YAML → Workflow domain aggregate
         let mut workflow = WorkflowParser::parse_yaml(yaml_manifest)
             .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {e}"))?;
+
+        // Set scope and tenant_id on the aggregate before any persistence or
+        // serialization. The caller supplies the authoritative scope; the parsed
+        // YAML default (Tenant / zaru-consumer) must never leak into domain_json.
+        workflow.scope = scope;
+        workflow.tenant_id = tenant_id.clone();
         let workflow_name = workflow.metadata.name.clone();
         let workflow_version = workflow
             .metadata
@@ -642,7 +656,12 @@ spec:
         );
 
         service
-            .register_workflow_for_tenant(&tenant_id, VALID_WORKFLOW_YAML, false)
+            .register_workflow_for_tenant(
+                &tenant_id,
+                VALID_WORKFLOW_YAML,
+                false,
+                crate::domain::workflow::WorkflowScope::Tenant,
+            )
             .await
             .unwrap();
 
