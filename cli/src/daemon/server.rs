@@ -1570,6 +1570,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
     let agent_service_for_grpc: Arc<dyn AgentLifecycleService> = agent_service.clone();
+    let volume_service_for_grpc: Arc<
+        dyn aegis_orchestrator_core::application::volume_manager::VolumeService,
+    > = volume_service.clone();
     let grpc_auth = match (&iam_service, config.spec.grpc_auth.clone()) {
         (Some(iam), Some(grpc_auth)) if grpc_auth.enabled => Some(
             aegis_orchestrator_core::presentation::grpc::auth_interceptor::GrpcIamAuthInterceptor::new(
@@ -1610,6 +1613,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // build a StandardStimulusService, and pass it as Some(...).
                 stimulus_service: None,
                 discovery_service: discovery_service.clone(),
+                volume_service: Some(volume_service_for_grpc),
             },
         )
         .await

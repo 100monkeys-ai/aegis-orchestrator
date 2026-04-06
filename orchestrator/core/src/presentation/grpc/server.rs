@@ -20,11 +20,13 @@ use crate::application::execution::ExecutionService;
 use crate::application::run_container_step::RunContainerStepUseCase;
 use crate::application::stimulus::StimulusService;
 use crate::application::validation_service::ValidationService;
+use crate::application::volume_manager::VolumeService;
 use crate::domain::agent::AgentId;
 use crate::domain::discovery::DiscoveryQuery;
 use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus};
 use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::tenant::TenantId;
+use crate::domain::volume::{StorageClass, VolumeBackend, VolumeOwnership};
 
 const DEFAULT_COMMAND_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_JUDGE_WEIGHT: f64 = 1.0;
@@ -71,6 +73,8 @@ pub struct AegisRuntimeService {
     agent_service: Option<Arc<dyn AgentLifecycleService>>,
     /// ADR-075: Discovery service for semantic search over agents and workflows.
     discovery_service: Option<Arc<dyn DiscoveryService>>,
+    /// BC-7: Volume lifecycle service for workspace volume provisioning (ADR-032/087).
+    volume_service: Option<Arc<dyn VolumeService>>,
 }
 
 impl AegisRuntimeService {
@@ -137,6 +141,7 @@ impl AegisRuntimeService {
             run_container_step_use_case: None,
             agent_service: None,
             discovery_service: None,
+            volume_service: None,
         }
     }
 
@@ -189,6 +194,12 @@ impl AegisRuntimeService {
     /// Set the discovery service for semantic search over agents and workflows (ADR-075).
     pub fn with_discovery_service(mut self, svc: Arc<dyn DiscoveryService>) -> Self {
         self.discovery_service = Some(svc);
+        self
+    }
+
+    /// Set the volume lifecycle service for workspace volume provisioning (ADR-032/087).
+    pub fn with_volume_service(mut self, svc: Arc<dyn VolumeService>) -> Self {
+        self.volume_service = Some(svc);
         self
     }
 
@@ -1060,17 +1071,49 @@ impl AegisRuntime for AegisRuntimeService {
             req.size_limit_mb
         };
 
-        // Delegate to volume manager via the execution service if available.
-        // For now, return a placeholder until the VolumeService is wired into the gRPC server.
-        let volume_id = uuid::Uuid::new_v4().to_string();
-        let remote_path = format!(
-            "/aegis/volumes/{tenant_id}/{execution_id}/{volume_id}",
-            tenant_id = tenant_id,
-            execution_id = execution_id,
-        );
+        let Some(ref volume_service) = self.volume_service else {
+            return Err(Status::unimplemented(
+                "Volume service is not configured on this node",
+            ));
+        };
+
+        let workflow_execution_uuid =
+            uuid::Uuid::parse_str(&req.workflow_execution_id).map_err(|e| {
+                Status::invalid_argument(format!("Invalid workflow_execution_id UUID: {e}"))
+            })?;
+
+        let volume_name = format!("workspace-{}", execution_id);
+        let storage_class = StorageClass::ephemeral_hours(ttl_hours as i64);
+        let ownership = VolumeOwnership::WorkflowExecution {
+            workflow_execution_id: workflow_execution_uuid,
+        };
+
+        let volume_id = volume_service
+            .create_volume(
+                volume_name,
+                tenant_id.clone(),
+                storage_class,
+                size_limit_mb as u64,
+                ownership,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("Failed to create workspace volume: {e}")))?;
+
+        let volume = volume_service
+            .get_volume(volume_id)
+            .await
+            .map_err(|e| Status::internal(format!("Failed to retrieve created volume: {e}")))?;
+
+        let remote_path = match &volume.backend {
+            VolumeBackend::SeaweedFS { remote_path, .. } => remote_path.clone(),
+            VolumeBackend::HostPath { path } => path.to_string_lossy().into_owned(),
+            VolumeBackend::OpenDal { .. } | VolumeBackend::Seal { .. } => {
+                format!("/aegis/volumes/{tenant_id}/{volume_id}")
+            }
+        };
 
         tracing::info!(
-            %volume_id,
+            volume_id = %volume_id,
             %remote_path,
             ttl_hours,
             size_limit_mb,
@@ -1078,7 +1121,7 @@ impl AegisRuntime for AegisRuntimeService {
         );
 
         Ok(Response::new(CreateWorkspaceVolumeResponse {
-            volume_id,
+            volume_id: volume_id.to_string(),
             remote_path,
         }))
     }
@@ -1463,6 +1506,7 @@ pub struct GrpcServerConfig {
     pub agent_service: Option<Arc<dyn AgentLifecycleService>>,
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     pub discovery_service: Option<Arc<dyn DiscoveryService>>,
+    pub volume_service: Option<Arc<dyn VolumeService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1494,6 +1538,10 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     if let Some(discovery) = config.discovery_service {
         service = service.with_discovery_service(discovery);
+    }
+
+    if let Some(volume_service) = config.volume_service {
+        service = service.with_volume_service(volume_service);
     }
 
     let server = service.into_server();
