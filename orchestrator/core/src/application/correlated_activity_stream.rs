@@ -862,7 +862,7 @@ mod tests {
             Some(Arc::new(EmptyWorkflowExecutionRepository)),
         );
         let mut stream = service
-            .stream_agent_activity(agent_id, &TenantId::default(), false)
+            .stream_agent_activity(agent_id, &TenantId::system(), false)
             .await
             .unwrap();
 
