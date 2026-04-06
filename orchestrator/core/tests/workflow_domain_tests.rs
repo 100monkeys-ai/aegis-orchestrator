@@ -123,6 +123,7 @@ fn container_run_state(
         registry_credentials: None,
         retry: None,
         shell: false,
+        output_handler: None,
     }
 }
 
@@ -360,6 +361,7 @@ fn state_kind_agent_variant() {
         judges: vec![],
         max_iterations: Some(5),
         pre_execution_validator: None,
+        output_handler: None,
     };
     assert!(matches!(kind, StateKind::Agent { .. }));
 }
@@ -402,6 +404,7 @@ fn state_kind_parallel_agents_variant() {
             confidence_weighting: None,
         },
         judges_for_parallel: vec![],
+        output_handler: None,
     };
     assert!(matches!(kind, StateKind::ParallelAgents { .. }));
 }
