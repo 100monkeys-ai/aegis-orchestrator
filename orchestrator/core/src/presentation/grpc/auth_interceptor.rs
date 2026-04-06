@@ -8,9 +8,18 @@
 //!
 //! When authentication succeeds, the resolved [`UserIdentity`] is inserted into
 //! the request's extensions so downstream handlers can access it.
+//!
+//! ## Tenant Injection (gap 056-10)
+//!
+//! After JWT validation, [`validate_grpc_request`] derives a [`TenantId`] from
+//! the validated identity and inserts it into the request extensions.  Operator
+//! callers may supply an `x-aegis-tenant` metadata key to override the derived
+//! tenant (same semantics as the HTTP `X-Aegis-Tenant` header).
 
-use crate::domain::iam::{IdentityProvider, UserIdentity};
+use crate::domain::iam::{IdentityKind, IdentityProvider, UserIdentity};
 use crate::domain::node_config::GrpcAuthConfig;
+use crate::domain::tenant::TenantId;
+use crate::presentation::tenant_middleware::derive_tenant_id;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tonic::{Request, Status};
@@ -58,11 +67,17 @@ impl GrpcIamAuthInterceptor {
 /// Since `tonic::Interceptor` is synchronous, this function is intended to be called
 /// from within the async gRPC handler methods. The handler calls this before processing
 /// the request and rejects with `Status::Unauthenticated` if validation fails.
+///
+/// ## Return value
+///
+/// Returns `Ok(None)` for exempt methods (no auth required). For authenticated calls,
+/// returns `Ok(Some((identity, tenant_id)))` where `tenant_id` is derived from the
+/// identity or overridden via the `x-aegis-tenant` metadata key (admin only).
 pub async fn validate_grpc_request<T>(
     interceptor: &GrpcIamAuthInterceptor,
     request: &Request<T>,
     method: &str,
-) -> Result<Option<UserIdentity>, Status> {
+) -> Result<Option<(UserIdentity, TenantId)>, Status> {
     // Check exemption
     if interceptor.is_exempt(method) {
         return Ok(None);
@@ -84,7 +99,29 @@ pub async fn validate_grpc_request<T>(
             Status::unauthenticated(format!("Token validation failed: {e}"))
         })?;
 
-    Ok(Some(validated.identity))
+    let identity = validated.identity;
+
+    // Derive tenant from identity, then check for admin override via x-aegis-tenant metadata.
+    let base_tenant = derive_tenant_id(&identity);
+    let tenant_id = if let IdentityKind::Operator { ref aegis_role } = identity.identity_kind {
+        if aegis_role.is_admin() {
+            if let Some(override_val) = request.metadata().get("x-aegis-tenant") {
+                if let Ok(slug_str) = override_val.to_str() {
+                    TenantId::from_realm_slug(slug_str).unwrap_or(base_tenant)
+                } else {
+                    base_tenant
+                }
+            } else {
+                base_tenant
+            }
+        } else {
+            base_tenant
+        }
+    } else {
+        base_tenant
+    };
+
+    Ok(Some((identity, tenant_id)))
 }
 
 #[cfg(test)]

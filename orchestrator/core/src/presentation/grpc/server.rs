@@ -197,11 +197,19 @@ impl AegisRuntimeService {
         AegisRuntimeServer::new(self)
     }
 
+    /// Authenticate the request and derive the effective `TenantId`.
+    ///
+    /// Returns `Ok(None)` for exempt methods. For authenticated calls, returns
+    /// `Ok(Some((identity, tenant_id)))` where `tenant_id` incorporates the
+    /// `x-aegis-tenant` admin override when applicable (gap 056-10).
+    ///
+    /// For service-account callers, the `x-tenant-id` delegation is applied
+    /// on top of the interceptor-derived value via `tenant_id_from_request`.
     async fn authorize<T>(
         &self,
         request: &Request<T>,
         method: &str,
-    ) -> Result<Option<UserIdentity>, Status> {
+    ) -> Result<Option<(UserIdentity, TenantId)>, Status> {
         if let Some(interceptor) = &self.grpc_auth {
             return validate_grpc_request(interceptor, request, method).await;
         }
@@ -228,10 +236,29 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<ExecuteAgentRequest>,
     ) -> Result<Response<Self::ExecuteAgentStream>, Status> {
-        let identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteAgent")
             .await?;
-        let tenant_id = Self::tenant_id_from_request(identity.as_ref(), &request);
+        let (identity, tenant_id) = match auth {
+            Some((id, tid)) => {
+                // For service accounts, apply x-tenant-id delegation on top of the
+                // interceptor-derived tenant (ADR-100).
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                // Use effective_tid (service-account delegation) if it differs from the
+                // interceptor's derived tenant, otherwise use the interceptor's value
+                // (which includes x-aegis-tenant admin override).
+                let final_tid = if matches!(
+                    id.identity_kind,
+                    crate::domain::iam::IdentityKind::ServiceAccount { .. }
+                ) {
+                    effective_tid
+                } else {
+                    tid
+                };
+                (Some(id), final_tid)
+            }
+            None => (None, Self::tenant_id_from_request(None, &request)),
+        };
         let req = request.into_inner();
 
         // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
@@ -687,10 +714,24 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<IngestStimulusRequest>,
     ) -> Result<Response<IngestStimulusResponse>, Status> {
-        let identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
             .await?;
-        let tenant_id = Self::tenant_id_from_request(identity.as_ref(), &request);
+        let (identity, tenant_id) = match auth {
+            Some((id, tid)) => {
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                let final_tid = if matches!(
+                    id.identity_kind,
+                    crate::domain::iam::IdentityKind::ServiceAccount { .. }
+                ) {
+                    effective_tid
+                } else {
+                    tid
+                };
+                (Some(id), final_tid)
+            }
+            None => (None, Self::tenant_id_from_request(None, &request)),
+        };
         let req = request.into_inner();
         let (stimulus_id, workflow_execution_id) = self
             .ingest_stimulus_rpc(
@@ -848,9 +889,13 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<SearchAgentsRequest>,
     ) -> Result<Response<SearchAgentsResponse>, Status> {
-        let identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchAgents")
             .await?;
+        let (identity, tenant_id) = match auth {
+            Some((id, tid)) => (Some(id), tid),
+            None => (None, Self::tenant_id_from_identity(None)),
+        };
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(
@@ -859,7 +904,6 @@ impl AegisRuntime for AegisRuntimeService {
         };
 
         let req = request.into_inner();
-        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
 
         let query = DiscoveryQuery {
             query: req.query,
@@ -912,9 +956,13 @@ impl AegisRuntime for AegisRuntimeService {
         &self,
         request: Request<SearchWorkflowsRequest>,
     ) -> Result<Response<SearchWorkflowsResponse>, Status> {
-        let identity = self
+        let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchWorkflows")
             .await?;
+        let (identity, tenant_id) = match auth {
+            Some((id, tid)) => (Some(id), tid),
+            None => (None, Self::tenant_id_from_identity(None)),
+        };
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(
@@ -923,7 +971,6 @@ impl AegisRuntime for AegisRuntimeService {
         };
 
         let req = request.into_inner();
-        let tenant_id = Self::tenant_id_from_identity(identity.as_ref());
 
         let query = DiscoveryQuery {
             query: req.query,

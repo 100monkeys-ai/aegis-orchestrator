@@ -4,9 +4,19 @@
 //!
 //! Extracts `TenantId` from validated `UserIdentity` and inserts it into
 //! request extensions. Runs after `iam_auth_middleware`.
+//!
+//! When an `Arc<EventBus>` is present in request extensions (injected by the
+//! router via `axum::Extension`), admin cross-tenant access is audited by
+//! publishing a [`TenantEvent::AdminCrossTenantAccess`] domain event (gap 056-9).
 
+use std::sync::Arc;
+
+use chrono::Utc;
+
+use crate::domain::events::TenantEvent;
 use crate::domain::iam::{IdentityKind, UserIdentity};
 use crate::domain::tenant::TenantId;
+use crate::infrastructure::event_bus::EventBus;
 use axum::{extract::Request, middleware::Next, response::Response};
 
 /// Derive TenantId from a UserIdentity
@@ -62,6 +72,19 @@ pub async fn tenant_context_middleware(request: Request, next: Next) -> Response
                                         target_tenant = %target_tenant,
                                         "Admin cross-tenant access"
                                     );
+                                    // Publish AdminCrossTenantAccess audit event (gap 056-9).
+                                    // EventBus is injected via axum::Extension when wired.
+                                    if let Some(event_bus) =
+                                        request.extensions().get::<Arc<EventBus>>().cloned()
+                                    {
+                                        event_bus.publish_tenant_event(
+                                            TenantEvent::AdminCrossTenantAccess {
+                                                admin_identity: id.sub.clone(),
+                                                target_tenant_id: target_tenant.clone(),
+                                                accessed_at: Utc::now(),
+                                            },
+                                        );
+                                    }
                                     target_tenant
                                 }
                                 Err(_) => base_tenant,
