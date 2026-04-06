@@ -1053,6 +1053,102 @@ impl AegisRuntime for AegisRuntimeService {
             destroyed: true,
         }))
     }
+
+    /// Proxy a `QueryCortexPatterns` request to the Cortex service (Gap 042-1).
+    ///
+    /// The Orchestrator is the trust boundary: it holds the Cortex API key and
+    /// proxies pattern queries so Zaru Client / SDK never connect to Cortex directly.
+    /// Returns an empty pattern list in memoryless mode (no `cortex_client` configured).
+    async fn query_cortex_patterns(
+        &self,
+        request: Request<QueryCortexPatternsRequest>,
+    ) -> Result<Response<QueryCortexPatternsResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/QueryCortexPatterns")
+            .await?;
+        let req = request.into_inner();
+
+        let Some(ref cortex_client) = self.cortex_client else {
+            tracing::debug!("QueryCortexPatterns called in memoryless mode — returning empty");
+            return Ok(Response::new(QueryCortexPatternsResponse {
+                patterns: vec![],
+            }));
+        };
+
+        let cortex_req = crate::infrastructure::aegis_cortex_proto::QueryPatternsRequest {
+            error_signature: req.error_signature,
+            error_type: req.error_type,
+            limit: req.limit,
+            min_success_score: req.min_success_score,
+            tenant_id: req.tenant_id,
+        };
+
+        match cortex_client.query_patterns(cortex_req).await {
+            Ok(resp) => {
+                let patterns = resp
+                    .patterns
+                    .into_iter()
+                    .map(|p| CortexPatternProto {
+                        pattern_id: p.id,
+                        error_signature: p.error_signature_hash,
+                        error_type: p.error_type,
+                        solution_approach: p.solution_approach,
+                        solution_code: p.solution_code,
+                        success_score: p.success_score,
+                        frequency: p.frequency,
+                    })
+                    .collect();
+                Ok(Response::new(QueryCortexPatternsResponse { patterns }))
+            }
+            Err(e) => Err(Status::unavailable(format!(
+                "Cortex pattern query failed: {e}"
+            ))),
+        }
+    }
+
+    /// Proxy a `StoreCortexPattern` request to the Cortex service (Gap 042-3).
+    ///
+    /// Returns a no-op response in memoryless mode (no `cortex_client` configured).
+    async fn store_cortex_pattern(
+        &self,
+        request: Request<StoreCortexPatternRequest>,
+    ) -> Result<Response<StoreCortexPatternResponse>, Status> {
+        let _identity = self
+            .authorize(&request, "/aegis.v1.AegisRuntime/StoreCortexPattern")
+            .await?;
+        let req = request.into_inner();
+
+        let Some(ref cortex_client) = self.cortex_client else {
+            tracing::debug!("StoreCortexPattern called in memoryless mode — returning noop");
+            return Ok(Response::new(StoreCortexPatternResponse {
+                pattern_id: String::new(),
+                deduplicated: false,
+                new_frequency: 0,
+            }));
+        };
+
+        let cortex_req = crate::infrastructure::aegis_cortex_proto::StorePatternRequest {
+            error_signature: req.error_signature,
+            error_type: req.error_type,
+            error_message: req.error_message,
+            solution_approach: req.solution_approach,
+            solution_code: req.solution_code,
+            agent_id: req.agent_id,
+            tags: req.tags,
+            tenant_id: req.tenant_id,
+        };
+
+        match cortex_client.store_pattern(cortex_req).await {
+            Ok(resp) => Ok(Response::new(StoreCortexPatternResponse {
+                pattern_id: resp.pattern_id,
+                deduplicated: resp.deduplicated,
+                new_frequency: resp.new_frequency,
+            })),
+            Err(e) => Err(Status::unavailable(format!(
+                "Cortex pattern store failed: {e}"
+            ))),
+        }
+    }
 }
 
 // ── BC-8: IngestStimulus gRPC helper ──────────────────────────────────────────
