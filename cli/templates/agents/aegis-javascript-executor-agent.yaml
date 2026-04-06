@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: aegis-javascript-executor-agent
-  version: "1.0.0"
+  version: "1.1.0"
   description: Writes idiomatic JavaScript (Node.js) code that fulfills a given intent and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
   labels:
     role: worker
@@ -12,7 +12,7 @@ spec:
   security_context: aegis-system-agent-runtime
   runtime:
     language: javascript
-    version: "3.11"
+    version: "20"
     model: smart
     isolation: inherit
 
@@ -30,11 +30,7 @@ spec:
     prompt_template: |
       {{instruction}}
 
-      Intent: {{intent}}
-      File path: {{file_path | default: "/workspace/solution.js"}}
-      Input values: {{input.inputs | default: "{}"}}
-
-      Write the solution and confirm the file was written.
+      {{input}}
 
   execution:
     mode: iterative
