@@ -121,7 +121,8 @@ impl Capability {
             )?;
 
             if let Some(ref allowlist) = self.command_allowlist {
-                if !allowlist.contains(&command.to_string()) {
+                let base_command = command.split_whitespace().next().unwrap_or(command);
+                if !allowlist.contains(&base_command.to_string()) {
                     return Err(PolicyViolation::CommandNotAllowed {
                         command: command.to_string(),
                         allowed_commands: allowlist.clone(),

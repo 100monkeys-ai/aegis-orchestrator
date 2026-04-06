@@ -399,7 +399,7 @@ fn capability_rejects_non_whitelisted_command() {
     let err = cap
         .allows("cmd.run", &json!({"command": "rm -rf /"}))
         .unwrap_err();
-    assert!(matches!(err, PolicyViolation::ToolNotAllowed { .. }));
+    assert!(matches!(err, PolicyViolation::CommandNotAllowed { .. }));
 }
 
 // ============================================================================
