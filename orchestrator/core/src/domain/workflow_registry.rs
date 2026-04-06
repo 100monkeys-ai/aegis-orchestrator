@@ -23,8 +23,9 @@
 //! `Workflow` manifests). `WorkflowRegistry` is a pure in-memory routing index.
 
 use crate::domain::agent::AgentId;
+use crate::domain::shared_kernel::TenantId;
 use crate::domain::workflow::WorkflowId;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -60,8 +61,9 @@ impl Default for WorkflowRegistryId {
 /// - The confidence threshold applied to LLM classification results
 pub struct WorkflowRegistry {
     pub id: WorkflowRegistryId,
-    /// Direct routing table. Keys are stored lowercase.
-    routes: HashMap<String, WorkflowId>,
+    /// Direct routing table. Keys are `(TenantId, lowercase_source_name)` to prevent
+    /// source_name collisions across tenants (gap 056-13).
+    routes: HashMap<(TenantId, String), WorkflowId>,
     /// RouterAgent invoked when no direct route matches.
     /// A `None` value means Stage 2 is unavailable; stimuli with no direct route
     /// are rejected with `StimulusError::NoRouterConfigured`.
@@ -85,19 +87,29 @@ impl WorkflowRegistry {
 
     // ── Commands ─────────────────────────────────────────────────────────────
 
-    /// Register a direct `source_name → WorkflowId` route.
+    /// Register a direct `(tenant_id, source_name) → WorkflowId` route.
+    ///
+    /// Route keys are scoped to a tenant so the same `source_name` can be
+    /// registered independently by different tenants without collision (gap 056-13).
     ///
     /// # Errors
-    /// Returns `Err` if the key is empty, contains `/`, or contains whitespace.
-    pub fn register_route(&mut self, source_name: &str, workflow_id: WorkflowId) -> Result<()> {
+    /// Returns `Err` if the source_name key is empty, contains `/`, or contains whitespace.
+    pub fn register_route(
+        &mut self,
+        tenant_id: &TenantId,
+        source_name: &str,
+        workflow_id: WorkflowId,
+    ) -> Result<()> {
         let key = Self::validate_key(source_name)?;
-        self.routes.insert(key, workflow_id);
+        self.routes.insert((tenant_id.clone(), key), workflow_id);
         Ok(())
     }
 
-    /// Remove a direct route by source name. Returns `true` if a route was removed.
-    pub fn remove_route(&mut self, source_name: &str) -> bool {
-        self.routes.remove(&source_name.to_lowercase()).is_some()
+    /// Remove a direct route for a specific tenant. Returns `true` if a route was removed.
+    pub fn remove_route(&mut self, tenant_id: &TenantId, source_name: &str) -> bool {
+        self.routes
+            .remove(&(tenant_id.clone(), source_name.to_lowercase()))
+            .is_some()
     }
 
     /// Replace the RouterAgent used for LLM fallback classification.
@@ -121,12 +133,14 @@ impl WorkflowRegistry {
 
     // ── Queries ──────────────────────────────────────────────────────────────
 
-    /// Stage 1: Deterministic lookup by source name.
+    /// Stage 1: Deterministic lookup by tenant and source name.
     ///
-    /// Returns `Some(WorkflowId)` if a direct route is registered, `None` otherwise.
-    /// Lookup is case-insensitive.
-    pub fn lookup_direct(&self, source_name: &str) -> Option<WorkflowId> {
-        self.routes.get(&source_name.to_lowercase()).copied()
+    /// Returns `Some(WorkflowId)` if a direct route is registered for the given
+    /// tenant and source name, `None` otherwise. Lookup is case-insensitive.
+    pub fn lookup_direct(&self, tenant_id: &TenantId, source_name: &str) -> Option<WorkflowId> {
+        self.routes
+            .get(&(tenant_id.clone(), source_name.to_lowercase()))
+            .copied()
     }
 
     /// The RouterAgent to invoke in Stage 2 if no direct route matched.
@@ -144,9 +158,14 @@ impl WorkflowRegistry {
         self.routes.len()
     }
 
-    /// Returns all registered source names (sorted for deterministic output).
-    pub fn registered_sources(&self) -> Vec<String> {
-        let mut keys: Vec<String> = self.routes.keys().cloned().collect();
+    /// Returns all registered source names for a tenant (sorted for deterministic output).
+    pub fn registered_sources(&self, tenant_id: &TenantId) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .routes
+            .keys()
+            .filter(|(tid, _)| tid == tenant_id)
+            .map(|(_, src)| src.clone())
+            .collect();
         keys.sort();
         keys
     }
@@ -180,35 +199,45 @@ mod tests {
         WorkflowId(Uuid::new_v4())
     }
 
+    fn tenant_a() -> TenantId {
+        TenantId::from_realm_slug("tenant-acme").unwrap()
+    }
+
+    fn tenant_b() -> TenantId {
+        TenantId::from_realm_slug("tenant-globex").unwrap()
+    }
+
     #[test]
     fn register_and_lookup_direct() {
         let mut reg = WorkflowRegistry::new(None);
         let wf = make_workflow_id();
-        reg.register_route("github", wf).unwrap();
-        assert_eq!(reg.lookup_direct("github"), Some(wf));
-        assert_eq!(reg.lookup_direct("GitHub"), Some(wf)); // case-insensitive
+        let tid = tenant_a();
+        reg.register_route(&tid, "github", wf).unwrap();
+        assert_eq!(reg.lookup_direct(&tid, "github"), Some(wf));
+        assert_eq!(reg.lookup_direct(&tid, "GitHub"), Some(wf)); // case-insensitive
     }
 
     #[test]
     fn lookup_missing_returns_none() {
         let reg = WorkflowRegistry::new(None);
-        assert!(reg.lookup_direct("nonexistent").is_none());
+        assert!(reg.lookup_direct(&tenant_a(), "nonexistent").is_none());
     }
 
     #[test]
     fn remove_route() {
         let mut reg = WorkflowRegistry::new(None);
         let wf = make_workflow_id();
-        reg.register_route("stripe", wf).unwrap();
-        assert!(reg.remove_route("stripe"));
-        assert!(reg.lookup_direct("stripe").is_none());
+        let tid = tenant_a();
+        reg.register_route(&tid, "stripe", wf).unwrap();
+        assert!(reg.remove_route(&tid, "stripe"));
+        assert!(reg.lookup_direct(&tid, "stripe").is_none());
     }
 
     #[test]
     fn invalid_key_slash() {
         let mut reg = WorkflowRegistry::new(None);
         let err = reg
-            .register_route("foo/bar", make_workflow_id())
+            .register_route(&tenant_a(), "foo/bar", make_workflow_id())
             .unwrap_err();
         assert!(err.to_string().contains("'/'"));
     }
@@ -216,7 +245,9 @@ mod tests {
     #[test]
     fn invalid_key_empty() {
         let mut reg = WorkflowRegistry::new(None);
-        let err = reg.register_route("", make_workflow_id()).unwrap_err();
+        let err = reg
+            .register_route(&tenant_a(), "", make_workflow_id())
+            .unwrap_err();
         assert!(err.to_string().contains("empty"));
     }
 
@@ -236,12 +267,33 @@ mod tests {
     #[test]
     fn registered_sources_sorted() {
         let mut reg = WorkflowRegistry::new(None);
-        reg.register_route("stripe", make_workflow_id()).unwrap();
-        reg.register_route("github", make_workflow_id()).unwrap();
-        reg.register_route("aws-sns", make_workflow_id()).unwrap();
+        let tid = tenant_a();
+        reg.register_route(&tid, "stripe", make_workflow_id())
+            .unwrap();
+        reg.register_route(&tid, "github", make_workflow_id())
+            .unwrap();
+        reg.register_route(&tid, "aws-sns", make_workflow_id())
+            .unwrap();
         assert_eq!(
-            reg.registered_sources(),
+            reg.registered_sources(&tid),
             vec!["aws-sns", "github", "stripe"]
         );
+    }
+
+    #[test]
+    fn tenant_isolation_no_cross_tenant_collision() {
+        let mut reg = WorkflowRegistry::new(None);
+        let wf_a = make_workflow_id();
+        let wf_b = make_workflow_id();
+        let tid_a = tenant_a();
+        let tid_b = tenant_b();
+
+        reg.register_route(&tid_a, "deploy", wf_a).unwrap();
+        reg.register_route(&tid_b, "deploy", wf_b).unwrap();
+
+        // Each tenant gets its own route — no collision.
+        assert_eq!(reg.lookup_direct(&tid_a, "deploy"), Some(wf_a));
+        assert_eq!(reg.lookup_direct(&tid_b, "deploy"), Some(wf_b));
+        assert_ne!(wf_a, wf_b);
     }
 }

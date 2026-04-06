@@ -122,17 +122,23 @@ pub trait StimulusService: Send + Sync {
     /// - `RouterAgentFailed` — The RouterAgent execution itself failed
     async fn ingest(&self, stimulus: Stimulus) -> Result<StimulusIngestResponse, StimulusError>;
 
-    /// Register a direct route: `source_name → workflow_id`.
+    /// Register a direct route: `(tenant_id, source_name) → workflow_id`.
     ///
-    /// Bypasses LLM classification entirely when matched.
+    /// Routes are tenant-scoped so the same source name can be registered by
+    /// different tenants without collision (gap 056-13).
     async fn register_route(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         source_name: &str,
         workflow_id: crate::domain::workflow::WorkflowId,
     ) -> anyhow::Result<()>;
 
-    /// Remove a direct route by source name.
-    async fn remove_route(&self, source_name: &str) -> bool;
+    /// Remove a direct route for a tenant by source name.
+    async fn remove_route(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        source_name: &str,
+    ) -> bool;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -277,12 +283,16 @@ impl StandardStimulusService {
         }
     }
 
-    async fn route(&self, stimulus: &Stimulus) -> Result<RoutingDecision, StimulusError> {
+    async fn route(
+        &self,
+        stimulus: &Stimulus,
+        tenant_id: &TenantId,
+    ) -> Result<RoutingDecision, StimulusError> {
         let registry = self.registry.read().await;
 
-        // Stage 1: Deterministic direct-route lookup
+        // Stage 1: Deterministic direct-route lookup (tenant-scoped, gap 056-13).
         let source_key = stimulus.source.name();
-        if let Some(workflow_id) = registry.lookup_direct(&source_key) {
+        if let Some(workflow_id) = registry.lookup_direct(tenant_id, &source_key) {
             debug!(
                 stimulus_id = %stimulus.id,
                 source = %source_key,
@@ -359,11 +369,11 @@ impl StandardStimulusService {
             .to_string();
 
         let registry = self.registry.read().await;
-        let workflow_id = registry.lookup_direct(&workflow_name).ok_or_else(|| {
-            StimulusError::UnknownWorkflow {
+        let workflow_id = registry
+            .lookup_direct(tenant_id, &workflow_name)
+            .ok_or_else(|| StimulusError::UnknownWorkflow {
                 workflow: workflow_name.clone(),
-            }
-        })?;
+            })?;
 
         Ok(RoutingDecision {
             workflow_id,
@@ -442,7 +452,8 @@ impl StimulusService for StandardStimulusService {
             });
 
         // ── 3. Route the stimulus ─────────────────────────────────────────────
-        let decision = match self.route(&stimulus).await {
+        let stimulus_tenant_id = Self::tenant_id_for_stimulus(&stimulus);
+        let decision = match self.route(&stimulus, &stimulus_tenant_id).await {
             Ok(d) => d,
             Err(StimulusError::LowConfidence {
                 confidence,
@@ -553,16 +564,21 @@ impl StimulusService for StandardStimulusService {
 
     async fn register_route(
         &self,
+        tenant_id: &crate::domain::tenant::TenantId,
         source_name: &str,
         workflow_id: crate::domain::workflow::WorkflowId,
     ) -> anyhow::Result<()> {
         let mut registry = self.registry.write().await;
-        registry.register_route(source_name, workflow_id)
+        registry.register_route(tenant_id, source_name, workflow_id)
     }
 
-    async fn remove_route(&self, source_name: &str) -> bool {
+    async fn remove_route(
+        &self,
+        tenant_id: &crate::domain::tenant::TenantId,
+        source_name: &str,
+    ) -> bool {
         let mut registry = self.registry.write().await;
-        registry.remove_route(source_name)
+        registry.remove_route(tenant_id, source_name)
     }
 }
 
@@ -805,7 +821,9 @@ mod tests {
     async fn deterministic_route_bypasses_router_and_starts_workflow() {
         let workflow_id = make_workflow_id();
         let mut registry = WorkflowRegistry::new(None);
-        registry.register_route("github", workflow_id).unwrap();
+        registry
+            .register_route(&TenantId::consumer(), "github", workflow_id)
+            .unwrap();
 
         let execution_service = Arc::new(RecordingExecutionService::default());
         let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-exec-123"));
@@ -951,7 +969,7 @@ mod tests {
         let workflow_id = make_workflow_id();
         let mut registry = WorkflowRegistry::new(Some(router_agent_id));
         registry
-            .register_route("deploy-workflow", workflow_id)
+            .register_route(&TenantId::consumer(), "deploy-workflow", workflow_id)
             .unwrap();
 
         let execution_service = Arc::new(RecordingExecutionService::with_completed_output(
@@ -1009,7 +1027,9 @@ mod tests {
     async fn duplicate_idempotency_key_does_not_start_second_workflow() {
         let workflow_id = make_workflow_id();
         let mut registry = WorkflowRegistry::new(None);
-        registry.register_route("github", workflow_id).unwrap();
+        registry
+            .register_route(&TenantId::consumer(), "github", workflow_id)
+            .unwrap();
 
         let execution_service = Arc::new(RecordingExecutionService::default());
         let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-exec-789"));
