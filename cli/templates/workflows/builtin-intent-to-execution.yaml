@@ -54,8 +54,8 @@ spec:
     WRITE_CODE:
       kind: Agent
       agent: "aegis-{{input.language}}-executor-agent"
+      intent: "{{intent}}"
       input: |
-        Intent: {{intent}}
         File path: /workspace/solution.{{input.language_ext}}
         Input values: {{input.inputs}}
 
