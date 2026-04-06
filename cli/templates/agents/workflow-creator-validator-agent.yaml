@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-creator-validator-agent
-  version: "1.1.0"
+  version: "1.0.0"
   description: Creates workflow manifests and enforces strict deterministic + semantic validation before registration.
   labels:
     role: worker

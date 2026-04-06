@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: aegis-bash-executor-agent
-  version: "1.2.0"
+  version: "1.0.0"
   description: Writes a bash script that fulfills a given intent and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
   labels:
     role: worker

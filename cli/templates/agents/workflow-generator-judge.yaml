@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-generator-judge
-  version: "1.1.0"
+  version: "1.0.0"
   description: Judge agent for validating generated workflow plans and workflow manifests.
   labels:
     role: judge

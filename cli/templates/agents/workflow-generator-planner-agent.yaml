@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: workflow-generator-planner-agent
-  version: "1.1.0"
+  version: "1.0.0"
   description: Plans workflow composition by discovering existing agents and identifying missing agent capabilities.
   labels:
     role: worker
