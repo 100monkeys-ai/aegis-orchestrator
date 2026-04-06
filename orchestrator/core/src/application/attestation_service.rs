@@ -436,6 +436,7 @@ mod tests {
                 domain_allowlist: None,
                 max_response_size: None,
                 rate_limit: None,
+                max_concurrent: None,
             }],
             deny_list: vec![],
             metadata: SecurityContextMetadata {

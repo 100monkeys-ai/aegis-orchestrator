@@ -378,6 +378,36 @@ impl ToolInvocationService {
                 ViolationType::TimeoutExceeded,
                 format!("Tool '{tool_name}' exceeded timeout {max_duration:?}"),
             ),
+            PolicyViolation::SubcommandNotAllowed {
+                command,
+                subcommand,
+                allowed_subcommands,
+            } => (
+                ViolationType::ToolNotAllowed,
+                format!(
+                    "Subcommand '{subcommand}' not allowed for '{command}'. Allowed: {allowed_subcommands:?}"
+                ),
+            ),
+            PolicyViolation::ConcurrentExecLimitExceeded { limit, active } => (
+                ViolationType::RateLimitExceeded,
+                format!("Concurrent dispatch limit exceeded: limit={limit}, active={active}"),
+            ),
+            PolicyViolation::OutputSizeLimitExceeded {
+                max_bytes,
+                actual_bytes,
+            } => (
+                ViolationType::ToolNotAllowed,
+                format!("Output size limit exceeded: max={max_bytes}B, actual={actual_bytes}B"),
+            ),
+            PolicyViolation::ExecTimeoutCeilingExceeded {
+                requested_secs,
+                ceiling_secs,
+            } => (
+                ViolationType::TimeoutExceeded,
+                format!(
+                    "Exec timeout ceiling exceeded: requested={requested_secs}s, ceiling={ceiling_secs}s"
+                ),
+            ),
         }
     }
 }

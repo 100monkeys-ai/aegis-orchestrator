@@ -25,6 +25,7 @@
 use super::PolicyViolation;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 /// Per-capability rate limit configuration.
@@ -56,7 +57,7 @@ pub struct Capability {
     /// is in this list.
     pub command_allowlist: Option<Vec<String>>,
     /// If set, `cmd.run` tool calls must have command arguments matching these subcommands.
-    pub subcommand_allowlist: Option<Vec<String>>,
+    pub subcommand_allowlist: Option<HashMap<String, Vec<String>>>,
     /// If set, `web.*` tool calls must target a URL whose domain suffix matches
     /// one of these entries.
     pub domain_allowlist: Option<Vec<String>>,
@@ -65,6 +66,10 @@ pub struct Capability {
     /// Optional per-capability rate limit. Enforcement is deferred to a later phase.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimit>,
+    /// Maximum number of concurrent `cmd.run` dispatches permitted for this
+    /// capability. `None` means no limit enforced at the capability layer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent: Option<u32>,
 }
 
 impl Capability {
@@ -124,18 +129,27 @@ impl Capability {
                 }
 
                 if let Some(ref sub_allowlist) = self.subcommand_allowlist {
+                    let allowed_for_cmd = sub_allowlist.get(*cmd_base).ok_or_else(|| {
+                        PolicyViolation::SubcommandNotAllowed {
+                            command: cmd_base.to_string(),
+                            subcommand: String::new(),
+                            allowed_subcommands: vec![],
+                        }
+                    })?;
                     if cmd_parts.len() > 1 {
                         let subcommand = cmd_parts[1];
-                        if !sub_allowlist.contains(&subcommand.to_string()) {
-                            return Err(PolicyViolation::ToolNotAllowed {
-                                tool_name: format!("cmd.run (subcommand: {subcommand})"),
-                                allowed_tools: sub_allowlist.clone(),
+                        if !allowed_for_cmd.contains(&subcommand.to_string()) {
+                            return Err(PolicyViolation::SubcommandNotAllowed {
+                                command: cmd_base.to_string(),
+                                subcommand: subcommand.to_string(),
+                                allowed_subcommands: allowed_for_cmd.clone(),
                             });
                         }
-                    } else if !sub_allowlist.is_empty() {
-                        return Err(PolicyViolation::ToolNotAllowed {
-                            tool_name: format!("cmd.run (missing subcommand: {cmd})"),
-                            allowed_tools: sub_allowlist.clone(),
+                    } else if !allowed_for_cmd.is_empty() {
+                        return Err(PolicyViolation::SubcommandNotAllowed {
+                            command: cmd_base.to_string(),
+                            subcommand: String::new(),
+                            allowed_subcommands: allowed_for_cmd.clone(),
                         });
                     }
                 }
@@ -200,11 +214,19 @@ mod tests {
         let cap = Capability {
             tool_pattern: "cmd.run".to_string(),
             path_allowlist: None,
-            command_allowlist: Some(vec!["cargo".to_string()]),
-            subcommand_allowlist: Some(vec!["build".to_string(), "check".to_string()]),
+            command_allowlist: None,
+            subcommand_allowlist: Some({
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "cargo".to_string(),
+                    vec!["build".to_string(), "check".to_string()],
+                );
+                m
+            }),
             domain_allowlist: None,
             max_response_size: None,
             rate_limit: None,
+            max_concurrent: None,
         };
 
         // Allowed: cargo build
@@ -233,5 +255,11 @@ mod tests {
 
         // Denied: missing subcommand
         assert!(cap.allows("cmd.run", &json!({"command": "cargo"})).is_err());
+
+        // Denied: base command not a key in the subcommand_allowlist map
+        assert!(matches!(
+            cap.allows("cmd.run", &json!({"command": "npm install"})),
+            Err(PolicyViolation::SubcommandNotAllowed { .. })
+        ));
     }
 }

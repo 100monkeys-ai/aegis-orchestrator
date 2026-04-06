@@ -72,6 +72,23 @@ pub enum PolicyViolation {
         tool_name: String,
         max_duration: Duration,
     },
+    SubcommandNotAllowed {
+        command: String,
+        subcommand: String,
+        allowed_subcommands: Vec<String>,
+    },
+    ConcurrentExecLimitExceeded {
+        limit: u32,
+        active: u32,
+    },
+    OutputSizeLimitExceeded {
+        max_bytes: u64,
+        actual_bytes: u64,
+    },
+    ExecTimeoutCeilingExceeded {
+        requested_secs: u32,
+        ceiling_secs: u32,
+    },
 }
 
 /// Audit metadata for a [`SecurityContext`] record.
@@ -266,6 +283,7 @@ mod tests {
                 domain_allowlist: None,
                 max_response_size: None,
                 rate_limit: None,
+                max_concurrent: None,
             }],
             deny_list: vec![],
             metadata: test_metadata(),
@@ -303,6 +321,7 @@ mod tests {
                 domain_allowlist: None,
                 max_response_size: None,
                 rate_limit: None,
+                max_concurrent: None,
             }],
             // Although fs.* is allowed, fs.delete is explicitly denied
             deny_list: vec!["fs.delete".to_string()],
@@ -375,6 +394,7 @@ mod tests {
                 domain_allowlist: None,
                 max_response_size: None,
                 rate_limit: None,
+                max_concurrent: None,
             }],
             deny_list: vec!["fs.delete".to_string()],
             metadata: test_metadata(),

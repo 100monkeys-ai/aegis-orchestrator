@@ -83,6 +83,7 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
+        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -90,17 +91,17 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
-        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{NodeClusterRepository, NodeRole},
         iam::IdentityProvider,
-        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
+        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
+        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -112,9 +113,8 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{connect_container_runtime, ContainerRuntime},
+        runtime::{ContainerRuntime, connect_container_runtime},
         temporal_client::TemporalClient,
-        TemporalEventListener,
     },
 };
 
@@ -699,6 +699,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                         domain_allowlist: cap.domain_allowlist.clone(),
                         max_response_size: None,
                         rate_limit: None,
+                        max_concurrent: None,
                     })
                     .collect();
 
@@ -1447,7 +1448,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ))
             }
             _ => {
-                debug!("Tenant provisioning service disabled (requires database + keycloak_admin config)");
+                debug!(
+                    "Tenant provisioning service disabled (requires database + keycloak_admin config)"
+                );
                 None
             }
         }
