@@ -1518,6 +1518,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }),
         iam_service: iam_service.clone(),
         tenant_provisioning_service,
+        realm_repo: db_pool.as_ref().map(|pool| {
+            Arc::new(
+                aegis_orchestrator_core::infrastructure::repositories::PostgresRealmRepository::new(
+                    pool.clone(),
+                ),
+            ) as Arc<dyn aegis_orchestrator_core::domain::iam::RealmRepository>
+        }),
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };

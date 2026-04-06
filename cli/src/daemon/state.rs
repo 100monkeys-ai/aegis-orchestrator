@@ -13,7 +13,7 @@ use aegis_orchestrator_core::{
     },
     domain::{
         cluster::NodeClusterRepository,
-        iam::IdentityProvider,
+        iam::{IdentityProvider, RealmRepository},
         node_config::NodeConfigManifest,
         repository::{StorageEventRepository, WorkflowExecutionRepository, WorkflowRepository},
     },
@@ -64,6 +64,8 @@ pub(crate) struct AppState {
     pub(crate) tenant_provisioning_service: Option<
         Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
     >,
+    /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
+    pub(crate) realm_repo: Option<Arc<dyn RealmRepository>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
 }
