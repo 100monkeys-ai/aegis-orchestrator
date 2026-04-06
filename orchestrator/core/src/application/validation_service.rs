@@ -278,6 +278,7 @@ impl ValidationService {
                 input: serde_json::Value::Object(payload),
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
+                workspace_remote_path: None,
             }
         } else {
             // No input_schema declared — pass content directly as a plain string.
@@ -286,6 +287,7 @@ impl ValidationService {
                 input: serde_json::Value::String(request.content.clone()),
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
+                workspace_remote_path: None,
             }
         };
 
@@ -622,6 +624,7 @@ impl GradientValidator for SemanticAgentValidator {
             }),
             workspace_volume_id: None,
             workspace_volume_mount_path: None,
+            workspace_remote_path: None,
         };
 
         // 3. Start child execution.
@@ -776,6 +779,7 @@ impl GradientValidator for MultiJudgeAgentValidator {
                     input: payload,
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 };
                 let exec_id = svc
                     .start_child_execution(jid, exec_input, parent_id)

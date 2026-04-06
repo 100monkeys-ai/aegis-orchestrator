@@ -206,6 +206,9 @@ pub struct ExecutionInput {
     pub workspace_volume_id: Option<crate::domain::shared_kernel::VolumeId>,
     /// Mount path for the workspace volume. Defaults to /workspace.
     pub workspace_volume_mount_path: Option<std::path::PathBuf>,
+    /// NFS remote path for the workspace volume in SeaweedFS.
+    /// When set, used directly for NFS registration instead of constructing a path.
+    pub workspace_remote_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -572,6 +575,7 @@ mod tests {
             input: serde_json::json!({}),
             workspace_volume_id: None,
             workspace_volume_mount_path: None,
+            workspace_remote_path: None,
         }
     }
 

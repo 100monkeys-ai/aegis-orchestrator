@@ -203,6 +203,7 @@ async fn invoke_agent_handler(
         input: input_value,
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
+        workspace_remote_path: None,
     };
 
     let child_exec_id = execution_service

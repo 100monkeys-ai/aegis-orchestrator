@@ -319,6 +319,7 @@ impl AegisRuntime for AegisRuntimeService {
                 .filter(|s| !s.is_empty())
                 .map(std::path::PathBuf::from)
                 .or_else(|| Some(std::path::PathBuf::from("/workspace"))),
+            workspace_remote_path: req.workspace_remote_path.filter(|s| !s.is_empty()),
         };
 
         // Channel for streaming events
@@ -1842,6 +1843,7 @@ mod tests {
                 input: serde_json::Value::Null,
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
+                workspace_remote_path: None,
             },
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),

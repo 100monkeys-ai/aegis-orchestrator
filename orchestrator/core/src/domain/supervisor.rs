@@ -805,6 +805,7 @@ mod tests {
             input: serde_json::json!({}),
             workspace_volume_id: None,
             workspace_volume_mount_path: None,
+            workspace_remote_path: None,
         }
     }
 
@@ -906,6 +907,7 @@ mod tests {
                     }),
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 },
                 1,
                 Arc::new(TestObserver::default()),

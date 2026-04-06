@@ -83,6 +83,7 @@ impl ToolInvocationService {
                     input,
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 },
                 "aegis-system-agent-runtime".to_string(),
                 None,

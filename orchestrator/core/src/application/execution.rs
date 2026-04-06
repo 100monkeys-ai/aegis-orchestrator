@@ -877,6 +877,7 @@ mod tests {
                 input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
+                workspace_remote_path: None,
             },
             1,
             "aegis-system-operator".to_string(),
@@ -980,6 +981,7 @@ mod tests {
                     input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 },
                 parent_execution.id,
             )
@@ -1070,6 +1072,7 @@ mod tests {
                     input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 },
                 parent_execution.id,
             )
@@ -1186,6 +1189,7 @@ mod tests {
                     input: serde_json::json!({ "tenant_id": "other-tenant" }),
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
                 },
                 parent_execution.id,
             )
@@ -1771,6 +1775,7 @@ impl StandardExecutionService {
         // Extract workspace volume fields before input is consumed by prepare_execution_input.
         let workspace_volume_id = input.workspace_volume_id;
         let workspace_volume_mount_path = input.workspace_volume_mount_path.clone();
+        let workspace_remote_path = input.workspace_remote_path.clone();
 
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
@@ -2127,7 +2132,8 @@ impl StandardExecutionService {
                     read: vec!["/*".to_string()],
                     write: vec!["/*".to_string()],
                 };
-                let remote_path = format!("/aegis/volumes/{}/{}", tenant_id, vol_id);
+                let remote_path = workspace_remote_path
+                    .unwrap_or_else(|| format!("/aegis/volumes/{}/{}", tenant_id, vol_id));
                 gw.register_volume(VolumeRegistration {
                     volume_id: vol_id,
                     execution_id,
