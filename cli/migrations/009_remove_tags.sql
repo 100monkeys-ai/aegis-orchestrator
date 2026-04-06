@@ -1,0 +1,4 @@
+ALTER TABLE agents DROP COLUMN IF EXISTS tags;
+ALTER TABLE workflows DROP COLUMN IF EXISTS tags;
+DROP INDEX IF EXISTS idx_agents_tags;
+DROP INDEX IF EXISTS idx_workflows_tags;

@@ -157,11 +157,10 @@ impl WorkflowRepository for PostgresWorkflowRepository {
 
         sqlx::query(
             r#"
-            INSERT INTO workflows (id, tenant_id, name, version, scope, description, tags, yaml_source, domain_json, temporal_def_json, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())
+            INSERT INTO workflows (id, tenant_id, name, version, scope, description, yaml_source, domain_json, temporal_def_json, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
             ON CONFLICT (id) DO UPDATE SET
                 description = EXCLUDED.description,
-                tags = EXCLUDED.tags,
                 yaml_source = EXCLUDED.yaml_source,
                 domain_json = EXCLUDED.domain_json,
                 temporal_def_json = EXCLUDED.temporal_def_json,
@@ -175,7 +174,6 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         .bind(&version)
         .bind(scope_str)
         .bind(&description)
-        .bind(&workflow.metadata.tags)
         .bind(yaml_source)
         .bind(&definition_json)
         .bind(&temporal_def_json)

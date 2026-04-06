@@ -81,8 +81,6 @@ pub struct WorkflowMetadataYaml {
     pub version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub labels: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -354,7 +352,6 @@ impl WorkflowParser {
             name: manifest.metadata.name,
             version: manifest.metadata.version,
             description: manifest.metadata.description,
-            tags: manifest.metadata.tags,
             labels: manifest.metadata.labels,
             annotations: manifest.metadata.annotations,
             input_schema: manifest.metadata.input_schema,
@@ -603,7 +600,6 @@ impl WorkflowParser {
             name: workflow.metadata.name.clone(),
             version: workflow.metadata.version.clone(),
             description: workflow.metadata.description.clone(),
-            tags: workflow.metadata.tags.clone(),
             labels: workflow.metadata.labels.clone(),
             annotations: workflow.metadata.annotations.clone(),
             input_schema: workflow.metadata.input_schema.clone(),

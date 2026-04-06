@@ -57,9 +57,9 @@ impl AgentRepository for PostgresAgentRepository {
             INSERT INTO agents (
                 id, tenant_id, name, version, manifest_yaml, manifest_json,
                 runtime, timeout_seconds, security_policy, status,
-                description, tags, scope, created_at, updated_at
+                description, scope, created_at, updated_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 name = EXCLUDED.name,
@@ -71,7 +71,6 @@ impl AgentRepository for PostgresAgentRepository {
                 security_policy = EXCLUDED.security_policy,
                 status = EXCLUDED.status,
                 description = EXCLUDED.description,
-                tags = EXCLUDED.tags,
                 scope = EXCLUDED.scope,
                 updated_at = EXCLUDED.updated_at
             "#,
@@ -87,7 +86,6 @@ impl AgentRepository for PostgresAgentRepository {
         .bind(security_policy)
         .bind(status_str)
         .bind(agent.manifest.metadata.description.as_deref())
-        .bind(&agent.manifest.metadata.tags)
         .bind(agent.scope.as_db_str())
         .bind(agent.created_at)
         .bind(agent.updated_at)

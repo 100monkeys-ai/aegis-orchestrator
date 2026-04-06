@@ -156,7 +156,6 @@ impl DiscoveryIndexEventHandler {
             status: "Active".to_string(),
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
-            tags: manifest.metadata.tags.clone(),
             input_schema: manifest
                 .spec
                 .input_schema
@@ -343,7 +342,6 @@ impl DiscoveryIndexEventHandler {
             agent_names,
             is_platform_template: false,
             updated_at: Utc::now().to_rfc3339(),
-            tags: workflow.metadata.tags.clone(),
             input_schema: workflow
                 .metadata
                 .input_schema

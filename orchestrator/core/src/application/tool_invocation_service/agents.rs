@@ -151,7 +151,6 @@ impl ToolInvocationService {
                     "status": format!("{:?}", a.status).to_lowercase(),
                     "description": a.manifest.metadata.description,
                     "labels": a.manifest.metadata.labels,
-                    "tags": a.manifest.metadata.tags,
                     "intent": "Top-level instruction that steers this agent's behavior. Pass directly as 'intent' when calling aegis.task.execute.",
                     "input_schema": a.manifest.spec.input_schema,
                 })

@@ -202,7 +202,6 @@ pub(crate) async fn list_workflows_handler(
                 "description": w.metadata.description,
                 "scope": w.scope.to_string(),
                 "status": "active",
-                "tags": w.metadata.tags,
                 "labels": w.metadata.labels,
                 "created_at": w.created_at.to_rfc3339(),
                 "updated_at": w.updated_at.map(|t| t.to_rfc3339()),

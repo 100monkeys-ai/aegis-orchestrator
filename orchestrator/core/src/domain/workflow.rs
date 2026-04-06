@@ -453,10 +453,6 @@ pub struct WorkflowMetadata {
     /// Human-readable description
     pub description: Option<String>,
 
-    /// Free-form tags for categorization and discovery
-    #[serde(default)]
-    pub tags: Vec<String>,
-
     /// Key-value labels for categorization
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -1605,7 +1601,6 @@ mod tests {
                 name: "test".to_string(),
                 version: Some("1.0.0".to_string()),
                 description: None,
-                tags: vec![],
                 labels: std::collections::HashMap::new(),
                 annotations: std::collections::HashMap::new(),
                 input_schema: None,
@@ -1637,7 +1632,6 @@ mod tests {
             name: "test".to_string(),
             version: None,
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1660,7 +1654,6 @@ mod tests {
             name: "test".to_string(),
             version: None,
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1700,7 +1693,6 @@ mod tests {
             name: "container-command-required".to_string(),
             version: None,
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1746,7 +1738,6 @@ mod tests {
             name: "parallel-duplicate-steps".to_string(),
             version: None,
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1806,7 +1797,6 @@ mod tests {
             name: "container-mount-path".to_string(),
             version: None,
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1856,7 +1846,6 @@ mod tests {
             name: "test-subworkflow".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1896,7 +1885,6 @@ mod tests {
             name: "test-subworkflow-faf".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1936,7 +1924,6 @@ mod tests {
             name: "test-subworkflow-ok".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
@@ -1971,7 +1958,6 @@ mod tests {
             name: "test-subworkflow-faf-ok".to_string(),
             version: Some("1.0.0".to_string()),
             description: None,
-            tags: vec![],
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
