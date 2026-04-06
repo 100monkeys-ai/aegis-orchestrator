@@ -22,6 +22,7 @@
 //! - Publish lifecycle state changes explicitly instead of relying on implicit side effects.
 
 use crate::application::agent::AgentLifecycleService;
+use crate::application::tenant_quota::TenantQuotaService;
 use crate::domain::agent::{Agent, AgentId, AgentManifest, AgentScope};
 use crate::domain::events::AgentLifecycleEvent;
 use crate::domain::iam::{IdentityKind, UserIdentity};
@@ -38,6 +39,8 @@ pub struct StandardAgentLifecycleService {
     repository: Arc<dyn AgentRepository>,
     event_bus: Arc<EventBus>,
     security_context_repo: Arc<dyn SecurityContextRepository>,
+    /// Optional quota enforcement service (wired at composition root, ADR-056).
+    quota_service: Option<Arc<TenantQuotaService>>,
 }
 
 impl StandardAgentLifecycleService {
@@ -50,7 +53,14 @@ impl StandardAgentLifecycleService {
             repository,
             event_bus,
             security_context_repo,
+            quota_service: None,
         }
+    }
+
+    /// Wire the quota enforcement service.
+    pub fn with_quota_service(mut self, quota_service: Arc<TenantQuotaService>) -> Self {
+        self.quota_service = Some(quota_service);
+        self
     }
 }
 
@@ -66,6 +76,14 @@ impl AgentLifecycleService for StandardAgentLifecycleService {
     ) -> Result<AgentId> {
         // Validate manifest before deploying
         manifest.validate().map_err(|e| anyhow::anyhow!(e))?;
+
+        // Quota check: ensure the tenant has not exceeded its max_agents limit (ADR-056).
+        if let Some(quota_svc) = &self.quota_service {
+            quota_svc
+                .check_agent_quota(tenant_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("quota_exceeded:{}", e))?;
+        }
 
         // ADR-102: Only Operators and ServiceAccounts may register agents with aegis-system-* contexts.
         if let Some(ctx) = &manifest.spec.security_context {

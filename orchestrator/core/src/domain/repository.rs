@@ -137,6 +137,9 @@ pub trait AgentRepository: Send + Sync {
         tenant_id: &TenantId,
         id: AgentId,
     ) -> Result<Option<Agent>, RepositoryError>;
+
+    /// Count agents with `status = 'active'` for a tenant (used by quota enforcement).
+    async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
 }
 
 /// Repository interface for Execution aggregates
@@ -197,6 +200,9 @@ pub trait ExecutionRepository: Send + Sync {
         &self,
         id: ExecutionId,
     ) -> Result<Option<Execution>, RepositoryError>;
+
+    /// Count executions with `status IN ('running', 'pending')` for a tenant (quota enforcement).
+    async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
 }
 
 /// Repository interface for Workflow aggregates

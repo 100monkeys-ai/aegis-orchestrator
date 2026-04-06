@@ -503,6 +503,22 @@ impl AgentRepository for PostgresAgentRepository {
         Ok(None)
     }
 
+    async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*) AS cnt FROM agents
+            WHERE tenant_id = $1 AND status = 'active'
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let count: i64 = row.get("cnt");
+        Ok(count.max(0) as u64)
+    }
+
     async fn resolve_by_name(
         &self,
         tenant_id: &TenantId,

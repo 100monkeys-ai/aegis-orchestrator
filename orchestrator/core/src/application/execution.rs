@@ -275,6 +275,8 @@ pub struct StandardExecutionService {
     /// Optional output handler service invoked after execution completes (ADR-103).
     output_handler_service:
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
+    /// Optional quota enforcement service (ADR-056). Checks concurrent execution limits.
+    quota_service: Option<Arc<crate::application::tenant_quota::TenantQuotaService>>,
 }
 
 impl StandardExecutionService {
@@ -546,7 +548,17 @@ impl StandardExecutionService {
             seal_gateway_client: None,
             token_issuer: None,
             output_handler_service: None,
+            quota_service: None,
         }
+    }
+
+    /// Attach a quota enforcement service for per-tenant concurrent execution limits (ADR-056).
+    pub fn with_quota_service(
+        mut self,
+        quota_service: Arc<crate::application::tenant_quota::TenantQuotaService>,
+    ) -> Self {
+        self.quota_service = Some(quota_service);
+        self
     }
 
     /// Attach an NFS gateway so volume contexts are registered before agent containers spawn
@@ -1581,6 +1593,14 @@ impl StandardExecutionService {
     ) -> Result<ExecutionId> {
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
 
+        // 0a. Quota check (ADR-056): enforce per-tenant concurrent execution limit.
+        if let Some(quota_svc) = &self.quota_service {
+            quota_svc
+                .check_execution_quota(&tenant_id)
+                .await
+                .map_err(|e| anyhow!("quota_exceeded:{}", e))?;
+        }
+
         // 0. Rate limit check (ADR-072): enforce AgentExecution quota at tenant scope
         if let (Some(enforcer), Some(resolver)) =
             (&self.rate_limit_enforcer, &self.rate_limit_resolver)
@@ -1699,6 +1719,21 @@ impl StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+
+        // Gap-056-7: Cross-tenant access guard.
+        //
+        // `get_agent_visible` may return a system-tier agent (from the `aegis-system` tenant)
+        // that is globally visible. Non-system agents must belong to the requesting tenant.
+        // System agents are always accessible by any authenticated tenant.
+        if !agent.tenant_id.is_system() && agent.tenant_id != tenant_id {
+            return Err(
+                crate::domain::execution::ExecutionError::CrossTenantAccessForbidden {
+                    requested_agent_tenant: agent.tenant_id.as_str().to_string(),
+                    caller_tenant: tenant_id.as_str().to_string(),
+                }
+                .into(),
+            );
+        }
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
         let security_context_name = agent

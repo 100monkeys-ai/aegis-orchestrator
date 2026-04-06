@@ -277,6 +277,20 @@ impl AgentRepository for InMemoryAgentRepository {
         }
         Ok(None)
     }
+
+    async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let count = agents
+            .get(tenant_id)
+            .map(|tenant_agents| {
+                tenant_agents
+                    .values()
+                    .filter(|a| matches!(a.status, crate::domain::agent::AgentStatus::Active))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        Ok(count)
+    }
 }
 
 // AgentLifecycleService implementation for in-memory use
@@ -577,6 +591,26 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .flat_map(|tenant_execs| tenant_execs.get(&id))
             .next()
             .cloned())
+    }
+
+    async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let count = executions
+            .get(tenant_id)
+            .map(|tenant_execs| {
+                tenant_execs
+                    .values()
+                    .filter(|e| {
+                        matches!(
+                            e.status,
+                            crate::domain::execution::ExecutionStatus::Running
+                                | crate::domain::execution::ExecutionStatus::Pending
+                        )
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        Ok(count)
     }
 }
 

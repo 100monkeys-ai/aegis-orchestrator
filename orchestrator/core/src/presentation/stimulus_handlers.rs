@@ -379,13 +379,18 @@ mod tests {
 
         async fn register_route(
             &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
             _source_name: &str,
             _workflow_id: crate::domain::workflow::WorkflowId,
         ) -> Result<()> {
             Ok(())
         }
 
-        async fn remove_route(&self, _source_name: &str) -> bool {
+        async fn remove_route(
+            &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
+            _source_name: &str,
+        ) -> bool {
             false
         }
     }
@@ -403,6 +408,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
+            tenant_onboarding_service: None,
             seal_session_repo: None,
             rate_limit_override_repo: None,
             config_layer_repo: None,
