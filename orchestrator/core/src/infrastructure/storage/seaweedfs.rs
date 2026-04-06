@@ -235,7 +235,9 @@ impl StorageProvider for SeaweedFSAdapter {
 
                 Ok(status.total_size)
             }
-            StatusCode::NOT_FOUND => Err(StorageError::NotFound(path.to_string())),
+            // A 404 from /dir/status means the directory has no tracked usage yet
+            // (e.g. only contains a .keep sentinel). Treat as zero usage.
+            StatusCode::NOT_FOUND => Ok(0),
             status => {
                 let error_msg = response
                     .text()
@@ -646,6 +648,28 @@ mod tests {
         // Path must start with /
         let result = adapter.create_directory("invalid/path").await;
         assert!(matches!(result, Err(StorageError::InvalidPath(_))));
+    }
+
+    #[tokio::test]
+    async fn test_get_usage_returns_zero_for_not_found() {
+        // Regression: SeaweedFS returns 404 for /dir/status when a directory
+        // was just created and only contains a .keep sentinel file.
+        // get_usage must return Ok(0) — not StorageError::NotFound — so that
+        // quota-guarded writes to newly created directories succeed.
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/dir/status")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "path".into(),
+                "/tenant/vol".into(),
+            ))
+            .with_status(404)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.get_usage("/tenant/vol").await;
+        assert_eq!(result, Ok(0), "404 from /dir/status must yield Ok(0)");
     }
 
     // Integration tests require running SeaweedFS instance
