@@ -621,9 +621,6 @@ pub struct SecretsManager {
     store: Arc<dyn SecretStore>,
     event_bus: Arc<EventBus>,
     cache: Arc<Mutex<SecretsCache>>,
-    /// OpenBao API address for sys/namespaces management (populated from config).
-    /// `None` in test environments that use `from_store`.
-    openbao_address: Option<String>,
 }
 
 impl SecretsManager {
@@ -639,7 +636,6 @@ impl SecretsManager {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
             ))),
-            openbao_address: Some(config.address.clone()),
         })
     }
 
@@ -652,7 +648,6 @@ impl SecretsManager {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
             ))),
-            openbao_address: None,
         }
     }
 
