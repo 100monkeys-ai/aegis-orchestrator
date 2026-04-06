@@ -27,6 +27,7 @@ pub struct HttpAttestationRequest {
     pub workload_id: Option<String>,
     pub zaru_tier: Option<String>,
     pub tenant_id: Option<String>,
+    pub task_summary: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -81,6 +82,7 @@ pub(crate) async fn attest_seal_handler(
             workload_id: request.workload_id.clone(),
             zaru_tier: request.zaru_tier.clone(),
             tenant_id,
+            task_summary: request.task_summary.clone(),
         };
 
     match state.attestation_service.attest(internal_req).await {

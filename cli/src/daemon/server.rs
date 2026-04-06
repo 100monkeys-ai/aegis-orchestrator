@@ -83,7 +83,6 @@ use super::{remove_pid_file, write_pid_file};
 use aegis_orchestrator_core::domain::rate_limit::{RateLimitEnforcer, RateLimitPolicyResolver};
 use aegis_orchestrator_core::{
     application::{
-        CorrelatedActivityStreamService,
         agent::AgentLifecycleService,
         execution::ExecutionService,
         execution::StandardExecutionService,
@@ -91,17 +90,17 @@ use aegis_orchestrator_core::{
         register_workflow::{RegisterWorkflowUseCase, StandardRegisterWorkflowUseCase},
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
         validation_service::ValidationService,
+        CorrelatedActivityStreamService,
     },
     domain::{
         cluster::{NodeClusterRepository, NodeRole},
         iam::IdentityProvider,
-        node_config::{IamConfig, IamRealmConfig, NodeConfigManifest, resolve_env_value},
+        node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
         repository::AgentRepository,
         runtime_registry::StandardRuntimeRegistry,
         supervisor::Supervisor,
     },
     infrastructure::{
-        TemporalEventListener,
         event_bus::EventBus,
         iam::StandardIamService,
         llm::registry::ProviderRegistry,
@@ -113,8 +112,9 @@ use aegis_orchestrator_core::{
             InMemoryAgentRepository, InMemoryExecutionRepository,
             InMemoryWorkflowExecutionRepository,
         },
-        runtime::{ContainerRuntime, connect_container_runtime},
+        runtime::{connect_container_runtime, ContainerRuntime},
         temporal_client::TemporalClient,
+        TemporalEventListener,
     },
 };
 
@@ -1199,17 +1199,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     );
 
     // Application Services — token_issuer was created earlier (ADR-088 §A8) and shared with ExecutionService.
-    let attestation_service: Arc<
-        dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
-    > = Arc::new(
+    let mut attestation_service_builder =
         aegis_orchestrator_core::application::attestation_service::AttestationServiceImpl::new(
             security_context_repo.clone(),
             seal_session_repo.clone(),
             token_issuer,
         )
         .with_gateway_client(attestation_gateway_client)
-        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone()),
-    );
+        .with_agent_manifest_tools(execution_service.clone(), agent_service.clone());
+
+    match aegis_orchestrator_core::infrastructure::docker::BollardContainerVerifier::new() {
+        Ok(v) => {
+            attestation_service_builder =
+                attestation_service_builder.with_container_verifier(std::sync::Arc::new(v));
+        }
+        Err(e) => {
+            warn!("Docker socket unavailable; container identity verification disabled: {e}");
+        }
+    }
+
+    let attestation_service: Arc<
+        dyn aegis_orchestrator_core::infrastructure::seal::attestation::AttestationService,
+    > = Arc::new(attestation_service_builder);
 
     // Secrets manager: initialize from `spec.secrets.backend`, otherwise use an in-memory store for local development/testing.
     let secrets_manager: Arc<aegis_orchestrator_core::infrastructure::secrets_manager::SecretsManager> =

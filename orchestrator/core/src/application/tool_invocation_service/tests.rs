@@ -1227,11 +1227,9 @@ fn build_semantic_judge_payload_includes_tool_audit_history() {
         payload["tool_audit_history"]["latest_schema_validate"]["tool_name"],
         "aegis.schema.validate"
     );
-    assert!(
-        payload["tool_audit_history"]
-            .get("schema_get_evidence")
-            .is_none()
-    );
+    assert!(payload["tool_audit_history"]
+        .get("schema_get_evidence")
+        .is_none());
 }
 
 #[test]
@@ -1621,12 +1619,10 @@ async fn task_logs_tool_returns_execution_fetch_error() {
     };
 
     assert_eq!(payload["tool"], "aegis.task.logs");
-    assert!(
-        payload["error"]
-            .as_str()
-            .unwrap()
-            .contains("Failed to fetch execution")
-    );
+    assert!(payload["error"]
+        .as_str()
+        .unwrap()
+        .contains("Failed to fetch execution"));
 }
 
 #[tokio::test]
@@ -1999,16 +1995,12 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         .await
         .unwrap();
 
-    assert!(
-        tools
-            .iter()
-            .any(|tool| tool.name == "aegis.workflow.status")
-    );
-    assert!(
-        !tools
-            .iter()
-            .any(|tool| tool.name == "aegis.workflow.delete")
-    );
+    assert!(tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.status"));
+    assert!(!tools
+        .iter()
+        .any(|tool| tool.name == "aegis.workflow.delete"));
 }
 
 #[tokio::test]

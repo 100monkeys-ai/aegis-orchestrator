@@ -59,7 +59,7 @@ use crate::domain::volume::{
 };
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
@@ -1079,10 +1079,9 @@ mod tests {
         }))
         .unwrap_err();
 
-        assert!(
-            err.to_string()
-                .contains("Context override key 'instruction' is reserved")
-        );
+        assert!(err
+            .to_string()
+            .contains("Context override key 'instruction' is reserved"));
     }
 
     #[test]
@@ -1757,8 +1756,8 @@ impl StandardExecutionService {
         ) =
             (&self.seal_gateway_client, &self.token_issuer)
         {
-            use base64::Engine;
             use base64::engine::general_purpose::STANDARD;
+            use base64::Engine;
             use ed25519_dalek::SigningKey;
 
             // 1. Generate ephemeral Ed25519 keypair

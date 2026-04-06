@@ -686,10 +686,9 @@ spec:
             .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Workflow engine not connected yet")
-        );
+        assert!(err
+            .to_string()
+            .contains("Workflow engine not connected yet"));
     }
 
     #[tokio::test]
@@ -726,10 +725,9 @@ spec:
             .register_workflow(VALID_WORKFLOW_YAML, false)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Failed to persist workflow to repository")
-        );
+        assert!(err
+            .to_string()
+            .contains("Failed to persist workflow to repository"));
     }
 
     #[tokio::test]
@@ -788,10 +786,9 @@ spec:
             .register_workflow(&invalid, false)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("Failed to parse workflow YAML manifest")
-        );
+        assert!(err
+            .to_string()
+            .contains("Failed to parse workflow YAML manifest"));
     }
 
     #[tokio::test]

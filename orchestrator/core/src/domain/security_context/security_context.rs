@@ -72,23 +72,99 @@ pub enum PolicyViolation {
         tool_name: String,
         max_duration: Duration,
     },
-    SubcommandNotAllowed {
+    CommandNotAllowed {
         command: String,
+        allowed_commands: Vec<String>,
+    },
+    SubcommandNotAllowed {
+        base_command: String,
         subcommand: String,
         allowed_subcommands: Vec<String>,
     },
     ConcurrentExecLimitExceeded {
         limit: u32,
-        active: u32,
     },
     OutputSizeLimitExceeded {
-        max_bytes: u64,
         actual_bytes: u64,
+        max_bytes: u64,
     },
-    ExecTimeoutCeilingExceeded {
-        requested_secs: u32,
-        ceiling_secs: u32,
-    },
+}
+
+impl std::fmt::Display for PolicyViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PolicyViolation::ToolNotAllowed { tool_name, allowed_tools } => write!(
+                f,
+                "tool '{}' is not allowed; permitted tools: [{}]",
+                tool_name,
+                allowed_tools.join(", ")
+            ),
+            PolicyViolation::ToolExplicitlyDenied { tool_name } => {
+                write!(f, "tool '{}' is explicitly denied", tool_name)
+            }
+            PolicyViolation::RateLimitExceeded {
+                resource_type,
+                bucket,
+                limit,
+                current,
+                retry_after_seconds,
+            } => write!(
+                f,
+                "rate limit exceeded for {resource_type}/{bucket}: {current}/{limit}, retry after {retry_after_seconds}s"
+            ),
+            PolicyViolation::PathOutsideBoundary { path, allowed_paths } => write!(
+                f,
+                "path '{}' is outside allowed boundaries: [{}]",
+                path.display(),
+                allowed_paths
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            PolicyViolation::PathTraversalAttempt { path } => {
+                write!(f, "path traversal attempt detected: '{}'", path.display())
+            }
+            PolicyViolation::DomainNotAllowed { domain, allowed_domains } => write!(
+                f,
+                "domain '{}' is not allowed; permitted domains: [{}]",
+                domain,
+                allowed_domains.join(", ")
+            ),
+            PolicyViolation::MissingRequiredArgument(arg) => {
+                write!(f, "missing required argument: '{arg}'")
+            }
+            PolicyViolation::TimeoutExceeded { tool_name, max_duration } => write!(
+                f,
+                "tool '{}' exceeded max duration of {:?}",
+                tool_name, max_duration
+            ),
+            PolicyViolation::CommandNotAllowed { command, allowed_commands } => write!(
+                f,
+                "command '{}' is not allowed; permitted commands: [{}]",
+                command,
+                allowed_commands.join(", ")
+            ),
+            PolicyViolation::SubcommandNotAllowed {
+                base_command,
+                subcommand,
+                allowed_subcommands,
+            } => write!(
+                f,
+                "subcommand '{}' is not allowed for '{}'; permitted subcommands: [{}]",
+                subcommand,
+                base_command,
+                allowed_subcommands.join(", ")
+            ),
+            PolicyViolation::ConcurrentExecLimitExceeded { limit } => {
+                write!(f, "concurrent execution limit of {limit} exceeded")
+            }
+            PolicyViolation::OutputSizeLimitExceeded { actual_bytes, max_bytes } => write!(
+                f,
+                "output size {actual_bytes} bytes exceeds maximum of {max_bytes} bytes"
+            ),
+        }
+    }
 }
 
 /// Audit metadata for a [`SecurityContext`] record.
@@ -290,22 +366,19 @@ mod tests {
         };
 
         // Allowed
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
-                .is_ok()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied by capability limits (path)
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/etc/passwd"}))
-                .is_err()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/etc/passwd"}))
+            .is_err());
 
         // Denied implicitly (not in capabilities)
-        assert!(
-            ctx.evaluate("fs.write", &json!({"path": "/workspace/test.txt"}))
-                .is_err()
-        );
+        assert!(ctx
+            .evaluate("fs.write", &json!({"path": "/workspace/test.txt"}))
+            .is_err());
     }
 
     #[test]
@@ -329,10 +402,9 @@ mod tests {
         };
 
         // Allowed due to wildcard
-        assert!(
-            ctx.evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
-                .is_ok()
-        );
+        assert!(ctx
+            .evaluate("fs.read", &json!({"path": "/workspace/test.txt"}))
+            .is_ok());
 
         // Denied due to explicit deny list
         assert!(matches!(

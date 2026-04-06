@@ -107,6 +107,9 @@ pub struct ContextClaims {
     /// Tenant routing identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tenant_id: Option<String>,
+    /// Optional human-readable summary of the task this execution is performing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_summary: Option<String>,
 }
 
 impl EnvelopeVerifier for SealEnvelope {

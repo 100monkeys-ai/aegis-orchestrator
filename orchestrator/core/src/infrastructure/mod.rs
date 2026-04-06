@@ -46,6 +46,7 @@ pub mod context_loader;
 pub mod cortex_client;
 pub mod db;
 pub mod discovery;
+pub mod docker;
 pub mod event_bus;
 pub mod human_input_service;
 pub mod iam;

@@ -653,6 +653,7 @@ impl AegisRuntime for AegisRuntimeService {
             // gRPC attestation is used by agent containers which run under the
             // system tenant (orchestrator-managed workloads).
             tenant_id: crate::domain::tenant::TenantId::system(),
+            task_summary: None,
         };
 
         match attestation_service.attest(attestation_req).await {

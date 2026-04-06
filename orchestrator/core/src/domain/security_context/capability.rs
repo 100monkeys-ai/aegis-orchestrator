@@ -57,6 +57,7 @@ pub struct Capability {
     /// is in this list.
     pub command_allowlist: Option<Vec<String>>,
     /// If set, `cmd.run` tool calls must have command arguments matching these subcommands.
+    /// Keys are base commands; values are the permitted subcommands for each base command.
     pub subcommand_allowlist: Option<HashMap<String, Vec<String>>>,
     /// If set, `web.*` tool calls must target a URL whose domain suffix matches
     /// one of these entries.
@@ -121,36 +122,38 @@ impl Capability {
 
                 if let Some(ref allowlist) = self.command_allowlist {
                     if !allowlist.contains(&cmd_base.to_string()) {
-                        return Err(PolicyViolation::ToolNotAllowed {
-                            tool_name: format!("cmd.run (command: {cmd})"),
-                            allowed_tools: allowlist.clone(),
+                        return Err(PolicyViolation::CommandNotAllowed {
+                            command: cmd_base.to_string(),
+                            allowed_commands: allowlist.clone(),
                         });
                     }
                 }
 
-                if let Some(ref sub_allowlist) = self.subcommand_allowlist {
-                    let allowed_for_cmd = sub_allowlist.get(*cmd_base).ok_or_else(|| {
-                        PolicyViolation::SubcommandNotAllowed {
+                if let Some(ref sub_map) = self.subcommand_allowlist {
+                    if !sub_map.contains_key(*cmd_base) {
+                        return Err(PolicyViolation::CommandNotAllowed {
                             command: cmd_base.to_string(),
-                            subcommand: String::new(),
-                            allowed_subcommands: vec![],
-                        }
-                    })?;
-                    if cmd_parts.len() > 1 {
-                        let subcommand = cmd_parts[1];
-                        if !allowed_for_cmd.contains(&subcommand.to_string()) {
+                            allowed_commands: sub_map.keys().cloned().collect(),
+                        });
+                    }
+                    let permitted_subs = &sub_map[*cmd_base];
+                    if !permitted_subs.is_empty() {
+                        if cmd_parts.len() > 1 {
+                            let subcommand = cmd_parts[1];
+                            if !permitted_subs.contains(&subcommand.to_string()) {
+                                return Err(PolicyViolation::SubcommandNotAllowed {
+                                    base_command: cmd_base.to_string(),
+                                    subcommand: subcommand.to_string(),
+                                    allowed_subcommands: permitted_subs.clone(),
+                                });
+                            }
+                        } else {
                             return Err(PolicyViolation::SubcommandNotAllowed {
-                                command: cmd_base.to_string(),
-                                subcommand: subcommand.to_string(),
-                                allowed_subcommands: allowed_for_cmd.clone(),
+                                base_command: cmd_base.to_string(),
+                                subcommand: String::new(),
+                                allowed_subcommands: permitted_subs.clone(),
                             });
                         }
-                    } else if !allowed_for_cmd.is_empty() {
-                        return Err(PolicyViolation::SubcommandNotAllowed {
-                            command: cmd_base.to_string(),
-                            subcommand: String::new(),
-                            allowed_subcommands: allowed_for_cmd.clone(),
-                        });
                     }
                 }
             }
@@ -214,15 +217,11 @@ mod tests {
         let cap = Capability {
             tool_pattern: "cmd.run".to_string(),
             path_allowlist: None,
-            command_allowlist: None,
-            subcommand_allowlist: Some({
-                let mut m = std::collections::HashMap::new();
-                m.insert(
-                    "cargo".to_string(),
-                    vec!["build".to_string(), "check".to_string()],
-                );
-                m
-            }),
+            command_allowlist: Some(vec!["cargo".to_string()]),
+            subcommand_allowlist: Some(HashMap::from([(
+                "cargo".to_string(),
+                vec!["build".to_string(), "check".to_string()],
+            )])),
             domain_allowlist: None,
             max_response_size: None,
             rate_limit: None,
@@ -230,36 +229,32 @@ mod tests {
         };
 
         // Allowed: cargo build
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo build"}))
-                .is_ok()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo build"}))
+            .is_ok());
 
         // Allowed: cargo check
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo check"}))
-                .is_ok()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo check"}))
+            .is_ok());
 
         // Denied: incorrect command base
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "npm install"}))
-                .is_err()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "npm install"}))
+            .is_err());
 
         // Denied: incorrect subcommand
-        assert!(
-            cap.allows("cmd.run", &json!({"command": "cargo publish"}))
-                .is_err()
-        );
+        assert!(cap
+            .allows("cmd.run", &json!({"command": "cargo publish"}))
+            .is_err());
 
         // Denied: missing subcommand
         assert!(cap.allows("cmd.run", &json!({"command": "cargo"})).is_err());
 
-        // Denied: base command not a key in the subcommand_allowlist map
+        // Denied: base command not in command_allowlist
         assert!(matches!(
             cap.allows("cmd.run", &json!({"command": "npm install"})),
-            Err(PolicyViolation::SubcommandNotAllowed { .. })
+            Err(PolicyViolation::CommandNotAllowed { .. })
         ));
     }
 }

@@ -22,7 +22,7 @@
 use crate::application::schema_registry::SchemaRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::seal_session::SealSessionError;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::sync::Arc;
 
 /// Handle the `schema.get` tool call.

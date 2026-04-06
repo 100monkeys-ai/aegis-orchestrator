@@ -9,7 +9,7 @@ use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus, Iteratio
 use crate::domain::repository::{ExecutionRepository, WorkflowExecutionRepository};
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::event_bus::{EventBus, EventBusError};
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use chrono::{DateTime, Utc};
 use futures::{Stream, StreamExt};
 use serde_json::Value;

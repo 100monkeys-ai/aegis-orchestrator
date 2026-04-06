@@ -165,10 +165,9 @@ impl EnvelopeVerifier for MockEnvelope {
 #[test]
 fn evaluate_allows_matching_capability_with_valid_args() {
     let ctx = make_context("zaru-test", vec![fs_read_capability()], vec![]);
-    assert!(
-        ctx.evaluate("fs.read", &json!({"path": "/workspace/foo.txt"}))
-            .is_ok()
-    );
+    assert!(ctx
+        .evaluate("fs.read", &json!({"path": "/workspace/foo.txt"}))
+        .is_ok());
 }
 
 #[test]
@@ -195,10 +194,9 @@ fn evaluate_deny_list_takes_precedence_over_capabilities() {
     assert!(matches!(err, PolicyViolation::ToolExplicitlyDenied { .. }));
 
     // fs.read should still be allowed
-    assert!(
-        ctx.evaluate("fs.read", &json!({"path": "/workspace/x"}))
-            .is_ok()
-    );
+    assert!(ctx
+        .evaluate("fs.read", &json!({"path": "/workspace/x"}))
+        .is_ok());
 }
 
 #[test]
@@ -317,10 +315,9 @@ fn capability_matches_universal_wildcard() {
 #[test]
 fn capability_allows_valid_path() {
     let cap = fs_read_capability();
-    assert!(
-        cap.allows("fs.read", &json!({"path": "/workspace/src/main.rs"}))
-            .is_ok()
-    );
+    assert!(cap
+        .allows("fs.read", &json!({"path": "/workspace/src/main.rs"}))
+        .is_ok());
 }
 
 #[test]
@@ -358,10 +355,9 @@ fn capability_allows_when_no_path_constraint() {
         max_concurrent: None,
     };
     // No path_allowlist means no path restriction
-    assert!(
-        cap.allows("fs.read", &json!({"path": "/anywhere/at/all"}))
-            .is_ok()
-    );
+    assert!(cap
+        .allows("fs.read", &json!({"path": "/anywhere/at/all"}))
+        .is_ok());
 }
 
 // ============================================================================
@@ -380,14 +376,12 @@ fn capability_allows_whitelisted_command() {
         rate_limit: None,
         max_concurrent: None,
     };
-    assert!(
-        cap.allows("cmd.run", &json!({"command": "cargo build --release"}))
-            .is_ok()
-    );
-    assert!(
-        cap.allows("cmd.run", &json!({"command": "rustc --version"}))
-            .is_ok()
-    );
+    assert!(cap
+        .allows("cmd.run", &json!({"command": "cargo build --release"}))
+        .is_ok());
+    assert!(cap
+        .allows("cmd.run", &json!({"command": "rustc --version"}))
+        .is_ok());
 }
 
 #[test]
@@ -415,17 +409,15 @@ fn capability_rejects_non_whitelisted_command() {
 #[test]
 fn capability_allows_whitelisted_domain() {
     let cap = web_capability_with_domains(vec!["github.com", "crates.io"]);
-    assert!(
-        cap.allows("web.fetch", &json!({"url": "https://github.com/foo/bar"}))
-            .is_ok()
-    );
-    assert!(
-        cap.allows(
+    assert!(cap
+        .allows("web.fetch", &json!({"url": "https://github.com/foo/bar"}))
+        .is_ok());
+    assert!(cap
+        .allows(
             "web.fetch",
             &json!({"url": "https://crates.io/crates/serde"})
         )
-        .is_ok()
-    );
+        .is_ok());
 }
 
 #[test]
