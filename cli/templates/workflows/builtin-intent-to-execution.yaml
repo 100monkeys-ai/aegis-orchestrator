@@ -5,11 +5,10 @@ metadata:
   version: "1.0.0"
   description: >-
     Seamless intent-to-execution pipeline. Accepts a natural-language intent and
-    optional typed inputs, discovers or generates a code-writing agent, writes
-    code to an ephemeral workspace volume, and executes it in an isolated
-    container. Output is formatted for display via the output_handler on
-    EXECUTE_CODE. Invoked via the aegis.execute.intent MCP tool from Zaru
-    Execute mode.
+    optional typed inputs, dispatches to a builtin language executor agent to write
+    code to an ephemeral workspace volume, executes it in an isolated container,
+    and returns a formatted result via output_handler. Invoked via the
+    aegis.execute.intent MCP tool from Zaru Execute mode.
   labels:
     category: platform
     type: builtin-execute
@@ -20,15 +19,15 @@ metadata:
     properties:
       language:
         type: string
-        description: Target programming language (e.g. python, javascript)
+        description: Target programming language (python, javascript, bash)
         default: python
       language_ext:
         type: string
-        description: File extension for the generated code file (e.g. py, js)
+        description: File extension for the generated code file (e.g. py, js, sh)
         default: py
       runner:
         type: string
-        description: Executable used to run the generated code file (e.g. python3, node)
+        description: Executable used to run the generated code file (e.g. python3, node, bash)
         default: python3
       container_image:
         type: string
@@ -43,7 +42,7 @@ metadata:
         description: JSON-serialized representation of inputs, injected as INTENT_INPUTS env var
         default: "{}"
 spec:
-  initial_state: DISCOVER_OR_GENERATE_AGENT
+  initial_state: WRITE_CODE
 
   storage:
     workspace:
@@ -52,53 +51,24 @@ spec:
       size_limit_mb: 256
 
   states:
-    DISCOVER_OR_GENERATE_AGENT:
+    WRITE_CODE:
       kind: Agent
-      agent: intent-executor-discovery-agent
+      agent: "aegis-{{input.language}}-executor-agent"
       input: |
-        Discover or generate a code-writing agent for this execution request.
-
         Intent: {{intent}}
-        Language: {{input.language}}
-
-        Step 1: Call aegis.agent.search with a query that captures the intent
-        and target language. If any result has relevance_score >= 0.75, you MUST
-        select it — do NOT call aegis.agent.generate.
-
-        Step 2: Only if no result has relevance_score >= 0.75 (or search returns
-        zero results), call aegis.agent.generate to create a minimal code-writer
-        agent for {{input.language}} that writes working code to a given file path
-        and prints the result to stdout.
-
-        Return JSON: { "agent_name": "<string>", "created": <bool> }
-      transitions:
-        - condition: on_success
-          target: GENERATE_CODE
-        - condition: on_failure
-          target: DISCOVERY_FAILED
-
-    GENERATE_CODE:
-      kind: Agent
-      agent: "{{DISCOVER_OR_GENERATE_AGENT.output.agent_name}}"
-      input: |
-        Write {{input.language}} code that fulfills this intent:
-
-        Intent: {{intent}}
+        File path: /workspace/solution.{{input.language_ext}}
         Input values: {{input.inputs}}
 
-        Requirements:
-        1. Write the complete solution to /workspace/solution.{{input.language_ext}}
-        2. The solution MUST print its final result to stdout
-        3. Embed the input values directly in the code
-        4. Use only the standard library — no third-party packages
-
-        Use fs.write to write to /workspace/solution.{{input.language_ext}}
+        Write the complete solution to /workspace/solution.{{input.language_ext}}.
+        The solution MUST print its final result to stdout.
+        Embed the input values directly in the code.
+        Use only the standard library — no third-party packages.
         Confirm the write succeeded before returning.
       transitions:
         - condition: on_success
           target: EXECUTE_CODE
         - condition: on_failure
-          target: GENERATION_FAILED
+          target: WRITE_FAILED
 
     EXECUTE_CODE:
       kind: ContainerRun
@@ -136,14 +106,9 @@ spec:
         - condition: exit_code_non_zero
           target: EXECUTION_FAILED
 
-    DISCOVERY_FAILED:
+    WRITE_FAILED:
       kind: System
-      command: "echo 'Pipeline failed at DISCOVER_OR_GENERATE_AGENT'"
-      transitions: []
-
-    GENERATION_FAILED:
-      kind: System
-      command: "echo 'Pipeline failed at GENERATE_CODE'"
+      command: "echo 'Pipeline failed at WRITE_CODE'"
       transitions: []
 
     EXECUTION_FAILED:

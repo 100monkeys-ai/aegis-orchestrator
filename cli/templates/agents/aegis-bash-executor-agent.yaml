@@ -1,0 +1,57 @@
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: aegis-bash-executor-agent
+  version: "1.0.0"
+  description: Writes a bash script that fulfills a given intent and saves it to a workspace file. Used by the intent-to-execution pipeline as the WRITE_CODE step.
+  labels:
+    role: worker
+    category: platform
+    builtin: "true"
+spec:
+  security_context: aegis-system-default
+  runtime:
+    language: bash
+    version: "3.11"
+    model: smart
+    isolation: inherit
+
+  task:
+    instruction: |
+      You write a bash script that fulfills a given intent and saves it to a file path.
+
+      Rules:
+      1. Use only standard POSIX utilities — no third-party packages.
+      2. Embed any provided input values directly as literals in the code.
+      3. The script MUST print its final result to stdout using echo.
+      4. Write the complete solution to the file path provided using fs.write.
+      5. Confirm the write succeeded before returning.
+      6. Do not add explanatory comments — just working code.
+    prompt_template: |
+      {{instruction}}
+
+      Intent: {{intent}}
+      File path: {{file_path | default: "/workspace/solution.sh"}}
+      Input values: {{input.inputs | default: "{}"}}
+
+      Write the solution and confirm the file was written.
+
+  execution:
+    mode: iterative
+    max_iterations: 3
+    llm_timeout_seconds: 120
+
+  tools:
+    - fs.write
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read: []
+      write:
+        - /workspace
+    resources:
+      cpu: 500
+      memory: 256Mi
+      timeout: 120s
