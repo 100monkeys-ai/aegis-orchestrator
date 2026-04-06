@@ -1093,7 +1093,7 @@ impl AegisRuntime for AegisRuntimeService {
                 volume_name,
                 tenant_id.clone(),
                 storage_class,
-                size_limit_mb as u64,
+                size_limit_mb,
                 ownership,
             )
             .await
