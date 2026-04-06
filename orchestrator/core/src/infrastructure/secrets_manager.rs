@@ -392,6 +392,72 @@ impl SecretStore for OpenBaoSecretStore {
             .decode(&resp.plaintext)
             .map_err(|e| SecretsError::TransitError(format!("Base64 decode failed: {e}")))
     }
+
+    /// Create an OpenBao namespace for per-tenant secret isolation (ADR-056).
+    ///
+    /// Issues `POST /v1/sys/namespaces/{name}` using the raw HTTP client and
+    /// the currently-active AppRole token. A 400 response with "already exists"
+    /// is treated as idempotent success.
+    async fn create_namespace(&self, name: &str) -> Result<(), SecretsError> {
+        let client = self.client.read().await;
+        let address = client.settings().address.clone();
+        let token = client.settings().token.clone();
+        let url = format!("{address}v1/sys/namespaces/{name}");
+        let resp = reqwest::Client::new()
+            .post(&url)
+            .header("X-Vault-Token", &token)
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .map_err(|e| {
+                SecretsError::ConnectionError(format!("Namespace create HTTP failed: {e}"))
+            })?;
+
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        // Idempotent: namespace already exists.
+        if status.as_u16() == 400 {
+            let body = resp.text().await.unwrap_or_default();
+            if body.contains("already exists") {
+                return Ok(());
+            }
+            return Err(SecretsError::ConfigError(format!(
+                "Namespace create returned 400: {body}"
+            )));
+        }
+        Err(SecretsError::ConfigError(format!(
+            "Namespace create failed with status {status} for namespace '{name}'"
+        )))
+    }
+
+    /// Delete an OpenBao namespace (rollback / deprovisioning).
+    ///
+    /// Issues `DELETE /v1/sys/namespaces/{name}` using the raw HTTP client.
+    /// A 404 (namespace not found) is treated as idempotent success.
+    async fn delete_namespace(&self, name: &str) -> Result<(), SecretsError> {
+        let client = self.client.read().await;
+        let address = client.settings().address.clone();
+        let token = client.settings().token.clone();
+        let url = format!("{address}v1/sys/namespaces/{name}");
+        let resp = reqwest::Client::new()
+            .delete(&url)
+            .header("X-Vault-Token", &token)
+            .send()
+            .await
+            .map_err(|e| {
+                SecretsError::ConnectionError(format!("Namespace delete HTTP failed: {e}"))
+            })?;
+
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+        Err(SecretsError::ConfigError(format!(
+            "Namespace delete failed with status {status} for namespace '{name}'"
+        )))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -555,6 +621,9 @@ pub struct SecretsManager {
     store: Arc<dyn SecretStore>,
     event_bus: Arc<EventBus>,
     cache: Arc<Mutex<SecretsCache>>,
+    /// OpenBao API address for sys/namespaces management (populated from config).
+    /// `None` in test environments that use `from_store`.
+    openbao_address: Option<String>,
 }
 
 impl SecretsManager {
@@ -570,6 +639,7 @@ impl SecretsManager {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
             ))),
+            openbao_address: Some(config.address.clone()),
         })
     }
 
@@ -582,12 +652,33 @@ impl SecretsManager {
             cache: Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(CACHE_CAPACITY).unwrap(),
             ))),
+            openbao_address: None,
         }
     }
 
     /// Returns a reference-counted handle to the underlying `SecretStore`.
     pub fn secret_store(&self) -> Arc<dyn SecretStore> {
         self.store.clone()
+    }
+
+    /// Create a per-tenant OpenBao namespace for secret isolation (ADR-056).
+    ///
+    /// Delegates to the underlying store's `create_namespace`. The production
+    /// `OpenBaoSecretStore` implementation issues the sys/namespaces API call;
+    /// test stores are no-ops.
+    pub async fn create_namespace(
+        &self,
+        name: &str,
+    ) -> Result<(), crate::domain::secrets::SecretsError> {
+        self.store.create_namespace(name).await
+    }
+
+    /// Delete a per-tenant OpenBao namespace (rollback / deprovisioning).
+    pub async fn delete_namespace(
+        &self,
+        name: &str,
+    ) -> Result<(), crate::domain::secrets::SecretsError> {
+        self.store.delete_namespace(name).await
     }
 
     fn cache_key(engine: &str, path: &str) -> String {

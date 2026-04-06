@@ -16,6 +16,7 @@
 
 use crate::domain::agent::AgentId;
 use crate::domain::execution::ExecutionId;
+use crate::domain::shared_kernel::TenantId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -80,6 +81,16 @@ impl std::fmt::Display for SensitiveString {
 ///
 /// Encodes `{namespace}/{mount_point}/{path}` as a validated value object.
 /// Use [`SecretPath::full_path`] to get the canonical string representation.
+///
+/// ## Per-Tenant Namespace Routing (ADR-056 §Wave 3)
+///
+/// When `tenant_id` is `Some(tid)` and `!tid.is_system()`, the effective KV engine
+/// mount is prefixed with `tenant-{slug}/` to route the operation into the tenant's
+/// dedicated OpenBao namespace. System-tier secrets (`tenant_id` is `None` or
+/// `is_system()`) continue to use the global namespace from the startup config.
+///
+/// Use [`SecretPath::effective_mount`] to obtain the correctly-routed engine mount
+/// string when calling the secret store.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SecretPath {
     /// Backend namespace (e.g. `"aegis-system"`, `"tenant-acme"`).
@@ -88,10 +99,13 @@ pub struct SecretPath {
     pub mount_point: String,
     /// Path within the mount (e.g. `"mcp-tools/gmail"`).
     pub path: String,
+    /// Optional tenant owning this secret. When set to a non-system tenant,
+    /// read/write operations are routed to the tenant's OpenBao namespace.
+    pub tenant_id: Option<TenantId>,
 }
 
 impl SecretPath {
-    /// Construct a `SecretPath`.
+    /// Construct a `SecretPath` without tenant routing (system / global secrets).
     pub fn new(
         namespace: impl Into<String>,
         mount_point: impl Into<String>,
@@ -101,6 +115,42 @@ impl SecretPath {
             namespace: namespace.into(),
             mount_point: mount_point.into(),
             path: path.into(),
+            tenant_id: None,
+        }
+    }
+
+    /// Construct a `SecretPath` scoped to a specific tenant (ADR-056).
+    pub fn for_tenant(
+        tenant_id: TenantId,
+        mount_point: impl Into<String>,
+        path: impl Into<String>,
+    ) -> Self {
+        let namespace = if tenant_id.is_system() {
+            "aegis-system".to_string()
+        } else {
+            format!("tenant-{}", tenant_id.as_str())
+        };
+        Self {
+            namespace: namespace.clone(),
+            mount_point: mount_point.into(),
+            path: path.into(),
+            tenant_id: Some(tenant_id),
+        }
+    }
+
+    /// Returns the engine mount string to pass to the secret store.
+    ///
+    /// When the path carries a non-system tenant, the mount is prefixed with
+    /// `tenant-{slug}/` so that the OpenBao path-based namespace routing
+    /// directs the operation into the tenant's isolated namespace.
+    ///
+    /// System or unscoped paths return the bare `mount_point`.
+    pub fn effective_mount(&self) -> String {
+        match &self.tenant_id {
+            Some(tid) if !tid.is_system() => {
+                format!("tenant-{}/{}", tid.as_str(), self.mount_point)
+            }
+            _ => self.mount_point.clone(),
         }
     }
 
@@ -270,6 +320,23 @@ pub trait SecretStore: Send + Sync {
         key_name: &str,
         ciphertext: &str,
     ) -> Result<Vec<u8>, SecretsError>;
+
+    /// Create an OpenBao namespace for tenant isolation (ADR-056).
+    ///
+    /// Default implementation is a no-op (test/dev stores do not model namespaces).
+    /// The production `OpenBaoSecretStore` overrides this to POST to `/v1/sys/namespaces/{name}`.
+    async fn create_namespace(&self, name: &str) -> Result<(), SecretsError> {
+        let _ = name;
+        Ok(())
+    }
+
+    /// Delete an OpenBao namespace (rollback / deprovisioning).
+    ///
+    /// Default implementation is a no-op.
+    async fn delete_namespace(&self, name: &str) -> Result<(), SecretsError> {
+        let _ = name;
+        Ok(())
+    }
 }
 
 impl DomainDynamicSecret {
