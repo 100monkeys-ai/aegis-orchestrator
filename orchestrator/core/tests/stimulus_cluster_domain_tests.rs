@@ -26,6 +26,7 @@ use aegis_orchestrator_core::domain::cluster::{
     RegisteredNode, ResourceSnapshot,
 };
 use aegis_orchestrator_core::domain::node_config::NodeRole;
+use aegis_orchestrator_core::domain::shared_kernel::TenantId;
 use aegis_orchestrator_core::domain::stimulus::{
     RejectionReason, RoutingDecision, RoutingMode, Stimulus, StimulusId, StimulusSource,
 };
@@ -267,24 +268,27 @@ fn registry_new_with_router_agent() {
 fn registry_register_route_case_insensitive() {
     let mut reg = WorkflowRegistry::new(None);
     let wf = make_workflow_id();
-    reg.register_route("GitHub", wf).unwrap();
+    reg.register_route(&TenantId::system(), "GitHub", wf)
+        .unwrap();
     // Lookup with different casing
-    assert_eq!(reg.lookup_direct("github"), Some(wf));
-    assert_eq!(reg.lookup_direct("GITHUB"), Some(wf));
-    assert_eq!(reg.lookup_direct("GitHub"), Some(wf));
+    assert_eq!(reg.lookup_direct(&TenantId::system(), "github"), Some(wf));
+    assert_eq!(reg.lookup_direct(&TenantId::system(), "GITHUB"), Some(wf));
+    assert_eq!(reg.lookup_direct(&TenantId::system(), "GitHub"), Some(wf));
 }
 
 #[test]
 fn registry_register_route_rejects_empty_key() {
     let mut reg = WorkflowRegistry::new(None);
-    assert!(reg.register_route("", make_workflow_id()).is_err());
+    assert!(reg
+        .register_route(&TenantId::system(), "", make_workflow_id())
+        .is_err());
 }
 
 #[test]
 fn registry_register_route_rejects_slash() {
     let mut reg = WorkflowRegistry::new(None);
     let err = reg
-        .register_route("foo/bar", make_workflow_id())
+        .register_route(&TenantId::system(), "foo/bar", make_workflow_id())
         .unwrap_err();
     assert!(err.to_string().contains("'/'"));
 }
@@ -292,27 +296,30 @@ fn registry_register_route_rejects_slash() {
 #[test]
 fn registry_register_route_rejects_whitespace() {
     let mut reg = WorkflowRegistry::new(None);
-    assert!(reg.register_route("foo bar", make_workflow_id()).is_err());
+    assert!(reg
+        .register_route(&TenantId::system(), "foo bar", make_workflow_id())
+        .is_err());
 }
 
 #[test]
 fn registry_remove_route_returns_true_if_existed() {
     let mut reg = WorkflowRegistry::new(None);
-    reg.register_route("stripe", make_workflow_id()).unwrap();
-    assert!(reg.remove_route("stripe"));
-    assert!(reg.lookup_direct("stripe").is_none());
+    reg.register_route(&TenantId::system(), "stripe", make_workflow_id())
+        .unwrap();
+    assert!(reg.remove_route(&TenantId::system(), "stripe"));
+    assert!(reg.lookup_direct(&TenantId::system(), "stripe").is_none());
 }
 
 #[test]
 fn registry_remove_route_returns_false_if_absent() {
     let mut reg = WorkflowRegistry::new(None);
-    assert!(!reg.remove_route("nonexistent"));
+    assert!(!reg.remove_route(&TenantId::system(), "nonexistent"));
 }
 
 #[test]
 fn registry_lookup_direct_returns_none_for_unknown() {
     let reg = WorkflowRegistry::new(None);
-    assert!(reg.lookup_direct("unknown").is_none());
+    assert!(reg.lookup_direct(&TenantId::system(), "unknown").is_none());
 }
 
 #[test]
@@ -349,16 +356,22 @@ fn registry_set_confidence_threshold_rejects_out_of_range() {
 #[test]
 fn registry_registered_sources_sorted() {
     let mut reg = WorkflowRegistry::new(None);
-    reg.register_route("zebra", make_workflow_id()).unwrap();
-    reg.register_route("apple", make_workflow_id()).unwrap();
-    reg.register_route("mango", make_workflow_id()).unwrap();
-    assert_eq!(reg.registered_sources(), vec!["apple", "mango", "zebra"]);
+    reg.register_route(&TenantId::system(), "zebra", make_workflow_id())
+        .unwrap();
+    reg.register_route(&TenantId::system(), "apple", make_workflow_id())
+        .unwrap();
+    reg.register_route(&TenantId::system(), "mango", make_workflow_id())
+        .unwrap();
+    assert_eq!(
+        reg.registered_sources(&TenantId::system()),
+        vec!["apple", "mango", "zebra"]
+    );
 }
 
 #[test]
 fn registry_registered_sources_empty() {
     let reg = WorkflowRegistry::new(None);
-    assert!(reg.registered_sources().is_empty());
+    assert!(reg.registered_sources(&TenantId::system()).is_empty());
 }
 
 // ============================================================================
