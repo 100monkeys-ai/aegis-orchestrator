@@ -60,8 +60,6 @@ opentelemetry = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 opentelemetry-otlp = { workspace = true }
 opentelemetry-appender-tracing = { workspace = true }
-tonic_12 = { package = "tonic", version = "0.12", features = ["tls", "tls-roots"] }
-
 # Docker client (needed to construct DockerContainerStepRunner in daemon)
 bollard = { workspace = true }
 

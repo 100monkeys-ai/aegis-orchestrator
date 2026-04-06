@@ -45,10 +45,10 @@ thiserror = "2.0.18"
 # Logging & Tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-opentelemetry = { version = "0.27", features = ["logs"] }
-opentelemetry_sdk = { version = "0.27", features = ["logs", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.27", features = ["logs", "grpc-tonic", "http-proto", "tls", "tls-roots"] }
-opentelemetry-appender-tracing = { version = "0.27" }
+opentelemetry = { version = "0.31", features = ["logs"] }
+opentelemetry_sdk = { version = "0.31", features = ["logs", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["logs", "grpc-tonic", "http-proto", "tls-ring", "tls-roots"] }
+opentelemetry-appender-tracing = { version = "0.31" }
 
 # Metrics
 metrics = "0.24"
