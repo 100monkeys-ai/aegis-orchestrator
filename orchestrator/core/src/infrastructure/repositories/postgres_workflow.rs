@@ -334,7 +334,8 @@ impl WorkflowRepository for PostgresWorkflowRepository {
             r#"
             SELECT domain_json, updated_at
             FROM workflows
-            WHERE tenant_id = $1 AND name = $2
+            WHERE name = $2
+              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
             ORDER BY updated_at DESC
             "#,
         )
