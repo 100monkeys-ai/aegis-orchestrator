@@ -101,8 +101,6 @@ spec:
         timeout_seconds: 60
         required: true
       transitions:
-        - condition: exit_code_zero
-          target: null
         - condition: exit_code_non_zero
           target: EXECUTION_FAILED
 
