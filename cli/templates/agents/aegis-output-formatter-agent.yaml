@@ -13,6 +13,8 @@ metadata:
     category: platform
     builtin: "true"
 spec:
+  security_context: aegis-system-agent-runtime
+
   runtime:
     language: python
     version: "3.11"
@@ -49,7 +51,6 @@ spec:
   tools: []
 
   security:
-    security_context: aegis-system-agent-runtime
     network:
       mode: none
     filesystem:
