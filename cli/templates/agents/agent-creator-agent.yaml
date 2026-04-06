@@ -2,7 +2,7 @@ apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: agent-creator-agent
-  version: "1.2.0"
+  version: "1.3.0"
   description: Creates valid Agent manifests and deploys them through orchestrator-native tooling.
   labels:
     role: worker
@@ -122,6 +122,19 @@ spec:
            `required` for mandatory fields. Omit `input_schema` entirely when the agent
            only accepts a free-form string via `{{input}}` with no named fields. Do not
            invent an `input_schema` for agents that do not benefit from one.
+         OUTPUT HANDLER — when to include `spec.output_handler`:
+         - Any agent whose final output is intended for direct human display (copywriting,
+           summarization, analysis, code generation, Q&A, reports) MUST include an
+           `output_handler` that routes through the builtin output formatter:
+             spec:
+               output_handler:
+                 type: agent
+                 agent_id: aegis-output-formatter-agent
+                 required: true
+         - Agents that produce structured data consumed by downstream automation (e.g., a
+           planner that returns JSON for another agent) should NOT include an output_handler —
+           the raw structured output is the intended consumer artifact.
+         - When in doubt: if a human will read the result, add the output_handler.
          SECURITY CONTEXT — STRICTLY FORBIDDEN IN GENERATED MANIFESTS:
          - Generated manifests MUST NOT include `spec.security_context`. This field is
            reserved for platform operators only (ADR-102). Including it in a generated
