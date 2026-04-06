@@ -128,8 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let trimmed = line.trim();
                 trimmed
                     .strip_prefix("// proto-version:")
-                    .map(|v| v.trim().parse::<u32>().ok())
-                    .flatten()
+                    .and_then(|v| v.trim().parse::<u32>().ok())
             })
             .ok_or(
                 "aegis_cortex.proto is missing a '// proto-version: N' comment — \
