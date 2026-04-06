@@ -392,6 +392,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             as Arc<dyn IdentityProvider>
     });
 
+    if config.is_production() && config.spec.iam.is_none() {
+        anyhow::bail!(
+            "Production nodes require spec.iam to be configured. \
+             See config-with-examples.yaml for the iam block schema."
+        );
+    }
     if config.is_production()
         && config
             .spec
@@ -400,6 +406,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .is_some_and(|iam| iam.realms.is_empty())
     {
         anyhow::bail!("Production nodes must configure at least one IAM realm");
+    }
+    if let Some(iam) = &config.spec.iam {
+        for realm in &iam.realms {
+            if realm.issuer_url.trim().is_empty() {
+                anyhow::bail!("IAM realm '{}' has empty issuer_url", realm.slug);
+            }
+            if realm.jwks_uri.trim().is_empty() {
+                anyhow::bail!("IAM realm '{}' has empty jwks_uri", realm.slug);
+            }
+        }
     }
 
     info!("Initializing LLM registry...");

@@ -491,22 +491,37 @@ spec:
   #       - tool_pattern: "aegis.runtime.list"
   #     deny_list: []
   #
-  # iam:
-  #   realms:
-  #     - slug: "aegis-system"
-  #       issuer_url: "https://auth.example.com/realms/aegis-system"
-  #       jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
-  #       audience: "aegis-orchestrator"
-  #       kind: "system"
-  #   jwks_cache_ttl_seconds: 300
-  #   claims:
-  #     zaru_tier: "zaru_tier"
-  #     aegis_role: "aegis_role"
-  #
-  # grpc_auth:
-  #   enabled: true
-  #   exempt_methods:
-  #     - "/aegis.orchestrator.v1.Health/Check"
+  iam:
+    # JWKS endpoints are fetched live from Keycloak at startup and cached.
+    # TTL-based refresh supports key rotation without service restarts.
+    realms:
+      - slug: "aegis-system"
+        # Full issuer URL format: https://<keycloak-host>/realms/<realm-slug>
+        issuer_url: "https://auth.example.com/realms/aegis-system"
+        # JWKS URI format: {issuer_url}/protocol/openid-connect/certs
+        jwks_uri: "https://auth.example.com/realms/aegis-system/protocol/openid-connect/certs"
+        # Must match the 'aud' claim in JWTs — set in Keycloak client's "Valid Audiences"
+        audience: "aegis-orchestrator"
+        # Realm classification: "system" | "consumer" | "tenant"
+        kind: "system"
+      # Example consumer realm (users authenticating via zaru-consumer):
+      # - slug: "zaru-consumer"
+      #   issuer_url: "https://auth.example.com/realms/zaru-consumer"
+      #   jwks_uri: "https://auth.example.com/realms/zaru-consumer/protocol/openid-connect/certs"
+      #   audience: "aegis-orchestrator"
+      #   kind: "consumer"
+    # Seconds to cache JWKS keys before re-fetching. Lower = faster rotation pickup.
+    jwks_cache_ttl_seconds: 300
+    # Keycloak attribute mapper names for custom claims.
+    claims:
+      zaru_tier: "zaru_tier"
+      aegis_role: "aegis_role"
+      tenant_id: "tenant_id"
+
+  grpc_auth:
+    enabled: true
+    exempt_methods:
+      - "/aegis.orchestrator.v1.Health/Check"
   #
   # seal_gateway:
   #   url: "http://aegis-seal-gateway:50055"
