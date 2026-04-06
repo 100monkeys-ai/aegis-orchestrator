@@ -63,6 +63,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
             advanced: None,
             input_schema: None,
             security_context: None,
+            output_handler: None,
         },
     }
 }

@@ -65,6 +65,7 @@ pub(crate) struct AppState {
         Arc<aegis_orchestrator_core::application::tenant_provisioning::TenantProvisioningService>,
     >,
     /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
+    #[allow(dead_code)]
     pub(crate) realm_repo: Option<Arc<dyn RealmRepository>>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
