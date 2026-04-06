@@ -36,7 +36,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use opentelemetry_otlp::{LogExporter, WithExportConfig, WithHttpConfig, WithTonicConfig};
-use opentelemetry_sdk::logs::LoggerProvider;
+use opentelemetry_sdk::logs::SdkLoggerProvider;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::info;
@@ -337,7 +337,7 @@ async fn main() -> Result<()> {
 }
 
 /// Initialize tracing subscriber for logging
-fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<LoggerProvider>> {
+fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<SdkLoggerProvider>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .or_else(|_| tracing_subscriber::EnvFilter::try_new(level))
         .context("Failed to create log filter")?;
@@ -360,12 +360,12 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Lo
                         .with_endpoint(endpoint)
                         .with_timeout(Duration::from_millis(cfg.batch.export_timeout_ms));
 
-                    let mut metadata = tonic_12::metadata::MetadataMap::new();
+                    let mut metadata = tonic::metadata::MetadataMap::new();
                     for (k, v) in &cfg.otlp_headers {
                         use std::str::FromStr;
                         if let (Ok(key), Ok(val)) = (
-                            tonic_12::metadata::MetadataKey::from_str(k),
-                            tonic_12::metadata::MetadataValue::from_str(v),
+                            tonic::metadata::MetadataKey::from_str(k),
+                            tonic::metadata::MetadataValue::from_str(v),
                         ) {
                             metadata.insert(key, val);
                         }
@@ -376,9 +376,9 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Lo
 
                     if let Some(ca) = &cfg.tls.ca_cert_path {
                         if let Ok(pem) = std::fs::read(ca) {
-                            let cert = tonic_12::transport::Certificate::from_pem(pem);
+                            let cert = tonic::transport::Certificate::from_pem(pem);
                             let tls_config =
-                                tonic_12::transport::ClientTlsConfig::new().ca_certificate(cert);
+                                tonic::transport::ClientTlsConfig::new().ca_certificate(cert);
                             exporter_builder = exporter_builder.with_tls_config(tls_config);
                         }
                     }
@@ -411,26 +411,24 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Lo
                 .with_max_queue_size(cfg.batch.max_queue_size)
                 .with_scheduled_delay(Duration::from_millis(cfg.batch.scheduled_delay_ms))
                 .with_max_export_batch_size(cfg.batch.max_export_batch_size)
-                .with_max_export_timeout(Duration::from_millis(cfg.batch.export_timeout_ms))
                 .build();
 
-            let processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(
-                exporter,
-                opentelemetry_sdk::runtime::Tokio,
-            )
-            .with_batch_config(batch_config)
-            .build();
+            let processor = opentelemetry_sdk::logs::BatchLogProcessor::builder(exporter)
+                .with_batch_config(batch_config)
+                .build();
 
-            let provider = opentelemetry_sdk::logs::LoggerProvider::builder()
+            let provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder()
                 .with_log_processor(processor)
-                .with_resource(opentelemetry_sdk::Resource::new(vec![
-                    opentelemetry::KeyValue::new(
-                        "service.name",
-                        cfg.service_name
-                            .clone()
-                            .unwrap_or_else(|| "aegis-orchestrator".to_string()),
-                    ),
-                ]))
+                .with_resource(
+                    opentelemetry_sdk::Resource::builder_empty()
+                        .with_attribute(opentelemetry::KeyValue::new(
+                            "service.name",
+                            cfg.service_name
+                                .clone()
+                                .unwrap_or_else(|| "aegis-orchestrator".to_string()),
+                        ))
+                        .build(),
+                )
                 .build();
 
             let otlp_layer =
