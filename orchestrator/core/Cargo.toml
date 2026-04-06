@@ -64,7 +64,7 @@ jsonschema = "0.45.0"
 
 # NFS Server Gateway (ADR-036)
 nfsserve = { workspace = true }
-bincode = { workspace = true }
+postcard = { workspace = true }
 parking_lot = "0.12"
 
 url = "2.5.8"

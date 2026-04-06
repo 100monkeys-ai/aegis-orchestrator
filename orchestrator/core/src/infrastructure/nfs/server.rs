@@ -25,7 +25,7 @@
 //!
 //! ## FileHandle Encoding (ADR-036)
 //! NFSv3 file handles are limited to 64 bytes. `AegisFileHandle` is serialized with
-//! bincode as a fixed-size 48-byte structure:
+//! postcard as a compact structure:
 //! ```ignore
 //! pub struct AegisFileHandle {
 //!     execution_id: ExecutionId, // 16 bytes (UUID)
@@ -34,7 +34,7 @@
 //!     created_at: i64,           // 8 bytes (Timestamp)
 //! }
 //! ```
-//! Current encoding: 48 bytes raw + ~4 bytes bincode overhead = 52 bytes (safe margin under 64-byte limit).
+//! Current encoding: 48 bytes raw + postcard varint overhead ≤ 52 bytes (safe margin under 64-byte limit).
 //!
 //! ## Security Model (Orchestrator Proxy Pattern)
 //! - Agent containers require **zero elevated privileges** (no CAP_SYS_ADMIN)

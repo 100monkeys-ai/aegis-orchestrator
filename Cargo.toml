@@ -72,7 +72,7 @@ reqwest = { version = "0.13", features = ["json"] }
 
 # NFS Server
 nfsserve = "0.10"
-bincode = "1"
+postcard = { version = "1", features = ["use-std"] }
 
 # gRPC
 tonic = "0.14"

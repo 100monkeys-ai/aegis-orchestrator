@@ -26,7 +26,7 @@
 //! - **nolock mount option**: Phase 1 has no NLM (Network Lock Manager) support
 //! - **soft mount with 10s timeout**: Graceful failure on network issues
 //! - **TCP protocol**: More reliable than UDP for container networks
-//! - **FileHandle encoding**: AegisFileHandle serialized with bincode (<64 bytes for NFSv3)
+//! - **FileHandle encoding**: AegisFileHandle serialized with postcard (<64 bytes for NFSv3)
 //!
 //! ## Transport Abstraction
 //! This NFS implementation is **Phase 1 (Docker)**. The same `AegisFSAL` core will be reused

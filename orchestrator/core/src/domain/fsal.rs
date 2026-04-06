@@ -114,8 +114,8 @@ pub enum FsalError {
 
 /// Aegis File Handle - encodes execution and volume ownership
 ///
-/// Serialized with bincode to fit within NFSv3's 64-byte limit.
-/// Current size: 48 bytes raw + ~4 bytes bincode overhead = 52 bytes (safe)
+/// Serialized with postcard to fit within NFSv3's 64-byte limit.
+/// Current size: 48 bytes raw + postcard varint overhead ≤ 52 bytes (safe)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AegisFileHandle {
     /// Execution that opened this file
@@ -150,12 +150,12 @@ impl AegisFileHandle {
 
     /// Serialize to bytes (for NFS file handle)
     pub fn to_bytes(&self) -> Result<Vec<u8>, FsalError> {
-        bincode::serialize(self).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
+        postcard::to_allocvec(self).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
     }
 
     /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FsalError> {
-        bincode::deserialize(bytes).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
+        postcard::from_bytes(bytes).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
     }
 
     /// Validate handle size fits in NFSv3 limit (64 bytes)

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! # NFS FileHandle Serialization (BC-7, ADR-036)
 //!
-//! Provides bincode-based encoding/decoding of [`AegisFileHandle`] so that it
+//! Provides postcard-based encoding/decoding of [`AegisFileHandle`] so that it
 //! fits within the **64-byte hard limit** imposed by the NFSv3 wire protocol
 //! (RFC 1813 §2.3.2, kernel NFS client enforces this via `NFS3_FHSIZE = 64`).
 //!
@@ -10,8 +10,8 @@
 //!
 //! ```text
 //! AegisFileHandle { execution_id: Uuid (16B), volume_id: Uuid (16B), path_hash: u64 (8B) }
-//!   └── bincode::serialize  →  ~44 bytes raw + ~4 bytes length prefix  =  ~48 bytes total
-//!                                                    OK: 48 ≤ 64  ✓
+//!   └── postcard::to_allocvec  →  ~40 bytes raw + varint overhead  ≤  52 bytes total
+//!                                                    OK: ≤ 52 ≤ 64  ✓
 //! ```
 //!
 //! The 64-byte constraint means we **cannot** store the full path in the handle —
@@ -35,7 +35,7 @@ use thiserror::Error;
 /// Errors arising from NFS FileHandle serialization/deserialization.
 #[derive(Debug, Error)]
 pub enum FileHandleError {
-    /// bincode serialization failed (should not happen in practice).
+    /// postcard serialization failed (should not happen in practice).
     #[error("Serialization error: {0}")]
     Serialization(String),
 
@@ -45,7 +45,7 @@ pub enum FileHandleError {
     #[error("FileHandle too large: {size} bytes (max 64)")]
     TooLarge { size: usize },
 
-    /// bincode deserialization failed; the bytes received from the NFS client
+    /// postcard deserialization failed; the bytes received from the NFS client
     /// are corrupt or were not produced by [`encode_file_handle`].
     #[error("Deserialization error: {0}")]
     Deserialization(String),
@@ -53,7 +53,7 @@ pub enum FileHandleError {
 
 /// Encode an [`AegisFileHandle`] to bytes for the NFS wire protocol.
 ///
-/// Uses bincode for compact binary encoding. Returns an error if the resulting
+/// Uses postcard for compact binary encoding. Returns an error if the resulting
 /// byte slice would exceed the 64-byte NFSv3 hard limit enforced by
 /// [`FileHandleError::TooLarge`].
 ///
@@ -67,11 +67,11 @@ pub enum FileHandleError {
 ///
 /// # Errors
 ///
-/// - [`FileHandleError::Serialization`] — bincode encountered an unexpected type.
+/// - [`FileHandleError::Serialization`] — postcard encountered an unexpected type.
 /// - [`FileHandleError::TooLarge`] — encoded size exceeds 64 bytes.
 pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandleError> {
     let bytes =
-        bincode::serialize(handle).map_err(|e| FileHandleError::Serialization(e.to_string()))?;
+        postcard::to_allocvec(handle).map_err(|e| FileHandleError::Serialization(e.to_string()))?;
 
     if bytes.len() > 64 {
         return Err(FileHandleError::TooLarge { size: bytes.len() });
@@ -91,7 +91,7 @@ pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandl
 /// [`FileHandleError::Deserialization`] if the bytes are corrupt or the type
 /// layout has changed since the handle was created.
 pub fn decode_file_handle(bytes: &[u8]) -> Result<AegisFileHandle, FileHandleError> {
-    bincode::deserialize(bytes).map_err(|e| FileHandleError::Deserialization(e.to_string()))
+    postcard::from_bytes(bytes).map_err(|e| FileHandleError::Deserialization(e.to_string()))
 }
 
 #[cfg(test)]
