@@ -1380,6 +1380,7 @@ mod tests {
                     volumes: vec![],
                     advanced: None,
                     input_schema: None,
+                    security_context: None,
                 },
             },
             deployed_at: Utc::now(),

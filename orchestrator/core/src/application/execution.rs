@@ -59,7 +59,7 @@ use crate::domain::volume::{
 };
 use crate::infrastructure::event_bus::{DomainEvent, EventBus, EventBusError};
 use crate::infrastructure::prompt_template_engine::{PromptContext, PromptTemplateEngine};
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::Stream;
@@ -839,6 +839,7 @@ mod tests {
                     .unwrap_or_default(),
                 advanced: None,
                 input_schema: None,
+                security_context: None,
             },
         })
     }
@@ -1065,9 +1066,10 @@ mod tests {
         }))
         .unwrap_err();
 
-        assert!(err
-            .to_string()
-            .contains("Context override key 'instruction' is reserved"));
+        assert!(
+            err.to_string()
+                .contains("Context override key 'instruction' is reserved")
+        );
     }
 
     #[test]
@@ -1465,8 +1467,7 @@ impl StandardExecutionService {
         let has_input = user_input_result.is_ok();
 
         if has_input {
-            const DEFAULT_PROMPT_TEMPLATE: &str =
-                "{{instruction}}{{#if intent}}\n\nTask: {{intent}}{{/if}}\n\nUser: {{input}}\nAgent:";
+            const DEFAULT_PROMPT_TEMPLATE: &str = "{{instruction}}{{#if intent}}\n\nTask: {{intent}}{{/if}}\n\nUser: {{input}}\nAgent:";
 
             let task_spec = agent
                 .manifest
@@ -1743,8 +1744,8 @@ impl StandardExecutionService {
         ) =
             (&self.seal_gateway_client, &self.token_issuer)
         {
-            use base64::engine::general_purpose::STANDARD;
             use base64::Engine;
+            use base64::engine::general_purpose::STANDARD;
             use ed25519_dalek::SigningKey;
 
             // 1. Generate ephemeral Ed25519 keypair

@@ -223,6 +223,7 @@ mod tests {
                 volumes: vec![],
                 advanced: None,
                 input_schema: None,
+                security_context: None,
             },
         };
 
