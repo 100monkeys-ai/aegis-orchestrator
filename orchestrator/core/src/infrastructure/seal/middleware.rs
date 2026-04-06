@@ -167,6 +167,9 @@ impl SealMiddleware {
                             PolicyViolation::OutputSizeLimitExceeded { .. } => {
                                 "output_size_limit_exceeded"
                             }
+                            PolicyViolation::ExecTimeoutCeilingExceeded { .. } => {
+                                "exec_timeout_ceiling_exceeded"
+                            }
                         };
                         metrics::counter!("aegis_seal_policy_violations_total", "violation_type" => violation_type).increment(1);
                     }

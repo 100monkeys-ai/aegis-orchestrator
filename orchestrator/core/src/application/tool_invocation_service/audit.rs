@@ -395,9 +395,9 @@ impl ToolInvocationService {
                     "Subcommand '{subcommand}' not allowed for '{base_command}'. Allowed: {allowed_subcommands:?}"
                 ),
             ),
-            PolicyViolation::ConcurrentExecLimitExceeded { limit } => (
+            PolicyViolation::ConcurrentExecLimitExceeded { limit, active } => (
                 ViolationType::RateLimitExceeded,
-                format!("Concurrent dispatch limit exceeded: limit={limit}"),
+                format!("Concurrent dispatch limit exceeded: limit={limit}, active={active}"),
             ),
             PolicyViolation::OutputSizeLimitExceeded {
                 actual_bytes,
@@ -405,6 +405,15 @@ impl ToolInvocationService {
             } => (
                 ViolationType::ToolNotAllowed,
                 format!("Output size limit exceeded: max={max_bytes}B, actual={actual_bytes}B"),
+            ),
+            PolicyViolation::ExecTimeoutCeilingExceeded {
+                requested_secs,
+                ceiling_secs,
+            } => (
+                ViolationType::TimeoutExceeded,
+                format!(
+                    "Exec timeout ceiling exceeded: requested={requested_secs}s, ceiling={ceiling_secs}s"
+                ),
             ),
         }
     }

@@ -79,6 +79,9 @@ struct ExecutionContext {
     tenant_id: TenantId,
     /// Security context name bound to this execution, used to scope available tools.
     security_context_name: String,
+    /// Count of in-flight `cmd.run` dispatches for this execution.
+    /// Used to enforce `Capability.max_concurrent`.
+    active_dispatch_count: u32,
 }
 
 pub struct InnerLoopService {
@@ -204,6 +207,7 @@ impl InnerLoopService {
                         user_identity: user_identity.clone(),
                         tenant_id,
                         security_context_name,
+                        active_dispatch_count: 0,
                     },
                 );
 
@@ -265,6 +269,7 @@ impl InnerLoopService {
 
                 ctx.pending_dispatch_id = None;
                 ctx.pending_tool_call_id = None;
+                ctx.active_dispatch_count = ctx.active_dispatch_count.saturating_sub(1);
 
                 self.active_executions
                     .write()
@@ -446,6 +451,27 @@ impl InnerLoopService {
                                             "execution context for '{execution_id_str}' not found in active_executions"
                                         ))?
                                 };
+
+                                // Concurrency gate: enforce max_concurrent from the matching Capability.
+                                if let Some(max) = self
+                                    .tool_invocation_service
+                                    .get_cmd_run_max_concurrent(
+                                        &next_ctx.tenant_id,
+                                        &next_ctx.security_context_name,
+                                    )
+                                    .await
+                                    .unwrap_or(None)
+                                {
+                                    if next_ctx.active_dispatch_count >= max {
+                                        anyhow::bail!(
+                                            "PolicyViolation: ConcurrentExecLimitExceeded (limit={max}, active={})",
+                                            next_ctx.active_dispatch_count
+                                        );
+                                    }
+                                }
+
+                                next_ctx.active_dispatch_count =
+                                    next_ctx.active_dispatch_count.saturating_add(1);
                                 let mut step = step;
                                 step.status = "dispatched".to_string();
                                 next_ctx.trajectory.push(step);

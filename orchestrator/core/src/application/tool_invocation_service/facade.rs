@@ -143,6 +143,25 @@ impl ToolInvocationService {
         self
     }
 
+    /// Return the `max_concurrent` limit for `cmd.run` from the first matching
+    /// `Capability` in the named `SecurityContext`, if any.
+    pub async fn get_cmd_run_max_concurrent(
+        &self,
+        _tenant_id: &TenantId,
+        security_context_name: &str,
+    ) -> anyhow::Result<Option<u32>> {
+        let ctx = self
+            .security_context_repo
+            .find_by_name(security_context_name)
+            .await?;
+        Ok(ctx.and_then(|c| {
+            c.capabilities
+                .into_iter()
+                .find(|cap| cap.matches_tool_name("cmd.run"))
+                .and_then(|cap| cap.max_concurrent)
+        }))
+    }
+
     /// SEAL envelope-based tool invocation (Path 1).
     /// Verifies the SEAL envelope, validates tool input contracts, then delegates
     /// to `dispatch_tool_core` for unified tool dispatch.
