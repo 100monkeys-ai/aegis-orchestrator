@@ -38,6 +38,8 @@ use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
 use crate::domain::shared_kernel::{AgentId, DispatchId, ExecutionId, ImagePullPolicy, VolumeId};
+use crate::domain::tenancy::TenantQuotaKind;
+use crate::domain::tenant::TenantId;
 use crate::domain::volume::StorageClass;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1170,20 +1172,34 @@ pub enum TenantEvent {
         tenant_slug: String,
         deleted_at: DateTime<Utc>,
     },
-    /// Admin accessed another tenant's data via X-Aegis-Tenant header
+    /// Tenant permanently deleted (after retention window or explicit hard-delete)
+    TenantHardDeleted {
+        tenant_id: TenantId,
+        hard_deleted_at: DateTime<Utc>,
+    },
+    /// Admin accessed another tenant's data via X-Aegis-Tenant header.
+    /// The admin's own tenant is implied by their authenticated identity.
     AdminCrossTenantAccess {
-        admin_sub: String,
-        source_tenant: String,
-        target_tenant: String,
+        admin_identity: String,
+        target_tenant_id: TenantId,
         accessed_at: DateTime<Utc>,
     },
     /// Tenant quota exceeded
     TenantQuotaExceeded {
         tenant_slug: String,
-        quota_kind: String,
-        current: u64,
+        quota_kind: TenantQuotaKind,
+        current_value: u64,
         limit: u64,
         exceeded_at: DateTime<Utc>,
+    },
+    /// A per-tenant resource quota was updated by an operator
+    TenantQuotaUpdated {
+        tenant_id: TenantId,
+        quota_kind: TenantQuotaKind,
+        old_limit: u64,
+        new_limit: u64,
+        updated_at: DateTime<Utc>,
+        updated_by: String,
     },
     /// Consumer user's per-user tenant provisioned at signup (ADR-097)
     UserTenantProvisioned {

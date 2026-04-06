@@ -66,7 +66,9 @@ pub mod stimulus;
 pub mod storage_event_persister;
 pub mod storage_router;
 pub mod temporal_mapper;
+pub mod tenant_onboarding;
 pub mod tenant_provisioning;
+pub mod tenant_quota;
 pub mod volume_manager;
 pub mod workflow_scope;
 

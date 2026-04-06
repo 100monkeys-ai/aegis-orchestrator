@@ -370,7 +370,7 @@ mod tests {
             vec![1, 2, 3],
             "token".to_string(),
             context,
-            crate::domain::tenant::TenantId::local_default(),
+            crate::domain::tenant::TenantId::consumer(),
         )
     }
 

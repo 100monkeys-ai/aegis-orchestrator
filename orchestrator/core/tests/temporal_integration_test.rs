@@ -162,36 +162,24 @@ impl WorkflowRepository for MockWorkflowRepo {
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow: &Workflow,
+        _workflow: &Workflow,
     ) -> Result<(), RepositoryError> {
-        self.save(workflow).await
-    }
-
-    async fn save(&self, _w: &Workflow) -> Result<(), RepositoryError> {
         Ok(())
     }
 
     async fn find_by_id_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow_id: WorkflowId,
+        _workflow_id: WorkflowId,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_id(workflow_id).await
-    }
-
-    async fn find_by_id(&self, _i: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
 
     async fn find_by_name_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow_name: &str,
+        _workflow_name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_name(workflow_name).await
-    }
-
-    async fn find_by_name(&self, _n: &str) -> Result<Option<Workflow>, RepositoryError> {
         Ok(None)
     }
 
@@ -208,22 +196,14 @@ impl WorkflowRepository for MockWorkflowRepo {
         &self,
         _tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
-        self.list_all().await
-    }
-
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
     }
 
     async fn delete_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow_id: WorkflowId,
+        _workflow_id: WorkflowId,
     ) -> Result<(), RepositoryError> {
-        self.delete(workflow_id).await
-    }
-
-    async fn delete(&self, _i: WorkflowId) -> Result<(), RepositoryError> {
         Ok(())
     }
 
@@ -283,25 +263,14 @@ impl WorkflowRepository for StaticWorkflowRepo {
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow: &Workflow,
+        _workflow: &Workflow,
     ) -> Result<(), RepositoryError> {
-        self.save(workflow).await
-    }
-
-    async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
         Ok(())
     }
 
     async fn find_by_id_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        workflow_id: WorkflowId,
-    ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_id(workflow_id).await
-    }
-
-    async fn find_by_id(
-        &self,
         workflow_id: WorkflowId,
     ) -> Result<Option<Workflow>, RepositoryError> {
         Ok((self.workflow.id == workflow_id).then(|| self.workflow.clone()))
@@ -312,10 +281,6 @@ impl WorkflowRepository for StaticWorkflowRepo {
         _tenant_id: &TenantId,
         workflow_name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_name(workflow_name).await
-    }
-
-    async fn find_by_name(&self, workflow_name: &str) -> Result<Option<Workflow>, RepositoryError> {
         Ok((self.workflow.metadata.name == workflow_name).then(|| self.workflow.clone()))
     }
 
@@ -334,10 +299,6 @@ impl WorkflowRepository for StaticWorkflowRepo {
         &self,
         _tenant_id: &TenantId,
     ) -> Result<Vec<Workflow>, RepositoryError> {
-        self.list_all().await
-    }
-
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![self.workflow.clone()])
     }
 
@@ -346,10 +307,6 @@ impl WorkflowRepository for StaticWorkflowRepo {
         _tenant_id: &TenantId,
         workflow_id: WorkflowId,
     ) -> Result<(), RepositoryError> {
-        self.delete(workflow_id).await
-    }
-
-    async fn delete(&self, workflow_id: WorkflowId) -> Result<(), RepositoryError> {
         if self.workflow.id == workflow_id {
             Ok(())
         } else {
@@ -359,10 +316,10 @@ impl WorkflowRepository for StaticWorkflowRepo {
 
     async fn resolve_by_name(
         &self,
-        _tenant_id: &TenantId,
+        tenant_id: &TenantId,
         name: &str,
     ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_name(name).await
+        self.find_by_name_for_tenant(tenant_id, name).await
     }
     async fn resolve_by_name_and_version(
         &self,
@@ -374,8 +331,8 @@ impl WorkflowRepository for StaticWorkflowRepo {
             && self.workflow.metadata.version.as_deref() == Some(version))
         .then(|| self.workflow.clone()))
     }
-    async fn list_visible(&self, _tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
-        self.list_all().await
+    async fn list_visible(&self, tenant_id: &TenantId) -> Result<Vec<Workflow>, RepositoryError> {
+        self.list_all_for_tenant(tenant_id).await
     }
     async fn list_global(&self) -> Result<Vec<Workflow>, RepositoryError> {
         Ok(vec![])
@@ -409,32 +366,29 @@ impl WorkflowRepository for StaticWorkflowRepo {
 struct MockWorkflowExecRepo;
 #[async_trait]
 impl WorkflowExecutionRepository for MockWorkflowExecRepo {
+    async fn find_tenant_id_by_execution(
+        &self,
+        _id: ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError> {
+        Ok(None)
+    }
+
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        execution: &WorkflowExecution,
+        _execution: &WorkflowExecution,
     ) -> Result<(), RepositoryError> {
-        self.save(execution).await
-    }
-
-    async fn save(&self, _e: &WorkflowExecution) -> Result<(), RepositoryError> {
         Ok(())
     }
 
     async fn find_by_id_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        execution_id: ExecutionId,
-    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
-        self.find_by_id(execution_id).await
-    }
-
-    async fn find_by_id(
-        &self,
-        _i: ExecutionId,
+        _execution_id: ExecutionId,
     ) -> Result<Option<WorkflowExecution>, RepositoryError> {
         Ok(None)
     }
+
     async fn append_event(
         &self,
         _execution_id: ExecutionId,
@@ -460,10 +414,6 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
         &self,
         _tenant_id: &TenantId,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
-        self.find_active().await
-    }
-
-    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
 
@@ -486,13 +436,6 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
         Vec<aegis_orchestrator_core::domain::workflow::WorkflowExecutionEventRecord>,
         RepositoryError,
     > {
-        Ok(vec![])
-    }
-    async fn list_paginated(
-        &self,
-        _limit: usize,
-        _offset: usize,
-    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
 
@@ -507,10 +450,10 @@ impl WorkflowExecutionRepository for MockWorkflowExecRepo {
     async fn list_paginated_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        limit: usize,
-        offset: usize,
+        _limit: usize,
+        _offset: usize,
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
-        self.list_paginated(limit, offset).await
+        Ok(vec![])
     }
 }
 
@@ -518,6 +461,13 @@ struct FailingWorkflowExecRepo;
 
 #[async_trait]
 impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
+    async fn find_tenant_id_by_execution(
+        &self,
+        _id: ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError> {
+        Ok(None)
+    }
+
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -528,21 +478,9 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
         ))
     }
 
-    async fn save(&self, execution: &WorkflowExecution) -> Result<(), RepositoryError> {
-        self.save_for_tenant(&TenantId::local_default(), execution)
-            .await
-    }
-
     async fn find_by_id_for_tenant(
         &self,
         _tenant_id: &TenantId,
-        _execution_id: ExecutionId,
-    ) -> Result<Option<WorkflowExecution>, RepositoryError> {
-        Ok(None)
-    }
-
-    async fn find_by_id(
-        &self,
         _execution_id: ExecutionId,
     ) -> Result<Option<WorkflowExecution>, RepositoryError> {
         Ok(None)
@@ -578,10 +516,6 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
         Ok(vec![])
     }
 
-    async fn find_active(&self) -> Result<Vec<WorkflowExecution>, RepositoryError> {
-        Ok(vec![])
-    }
-
     async fn find_by_workflow_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -601,14 +535,6 @@ impl WorkflowExecutionRepository for FailingWorkflowExecRepo {
         Vec<aegis_orchestrator_core::domain::workflow::WorkflowExecutionEventRecord>,
         RepositoryError,
     > {
-        Ok(vec![])
-    }
-
-    async fn list_paginated(
-        &self,
-        _limit: usize,
-        _offset: usize,
-    ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         Ok(vec![])
     }
 
@@ -776,7 +702,7 @@ states:
         input: serde_json::json!({"message": "hello testing"}),
         blackboard: None,
         version: None,
-        tenant_id: Some(TenantId::local_default()),
+        tenant_id: Some(TenantId::consumer()),
         security_context_name: None,
         intent: None,
     };
@@ -812,7 +738,7 @@ async fn start_execution_surfaces_repository_save_failure_before_temporal_start(
             input: json!({"topic": "copy"}),
             blackboard: None,
             version: None,
-            tenant_id: Some(TenantId::local_default()),
+            tenant_id: Some(TenantId::consumer()),
             security_context_name: None,
             intent: None,
         })

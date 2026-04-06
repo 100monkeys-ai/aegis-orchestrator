@@ -37,6 +37,8 @@ pub enum KeycloakAdminError {
     TokenError(String),
     #[error("failed to set user attribute: {status} {body}")]
     AttributeError { status: u16, body: String },
+    #[error("realm operation failed: {status} {body}")]
+    RealmError { status: u16, body: String },
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
 }
@@ -104,6 +106,53 @@ impl KeycloakAdminClient {
         }
 
         Ok(token_resp.access_token)
+    }
+
+    /// Create a new Keycloak realm for an enterprise tenant (ADR-056).
+    ///
+    /// Idempotent: a 409 Conflict response (realm already exists) is treated as success.
+    pub async fn create_realm(&self, realm_name: &str) -> Result<(), KeycloakAdminError> {
+        let token = self.get_admin_token().await?;
+        let url = format!("{}/admin/realms", self.config.host);
+
+        let resp = self
+            .http
+            .post(&url)
+            .bearer_auth(&token)
+            .json(&serde_json::json!({
+                "realm": realm_name,
+                "enabled": true
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 409 {
+            return Ok(());
+        }
+
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(KeycloakAdminError::RealmError { status: code, body })
+    }
+
+    /// Delete a Keycloak realm (rollback / deprovisioning).
+    ///
+    /// A 404 response (realm not found) is treated as idempotent success.
+    pub async fn delete_realm(&self, realm_name: &str) -> Result<(), KeycloakAdminError> {
+        let token = self.get_admin_token().await?;
+        let url = format!("{}/admin/realms/{}", self.config.host, realm_name);
+
+        let resp = self.http.delete(&url).bearer_auth(&token).send().await?;
+
+        let status = resp.status();
+        if status.is_success() || status.as_u16() == 404 {
+            return Ok(());
+        }
+
+        let code = status.as_u16();
+        let body = resp.text().await.unwrap_or_default();
+        Err(KeycloakAdminError::RealmError { status: code, body })
     }
 
     /// Set a user attribute on a Keycloak user in the given realm.

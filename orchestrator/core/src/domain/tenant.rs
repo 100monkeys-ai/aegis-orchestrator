@@ -22,11 +22,6 @@ mod tests {
     }
 
     #[test]
-    fn local_default_delegates_to_consumer() {
-        assert_eq!(TenantId::local_default(), TenantId::consumer());
-    }
-
-    #[test]
     fn default_returns_consumer() {
         assert_eq!(TenantId::default(), TenantId::consumer());
     }

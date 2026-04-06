@@ -297,6 +297,13 @@ pub enum ExecutionError {
         parent_tenant: String,
         child_tenant: String,
     },
+    #[error(
+        "Cross-tenant access forbidden: caller tenant '{caller_tenant}' cannot execute agent owned by tenant '{requested_agent_tenant}'"
+    )]
+    CrossTenantAccessForbidden {
+        requested_agent_tenant: String,
+        caller_tenant: String,
+    },
 }
 
 impl Execution {

@@ -739,4 +739,18 @@ impl ExecutionRepository for PostgresExecutionRepository {
             Ok(None)
         }
     }
+
+    async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COUNT(*) FROM executions
+            WHERE tenant_id = $1 AND status IN ('running', 'pending')
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+        Ok(count.max(0) as u64)
+    }
 }

@@ -963,16 +963,16 @@ mod tests {
 
     #[async_trait]
     impl WorkflowExecutionRepository for FailingAppendRepo {
+        async fn find_tenant_id_by_execution(
+            &self,
+            _id: ExecutionId,
+        ) -> Result<Option<TenantId>, RepositoryError> {
+            Ok(None)
+        }
+
         async fn save_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,
-            execution: &crate::domain::workflow::WorkflowExecution,
-        ) -> Result<(), RepositoryError> {
-            self.save(execution).await
-        }
-
-        async fn save(
-            &self,
             _execution: &crate::domain::workflow::WorkflowExecution,
         ) -> Result<(), RepositoryError> {
             Ok(())
@@ -981,34 +981,14 @@ mod tests {
         async fn find_by_id_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,
-            id: ExecutionId,
-        ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-            self.find_by_id(id).await
-        }
-
-        async fn find_by_id(
-            &self,
             _id: ExecutionId,
         ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-            Ok(None)
-        }
-
-        async fn find_tenant_id_by_execution(
-            &self,
-            _id: ExecutionId,
-        ) -> Result<Option<TenantId>, RepositoryError> {
             Ok(None)
         }
 
         async fn find_active_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,
-        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-            self.find_active().await
-        }
-
-        async fn find_active(
-            &self,
         ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
             Ok(vec![])
         }
@@ -1062,21 +1042,13 @@ mod tests {
             Ok(0)
         }
 
-        async fn list_paginated(
+        async fn list_paginated_for_tenant(
             &self,
+            _tenant_id: &crate::domain::tenant::TenantId,
             _limit: usize,
             _offset: usize,
         ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
             Ok(vec![])
-        }
-
-        async fn list_paginated_for_tenant(
-            &self,
-            _tenant_id: &crate::domain::tenant::TenantId,
-            limit: usize,
-            offset: usize,
-        ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-            self.list_paginated(limit, offset).await
         }
     }
 
@@ -1303,9 +1275,14 @@ mod tests {
             crate::domain::execution::ExecutionStatus::Completed
         );
         assert_eq!(saved.blackboard.get("result"), Some(&json!("done")));
+        // Verify the execution is not visible under a different tenant's scope
+        let other_tenant = TenantId::from_string("tenant-red").unwrap();
         assert!(
-            repo.find_by_id(execution_id).await.unwrap().is_none(),
-            "default tenant lookup should not be used for non-local executions"
+            repo.find_by_id_for_tenant(&other_tenant, execution_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "cross-tenant lookup should return None for an execution owned by a different tenant"
         );
 
         match receiver.recv().await.unwrap() {

@@ -681,8 +681,7 @@ impl InnerLoopService {
                         &fallback_identity
                     }
                 };
-                let effective_tenant_id =
-                    tenant_id.cloned().unwrap_or_else(TenantId::local_default);
+                let effective_tenant_id = tenant_id.cloned().unwrap_or_else(TenantId::consumer);
                 let scope = if user_identity.is_some() {
                     RateLimitScope::User {
                         user_id: effective_identity.sub.clone(),
@@ -765,7 +764,7 @@ impl InnerLoopService {
                             }
                         };
                         let effective_tenant_id =
-                            tenant_id.cloned().unwrap_or_else(TenantId::local_default);
+                            tenant_id.cloned().unwrap_or_else(TenantId::consumer);
                         let scope = if user_identity.is_some() {
                             RateLimitScope::User {
                                 user_id: effective_identity.sub.clone(),

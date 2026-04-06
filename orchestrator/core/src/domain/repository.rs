@@ -138,49 +138,8 @@ pub trait AgentRepository: Send + Sync {
         id: AgentId,
     ) -> Result<Option<Agent>, RepositoryError>;
 
-    /// Save agent (create or update)
-    async fn save(&self, agent: &Agent) -> Result<(), RepositoryError> {
-        self.save_for_tenant(&TenantId::local_default(), agent)
-            .await
-    }
-
-    /// Find agent by ID
-    async fn find_by_id(&self, id: AgentId) -> Result<Option<Agent>, RepositoryError> {
-        self.find_by_id_for_tenant(&TenantId::local_default(), id)
-            .await
-    }
-
-    /// Find agent by name
-    async fn find_by_name(&self, name: &str) -> Result<Option<Agent>, RepositoryError> {
-        self.find_by_name_for_tenant(&TenantId::local_default(), name)
-            .await
-    }
-
-    /// Find agent by name and version
-    async fn find_by_name_and_version(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<Agent>, RepositoryError> {
-        self.find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
-            .await
-    }
-
-    /// List all agents
-    async fn list_all(&self) -> Result<Vec<Agent>, RepositoryError> {
-        self.list_all_for_tenant(&TenantId::local_default()).await
-    }
-
-    /// Delete agent by ID
-    async fn delete(&self, id: AgentId) -> Result<(), RepositoryError> {
-        self.delete_for_tenant(&TenantId::local_default(), id).await
-    }
-
-    /// List all version history entries for an agent
-    async fn list_versions(&self, agent_id: AgentId) -> Result<Vec<AgentVersion>, RepositoryError> {
-        self.list_versions_for_tenant(&TenantId::local_default(), agent_id)
-            .await
-    }
+    /// Count agents with `status = 'active'` for a tenant (used by quota enforcement).
+    async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
 }
 
 /// Repository interface for Execution aggregates
@@ -231,54 +190,6 @@ pub trait ExecutionRepository: Send + Sync {
         agent_id: AgentId,
     ) -> Result<i64, RepositoryError>;
 
-    /// Save execution (create or update)
-    async fn save(&self, execution: &Execution) -> Result<(), RepositoryError> {
-        self.save_for_tenant(&TenantId::local_default(), execution)
-            .await
-    }
-
-    /// Find execution by ID
-    async fn find_by_id(&self, id: ExecutionId) -> Result<Option<Execution>, RepositoryError> {
-        self.find_by_id_for_tenant(&TenantId::local_default(), id)
-            .await
-    }
-
-    /// Find executions by agent ID (newest first, capped at `limit`)
-    async fn find_by_agent(
-        &self,
-        agent_id: AgentId,
-        limit: usize,
-    ) -> Result<Vec<Execution>, RepositoryError> {
-        self.find_by_agent_for_tenant(&TenantId::local_default(), agent_id, limit)
-            .await
-    }
-
-    /// Find executions by workflow ID (newest first, capped at `limit`)
-    async fn find_by_workflow(
-        &self,
-        workflow_id: WorkflowId,
-        limit: usize,
-    ) -> Result<Vec<Execution>, RepositoryError> {
-        self.find_by_workflow_for_tenant(&TenantId::local_default(), workflow_id, limit)
-            .await
-    }
-
-    /// Find recent executions (limit results)
-    async fn find_recent(&self, limit: usize) -> Result<Vec<Execution>, RepositoryError> {
-        self.find_recent_for_tenant(&TenantId::local_default(), limit)
-            .await
-    }
-
-    /// Delete execution by ID
-    async fn delete(&self, id: ExecutionId) -> Result<(), RepositoryError> {
-        self.delete_for_tenant(&TenantId::local_default(), id).await
-    }
-
-    async fn count_by_agent(&self, agent_id: AgentId) -> Result<i64, RepositoryError> {
-        self.count_by_agent_for_tenant(&TenantId::local_default(), agent_id)
-            .await
-    }
-
     /// Look up an execution by ID without a tenant filter.
     ///
     /// This is an internal service-to-service method. It intentionally bypasses tenant
@@ -289,6 +200,9 @@ pub trait ExecutionRepository: Send + Sync {
         &self,
         id: ExecutionId,
     ) -> Result<Option<Execution>, RepositoryError>;
+
+    /// Count executions with `status IN ('running', 'pending')` for a tenant (quota enforcement).
+    async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError>;
 }
 
 /// Repository interface for Workflow aggregates
@@ -392,44 +306,6 @@ pub trait WorkflowRepository: Send + Sync {
         self.find_by_id_for_tenant(&TenantId::system(), id).await
     }
 
-    /// Save workflow (create or update)
-    async fn save(&self, workflow: &Workflow) -> Result<(), RepositoryError> {
-        self.save_for_tenant(&TenantId::local_default(), workflow)
-            .await
-    }
-
-    /// Find workflow by ID
-    async fn find_by_id(&self, id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_id_for_tenant(&TenantId::local_default(), id)
-            .await
-    }
-
-    /// Find workflow by name
-    async fn find_by_name(&self, name: &str) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_name_for_tenant(&TenantId::local_default(), name)
-            .await
-    }
-
-    /// Find workflow by name and version
-    async fn find_by_name_and_version(
-        &self,
-        name: &str,
-        version: &str,
-    ) -> Result<Option<Workflow>, RepositoryError> {
-        self.find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
-            .await
-    }
-
-    /// List all workflows
-    async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
-        self.list_all_for_tenant(&TenantId::local_default()).await
-    }
-
-    /// Delete workflow by ID
-    async fn delete(&self, id: WorkflowId) -> Result<(), RepositoryError> {
-        self.delete_for_tenant(&TenantId::local_default(), id).await
-    }
-
     /// Fetch a workflow by ID, checking the requesting tenant first then falling through to the
     /// system tenant. Returns `Ok(Some(...))` if found in either tenant, `Ok(None)` if absent
     /// in both. Mirrors the agent visibility pattern.
@@ -481,50 +357,6 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError>;
 
-    /// Save workflow execution (create or update)
-    async fn save(
-        &self,
-        execution: &crate::domain::workflow::WorkflowExecution,
-    ) -> Result<(), RepositoryError> {
-        self.save_for_tenant(&TenantId::local_default(), execution)
-            .await
-    }
-
-    /// Find workflow execution by ID
-    async fn find_by_id(
-        &self,
-        id: ExecutionId,
-    ) -> Result<Option<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-        self.find_by_id_for_tenant(&TenantId::local_default(), id)
-            .await
-    }
-
-    /// Resolve the owning tenant for a workflow execution by ID.
-    async fn find_tenant_id_by_execution(
-        &self,
-        id: ExecutionId,
-    ) -> Result<Option<TenantId>, RepositoryError> {
-        Ok(self.find_by_id(id).await?.map(|we| we.tenant_id))
-    }
-
-    /// Find active workflow executions
-    async fn find_active(
-        &self,
-    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-        self.find_active_for_tenant(&TenantId::local_default())
-            .await
-    }
-
-    async fn find_by_workflow(
-        &self,
-        workflow_id: crate::domain::workflow::WorkflowId,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-        self.find_by_workflow_for_tenant(&TenantId::local_default(), workflow_id, limit, offset)
-            .await
-    }
-
     async fn count_by_workflow_for_tenant(
         &self,
         tenant_id: &TenantId,
@@ -539,21 +371,6 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         temporal_workflow_id: &str,
         temporal_run_id: &str,
     ) -> Result<(), RepositoryError>;
-
-    async fn update_temporal_linkage(
-        &self,
-        execution_id: ExecutionId,
-        temporal_workflow_id: &str,
-        temporal_run_id: &str,
-    ) -> Result<(), RepositoryError> {
-        self.update_temporal_linkage_for_tenant(
-            &TenantId::local_default(),
-            execution_id,
-            temporal_workflow_id,
-            temporal_run_id,
-        )
-        .await
-    }
 
     /// Append an execution event to the event sourcing audit trail (idempotent)
     async fn append_event(
@@ -577,15 +394,14 @@ pub trait WorkflowExecutionRepository: Send + Sync {
         offset: usize,
     ) -> Result<Vec<crate::domain::workflow::WorkflowExecutionEventRecord>, RepositoryError>;
 
-    /// List workflow executions paginated (newest first)
-    async fn list_paginated(
+    /// Resolve the owning tenant for a workflow execution by its ID.
+    ///
+    /// Returns `None` if the execution does not exist. Used by the Temporal event listener
+    /// to route events to the correct tenant scope without requiring a known tenant upfront.
+    async fn find_tenant_id_by_execution(
         &self,
-        limit: usize,
-        offset: usize,
-    ) -> Result<Vec<crate::domain::workflow::WorkflowExecution>, RepositoryError> {
-        self.list_paginated_for_tenant(&TenantId::local_default(), limit, offset)
-            .await
-    }
+        id: ExecutionId,
+    ) -> Result<Option<TenantId>, RepositoryError>;
 }
 
 /// Repository interface for Volume aggregates

@@ -90,7 +90,7 @@ pub trait RegisterWorkflowUseCase: Send + Sync {
         yaml_manifest: &str,
         force: bool,
     ) -> Result<RegisteredWorkflow> {
-        self.register_workflow_for_tenant(&TenantId::local_default(), yaml_manifest, force)
+        self.register_workflow_for_tenant(&TenantId::consumer(), yaml_manifest, force)
             .await
     }
 }
@@ -486,36 +486,24 @@ spec:
         async fn save_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            workflow: &Workflow,
+            _workflow: &Workflow,
         ) -> Result<(), RepositoryError> {
-            self.save(workflow).await
-        }
-
-        async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
             Err(RepositoryError::Database("write failed".to_string()))
         }
 
         async fn find_by_id_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            id: WorkflowId,
+            _id: WorkflowId,
         ) -> Result<Option<Workflow>, RepositoryError> {
-            self.find_by_id(id).await
-        }
-
-        async fn find_by_id(&self, _id: WorkflowId) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
 
         async fn find_by_name_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            name: &str,
+            _name: &str,
         ) -> Result<Option<Workflow>, RepositoryError> {
-            self.find_by_name(name).await
-        }
-
-        async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
 
@@ -532,22 +520,14 @@ spec:
             &self,
             _tenant_id: &TenantId,
         ) -> Result<Vec<Workflow>, RepositoryError> {
-            self.list_all().await
-        }
-
-        async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
             Ok(vec![])
         }
 
         async fn delete_for_tenant(
             &self,
             _tenant_id: &TenantId,
-            id: WorkflowId,
+            _id: WorkflowId,
         ) -> Result<(), RepositoryError> {
-            self.delete(id).await
-        }
-
-        async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
             Ok(())
         }
 
@@ -626,7 +606,7 @@ spec:
         let calls = engine.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "registration-test-workflow");
-        assert_eq!(calls[0].tenant_id, TenantId::local_default().to_string());
+        assert_eq!(calls[0].tenant_id, TenantId::consumer().to_string());
         assert_eq!(calls[0].version, "1.2.3");
 
         let persisted = repo
@@ -857,7 +837,10 @@ spec:
         assert_eq!(calls[0].workflow_id, first.workflow_id);
         assert_eq!(calls[1].workflow_id, first.workflow_id);
 
-        let workflows = repo.list_all().await.unwrap();
+        let workflows = repo
+            .list_all_for_tenant(&TenantId::consumer())
+            .await
+            .unwrap();
         assert_eq!(workflows.len(), 1);
         assert_eq!(workflows[0].id.to_string(), first.workflow_id);
     }

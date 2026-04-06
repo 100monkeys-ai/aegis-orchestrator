@@ -539,6 +539,13 @@ impl StubWorkflowExecutionRepository {
 
 #[async_trait]
 impl WorkflowExecutionRepository for StubWorkflowExecutionRepository {
+    async fn find_tenant_id_by_execution(
+        &self,
+        _id: crate::domain::execution::ExecutionId,
+    ) -> Result<Option<TenantId>, crate::domain::repository::RepositoryError> {
+        Ok(None)
+    }
+
     async fn save_for_tenant(
         &self,
         _tenant_id: &TenantId,
@@ -1391,7 +1398,7 @@ async fn workflow_execution_tools_list_and_get() {
     let (fsal, volume_registry) = test_fsal_deps();
     let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
     let workflow_execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
-    let tenant_id = TenantId::local_default();
+    let tenant_id = TenantId::consumer();
     let workflow = build_test_workflow("execution-list");
 
     workflow_repo

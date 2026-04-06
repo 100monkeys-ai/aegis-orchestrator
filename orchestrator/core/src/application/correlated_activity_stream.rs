@@ -666,6 +666,13 @@ mod tests {
 
     #[async_trait]
     impl WorkflowExecutionRepository for EmptyWorkflowExecutionRepository {
+        async fn find_tenant_id_by_execution(
+            &self,
+            _id: crate::domain::execution::ExecutionId,
+        ) -> std::result::Result<Option<crate::domain::tenant::TenantId>, RepositoryError> {
+            Ok(None)
+        }
+
         async fn save_for_tenant(
             &self,
             _tenant_id: &crate::domain::tenant::TenantId,

@@ -279,6 +279,20 @@ impl AgentRepository for InMemoryAgentRepository {
         }
         Ok(None)
     }
+
+    async fn count_active(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let agents = self.agents.read().unwrap();
+        let count = agents
+            .get(tenant_id)
+            .map(|tenant_agents| {
+                tenant_agents
+                    .values()
+                    .filter(|a| matches!(a.status, crate::domain::agent::AgentStatus::Active))
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        Ok(count)
+    }
 }
 
 // AgentLifecycleService implementation for in-memory use
@@ -579,6 +593,26 @@ impl ExecutionRepository for InMemoryExecutionRepository {
             .flat_map(|tenant_execs| tenant_execs.get(&id))
             .next()
             .cloned())
+    }
+
+    async fn count_running(&self, tenant_id: &TenantId) -> Result<u64, RepositoryError> {
+        let executions = self.executions.read().unwrap();
+        let count = executions
+            .get(tenant_id)
+            .map(|tenant_execs| {
+                tenant_execs
+                    .values()
+                    .filter(|e| {
+                        matches!(
+                            e.status,
+                            crate::domain::execution::ExecutionStatus::Running
+                                | crate::domain::execution::ExecutionStatus::Pending
+                        )
+                    })
+                    .count() as u64
+            })
+            .unwrap_or(0);
+        Ok(count)
     }
 }
 
@@ -1325,59 +1359,80 @@ mod tests {
     #[tokio::test]
     async fn test_in_memory_agent_repository_basic() {
         let repo = InMemoryAgentRepository::new();
+        let tenant = TenantId::consumer();
 
         // Test with empty repository
-        let all_agents = repo.list_all().await.unwrap();
+        let all_agents = repo.list_all_for_tenant(&tenant).await.unwrap();
         assert_eq!(all_agents.len(), 0);
 
         // Test finding non-existent agent
         let non_existent_id = AgentId::new();
-        let result = repo.find_by_id(non_existent_id).await.unwrap();
+        let result = repo
+            .find_by_id_for_tenant(&tenant, non_existent_id)
+            .await
+            .unwrap();
         assert!(result.is_none());
 
         // Test finding by non-existent name
-        let result = repo.find_by_name("non-existent").await.unwrap();
+        let result = repo
+            .find_by_name_for_tenant(&tenant, "non-existent")
+            .await
+            .unwrap();
         assert!(result.is_none());
 
         // Test deleting non-existent agent (should not error)
-        let delete_result = repo.delete(non_existent_id).await;
+        let delete_result = repo.delete_for_tenant(&tenant, non_existent_id).await;
         assert!(delete_result.is_ok());
     }
 
     #[tokio::test]
     async fn test_in_memory_execution_repository_basic() {
         let repo = InMemoryExecutionRepository::new();
+        let tenant = TenantId::consumer();
 
         // Test with empty repository
         let agent_id = AgentId::new();
-        let agent_executions = repo.find_by_agent(agent_id, 100).await.unwrap();
+        let agent_executions = repo
+            .find_by_agent_for_tenant(&tenant, agent_id, 100)
+            .await
+            .unwrap();
         assert_eq!(agent_executions.len(), 0);
 
         // Test finding non-existent execution
         let execution_id = ExecutionId::new();
-        let result = repo.find_by_id(execution_id).await.unwrap();
+        let result = repo
+            .find_by_id_for_tenant(&tenant, execution_id)
+            .await
+            .unwrap();
         assert!(result.is_none());
 
         // Test deleting non-existent execution (should not error)
-        let delete_result = repo.delete(execution_id).await;
+        let delete_result = repo.delete_for_tenant(&tenant, execution_id).await;
         assert!(delete_result.is_ok());
     }
 
     #[tokio::test]
     async fn test_in_memory_workflow_repository_basic() {
         let repo = InMemoryWorkflowRepository::new();
+        let tenant = TenantId::consumer();
 
         // Test with empty repository
-        let all_workflows = repo.list_all().await.unwrap();
+        let all_workflows = repo.list_all_for_tenant(&tenant).await.unwrap();
         assert_eq!(all_workflows.len(), 0);
 
         // Test finding non-existent workflow
         let workflow_id = WorkflowId::new();
-        let result = repo.find_by_id(workflow_id).await.unwrap();
+        let result = repo
+            .find_by_id_for_tenant(&tenant, workflow_id)
+            .await
+            .unwrap();
         assert!(result.is_none());
 
         // Test finding by non-existent name
-        let result = repo.find_by_name("non-existent").await.unwrap();
+        let result = repo
+            .find_by_name_for_tenant(&tenant, "non-existent")
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 }

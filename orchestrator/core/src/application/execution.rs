@@ -275,6 +275,8 @@ pub struct StandardExecutionService {
     /// Optional output handler service invoked after execution completes (ADR-103).
     output_handler_service:
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
+    /// Optional quota enforcement service (ADR-056). Checks concurrent execution limits.
+    quota_service: Option<Arc<crate::application::tenant_quota::TenantQuotaService>>,
 }
 
 impl StandardExecutionService {
@@ -546,7 +548,17 @@ impl StandardExecutionService {
             seal_gateway_client: None,
             token_issuer: None,
             output_handler_service: None,
+            quota_service: None,
         }
+    }
+
+    /// Attach a quota enforcement service for per-tenant concurrent execution limits (ADR-056).
+    pub fn with_quota_service(
+        mut self,
+        quota_service: Arc<crate::application::tenant_quota::TenantQuotaService>,
+    ) -> Self {
+        self.quota_service = Some(quota_service);
+        self
     }
 
     /// Attach an NFS gateway so volume contexts are registered before agent containers spawn
@@ -881,7 +893,7 @@ mod tests {
 
     #[tokio::test]
     async fn judge_inherits_parent_explicit_volumes_as_read_only_mounts() {
-        let tenant_id = CoreTenantId::local_default();
+        let tenant_id = CoreTenantId::consumer();
         let parent_agent = make_agent("worker", None, Some("/workspace/project"));
         let judge_agent = make_agent("judge", Some("judge"), None);
         let parent_execution = make_parent_execution(parent_agent.id);
@@ -995,7 +1007,7 @@ mod tests {
 
     #[tokio::test]
     async fn judge_fails_fast_when_parent_has_provisioned_volumes_but_no_nfs_gateway() {
-        let tenant_id = CoreTenantId::local_default();
+        let tenant_id = CoreTenantId::consumer();
         let parent_agent = make_agent("worker", None, Some("/workspace/project"));
         let judge_agent = make_agent("judge", Some("judge"), None);
         let parent_execution = make_parent_execution(parent_agent.id);
@@ -1182,6 +1194,7 @@ mod tests {
 struct ExecutionMonitor {
     execution_id: ExecutionId,
     agent_id: AgentId,
+    tenant_id: TenantId,
     repository: Arc<dyn ExecutionRepository>,
     event_bus: Arc<EventBus>,
 }
@@ -1194,11 +1207,18 @@ impl SupervisorObserver for ExecutionMonitor {
         metrics::counter!("aegis_execution_iterations_total").increment(1);
 
         // Update DB
-        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
             {
                 let _ = exec.start_iteration(action.to_string());
             }
-            let _ = self.repository.save(&exec).await;
+            let _ = self
+                .repository
+                .save_for_tenant(&self.tenant_id, &exec)
+                .await;
         }
         // Emit Event
         self.event_bus
@@ -1227,9 +1247,16 @@ impl SupervisorObserver for ExecutionMonitor {
 
     async fn on_iteration_complete(&self, iteration: u8, output: &str, _exit_code: i64) {
         let now = Utc::now();
-        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
             exec.complete_iteration(output.to_string());
-            let _ = self.repository.save(&exec).await;
+            let _ = self
+                .repository
+                .save_for_tenant(&self.tenant_id, &exec)
+                .await;
         }
         self.event_bus
             .publish_execution_event(ExecutionEvent::IterationCompleted {
@@ -1249,9 +1276,16 @@ impl SupervisorObserver for ExecutionMonitor {
             details: None,
         };
 
-        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
             exec.fail_iteration(iter_error.clone());
-            let _ = self.repository.save(&exec).await;
+            let _ = self
+                .repository
+                .save_for_tenant(&self.tenant_id, &exec)
+                .await;
         }
 
         self.event_bus
@@ -1342,7 +1376,11 @@ impl SupervisorObserver for ExecutionMonitor {
             ));
 
         // Persist validation results so Iteration.validation_results is populated.
-        if let Ok(Some(mut exec)) = self.repository.find_by_id(self.execution_id).await {
+        if let Ok(Some(mut exec)) = self
+            .repository
+            .find_by_id_for_tenant(&self.tenant_id, self.execution_id)
+            .await
+        {
             if let Err(e) = exec.store_validation_results(iteration, results.clone()) {
                 tracing::warn!(
                     "Failed to store validation results for execution {} iteration {}: {}",
@@ -1351,7 +1389,10 @@ impl SupervisorObserver for ExecutionMonitor {
                     e
                 );
             } else {
-                let _ = self.repository.save(&exec).await;
+                let _ = self
+                    .repository
+                    .save_for_tenant(&self.tenant_id, &exec)
+                    .await;
             }
         }
     }
@@ -1552,6 +1593,14 @@ impl StandardExecutionService {
     ) -> Result<ExecutionId> {
         let tenant_id = Self::resolve_tenant_from_input(&input)?;
 
+        // 0a. Quota check (ADR-056): enforce per-tenant concurrent execution limit.
+        if let Some(quota_svc) = &self.quota_service {
+            quota_svc
+                .check_execution_quota(&tenant_id)
+                .await
+                .map_err(|e| anyhow!("quota_exceeded:{}", e))?;
+        }
+
         // 0. Rate limit check (ADR-072): enforce AgentExecution quota at tenant scope
         if let (Some(enforcer), Some(resolver)) =
             (&self.rate_limit_enforcer, &self.rate_limit_resolver)
@@ -1670,6 +1719,21 @@ impl StandardExecutionService {
             .agent_service
             .get_agent_visible(&tenant_id, agent_id)
             .await?;
+
+        // Gap-056-7: Cross-tenant access guard.
+        //
+        // `get_agent_visible` may return a system-tier agent (from the `aegis-system` tenant)
+        // that is globally visible. Non-system agents must belong to the requesting tenant.
+        // System agents are always accessible by any authenticated tenant.
+        if !agent.tenant_id.is_system() && agent.tenant_id != tenant_id {
+            return Err(
+                crate::domain::execution::ExecutionError::CrossTenantAccessForbidden {
+                    requested_agent_tenant: agent.tenant_id.as_str().to_string(),
+                    caller_tenant: tenant_id.as_str().to_string(),
+                }
+                .into(),
+            );
+        }
 
         // ADR-102: Use manifest-declared security_context if present; otherwise use caller's context.
         let security_context_name = agent
@@ -2133,6 +2197,7 @@ impl StandardExecutionService {
         let monitor = Arc::new(ExecutionMonitor {
             execution_id,
             agent_id,
+            tenant_id: tenant_id_for_task.clone(),
             repository: repository.clone(),
             event_bus: event_bus.clone(),
         });
@@ -2394,7 +2459,7 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
-        self.get_execution_for_tenant(&TenantId::local_default(), id)
+        self.get_execution_for_tenant(&TenantId::consumer(), id)
             .await
     }
 
@@ -2414,12 +2479,12 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn get_iterations(&self, exec_id: ExecutionId) -> Result<Vec<Iteration>> {
-        self.get_iterations_for_tenant(&TenantId::local_default(), exec_id)
+        self.get_iterations_for_tenant(&TenantId::consumer(), exec_id)
             .await
     }
 
     async fn cancel_execution(&self, id: ExecutionId) -> Result<()> {
-        self.cancel_execution_for_tenant(&TenantId::local_default(), id)
+        self.cancel_execution_for_tenant(&TenantId::consumer(), id)
             .await
     }
 
@@ -2454,7 +2519,7 @@ impl ExecutionService for StandardExecutionService {
         agent_id: Option<AgentId>,
         limit: usize,
     ) -> Result<Vec<Execution>> {
-        self.list_executions_for_tenant(&TenantId::local_default(), agent_id, None, limit)
+        self.list_executions_for_tenant(&TenantId::consumer(), agent_id, None, limit)
             .await
     }
 
@@ -2465,9 +2530,11 @@ impl ExecutionService for StandardExecutionService {
         parent_execution_id: ExecutionId,
     ) -> Result<ExecutionId> {
         // 1. Fetch parent to validate hierarchy depth and build child hierarchy.
+        // Uses find_by_id_unscoped because the parent_execution_id is an orchestrator-provisioned
+        // ID (trusted internal reference); the returned execution carries its own tenant_id.
         let parent = self
             .repository
-            .find_by_id(parent_execution_id)
+            .find_by_id_unscoped(parent_execution_id)
             .await?
             .ok_or_else(|| anyhow!("Parent execution {parent_execution_id} not found"))?;
         let parent_tenant_id = Self::resolve_tenant_from_input(&parent.input)?;
@@ -2840,6 +2907,7 @@ impl ExecutionService for StandardExecutionService {
         let monitor = Arc::new(ExecutionMonitor {
             execution_id: child_execution_id,
             agent_id,
+            tenant_id: tenant_id.clone(),
             repository: repository.clone(),
             event_bus: event_bus.clone(),
         });
@@ -2982,7 +3050,7 @@ impl ExecutionService for StandardExecutionService {
     }
 
     async fn delete_execution(&self, id: ExecutionId) -> Result<()> {
-        self.delete_execution_for_tenant(&TenantId::local_default(), id)
+        self.delete_execution_for_tenant(&TenantId::consumer(), id)
             .await
     }
 
@@ -2992,7 +3060,8 @@ impl ExecutionService for StandardExecutionService {
         iteration: u8,
         interaction: crate::domain::execution::LlmInteraction,
     ) -> Result<()> {
-        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+        if let Some(mut exec) = self.repository.find_by_id_unscoped(execution_id).await? {
+            let tenant_id = exec.tenant_id.clone();
             if let Err(e) = exec.add_llm_interaction(iteration, interaction) {
                 tracing::warn!(
                     "Failed to record LLM interaction for execution {} iteration {}: {}",
@@ -3001,7 +3070,7 @@ impl ExecutionService for StandardExecutionService {
                     e
                 );
             } else {
-                self.repository.save(&exec).await?;
+                self.repository.save_for_tenant(&tenant_id, &exec).await?;
             }
         }
         Ok(())
@@ -3013,7 +3082,8 @@ impl ExecutionService for StandardExecutionService {
         iteration: u8,
         trajectory: Vec<crate::domain::execution::TrajectoryStep>,
     ) -> Result<()> {
-        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+        if let Some(mut exec) = self.repository.find_by_id_unscoped(execution_id).await? {
+            let tenant_id = exec.tenant_id.clone();
             if let Err(e) = exec.store_iteration_trajectory(iteration, trajectory) {
                 tracing::warn!(
                     "Failed to record trajectory for execution {} iteration {}: {}",
@@ -3022,7 +3092,7 @@ impl ExecutionService for StandardExecutionService {
                     e
                 );
             } else {
-                self.repository.save(&exec).await?;
+                self.repository.save_for_tenant(&tenant_id, &exec).await?;
             }
         }
         Ok(())
@@ -3033,9 +3103,10 @@ impl ExecutionService for StandardExecutionService {
         execution_id: ExecutionId,
         tool_name: String,
     ) -> Result<()> {
-        if let Some(mut exec) = self.repository.find_by_id(execution_id).await? {
+        if let Some(mut exec) = self.repository.find_by_id_unscoped(execution_id).await? {
+            let tenant_id = exec.tenant_id.clone();
             exec.add_policy_violation(tool_name);
-            self.repository.save(&exec).await?;
+            self.repository.save_for_tenant(&tenant_id, &exec).await?;
         }
         Ok(())
     }

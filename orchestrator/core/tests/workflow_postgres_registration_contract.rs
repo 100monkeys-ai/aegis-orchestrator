@@ -145,7 +145,7 @@ async fn workflow_repository_force_redeploy_keeps_workflow_tables_on_same_id() {
 
     setup_temp_tables(&pool).await;
 
-    let tenant_id = TenantId::local_default();
+    let tenant_id = TenantId::consumer();
     let original = build_workflow("copy-generator");
     let original_id = original.id;
 

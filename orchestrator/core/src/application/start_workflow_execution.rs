@@ -106,10 +106,7 @@ pub trait StartWorkflowExecutionUseCase: Send + Sync {
         &self,
         request: StartWorkflowExecutionRequest,
     ) -> Result<StartedWorkflowExecution> {
-        let tenant_id = request
-            .tenant_id
-            .clone()
-            .unwrap_or_else(TenantId::local_default);
+        let tenant_id = request.tenant_id.clone().unwrap_or_else(TenantId::consumer);
         self.start_execution_for_tenant(&tenant_id, request, None)
             .await
     }
@@ -519,6 +516,18 @@ mod tests {
 
     #[async_trait]
     impl WorkflowExecutionRepository for RecordingWorkflowExecutionRepository {
+        async fn find_tenant_id_by_execution(
+            &self,
+            id: ExecutionId,
+        ) -> Result<Option<TenantId>, RepositoryError> {
+            Ok(self
+                .executions
+                .lock()
+                .unwrap()
+                .get(&id)
+                .map(|e| e.tenant_id.clone()))
+        }
+
         async fn save_for_tenant(
             &self,
             _tenant_id: &TenantId,
@@ -678,7 +687,10 @@ mod tests {
     async fn start_execution_wraps_scalar_input_seeds_blackboard_and_publishes_event() {
         let workflow = build_test_workflow("build-and-test");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
         let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-123"));
         let event_bus = Arc::new(EventBus::new(32));
@@ -700,7 +712,7 @@ mod tests {
                     "validation_threshold": 0.85
                 })),
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -725,7 +737,7 @@ mod tests {
 
         let execution_id = ExecutionId::from_string(&result.execution_id).unwrap();
         let persisted = execution_repo
-            .find_by_id(execution_id)
+            .find_by_id_for_tenant(&TenantId::consumer(), execution_id)
             .await
             .unwrap()
             .unwrap();
@@ -756,7 +768,10 @@ mod tests {
     async fn start_execution_saves_before_engine_connection_check() {
         let workflow = build_test_workflow("save-first-workflow");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
 
         let service = StandardStartWorkflowExecutionUseCase::new(
@@ -772,7 +787,7 @@ mod tests {
                 input: json!({ "branch": "main" }),
                 blackboard: None,
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -783,7 +798,10 @@ mod tests {
             .to_string()
             .contains("Workflow engine not connected yet"));
 
-        let active = execution_repo.find_active().await.unwrap();
+        let active = execution_repo
+            .find_active_for_tenant(&TenantId::consumer())
+            .await
+            .unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].workflow_id, workflow.id);
     }
@@ -792,7 +810,10 @@ mod tests {
     async fn start_execution_rejects_non_object_blackboard() {
         let workflow = build_test_workflow("invalid-blackboard");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
         let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-invalid"));
 
@@ -809,7 +830,7 @@ mod tests {
                 input: json!({ "target": "release" }),
                 blackboard: Some(json!(["not", "an", "object"])),
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -825,7 +846,10 @@ mod tests {
     async fn start_execution_rejects_reserved_blackboard_keys() {
         let workflow = build_test_workflow("reserved-blackboard");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
         let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-reserved"));
 
@@ -842,7 +866,7 @@ mod tests {
                 input: json!({ "target": "release" }),
                 blackboard: Some(json!({ "input": "reserved" })),
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -856,7 +880,10 @@ mod tests {
     async fn start_execution_resolves_workflow_by_uuid_identifier() {
         let workflow = build_test_workflow("uuid-resolve-workflow");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
         let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-xyz"));
 
@@ -873,7 +900,7 @@ mod tests {
                 input: json!({ "target": "release" }),
                 blackboard: None,
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -891,7 +918,10 @@ mod tests {
     async fn start_execution_persists_temporal_linkage_after_temporal_start() {
         let workflow = build_test_workflow("temporal-linkage-workflow");
         let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
-        workflow_repo.save(&workflow).await.unwrap();
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
         let execution_repo = Arc::new(RecordingWorkflowExecutionRepository::default());
         let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-456"));
 
@@ -908,7 +938,7 @@ mod tests {
                 input: json!({ "prompt": "ship it" }),
                 blackboard: None,
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })
@@ -921,7 +951,7 @@ mod tests {
         assert_eq!(
             updates[0],
             TemporalLinkageCall {
-                tenant_id: TenantId::local_default(),
+                tenant_id: TenantId::consumer(),
                 execution_id,
                 temporal_workflow_id: response.execution_id.clone(),
                 temporal_run_id: "temporal-run-456".to_string(),
@@ -938,25 +968,14 @@ mod tests {
             async fn save_for_tenant(
                 &self,
                 _tenant_id: &TenantId,
-                workflow: &Workflow,
+                _workflow: &Workflow,
             ) -> Result<(), RepositoryError> {
-                self.save(workflow).await
-            }
-
-            async fn save(&self, _workflow: &Workflow) -> Result<(), RepositoryError> {
                 Ok(())
             }
 
             async fn find_by_id_for_tenant(
                 &self,
                 _tenant_id: &TenantId,
-                id: WorkflowId,
-            ) -> Result<Option<Workflow>, RepositoryError> {
-                self.find_by_id(id).await
-            }
-
-            async fn find_by_id(
-                &self,
                 _id: WorkflowId,
             ) -> Result<Option<Workflow>, RepositoryError> {
                 Ok(None)
@@ -965,12 +984,8 @@ mod tests {
             async fn find_by_name_for_tenant(
                 &self,
                 _tenant_id: &TenantId,
-                name: &str,
+                _name: &str,
             ) -> Result<Option<Workflow>, RepositoryError> {
-                self.find_by_name(name).await
-            }
-
-            async fn find_by_name(&self, _name: &str) -> Result<Option<Workflow>, RepositoryError> {
                 Ok(None)
             }
 
@@ -987,22 +1002,14 @@ mod tests {
                 &self,
                 _tenant_id: &TenantId,
             ) -> Result<Vec<Workflow>, RepositoryError> {
-                self.list_all().await
-            }
-
-            async fn list_all(&self) -> Result<Vec<Workflow>, RepositoryError> {
                 Ok(vec![])
             }
 
             async fn delete_for_tenant(
                 &self,
                 _tenant_id: &TenantId,
-                id: WorkflowId,
+                _id: WorkflowId,
             ) -> Result<(), RepositoryError> {
-                self.delete(id).await
-            }
-
-            async fn delete(&self, _id: WorkflowId) -> Result<(), RepositoryError> {
                 Ok(())
             }
 
@@ -1069,7 +1076,7 @@ mod tests {
                 input: json!({}),
                 blackboard: None,
                 version: None,
-                tenant_id: Some(TenantId::local_default()),
+                tenant_id: Some(TenantId::consumer()),
                 security_context_name: None,
                 intent: None,
             })

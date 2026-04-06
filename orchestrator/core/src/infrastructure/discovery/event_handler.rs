@@ -145,7 +145,7 @@ impl DiscoveryIndexEventHandler {
 
         let req = IndexAgentRequest {
             agent_id: agent_id.to_string(),
-            tenant_id: TenantId::local_default().to_string(),
+            tenant_id: TenantId::consumer().to_string(),
             name: name.clone(),
             version: version.clone(),
             description,
@@ -173,7 +173,7 @@ impl DiscoveryIndexEventHandler {
     async fn handle_agent_update(&self, agent_id: &AgentId) {
         let agent = match self
             .agent_repo
-            .find_by_id_for_tenant(&TenantId::local_default(), *agent_id)
+            .find_by_id_for_tenant(&TenantId::consumer(), *agent_id)
             .await
         {
             Ok(Some(a)) => a,
@@ -193,7 +193,7 @@ impl DiscoveryIndexEventHandler {
     async fn handle_agent_remove(&self, agent_id: &AgentId) {
         let req = RemoveDiscoveryAgentRequest {
             agent_id: agent_id.to_string(),
-            tenant_id: TenantId::local_default().to_string(),
+            tenant_id: TenantId::consumer().to_string(),
         };
 
         if let Err(e) = self.cortex_client.remove_discovery_agent(req).await {
@@ -206,7 +206,7 @@ impl DiscoveryIndexEventHandler {
     async fn handle_workflow_remove(&self, workflow_id: &WorkflowId) {
         let req = RemoveDiscoveryWorkflowRequest {
             workflow_id: workflow_id.to_string(),
-            tenant_id: TenantId::local_default().to_string(),
+            tenant_id: TenantId::consumer().to_string(),
         };
 
         if let Err(e) = self.cortex_client.remove_discovery_workflow(req).await {
@@ -231,10 +231,10 @@ impl DiscoveryIndexEventHandler {
         name: &str,
         version: &str,
     ) -> Option<crate::domain::workflow::Workflow> {
-        // 1. name+version under local_default
+        // 1. name+version under consumer
         match self
             .workflow_repo
-            .find_by_name_and_version_for_tenant(&TenantId::local_default(), name, version)
+            .find_by_name_and_version_for_tenant(&TenantId::consumer(), name, version)
             .await
         {
             Ok(Some(w)) => return Some(w),
@@ -243,7 +243,7 @@ impl DiscoveryIndexEventHandler {
                 tracing::warn!(
                     workflow_id = %workflow_id,
                     error = %e,
-                    "Failed to look up workflow by name/version for local_default tenant"
+                    "Failed to look up workflow by name/version for consumer tenant"
                 );
             }
         }
@@ -265,10 +265,10 @@ impl DiscoveryIndexEventHandler {
             }
         }
 
-        // 3. ID under local_default
+        // 3. ID under consumer
         match self
             .workflow_repo
-            .find_by_id_for_tenant(&TenantId::local_default(), *workflow_id)
+            .find_by_id_for_tenant(&TenantId::consumer(), *workflow_id)
             .await
         {
             Ok(Some(w)) => return Some(w),
@@ -277,7 +277,7 @@ impl DiscoveryIndexEventHandler {
                 tracing::warn!(
                     workflow_id = %workflow_id,
                     error = %e,
-                    "Failed to look up workflow by ID for local_default tenant"
+                    "Failed to look up workflow by ID for consumer tenant"
                 );
             }
         }
@@ -418,7 +418,7 @@ impl DiscoveryIndexEventHandler {
         // ── Agents ──────────────────────────────────────────────────────
         let agents = self
             .agent_repo
-            .list_all_for_tenant(&TenantId::local_default())
+            .list_all_for_tenant(&TenantId::consumer())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list agents for indexing: {e}"))?;
 
@@ -434,7 +434,7 @@ impl DiscoveryIndexEventHandler {
         // ── Workflows ───────────────────────────────────────────────────
         let workflows = self
             .workflow_repo
-            .list_all_for_tenant(&TenantId::local_default())
+            .list_all_for_tenant(&TenantId::consumer())
             .await
             .map_err(|e| anyhow::anyhow!("Failed to list workflows for indexing: {e}"))?;
 

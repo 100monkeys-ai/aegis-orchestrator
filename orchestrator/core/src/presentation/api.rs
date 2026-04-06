@@ -87,6 +87,9 @@ pub struct AppState {
     pub event_bus: Option<Arc<EventBus>>,
     /// Tenant repository for admin tenant management (ADR-056). Optional until wired.
     pub tenant_repo: Option<Arc<dyn TenantRepository>>,
+    /// Enterprise tenant onboarding service (ADR-056 §Tenant Lifecycle). Optional until wired.
+    pub tenant_onboarding_service:
+        Option<Arc<crate::application::tenant_onboarding::TenantOnboardingService>>,
     /// SEAL session repository for token-based auth on SSE streams (ADR-035). Optional until wired.
     pub seal_session_repo: Option<Arc<dyn SealSessionRepository>>,
     /// Rate-limit override repository for admin CRUD (ADR-072). Optional until wired.
@@ -127,6 +130,7 @@ pub fn app(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
+        tenant_onboarding_service: None,
         seal_session_repo: None,
         rate_limit_override_repo: None,
         config_layer_repo: None,
@@ -238,6 +242,7 @@ pub fn app_with_inner_loop(
         workflow_execution_repo: None,
         event_bus: None,
         tenant_repo: None,
+        tenant_onboarding_service: None,
         seal_session_repo: None,
         rate_limit_override_repo: None,
         config_layer_repo: None,
@@ -1093,7 +1098,12 @@ fn default_tier() -> String {
     "enterprise".to_string()
 }
 
-/// `POST /v1/admin/tenants` — create a new tenant
+/// `POST /v1/admin/tenants` — create a new enterprise tenant
+///
+/// When `tenant_onboarding_service` is wired in `AppState`, this handler delegates
+/// to [`TenantOnboardingService::provision`] which executes the 5-step atomic
+/// provisioning sequence (Keycloak realm + OpenBao namespace + DB record, ADR-056).
+/// When not wired (legacy / minimal deployments), falls back to a bare repo insert.
 async fn create_tenant(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -1101,17 +1111,6 @@ async fn create_tenant(
     if let Err(resp) = require_admin(request.extensions()) {
         return resp;
     }
-
-    let repo = match &state.tenant_repo {
-        Some(r) => r.clone(),
-        None => {
-            return (
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Tenant repository not configured"})),
-            )
-                .into_response();
-        }
-    };
 
     let body = match axum::body::to_bytes(request.into_body(), 1024 * 64).await {
         Ok(b) => b,
@@ -1161,8 +1160,50 @@ async fn create_tenant(
         }
     };
 
+    // Prefer TenantOnboardingService (full atomic provisioning) when available.
+    if let Some(onboarding_svc) = &state.tenant_onboarding_service {
+        let quotas = TenantQuotas::for_tier(&tier);
+        return match onboarding_svc
+            .provision(slug, payload.display_name, tier, quotas)
+            .await
+        {
+            Ok(tenant) => (
+                axum::http::StatusCode::CREATED,
+                Json(serde_json::to_value(&tenant).unwrap_or(json!({"status": "created"}))),
+            )
+                .into_response(),
+            Err(crate::application::tenant_onboarding::TenantOnboardingError::SlugConflict(s)) => (
+                axum::http::StatusCode::CONFLICT,
+                Json(json!({"error": format!("Tenant slug already exists: {s}")})),
+            )
+                .into_response(),
+            Err(crate::application::tenant_onboarding::TenantOnboardingError::SlugInvalid(s)) => (
+                axum::http::StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("Invalid tenant slug: {s}")})),
+            )
+                .into_response(),
+            Err(e) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": e.to_string()})),
+            )
+                .into_response(),
+        };
+    }
+
+    // Fallback: bare repo insert (no Keycloak realm / OpenBao namespace provisioning).
+    let repo = match &state.tenant_repo {
+        Some(r) => r.clone(),
+        None => {
+            return (
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "Tenant repository not configured"})),
+            )
+                .into_response();
+        }
+    };
+
     let keycloak_realm = format!("tenant-{}", payload.slug);
-    let openbao_namespace = format!("tenant/{}", payload.slug);
+    let openbao_namespace = format!("tenant-{}/", payload.slug);
 
     let tenant = Tenant::new(
         slug,
@@ -2742,6 +2783,7 @@ mod tests {
             workflow_execution_repo: None,
             event_bus: None,
             tenant_repo: None,
+            tenant_onboarding_service: None,
             seal_session_repo: None,
             rate_limit_override_repo: None,
             config_layer_repo: None,
