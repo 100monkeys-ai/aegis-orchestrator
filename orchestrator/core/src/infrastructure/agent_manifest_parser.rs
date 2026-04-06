@@ -294,7 +294,6 @@ spec:
                 name: "test-agent".to_string(),
                 version: "1.0.0".to_string(),
                 description: Some("Test agent".to_string()),
-                tags: vec![],
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
             },

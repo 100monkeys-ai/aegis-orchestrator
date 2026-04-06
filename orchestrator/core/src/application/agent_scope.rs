@@ -200,7 +200,6 @@ mod tests {
                 name: name.to_string(),
                 version: "1.0.0".to_string(),
                 description: None,
-                tags: vec![],
                 labels: std::collections::HashMap::new(),
                 annotations: std::collections::HashMap::new(),
             },
