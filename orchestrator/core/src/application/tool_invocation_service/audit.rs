@@ -386,13 +386,13 @@ impl ToolInvocationService {
                 format!("Command '{command}' not allowed. Allowed: {allowed_commands:?}"),
             ),
             PolicyViolation::SubcommandNotAllowed {
-                base_command,
+                command,
                 subcommand,
                 allowed_subcommands,
             } => (
                 ViolationType::ToolNotAllowed,
                 format!(
-                    "Subcommand '{subcommand}' not allowed for '{base_command}'. Allowed: {allowed_subcommands:?}"
+                    "Subcommand '{subcommand}' not allowed for '{command}'. Allowed: {allowed_subcommands:?}"
                 ),
             ),
             PolicyViolation::ConcurrentExecLimitExceeded { limit, active } => (

@@ -77,7 +77,7 @@ pub enum PolicyViolation {
         allowed_commands: Vec<String>,
     },
     SubcommandNotAllowed {
-        base_command: String,
+        command: String,
         subcommand: String,
         allowed_subcommands: Vec<String>,
     },
@@ -151,14 +151,14 @@ impl std::fmt::Display for PolicyViolation {
                 allowed_commands.join(", ")
             ),
             PolicyViolation::SubcommandNotAllowed {
-                base_command,
+                command,
                 subcommand,
                 allowed_subcommands,
             } => write!(
                 f,
                 "subcommand '{}' is not allowed for '{}'; permitted subcommands: [{}]",
                 subcommand,
-                base_command,
+                command,
                 allowed_subcommands.join(", ")
             ),
             PolicyViolation::ConcurrentExecLimitExceeded { limit, active } => {

@@ -116,44 +116,49 @@ impl Capability {
 
         // Check command constraints for cmd.run
         if tool_name == "cmd.run" {
-            if let Some(cmd) = args.get("command").and_then(|c| c.as_str()) {
-                let cmd_parts: Vec<&str> = cmd.split_whitespace().collect();
-                let cmd_base = cmd_parts.first().unwrap_or(&"");
+            let command = args.get("command").and_then(|c| c.as_str()).ok_or(
+                PolicyViolation::MissingRequiredArgument("command".to_string()),
+            )?;
 
-                if let Some(ref allowlist) = self.command_allowlist {
-                    if !allowlist.contains(&cmd_base.to_string()) {
-                        return Err(PolicyViolation::CommandNotAllowed {
-                            command: cmd_base.to_string(),
-                            allowed_commands: allowlist.clone(),
-                        });
-                    }
+            if let Some(ref allowlist) = self.command_allowlist {
+                if !allowlist.contains(&command.to_string()) {
+                    return Err(PolicyViolation::CommandNotAllowed {
+                        command: command.to_string(),
+                        allowed_commands: allowlist.clone(),
+                    });
                 }
+            }
 
-                if let Some(ref sub_map) = self.subcommand_allowlist {
-                    if !sub_map.contains_key(*cmd_base) {
-                        return Err(PolicyViolation::CommandNotAllowed {
-                            command: cmd_base.to_string(),
+            if let Some(ref sub_map) = self.subcommand_allowlist {
+                let allowed_subcmds =
+                    sub_map
+                        .get(command)
+                        .ok_or_else(|| PolicyViolation::CommandNotAllowed {
+                            command: command.to_string(),
                             allowed_commands: sub_map.keys().cloned().collect(),
-                        });
-                    }
-                    let permitted_subs = &sub_map[*cmd_base];
-                    if !permitted_subs.is_empty() {
-                        if cmd_parts.len() > 1 {
-                            let subcommand = cmd_parts[1];
-                            if !permitted_subs.contains(&subcommand.to_string()) {
-                                return Err(PolicyViolation::SubcommandNotAllowed {
-                                    base_command: cmd_base.to_string(),
-                                    subcommand: subcommand.to_string(),
-                                    allowed_subcommands: permitted_subs.clone(),
-                                });
-                            }
-                        } else {
+                        })?;
+
+                let cmd_args: Vec<&str> = args
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                    .unwrap_or_default();
+
+                if !allowed_subcmds.is_empty() {
+                    if let Some(subcmd) = cmd_args.first() {
+                        if !allowed_subcmds.contains(&subcmd.to_string()) {
                             return Err(PolicyViolation::SubcommandNotAllowed {
-                                base_command: cmd_base.to_string(),
-                                subcommand: String::new(),
-                                allowed_subcommands: permitted_subs.clone(),
+                                command: command.to_string(),
+                                subcommand: subcmd.to_string(),
+                                allowed_subcommands: allowed_subcmds.clone(),
                             });
                         }
+                    } else {
+                        return Err(PolicyViolation::SubcommandNotAllowed {
+                            command: command.to_string(),
+                            subcommand: String::new(),
+                            allowed_subcommands: allowed_subcmds.clone(),
+                        });
                     }
                 }
             }
@@ -230,30 +235,30 @@ mod tests {
 
         // Allowed: cargo build
         assert!(cap
-            .allows("cmd.run", &json!({"command": "cargo build"}))
+            .allows("cmd.run", &json!({"command": "cargo", "args": ["build"]}))
             .is_ok());
 
         // Allowed: cargo check
         assert!(cap
-            .allows("cmd.run", &json!({"command": "cargo check"}))
+            .allows("cmd.run", &json!({"command": "cargo", "args": ["check"]}))
             .is_ok());
 
         // Denied: incorrect command base
         assert!(cap
-            .allows("cmd.run", &json!({"command": "npm install"}))
+            .allows("cmd.run", &json!({"command": "npm", "args": ["install"]}))
             .is_err());
 
         // Denied: incorrect subcommand
         assert!(cap
-            .allows("cmd.run", &json!({"command": "cargo publish"}))
+            .allows("cmd.run", &json!({"command": "cargo", "args": ["publish"]}))
             .is_err());
 
-        // Denied: missing subcommand
+        // Denied: missing subcommand (no args key)
         assert!(cap.allows("cmd.run", &json!({"command": "cargo"})).is_err());
 
-        // Denied: base command not in command_allowlist
+        // Denied: base command not in command_allowlist → CommandNotAllowed
         assert!(matches!(
-            cap.allows("cmd.run", &json!({"command": "npm install"})),
+            cap.allows("cmd.run", &json!({"command": "npm", "args": ["install"]})),
             Err(PolicyViolation::CommandNotAllowed { .. })
         ));
     }
