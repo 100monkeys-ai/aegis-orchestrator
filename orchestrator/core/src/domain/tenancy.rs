@@ -31,7 +31,7 @@ pub enum TenantTier {
 
 /// Discriminant for per-tenant resource quota types (ADR-056).
 ///
-/// Used in [`TenantEvent::TenantQuotaExceeded`] and [`TenantEvent::TenantQuotaUpdated`]
+/// Used in `TenantEvent::TenantQuotaExceeded` and `TenantEvent::TenantQuotaUpdated`
 /// to identify which quota was violated or changed without relying on stringly-typed fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

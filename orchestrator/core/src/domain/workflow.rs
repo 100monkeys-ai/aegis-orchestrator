@@ -687,7 +687,7 @@ pub struct WorkflowState {
 pub use crate::domain::runtime::{ContainerResources, ContainerVolumeMount};
 
 /// Retry configuration for a ContainerRun step
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct RetryConfig {
     /// Maximum number of additional attempts after the first (0 = no retries)
     #[serde(default)]

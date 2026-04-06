@@ -610,7 +610,7 @@ spec:
         assert_eq!(calls[0].version, "1.2.3");
 
         let persisted = repo
-            .find_by_name("registration-test-workflow")
+            .find_by_name_visible(&TenantId::consumer(), "registration-test-workflow")
             .await
             .unwrap()
             .unwrap();
@@ -727,7 +727,7 @@ spec:
             .await
             .unwrap_err();
         let stored = repo
-            .find_by_name("registration-test-workflow")
+            .find_by_name_visible(&TenantId::consumer(), "registration-test-workflow")
             .await
             .unwrap();
         assert!(stored.is_none());

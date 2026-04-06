@@ -795,7 +795,10 @@ mod tests {
             .unwrap();
         execution.complete_iteration("ok".to_string());
         execution.complete();
-        repository.save(&execution).await.unwrap();
+        repository
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
 
         let service = CorrelatedActivityStreamService::new(event_bus.clone(), repository, None);
         let execution_id = execution.id;
@@ -848,7 +851,10 @@ mod tests {
             "aegis-system-operator".to_string(),
         );
         let execution_id = execution.id;
-        repository.save(&execution).await.unwrap();
+        repository
+            .save_for_tenant(&TenantId::system(), &execution)
+            .await
+            .unwrap();
 
         let service = CorrelatedActivityStreamService::new(
             event_bus.clone(),

@@ -414,6 +414,7 @@ mod tests {
             config_layer_repo: None,
             node_cluster_repo: None,
             security_context_repo: None,
+            realm_repo: None,
             pg_pool: None,
         })
     }

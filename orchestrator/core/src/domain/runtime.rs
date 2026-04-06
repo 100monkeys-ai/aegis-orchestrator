@@ -371,7 +371,7 @@ pub struct ContainerVolumeMount {
 ///
 /// Configures CPU, memory, and timeout limits for workflow container steps.
 /// Part of the Execution bounded context (BC-2) runtime configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 pub struct ContainerResources {
     /// CPU quota in millicores (e.g., 1000 = 1 vCPU, 500 = 0.5 vCPU)
     #[serde(default)]

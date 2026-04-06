@@ -1101,7 +1101,7 @@ fn default_tier() -> String {
 /// `POST /v1/admin/tenants` — create a new enterprise tenant
 ///
 /// When `tenant_onboarding_service` is wired in `AppState`, this handler delegates
-/// to [`TenantOnboardingService::provision`] which executes the 5-step atomic
+/// to `TenantOnboardingService::provision` which executes the 5-step atomic
 /// provisioning sequence (Keycloak realm + OpenBao namespace + DB record, ADR-056).
 /// When not wired (legacy / minimal deployments), falls back to a bare repo insert.
 async fn create_tenant(
