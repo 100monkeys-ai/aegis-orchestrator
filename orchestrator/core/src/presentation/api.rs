@@ -99,6 +99,8 @@ pub struct AppState {
     pub security_context_repo: Option<Arc<dyn SecurityContextRepository>>,
     /// PostgreSQL pool for direct audit-log queries. Optional until wired.
     pub pg_pool: Option<Arc<sqlx::PgPool>>,
+    /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
+    pub realm_repo: Option<Arc<dyn crate::domain::iam::RealmRepository>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -131,6 +133,7 @@ pub fn app(
         node_cluster_repo: None,
         security_context_repo: None,
         pg_pool: None,
+        realm_repo: None,
     });
 
     Router::new()
@@ -241,6 +244,7 @@ pub fn app_with_inner_loop(
         node_cluster_repo: None,
         security_context_repo: None,
         pg_pool: None,
+        realm_repo: None,
     });
 
     Router::new()
@@ -2744,6 +2748,7 @@ mod tests {
             node_cluster_repo: None,
             security_context_repo: None,
             pg_pool: None,
+            realm_repo: None,
         })
     }
 
