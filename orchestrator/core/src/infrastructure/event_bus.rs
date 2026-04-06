@@ -161,6 +161,9 @@ impl DomainEvent {
                     ValidationEvent::GradientValidationPerformed { execution_id, .. }
                     | ValidationEvent::MultiJudgeConsensus { execution_id, .. } => *execution_id,
                 },
+                ExecutionEvent::OutputHandlerStarted { execution_id, .. }
+                | ExecutionEvent::OutputHandlerCompleted { execution_id, .. }
+                | ExecutionEvent::OutputHandlerFailed { execution_id, .. } => *execution_id,
             }),
             DomainEvent::Workflow(event) => Some(match event {
                 WorkflowEvent::WorkflowExecutionStarted { execution_id, .. }
@@ -287,7 +290,7 @@ impl DomainEvent {
                 | AgentLifecycleEvent::AgentFailed { agent_id, .. }
                 | AgentLifecycleEvent::AgentScopeChanged { agent_id, .. } => *agent_id,
             }),
-            DomainEvent::Execution(event) => Some(match event {
+            DomainEvent::Execution(event) => match event {
                 ExecutionEvent::ExecutionStarted { agent_id, .. }
                 | ExecutionEvent::IterationStarted { agent_id, .. }
                 | ExecutionEvent::IterationCompleted { agent_id, .. }
@@ -302,12 +305,15 @@ impl DomainEvent {
                 | ExecutionEvent::InstanceSpawned { agent_id, .. }
                 | ExecutionEvent::InstanceTerminated { agent_id, .. }
                 | ExecutionEvent::ChildExecutionSpawned { agent_id, .. }
-                | ExecutionEvent::ChildExecutionCompleted { agent_id, .. } => *agent_id,
-                ExecutionEvent::Validation(validation) => match validation {
+                | ExecutionEvent::ChildExecutionCompleted { agent_id, .. } => Some(*agent_id),
+                ExecutionEvent::Validation(validation) => Some(match validation {
                     ValidationEvent::GradientValidationPerformed { agent_id, .. }
                     | ValidationEvent::MultiJudgeConsensus { agent_id, .. } => *agent_id,
-                },
-            }),
+                }),
+                ExecutionEvent::OutputHandlerStarted { .. }
+                | ExecutionEvent::OutputHandlerCompleted { .. }
+                | ExecutionEvent::OutputHandlerFailed { .. } => None,
+            },
             DomainEvent::Workflow(_)
             | DomainEvent::Volume(_)
             | DomainEvent::Storage(_)
@@ -390,6 +396,9 @@ impl DomainEvent {
                     }
                     ValidationEvent::MultiJudgeConsensus { reached_at, .. } => *reached_at,
                 },
+                ExecutionEvent::OutputHandlerStarted { .. }
+                | ExecutionEvent::OutputHandlerCompleted { .. }
+                | ExecutionEvent::OutputHandlerFailed { .. } => Utc::now(),
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { registered_at, .. } => *registered_at,
@@ -510,6 +519,10 @@ impl DomainEvent {
                 TenantEvent::AdminCrossTenantAccess { accessed_at, .. } => *accessed_at,
                 TenantEvent::TenantQuotaExceeded { exceeded_at, .. } => *exceeded_at,
                 TenantEvent::UserTenantProvisioned { provisioned_at, .. } => *provisioned_at,
+                TenantEvent::TenantHardDeleted {
+                    hard_deleted_at, ..
+                } => *hard_deleted_at,
+                TenantEvent::TenantQuotaUpdated { updated_at, .. } => *updated_at,
             },
             DomainEvent::Cluster(event) => match event {
                 ClusterEvent::NodeAttested { attested_at, .. } => *attested_at,
@@ -569,6 +582,9 @@ impl DomainEvent {
                     }
                     ValidationEvent::MultiJudgeConsensus { .. } => "multi_judge_consensus",
                 },
+                ExecutionEvent::OutputHandlerStarted { .. } => "output_handler_started",
+                ExecutionEvent::OutputHandlerCompleted { .. } => "output_handler_completed",
+                ExecutionEvent::OutputHandlerFailed { .. } => "output_handler_failed",
             },
             DomainEvent::Workflow(event) => match event {
                 WorkflowEvent::WorkflowRegistered { .. } => "workflow_registered",
@@ -689,6 +705,8 @@ impl DomainEvent {
                 TenantEvent::AdminCrossTenantAccess { .. } => "admin_cross_tenant_access",
                 TenantEvent::TenantQuotaExceeded { .. } => "tenant_quota_exceeded",
                 TenantEvent::UserTenantProvisioned { .. } => "user_tenant_provisioned",
+                TenantEvent::TenantHardDeleted { .. } => "tenant_hard_deleted",
+                TenantEvent::TenantQuotaUpdated { .. } => "tenant_quota_updated",
             },
             DomainEvent::Cluster(event) => match event {
                 ClusterEvent::NodeAttested { .. } => "node_attested",
@@ -775,7 +793,10 @@ impl DomainEvent {
                 | ExecutionEvent::ExecutionCancelled { .. }
                 | ExecutionEvent::ExecutionTimedOut { .. }
                 | ExecutionEvent::ChildExecutionSpawned { .. }
-                | ExecutionEvent::ChildExecutionCompleted { .. } => None,
+                | ExecutionEvent::ChildExecutionCompleted { .. }
+                | ExecutionEvent::OutputHandlerStarted { .. }
+                | ExecutionEvent::OutputHandlerCompleted { .. }
+                | ExecutionEvent::OutputHandlerFailed { .. } => None,
             },
             DomainEvent::Workflow(WorkflowEvent::WorkflowIterationStarted {
                 iteration_number,
@@ -814,6 +835,9 @@ impl DomainEvent {
                 | ExecutionEvent::InstanceTerminated { .. } => "runtime",
                 ExecutionEvent::ChildExecutionSpawned { .. }
                 | ExecutionEvent::ChildExecutionCompleted { .. } => "execution",
+                ExecutionEvent::OutputHandlerStarted { .. }
+                | ExecutionEvent::OutputHandlerCompleted { .. }
+                | ExecutionEvent::OutputHandlerFailed { .. } => "output_handler",
             }),
             DomainEvent::Workflow(_) => Some("workflow"),
             DomainEvent::Learning(_) => Some("learning"),
@@ -1152,6 +1176,11 @@ impl ExecutionEventReceiver {
                     execution_id == &self.execution_id
                 }
             },
+            ExecutionEvent::OutputHandlerStarted { execution_id, .. }
+            | ExecutionEvent::OutputHandlerCompleted { execution_id, .. }
+            | ExecutionEvent::OutputHandlerFailed { execution_id, .. } => {
+                execution_id == &self.execution_id
+            }
         }
     }
 }
@@ -1271,6 +1300,9 @@ impl AgentEventReceiver {
                         agent_id == &self.agent_id
                     }
                 },
+                ExecutionEvent::OutputHandlerStarted { .. }
+                | ExecutionEvent::OutputHandlerCompleted { .. }
+                | ExecutionEvent::OutputHandlerFailed { .. } => false, // not agent-scoped
             },
             DomainEvent::Learning(e) => match e {
                 LearningEvent::PatternDiscovered { agent_id, .. } => agent_id == &self.agent_id,

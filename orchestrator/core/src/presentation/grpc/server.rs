@@ -718,7 +718,7 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
             .await?;
-        let (identity, tenant_id) = match auth {
+        let (_identity, tenant_id) = match auth {
             Some((id, tid)) => {
                 let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
                 let final_tid = if matches!(
@@ -1196,6 +1196,15 @@ impl AegisRuntime for AegisRuntimeService {
                 "Cortex pattern store failed: {e}"
             ))),
         }
+    }
+
+    async fn invoke_output_handler(
+        &self,
+        _request: Request<InvokeOutputHandlerRequest>,
+    ) -> Result<Response<InvokeOutputHandlerResponse>, Status> {
+        Err(Status::unimplemented(
+            "invoke_output_handler: dispatch handled internally",
+        ))
     }
 }
 

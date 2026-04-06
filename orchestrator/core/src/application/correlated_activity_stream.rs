@@ -7,6 +7,7 @@ use crate::domain::events::{
 };
 use crate::domain::execution::{Execution, ExecutionId, ExecutionStatus, IterationStatus};
 use crate::domain::repository::{ExecutionRepository, WorkflowExecutionRepository};
+use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::DomainEvent;
 use crate::infrastructure::event_bus::{EventBus, EventBusError};
 use anyhow::{anyhow, Result};
@@ -97,9 +98,10 @@ impl CorrelatedActivityStreamService {
     pub async fn stream_agent_activity(
         &self,
         agent_id: AgentId,
+        tenant_id: &TenantId,
         verbose: bool,
     ) -> Result<Pin<Box<dyn Stream<Item = Result<CorrelatedActivityEvent>> + Send>>> {
-        let history = self.agent_history(agent_id, verbose).await?;
+        let history = self.agent_history(agent_id, tenant_id, verbose).await?;
         let repository = Arc::clone(&self.execution_repository);
         let cache = Arc::new(RwLock::new(HashMap::<ExecutionId, AgentId>::new()));
         let receiver = self.event_bus.subscribe();
@@ -161,7 +163,11 @@ impl CorrelatedActivityStreamService {
     ) -> Result<Vec<CorrelatedActivityEvent>> {
         let mut history = Vec::new();
 
-        if let Some(execution) = self.execution_repository.find_by_id(execution_id).await? {
+        if let Some(execution) = self
+            .execution_repository
+            .find_by_id_unscoped(execution_id)
+            .await?
+        {
             history.extend(execution_to_history(&execution));
         }
 
@@ -181,11 +187,12 @@ impl CorrelatedActivityStreamService {
     pub async fn agent_history(
         &self,
         agent_id: AgentId,
+        tenant_id: &TenantId,
         _verbose: bool,
     ) -> Result<Vec<CorrelatedActivityEvent>> {
         let executions = self
             .execution_repository
-            .find_by_agent(agent_id, 50)
+            .find_by_agent_for_tenant(tenant_id, agent_id, 50)
             .await?;
         let mut history = Vec::new();
 
@@ -223,9 +230,12 @@ async fn resolve_agent_for_event(
         return Ok(Some(agent_id));
     }
 
-    let execution = repository.find_by_id(execution_id).await?.ok_or_else(|| {
-        anyhow!("Execution {execution_id} not found while correlating agent activity")
-    })?;
+    let execution = repository
+        .find_by_id_unscoped(execution_id)
+        .await?
+        .ok_or_else(|| {
+            anyhow!("Execution {execution_id} not found while correlating agent activity")
+        })?;
     let agent_id = execution.agent_id;
     cache.write().await.insert(execution_id, agent_id);
     Ok(Some(agent_id))
@@ -846,7 +856,7 @@ mod tests {
             Some(Arc::new(EmptyWorkflowExecutionRepository)),
         );
         let mut stream = service
-            .stream_agent_activity(agent_id, false)
+            .stream_agent_activity(agent_id, &TenantId::default(), false)
             .await
             .unwrap();
 

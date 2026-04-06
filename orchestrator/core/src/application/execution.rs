@@ -1847,6 +1847,7 @@ impl StandardExecutionService {
                 iat: Some(now.timestamp()),
                 nbf: None,
                 jti: Some(uuid::Uuid::new_v4().to_string()),
+                task_summary: None,
                 sub: agent_id.0.to_string(),
                 scp: seal_security_context.clone(),
                 wid: if container_id_str.is_empty() {

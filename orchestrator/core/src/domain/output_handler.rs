@@ -37,7 +37,7 @@ use crate::domain::workflow::RetryConfig;
 /// When `required` is `true` on any variant, a handler failure marks the
 /// execution as failed. When `required` is `false` (the default), the handler
 /// runs in a fire-and-forget mode and failures are only logged.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, schemars::JsonSchema)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum OutputHandlerConfig {
     /// Spawn a named agent as a child execution to process/deliver the output.
