@@ -72,6 +72,8 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub isolation: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<String>,
@@ -278,6 +280,7 @@ impl TemporalWorkflowMapper {
             StateKind::Agent {
                 agent,
                 input,
+                intent,
                 isolation,
                 judges,
                 max_iterations,
@@ -303,6 +306,7 @@ impl TemporalWorkflowMapper {
                     kind: "Agent".to_string(),
                     agent: Some(agent.clone()),
                     input: Some(input.clone()),
+                    intent: intent.clone(),
                     isolation: isolation.map(Self::map_isolation_mode),
                     timeout,
                     judges: mapped_judges,
@@ -348,6 +352,7 @@ impl TemporalWorkflowMapper {
                 kind: "System".to_string(),
                 agent: None,
                 input: None,
+                intent: None,
                 isolation: None,
                 timeout,
                 judges: None,
@@ -389,6 +394,7 @@ impl TemporalWorkflowMapper {
                 kind: "Human".to_string(),
                 agent: None,
                 input: None,
+                intent: None,
                 isolation: None,
                 timeout,
                 judges: None,
@@ -963,6 +969,7 @@ mod tests {
                 kind: StateKind::Agent {
                     agent: "test-agent".to_string(),
                     input: "Hello {{task}}".to_string(),
+                    intent: None,
                     isolation: None,
                     judges: vec![],
                     max_iterations: None,

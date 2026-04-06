@@ -29,6 +29,7 @@ fn test_map_100monkeys_workflow() {
             kind: StateKind::Agent {
                 agent: "coder".to_string(),
                 input: "Task: {{task}}".to_string(),
+                intent: None,
                 isolation: Some(IsolationMode::Docker),
                 judges: vec![],
                 max_iterations: None,

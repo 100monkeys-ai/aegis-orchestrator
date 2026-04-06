@@ -117,6 +117,9 @@ pub enum StateKindYaml {
     Agent {
         agent: String,
         input: String,
+        /// Optional per-state intent template (Handlebars, ADR-092).
+        #[serde(default)]
+        intent: Option<String>,
         #[serde(default)]
         isolation: Option<IsolationMode>,
         /// Judge agents declared per-state (ADR-016 / ADR-017)
@@ -411,6 +414,7 @@ impl WorkflowParser {
             StateKindYaml::Agent {
                 agent,
                 input,
+                intent,
                 isolation,
                 judges,
                 max_iterations,
@@ -419,6 +423,7 @@ impl WorkflowParser {
             } => StateKind::Agent {
                 agent,
                 input,
+                intent,
                 isolation,
                 judges: judges
                     .into_iter()
@@ -656,6 +661,7 @@ impl WorkflowParser {
             StateKind::Agent {
                 agent,
                 input,
+                intent,
                 isolation,
                 judges,
                 max_iterations,
@@ -664,6 +670,7 @@ impl WorkflowParser {
             } => StateKindYaml::Agent {
                 agent: agent.clone(),
                 input: input.clone(),
+                intent: intent.clone(),
                 isolation: *isolation,
                 judges: judges
                     .iter()

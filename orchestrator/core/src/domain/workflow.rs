@@ -769,6 +769,12 @@ pub enum StateKind {
         /// Input template (Handlebars syntax)
         input: String,
 
+        /// Optional per-state intent template (Handlebars). When present, rendered
+        /// against the blackboard and forwarded as the natural-language steering for
+        /// the agent. Falls back to the workflow-level intent when absent. ADR-092.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
+
         /// Optional isolation override
         #[serde(default)]
         isolation: Option<IsolationMode>,
@@ -1543,6 +1549,7 @@ mod tests {
                 kind: StateKind::Agent {
                     agent: "builder".to_string(),
                     input: "{{workflow.task}}".to_string(),
+                    intent: None,
                     isolation: None,
                     judges: vec![
                         JudgeConfig {
