@@ -969,7 +969,11 @@ mod tests {
         let workflow_id = make_workflow_id();
         let mut registry = WorkflowRegistry::new(Some(router_agent_id));
         registry
-            .register_route(&TenantId::consumer(), "deploy-workflow", workflow_id)
+            .register_route(
+                &TenantId::from_string("tenant-99").unwrap(),
+                "deploy-workflow",
+                workflow_id,
+            )
             .unwrap();
 
         let execution_service = Arc::new(RecordingExecutionService::with_completed_output(
