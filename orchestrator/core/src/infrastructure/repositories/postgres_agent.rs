@@ -379,7 +379,8 @@ impl AgentRepository for PostgresAgentRepository {
             r#"
             SELECT id, version, created_at, manifest_yaml
             FROM agent_versions
-            WHERE tenant_id = $1 AND agent_id = $2
+            WHERE agent_id = $2
+              AND (tenant_id = $1 OR tenant_id = 'aegis-system')
             ORDER BY created_at DESC
             "#,
         )
