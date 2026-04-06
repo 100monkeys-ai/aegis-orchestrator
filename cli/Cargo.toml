@@ -83,7 +83,6 @@ prost = { workspace = true }
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
-daemonize = "0.5"
 libc = "0.2"
 
 [package.metadata.docs.rs]
