@@ -670,3 +670,49 @@ impl EffectiveConfigValidator {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_effective_config_validator_rejects_missing_fields() {
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "storage": { "backend": "seaweedfs" }
+            }),
+            version: "v1".to_string(),
+        };
+        let result = EffectiveConfigValidator::validate(&merged);
+        assert!(result.is_err());
+        let missing = result.unwrap_err();
+        assert!(missing.contains(&"runtime".to_string()));
+        assert!(missing.contains(&"llm".to_string()));
+        assert!(!missing.contains(&"storage".to_string()));
+    }
+
+    #[test]
+    fn test_effective_config_validator_accepts_complete_config() {
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "runtime": { "default_isolation": "docker" },
+                "storage": { "backend": "seaweedfs" },
+                "llm": { "provider": "openai" }
+            }),
+            version: "v1".to_string(),
+        };
+        assert!(EffectiveConfigValidator::validate(&merged).is_ok());
+    }
+
+    #[test]
+    fn test_effective_config_validator_rejects_non_object() {
+        let merged = MergedConfig {
+            payload: serde_json::json!("not an object"),
+            version: "v1".to_string(),
+        };
+        let result = EffectiveConfigValidator::validate(&merged);
+        assert!(result.is_err());
+        let missing = result.unwrap_err();
+        assert!(missing[0].contains("root object"));
+    }
+}

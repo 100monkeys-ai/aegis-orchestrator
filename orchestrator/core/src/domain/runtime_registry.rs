@@ -22,6 +22,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use thiserror::Error;
 
+use crate::domain::cluster::MergedConfig;
+
 /// Errors returned by the StandardRuntime registry.
 #[derive(Debug, Error, Clone)]
 pub enum RegistryError {
@@ -147,6 +149,27 @@ impl StandardRuntimeRegistry {
         let manifest: RegistryManifest = serde_yaml::from_str(content)
             .map_err(|e| RegistryError::ParseError(format!("YAML parse error: {e}")))?;
 
+        Ok(Self {
+            spec: manifest.spec,
+        })
+    }
+
+    /// Load the registry from a merged database configuration (ADR-060).
+    ///
+    /// Looks for a `runtime-registry` or `runtime` key in the merged payload
+    /// and deserialises the value as a [`RegistryManifest`].
+    pub fn from_merged_config(merged: &MergedConfig) -> Result<Self, RegistryError> {
+        let runtime_value = merged
+            .payload
+            .get("runtime-registry")
+            .or_else(|| merged.payload.get("runtime"))
+            .ok_or_else(|| {
+                RegistryError::ParseError(
+                    "No runtime-registry section in merged config".to_string(),
+                )
+            })?;
+        let manifest: RegistryManifest = serde_json::from_value(runtime_value.clone())
+            .map_err(|e| RegistryError::ParseError(format!("JSON parse error: {e}")))?;
         Ok(Self {
             spec: manifest.spec,
         })
@@ -397,5 +420,87 @@ spec:
             entry.metadata.bootstrap_env.get("TYPESCRIPT_VERSION"),
             Some(&"5.1".to_string())
         );
+    }
+
+    #[test]
+    fn test_from_merged_config_runtime_registry_key() {
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "runtime-registry": {
+                    "apiVersion": "aegis.ai/v1",
+                    "kind": "RuntimeRegistry",
+                    "metadata": { "name": "merged-registry" },
+                    "spec": {
+                        "registry_url": "docker.io",
+                        "runtimes": {
+                            "python": {
+                                "3.12": {
+                                    "image": "python:3.12-slim",
+                                    "description": "Python 3.12"
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            version: "v1".to_string(),
+        };
+
+        let registry = StandardRuntimeRegistry::from_merged_config(&merged).unwrap();
+        assert_eq!(
+            registry.resolve("python", "3.12").unwrap(),
+            "python:3.12-slim"
+        );
+    }
+
+    #[test]
+    fn test_from_merged_config_runtime_fallback_key() {
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "runtime": {
+                    "apiVersion": "aegis.ai/v1",
+                    "kind": "RuntimeRegistry",
+                    "metadata": { "name": "fallback-registry" },
+                    "spec": {
+                        "registry_url": "ghcr.io",
+                        "runtimes": {
+                            "javascript": {
+                                "20": {
+                                    "image": "node:20-alpine",
+                                    "description": "Node.js 20"
+                                }
+                            }
+                        }
+                    }
+                }
+            }),
+            version: "v1".to_string(),
+        };
+
+        let registry = StandardRuntimeRegistry::from_merged_config(&merged).unwrap();
+        assert_eq!(
+            registry.resolve("javascript", "20").unwrap(),
+            "node:20-alpine"
+        );
+        assert_eq!(registry.registry_url(), "ghcr.io");
+    }
+
+    #[test]
+    fn test_from_merged_config_missing_section() {
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "other": "data"
+            }),
+            version: "v1".to_string(),
+        };
+
+        let result = StandardRuntimeRegistry::from_merged_config(&merged);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            RegistryError::ParseError(msg) => {
+                assert!(msg.contains("No runtime-registry section"));
+            }
+            other => panic!("Expected ParseError, got: {other:?}"),
+        }
     }
 }

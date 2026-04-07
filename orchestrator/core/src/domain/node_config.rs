@@ -32,6 +32,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use crate::domain::cluster::MergedConfig;
+
 /// Top-level Kubernetes-style node configuration manifest
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeConfigManifest {
@@ -47,6 +49,26 @@ pub struct NodeConfigManifest {
 
     /// Node configuration specification
     pub spec: NodeConfigSpec,
+}
+
+/// Minimal configuration subset needed to establish database connectivity and
+/// controller contact before the full merged config is available (ADR-060 §4).
+///
+/// Extracted from `NodeConfigManifest` via [`NodeConfigManifest::bootstrap`].
+/// The full effective config is obtained by merging database layers over the
+/// bootstrap seed once the database pool is available.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BootstrapConfig {
+    /// Node identifier (from `spec.node.id`).
+    pub node_id: String,
+    /// Node role in the cluster (from `spec.cluster.role`).
+    pub role: NodeRole,
+    /// Database connection settings (required to reach the config layers table).
+    pub database: Option<DatabaseConfig>,
+    /// Controller endpoint for worker/hybrid nodes to reach the controller.
+    pub controller_endpoint: Option<String>,
+    /// Path to the persistent Ed25519 keypair for node authentication.
+    pub node_keypair_path: PathBuf,
 }
 
 /// Manifest metadata (Kubernetes-style)
@@ -1577,6 +1599,41 @@ impl NodeConfigManifest {
         Ok(config)
     }
 
+    /// Extract the minimal bootstrap configuration needed to establish database
+    /// connectivity and controller contact (ADR-060 Gap 059-12).
+    ///
+    /// The returned [`BootstrapConfig`] contains only the fields required before
+    /// the full merged configuration is available from the database.
+    pub fn bootstrap(&self) -> BootstrapConfig {
+        let cluster = self.spec.cluster.as_ref();
+        BootstrapConfig {
+            node_id: self.spec.node.id.clone(),
+            role: cluster.map(|c| c.role).unwrap_or_default(),
+            database: self.spec.database.clone(),
+            controller_endpoint: cluster
+                .and_then(|c| c.controller.as_ref())
+                .map(|ctrl| ctrl.endpoint.clone()),
+            node_keypair_path: cluster
+                .map(|c| c.node_keypair_path.clone())
+                .unwrap_or_else(default_keypair_path),
+        }
+    }
+
+    /// Deep-merge a database-backed [`MergedConfig`] overlay over the current
+    /// YAML-derived spec (ADR-060 Gap 059-2).
+    ///
+    /// The merge serialises the current [`NodeConfigSpec`] to JSON, performs a
+    /// recursive merge with `merged.payload` (overlay wins), and deserialises
+    /// back. Fields present only in the YAML seed are preserved; fields present
+    /// in the database overlay take precedence.
+    pub fn apply_merged_overlay(&mut self, merged: &MergedConfig) -> anyhow::Result<()> {
+        let base = serde_json::to_value(&self.spec)?;
+        let overlay = &merged.payload;
+        let merged_value = deep_merge_json(base, overlay.clone());
+        self.spec = serde_json::from_value(merged_value)?;
+        Ok(())
+    }
+
     /// Discover configuration file using precedence order
     /// 1. AEGIS_CONFIG_PATH environment variable
     /// 2. ./aegis-config.yaml (working directory)
@@ -1958,6 +2015,27 @@ pub fn resolve_env_value_optional(raw: &Option<String>) -> Option<String> {
     raw.as_ref().and_then(|v| resolve_env_value(v).ok())
 }
 
+/// Recursively merge two JSON values. When both are objects the overlay's keys
+/// take precedence; nested objects are merged recursively. For all other types
+/// (arrays, scalars) the overlay value replaces the base.
+fn deep_merge_json(base: serde_json::Value, overlay: serde_json::Value) -> serde_json::Value {
+    match (base, overlay) {
+        (serde_json::Value::Object(mut base_map), serde_json::Value::Object(overlay_map)) => {
+            for (key, overlay_val) in overlay_map {
+                let merged = if let Some(base_val) = base_map.remove(&key) {
+                    deep_merge_json(base_val, overlay_val)
+                } else {
+                    overlay_val
+                };
+                base_map.insert(key, merged);
+            }
+            serde_json::Value::Object(base_map)
+        }
+        // Overlay wins for non-object types
+        (_base, overlay) => overlay,
+    }
+}
+
 fn default_bootstrap_script() -> String {
     "assets/bootstrap.py".to_string()
 }
@@ -2134,5 +2212,95 @@ mod tests {
             models: vec![],
         });
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn test_bootstrap_extracts_minimal_config() {
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.node.id = "550e8400-e29b-41d4-a716-446655440000".to_string();
+        manifest.spec.database = Some(DatabaseConfig {
+            url: "postgresql://localhost/aegis".to_string(),
+            max_connections: 5,
+            connect_timeout_seconds: 10,
+        });
+        manifest.spec.cluster = Some(ClusterConfig {
+            enabled: true,
+            role: NodeRole::Worker,
+            controller: Some(ClusterControllerConfig {
+                endpoint: "https://controller:9090".to_string(),
+                token: None,
+            }),
+            cluster_grpc_port: 9090,
+            peers: vec![],
+            node_keypair_path: PathBuf::from("/etc/aegis/keypair"),
+            heartbeat_interval_secs: 30,
+            token_refresh_margin_secs: 120,
+            tls: None,
+        });
+
+        let bootstrap = manifest.bootstrap();
+        assert_eq!(bootstrap.node_id, "550e8400-e29b-41d4-a716-446655440000");
+        assert_eq!(bootstrap.role, NodeRole::Worker);
+        assert!(bootstrap.database.is_some());
+        assert_eq!(
+            bootstrap.controller_endpoint.as_deref(),
+            Some("https://controller:9090")
+        );
+        assert_eq!(
+            bootstrap.node_keypair_path,
+            PathBuf::from("/etc/aegis/keypair")
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_defaults_without_cluster() {
+        let manifest = NodeConfigManifest::default();
+        let bootstrap = manifest.bootstrap();
+        assert_eq!(bootstrap.role, NodeRole::Hybrid);
+        assert!(bootstrap.controller_endpoint.is_none());
+        assert!(bootstrap.database.is_none());
+    }
+
+    #[test]
+    fn test_apply_merged_overlay_overrides_values() {
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.node.id = "test-node-id".to_string();
+        manifest.spec.runtime.bootstrap_script = "original.py".to_string();
+        manifest.spec.runtime.orchestrator_url = "http://original:8088".to_string();
+
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "runtime": {
+                    "bootstrap_script": "overridden.py"
+                }
+            }),
+            version: "v1-merged".to_string(),
+        };
+
+        manifest.apply_merged_overlay(&merged).unwrap();
+        assert_eq!(manifest.spec.runtime.bootstrap_script, "overridden.py");
+        // Fields not in overlay are preserved
+        assert_eq!(
+            manifest.spec.runtime.orchestrator_url,
+            "http://original:8088"
+        );
+    }
+
+    #[test]
+    fn test_apply_merged_overlay_preserves_unset_fields() {
+        let mut manifest = NodeConfigManifest::default();
+        manifest.spec.node.id = "test-id".to_string();
+        let original_id = manifest.spec.node.id.clone();
+
+        let merged = MergedConfig {
+            payload: serde_json::json!({
+                "deploy_builtins": true
+            }),
+            version: "v2".to_string(),
+        };
+
+        manifest.apply_merged_overlay(&merged).unwrap();
+        assert!(manifest.spec.deploy_builtins);
+        assert_eq!(manifest.spec.node.id, original_id);
     }
 }
