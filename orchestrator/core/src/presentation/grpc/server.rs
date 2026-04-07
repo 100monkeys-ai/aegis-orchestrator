@@ -79,18 +79,6 @@ pub struct AegisRuntimeService {
 }
 
 impl AegisRuntimeService {
-    fn tenant_id_from_identity(identity: Option<&UserIdentity>) -> TenantId {
-        match identity.map(|identity| &identity.identity_kind) {
-            Some(IdentityKind::ConsumerUser { tenant_id, .. }) => tenant_id.clone(),
-            Some(IdentityKind::TenantUser { tenant_slug }) => {
-                TenantId::from_realm_slug(tenant_slug).unwrap_or_else(|_| TenantId::consumer())
-            }
-            Some(IdentityKind::Operator { .. }) => TenantId::system(),
-            Some(IdentityKind::ServiceAccount { .. }) => TenantId::system(),
-            None => TenantId::default(),
-        }
-    }
-
     /// Resolve the effective tenant for a gRPC request, honoring the
     /// `x-tenant-id` metadata key when the caller is a service account.
     ///

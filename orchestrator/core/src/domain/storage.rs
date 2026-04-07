@@ -274,7 +274,7 @@ pub trait StorageProvider: Send + Sync {
 }
 
 /// Storage errors
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum StorageError {
     #[error("Directory not found: {0}")]
     NotFound(String),
