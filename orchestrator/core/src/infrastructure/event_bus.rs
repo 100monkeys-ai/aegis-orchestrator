@@ -891,6 +891,21 @@ impl EventBus {
 
     /// Publish a workflow event
     pub fn publish_workflow_event(&self, event: WorkflowEvent) {
+        // ADR-087 §Observability: record agent cache hit when the pipeline reused an
+        // existing agent. The domain event does not carry tenant_id at this layer, so
+        // the label is left empty; per-tenant breakdown requires adding tenant_id to
+        // IntentExecutionPipelineCompleted in a future iteration.
+        if let WorkflowEvent::IntentExecutionPipelineCompleted {
+            reused_existing_agent: true,
+            ..
+        } = &event
+        {
+            metrics::counter!(
+                "zaru_intent_pipeline_agent_cache_hits_total",
+                "tenant_id" => ""
+            )
+            .increment(1);
+        }
         self.publish(DomainEvent::Workflow(event));
     }
 

@@ -589,6 +589,13 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                     duration_ms,
                 };
 
+                // ADR-087 §Observability: record container exit code.
+                metrics::counter!(
+                    "zaru_intent_pipeline_container_exit_code_total",
+                    "exit_code" => result.exit_code.to_string()
+                )
+                .increment(1);
+
                 if result.exit_code == 0 {
                     self.event_bus.publish_container_run_event(
                         ContainerRunEvent::ContainerRunCompleted {

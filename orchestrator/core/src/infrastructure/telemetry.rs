@@ -47,6 +47,94 @@ pub fn init_metrics(
     )
     .set(1.0);
 
+    // Register intent pipeline metric descriptors (ADR-087 §Observability)
+    register_intent_pipeline_metrics();
+
     tracing::info!("Metrics exporter listening on {}", addr);
     Ok(())
+}
+
+/// Registers the four intent execution pipeline metric descriptors defined in
+/// ADR-087 §Observability. Calling this pre-populates the Prometheus registry
+/// so the metrics appear at scrape time even before the first pipeline run.
+///
+/// This function is idempotent — subsequent calls are no-ops because the
+/// `metrics` crate deduplicates registrations by name.
+pub fn register_intent_pipeline_metrics() {
+    // Counter: pipeline start events, labelled by tenant and language.
+    metrics::counter!(
+        "zaru_intent_pipeline_starts_total",
+        "tenant_id" => "",
+        "language" => ""
+    )
+    .absolute(0);
+
+    // Histogram: end-to-end pipeline duration, labelled by tenant, language, and outcome.
+    // Buckets are picked up from the `_duration_seconds` suffix matcher set in `init_metrics`.
+    metrics::histogram!(
+        "zaru_intent_pipeline_duration_seconds",
+        "tenant_id" => "",
+        "language" => "",
+        "outcome" => ""
+    )
+    .record(0.0);
+
+    // Counter: Cortex / agent cache hits, labelled by tenant.
+    metrics::counter!(
+        "zaru_intent_pipeline_agent_cache_hits_total",
+        "tenant_id" => ""
+    )
+    .absolute(0);
+
+    // Counter: container exit codes observed by the step runner.
+    metrics::counter!(
+        "zaru_intent_pipeline_container_exit_code_total",
+        "exit_code" => ""
+    )
+    .absolute(0);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::register_intent_pipeline_metrics;
+
+    /// Regression: all four ADR-087 metric descriptors must register without panicking.
+    /// The `metrics` crate panics if a metric is registered with conflicting types.
+    #[test]
+    fn test_intent_pipeline_metrics_register_without_panic() {
+        // Calling twice proves idempotency (second call must not panic either).
+        register_intent_pipeline_metrics();
+        register_intent_pipeline_metrics();
+    }
+
+    /// Regression: counter increments with valid label values must not panic.
+    #[test]
+    fn test_intent_pipeline_counter_increment_valid_labels() {
+        metrics::counter!(
+            "zaru_intent_pipeline_starts_total",
+            "tenant_id" => "tenant-abc",
+            "language" => "python"
+        )
+        .increment(1);
+
+        metrics::counter!(
+            "zaru_intent_pipeline_agent_cache_hits_total",
+            "tenant_id" => "tenant-abc"
+        )
+        .increment(1);
+
+        metrics::counter!(
+            "zaru_intent_pipeline_container_exit_code_total",
+            "exit_code" => "0"
+        )
+        .increment(1);
+
+        metrics::histogram!(
+            "zaru_intent_pipeline_duration_seconds",
+            "tenant_id" => "tenant-abc",
+            "language" => "python",
+            "outcome" => "success"
+        )
+        .record(1.5);
+    }
 }
