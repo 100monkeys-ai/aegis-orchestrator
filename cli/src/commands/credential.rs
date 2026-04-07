@@ -3,9 +3,7 @@
 //! Credential management commands for the AEGIS CLI
 //!
 //! Manages provider credential bindings (API keys and OAuth tokens) through the
-//! daemon API.  Includes the `migrate-legacy` subcommand that enumerates bindings
-//! in `pending_migration` status and drives the migration workflow defined in
-//! ADR-078.
+//! daemon API.
 //!
 //! # Architecture
 //!
@@ -83,16 +81,6 @@ pub enum CredentialCommand {
         #[command(subcommand)]
         command: GrantCommand,
     },
-
-    /// Migrate credential bindings that are in `pending_migration` status to
-    /// the OpenBao secret store.
-    ///
-    /// NOTE: The actual pgp_sym_decrypt step requires direct database access and
-    /// cannot be performed through the daemon API.  This command enumerates
-    /// pending_migration bindings and reports them.  The full migration
-    /// procedure, including decryption with PROVIDER_KEY_ENCRYPTION_SECRET, is
-    /// described in ADR-078.
-    MigrateLegacy,
 }
 
 /// Subcommands for `aegis credential grant`.
@@ -213,8 +201,6 @@ pub async fn handle_command(
                 grant_id,
             } => revoke_grant(&binding_id, &grant_id, &client, output_format).await,
         },
-
-        CredentialCommand::MigrateLegacy => migrate_legacy(&client, output_format).await,
     }
 }
 
@@ -408,106 +394,5 @@ async fn revoke_grant(
         "{}",
         format!("✓ Grant '{grant_id}' revoked from credential '{binding_id}'").green()
     );
-    Ok(())
-}
-
-/// Enumerate `pending_migration` credential bindings and report them.
-///
-/// The actual decryption of pgp_sym_encrypt values stored in
-/// `user_provider_keys.api_key` cannot be performed through the daemon API —
-/// it requires a direct database connection and the `PROVIDER_KEY_ENCRYPTION_SECRET`
-/// environment variable to call `pgp_sym_decrypt`.  This command reports all
-/// pending bindings so that a human operator can coordinate the decryption step.
-///
-/// # TODO
-/// Implement the full migration flow once the daemon exposes a dedicated
-/// `/v1/credentials/migrate` endpoint that:
-///   1. Reads `credential_bindings WHERE status = 'pending_migration'`
-///   2. Decrypts each `user_provider_keys.api_key` value server-side
-///   3. Writes plaintext to OpenBao via `PUT /v1/secrets/{secret_path}`
-///   4. Updates the binding status to `'active'`
-///
-/// See ADR-078 for the full migration design.
-async fn migrate_legacy(client: &DaemonClient, output_format: OutputFormat) -> Result<()> {
-    println!(
-        "{}",
-        "⚠  NOTE: Direct pgp_sym_decrypt of legacy api_key values requires database access and \
-         cannot be performed through the daemon API.  This command enumerates pending_migration \
-         bindings only.  See ADR-078 for the complete migration procedure."
-            .yellow()
-    );
-    println!();
-
-    // Enumerate all credential bindings and filter to pending_migration ones.
-    let body = client.list_credentials().await?;
-
-    let bindings = body
-        .as_array()
-        .cloned()
-        .or_else(|| body.get("credentials").and_then(|v| v.as_array()).cloned())
-        .unwrap_or_default();
-
-    let pending: Vec<&serde_json::Value> = bindings
-        .iter()
-        .filter(|b| {
-            b.get("status")
-                .and_then(|s| s.as_str())
-                .map(|s| s == "pending_migration")
-                .unwrap_or(false)
-        })
-        .collect();
-
-    let total = bindings.len();
-    let pending_count = pending.len();
-
-    if output_format.is_structured() {
-        return render_serialized(
-            output_format,
-            &serde_json::json!({
-                "total_bindings": total,
-                "pending_migration_count": pending_count,
-                "pending_migration_bindings": pending,
-                "note": "pgp_sym_decrypt requires direct database access; see ADR-078"
-            }),
-        );
-    }
-
-    if pending.is_empty() {
-        println!(
-            "{}",
-            format!("✓ No bindings pending migration (total: {total})").green()
-        );
-        return Ok(());
-    }
-
-    println!(
-        "Found {} of {} binding(s) pending migration:",
-        pending_count.to_string().bold(),
-        total
-    );
-    println!("{:<38} {:<20} STATUS", "ID", "PROVIDER");
-
-    for binding in &pending {
-        let id = binding
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown>");
-        let provider = binding
-            .get("provider")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown>");
-        let status = binding
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<unknown>");
-        println!("{id:<38} {provider:<20} {status}");
-    }
-
-    println!();
-    println!(
-        "{}",
-        "Migrated 0 of N bindings — decryption requires direct DB access (see ADR-078).".yellow()
-    );
-
     Ok(())
 }
