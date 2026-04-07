@@ -2592,3 +2592,128 @@ async fn workflow_run_with_version_passes_version_through() {
     assert_eq!(request.version, Some("3.1.0".to_string()));
     assert_eq!(request.workflow_id, "my-workflow");
 }
+
+// ── ADR-087 D4: Free tier volume_id rejection ──────────────────────────────
+
+fn make_security_context(name: &str) -> SecurityContext {
+    SecurityContext {
+        name: name.to_string(),
+        description: String::new(),
+        capabilities: vec![],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    }
+}
+
+fn make_execute_intent_service() -> ToolInvocationService {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+    ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(TestAgentLifecycleService),
+        Arc::new(TestExecutionService),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    )
+}
+
+/// ADR-087 D4: Free tier caller + volume_id Some → InvalidArguments before any
+/// WorkflowExecution is created.
+#[tokio::test]
+async fn test_free_tier_volume_id_rejected() {
+    let service = make_execute_intent_service();
+    let free_ctx = make_security_context("zaru-free");
+
+    let result = service
+        .invoke_aegis_execute_intent_tool(
+            &serde_json::json!({
+                "intent": "run something",
+                "volume_id": "vol-abc123",
+            }),
+            &free_ctx,
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(SealSessionError::InvalidArguments(ref msg)) if msg.contains("volume_id")),
+        "expected InvalidArguments about volume_id, got {result:?}"
+    );
+}
+
+/// ADR-087 D4: Free tier caller + no volume_id → passes the tier check and proceeds.
+/// The service has no workflow execution use case configured so it returns a Direct
+/// error payload rather than panicking — the gate does not fire.
+#[tokio::test]
+async fn test_free_tier_no_volume_id_allowed() {
+    let service = make_execute_intent_service();
+    let free_ctx = make_security_context("zaru-free");
+
+    let result = service
+        .invoke_aegis_execute_intent_tool(
+            &serde_json::json!({
+                "intent": "run something",
+            }),
+            &free_ctx,
+        )
+        .await;
+
+    // The tier check passes; the call falls through to the unconfigured use-case
+    // branch, which returns a Direct JSON payload (not an Err).
+    assert!(
+        result.is_ok(),
+        "expected Ok (tier check passed), got {result:?}"
+    );
+    if let Ok(ToolInvocationResult::Direct(payload)) = result {
+        assert_eq!(
+            payload["error"], "Workflow execution service not configured",
+            "unexpected payload: {payload}"
+        );
+    }
+}
+
+/// ADR-087 D4: Non-Free tier caller + volume_id Some → passes the tier check.
+/// Uses `zaru-pro` as a representative paid tier.
+#[tokio::test]
+async fn test_paid_tier_volume_id_allowed() {
+    let service = make_execute_intent_service();
+    let pro_ctx = make_security_context("zaru-pro");
+
+    let result = service
+        .invoke_aegis_execute_intent_tool(
+            &serde_json::json!({
+                "intent": "run something",
+                "volume_id": "vol-abc123",
+            }),
+            &pro_ctx,
+        )
+        .await;
+
+    // The tier check passes; the call falls through to the unconfigured use-case
+    // branch, which returns a Direct JSON payload (not an Err).
+    assert!(
+        result.is_ok(),
+        "expected Ok (tier check passed), got {result:?}"
+    );
+    if let Ok(ToolInvocationResult::Direct(payload)) = result {
+        assert_eq!(
+            payload["error"], "Workflow execution service not configured",
+            "unexpected payload: {payload}"
+        );
+    }
+}

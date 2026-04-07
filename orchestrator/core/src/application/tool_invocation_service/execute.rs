@@ -9,7 +9,7 @@ impl ToolInvocationService {
     pub(super) async fn invoke_aegis_execute_intent_tool(
         &self,
         args: &Value,
-        _security_context: &crate::domain::security_context::SecurityContext,
+        security_context: &crate::domain::security_context::SecurityContext,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let intent = args.get("intent").and_then(|v| v.as_str()).ok_or_else(|| {
             SealSessionError::InvalidArguments(
@@ -22,6 +22,19 @@ impl ToolInvocationService {
             .get("volume_id")
             .and_then(|v| v.as_str())
             .map(String::from);
+
+        // ADR-087 D4: Free tier users may not supply a persistent volume_id.
+        // Reject before any WorkflowExecution record is created.
+        if volume_id.is_some() {
+            let tier =
+                crate::domain::iam::ZaruTier::from_security_context_name(&security_context.name);
+            if tier == Some(crate::domain::iam::ZaruTier::Free) {
+                return Err(SealSessionError::InvalidArguments(
+                    "volume_id is not available on the Free tier".to_string(),
+                ));
+            }
+        }
+
         let language = args
             .get("language")
             .and_then(|v| v.as_str())
