@@ -225,8 +225,7 @@ impl VolumeRepository for PostgresVolumeRepository {
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE tenant_id = $1
-              AND ownership->>'type' = 'persistent'
-              AND ownership->>'owner' = $2
+              AND owner_user_id = $2
             ORDER BY created_at DESC
             "#,
         )
@@ -253,8 +252,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             SELECT COUNT(*)::BIGINT AS cnt
             FROM volumes
             WHERE tenant_id = $1
-              AND ownership->>'type' = 'persistent'
-              AND ownership->>'owner' = $2
+              AND owner_user_id = $2
             "#,
         )
         .bind(tenant_id.as_str())
@@ -277,8 +275,7 @@ impl VolumeRepository for PostgresVolumeRepository {
             SELECT COALESCE(SUM(size_limit_bytes), 0)::BIGINT AS total
             FROM volumes
             WHERE tenant_id = $1
-              AND ownership->>'type' = 'persistent'
-              AND ownership->>'owner' = $2
+              AND owner_user_id = $2
             "#,
         )
         .bind(tenant_id.as_str())
