@@ -101,11 +101,9 @@ fn require_operator_or_admin(
     })?;
 
     match &identity.identity_kind {
-        IdentityKind::Operator { aegis_role }
-            if matches!(aegis_role, AegisRole::Operator | AegisRole::Admin) =>
-        {
-            Ok(identity)
-        }
+        IdentityKind::Operator {
+            aegis_role: AegisRole::Operator | AegisRole::Admin,
+        } => Ok(identity),
         _ => Err((
             StatusCode::FORBIDDEN,
             Json(json!({"error": "Operator or Admin role required"})),

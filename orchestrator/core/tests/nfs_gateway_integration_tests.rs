@@ -205,6 +205,30 @@ impl VolumeRepository for TestVolumeRepository {
         Ok(Vec::new())
     }
 
+    async fn find_by_owner(
+        &self,
+        _tenant_id: &TenantId,
+        _owner_user_id: &str,
+    ) -> Result<Vec<Volume>, RepositoryError> {
+        Ok(vec![])
+    }
+
+    async fn count_by_owner(
+        &self,
+        _tenant_id: &TenantId,
+        _owner_user_id: &str,
+    ) -> Result<u32, RepositoryError> {
+        Ok(0)
+    }
+
+    async fn sum_size_by_owner(
+        &self,
+        _tenant_id: &TenantId,
+        _owner_user_id: &str,
+    ) -> Result<u64, RepositoryError> {
+        Ok(0)
+    }
+
     async fn delete(&self, id: VolumeId) -> Result<(), RepositoryError> {
         let mut volumes = self.volumes.write().await;
         volumes.retain(|v| v.id != id);

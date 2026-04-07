@@ -116,7 +116,7 @@ impl UserVolumeService {
         }
 
         // Delegate creation to VolumeService (size_limit_mb is bytes / 1024 / 1024)
-        let size_limit_mb = (cmd.size_limit_bytes + 1024 * 1024 - 1) / (1024 * 1024);
+        let size_limit_mb = cmd.size_limit_bytes.div_ceil(1024 * 1024);
         let volume_id = self
             .volume_service
             .create_volume(
