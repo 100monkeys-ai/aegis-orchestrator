@@ -55,6 +55,11 @@ pub struct ContainerStepRunnerConfig {
     pub nfs_server_host: Option<String>,
     pub nfs_port: u16,
     pub nfs_mountport: u16,
+    /// Docker network mode for container steps (e.g. `"host"`).
+    /// Must match the network mode used by agent containers so that
+    /// `addr=127.0.0.1` in NFS mount options resolves to the host NFS
+    /// server rather than the container's own loopback (ADR-036).
+    pub network_mode: Option<String>,
 }
 
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
@@ -68,6 +73,10 @@ pub struct ContainerStepRunnerImpl {
     nfs_server_host: Option<String>,
     nfs_port: u16,
     nfs_mountport: u16,
+    /// Docker network mode applied to every container step (e.g. `"host"`).
+    /// Inherited from the same resolved value used for agent containers so
+    /// that NFS `addr=127.0.0.1` refers to the host, not the container loopback.
+    network_mode: Option<String>,
     event_bus: Arc<EventBus>,
     /// Used to resolve per-step registry credentials stored in OpenBao (ADR-050).
     /// When `ContainerStepConfig::registry_credentials` is `Some("secret:engine/path")`,
@@ -94,6 +103,7 @@ impl ContainerStepRunnerImpl {
             nfs_server_host: config.nfs_server_host,
             nfs_port: config.nfs_port,
             nfs_mountport: config.nfs_mountport,
+            network_mode: config.network_mode,
             event_bus,
             secrets_manager,
             volume_registry,
@@ -329,6 +339,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
         let host_config = {
             let mut hc = HostConfig {
+                network_mode: self.network_mode.clone(),
                 ..Default::default()
             };
 
@@ -753,7 +764,23 @@ fn parse_memory_string(s: &str) -> Option<i64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_memory_string;
+    use super::{parse_memory_string, ContainerStepRunnerConfig};
+
+    /// Regression: ContainerStepRunnerConfig must propagate network_mode so
+    /// container steps use the same Docker network as agent containers.
+    /// Without this field, HostConfig defaulted to bridge networking and
+    /// addr=127.0.0.1 in NFS mount options resolved to the container's own
+    /// loopback, making the NFS server unreachable (ADR-036).
+    #[test]
+    fn test_config_network_mode_stored() {
+        let config = ContainerStepRunnerConfig {
+            nfs_server_host: None,
+            nfs_port: 2049,
+            nfs_mountport: 2049,
+            network_mode: Some("host".to_string()),
+        };
+        assert_eq!(config.network_mode.as_deref(), Some("host"));
+    }
 
     #[test]
     fn parse_memory_string_supports_iec_units() {

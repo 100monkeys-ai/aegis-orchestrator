@@ -1297,6 +1297,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 nfs_server_host,
                 nfs_port: config.spec.runtime.nfs_port,
                 nfs_mountport: config.spec.runtime.nfs_mountport,
+                network_mode: network_mode.clone(),
             },
             event_bus.clone(),
             secrets_manager.clone(),
