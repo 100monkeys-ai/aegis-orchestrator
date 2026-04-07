@@ -344,7 +344,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                     .network_mode
                     .clone()
                     .or_else(|| self.network_mode.clone()),
-                read_only_rootfs: Some(config.read_only_root_filesystem),
+                readonly_rootfs: Some(config.read_only_root_filesystem),
                 ..Default::default()
             };
 

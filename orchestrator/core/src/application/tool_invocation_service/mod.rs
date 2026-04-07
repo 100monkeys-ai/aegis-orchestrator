@@ -66,6 +66,7 @@ const COMPACT_JSON_INLINE_LIMIT: usize = 256;
 const COMPACT_STRING_PREVIEW_LIMIT: usize = 96;
 const COMPACT_ERROR_PREVIEW_LIMIT: usize = 3;
 
+#[derive(Debug)]
 pub enum ToolInvocationResult {
     Direct(Value),
     DispatchRequired(DispatchAction),
