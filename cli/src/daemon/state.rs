@@ -22,10 +22,9 @@ use aegis_orchestrator_core::{
         event_bus::EventBus, secrets_manager::SecretsManager, temporal_client::TemporalClient,
         TemporalEventListener,
     },
-    presentation::webhook_guard::{WebhookHmacState, WebhookSecretProvider},
+    presentation::webhook_guard::WebhookSecretProvider,
 };
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
-use axum::extract::FromRef;
 
 use super::operator_read_models::OperatorReadModelStore;
 
@@ -85,18 +84,4 @@ pub(crate) struct AppState {
     pub(crate) file_operations_service: Arc<FileOperationsService>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
-}
-
-/// Enable webhook HMAC authentication via Axum extractor pulling state from [`Arc<AppState>`].
-///
-/// The router uses `State<Arc<AppState>>`, so axum's `FromRef` machinery resolves against
-/// `Arc<AppState>`. Axum 0.8 does NOT provide a blanket `FromRef<Arc<S>>` impl, so we must
-/// implement `FromRef<Arc<AppState>>` directly. The orphan rule is satisfied because
-/// `AppState` is defined in this crate.
-impl FromRef<Arc<AppState>> for WebhookHmacState {
-    fn from_ref(state: &Arc<AppState>) -> Self {
-        WebhookHmacState {
-            secret_provider: state.webhook_secret_provider.clone(),
-        }
-    }
 }

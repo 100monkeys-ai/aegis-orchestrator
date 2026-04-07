@@ -16,7 +16,7 @@
 //! - Return `503 Service Unavailable` if stimulus service is not wired in app state
 
 use axum::{
-    extract::{Path, State},
+    extract::{Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -141,17 +141,29 @@ pub(crate) async fn ingest_stimulus_handler(
 /// Accepts a raw webhook payload from an external system. The `source` path
 /// parameter identifies the webhook source (e.g. `"github"`, `"stripe"`).
 ///
-/// Authentication is performed by [`WebhookHmacGuard`]: it reads the
-/// `X-Aegis-Signature: sha256=<hex>` header and verifies it against the
+/// Authentication is performed by [`WebhookHmacGuard::from_request`]: it reads
+/// the `X-Aegis-Signature: sha256=<hex>` header and verifies it against the
 /// secret configured for this source.
 ///
 /// Returns `202 Accepted` with `{ stimulus_id, workflow_execution_id }`.
 pub(crate) async fn webhook_handler(
     State(state): State<Arc<AppState>>,
-    Path(source): Path<String>,
-    headers: HeaderMap,
-    guard: WebhookHmacGuard,
+    req: Request,
 ) -> impl IntoResponse {
+    // ── HMAC verification ─────────────────────────────────────────────────────
+    // Extract headers before verification for later stimulus construction.
+    // WebhookHmacGuard::from_request takes ownership of the request and reads
+    // the body; we snapshot headers first.
+    let headers = req.headers().clone();
+
+    let guard =
+        match WebhookHmacGuard::from_request(req, state.webhook_secret_provider.as_ref()).await {
+            Ok(g) => g,
+            Err(e) => return e.into_response(),
+        };
+
+    let source = guard.source.clone();
+
     let stimulus_service = match &state.stimulus_service {
         Some(svc) => svc.clone(),
         None => {

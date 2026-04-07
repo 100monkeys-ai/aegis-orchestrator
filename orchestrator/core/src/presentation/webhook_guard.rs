@@ -1,27 +1,30 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! # WebhookHmacGuard — Axum extractor for HMAC-SHA256 webhook verification (ADR-021)
+//! # WebhookHmacGuard — HMAC-SHA256 webhook verification (ADR-021)
 //!
-//! Extracts and verifies the `X-Aegis-Signature: sha256=<hex>` header on
-//! incoming webhook requests. Uses constant-time comparison (`subtle` crate)
-//! to prevent timing attacks.
+//! Verifies the `X-Aegis-Signature: sha256=<hex>` header on incoming webhook
+//! requests. Uses constant-time comparison (`subtle` crate) to prevent timing
+//! attacks.
 //!
 //! ## Usage
 //!
-//! ```rust,no_run
-//! use aegis_orchestrator_core::presentation::webhook_guard::WebhookHmacGuard;
-//! use axum::response::IntoResponse;
+//! Call [`WebhookHmacGuard::from_request`] with the raw [`axum::extract::Request`]
+//! and a [`WebhookSecretProvider`] to obtain a verified guard:
 //!
-//! async fn my_handler(
-//!     WebhookHmacGuard { source, body }: WebhookHmacGuard,
-//! ) -> impl IntoResponse {
-//!     // Process webhook payload
-//!     format!("Received webhook from {}", source)
+//! ```rust,no_run
+//! use aegis_orchestrator_core::presentation::webhook_guard::{
+//!     WebhookHmacGuard, WebhookSecretProvider,
+//! };
+//! use axum::extract::Request;
+//! use std::sync::Arc;
+//!
+//! async fn my_handler(req: Request, provider: Arc<dyn WebhookSecretProvider>) {
+//!     match WebhookHmacGuard::from_request(req, provider.as_ref()).await {
+//!         Ok(guard) => { /* guard.source, guard.body */ }
+//!         Err(e) => { /* reject */ }
+//!     }
 //! }
 //! ```
-//!
-//! The handler receives the verified raw body bytes. If verification fails,
-//! the extractor returns `401 Unauthorized` before the handler is called.
 //!
 //! ## Secret Resolution
 //!
@@ -33,13 +36,12 @@
 use async_trait::async_trait;
 use axum::{
     body::Bytes,
-    extract::{FromRef, Request},
+    extract::Request,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use std::sync::Arc;
 use subtle::ConstantTimeEq;
 use tracing::{debug, warn};
 
@@ -147,37 +149,37 @@ impl std::fmt::Display for WebhookAuthError {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// WebhookHmacGuard extractor
+// WebhookHmacGuard
 // ──────────────────────────────────────────────────────────────────────────────
 
-/// Axum extractor that verifies the HMAC-SHA256 signature of an incoming webhook.
+/// Verifies the HMAC-SHA256 signature of an incoming webhook request.
 ///
-/// On success, the handler receives:
+/// On success, contains:
 /// - `source`: the URL path segment (e.g. `"github"`, `"stripe"`)
 /// - `body`: the verified raw request body bytes
+///
+/// Call [`WebhookHmacGuard::from_request`] to perform verification. This type
+/// is intentionally not an axum extractor — callers hold the `AppState` and
+/// pass the provider directly, which avoids the orphan-rule conflict that arises
+/// when trying to implement `FromRef<Arc<AppState>>` for a type defined in a
+/// foreign crate.
 pub struct WebhookHmacGuard {
     pub source: String,
     pub body: Bytes,
 }
 
-/// State fragment required by [`WebhookHmacGuard`].
-///
-/// Add `webhook_secret_provider: Arc<dyn WebhookSecretProvider>` to `AppState`
-/// and implement `FromRef<AppState>` for `WebhookHmacState`.
-pub struct WebhookHmacState {
-    pub secret_provider: Arc<dyn WebhookSecretProvider>,
-}
-
-impl<S> axum::extract::FromRequest<S> for WebhookHmacGuard
-where
-    WebhookHmacState: FromRef<S>,
-    S: Send + Sync,
-{
-    type Rejection = WebhookAuthError;
-
-    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        let hmac_state = WebhookHmacState::from_ref(state);
-
+impl WebhookHmacGuard {
+    /// Verify the HMAC-SHA256 signature of `req` using `provider`.
+    ///
+    /// Extracts the `X-Aegis-Signature: sha256=<hex>` header, reads the body,
+    /// computes the expected HMAC, and performs a constant-time comparison.
+    ///
+    /// Returns [`WebhookHmacGuard`] on success, or a [`WebhookAuthError`] that
+    /// can be returned directly as an HTTP response on failure.
+    pub async fn from_request(
+        req: Request,
+        provider: &dyn WebhookSecretProvider,
+    ) -> Result<Self, WebhookAuthError> {
         // ── Extract source from the URI path (last segment) ───────────────────
         // Path: /v1/webhooks/{source}  → last segment = source
         let source = req
@@ -204,18 +206,14 @@ where
         let expected_bytes = hex::decode(hex_sig).map_err(|_| WebhookAuthError::InvalidHex)?;
 
         // ── Fetch secret for this source ──────────────────────────────────────
-        let secret = hmac_state
-            .secret_provider
-            .get_secret(&source)
-            .await
-            .ok_or_else(|| {
-                warn!(source = %source, "No HMAC secret configured for webhook source");
-                WebhookAuthError::SecretNotFound {
-                    source: source.clone(),
-                }
-            })?;
+        let secret = provider.get_secret(&source).await.ok_or_else(|| {
+            warn!(source = %source, "No HMAC secret configured for webhook source");
+            WebhookAuthError::SecretNotFound {
+                source: source.clone(),
+            }
+        })?;
 
-        // ── Read body bytes (must be done after header extraction) ────────────
+        // ── Read body bytes ───────────────────────────────────────────────────
         let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX)
             .await
             .map_err(|e| WebhookAuthError::BodyReadError(e.to_string()))?;
@@ -307,5 +305,77 @@ mod tests {
         let result = provider.get_secret("my-source").await;
         assert_eq!(result, Some(b"test-secret".to_vec()));
         std::env::remove_var("AEGIS_WEBHOOK_SECRET_MY_SOURCE");
+    }
+
+    #[tokio::test]
+    async fn from_request_rejects_missing_signature_header() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        let provider = EnvWebhookSecretProvider;
+        // No X-Aegis-Signature header — must fail with MissingSignature
+        let req = Request::builder()
+            .uri("/v1/webhooks/test-source")
+            .body(Body::from(b"hello".as_slice()))
+            .unwrap();
+
+        let result = WebhookHmacGuard::from_request(req, &provider).await;
+        assert!(
+            matches!(result, Err(WebhookAuthError::MissingSignature)),
+            "expected MissingSignature, got {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn from_request_rejects_invalid_signature() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        // Configure a secret for "test-source"
+        std::env::set_var("AEGIS_WEBHOOK_SECRET_TEST_SOURCE", "correct-secret");
+
+        let provider = EnvWebhookSecretProvider;
+        let wrong_sig = compute_webhook_signature(b"hello", b"wrong-secret");
+
+        let req = Request::builder()
+            .uri("/v1/webhooks/test-source")
+            .header("X-Aegis-Signature", wrong_sig)
+            .body(Body::from(b"hello".as_slice()))
+            .unwrap();
+
+        let result = WebhookHmacGuard::from_request(req, &provider).await;
+        std::env::remove_var("AEGIS_WEBHOOK_SECRET_TEST_SOURCE");
+
+        assert!(
+            matches!(result, Err(WebhookAuthError::InvalidSignature)),
+            "expected InvalidSignature, got {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    async fn from_request_accepts_valid_signature() {
+        use axum::body::Body;
+        use axum::http::Request;
+
+        std::env::set_var("AEGIS_WEBHOOK_SECRET_GOOD_SOURCE", "my-secret");
+
+        let provider = EnvWebhookSecretProvider;
+        let body = b"payload";
+        let sig = compute_webhook_signature(body, b"my-secret");
+
+        let req = Request::builder()
+            .uri("/v1/webhooks/good-source")
+            .header("X-Aegis-Signature", sig)
+            .body(Body::from(body.as_slice()))
+            .unwrap();
+
+        let result = WebhookHmacGuard::from_request(req, &provider).await;
+        std::env::remove_var("AEGIS_WEBHOOK_SECRET_GOOD_SOURCE");
+
+        let guard = result.expect("expected Ok guard");
+        assert_eq!(guard.source, "good-source");
+        assert_eq!(guard.body.as_ref(), b"payload");
     }
 }
