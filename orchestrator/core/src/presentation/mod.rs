@@ -17,6 +17,7 @@
 //! | [`metrics_middleware`] | HTTP | Prometheus metrics tracking (ADR-058) |
 
 pub mod api;
+pub mod credential_handlers;
 pub mod grpc;
 pub mod keycloak_auth;
 pub mod metrics_middleware;
