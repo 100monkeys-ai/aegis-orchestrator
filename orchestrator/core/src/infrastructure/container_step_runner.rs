@@ -339,7 +339,12 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
         let host_config = {
             let mut hc = HostConfig {
-                network_mode: self.network_mode.clone(),
+                // Step-level network_mode overrides the runner-level default (ADR-087 D5).
+                network_mode: config
+                    .network_mode
+                    .clone()
+                    .or_else(|| self.network_mode.clone()),
+                read_only_rootfs: Some(config.read_only_root_filesystem),
                 ..Default::default()
             };
 
@@ -470,6 +475,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             cmd: Some(cmd),
             env: Some(env_strings),
             working_dir: config.workdir.clone(),
+            user: config.run_as_user.clone(),
             attach_stdout: Some(true),
             attach_stderr: Some(true),
             // No tty — we want raw stdout/stderr separately
@@ -765,6 +771,7 @@ fn parse_memory_string(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::{parse_memory_string, ContainerStepRunnerConfig};
+    use crate::domain::runtime::ContainerStepConfig;
 
     /// Regression: ContainerStepRunnerConfig must propagate network_mode so
     /// container steps use the same Docker network as agent containers.
@@ -780,6 +787,69 @@ mod tests {
             network_mode: Some("host".to_string()),
         };
         assert_eq!(config.network_mode.as_deref(), Some("host"));
+    }
+
+    /// Regression: ContainerStepConfig security fields must be stored and accessible
+    /// so the runner can forward them to HostConfig/ContainerCreateBody (ADR-087 D5).
+    /// Before this fix, ContainerStepConfig had no security fields and the runner
+    /// never enforced read-only root fs, run_as_user, or network isolation.
+    #[test]
+    fn test_security_fields_propagated_to_host_config() {
+        use crate::domain::agent::ImagePullPolicy;
+        use crate::domain::execution::ExecutionId;
+        use crate::domain::workflow::StateName;
+
+        let config = ContainerStepConfig {
+            name: "execute-user-code".to_string(),
+            image: "python:3.12-slim".to_string(),
+            image_pull_policy: ImagePullPolicy::IfNotPresent,
+            command: vec!["python3".to_string(), "/workspace/solution.py".to_string()],
+            env: std::collections::HashMap::new(),
+            workdir: Some("/workspace".to_string()),
+            volumes: vec![],
+            resources: None,
+            registry_credentials: None,
+            execution_id: ExecutionId::new(),
+            state_name: StateName::new("EXECUTE_CODE").unwrap(),
+            read_only_root_filesystem: true,
+            run_as_user: Some("65534:65534".to_string()),
+            network_mode: Some("none".to_string()),
+        };
+
+        assert!(config.read_only_root_filesystem);
+        assert_eq!(config.run_as_user.as_deref(), Some("65534:65534"));
+        assert_eq!(config.network_mode.as_deref(), Some("none"));
+    }
+
+    /// Regression: step-level network_mode must take precedence over the runner-level
+    /// default so EXECUTE_CODE can enforce "none" regardless of the global network mode
+    /// (ADR-087 D5). Before this fix, only self.network_mode was used, so a step could
+    /// not override the runner default.
+    #[test]
+    fn test_step_network_mode_overrides_runner_network_mode() {
+        // Simulate the precedence logic used in run_step:
+        //   config.network_mode.clone().or_else(|| self.network_mode.clone())
+        let runner_network_mode: Option<String> = Some("host".to_string());
+        let step_network_mode: Option<String> = Some("none".to_string());
+
+        let resolved = step_network_mode
+            .clone()
+            .or_else(|| runner_network_mode.clone());
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some("none"),
+            "step-level network_mode 'none' must override runner-level 'host'"
+        );
+
+        // When the step has no override, the runner default applies.
+        let no_step_override: Option<String> = None;
+        let resolved_fallback = no_step_override.or_else(|| runner_network_mode.clone());
+        assert_eq!(
+            resolved_fallback.as_deref(),
+            Some("host"),
+            "runner-level network_mode must be used when step has no override"
+        );
     }
 
     #[test]

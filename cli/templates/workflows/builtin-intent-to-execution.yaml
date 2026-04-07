@@ -87,6 +87,9 @@ spec:
         memory: "256Mi"
         timeout: "600s"
       shell: false
+      network_mode: "none"
+      run_as_user: "65534:65534"
+      read_only_root_filesystem: true
       output_handler:
         type: agent
         agent_id: aegis-output-formatter-agent

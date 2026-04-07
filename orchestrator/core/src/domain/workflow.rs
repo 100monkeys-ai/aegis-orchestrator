@@ -890,6 +890,18 @@ pub enum StateKind {
         #[serde(default)]
         shell: bool,
 
+        /// If true, the container's root filesystem is mounted read-only (ADR-087 D5).
+        #[serde(default)]
+        read_only_root_filesystem: bool,
+
+        /// User the container process runs as, e.g. "65534:65534" (ADR-087 D5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        run_as_user: Option<String>,
+
+        /// Docker network mode override for this state, e.g. "none" (ADR-087 D5).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        network_mode: Option<String>,
+
         /// Optional egress handler fired after this state completes (ADR-103).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
@@ -1734,6 +1746,9 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    read_only_root_filesystem: false,
+                    run_as_user: None,
+                    network_mode: None,
                     output_handler: None,
                 },
                 transitions: vec![],
@@ -1843,6 +1858,9 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    read_only_root_filesystem: false,
+                    run_as_user: None,
+                    network_mode: None,
                     output_handler: None,
                 },
                 transitions: vec![],
