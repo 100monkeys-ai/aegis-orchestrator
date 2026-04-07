@@ -179,6 +179,15 @@ pub enum StateKindYaml {
         retry: Option<crate::domain::workflow::RetryConfig>,
         #[serde(default)]
         shell: bool,
+        /// If true, the container's root filesystem is mounted read-only (ADR-087 D5).
+        #[serde(default)]
+        read_only_root_filesystem: bool,
+        /// User the container process runs as, e.g. "65534:65534" (ADR-087 D5).
+        #[serde(default)]
+        run_as_user: Option<String>,
+        /// Docker network mode for this step, e.g. "none" (ADR-087 D5).
+        #[serde(default)]
+        network_mode: Option<String>,
         /// Optional egress handler fired after this state completes (ADR-103).
         #[serde(default)]
         output_handler: Option<crate::domain::output_handler::OutputHandlerConfig>,
@@ -507,6 +516,9 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                read_only_root_filesystem,
+                run_as_user,
+                network_mode,
                 output_handler,
             } => StateKind::ContainerRun {
                 name,
@@ -520,6 +532,9 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                read_only_root_filesystem,
+                run_as_user,
+                network_mode,
                 output_handler,
             },
             StateKindYaml::ParallelContainerRun { steps, completion } => {
@@ -746,6 +761,9 @@ impl WorkflowParser {
                 registry_credentials,
                 retry,
                 shell,
+                read_only_root_filesystem,
+                run_as_user,
+                network_mode,
                 output_handler,
             } => StateKindYaml::ContainerRun {
                 name: name.clone(),
@@ -759,6 +777,9 @@ impl WorkflowParser {
                 registry_credentials: registry_credentials.clone(),
                 retry: retry.clone(),
                 shell: *shell,
+                read_only_root_filesystem: *read_only_root_filesystem,
+                run_as_user: run_as_user.clone(),
+                network_mode: network_mode.clone(),
                 output_handler: output_handler.clone(),
             },
             StateKind::ParallelContainerRun { steps, completion } => {

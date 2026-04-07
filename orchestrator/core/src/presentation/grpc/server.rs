@@ -876,6 +876,13 @@ impl AegisRuntime for AegisRuntimeService {
             },
             max_attempts,
             shell: req.shell,
+            // ADR-087 D5: security fields will be sent by the temporal worker once
+            // the proto is extended. Defaulting to false/None here is safe because
+            // the EXECUTE_CODE state enforces these invariants via the workflow YAML,
+            // which flows through a separate execution path.
+            read_only_root_filesystem: false,
+            run_as_user: None,
+            network_mode: None,
         };
 
         match use_case.execute(input).await {

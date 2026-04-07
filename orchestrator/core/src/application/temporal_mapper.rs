@@ -132,6 +132,15 @@ pub struct TemporalWorkflowState {
     pub container_run_retry: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub container_run_shell: Option<bool>,
+    /// If true, container root filesystem is mounted read-only (ADR-087 D5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_read_only_root_filesystem: Option<bool>,
+    /// User the container process runs as (ADR-087 D5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_run_as_user: Option<String>,
+    /// Docker network mode override (ADR-087 D5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container_run_network_mode: Option<String>,
 
     // ParallelContainerRun-specific fields (ADR-050)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -331,6 +340,9 @@ impl TemporalWorkflowMapper {
                     container_run_registry_credentials: None,
                     container_run_retry: None,
                     container_run_shell: None,
+                    container_run_read_only_root_filesystem: None,
+                    container_run_run_as_user: None,
+                    container_run_network_mode: None,
                     parallel_container_steps: None,
                     parallel_container_completion: None,
                     subworkflow_id: None,
@@ -495,6 +507,9 @@ impl TemporalWorkflowMapper {
                     container_run_registry_credentials: None,
                     container_run_retry: None,
                     container_run_shell: None,
+                    container_run_read_only_root_filesystem: None,
+                    container_run_run_as_user: None,
+                    container_run_network_mode: None,
                     parallel_container_steps: None,
                     parallel_container_completion: None,
                     subworkflow_id: None,
@@ -520,6 +535,9 @@ impl TemporalWorkflowMapper {
                 registry_credentials,
                 retry,
                 shell,
+                read_only_root_filesystem,
+                run_as_user,
+                network_mode,
                 output_handler,
             } => {
                 let pull_policy_str = image_pull_policy.as_ref().map(|p| match p {
@@ -565,6 +583,9 @@ impl TemporalWorkflowMapper {
                         .as_ref()
                         .map(|r| serde_json::to_value(r).unwrap_or(serde_json::json!({}))),
                     container_run_shell: Some(*shell),
+                    container_run_read_only_root_filesystem: Some(*read_only_root_filesystem),
+                    container_run_run_as_user: run_as_user.clone(),
+                    container_run_network_mode: network_mode.clone(),
                     parallel_container_steps: None,
                     parallel_container_completion: None,
                     subworkflow_id: None,
@@ -1049,6 +1070,9 @@ mod tests {
                     registry_credentials: None,
                     retry: None,
                     shell: false,
+                    read_only_root_filesystem: false,
+                    run_as_user: None,
+                    network_mode: None,
                     output_handler: None,
                 },
                 transitions: vec![],

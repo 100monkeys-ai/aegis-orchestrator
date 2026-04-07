@@ -425,6 +425,16 @@ pub struct ContainerStepConfig {
 
     /// Logical name of the workflow state that triggered this step
     pub state_name: StateName,
+
+    /// If true, the container's root filesystem is mounted read-only (ADR-087 D5).
+    pub read_only_root_filesystem: bool,
+
+    /// Override the user the container process runs as (e.g. "65534:65534") (ADR-087 D5).
+    pub run_as_user: Option<String>,
+
+    /// Docker network mode for this container step (ADR-087 D5).
+    /// When set, overrides the runner-level default network mode.
+    pub network_mode: Option<String>,
 }
 
 /// Result of a successfully completed container step (ADR-050).

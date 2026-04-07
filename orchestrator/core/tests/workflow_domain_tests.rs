@@ -123,6 +123,9 @@ fn container_run_state(
         registry_credentials: None,
         retry: None,
         shell: false,
+        read_only_root_filesystem: false,
+        run_as_user: None,
+        network_mode: None,
         output_handler: None,
     }
 }

@@ -36,6 +36,12 @@ pub struct RunContainerStepInput {
     /// Maximum number of attempts (1 = no retry).
     pub max_attempts: u32,
     pub shell: bool,
+    /// If true, the container's root filesystem is mounted read-only (ADR-087 D5).
+    pub read_only_root_filesystem: bool,
+    /// User the container process runs as, e.g. "65534:65534" (ADR-087 D5).
+    pub run_as_user: Option<String>,
+    /// Docker network mode override, e.g. "none" (ADR-087 D5).
+    pub network_mode: Option<String>,
 }
 
 /// Output from a single container step execution.
@@ -98,6 +104,9 @@ impl RunContainerStepUseCase {
                 registry_credentials: input.registry_credentials.clone(),
                 execution_id: input.execution_id,
                 state_name: input.state_name.clone(),
+                read_only_root_filesystem: input.read_only_root_filesystem,
+                run_as_user: input.run_as_user.clone(),
+                network_mode: input.network_mode.clone(),
             };
 
             match self.runner.run_step(config).await {
@@ -232,6 +241,10 @@ impl RunParallelContainerStepsUseCase {
                         max_attempts: 1,
                         // shell is a plain bool (not Option) on ContainerRunConfig.
                         shell: step.shell,
+                        // ParallelContainerRun steps do not carry per-step security overrides.
+                        read_only_root_filesystem: false,
+                        run_as_user: None,
+                        network_mode: None,
                     };
                     let outcome = uc.execute(input).await;
                     ParallelStepResult { name, outcome }
@@ -411,6 +424,9 @@ mod tests {
             registry_credentials: None,
             max_attempts: 1,
             shell: false,
+            read_only_root_filesystem: false,
+            run_as_user: None,
+            network_mode: None,
         }
     }
 
