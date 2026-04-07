@@ -6,10 +6,10 @@ use std::sync::Arc;
 
 use aegis_orchestrator_core::{
     application::{
-        execution::StandardExecutionService, file_operations_service::FileOperationsService,
-        lifecycle::StandardAgentLifecycleService,
+        credential_service::CredentialManagementService, execution::StandardExecutionService,
+        file_operations_service::FileOperationsService, lifecycle::StandardAgentLifecycleService,
         register_workflow::StandardRegisterWorkflowUseCase,
-        start_workflow_execution::StandardStartWorkflowExecutionUseCase,
+        start_workflow_execution::StandardStartWorkflowExecutionUseCase, stimulus::StimulusService,
         user_volume_service::UserVolumeService, CorrelatedActivityStreamService,
     },
     domain::{
@@ -18,9 +18,14 @@ use aegis_orchestrator_core::{
         node_config::NodeConfigManifest,
         repository::{StorageEventRepository, WorkflowExecutionRepository, WorkflowRepository},
     },
-    infrastructure::{event_bus::EventBus, temporal_client::TemporalClient, TemporalEventListener},
+    infrastructure::{
+        event_bus::EventBus, secrets_manager::SecretsManager, temporal_client::TemporalClient,
+        TemporalEventListener,
+    },
+    presentation::webhook_guard::{WebhookHmacState, WebhookSecretProvider},
 };
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
+use axum::extract::FromRef;
 
 use super::operator_read_models::OperatorReadModelStore;
 
@@ -68,8 +73,25 @@ pub(crate) struct AppState {
     /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
     #[allow(dead_code)]
     pub(crate) realm_repo: Option<Arc<dyn RealmRepository>>,
+    /// BC-11 Credential management service (ADR-078). Optional until DB is available.
+    pub(crate) credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Secrets manager for `/v1/secrets/*` admin endpoints (ADR-034).
+    pub(crate) secrets_manager: Arc<SecretsManager>,
+    /// HMAC secret provider for webhook requests (ADR-021).
+    pub(crate) webhook_secret_provider: Arc<dyn WebhookSecretProvider>,
+    /// BC-8: Stimulus routing and webhook ingestion service (ADR-021). Optional until wired.
+    pub(crate) stimulus_service: Option<Arc<dyn StimulusService>>,
     pub(crate) user_volume_service: Arc<UserVolumeService>,
     pub(crate) file_operations_service: Arc<FileOperationsService>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
+}
+
+/// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
+impl FromRef<Arc<AppState>> for WebhookHmacState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
+        WebhookHmacState {
+            secret_provider: state.webhook_secret_provider.clone(),
+        }
+    }
 }

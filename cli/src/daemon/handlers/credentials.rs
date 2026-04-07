@@ -24,14 +24,14 @@
 //! No business logic lives here — all work is delegated to
 //! `CredentialManagementService` and `SecretsManager`.
 
-use crate::domain::api_scope::ApiScope;
-use crate::domain::credential::{
+use crate::daemon::state::AppState;
+use aegis_orchestrator_core::domain::api_scope::ApiScope;
+use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, GrantTarget,
 };
-use crate::domain::iam::{AegisRole, IdentityKind, UserIdentity};
-use crate::domain::secrets::{AccessContext, SensitiveString};
-use crate::domain::tenant::TenantId;
-use crate::presentation::api::AppState;
+use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
+use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
+use aegis_orchestrator_core::domain::tenant::TenantId;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -117,49 +117,49 @@ fn require_operator_or_admin(
 // ============================================================================
 
 #[derive(Debug, Deserialize)]
-pub struct StoreApiKeyRequest {
-    pub provider: String,
-    pub label: String,
-    /// "personal" | "team:&lt;uuid&gt;"
-    pub scope: Option<String>,
+pub(crate) struct StoreApiKeyRequest {
+    pub(crate) provider: String,
+    pub(crate) label: String,
+    /// "personal" | "team:\<uuid\>"
+    pub(crate) scope: Option<String>,
     /// The raw API key value — treated as sensitive
-    pub value: String,
+    pub(crate) value: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct AddGrantRequest {
+pub(crate) struct AddGrantRequest {
     /// "agent" | "workflow" | "all_agents"
-    pub target_type: String,
+    pub(crate) target_type: String,
     /// Agent or workflow UUID string (required for "agent" and "workflow" targets)
-    pub target_value: Option<String>,
+    pub(crate) target_value: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OAuthInitiateRequest {
-    pub provider: String,
-    pub redirect_uri: String,
+pub(crate) struct OAuthInitiateRequest {
+    pub(crate) provider: String,
+    pub(crate) redirect_uri: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct OAuthCallbackQuery {
-    pub state: String,
-    pub code: String,
+pub(crate) struct OAuthCallbackQuery {
+    pub(crate) state: String,
+    pub(crate) code: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DevicePollRequest {
-    pub device_code: String,
-    pub provider: String,
+pub(crate) struct DevicePollRequest {
+    pub(crate) device_code: String,
+    pub(crate) provider: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WriteSecretRequest {
-    pub data: serde_json::Value,
+pub(crate) struct WriteSecretRequest {
+    pub(crate) data: serde_json::Value,
 }
 
 #[derive(Debug, Deserialize)]
 struct RotateRequest {
-    pub value: String,
+    pub(crate) value: String,
 }
 
 // ============================================================================
@@ -228,7 +228,7 @@ fn parse_grant_target(req: &AddGrantRequest) -> Result<GrantTarget, Response> {
                     .into_response()
             })?;
             Ok(GrantTarget::Agent {
-                agent_id: crate::domain::agent::AgentId(id),
+                agent_id: aegis_orchestrator_core::domain::agent::AgentId(id),
             })
         }
         "workflow" => {
@@ -287,7 +287,7 @@ fn parse_grant_id(id: &str) -> Result<CredentialGrantId, Response> {
 // ============================================================================
 
 /// `GET /v1/credentials` — list all credential bindings owned by the caller.
-pub async fn list_credentials_handler(
+pub(crate) async fn list_credentials_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
@@ -329,7 +329,7 @@ pub async fn list_credentials_handler(
 }
 
 /// `POST /v1/credentials/api-keys` — store a new API key credential.
-pub async fn store_api_key_handler(
+pub(crate) async fn store_api_key_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
@@ -407,7 +407,7 @@ pub async fn store_api_key_handler(
 }
 
 /// `GET /v1/credentials/{id}` — fetch a single credential binding.
-pub async fn get_credential_handler(
+pub(crate) async fn get_credential_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     request: axum::extract::Request,
@@ -448,7 +448,7 @@ pub async fn get_credential_handler(
 }
 
 /// `DELETE /v1/credentials/{id}` — revoke a credential binding.
-pub async fn revoke_credential_handler(
+pub(crate) async fn revoke_credential_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     request: axum::extract::Request,
@@ -484,7 +484,7 @@ pub async fn revoke_credential_handler(
 }
 
 /// `POST /v1/credentials/{id}/rotate` — rotate the underlying secret value.
-pub async fn rotate_credential_handler(
+pub(crate) async fn rotate_credential_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     request: axum::extract::Request,
@@ -545,7 +545,7 @@ pub async fn rotate_credential_handler(
 }
 
 /// `GET /v1/credentials/{id}/grants` — list grants for a binding.
-pub async fn list_grants_handler(
+pub(crate) async fn list_grants_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     request: axum::extract::Request,
@@ -596,7 +596,7 @@ pub async fn list_grants_handler(
 }
 
 /// `POST /v1/credentials/{id}/grants` — add a grant to a binding.
-pub async fn add_grant_handler(
+pub(crate) async fn add_grant_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     request: axum::extract::Request,
@@ -665,7 +665,7 @@ pub async fn add_grant_handler(
 }
 
 /// `DELETE /v1/credentials/{id}/grants/{grant_id}` — revoke a single grant.
-pub async fn revoke_grant_handler(
+pub(crate) async fn revoke_grant_handler(
     State(state): State<Arc<AppState>>,
     Path((id, grant_id_str)): Path<(String, String)>,
     request: axum::extract::Request,
@@ -710,7 +710,7 @@ pub async fn revoke_grant_handler(
 }
 
 /// `POST /v1/credentials/oauth/initiate` — begin an OAuth2 PKCE flow.
-pub async fn oauth_initiate_handler(
+pub(crate) async fn oauth_initiate_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
@@ -783,7 +783,7 @@ pub async fn oauth_initiate_handler(
 /// The provider redirects here with `?state=...&code=...` query parameters.
 /// The state token links this request back to the pending binding created
 /// during `oauth/initiate`.
-pub async fn oauth_callback_handler(
+pub(crate) async fn oauth_callback_handler(
     State(state): State<Arc<AppState>>,
     Query(query): Query<OAuthCallbackQuery>,
 ) -> Response {
@@ -827,7 +827,7 @@ pub async fn oauth_callback_handler(
 /// Returns `202 Accepted` while the device flow is still pending, `200 OK`
 /// with `binding_id` when it completes. The `device_code` is used as the
 /// state token for the pending-state lookup.
-pub async fn device_poll_handler(
+pub(crate) async fn device_poll_handler(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
@@ -908,7 +908,7 @@ pub async fn device_poll_handler(
 /// `GET /v1/secrets` — list secret paths.
 ///
 /// `SecretsManager` does not expose a KV list operation; returns 501.
-pub async fn list_secrets_handler(
+pub(crate) async fn list_secrets_handler(
     State(_state): State<Arc<AppState>>,
     request: axum::extract::Request,
 ) -> Response {
@@ -927,7 +927,7 @@ pub async fn list_secrets_handler(
 ///
 /// Returns the field keys present in the secret; raw values are never surfaced
 /// through this endpoint to avoid leaking sensitive material over the API.
-pub async fn get_secret_handler(
+pub(crate) async fn get_secret_handler(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     request: axum::extract::Request,
@@ -937,17 +937,7 @@ pub async fn get_secret_handler(
         Err(r) => return r,
     };
 
-    let sm = match &state.secrets_manager {
-        Some(s) => s.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Secrets manager not configured"})),
-            )
-                .into_response();
-        }
-    };
-
+    let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
     match sm.read_secret("kv", &path, &ctx).await {
@@ -963,7 +953,7 @@ pub async fn get_secret_handler(
             )
                 .into_response()
         }
-        Err(crate::domain::secrets::SecretsError::SecretNotFound { .. }) => (
+        Err(aegis_orchestrator_core::domain::secrets::SecretsError::SecretNotFound { .. }) => (
             StatusCode::NOT_FOUND,
             Json(json!({"error": "Secret not found", "path": path})),
         )
@@ -977,7 +967,7 @@ pub async fn get_secret_handler(
 }
 
 /// `PUT /v1/secrets/{path}` — write (create or update) a secret.
-pub async fn write_secret_handler(
+pub(crate) async fn write_secret_handler(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     request: axum::extract::Request,
@@ -1031,17 +1021,7 @@ pub async fn write_secret_handler(
         })
         .collect();
 
-    let sm = match &state.secrets_manager {
-        Some(s) => s.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Secrets manager not configured"})),
-            )
-                .into_response();
-        }
-    };
-
+    let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
     match sm.write_secret("kv", &path, secret_data, &ctx).await {
@@ -1059,7 +1039,7 @@ pub async fn write_secret_handler(
 }
 
 /// `DELETE /v1/secrets/{path}` — delete a secret by path.
-pub async fn delete_secret_handler(
+pub(crate) async fn delete_secret_handler(
     State(state): State<Arc<AppState>>,
     Path(path): Path<String>,
     request: axum::extract::Request,
@@ -1069,17 +1049,7 @@ pub async fn delete_secret_handler(
         Err(r) => return r,
     };
 
-    let sm = match &state.secrets_manager {
-        Some(s) => s.clone(),
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Secrets manager not configured"})),
-            )
-                .into_response();
-        }
-    };
-
+    let sm = &state.secrets_manager;
     let ctx = AccessContext::system(&identity.sub);
 
     match sm.delete_secret("kv", &path, &ctx).await {

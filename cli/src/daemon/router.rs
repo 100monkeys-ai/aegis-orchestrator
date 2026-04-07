@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{middleware, Router};
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
@@ -30,6 +30,12 @@ use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_han
 use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
+use crate::daemon::handlers::credentials::{
+    add_grant_handler, delete_secret_handler, device_poll_handler, get_credential_handler,
+    get_secret_handler, list_credentials_handler, list_grants_handler, list_secrets_handler,
+    oauth_callback_handler, oauth_initiate_handler, revoke_credential_handler,
+    revoke_grant_handler, rotate_credential_handler, store_api_key_handler, write_secret_handler,
+};
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
     cancel_execution_handler, delete_execution_handler, get_execution_handler,
@@ -43,6 +49,7 @@ use crate::daemon::handlers::observability::{
 use crate::daemon::handlers::seal::{
     attest_seal_handler, invoke_seal_handler, list_seal_tools_handler,
 };
+use crate::daemon::handlers::stimulus::{ingest_stimulus_handler, webhook_handler};
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
 use crate::daemon::handlers::tenant_provisioning::keycloak_event_handler;
 use crate::daemon::handlers::volumes;
@@ -175,7 +182,10 @@ pub(crate) fn create_router(
         .route("/v1/cluster/nodes", get(cluster_nodes_handler))
         .route("/v1/swarms", get(list_swarms_handler))
         .route("/v1/swarms/{swarm_id}", get(get_swarm_handler))
-        .route("/v1/stimuli", get(list_stimuli_handler))
+        .route(
+            "/v1/stimuli",
+            get(list_stimuli_handler).post(ingest_stimulus_handler),
+        )
         .route("/v1/stimuli/{stimulus_id}", get(get_stimulus_handler))
         .route(
             "/v1/security/incidents",
@@ -214,6 +224,47 @@ pub(crate) fn create_router(
         .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
         // Keycloak webhook for tenant provisioning (ADR-097)
         .route("/v1/webhooks/keycloak", post(keycloak_event_handler))
+        // BC-8 Webhook stimulus ingestion (ADR-021)
+        .route("/v1/webhooks/{source}", post(webhook_handler))
+        // BC-11 Credential management (ADR-078) — static paths BEFORE parameterized
+        .route("/v1/credentials", get(list_credentials_handler))
+        .route("/v1/credentials/api-keys", post(store_api_key_handler))
+        .route(
+            "/v1/credentials/oauth/initiate",
+            post(oauth_initiate_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/callback",
+            get(oauth_callback_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/device/poll",
+            post(device_poll_handler),
+        )
+        .route(
+            "/v1/credentials/{id}",
+            get(get_credential_handler).delete(revoke_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/rotate",
+            post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/grants",
+            get(list_grants_handler).post(add_grant_handler),
+        )
+        .route(
+            "/v1/credentials/{id}/grants/{grant_id}",
+            delete(revoke_grant_handler),
+        )
+        // BC-11 Secrets admin (ADR-034)
+        .route("/v1/secrets", get(list_secrets_handler))
+        .route(
+            "/v1/secrets/{path}",
+            get(get_secret_handler)
+                .put(write_secret_handler)
+                .delete(delete_secret_handler),
+        )
         // User volume management (Gap 079)
         // Note: /v1/volumes/quota MUST be registered before /v1/volumes/:id to avoid
         // axum routing ambiguity — "quota" would otherwise be matched as an id segment.

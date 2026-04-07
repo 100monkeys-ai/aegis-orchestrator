@@ -118,7 +118,13 @@ use aegis_orchestrator_core::{
     },
 };
 
+use aegis_orchestrator_core::application::credential_service::{
+    CredentialManagementService, StandardCredentialManagementService,
+};
+use aegis_orchestrator_core::domain::credential::CredentialBindingRepository;
 use aegis_orchestrator_core::domain::security_context::SecurityContextRepository;
+use aegis_orchestrator_core::infrastructure::repositories::PostgresCredentialBindingRepository;
+use aegis_orchestrator_core::presentation::webhook_guard::EnvWebhookSecretProvider;
 use aegis_orchestrator_swarm::infrastructure::StandardSwarmService;
 
 use super::operator_read_models::OperatorReadModelStore;
@@ -1264,6 +1270,18 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         };
 
+    // ─── Credential Management Service (BC-11, ADR-078) ────────────────────────
+    let credential_service: Option<Arc<dyn CredentialManagementService>> =
+        db_pool.as_ref().map(|pool| {
+            let repo = Arc::new(PostgresCredentialBindingRepository::new(pool.clone()))
+                as Arc<dyn CredentialBindingRepository>;
+            Arc::new(StandardCredentialManagementService::new(
+                repo,
+                secrets_manager.clone(),
+                event_bus.clone(),
+            )) as Arc<dyn CredentialManagementService>
+        });
+
     // ─── Container Step Runner (ADR-050) ──────────────────────────────────────
     // Dedicated Docker client + image manager + step runner for CI/CD container
     // steps executed by ContainerRun / ParallelContainerRun workflow states.
@@ -1542,6 +1560,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             ) as Arc<dyn aegis_orchestrator_core::domain::iam::RealmRepository>
         }),
+        credential_service,
+        secrets_manager: secrets_manager.clone(),
+        webhook_secret_provider: Arc::new(EnvWebhookSecretProvider),
+        stimulus_service: None,
         user_volume_service,
         file_operations_service,
         config: config.clone(),
