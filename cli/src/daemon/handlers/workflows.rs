@@ -17,6 +17,7 @@ use aegis_orchestrator_core::application::start_workflow_execution::{
 };
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::tenant_id_from_identity;
 use crate::daemon::state::AppState;
@@ -32,10 +33,12 @@ pub(crate) struct RegisterWorkflowQuery {
 /// POST /v1/workflows/temporal/register - Register a workflow with Temporal
 pub(crate) async fn register_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<RegisterWorkflowQuery>,
     body: String,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:deploy")?;
     use aegis_orchestrator_core::domain::workflow::WorkflowScope;
 
     // Resolve scope and tenant_id together before registration so the correct
@@ -54,23 +57,25 @@ pub(crate) async fn register_temporal_workflow_handler(
         .register_workflow_for_tenant(&tenant_id, &body, query.force, scope)
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(e) => (
+        Ok(res) => Ok((StatusCode::OK, Json(res)).into_response()),
+        Err(e) => Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": format!("Failed to register workflow: {}", e)
             })),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 /// POST /v1/workflows/temporal/execute - Start a workflow execution
 pub(crate) async fn execute_temporal_workflow_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Json(mut request): Json<StartWorkflowExecutionRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:run")?;
     let tenant_id = request
         .tenant_id
         .get_or_insert_with(|| {
@@ -82,14 +87,14 @@ pub(crate) async fn execute_temporal_workflow_handler(
         .start_execution_for_tenant(&tenant_id, request, identity.as_ref().map(|ext| &ext.0))
         .await
     {
-        Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(e) => (
+        Ok(res) => Ok((StatusCode::OK, Json(res)).into_response()),
+        Err(e) => Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "error": format!("Failed to start workflow execution: {}", e)
             })),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
@@ -108,11 +113,13 @@ pub(crate) struct RunWorkflowQuery {
 
 pub(crate) async fn run_workflow_legacy_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
     Query(query): Query<RunWorkflowQuery>,
     Json(request): Json<RunWorkflowLegacyRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:run")?;
     let req = StartWorkflowExecutionRequest {
         workflow_id: name,
         input: request.input,
@@ -126,7 +133,9 @@ pub(crate) async fn run_workflow_legacy_handler(
             .map(|ext| ext.0.to_security_context_name()),
         intent: None,
     };
-    execute_temporal_workflow_handler(State(state), identity, Json(req)).await
+    // Re-use execute handler but bypass the scope check (already checked above)
+    let bypass_guard = ScopeGuard(vec!["workflow:run".to_string()]);
+    execute_temporal_workflow_handler(State(state), bypass_guard, identity, Json(req)).await
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -139,9 +148,11 @@ pub(crate) struct ListWorkflowsQuery {
 /// GET /v1/workflows - List all workflows
 pub(crate) async fn list_workflows_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<ListWorkflowsQuery>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:list")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     let workflows = if query.scope.as_deref() == Some("global") {
@@ -197,15 +208,17 @@ pub(crate) async fn list_workflows_handler(
         })
         .collect();
 
-    (StatusCode::OK, Json(workflow_list))
+    Ok((StatusCode::OK, Json(workflow_list)))
 }
 
 /// GET /v1/workflows/:name - Get workflow YAML
 pub(crate) async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:read")?;
     use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
@@ -216,25 +229,27 @@ pub(crate) async fn get_workflow_handler(
         .await
     {
         Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {
-            Ok(yaml) => (StatusCode::OK, yaml),
-            Err(e) => (
+            Ok(yaml) => Ok((StatusCode::OK, yaml)),
+            Err(e) => Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Failed to serialize workflow: {e}"),
-            ),
+            )),
         },
-        _ => (
+        _ => Ok((
             StatusCode::NOT_FOUND,
             format!("Workflow '{name}' not found"),
-        ),
+        )),
     }
 }
 
 /// DELETE /v1/workflows/:name - Delete workflow
 pub(crate) async fn delete_workflow_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:delete")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .workflow_repo
@@ -249,10 +264,10 @@ pub(crate) async fn delete_workflow_handler(
                 .delete_for_tenant(&tenant_id, workflow_id)
                 .await
             {
-                return (
+                return Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": e.to_string()})),
-                );
+                ));
             }
             state.event_bus.publish_workflow_event(
                 aegis_orchestrator_core::domain::events::WorkflowEvent::WorkflowRemoved {
@@ -261,21 +276,23 @@ pub(crate) async fn delete_workflow_handler(
                     removed_at: Utc::now(),
                 },
             );
-            (StatusCode::OK, Json(serde_json::json!({"success": true})))
+            Ok((StatusCode::OK, Json(serde_json::json!({"success": true}))))
         }
-        _ => (
+        _ => Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not found"})),
-        ),
+        )),
     }
 }
 
 /// GET /v1/workflows/:name/versions - List all versions of a workflow
 pub(crate) async fn list_workflow_versions_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:list")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .workflow_repo
@@ -297,22 +314,24 @@ pub(crate) async fn list_workflow_versions_handler(
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(serde_json::json!(versions)))
+            Ok((StatusCode::OK, Json(serde_json::json!(versions))))
         }
-        Err(e) => (
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
-        ),
+        )),
     }
 }
 
 /// POST /v1/workflows/:id_or_name/scope - Change workflow scope (promote/demote)
 pub(crate) async fn update_workflow_scope_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(id_or_name): Path<String>,
     Json(body): Json<serde_json::Value>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:deploy")?;
     use aegis_orchestrator_core::application::workflow_scope::ScopeChangeRequester;
     use aegis_orchestrator_core::domain::workflow::WorkflowScope;
 
@@ -337,11 +356,11 @@ pub(crate) async fn update_workflow_scope_handler(
     let target_scope_str = match body.get("target_scope").and_then(|v| v.as_str()) {
         Some(s) => s.to_string(),
         None => {
-            return (
+            return Ok((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": "missing 'target_scope' field"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -349,11 +368,11 @@ pub(crate) async fn update_workflow_scope_handler(
         "global" => WorkflowScope::Global,
         "tenant" => WorkflowScope::Tenant,
         other => {
-            return (
+            return Ok((
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": format!("invalid scope: '{other}'. Valid values: global, tenant")})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -374,18 +393,18 @@ pub(crate) async fn update_workflow_scope_handler(
     let workflow = match workflow {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return (
+            return Ok((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": format!("workflow '{}' not found", id_or_name)})),
             )
-                .into_response();
+                .into_response());
         }
         Err(e) => {
-            return (
+            return Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -403,7 +422,7 @@ pub(crate) async fn update_workflow_scope_handler(
         .change_scope(workflow_id, target_scope.clone(), &requester)
         .await
     {
-        Ok(()) => (
+        Ok(()) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({
                 "workflow_id": workflow_id.0,
@@ -411,34 +430,34 @@ pub(crate) async fn update_workflow_scope_handler(
                 "new_scope": target_scope.to_string(),
             })),
         )
-            .into_response(),
+            .into_response()),
         Err(
             aegis_orchestrator_core::application::workflow_scope::ScopeChangeError::NameCollision {
                 existing_id,
                 name,
                 version,
             },
-        ) => (
+        ) => Ok((
             StatusCode::CONFLICT,
             Json(serde_json::json!({
                 "error": format!("Name collision: workflow '{name}' v{version} already exists at target scope"),
                 "existing_id": existing_id.0,
             })),
         )
-            .into_response(),
+            .into_response()),
         Err(
             aegis_orchestrator_core::application::workflow_scope::ScopeChangeError::Unauthorized {
                 reason,
             },
-        ) => (
+        ) => Ok((
             StatusCode::FORBIDDEN,
             Json(serde_json::json!({"error": reason})),
         )
-            .into_response(),
-        Err(e) => (
+            .into_response()),
+        Err(e) => Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }

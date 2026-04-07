@@ -193,4 +193,28 @@ mod tests {
         // temporal-events authenticates via JWT in the handler itself
         assert!(!is_exempt("/v1/temporal-events"));
     }
+
+    #[test]
+    fn scope_guard_require_present() {
+        let guard = ScopeGuard(vec!["agent:read".to_string()]);
+        assert!(guard.require("agent:read").is_ok());
+    }
+
+    #[test]
+    fn scope_guard_require_missing() {
+        let guard = ScopeGuard(vec![]);
+        let result = guard.require("agent:read");
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn scope_guard_require_wrong_scope() {
+        let guard = ScopeGuard(vec!["agent:list".to_string()]);
+        let result = guard.require("agent:execute");
+        assert!(result.is_err());
+        let (status, _) = result.unwrap_err();
+        assert_eq!(status, axum::http::StatusCode::FORBIDDEN);
+    }
 }

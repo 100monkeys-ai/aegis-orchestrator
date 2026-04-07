@@ -23,6 +23,7 @@ use aegis_orchestrator_core::infrastructure::temporal_proto::temporal::api::work
     DeleteWorkflowExecutionRequest, RequestCancelWorkflowExecutionRequest,
 };
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
+use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::tenant_id_from_identity;
 use crate::daemon::state::AppState;
@@ -492,9 +493,11 @@ pub(crate) async fn workflow_execution_temporal_linkage(
 /// GET /v1/workflows/executions - List workflow executions (paginated, newest first)
 pub(crate) async fn list_workflow_executions_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:list")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let limit = params
         .get("limit")
@@ -545,22 +548,24 @@ pub(crate) async fn list_workflow_executions_handler(
                     })
                 })
                 .collect();
-            (StatusCode::OK, Json(list)).into_response()
+            Ok((StatusCode::OK, Json(list)).into_response())
         }
-        Err(e) => (
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 /// GET /v1/workflows/executions/:execution_id - Get execution details
 pub(crate) async fn get_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:read")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let execution = match state
         .workflow_execution_repo
@@ -569,18 +574,18 @@ pub(crate) async fn get_workflow_execution_handler(
     {
         Ok(Some(execution)) => execution,
         Ok(None) => {
-            return (
+            return Ok((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "workflow execution not found"})),
             )
-                .into_response();
+                .into_response());
         }
         Err(e) => {
-            return (
+            return Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": e.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -606,7 +611,7 @@ pub(crate) async fn get_workflow_execution_handler(
             }
         };
 
-    (
+    Ok((
         StatusCode::OK,
         Json(serde_json::json!({
             "execution_id": execution.id.0,
@@ -622,7 +627,7 @@ pub(crate) async fn get_workflow_execution_handler(
             "temporal_run_id": temporal_linkage.as_ref().map(|linkage| linkage.temporal_run_id.clone()),
         })),
     )
-        .into_response()
+        .into_response())
 }
 
 #[derive(serde::Deserialize)]
@@ -633,20 +638,22 @@ pub(crate) struct WorkflowSignalRequest {
 /// POST /v1/workflows/executions/:execution_id/signal
 pub(crate) async fn signal_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Path(execution_id): Path<String>,
     Json(request): Json<WorkflowSignalRequest>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:signal")?;
     let guard = state.temporal_client_container.read().await;
     let client = match guard.as_ref() {
         Some(c) => c.clone(),
         None => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({
                     "error": "Temporal client not yet connected"
                 })),
             )
-                .into_response();
+                .into_response());
         }
     };
     drop(guard);
@@ -655,29 +662,31 @@ pub(crate) async fn signal_workflow_execution_handler(
         .send_human_signal(&execution_id, request.response)
         .await
     {
-        Ok(()) => (
+        Ok(()) => Ok((
             StatusCode::ACCEPTED,
             Json(serde_json::json!({
                 "status": "signal_sent",
                 "execution_id": execution_id
             })),
         )
-            .into_response(),
-        Err(e) => (
+            .into_response()),
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 /// GET /v1/workflows/executions/:execution_id/logs - List workflow log events
 pub(crate) async fn get_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
     Query(params): Query<WorkflowLogQuery>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:read")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let execution_id = ExecutionId(execution_id);
     let execution = match state
@@ -687,18 +696,18 @@ pub(crate) async fn get_workflow_logs_handler(
     {
         Ok(Some(execution)) => execution,
         Ok(None) => {
-            return (
+            return Ok((
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({"error": "workflow execution not found"})),
             )
-                .into_response();
+                .into_response());
         }
         Err(error) => {
-            return (
+            return Ok((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({"error": error.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -760,7 +769,7 @@ pub(crate) async fn get_workflow_logs_handler(
                 .collect();
 
             let count = transformed.len();
-            (
+            Ok((
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "execution_id": execution.id.0,
@@ -770,13 +779,13 @@ pub(crate) async fn get_workflow_logs_handler(
                     "offset": offset,
                 })),
             )
-                .into_response()
+                .into_response())
         }
-        Err(error) => (
+        Err(error) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": error.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
@@ -858,16 +867,18 @@ pub(crate) async fn stream_workflow_logs_handler(
 
 pub(crate) async fn cancel_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Path(execution_id): Path<Uuid>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:cancel")?;
     let namespace = match temporal_namespace(&state.config) {
         Ok(namespace) => namespace,
         Err(error) => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": error.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -886,41 +897,43 @@ pub(crate) async fn cancel_workflow_execution_handler(
                 links: Vec::new(),
             };
             match client.request_cancel_workflow_execution(request).await {
-                Ok(_) => (
+                Ok(_) => Ok((
                     StatusCode::ACCEPTED,
                     Json(serde_json::json!({
                         "status": "cancel_requested",
                         "execution_id": execution_id
                     })),
                 )
-                    .into_response(),
-                Err(error) => (
+                    .into_response()),
+                Err(error) => Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": error.to_string()})),
                 )
-                    .into_response(),
+                    .into_response()),
             }
         }
-        Err(error) => (
+        Err(error) => Ok((
             StatusCode::SERVICE_UNAVAILABLE,
             Json(serde_json::json!({"error": error.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 pub(crate) async fn remove_workflow_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Path(execution_id): Path<Uuid>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("workflow:cancel")?;
     let namespace = match temporal_namespace(&state.config) {
         Ok(namespace) => namespace,
         Err(error) => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": error.to_string()})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -939,22 +952,22 @@ pub(crate) async fn remove_workflow_execution_handler(
     };
 
     if let Err(error) = temporal_result {
-        return (
+        return Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": error.to_string()})),
         )
-            .into_response();
+            .into_response());
     }
 
     let db_cleanup = if let Some(database) = &state.config.spec.database {
         let database_url = match resolve_env_value(&database.url) {
             Ok(url) => url,
             Err(error) => {
-                return (
+                return Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({"error": error.to_string()})),
                 )
-                    .into_response();
+                    .into_response());
             }
         };
         match sqlx::postgres::PgPoolOptions::new()
@@ -974,20 +987,20 @@ pub(crate) async fn remove_workflow_execution_handler(
     };
 
     match db_cleanup {
-        Ok(()) => (
+        Ok(()) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({
                 "status": "removed",
                 "execution_id": execution_id
             })),
         )
-            .into_response(),
-        Err(error) => (
+            .into_response()),
+        Err(error) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "error": format!("Workflow execution deleted in Temporal but local cleanup failed: {error}")
             })),
         )
-            .into_response(),
+            .into_response()),
     }
 }

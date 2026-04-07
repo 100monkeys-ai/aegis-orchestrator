@@ -14,6 +14,7 @@ use uuid::Uuid;
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
+use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::tenant_id_from_identity;
 use crate::daemon::state::AppState;
@@ -29,39 +30,49 @@ pub(crate) struct ListExecutionsQuery {
 
 pub(crate) async fn get_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("execution:read")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
         .get_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(exec) => Json(serde_json::json!({
+        Ok(exec) => Ok(axum::Json(serde_json::json!({
             "id": exec.id.0,
             "agent_id": exec.agent_id.0,
             "status": format!("{:?}", exec.status),
             // "started_at": exec.started_at,
             // "ended_at": exec.ended_at
-        })),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        }))),
+        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
 pub(crate) async fn cancel_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("execution:cancel")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
         .cancel_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(_) => Json(serde_json::json!({"success": true})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(_) => Ok(axum::Json(serde_json::json!({"success": true}))),
+        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -97,17 +108,22 @@ pub(crate) async fn stream_events_handler(
 
 pub(crate) async fn delete_execution_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("execution:remove")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     match state
         .execution_service
         .delete_execution_for_tenant(&tenant_id, ExecutionId(execution_id))
         .await
     {
-        Ok(_) => Json(serde_json::json!({"success": true})),
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Ok(_) => Ok(axum::Json(serde_json::json!({"success": true}))),
+        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
     }
 }
 
@@ -119,9 +135,14 @@ pub(crate) async fn delete_execution_handler(
 /// not explicitly configured, a safe default of 1000 is used.
 pub(crate) async fn list_executions_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     axum::extract::Query(query): axum::extract::Query<ListExecutionsQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("execution:list")?;
     let agent_id = query.agent_id.map(AgentId);
 
     // Determine the maximum allowed page size from configuration, with a
@@ -144,12 +165,12 @@ pub(crate) async fn list_executions_handler(
         {
             Ok(Some(wf)) => Some(wf.id),
             Ok(None) => {
-                return Json(
+                return Ok(axum::Json(
                     serde_json::json!({"error": format!("Workflow '{}' not found", wf_name)}),
-                );
+                ));
             }
             Err(e) => {
-                return Json(serde_json::json!({"error": e.to_string()}));
+                return Ok(axum::Json(serde_json::json!({"error": e.to_string()})));
             }
         }
     } else {
@@ -174,8 +195,8 @@ pub(crate) async fn list_executions_handler(
                     })
                 })
                 .collect();
-            Json(serde_json::json!(json_executions))
+            Ok(axum::Json(serde_json::json!(json_executions)))
         }
-        Err(e) => Json(serde_json::json!({"error": e.to_string()})),
+        Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
     }
 }

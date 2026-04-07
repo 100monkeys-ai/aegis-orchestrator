@@ -21,8 +21,9 @@ pub enum AuthCommand {
     Login {
         /// Environment hostname (e.g. dev.100monkeys.ai).
         /// Auth endpoint is derived as `https://auth.<hostname>`, API as `https://api.<hostname>`.
-        #[arg(long, default_value = "dev.100monkeys.ai")]
-        env: String,
+        /// Precedence: --env flag > AEGIS_ENV env var > "dev.100monkeys.ai" default.
+        #[arg(long)]
+        env: Option<String>,
         /// Exit non-zero if not already authenticated (for CI/CD pipelines).
         #[arg(long)]
         non_interactive: bool,
@@ -45,7 +46,12 @@ pub async fn handle_command(command: AuthCommand, output_format: OutputFormat) -
         AuthCommand::Login {
             env,
             non_interactive,
-        } => login(&env, non_interactive).await,
+        } => {
+            let env = env
+                .or_else(crate::auth::env::aegis_env)
+                .unwrap_or_else(|| "dev.100monkeys.ai".to_string());
+            login(&env, non_interactive).await
+        }
         AuthCommand::Logout => logout().await,
         AuthCommand::Status => status(output_format).await,
         AuthCommand::Switch { profile } => switch_profile(&profile),
