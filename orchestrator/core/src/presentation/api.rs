@@ -25,6 +25,7 @@
 //! | `POST` | `/v1/webhooks/{source}` | Webhook ingestion — HMAC-SHA256 (ADR-021) |
 //! | `GET` | `/health` | liveness probe |
 
+use crate::application::credential_service::CredentialManagementService;
 use crate::application::execution::ExecutionService;
 use crate::application::inner_loop_service::InnerLoopService;
 use crate::application::stimulus::StimulusService;
@@ -47,6 +48,13 @@ use crate::domain::tenant::TenantId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::rate_limit::override_repository::{
     CreateOverrideRequest, RateLimitOverrideRepository,
+};
+use crate::infrastructure::secrets_manager::SecretsManager;
+use crate::presentation::credential_handlers::{
+    add_grant_handler, delete_secret_handler, device_poll_handler, get_credential_handler,
+    get_secret_handler, list_credentials_handler, list_grants_handler, list_secrets_handler,
+    oauth_callback_handler, oauth_initiate_handler, revoke_credential_handler,
+    revoke_grant_handler, rotate_credential_handler, store_api_key_handler, write_secret_handler,
 };
 use crate::presentation::metrics_middleware::metrics_middleware;
 use crate::presentation::stimulus_handlers::{ingest_stimulus_handler, webhook_handler};
@@ -104,6 +112,10 @@ pub struct AppState {
     pub pg_pool: Option<Arc<sqlx::PgPool>>,
     /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
     pub realm_repo: Option<Arc<dyn crate::domain::iam::RealmRepository>>,
+    /// Credential management service for BC-11 REST endpoints (ADR-078). Optional until wired.
+    pub credential_service: Option<Arc<dyn CredentialManagementService>>,
+    /// Secrets manager for `/v1/secrets/*` admin endpoints (ADR-034). Optional until wired.
+    pub secrets_manager: Option<Arc<SecretsManager>>,
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
@@ -138,6 +150,8 @@ pub fn app(
         security_context_repo: None,
         pg_pool: None,
         realm_repo: None,
+        credential_service: None,
+        secrets_manager: None,
     });
 
     Router::new()
@@ -215,6 +229,45 @@ pub fn app(
         )
         // Admin audit log (ADR-073)
         .route("/v1/admin/audit-log", get(query_audit_log))
+        // BC-11 Credential management (ADR-078) — static paths BEFORE parameterized
+        .route("/v1/credentials", get(list_credentials_handler))
+        .route("/v1/credentials/api-keys", post(store_api_key_handler))
+        .route(
+            "/v1/credentials/oauth/initiate",
+            post(oauth_initiate_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/callback",
+            get(oauth_callback_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/device/poll",
+            post(device_poll_handler),
+        )
+        .route(
+            "/v1/credentials/:id",
+            get(get_credential_handler).delete(revoke_credential_handler),
+        )
+        .route(
+            "/v1/credentials/:id/rotate",
+            post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/:id/grants",
+            get(list_grants_handler).post(add_grant_handler),
+        )
+        .route(
+            "/v1/credentials/:id/grants/:grant_id",
+            delete(revoke_grant_handler),
+        )
+        // BC-11 Secrets admin (ADR-034)
+        .route("/v1/secrets", get(list_secrets_handler))
+        .route(
+            "/v1/secrets/:path",
+            get(get_secret_handler)
+                .put(write_secret_handler)
+                .delete(delete_secret_handler),
+        )
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -250,6 +303,8 @@ pub fn app_with_inner_loop(
         security_context_repo: None,
         pg_pool: None,
         realm_repo: None,
+        credential_service: None,
+        secrets_manager: None,
     });
 
     Router::new()
@@ -325,6 +380,45 @@ pub fn app_with_inner_loop(
         )
         // Admin audit log (ADR-073)
         .route("/v1/admin/audit-log", get(query_audit_log))
+        // BC-11 Credential management (ADR-078) — static paths BEFORE parameterized
+        .route("/v1/credentials", get(list_credentials_handler))
+        .route("/v1/credentials/api-keys", post(store_api_key_handler))
+        .route(
+            "/v1/credentials/oauth/initiate",
+            post(oauth_initiate_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/callback",
+            get(oauth_callback_handler),
+        )
+        .route(
+            "/v1/credentials/oauth/device/poll",
+            post(device_poll_handler),
+        )
+        .route(
+            "/v1/credentials/:id",
+            get(get_credential_handler).delete(revoke_credential_handler),
+        )
+        .route(
+            "/v1/credentials/:id/rotate",
+            post(rotate_credential_handler),
+        )
+        .route(
+            "/v1/credentials/:id/grants",
+            get(list_grants_handler).post(add_grant_handler),
+        )
+        .route(
+            "/v1/credentials/:id/grants/:grant_id",
+            delete(revoke_grant_handler),
+        )
+        // BC-11 Secrets admin (ADR-034)
+        .route("/v1/secrets", get(list_secrets_handler))
+        .route(
+            "/v1/secrets/:path",
+            get(get_secret_handler)
+                .put(write_secret_handler)
+                .delete(delete_secret_handler),
+        )
         // Health endpoints (ADR-062)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -2794,6 +2888,8 @@ mod tests {
             security_context_repo: None,
             pg_pool: None,
             realm_repo: None,
+            credential_service: None,
+            secrets_manager: None,
         })
     }
 
