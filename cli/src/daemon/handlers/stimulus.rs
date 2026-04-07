@@ -38,8 +38,6 @@ use aegis_orchestrator_core::presentation::webhook_guard::WebhookHmacGuard;
 /// Request body for `POST /v1/stimuli`.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct IngestStimulusBody {
-    /// Source name (e.g. `"github"`, `"stripe"`, `"custom-webhook"`).
-    pub(crate) source: String,
     /// Raw stimulus content (JSON, plain text, or base64-encoded binary).
     pub(crate) content: String,
     /// Optional idempotency key to prevent duplicate processing.
