@@ -35,6 +35,7 @@ const DEFAULT_VALIDATION_POLL_INTERVAL_MS: u64 = 1000;
 const EXECUTION_TERMINAL_POLL_INTERVAL_MS: u64 = 250;
 use crate::domain::stimulus::{Stimulus, StimulusSource};
 use crate::presentation::grpc::auth_interceptor::{validate_grpc_request, GrpcIamAuthInterceptor};
+use crate::presentation::keycloak_auth::ScopeGuard;
 use crate::presentation::metrics_middleware::GrpcMetricsLayer;
 
 // Generated protobuf code lives in infrastructure::aegis_runtime_proto (ADR-042)
@@ -211,8 +212,9 @@ impl AegisRuntimeService {
     /// Authenticate the request and derive the effective `TenantId`.
     ///
     /// Returns `Ok(None)` for exempt methods. For authenticated calls, returns
-    /// `Ok(Some((identity, tenant_id)))` where `tenant_id` incorporates the
-    /// `x-aegis-tenant` admin override when applicable (gap 056-10).
+    /// `Ok(Some((identity, tenant_id, scope_guard)))` where `tenant_id` incorporates
+    /// the `x-aegis-tenant` admin override when applicable (gap 056-10), and
+    /// `scope_guard` carries the resource:action scopes from the JWT.
     ///
     /// For service-account callers, the `x-tenant-id` delegation is applied
     /// on top of the interceptor-derived value via `tenant_id_from_request`.
@@ -220,7 +222,7 @@ impl AegisRuntimeService {
         &self,
         request: &Request<T>,
         method: &str,
-    ) -> Result<Option<(UserIdentity, TenantId)>, Status> {
+    ) -> Result<Option<(UserIdentity, TenantId, ScopeGuard)>, Status> {
         if let Some(interceptor) = &self.grpc_auth {
             return validate_grpc_request(interceptor, request, method).await;
         }
@@ -250,8 +252,8 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/ExecuteAgent")
             .await?;
-        let (identity, tenant_id) = match auth {
-            Some((id, tid)) => {
+        let (identity, tenant_id, scope_guard) = match auth {
+            Some((id, tid, sg)) => {
                 // For service accounts, apply x-tenant-id delegation on top of the
                 // interceptor-derived tenant (ADR-100).
                 let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
@@ -266,10 +268,22 @@ impl AegisRuntime for AegisRuntimeService {
                 } else {
                     tid
                 };
-                (Some(id), final_tid)
+                (Some(id), final_tid, sg)
             }
-            None => (None, Self::tenant_id_from_request(None, &request)),
+            None => (
+                None,
+                Self::tenant_id_from_request(None, &request),
+                ScopeGuard::default(),
+            ),
         };
+        scope_guard.require("agent:execute").map_err(|(_, body)| {
+            tonic::Status::permission_denied(
+                body.0
+                    .get("required")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("insufficient_scope"),
+            )
+        })?;
         let req = request.into_inner();
 
         // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
@@ -740,8 +754,8 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
             .await?;
-        let (_identity, tenant_id) = match auth {
-            Some((id, tid)) => {
+        let (_identity, tenant_id, scope_guard) = match auth {
+            Some((id, tid, sg)) => {
                 let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
                 let final_tid = if matches!(
                     id.identity_kind,
@@ -751,10 +765,22 @@ impl AegisRuntime for AegisRuntimeService {
                 } else {
                     tid
                 };
-                (Some(id), final_tid)
+                (Some(id), final_tid, sg)
             }
-            None => (None, Self::tenant_id_from_request(None, &request)),
+            None => (
+                None,
+                Self::tenant_id_from_request(None, &request),
+                ScopeGuard::default(),
+            ),
         };
+        scope_guard.require("workflow:run").map_err(|(_, body)| {
+            tonic::Status::permission_denied(
+                body.0
+                    .get("required")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("insufficient_scope"),
+            )
+        })?;
         let req = request.into_inner();
         let (stimulus_id, workflow_execution_id) = self
             .ingest_stimulus_rpc(
@@ -915,10 +941,22 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchAgents")
             .await?;
-        let (identity, tenant_id) = match auth {
-            Some((id, tid)) => (Some(id), tid),
-            None => (None, Self::tenant_id_from_identity(None)),
+        let (identity, tenant_id, scope_guard) = match auth {
+            Some((id, tid, sg)) => (Some(id), tid, sg),
+            None => (
+                None,
+                Self::tenant_id_from_identity(None),
+                ScopeGuard::default(),
+            ),
         };
+        scope_guard.require("agent:list").map_err(|(_, body)| {
+            tonic::Status::permission_denied(
+                body.0
+                    .get("required")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("insufficient_scope"),
+            )
+        })?;
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(
@@ -982,10 +1020,22 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchWorkflows")
             .await?;
-        let (identity, tenant_id) = match auth {
-            Some((id, tid)) => (Some(id), tid),
-            None => (None, Self::tenant_id_from_identity(None)),
+        let (identity, tenant_id, scope_guard) = match auth {
+            Some((id, tid, sg)) => (Some(id), tid, sg),
+            None => (
+                None,
+                Self::tenant_id_from_identity(None),
+                ScopeGuard::default(),
+            ),
         };
+        scope_guard.require("workflow:list").map_err(|(_, body)| {
+            tonic::Status::permission_denied(
+                body.0
+                    .get("required")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("insufficient_scope"),
+            )
+        })?;
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(

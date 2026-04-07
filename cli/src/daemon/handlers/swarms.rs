@@ -8,6 +8,7 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 use aegis_orchestrator_swarm::application::SwarmService;
 
 use crate::daemon::handlers::{bounded_limit, LimitQuery};
@@ -44,8 +45,13 @@ pub(crate) struct SwarmView {
 
 pub(crate) async fn list_swarms_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Query(query): Query<LimitQuery>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("swarm:list")?;
     let swarms = state.swarm_service.list_swarms().await;
     let limit = bounded_limit(query.limit, swarms.len().max(1), 500);
     let mut items = Vec::new();
@@ -69,13 +75,18 @@ pub(crate) async fn list_swarms_handler(
         });
     }
 
-    Json(serde_json::json!({ "items": items }))
+    Ok(axum::Json(serde_json::json!({ "items": items })))
 }
 
 pub(crate) async fn get_swarm_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Path(swarm_id): Path<Uuid>,
-) -> Json<serde_json::Value> {
+) -> Result<
+    impl axum::response::IntoResponse,
+    (axum::http::StatusCode, axum::Json<serde_json::Value>),
+> {
+    scope_guard.require("swarm:read")?;
     let swarm_id = aegis_orchestrator_swarm::domain::SwarmId(swarm_id);
     match state.swarm_service.get_swarm(swarm_id).await {
         Ok(Some(swarm)) => {
@@ -96,7 +107,7 @@ pub(crate) async fn get_swarm_handler(
                 lock_count: locks.len(),
                 recent_message_count: messages.len(),
             };
-            Json(serde_json::json!({
+            Ok(axum::Json(serde_json::json!({
                 "swarm": view,
                 "locks": locks.into_iter().map(|lock| SwarmLockView {
                     resource_id: lock.resource_id,
@@ -110,8 +121,8 @@ pub(crate) async fn get_swarm_handler(
                     payload_bytes: message.payload.len(),
                     sent_at: message.sent_at,
                 }).collect::<Vec<_>>(),
-            }))
+            })))
         }
-        Ok(None) | Err(_) => Json(serde_json::json!({"error": "swarm not found"})),
+        Ok(None) | Err(_) => Ok(axum::Json(serde_json::json!({"error": "swarm not found"}))),
     }
 }

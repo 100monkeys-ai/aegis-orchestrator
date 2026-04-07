@@ -19,6 +19,7 @@
 use crate::domain::iam::{IdentityKind, IdentityProvider, UserIdentity};
 use crate::domain::node_config::GrpcAuthConfig;
 use crate::domain::tenant::TenantId;
+use crate::presentation::keycloak_auth::ScopeGuard;
 use crate::presentation::tenant_middleware::derive_tenant_id;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -71,13 +72,14 @@ impl GrpcIamAuthInterceptor {
 /// ## Return value
 ///
 /// Returns `Ok(None)` for exempt methods (no auth required). For authenticated calls,
-/// returns `Ok(Some((identity, tenant_id)))` where `tenant_id` is derived from the
-/// identity or overridden via the `x-aegis-tenant` metadata key (admin only).
+/// returns `Ok(Some((identity, tenant_id, scope_guard)))` where `tenant_id` is derived
+/// from the identity or overridden via the `x-aegis-tenant` metadata key (admin only),
+/// and `scope_guard` carries the resource:action scopes extracted from the JWT "scope" claim.
 pub async fn validate_grpc_request<T>(
     interceptor: &GrpcIamAuthInterceptor,
     request: &Request<T>,
     method: &str,
-) -> Result<Option<(UserIdentity, TenantId)>, Status> {
+) -> Result<Option<(UserIdentity, TenantId, ScopeGuard)>, Status> {
     // Check exemption
     if interceptor.is_exempt(method) {
         return Ok(None);
@@ -121,7 +123,16 @@ pub async fn validate_grpc_request<T>(
         base_tenant
     };
 
-    Ok(Some((identity, tenant_id)))
+    // Extract resource:action scopes from the JWT "scope" claim.
+    let scope_str = validated
+        .raw_claims
+        .get("scope")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let scopes: Vec<String> = scope_str.split_whitespace().map(String::from).collect();
+    let scope_guard = ScopeGuard(scopes);
+
+    Ok(Some((identity, tenant_id, scope_guard)))
 }
 
 #[cfg(test)]

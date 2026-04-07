@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::infrastructure::repositories::postgres_api_key::CreateApiKeyRow;
+use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::state::AppState;
 
@@ -65,16 +66,18 @@ fn hash_key(key: &str) -> String {
 /// `GET /v1/api-keys` — list API keys for the authenticated user.
 pub(crate) async fn list_api_keys_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Extension(identity): Extension<UserIdentity>,
-) -> axum::response::Response {
+) -> Result<axum::response::Response, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("key:list")?;
     let repo = match &state.api_key_repo {
         Some(r) => r.clone(),
         None => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "API key repository not configured"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
@@ -94,17 +97,17 @@ pub(crate) async fn list_api_keys_handler(
                     })
                 })
                 .collect();
-            (
+            Ok((
                 StatusCode::OK,
                 Json(serde_json::json!({ "api_keys": keys })),
             )
-                .into_response()
+                .into_response())
         }
-        Err(e) => (
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
@@ -112,27 +115,29 @@ pub(crate) async fn list_api_keys_handler(
 /// exactly once and is never stored.
 pub(crate) async fn create_api_key_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Extension(identity): Extension<UserIdentity>,
     Json(payload): Json<CreateApiKeyRequest>,
-) -> axum::response::Response {
+) -> Result<axum::response::Response, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("key:create")?;
     let repo = match &state.api_key_repo {
         Some(r) => r.clone(),
         None => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "API key repository not configured"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
     let name_len = payload.name.len();
     if name_len == 0 || name_len > 64 {
-        return (
+        return Ok((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({"error": "name must be between 1 and 64 characters"})),
         )
-            .into_response();
+            .into_response());
     }
 
     let key_value = generate_api_key();
@@ -148,7 +153,7 @@ pub(crate) async fn create_api_key_handler(
     };
 
     match repo.create(&row).await {
-        Ok(created) => (
+        Ok(created) => Ok((
             StatusCode::CREATED,
             Json(serde_json::json!({
                 "id": created.id,
@@ -159,47 +164,49 @@ pub(crate) async fn create_api_key_handler(
                 "created_at": created.created_at,
             })),
         )
-            .into_response(),
-        Err(e) => (
+            .into_response()),
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
 
 /// `DELETE /v1/api-keys/:id` — revoke an API key.
 pub(crate) async fn revoke_api_key_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     Extension(identity): Extension<UserIdentity>,
     Path(id): Path<Uuid>,
-) -> axum::response::Response {
+) -> Result<axum::response::Response, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("key:revoke")?;
     let repo = match &state.api_key_repo {
         Some(r) => r.clone(),
         None => {
-            return (
+            return Ok((
                 StatusCode::SERVICE_UNAVAILABLE,
                 Json(serde_json::json!({"error": "API key repository not configured"})),
             )
-                .into_response();
+                .into_response());
         }
     };
 
     match repo.revoke(id, &identity.sub).await {
-        Ok(true) => (
+        Ok(true) => Ok((
             StatusCode::OK,
             Json(serde_json::json!({"message": "API key revoked"})),
         )
-            .into_response(),
-        Ok(false) => (
+            .into_response()),
+        Ok(false) => Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "API key not found or already revoked"})),
         )
-            .into_response(),
-        Err(e) => (
+            .into_response()),
+        Err(e) => Ok((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
         )
-            .into_response(),
+            .into_response()),
     }
 }
