@@ -159,8 +159,8 @@ async fn workflow_dispatch_rejects_input_missing_required_field() {
         .unwrap_err();
 
     assert!(
-        err.to_string().contains("InvalidExecutionInput"),
-        "expected InvalidExecutionInput in error, got: {err}"
+        err.to_string().contains("Input validation failed"),
+        "expected Input validation failed in error, got: {err}"
     );
 }
 
@@ -245,8 +245,8 @@ fn agent_input_schema_rejects_missing_required_field() {
     let input = json!({}); // missing "target"
     let err = validate_agent_input(&schema, &input).unwrap_err();
     assert!(
-        err.to_string().contains("InvalidExecutionInput"),
-        "expected InvalidExecutionInput, got: {err}"
+        err.to_string().contains("Input validation failed"),
+        "expected Input validation failed, got: {err}"
     );
 }
 
