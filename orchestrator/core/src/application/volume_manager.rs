@@ -940,6 +940,40 @@ mod tests {
             volumes.remove(&id);
             Ok(())
         }
+
+        async fn find_by_owner(
+            &self,
+            tenant_id: &TenantId,
+            owner_user_id: &str,
+        ) -> Result<Vec<Volume>, RepositoryError> {
+            let volumes = self.volumes.lock().await;
+            Ok(volumes
+                .values()
+                .filter(|v| {
+                    v.tenant_id == *tenant_id
+                        && matches!(&v.ownership, VolumeOwnership::Persistent { owner } if owner == owner_user_id)
+                })
+                .cloned()
+                .collect())
+        }
+
+        async fn count_by_owner(
+            &self,
+            tenant_id: &TenantId,
+            owner_user_id: &str,
+        ) -> Result<u32, RepositoryError> {
+            let volumes = self.find_by_owner(tenant_id, owner_user_id).await?;
+            Ok(volumes.len() as u32)
+        }
+
+        async fn sum_size_by_owner(
+            &self,
+            tenant_id: &TenantId,
+            owner_user_id: &str,
+        ) -> Result<u64, RepositoryError> {
+            let volumes = self.find_by_owner(tenant_id, owner_user_id).await?;
+            Ok(volumes.iter().map(|v| v.size_limit_bytes).sum())
+        }
     }
 
     struct FailingVolumeRepository;
@@ -976,6 +1010,30 @@ mod tests {
 
         async fn delete(&self, _id: VolumeId) -> Result<(), RepositoryError> {
             Ok(())
+        }
+
+        async fn find_by_owner(
+            &self,
+            _tenant_id: &TenantId,
+            _owner_user_id: &str,
+        ) -> Result<Vec<Volume>, RepositoryError> {
+            Ok(Vec::new())
+        }
+
+        async fn count_by_owner(
+            &self,
+            _tenant_id: &TenantId,
+            _owner_user_id: &str,
+        ) -> Result<u32, RepositoryError> {
+            Ok(0)
+        }
+
+        async fn sum_size_by_owner(
+            &self,
+            _tenant_id: &TenantId,
+            _owner_user_id: &str,
+        ) -> Result<u64, RepositoryError> {
+            Ok(0)
         }
     }
 

@@ -3229,9 +3229,11 @@ impl StandardExecutionService {
                         let task_signature = exec.input.intent.clone().unwrap_or_default();
                         let steps = trajectory
                             .into_iter()
-                            .map(|step| TrajectoryStepCommand {
+                            .enumerate()
+                            .map(|(i, step)| TrajectoryStepCommand {
                                 tool_name: step.tool_name,
                                 arguments_json: step.arguments_json,
+                                order_index: i as u32,
                             })
                             .collect();
 

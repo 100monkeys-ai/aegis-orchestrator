@@ -416,6 +416,8 @@ mod tests {
             security_context_repo: None,
             realm_repo: None,
             pg_pool: None,
+            credential_service: None,
+            secrets_manager: None,
         })
     }
 

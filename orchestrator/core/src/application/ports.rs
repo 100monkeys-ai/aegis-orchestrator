@@ -44,6 +44,7 @@ pub trait WorkflowEnginePort: Send + Sync {
 pub struct TrajectoryStepCommand {
     pub tool_name: String,
     pub arguments_json: String,
+    pub order_index: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

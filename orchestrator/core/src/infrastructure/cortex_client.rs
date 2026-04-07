@@ -201,6 +201,7 @@ impl CortexPatternPort for CortexGrpcClient {
                     |s| crate::infrastructure::aegis_cortex_proto::TrajectoryStep {
                         tool_name: s.tool_name,
                         arguments_json: s.arguments_json,
+                        order_index: s.order_index,
                     },
                 )
                 .collect(),
