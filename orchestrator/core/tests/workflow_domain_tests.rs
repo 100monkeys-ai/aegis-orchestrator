@@ -356,7 +356,7 @@ fn state_name_preserves_arbitrary_characters() {
 fn state_kind_agent_variant() {
     let kind = StateKind::Agent {
         agent: "code-gen".to_string(),
-        input: "{{workflow.task}}".to_string(),
+        input: "{{input}}".to_string(),
         intent: None,
         isolation: None,
         judges: vec![],

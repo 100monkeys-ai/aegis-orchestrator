@@ -436,7 +436,7 @@ spec:
     START:
       kind: Agent
       agent: coder-v1
-      input: "{{workflow.task}}"
+      input: "{{input}}"
       transitions:
         - condition: always
           target: END

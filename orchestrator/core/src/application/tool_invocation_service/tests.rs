@@ -700,7 +700,7 @@ spec:
     START:
       kind: Agent
       agent: builder
-      input: "{{{{workflow.task}}}}"
+      input: "{{{{input}}}}"
       transitions:
         - condition: always
           target: END
@@ -725,14 +725,14 @@ spec:
     FIRST:
       kind: Agent
       agent: builder
-      input: "{{{{workflow.task}}}}"
+      input: "{{{{input}}}}"
       transitions:
         - condition: always
           target: SECOND
     SECOND:
       kind: Agent
       agent: builder
-      input: "{{{{workflow.task}}}}"
+      input: "{{{{input}}}}"
       transitions:
         - condition: always
           target: FIRST
@@ -758,7 +758,7 @@ spec:
     VALIDATE:
       kind: Agent
       agent: validator
-      input: "{{{{workflow.task}}}}"
+      input: "{{{{input}}}}"
       transitions:
 {validation_transitions}
     SUCCESS:

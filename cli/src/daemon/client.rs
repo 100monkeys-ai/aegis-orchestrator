@@ -868,12 +868,15 @@ impl DaemonClient {
         input: serde_json::Value,
         blackboard: Option<serde_json::Value>,
         version: Option<&str>,
+        intent: Option<String>,
     ) -> Result<Uuid> {
         #[derive(Serialize)]
         struct RunRequest {
             input: serde_json::Value,
             #[serde(skip_serializing_if = "Option::is_none")]
             blackboard: Option<serde_json::Value>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            intent: Option<String>,
         }
 
         let mut url = format!("{}/v1/workflows/{}/run", self.base_url, name);
@@ -883,7 +886,11 @@ impl DaemonClient {
 
         let response = self
             .request(reqwest::Method::POST, url)
-            .json(&RunRequest { input, blackboard })
+            .json(&RunRequest {
+                input,
+                blackboard,
+                intent,
+            })
             .send()
             .await
             .context("Failed to run workflow")?;
@@ -1039,7 +1046,7 @@ impl DaemonClient {
     }
 
     /// Describe a workflow (get YAML definition)
-    pub async fn describe_workflow(&self, name: &str) -> Result<String> {
+    pub async fn describe_workflow(&self, name: &str) -> Result<serde_json::Value> {
         let response = self
             .request(
                 reqwest::Method::GET,
@@ -1054,12 +1061,12 @@ impl DaemonClient {
             anyhow::bail!("Failed to describe workflow: {error_text}");
         }
 
-        let workflow_yaml = response
-            .text()
+        let value = response
+            .json::<serde_json::Value>()
             .await
-            .context("Failed to read workflow YAML")?;
+            .context("Failed to parse workflow JSON")?;
 
-        Ok(workflow_yaml)
+        Ok(value)
     }
 
     /// Delete a workflow

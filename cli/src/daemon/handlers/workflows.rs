@@ -83,13 +83,21 @@ pub(crate) async fn execute_temporal_workflow_handler(
         .await
     {
         Ok(res) => (StatusCode::OK, Json(res)).into_response(),
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": format!("Failed to start workflow execution: {}", e)
-            })),
-        )
-            .into_response(),
+        Err(e) => {
+            let error_str = e.to_string();
+            let status = if error_str.contains("InvalidExecutionInput") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (
+                status,
+                Json(serde_json::json!({
+                    "error": format!("Failed to start workflow execution: {}", e)
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -99,6 +107,8 @@ pub(crate) struct RunWorkflowLegacyRequest {
     input: serde_json::Value,
     #[serde(default)]
     blackboard: Option<serde_json::Value>,
+    #[serde(default)]
+    intent: Option<String>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -124,7 +134,7 @@ pub(crate) async fn run_workflow_legacy_handler(
         security_context_name: identity
             .as_ref()
             .map(|ext| ext.0.to_security_context_name()),
-        intent: None,
+        intent: request.intent,
     };
     execute_temporal_workflow_handler(State(state), identity, Json(req)).await
 }
@@ -200,14 +210,12 @@ pub(crate) async fn list_workflows_handler(
     (StatusCode::OK, Json(workflow_list))
 }
 
-/// GET /v1/workflows/:name - Get workflow YAML
+/// GET /v1/workflows/:name - Get workflow details as JSON
 pub(crate) async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
     Path(name): Path<String>,
 ) -> impl IntoResponse {
-    use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
-
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     match state
@@ -215,17 +223,29 @@ pub(crate) async fn get_workflow_handler(
         .find_by_name_visible(&tenant_id, &name)
         .await
     {
-        Ok(Some(workflow)) => match WorkflowParser::to_yaml(&workflow) {
-            Ok(yaml) => (StatusCode::OK, yaml),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to serialize workflow: {e}"),
-            ),
-        },
+        Ok(Some(workflow)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "id": workflow.id.0,
+                "name": workflow.metadata.name,
+                "version": workflow.metadata.version,
+                "description": workflow.metadata.description,
+                "scope": workflow.scope.to_string(),
+                "labels": workflow.metadata.labels,
+                "created_at": workflow.created_at.to_rfc3339(),
+                "updated_at": workflow.updated_at.map(|t| t.to_rfc3339()),
+                "tenant_id": workflow.tenant_id.as_str(),
+                "input_schema": workflow.metadata.input_schema,
+            })),
+        )
+            .into_response(),
         _ => (
             StatusCode::NOT_FOUND,
-            format!("Workflow '{name}' not found"),
-        ),
+            Json(serde_json::json!({
+                "error": format!("Workflow '{name}' not found")
+            })),
+        )
+            .into_response(),
     }
 }
 

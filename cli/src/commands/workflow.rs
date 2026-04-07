@@ -64,6 +64,10 @@ pub enum WorkflowCommand {
         #[arg(value_name = "NAME")]
         name: String,
 
+        /// Natural-language steering for this execution
+        #[arg(long, value_name = "TEXT")]
+        intent: Option<String>,
+
         /// Workflow input parameters (JSON string)
         #[arg(long, short = 'i', value_name = "JSON")]
         input: Option<String>,
@@ -261,6 +265,7 @@ pub async fn handle_command(
         }
         WorkflowCommand::Run {
             name,
+            intent,
             input,
             params,
             blackboard,
@@ -271,6 +276,7 @@ pub async fn handle_command(
             run_workflow(
                 WorkflowRunRequest {
                     name,
+                    intent,
                     input_json: input,
                     params,
                     blackboard,
@@ -407,6 +413,7 @@ struct WorkflowRunOutput {
 
 struct WorkflowRunRequest {
     name: String,
+    intent: Option<String>,
     input_json: Option<String>,
     params: Vec<String>,
     blackboard: Option<String>,
@@ -656,6 +663,7 @@ async fn run_workflow(
             serde_json::Value::Object(input_params),
             blackboard,
             request.version.as_deref(),
+            request.intent,
         )
         .await
         .context("Failed to start workflow execution")?;
@@ -848,6 +856,7 @@ async fn generate_workflow(
             serde_json::json!({
                 "input": input
             }),
+            None,
             None,
             None,
         )
@@ -1195,18 +1204,19 @@ async fn describe_workflow(
 
     let auth_key = crate::auth::require_key().await?;
     let client = DaemonClient::new(host, port)?.with_auth(auth_key);
-    let workflow_yaml = client
+    let value = client
         .describe_workflow(&name)
         .await
         .context("Failed to get workflow details")?;
 
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&workflow_yaml).context("Failed to parse workflow YAML")?;
-
     match output_format {
-        OutputFormat::Json | OutputFormat::Yaml => render_serialized(output_format, &parsed),
+        OutputFormat::Json | OutputFormat::Yaml => render_serialized(output_format, &value),
         OutputFormat::Text | OutputFormat::Table => {
-            print!("{workflow_yaml}");
+            print!(
+                "{}",
+                serde_json::to_string_pretty(&value)
+                    .context("Failed to serialize workflow details")?
+            );
             Ok(())
         }
     }

@@ -1548,7 +1548,7 @@ mod tests {
             WorkflowState {
                 kind: StateKind::Agent {
                     agent: "builder".to_string(),
-                    input: "{{workflow.task}}".to_string(),
+                    input: "{{input}}".to_string(),
                     intent: None,
                     isolation: None,
                     judges: vec![
@@ -1582,7 +1582,7 @@ mod tests {
                 kind: StateKind::ParallelAgents {
                     agents: vec![ParallelAgentConfig {
                         agent: "worker".to_string(),
-                        input: "{{workflow.task}}".to_string(),
+                        input: "{{input}}".to_string(),
                         weight: 1.0,
                         timeout_seconds: 60,
                         poll_interval_ms: 500,

@@ -78,6 +78,37 @@ pub enum AgentCommand {
         verbose: bool,
     },
 
+    /// Execute an agent directly
+    Run {
+        /// Agent UUID or name
+        #[arg(value_name = "AGENT")]
+        agent: String,
+
+        /// Natural-language steering for this execution
+        #[arg(long, value_name = "TEXT")]
+        intent: Option<String>,
+
+        /// Structured input (JSON string)
+        #[arg(long, short = 'i', value_name = "JSON")]
+        input: Option<String>,
+
+        /// Individual parameters (key=value)
+        #[arg(long = "param", short = 'p', value_name = "KEY=VALUE")]
+        params: Vec<String>,
+
+        /// Target a specific agent version
+        #[arg(long, value_name = "VERSION")]
+        version: Option<String>,
+
+        /// Follow execution logs
+        #[arg(long, short = 'f')]
+        follow: bool,
+
+        /// Wait for completion
+        #[arg(long, short = 'w')]
+        wait: bool,
+    },
+
     /// Generate an agent from natural-language input
     Generate {
         /// Natural-language intent for the agent to create
@@ -144,6 +175,28 @@ pub async fn handle_command(
             } else {
                 logs_agent(agent_id, follow, errors, verbose, client).await
             }
+        }
+        AgentCommand::Run {
+            agent,
+            intent,
+            input,
+            params,
+            version,
+            follow,
+            wait,
+        } => {
+            run_agent(
+                agent,
+                intent,
+                input,
+                params,
+                version,
+                follow,
+                wait,
+                client,
+                output_format,
+            )
+            .await
         }
         AgentCommand::Generate { input, follow } => {
             generate_agent(input, follow, client, config_path.as_ref(), output_format).await
@@ -385,6 +438,147 @@ async fn logs_agent(
     client
         .stream_agent_logs(agent_id, follow, errors_only, verbose)
         .await?;
+
+    Ok(())
+}
+
+/// Output struct for structured `agent run` results.
+#[derive(Serialize)]
+struct AgentRunOutput {
+    agent_id: Uuid,
+    execution_id: Uuid,
+    intent: Option<String>,
+    follow: bool,
+    wait: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent(
+    agent: String,
+    intent: Option<String>,
+    input_json: Option<String>,
+    params: Vec<String>,
+    version: Option<String>,
+    follow: bool,
+    wait: bool,
+    client: DaemonClient,
+    output_format: OutputFormat,
+) -> Result<()> {
+    if output_format.is_structured() && follow {
+        return structured_output_unsupported("aegis agent run --follow", output_format);
+    }
+
+    // Parse structured input
+    let mut input_map = serde_json::Map::new();
+    if let Some(json_str) = input_json {
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)
+            .or_else(|_| serde_yaml::from_str(&json_str))
+            .context("--input must be valid JSON or YAML")?;
+        if let Some(obj) = parsed.as_object() {
+            input_map.extend(obj.clone());
+        } else {
+            anyhow::bail!("Agent --input must be a JSON object");
+        }
+    }
+    for param in params {
+        let parts: Vec<&str> = param.splitn(2, '=').collect();
+        if parts.len() != 2 {
+            anyhow::bail!("Invalid --param format: '{param}'. Expected 'key=value'");
+        }
+        let key = parts[0].to_string();
+        let value = parts[1].to_string();
+        let json_value = serde_json::from_str(&value).unwrap_or(serde_json::Value::String(value));
+        input_map.insert(key, json_value);
+    }
+
+    // Resolve agent UUID: parse directly if UUID, else look up by name
+    let agent_id = if let Ok(uuid) = Uuid::parse_str(&agent) {
+        uuid
+    } else {
+        match client.lookup_agent(&agent).await? {
+            Some(id) => id,
+            None => anyhow::bail!("Agent '{agent}' not found"),
+        }
+    };
+
+    if !output_format.is_structured() {
+        println!("{}", "🚀 Starting agent execution...".cyan());
+        println!("   Agent: {agent_id}");
+        if let Some(ref i) = intent {
+            println!("   Intent: {i}");
+        }
+        if !input_map.is_empty() {
+            println!("   Input: {}", serde_json::to_string(&input_map).unwrap());
+        }
+        println!();
+    }
+
+    let execution_id = client
+        .execute_agent(
+            agent_id,
+            serde_json::Value::Object(input_map),
+            intent.clone(),
+            None,
+            version.as_deref(),
+        )
+        .await
+        .context("Failed to start agent execution")?;
+
+    if output_format.is_structured() {
+        return render_serialized(
+            output_format,
+            &AgentRunOutput {
+                agent_id,
+                execution_id,
+                intent,
+                follow,
+                wait,
+            },
+        );
+    }
+
+    println!(
+        "{}",
+        format!("✓ Agent execution started: {execution_id}").green()
+    );
+
+    if follow {
+        println!("{}", "📡 Streaming logs...".cyan());
+        println!();
+        client
+            .stream_logs(execution_id, true, false, false)
+            .await
+            .context("Failed to stream agent logs")?;
+    } else if wait {
+        println!("Waiting for completion...");
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            match client.get_execution(execution_id).await {
+                Ok(info) => match info.status.as_str() {
+                    "completed" | "succeeded" => {
+                        println!(
+                            "{}",
+                            format!("✓ Execution {execution_id} completed").green()
+                        );
+                        break;
+                    }
+                    "failed" | "error" => {
+                        println!("{}", format!("✗ Execution {execution_id} failed").red());
+                        break;
+                    }
+                    _ => {}
+                },
+                Err(e) => {
+                    println!(
+                        "{}",
+                        format!("Warning: failed to poll execution: {e}").yellow()
+                    );
+                }
+            }
+        }
+    } else {
+        println!("Follow agent logs with:\n  aegis agent logs {execution_id} --follow");
+    }
 
     Ok(())
 }
