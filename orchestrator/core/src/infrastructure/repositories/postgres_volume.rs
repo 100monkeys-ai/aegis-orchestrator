@@ -45,14 +45,20 @@ impl VolumeRepository for PostgresVolumeRepository {
         let ownership_json = serde_json::to_value(&volume.ownership)
             .map_err(|e| RepositoryError::Serialization(e.to_string()))?;
 
+        let owner_user_id = match &volume.ownership {
+            VolumeOwnership::Persistent { owner } => Some(owner.as_str()),
+            _ => None,
+        };
+
         sqlx::query(
             r#"
             INSERT INTO volumes (
                 id, name, tenant_id, storage_class, backend,
                 size_limit_bytes, status, ownership,
-                created_at, attached_at, detached_at, expires_at
+                created_at, attached_at, detached_at, expires_at,
+                owner_user_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
                 storage_class = EXCLUDED.storage_class,
                 backend = EXCLUDED.backend,
@@ -61,7 +67,8 @@ impl VolumeRepository for PostgresVolumeRepository {
                 ownership = EXCLUDED.ownership,
                 attached_at = EXCLUDED.attached_at,
                 detached_at = EXCLUDED.detached_at,
-                expires_at = EXCLUDED.expires_at
+                expires_at = EXCLUDED.expires_at,
+                owner_user_id = EXCLUDED.owner_user_id
             -- Note: name and tenant_id are NOT unique - multiple executions can use same logical name
             -- remote_path is unique and includes volume_id, ensuring true isolation
             "#
@@ -78,6 +85,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         .bind(volume.attached_at)
         .bind(volume.detached_at)
         .bind(volume.expires_at)
+        .bind(owner_user_id)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save volume: {e}")))?;
@@ -420,5 +428,126 @@ mod tests {
         assert_eq!(loaded.tenant_id, TenantId::default());
         assert_eq!(loaded.backend, volume.backend);
         assert_eq!(loaded.ownership, volume.ownership);
+    }
+
+    async fn make_temp_volumes_table(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            CREATE TEMP TABLE volumes (
+                id UUID PRIMARY KEY,
+                name TEXT NOT NULL,
+                tenant_id TEXT NOT NULL,
+                storage_class JSONB NOT NULL,
+                backend JSONB NOT NULL,
+                size_limit_bytes BIGINT NOT NULL,
+                status JSONB NOT NULL,
+                ownership JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                attached_at TIMESTAMPTZ,
+                detached_at TIMESTAMPTZ,
+                expires_at TIMESTAMPTZ,
+                owner_user_id TEXT
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("Failed to create temp volumes table");
+    }
+
+    #[tokio::test]
+    async fn save_persistent_volume_populates_owner_user_id() {
+        let Some(pool) = connect_test_pool().await else {
+            eprintln!("Skipping: DATABASE_URL/AEGIS_DATABASE_URL not set or unreachable");
+            return;
+        };
+
+        make_temp_volumes_table(&pool).await;
+
+        let repository = PostgresVolumeRepository::new(pool.clone());
+        let now = Utc::now();
+        let volume = Volume {
+            id: VolumeId::new(),
+            name: "persistent-vol".to_string(),
+            tenant_id: TenantId::default(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::HostPath {
+                path: "/aegis/volumes/local/persistent-vol".into(),
+            },
+            size_limit_bytes: 1024 * 1024,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::Persistent {
+                owner: "user-123".to_string(),
+            },
+            created_at: now,
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+        };
+
+        repository
+            .save(&volume)
+            .await
+            .expect("Failed to save persistent volume");
+
+        let row = sqlx::query("SELECT owner_user_id FROM volumes WHERE id = $1")
+            .bind(volume.id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to query owner_user_id");
+
+        let owner_user_id: Option<String> = row.get("owner_user_id");
+        assert_eq!(
+            owner_user_id.as_deref(),
+            Some("user-123"),
+            "Persistent volume must have owner_user_id populated"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_execution_volume_owner_user_id_is_null() {
+        let Some(pool) = connect_test_pool().await else {
+            eprintln!("Skipping: DATABASE_URL/AEGIS_DATABASE_URL not set or unreachable");
+            return;
+        };
+
+        make_temp_volumes_table(&pool).await;
+
+        let repository = PostgresVolumeRepository::new(pool.clone());
+        let execution_id = ExecutionId::new();
+        let now = Utc::now();
+        let volume = Volume {
+            id: VolumeId::new(),
+            name: "exec-vol".to_string(),
+            tenant_id: TenantId::default(),
+            storage_class: StorageClass::ephemeral_hours(1),
+            backend: VolumeBackend::HostPath {
+                path: "/aegis/volumes/local/exec-vol".into(),
+            },
+            size_limit_bytes: 1024 * 1024,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::Execution { execution_id },
+            created_at: now,
+            attached_at: None,
+            detached_at: None,
+            expires_at: Some(now + chrono::Duration::hours(1)),
+        };
+
+        repository
+            .save(&volume)
+            .await
+            .expect("Failed to save execution volume");
+
+        let row = sqlx::query("SELECT owner_user_id FROM volumes WHERE id = $1")
+            .bind(volume.id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to query owner_user_id");
+
+        let owner_user_id: Option<String> = row.get("owner_user_id");
+        assert!(
+            owner_user_id.is_none(),
+            "Execution volume must have NULL owner_user_id, got: {owner_user_id:?}"
+        );
     }
 }
