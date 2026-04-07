@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, patch, post};
 use axum::{middleware, Router};
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
@@ -45,6 +45,7 @@ use crate::daemon::handlers::seal::{
 };
 use crate::daemon::handlers::swarms::{get_swarm_handler, list_swarms_handler};
 use crate::daemon::handlers::tenant_provisioning::keycloak_event_handler;
+use crate::daemon::handlers::volumes;
 use crate::daemon::handlers::workflow_executions::{
     cancel_workflow_execution_handler, get_workflow_execution_handler, get_workflow_logs_handler,
     list_workflow_executions_handler, remove_workflow_execution_handler,
@@ -213,6 +214,31 @@ pub(crate) fn create_router(
         .route("/v1/api-keys/{id}", delete(revoke_api_key_handler))
         // Keycloak webhook for tenant provisioning (ADR-097)
         .route("/v1/webhooks/keycloak", post(keycloak_event_handler))
+        // User volume management (Gap 079)
+        // Note: /v1/volumes/quota MUST be registered before /v1/volumes/:id to avoid
+        // axum routing ambiguity — "quota" would otherwise be matched as an id segment.
+        .route(
+            "/v1/volumes",
+            post(volumes::create_volume).get(volumes::list_volumes),
+        )
+        .route("/v1/volumes/quota", get(volumes::get_quota))
+        .route(
+            "/v1/volumes/:id",
+            get(volumes::get_volume)
+                .patch(volumes::rename_volume)
+                .delete(volumes::delete_volume),
+        )
+        .route(
+            "/v1/volumes/:id/files",
+            get(volumes::list_files).delete(volumes::delete_path),
+        )
+        .route(
+            "/v1/volumes/:id/files/download",
+            get(volumes::download_file),
+        )
+        .route("/v1/volumes/:id/files/upload", post(volumes::upload_file))
+        .route("/v1/volumes/:id/files/mkdir", post(volumes::mkdir))
+        .route("/v1/volumes/:id/files/move", post(volumes::move_path))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {

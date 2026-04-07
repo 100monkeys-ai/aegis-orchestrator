@@ -142,7 +142,7 @@ pub enum IdentityKind {
 
 /// ZaruTier is owned by BC-13 (IAM) and sourced from a OIDC custom claim.
 /// Maps to SEAL SecurityContext names consumed by ZaruAuthMiddleware → AttestationService.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ZaruTier {
     Free,
     Pro,

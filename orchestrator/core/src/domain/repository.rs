@@ -428,6 +428,27 @@ pub trait VolumeRepository: Send + Sync {
 
     /// Delete volume by ID
     async fn delete(&self, id: VolumeId) -> Result<(), RepositoryError>;
+
+    /// Find all volumes owned by a specific user within a tenant
+    async fn find_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<Vec<Volume>, RepositoryError>;
+
+    /// Count volumes owned by a specific user within a tenant
+    async fn count_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<u32, RepositoryError>;
+
+    /// Sum size_limit_bytes for all volumes owned by a specific user within a tenant
+    async fn sum_size_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<u64, RepositoryError>;
 }
 
 /// Repository interface for StorageEvent audit trail (ADR-036)

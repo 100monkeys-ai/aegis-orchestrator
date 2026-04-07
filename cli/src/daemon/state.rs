@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use aegis_orchestrator_core::{
     application::{
-        execution::StandardExecutionService, lifecycle::StandardAgentLifecycleService,
+        execution::StandardExecutionService, file_operations_service::FileOperationsService,
+        lifecycle::StandardAgentLifecycleService,
         register_workflow::StandardRegisterWorkflowUseCase,
         start_workflow_execution::StandardStartWorkflowExecutionUseCase,
-        CorrelatedActivityStreamService,
+        user_volume_service::UserVolumeService, CorrelatedActivityStreamService,
     },
     domain::{
         cluster::NodeClusterRepository,
@@ -67,6 +68,8 @@ pub(crate) struct AppState {
     /// Identity realm repository for dynamic OIDC realm persistence (ADR-041). Optional until wired.
     #[allow(dead_code)]
     pub(crate) realm_repo: Option<Arc<dyn RealmRepository>>,
+    pub(crate) user_volume_service: Arc<UserVolumeService>,
+    pub(crate) file_operations_service: Arc<FileOperationsService>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
 }

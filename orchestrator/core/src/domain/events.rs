@@ -657,6 +657,31 @@ pub enum VolumeEvent {
         actual_bytes: u64,
         exceeded_at: DateTime<Utc>,
     },
+    UserVolumeCreated {
+        volume_id: VolumeId,
+        owner_user_id: String,
+        tenant_id: TenantId,
+        label: String,
+        size_limit_bytes: u64,
+        created_at: DateTime<Utc>,
+    },
+    UserVolumeRenamed {
+        volume_id: VolumeId,
+        old_label: String,
+        new_label: String,
+        renamed_at: DateTime<Utc>,
+    },
+    UserVolumeDeleted {
+        volume_id: VolumeId,
+        owner_user_id: String,
+        deleted_at: DateTime<Utc>,
+    },
+    UserVolumeQuotaWarning {
+        owner_user_id: String,
+        tenant_id: TenantId,
+        usage_percent: f32,
+        warned_at: DateTime<Utc>,
+    },
 }
 
 /// Infrastructure-level security policy violation events (BC-4 Security Policy).

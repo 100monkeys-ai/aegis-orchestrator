@@ -218,6 +218,11 @@ impl AegisFSAL {
         }
     }
 
+    /// Expose storage provider for direct use by application services (e.g. FileOperationsService)
+    pub fn storage_provider(&self) -> &Arc<dyn crate::domain::storage::StorageProvider> {
+        &self.storage_provider
+    }
+
     fn routed_storage_path(&self, volume: &Volume, path: &str) -> String {
         match &volume.backend {
             crate::domain::volume::VolumeBackend::HostPath { path: host_path } => host_path
@@ -337,6 +342,37 @@ impl AegisFSAL {
                 execution_id,
                 volume_id,
             });
+        }
+
+        Ok(volume)
+    }
+
+    /// Authorize a user (not an execution) to access a volume they own
+    pub async fn authorize_for_user(
+        &self,
+        user_id: &str,
+        volume_id: &VolumeId,
+    ) -> Result<Volume, FsalError> {
+        let volume = self
+            .volume_repository
+            .find_by_id(*volume_id)
+            .await
+            .map_err(|_| FsalError::VolumeNotFound(*volume_id))?
+            .ok_or(FsalError::VolumeNotFound(*volume_id))?;
+
+        match &volume.status {
+            VolumeStatus::Available | VolumeStatus::Attached => {}
+            _ => return Err(FsalError::VolumeNotAttached(*volume_id)),
+        }
+
+        match &volume.ownership {
+            crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == user_id => {}
+            _ => {
+                return Err(FsalError::UnauthorizedAccess {
+                    execution_id: ExecutionId::new(),
+                    volume_id: *volume_id,
+                })
+            }
         }
 
         Ok(volume)
@@ -870,5 +906,178 @@ mod tests {
         let decoded = AegisFileHandle::from_bytes(&bytes).unwrap();
 
         assert_eq!(original, decoded);
+    }
+
+    // ── authorize_for_user tests ───────────────────────────────────────────
+
+    use crate::domain::events::StorageEvent;
+    use crate::domain::storage::{
+        DirEntry as SDirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError,
+        StorageProvider,
+    };
+    use crate::infrastructure::repositories::InMemoryVolumeRepository;
+    use std::sync::Arc;
+
+    struct NoopStorage;
+
+    #[async_trait::async_trait]
+    impl StorageProvider for NoopStorage {
+        async fn create_directory(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn delete_directory(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn set_quota(&self, _: &str, _: u64) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn get_usage(&self, _: &str) -> Result<u64, StorageError> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn open_file(&self, _: &str, _: OpenMode) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(vec![]))
+        }
+        async fn read_at(&self, _: &FileHandle, _: u64, _: usize) -> Result<Vec<u8>, StorageError> {
+            Ok(vec![])
+        }
+        async fn write_at(
+            &self,
+            _: &FileHandle,
+            _: u64,
+            data: &[u8],
+        ) -> Result<usize, StorageError> {
+            Ok(data.len())
+        }
+        async fn close_file(&self, _: &FileHandle) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn stat(&self, path: &str) -> Result<FileAttributes, StorageError> {
+            Err(StorageError::FileNotFound(path.to_string()))
+        }
+        async fn readdir(&self, _: &str) -> Result<Vec<SDirEntry>, StorageError> {
+            Ok(vec![])
+        }
+        async fn create_file(&self, _: &str, _: u32) -> Result<FileHandle, StorageError> {
+            Ok(FileHandle(vec![]))
+        }
+        async fn delete_file(&self, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+        async fn rename(&self, _: &str, _: &str) -> Result<(), StorageError> {
+            Ok(())
+        }
+    }
+
+    struct NoopPublisher;
+
+    #[async_trait::async_trait]
+    impl EventPublisher for NoopPublisher {
+        async fn publish_storage_event(&self, _: StorageEvent) {}
+    }
+
+    fn make_available_persistent_volume(owner: &str) -> crate::domain::volume::Volume {
+        use crate::domain::volume::{FilerEndpoint, StorageClass, VolumeBackend, VolumeOwnership};
+        use chrono::Utc;
+        crate::domain::volume::Volume {
+            id: VolumeId::new(),
+            name: "test-vol".to_string(),
+            tenant_id: crate::domain::volume::TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/aegis/volumes/test/v1".to_string(),
+            },
+            size_limit_bytes: 1_000_000,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::persistent(owner),
+            created_at: Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+        }
+    }
+
+    async fn make_fsal_with_volume(vol: &crate::domain::volume::Volume) -> AegisFSAL {
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(vol).await.unwrap();
+
+        AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        )
+    }
+
+    #[tokio::test]
+    async fn authorize_for_user_correct_owner_passes() {
+        let vol = make_available_persistent_volume("alice");
+        let fsal = make_fsal_with_volume(&vol).await;
+        let result = fsal.authorize_for_user("alice", &vol.id).await;
+        assert!(result.is_ok(), "correct owner should pass: {:?}", result);
+    }
+
+    #[tokio::test]
+    async fn authorize_for_user_wrong_owner_fails() {
+        let vol = make_available_persistent_volume("alice");
+        let fsal = make_fsal_with_volume(&vol).await;
+        let result = fsal.authorize_for_user("bob", &vol.id).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "wrong owner should fail: {:?}",
+            result
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_for_user_workflow_ownership_fails() {
+        use crate::domain::volume::{FilerEndpoint, StorageClass, VolumeBackend, VolumeOwnership};
+        use chrono::Utc;
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+        use uuid::Uuid;
+
+        let vol = crate::domain::volume::Volume {
+            id: VolumeId::new(),
+            name: "wf-vol".to_string(),
+            tenant_id: crate::domain::volume::TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/aegis/volumes/test/wfv".to_string(),
+            },
+            size_limit_bytes: 1_000_000,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::WorkflowExecution {
+                workflow_execution_id: Uuid::new_v4(),
+            },
+            created_at: Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+        };
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+
+        let fsal = AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        );
+
+        let result = fsal.authorize_for_user("alice", &vol.id).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "workflow ownership should fail user auth: {:?}",
+            result
+        );
     }
 }
