@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{delete, get, post};
 use axum::{middleware, Router};
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;

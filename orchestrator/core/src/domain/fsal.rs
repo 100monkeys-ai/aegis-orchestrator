@@ -912,8 +912,7 @@ mod tests {
 
     use crate::domain::events::StorageEvent;
     use crate::domain::storage::{
-        DirEntry as SDirEntry, FileAttributes, FileHandle, FileType, OpenMode, StorageError,
-        StorageProvider,
+        DirEntry as SDirEntry, FileAttributes, FileHandle, OpenMode, StorageError, StorageProvider,
     };
     use crate::infrastructure::repositories::InMemoryVolumeRepository;
     use std::sync::Arc;

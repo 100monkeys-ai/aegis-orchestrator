@@ -87,9 +87,9 @@ pub(crate) struct AppState {
     pub(crate) start_time: std::time::Instant,
 }
 
-/// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
-impl FromRef<AppState> for WebhookHmacState {
-    fn from_ref(state: &AppState) -> Self {
+/// Enable webhook HMAC authentication via Axum extractor pulling state from [`Arc<AppState>`].
+impl FromRef<Arc<AppState>> for WebhookHmacState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
         WebhookHmacState {
             secret_provider: state.webhook_secret_provider.clone(),
         }
