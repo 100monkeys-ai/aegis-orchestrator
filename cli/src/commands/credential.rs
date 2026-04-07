@@ -32,7 +32,7 @@ pub enum CredentialCommand {
         #[arg(long, value_name = "LABEL")]
         label: String,
 
-        /// Scope: "personal" or "team:<uuid>"
+        /// Scope: "personal" or "team:&lt;uuid&gt;"
         #[arg(long, value_name = "SCOPE", default_value = "personal")]
         scope: String,
 

@@ -120,7 +120,7 @@ fn require_operator_or_admin(
 pub struct StoreApiKeyRequest {
     pub provider: String,
     pub label: String,
-    /// "personal" | "team:\<uuid\>"
+    /// "personal" | "team:&lt;uuid&gt;"
     pub scope: Option<String>,
     /// The raw API key value — treated as sensitive
     pub value: String,
