@@ -19,6 +19,7 @@ use aegis_orchestrator_core::application::start_workflow_execution::{
     StandardStartWorkflowExecutionUseCase, StartWorkflowExecutionRequest,
     StartWorkflowExecutionUseCase,
 };
+use aegis_orchestrator_core::domain::repository::WorkflowRepository;
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use aegis_orchestrator_core::domain::workflow::{
     StateKind, StateName, TransitionCondition, TransitionRule, Workflow, WorkflowMetadata,
