@@ -178,10 +178,14 @@ pub(crate) async fn execute_agent_handler(
 
 pub(crate) async fn stream_agent_events_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(agent_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(e) = scope_guard.require("agent:logs") {
+        return e.into_response();
+    }
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(false);
     let verbose = params.get("verbose").map(|v| v == "true").unwrap_or(false);
     let aid = aegis_orchestrator_core::domain::agent::AgentId(agent_id);
@@ -203,7 +207,9 @@ pub(crate) async fn stream_agent_events_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 #[derive(serde::Deserialize, Default)]

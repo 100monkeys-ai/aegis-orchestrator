@@ -792,16 +792,25 @@ pub(crate) async fn get_workflow_logs_handler(
 /// GET /v1/workflows/executions/:execution_id/logs/stream - Stream workflow log events
 pub(crate) async fn stream_workflow_logs_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(e) = scope_guard.require("workflow:logs") {
+        return e.into_response();
+    }
+
     let mk_sse = |stream: std::pin::Pin<
         Box<
             dyn futures::Stream<
                     Item = std::result::Result<axum::response::sse::Event, anyhow::Error>,
                 > + Send,
         >,
-    >| { Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default()) };
+    >| {
+        Sse::new(stream)
+            .keep_alive(axum::response::sse::KeepAlive::default())
+            .into_response()
+    };
 
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
     let execution_id = ExecutionId(execution_id);

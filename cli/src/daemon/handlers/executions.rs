@@ -78,10 +78,14 @@ pub(crate) async fn cancel_execution_handler(
 
 pub(crate) async fn stream_events_handler(
     State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
     Path(execution_id): Path<Uuid>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    if let Err(e) = scope_guard.require("execution:stream") {
+        return e.into_response();
+    }
     let follow = params.get("follow").map(|v| v != "false").unwrap_or(true);
     let verbose = params.get("verbose").map(|v| v == "true").unwrap_or(false);
     let exec_id = aegis_orchestrator_core::domain::execution::ExecutionId(execution_id);
@@ -103,7 +107,9 @@ pub(crate) async fn stream_events_handler(
         }
     };
 
-    Sse::new(stream).keep_alive(axum::response::sse::KeepAlive::default())
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
 }
 
 pub(crate) async fn delete_execution_handler(
