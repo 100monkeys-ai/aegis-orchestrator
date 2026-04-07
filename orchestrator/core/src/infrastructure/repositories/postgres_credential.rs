@@ -161,7 +161,7 @@ fn hydrate_binding(row: &sqlx::postgres::PgRow) -> anyhow::Result<UserCredential
     let created_at: DateTime<Utc> = row.try_get("created_at")?;
     let updated_at: DateTime<Utc> = row.try_get("updated_at")?;
 
-    let tenant_id = TenantId::new(tenant_id_str);
+    let tenant_id = TenantId::new(tenant_id_str).map_err(|e| anyhow::anyhow!(e))?;
     let credential_type = str_to_credential_type(&credential_type_str)?;
     let provider = str_to_provider(&provider_str);
     let status = str_to_status(&status_str)?;
