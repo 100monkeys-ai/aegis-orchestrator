@@ -32,6 +32,28 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // ============================================================================
+// OAuth Pending State
+// ============================================================================
+
+/// Transient row tracking an in-flight OAuth2 PKCE authorisation flow.
+///
+/// Stored in the `oauth_pending_states` table until the callback arrives or
+/// the row is expired by [`CredentialBindingRepository::delete_expired_oauth_states`].
+#[derive(Debug, Clone)]
+pub struct OAuthPendingState {
+    /// The opaque CSRF / state token passed through the provider redirect.
+    pub state: String,
+    /// The binding that was created in `PendingOAuth` status.
+    pub binding_id: CredentialBindingId,
+    /// PKCE code verifier (held server-side; the challenge was sent to the provider).
+    pub pkce_verifier: String,
+    /// The redirect URI registered with the provider for this flow.
+    pub redirect_uri: String,
+    /// When the pending state was inserted (used to expire stale flows).
+    pub created_at: DateTime<Utc>,
+}
+
+// ============================================================================
 // Value Objects — Identities
 // ============================================================================
 
@@ -330,6 +352,30 @@ pub trait CredentialBindingRepository: Send + Sync {
 
     /// Permanently delete a binding and all its grants.
     async fn delete(&self, id: &CredentialBindingId) -> anyhow::Result<()>;
+
+    // -----------------------------------------------------------------------
+    // OAuth pending state management
+    // -----------------------------------------------------------------------
+
+    /// Insert an OAuth2 PKCE pending state row.
+    async fn save_oauth_state(
+        &self,
+        state: &str,
+        binding_id: &CredentialBindingId,
+        pkce_verifier: &str,
+        redirect_uri: &str,
+    ) -> anyhow::Result<()>;
+
+    /// Load a pending state by its opaque state token, or `None` if not found.
+    async fn find_oauth_state(&self, state: &str) -> anyhow::Result<Option<OAuthPendingState>>;
+
+    /// Delete a single pending state row (called after successful completion or rejection).
+    async fn delete_oauth_state(&self, state: &str) -> anyhow::Result<()>;
+
+    /// Delete all pending state rows older than `older_than` (TTL cleanup).
+    ///
+    /// Returns the number of rows deleted.
+    async fn delete_expired_oauth_states(&self, older_than: DateTime<Utc>) -> anyhow::Result<u64>;
 }
 
 // ============================================================================

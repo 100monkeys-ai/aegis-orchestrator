@@ -16,6 +16,7 @@
 //! | [`execution`] | BC-2 Execution | `ExecutionService` trait, `StandardExecutionService` impl |
 //! | [`policy`] | BC-4 Security Policy | Policy validation use-cases |
 //! | [`attestation_service`] | BC-12 SEAL | Orchestrates SEAL attestation flow (ADR-035) |
+//! | [`credential_service`] | BC-11 Secrets & Identity | `CredentialManagementService` — user credential binding lifecycle (ADR-078) |
 //! | [`tool_catalog`] | BC-14 SEAL Tooling Gateway | `StandardToolCatalog` — enriched tool discovery with source/category/tag classification |
 //! | [`tool_invocation_service`] | BC-12 SEAL | Mediates all MCP tool calls through the orchestrator proxy (ADR-033) |
 //! | [`validation_service`] | BC-2 Execution | Gradient validation application service (ADR-017) |
@@ -41,6 +42,7 @@ pub mod agent_scope;
 pub mod attestation_service;
 pub mod cluster;
 pub mod correlated_activity_stream;
+pub mod credential_service;
 pub mod discovery_service;
 pub mod execution;
 pub mod lifecycle;

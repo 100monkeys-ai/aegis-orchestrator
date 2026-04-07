@@ -784,6 +784,24 @@ impl SecretsManager {
         result
     }
 
+    /// Delete a secret from the KV engine and invalidate the cache entry (ADR-078).
+    ///
+    /// Used by the credential revocation path to purge a user credential value
+    /// from OpenBao when the binding is revoked. Cache is always invalidated,
+    /// regardless of whether the store returned an error (the secret may already
+    /// have been deleted).
+    pub async fn delete_secret(
+        &self,
+        engine: &str,
+        path: &str,
+        _context: &AccessContext,
+    ) -> Result<(), SecretsError> {
+        let result = self.store.delete(engine, path).await;
+        // Invalidate cache entry regardless of success/failure.
+        self.cache.lock().await.pop(&Self::cache_key(engine, path));
+        result
+    }
+
     /// Generate short-lived credentials from a dynamic engine (e.g. database/PKI).
     pub async fn generate_dynamic_secret(
         &self,
