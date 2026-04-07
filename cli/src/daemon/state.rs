@@ -88,8 +88,8 @@ pub(crate) struct AppState {
 }
 
 /// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
-impl FromRef<Arc<AppState>> for WebhookHmacState {
-    fn from_ref(state: &Arc<AppState>) -> Self {
+impl FromRef<AppState> for WebhookHmacState {
+    fn from_ref(state: &AppState) -> Self {
         WebhookHmacState {
             secret_provider: state.webhook_secret_provider.clone(),
         }
