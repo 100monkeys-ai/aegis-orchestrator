@@ -169,10 +169,15 @@ pub(crate) async fn execute_agent_handler(
             StatusCode::OK,
             Json(serde_json::json!({"execution_id": id.0})),
         )),
-        Err(e) => Ok((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )),
+        Err(e) => {
+            let error_str = e.to_string();
+            let status = if error_str.contains("InvalidExecutionInput") {
+                StatusCode::UNPROCESSABLE_ENTITY
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Ok((status, Json(serde_json::json!({"error": error_str}))))
+        }
     }
 }
 

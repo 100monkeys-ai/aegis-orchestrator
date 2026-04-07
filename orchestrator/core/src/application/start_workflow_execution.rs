@@ -322,6 +322,31 @@ impl StartWorkflowExecutionUseCase for StandardStartWorkflowExecutionUseCase {
         .context("Failed to query workflow repository")?
         .ok_or_else(|| anyhow::anyhow!("Workflow not found: {}", request.workflow_id))?;
 
+        // Step 1.5: Validate request input against workflow's declared input_schema (ADR-092 D7)
+        if let Some(schema) = &workflow.metadata.input_schema {
+            let compiled = jsonschema::validator_for(schema).map_err(|e| {
+                anyhow::anyhow!(
+                    "{}",
+                    crate::domain::execution::ExecutionError::InvalidExecutionInput(format!(
+                        "Workflow input_schema is invalid: {e}"
+                    ))
+                )
+            })?;
+            let errors: Vec<String> = compiled
+                .iter_errors(&request.input)
+                .map(|e| e.to_string())
+                .collect();
+            if !errors.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    crate::domain::execution::ExecutionError::InvalidExecutionInput(format!(
+                        "Input validation failed: {}",
+                        errors.join("; ")
+                    ))
+                ));
+            }
+        }
+
         // Step 2: Create workflow execution aggregate
         let execution_id = ExecutionId(uuid::Uuid::new_v4());
         let mut workflow_execution =
@@ -1084,5 +1109,151 @@ mod tests {
             .unwrap_err();
 
         assert!(err.to_string().contains("Workflow not found"));
+    }
+
+    // =========================================================================
+    // ADR-092 D7 regression tests: input_schema validation at dispatch
+    // =========================================================================
+
+    fn build_workflow_with_schema(name: &str, input_schema: serde_json::Value) -> Workflow {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo ready".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![TransitionRule {
+                    condition: TransitionCondition::Always,
+                    target: StateName::new("END").unwrap(),
+                    feedback: None,
+                }],
+                timeout: None,
+            },
+        );
+        states.insert(
+            StateName::new("END").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo done".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+            },
+        );
+        Workflow::new(
+            WorkflowMetadata {
+                name: name.to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                input_schema: Some(input_schema),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                storage: Default::default(),
+            },
+        )
+        .unwrap()
+    }
+
+    /// ADR-092 D7 regression: dispatching a workflow with a required field missing must
+    /// return an error containing "InvalidExecutionInput" — never proceed to Temporal.
+    #[tokio::test]
+    async fn input_schema_validation_rejects_missing_required_field() {
+        let schema = json!({
+            "type": "object",
+            "required": ["branch"],
+            "properties": {
+                "branch": { "type": "string" }
+            }
+        });
+        let workflow = build_workflow_with_schema("schema-required-field", schema);
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
+        let engine = Arc::new(RecordingWorkflowEngine::new("should-not-be-called"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let err = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({}), // missing required "branch"
+                blackboard: None,
+                version: None,
+                tenant_id: Some(TenantId::consumer()),
+                security_context_name: None,
+                intent: None,
+            })
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("InvalidExecutionInput"),
+            "expected InvalidExecutionInput, got: {err}"
+        );
+        // Temporal must not have been invoked
+        assert!(
+            engine.calls().is_empty(),
+            "Temporal engine must not be called when input validation fails"
+        );
+    }
+
+    /// ADR-092 D7 regression: dispatching a workflow with valid input matching the declared
+    /// input_schema must succeed and proceed to Temporal normally.
+    #[tokio::test]
+    async fn input_schema_validation_accepts_valid_input() {
+        let schema = json!({
+            "type": "object",
+            "required": ["branch"],
+            "properties": {
+                "branch": { "type": "string" }
+            }
+        });
+        let workflow = build_workflow_with_schema("schema-valid-input", schema);
+        let workflow_repo = Arc::new(InMemoryWorkflowRepository::new());
+        workflow_repo
+            .save_for_tenant(&TenantId::consumer(), &workflow)
+            .await
+            .unwrap();
+        let engine = Arc::new(RecordingWorkflowEngine::new("temporal-run-schema-ok"));
+
+        let service = StandardStartWorkflowExecutionUseCase::new(
+            workflow_repo,
+            Arc::new(InMemoryWorkflowExecutionRepository::new()),
+            Arc::new(tokio::sync::RwLock::new(Some(engine.clone()))),
+            Arc::new(EventBus::new(8)),
+        );
+
+        let result = service
+            .start_execution(StartWorkflowExecutionRequest {
+                workflow_id: workflow.metadata.name.clone(),
+                input: json!({ "branch": "main" }),
+                blackboard: None,
+                version: None,
+                tenant_id: Some(TenantId::consumer()),
+                security_context_name: None,
+                intent: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result.status, "running");
+        assert_eq!(engine.calls().len(), 1);
     }
 }

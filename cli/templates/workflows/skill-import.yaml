@@ -72,7 +72,7 @@ spec:
         Parsed skill:
         {{PARSE_AND_VALIDATE.output}}
 
-        {{#if workflow.agent_name_override}}
+        {{#if input.agent_name_override}}
         Agent name override: {{input.agent_name_override}}
         {{/if}}
 

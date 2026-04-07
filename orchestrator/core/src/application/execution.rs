@@ -1768,6 +1768,25 @@ impl StandardExecutionService {
             .map(|s| s.to_string())
             .unwrap_or(security_context_name);
 
+        // ADR-092 D7: Validate structured input against agent's declared input_schema.
+        // The `intent` field is excluded from schema validation — only `input.input` is checked.
+        if let Some(schema) = &agent.manifest.spec.input_schema {
+            let compiled = jsonschema::validator_for(schema).map_err(|e| {
+                ExecutionError::InvalidExecutionInput(format!("Agent input_schema is invalid: {e}"))
+            })?;
+            let errors: Vec<String> = compiled
+                .iter_errors(&input.input)
+                .map(|e| e.to_string())
+                .collect();
+            if !errors.is_empty() {
+                return Err(ExecutionError::InvalidExecutionInput(format!(
+                    "Input validation failed: {}",
+                    errors.join("; ")
+                ))
+                .into());
+            }
+        }
+
         // 1.5 Validate that all tools requested by the agent exist in the ToolRouter index (Safety & Polish)
         if let Some(router) = &self.tool_router {
             let available_tools = router.list_tools().await.map_err(|e| {
