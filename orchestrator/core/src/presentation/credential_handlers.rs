@@ -22,7 +22,7 @@
 //! | `/v1/secrets/*` | Operator \| Admin | — |
 //!
 //! No business logic lives here — all work is delegated to
-//! [`CredentialManagementService`] and [`SecretsManager`].
+//! `CredentialManagementService` and `SecretsManager`.
 
 use crate::domain::api_scope::ApiScope;
 use crate::domain::credential::{
@@ -120,7 +120,7 @@ fn require_operator_or_admin(
 pub struct StoreApiKeyRequest {
     pub provider: String,
     pub label: String,
-    /// "personal" | "team:<uuid>"
+    /// "personal" | "team:\<uuid\>"
     pub scope: Option<String>,
     /// The raw API key value — treated as sensitive
     pub value: String,
