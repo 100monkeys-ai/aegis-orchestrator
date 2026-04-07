@@ -3,6 +3,7 @@
 //! Intent-to-execution pipeline tool handlers (ADR-087).
 
 use super::*;
+use std::time::Instant;
 
 impl ToolInvocationService {
     /// Handle `aegis.execute.intent` — start the intent-to-execution pipeline.
@@ -90,7 +91,21 @@ impl ToolInvocationService {
             }
         };
 
-        match start_use_case
+        // Metric labels — captured here where tenant_id and language are in scope.
+        let tenant_id_label = tenant_id.as_str().to_string();
+        let language_label = format!("{lang:?}").to_lowercase();
+
+        // ADR-087 §Observability: increment pipeline starts counter.
+        metrics::counter!(
+            "zaru_intent_pipeline_starts_total",
+            "tenant_id" => tenant_id_label.clone(),
+            "language" => language_label.clone()
+        )
+        .increment(1);
+
+        let pipeline_start = Instant::now();
+
+        let result = start_use_case
             .start_execution(
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: "builtin-intent-to-execution".to_string(),
@@ -102,8 +117,20 @@ impl ToolInvocationService {
                     intent: Some(intent.to_string()),
                 },
             )
-            .await
-        {
+            .await;
+
+        // ADR-087 §Observability: record pipeline start latency with outcome label.
+        let elapsed = pipeline_start.elapsed().as_secs_f64();
+        let outcome = if result.is_ok() { "success" } else { "failed" };
+        metrics::histogram!(
+            "zaru_intent_pipeline_duration_seconds",
+            "tenant_id" => tenant_id_label,
+            "language" => language_label,
+            "outcome" => outcome
+        )
+        .record(elapsed);
+
+        match result {
             Ok(started) => Ok(ToolInvocationResult::Direct(serde_json::json!({
                 "tool": "aegis.execute.intent",
                 "pipeline_execution_id": started.execution_id,
