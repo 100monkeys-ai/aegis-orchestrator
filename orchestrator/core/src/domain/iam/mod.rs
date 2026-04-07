@@ -25,6 +25,9 @@
 //! - SEAL agent attestation (Ed25519 ephemeral keypair) is **unchanged** by ADR-041.
 //!   OIDC is for human and service-account identities only.
 
+pub mod delegation;
+pub use delegation::resolve_effective_tenant;
+
 use crate::domain::tenant::TenantId;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};

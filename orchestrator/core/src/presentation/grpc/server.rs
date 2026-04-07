@@ -24,7 +24,7 @@ use crate::application::volume_manager::VolumeService;
 use crate::domain::agent::AgentId;
 use crate::domain::discovery::DiscoveryQuery;
 use crate::domain::execution::{Execution, ExecutionInput, ExecutionStatus};
-use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+use crate::domain::iam::{resolve_effective_tenant, IdentityKind, UserIdentity, ZaruTier};
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::{StorageClass, VolumeBackend, VolumeOwnership};
 
@@ -94,26 +94,17 @@ impl AegisRuntimeService {
     /// Resolve the effective tenant for a gRPC request, honoring the
     /// `x-tenant-id` metadata key when the caller is a service account.
     ///
-    /// Mirrors the HTTP `tenant_id_from_request` logic (ADR-100).
+    /// Delegates to the canonical domain-layer gate [`resolve_effective_tenant`]
+    /// (ADR-100).
     fn tenant_id_from_request<T>(
         identity: Option<&UserIdentity>,
         request: &Request<T>,
     ) -> TenantId {
-        match identity.map(|id| &id.identity_kind) {
-            Some(IdentityKind::ServiceAccount { .. }) => {
-                let delegation = request
-                    .metadata()
-                    .get("x-tenant-id")
-                    .and_then(|v| v.to_str().ok())
-                    .filter(|s| !s.is_empty());
-                if let Some(t) = delegation {
-                    TenantId::from_realm_slug(t).unwrap_or_else(|_| TenantId::system())
-                } else {
-                    TenantId::system()
-                }
-            }
-            _ => Self::tenant_id_from_identity(identity),
-        }
+        let delegation = request
+            .metadata()
+            .get("x-tenant-id")
+            .and_then(|v| v.to_str().ok());
+        resolve_effective_tenant(identity, delegation)
     }
 
     fn zaru_tier_from_identity(identity: Option<&UserIdentity>) -> ZaruTier {
@@ -942,10 +933,13 @@ impl AegisRuntime for AegisRuntimeService {
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchAgents")
             .await?;
         let (identity, tenant_id, scope_guard) = match auth {
-            Some((id, tid, sg)) => (Some(id), tid, sg),
+            Some((id, _tid, sg)) => {
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                (Some(id), effective_tid, sg)
+            }
             None => (
                 None,
-                Self::tenant_id_from_identity(None),
+                Self::tenant_id_from_request(None, &request),
                 ScopeGuard::default(),
             ),
         };
@@ -1021,10 +1015,13 @@ impl AegisRuntime for AegisRuntimeService {
             .authorize(&request, "/aegis.v1.AegisRuntime/SearchWorkflows")
             .await?;
         let (identity, tenant_id, scope_guard) = match auth {
-            Some((id, tid, sg)) => (Some(id), tid, sg),
+            Some((id, _tid, sg)) => {
+                let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
+                (Some(id), effective_tid, sg)
+            }
             None => (
                 None,
-                Self::tenant_id_from_identity(None),
+                Self::tenant_id_from_request(None, &request),
                 ScopeGuard::default(),
             ),
         };
