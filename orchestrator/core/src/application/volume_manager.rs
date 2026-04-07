@@ -31,6 +31,7 @@
 use crate::domain::agent::VolumeSpec;
 use crate::domain::events::VolumeEvent;
 use crate::domain::execution::ExecutionId;
+use crate::domain::iam::ZaruTier;
 use crate::domain::repository::VolumeRepository;
 use crate::domain::runtime::InstanceId;
 use crate::domain::storage::StorageProvider;
@@ -45,6 +46,19 @@ use chrono::Utc;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
+
+// ============================================================================
+// Commands
+// ============================================================================
+
+/// Command to create a user-owned persistent volume (Gap 079-2)
+pub struct CreateUserVolumeCommand {
+    pub tenant_id: TenantId,
+    pub owner_user_id: String,
+    pub label: String,
+    pub size_limit_bytes: u64,
+    pub zaru_tier: ZaruTier,
+}
 
 // ============================================================================
 // Service Trait

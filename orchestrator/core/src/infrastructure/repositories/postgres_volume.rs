@@ -211,6 +211,82 @@ impl VolumeRepository for PostgresVolumeRepository {
 
         Ok(())
     }
+
+    async fn find_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<Vec<Volume>, RepositoryError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                id, name, tenant_id, storage_class, backend,
+                size_limit_bytes, status, ownership,
+                created_at, attached_at, detached_at, expires_at
+            FROM volumes
+            WHERE tenant_id = $1
+              AND owner_user_id = $2
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(owner_user_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let mut volumes = Vec::new();
+        for row in rows {
+            volumes.push(parse_volume_row(row)?);
+        }
+        Ok(volumes)
+    }
+
+    async fn count_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<u32, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COUNT(*)::BIGINT AS cnt
+            FROM volumes
+            WHERE tenant_id = $1
+              AND owner_user_id = $2
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(owner_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let count: i64 = row.get("cnt");
+        Ok(count as u32)
+    }
+
+    async fn sum_size_by_owner(
+        &self,
+        tenant_id: &TenantId,
+        owner_user_id: &str,
+    ) -> Result<u64, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT COALESCE(SUM(size_limit_bytes), 0)::BIGINT AS total
+            FROM volumes
+            WHERE tenant_id = $1
+              AND owner_user_id = $2
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(owner_user_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        let total: i64 = row.get("total");
+        Ok(total as u64)
+    }
 }
 
 /// Parse a volume from a database row

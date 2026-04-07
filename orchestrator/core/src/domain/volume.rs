@@ -29,6 +29,7 @@
 
 pub use crate::domain::shared_kernel::{TenantId, VolumeId};
 
+use crate::domain::iam::ZaruTier;
 use crate::domain::shared_kernel::ExecutionId;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
@@ -260,6 +261,74 @@ impl VolumeMount {
             filer_endpoint,
             remote_path,
         }
+    }
+}
+
+/// Per-tier storage quota limits
+#[derive(Debug, Clone, PartialEq)]
+pub struct TierStorageLimit {
+    pub max_volumes: u32,
+    pub total_storage_bytes: u64,
+    pub max_file_size_bytes: u64,
+}
+
+/// Storage limits indexed by ZaruTier
+#[derive(Debug, Clone)]
+pub struct StorageTierLimits {
+    pub limits: std::collections::HashMap<ZaruTier, TierStorageLimit>,
+}
+
+impl Default for StorageTierLimits {
+    fn default() -> Self {
+        let mut limits = std::collections::HashMap::new();
+        limits.insert(
+            ZaruTier::Free,
+            TierStorageLimit {
+                max_volumes: 2,
+                total_storage_bytes: 500 * 1024 * 1024,
+                max_file_size_bytes: 50 * 1024 * 1024,
+            },
+        );
+        limits.insert(
+            ZaruTier::Pro,
+            TierStorageLimit {
+                max_volumes: 10,
+                total_storage_bytes: 10 * 1024 * 1024 * 1024,
+                max_file_size_bytes: 500 * 1024 * 1024,
+            },
+        );
+        limits.insert(
+            ZaruTier::Business,
+            TierStorageLimit {
+                max_volumes: 50,
+                total_storage_bytes: 100 * 1024 * 1024 * 1024,
+                max_file_size_bytes: 2 * 1024 * 1024 * 1024,
+            },
+        );
+        limits.insert(
+            ZaruTier::Enterprise,
+            TierStorageLimit {
+                max_volumes: u32::MAX,
+                total_storage_bytes: u64::MAX,
+                max_file_size_bytes: u64::MAX,
+            },
+        );
+        Self { limits }
+    }
+}
+
+/// Current quota consumption for a user within a tenant
+#[derive(Debug, Clone)]
+pub struct QuotaUsage {
+    pub volume_count: u32,
+    pub total_bytes_used: u64,
+    pub tier_limit: TierStorageLimit,
+}
+
+impl QuotaUsage {
+    pub fn is_at_limit(&self) -> bool {
+        self.volume_count >= self.tier_limit.max_volumes
+            || self.total_bytes_used >= self.tier_limit.total_storage_bytes
     }
 }
 

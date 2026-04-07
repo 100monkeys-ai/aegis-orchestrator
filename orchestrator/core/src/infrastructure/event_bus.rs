@@ -211,7 +211,11 @@ impl DomainEvent {
                 | VolumeEvent::VolumeDeleted { .. }
                 | VolumeEvent::VolumeExpired { .. }
                 | VolumeEvent::VolumeMountFailed { .. }
-                | VolumeEvent::VolumeQuotaExceeded { .. } => None,
+                | VolumeEvent::VolumeQuotaExceeded { .. }
+                | VolumeEvent::UserVolumeCreated { .. }
+                | VolumeEvent::UserVolumeRenamed { .. }
+                | VolumeEvent::UserVolumeDeleted { .. }
+                | VolumeEvent::UserVolumeQuotaWarning { .. } => None,
             },
             DomainEvent::Storage(event) => Some(match event {
                 StorageEvent::FileOpened { execution_id, .. }
@@ -444,6 +448,10 @@ impl DomainEvent {
                 VolumeEvent::VolumeExpired { expired_at, .. } => *expired_at,
                 VolumeEvent::VolumeMountFailed { failed_at, .. } => *failed_at,
                 VolumeEvent::VolumeQuotaExceeded { exceeded_at, .. } => *exceeded_at,
+                VolumeEvent::UserVolumeCreated { created_at, .. } => *created_at,
+                VolumeEvent::UserVolumeRenamed { renamed_at, .. } => *renamed_at,
+                VolumeEvent::UserVolumeDeleted { deleted_at, .. } => *deleted_at,
+                VolumeEvent::UserVolumeQuotaWarning { warned_at, .. } => *warned_at,
             },
             DomainEvent::Storage(event) => match event {
                 StorageEvent::FileOpened { opened_at, .. } => *opened_at,
@@ -635,6 +643,10 @@ impl DomainEvent {
                 VolumeEvent::VolumeExpired { .. } => "volume_expired",
                 VolumeEvent::VolumeMountFailed { .. } => "volume_mount_failed",
                 VolumeEvent::VolumeQuotaExceeded { .. } => "volume_quota_exceeded",
+                VolumeEvent::UserVolumeCreated { .. } => "user_volume_created",
+                VolumeEvent::UserVolumeRenamed { .. } => "user_volume_renamed",
+                VolumeEvent::UserVolumeDeleted { .. } => "user_volume_deleted",
+                VolumeEvent::UserVolumeQuotaWarning { .. } => "user_volume_quota_warning",
             },
             DomainEvent::Storage(event) => match event {
                 StorageEvent::FileOpened { .. } => "file_opened",

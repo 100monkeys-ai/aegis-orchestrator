@@ -1352,6 +1352,55 @@ impl crate::domain::repository::VolumeRepository for InMemoryVolumeRepository {
         volumes.remove(&id);
         Ok(())
     }
+
+    async fn find_by_owner(
+        &self,
+        tenant_id: &crate::domain::volume::TenantId,
+        owner_user_id: &str,
+    ) -> Result<Vec<crate::domain::volume::Volume>, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        Ok(volumes
+            .values()
+            .filter(|v| {
+                v.tenant_id == *tenant_id
+                    && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn count_by_owner(
+        &self,
+        tenant_id: &crate::domain::volume::TenantId,
+        owner_user_id: &str,
+    ) -> Result<u32, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        let count = volumes
+            .values()
+            .filter(|v| {
+                v.tenant_id == *tenant_id
+                    && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
+            })
+            .count();
+        Ok(count as u32)
+    }
+
+    async fn sum_size_by_owner(
+        &self,
+        tenant_id: &crate::domain::volume::TenantId,
+        owner_user_id: &str,
+    ) -> Result<u64, RepositoryError> {
+        let volumes = self.volumes.read().unwrap();
+        let total = volumes
+            .values()
+            .filter(|v| {
+                v.tenant_id == *tenant_id
+                    && matches!(&v.ownership, crate::domain::volume::VolumeOwnership::Persistent { owner } if owner == owner_user_id)
+            })
+            .map(|v| v.size_limit_bytes)
+            .sum();
+        Ok(total)
+    }
 }
 
 #[cfg(test)]

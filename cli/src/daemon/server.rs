@@ -679,7 +679,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let nfs_gateway = Arc::new(
         aegis_orchestrator_core::application::nfs_gateway::NfsGatewayService::new(
             storage_provider.clone(),
-            volume_repo,
+            volume_repo.clone(),
             event_publisher,
             Some(nfs_bind_port),
         ),
@@ -1484,6 +1484,22 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     };
 
+    // Initialize user volume service and file operations service (Gap 079)
+    let user_volume_service = Arc::new(
+        aegis_orchestrator_core::application::user_volume_service::UserVolumeService::new(
+            volume_repo.clone(),
+            volume_service.clone(),
+            event_bus.clone(),
+            aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
+        ),
+    );
+
+    let file_operations_service = Arc::new(
+        aegis_orchestrator_core::application::file_operations_service::FileOperationsService::new(
+            nfs_gateway.fsal().clone(),
+        ),
+    );
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1526,6 +1542,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 ),
             ) as Arc<dyn aegis_orchestrator_core::domain::iam::RealmRepository>
         }),
+        user_volume_service,
+        file_operations_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
     };
