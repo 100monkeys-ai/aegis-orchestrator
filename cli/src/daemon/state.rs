@@ -87,12 +87,14 @@ pub(crate) struct AppState {
     pub(crate) start_time: std::time::Instant,
 }
 
-/// Enable webhook HMAC authentication via Axum extractor pulling state from [`AppState`].
+/// Enable webhook HMAC authentication via Axum extractor pulling state from [`Arc<AppState>`].
 ///
-/// Axum provides a blanket `impl<S> FromRef<Arc<S>> for T where T: FromRef<S>`, so
-/// implementing `FromRef<AppState>` is sufficient — the `Arc` unwrapping is automatic.
-impl FromRef<AppState> for WebhookHmacState {
-    fn from_ref(state: &AppState) -> Self {
+/// The router uses `State<Arc<AppState>>`, so axum's `FromRef` machinery resolves against
+/// `Arc<AppState>`. Axum 0.8 does NOT provide a blanket `FromRef<Arc<S>>` impl, so we must
+/// implement `FromRef<Arc<AppState>>` directly. The orphan rule is satisfied because
+/// `AppState` is defined in this crate.
+impl FromRef<Arc<AppState>> for WebhookHmacState {
+    fn from_ref(state: &Arc<AppState>) -> Self {
         WebhookHmacState {
             secret_provider: state.webhook_secret_provider.clone(),
         }
