@@ -27,6 +27,7 @@
 //! | [`TenantEvent`] | Multi-Tenant | Tenant lifecycle, audit, and quota events (ADR-056) |
 //! | [`RateLimitEvent`] | Cross-cutting (ADR-072) | Rate limit rejection and warning threshold events |
 //! | [`SwarmEvent`] | BC-6 Swarm Coordination | Swarm lifecycle, child spawning, lock, and broadcast events (ADR-039) |
+//! | [`CredentialEvent`] | BC-11 Secrets & Identity | Credential binding lifecycle, grant, rotation, and access audit (ADR-078) |
 //!
 //! ## Phase 2 Note
 //!
@@ -34,6 +35,9 @@
 //! event replay and external consumers (Kafka, NATS) are planned for Phase 2 per ADR-030.
 
 use crate::domain::agent::{AgentManifest, AgentScope};
+use crate::domain::credential::{
+    CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialType, GrantTarget,
+};
 use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
@@ -1288,6 +1292,60 @@ pub enum SwarmEvent {
         swarm_id: uuid::Uuid,
         from: AgentId,
         recipient_count: usize,
+    },
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BC-11 Credential Binding Events  (ADR-078)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Domain events for the Credential Binding bounded context (BC-11, ADR-078).
+///
+/// Published by the credential application service for every significant state
+/// change on a [`crate::domain::credential::UserCredentialBinding`] aggregate.
+/// Consumed by:
+/// - Cortex for credential usage pattern learning
+/// - Zaru client for the credential management dashboard
+/// - SOC 2 audit trail export (Phase 2)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CredentialEvent {
+    /// A new credential binding was created and stored in OpenBao.
+    CredentialCreated {
+        binding_id: CredentialBindingId,
+        owner_user_id: String,
+        tenant_id: TenantId,
+        provider: CredentialProvider,
+        credential_type: CredentialType,
+    },
+    /// A credential binding was explicitly revoked; all grants are cleared.
+    CredentialRevoked {
+        binding_id: CredentialBindingId,
+        tenant_id: TenantId,
+    },
+    /// The underlying secret value was rotated in OpenBao; the binding id is
+    /// stable but the secret path leaf has been updated.
+    CredentialRotated {
+        binding_id: CredentialBindingId,
+        tenant_id: TenantId,
+    },
+    /// A new grant was added, allowing `target` to use the binding.
+    CredentialGranted {
+        binding_id: CredentialBindingId,
+        grant_id: CredentialGrantId,
+        target: GrantTarget,
+        granted_by: String,
+    },
+    /// An existing grant was revoked, revoking `target`'s access.
+    CredentialGrantRevoked {
+        binding_id: CredentialBindingId,
+        grant_id: CredentialGrantId,
+    },
+    /// An agent successfully retrieved the credential value for use in an
+    /// execution — emitted for access audit and Cortex learning.
+    CredentialAccessed {
+        binding_id: CredentialBindingId,
+        agent_id: AgentId,
+        tenant_id: TenantId,
     },
 }
 
