@@ -506,13 +506,17 @@ pub(crate) async fn update_agent_scope_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    headers: HeaderMap,
     Path(agent_id): Path<Uuid>,
     Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("agent:deploy")?;
     use aegis_orchestrator_core::application::agent_scope::AgentScopeChangeError;
 
-    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+    let delegation = headers
+        .get(TENANT_DELEGATION_HEADER)
+        .and_then(|v| v.to_str().ok());
+    let tenant_id = tenant_id_from_request(identity.as_ref().map(|e| &e.0), delegation);
     let user_id = identity
         .as_ref()
         .map(|ext| ext.0.sub.clone())
