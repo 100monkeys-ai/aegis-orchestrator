@@ -337,6 +337,16 @@ pub trait SecretStore: Send + Sync {
         let _ = name;
         Ok(())
     }
+
+    /// Delete a secret at `engine/path` from the KV store.
+    ///
+    /// Default implementation is a no-op so that test and dev stores do not need
+    /// to implement deletion logic. The production `OpenBaoSecretStore` overrides
+    /// this to issue the appropriate KV delete API call.
+    async fn delete(&self, engine: &str, path: &str) -> Result<(), SecretsError> {
+        let _ = (engine, path);
+        Ok(())
+    }
 }
 
 impl DomainDynamicSecret {

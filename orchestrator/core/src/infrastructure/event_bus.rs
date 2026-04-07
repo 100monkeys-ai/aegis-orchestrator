@@ -64,10 +64,10 @@
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
-    AgentLifecycleEvent, ContainerRunEvent, ExecutionEvent, IamEvent, ImageManagementEvent,
-    LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SealEvent, SecretEvent,
-    StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent, VolumeEvent,
-    WorkflowEvent,
+    AgentLifecycleEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent, IamEvent,
+    ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SealEvent,
+    SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent,
+    VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
 use chrono::{DateTime, Utc};
@@ -96,6 +96,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::Cluster(_) => "cluster",
         DomainEvent::RateLimit(_) => "rate_limit",
         DomainEvent::Swarm(_) => "swarm",
+        DomainEvent::Credential(_) => "credential",
     }
 }
 
@@ -131,6 +132,8 @@ pub enum DomainEvent {
     RateLimit(RateLimitEvent),
     /// BC-6 Swarm Coordination events (ADR-039)
     Swarm(SwarmEvent),
+    /// BC-11 Credential binding lifecycle events (ADR-078)
+    Credential(CredentialEvent),
 }
 
 impl DomainEvent {
@@ -140,7 +143,8 @@ impl DomainEvent {
             | DomainEvent::Stimulus(_)
             | DomainEvent::Iam(_)
             | DomainEvent::Tenant(_)
-            | DomainEvent::RateLimit(_) => None,
+            | DomainEvent::RateLimit(_)
+            | DomainEvent::Credential(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -359,7 +363,8 @@ impl DomainEvent {
             DomainEvent::ContainerRun(_)
             | DomainEvent::Cluster(_)
             | DomainEvent::RateLimit(_)
-            | DomainEvent::Swarm(_) => None,
+            | DomainEvent::Swarm(_)
+            | DomainEvent::Credential(_) => None,
         }
     }
 
@@ -546,6 +551,7 @@ impl DomainEvent {
                 | SwarmEvent::LockReleased { .. }
                 | SwarmEvent::MessageBroadcast { .. } => Utc::now(),
             },
+            DomainEvent::Credential(_) => Utc::now(),
         }
     }
 
@@ -728,6 +734,14 @@ impl DomainEvent {
                 SwarmEvent::LockReleased { .. } => "swarm_lock_released",
                 SwarmEvent::MessageBroadcast { .. } => "swarm_message_broadcast",
             },
+            DomainEvent::Credential(event) => match event {
+                CredentialEvent::CredentialCreated { .. } => "credential_created",
+                CredentialEvent::CredentialRevoked { .. } => "credential_revoked",
+                CredentialEvent::CredentialRotated { .. } => "credential_rotated",
+                CredentialEvent::CredentialGranted { .. } => "credential_granted",
+                CredentialEvent::CredentialGrantRevoked { .. } => "credential_grant_revoked",
+                CredentialEvent::CredentialAccessed { .. } => "credential_accessed",
+            },
         }
     }
 
@@ -751,6 +765,7 @@ impl DomainEvent {
             DomainEvent::Cluster(_) => "cluster",
             DomainEvent::RateLimit(_) => "rate_limit",
             DomainEvent::Swarm(_) => "swarm",
+            DomainEvent::Credential(_) => "credential",
         }
     }
 
@@ -853,6 +868,7 @@ impl DomainEvent {
             DomainEvent::Cluster(_) => Some("cluster"),
             DomainEvent::RateLimit(_) => Some("rate_limit"),
             DomainEvent::Swarm(_) => Some("swarm"),
+            DomainEvent::Credential(_) => Some("credential"),
         }
     }
 }
@@ -976,6 +992,11 @@ impl EventBus {
     /// Publish a swarm coordination event (BC-6 ADR-039)
     pub fn publish_swarm_event(&self, event: SwarmEvent) {
         self.publish(DomainEvent::Swarm(event));
+    }
+
+    /// Publish a credential binding lifecycle event (BC-11 ADR-078)
+    pub fn publish_credential_event(&self, event: CredentialEvent) {
+        self.publish(DomainEvent::Credential(event));
     }
 
     /// Publish a domain event to all subscribers
