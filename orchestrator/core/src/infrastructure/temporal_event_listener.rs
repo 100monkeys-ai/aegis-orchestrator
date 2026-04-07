@@ -62,7 +62,9 @@ use crate::application::complete_workflow_execution::{
 use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason, WorkflowEvent};
 use crate::domain::execution::ExecutionId;
 use crate::domain::repository::WorkflowExecutionRepository;
-use crate::domain::workflow::WorkflowId;
+use crate::domain::shared_kernel::VolumeId;
+use crate::domain::tenant::TenantId;
+use crate::domain::workflow::{ExecutionLanguage, WorkflowId};
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
@@ -182,6 +184,42 @@ pub struct TemporalEventPayload {
     /// Number of failed steps (ParallelContainerRun aggregated events)
     #[serde(default)]
     pub failed: Option<u32>,
+
+    /// Tenant ID (IntentExecutionPipeline events — ADR-087)
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+
+    /// Inner workflow execution ID (IntentExecutionPipeline events — ADR-087)
+    #[serde(default)]
+    pub workflow_execution_id: Option<String>,
+
+    /// Intent text (IntentExecutionPipelineStarted — ADR-087)
+    #[serde(default)]
+    pub intent: Option<String>,
+
+    /// Execution language string (IntentExecutionPipelineStarted — ADR-087)
+    #[serde(default)]
+    pub language: Option<String>,
+
+    /// Workspace volume ID (IntentExecutionPipelineStarted — ADR-087)
+    #[serde(default)]
+    pub workspace_volume_id: Option<String>,
+
+    /// Final result text (IntentExecutionPipelineCompleted — ADR-087)
+    #[serde(default)]
+    pub final_result: Option<String>,
+
+    /// Whether an existing agent was reused (IntentExecutionPipelineCompleted — ADR-087)
+    #[serde(default)]
+    pub reused_existing_agent: Option<bool>,
+
+    /// Similarity score of the reused agent (IntentExecutionPipelineCompleted — ADR-087)
+    #[serde(default)]
+    pub agent_similarity_score: Option<f32>,
+
+    /// FSM state name where the pipeline failed (IntentExecutionPipelineFailed — ADR-087)
+    #[serde(default)]
+    pub failed_at_state: Option<String>,
 
     /// Event timestamp
     pub timestamp: String,
@@ -421,6 +459,93 @@ impl TemporalEventMapper {
                 Ok(WorkflowEvent::SubworkflowFailed {
                     parent_execution_id,
                     child_execution_id,
+                    reason,
+                    failed_at: timestamp,
+                })
+            }
+
+            "IntentExecutionPipelineStarted" => {
+                let pipeline_execution_id = execution_id;
+                let workflow_execution_id = ExecutionId(Uuid::parse_str(
+                    payload.workflow_execution_id.as_deref().ok_or_else(|| {
+                        anyhow!("IntentExecutionPipelineStarted missing workflow_execution_id")
+                    })?,
+                )?);
+                let intent = payload
+                    .intent
+                    .clone()
+                    .ok_or_else(|| anyhow!("IntentExecutionPipelineStarted missing intent"))?;
+                let language: ExecutionLanguage = payload
+                    .language
+                    .as_deref()
+                    .map(|l| serde_json::from_value(serde_json::json!(l)).unwrap_or_default())
+                    .unwrap_or_default();
+                let workspace_volume_id =
+                    VolumeId::from_string(payload.workspace_volume_id.as_deref().ok_or_else(
+                        || anyhow!("IntentExecutionPipelineStarted missing workspace_volume_id"),
+                    )?)
+                    .context("IntentExecutionPipelineStarted: invalid workspace_volume_id UUID")?;
+
+                Ok(WorkflowEvent::IntentExecutionPipelineStarted {
+                    pipeline_execution_id,
+                    workflow_execution_id,
+                    intent,
+                    language,
+                    workspace_volume_id,
+                    started_at: timestamp,
+                })
+            }
+
+            "IntentExecutionPipelineCompleted" => {
+                let pipeline_execution_id = execution_id;
+                let workflow_execution_id = ExecutionId(Uuid::parse_str(
+                    payload.workflow_execution_id.as_deref().ok_or_else(|| {
+                        anyhow!("IntentExecutionPipelineCompleted missing workflow_execution_id")
+                    })?,
+                )?);
+                let tenant_id =
+                    TenantId::from_string(payload.tenant_id.as_deref().ok_or_else(|| {
+                        anyhow!("IntentExecutionPipelineCompleted missing tenant_id")
+                    })?)
+                    .context("IntentExecutionPipelineCompleted: invalid tenant_id")?;
+                let final_result = payload.final_result.clone().unwrap_or_default();
+                let duration_ms = payload.duration_ms.unwrap_or(0);
+                let reused_existing_agent = payload.reused_existing_agent.unwrap_or(false);
+                let agent_similarity_score = payload.agent_similarity_score;
+
+                Ok(WorkflowEvent::IntentExecutionPipelineCompleted {
+                    pipeline_execution_id,
+                    workflow_execution_id,
+                    tenant_id,
+                    final_result,
+                    duration_ms,
+                    reused_existing_agent,
+                    agent_similarity_score,
+                    completed_at: timestamp,
+                })
+            }
+
+            "IntentExecutionPipelineFailed" => {
+                let pipeline_execution_id = execution_id;
+                let workflow_execution_id = ExecutionId(Uuid::parse_str(
+                    payload.workflow_execution_id.as_deref().ok_or_else(|| {
+                        anyhow!("IntentExecutionPipelineFailed missing workflow_execution_id")
+                    })?,
+                )?);
+                let failed_at_state = payload
+                    .failed_at_state
+                    .clone()
+                    .or_else(|| payload.state_name.clone())
+                    .unwrap_or_default();
+                let reason = payload
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Unknown pipeline failure".to_string());
+
+                Ok(WorkflowEvent::IntentExecutionPipelineFailed {
+                    pipeline_execution_id,
+                    workflow_execution_id,
+                    failed_at_state,
                     reason,
                     failed_at: timestamp,
                 })
@@ -957,6 +1082,75 @@ mod tests {
 
         let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
         assert!(err.to_string().contains("output required"));
+    }
+
+    /// Regression: IntentExecutionPipelineCompleted must carry a non-empty tenant_id so
+    /// the zaru_intent_pipeline_agent_cache_hits_total metric label is meaningful.
+    #[test]
+    fn test_map_intent_execution_pipeline_completed_carries_tenant_id() {
+        let pipeline_exec_id = "550e8400-e29b-41d4-a716-446655440001";
+        let workflow_exec_id = "550e8400-e29b-41d4-a716-446655440002";
+
+        let payload = TemporalEventPayload {
+            event_type: "IntentExecutionPipelineCompleted".to_string(),
+            execution_id: pipeline_exec_id.to_string(),
+            temporal_sequence_number: 42,
+            timestamp: "2026-04-06T10:00:00Z".to_string(),
+            workflow_execution_id: Some(workflow_exec_id.to_string()),
+            tenant_id: Some("acme-corp".to_string()),
+            final_result: Some("print('hello')".to_string()),
+            duration_ms: Some(1234),
+            reused_existing_agent: Some(true),
+            agent_similarity_score: Some(0.95),
+            ..Default::default()
+        };
+
+        let event = TemporalEventMapper::to_domain_event(&payload).unwrap();
+        let WorkflowEvent::IntentExecutionPipelineCompleted {
+            pipeline_execution_id,
+            workflow_execution_id,
+            tenant_id,
+            final_result,
+            duration_ms,
+            reused_existing_agent,
+            agent_similarity_score,
+            ..
+        } = event
+        else {
+            panic!("Expected IntentExecutionPipelineCompleted, got a different variant");
+        };
+
+        assert_eq!(pipeline_execution_id.0.to_string(), pipeline_exec_id);
+        assert_eq!(workflow_execution_id.0.to_string(), workflow_exec_id);
+        assert_eq!(tenant_id.as_str(), "acme-corp");
+        assert!(
+            !tenant_id.as_str().is_empty(),
+            "tenant_id must not be empty"
+        );
+        assert_eq!(final_result, "print('hello')");
+        assert_eq!(duration_ms, 1234);
+        assert!(reused_existing_agent);
+        assert_eq!(agent_similarity_score, Some(0.95));
+    }
+
+    /// Regression: IntentExecutionPipelineCompleted without tenant_id must fail mapping.
+    #[test]
+    fn test_map_intent_execution_pipeline_completed_requires_tenant_id() {
+        let payload = TemporalEventPayload {
+            event_type: "IntentExecutionPipelineCompleted".to_string(),
+            execution_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            temporal_sequence_number: 43,
+            timestamp: "2026-04-06T10:00:00Z".to_string(),
+            workflow_execution_id: Some("550e8400-e29b-41d4-a716-446655440002".to_string()),
+            tenant_id: None,
+            ..Default::default()
+        };
+
+        let err = TemporalEventMapper::to_domain_event(&payload).unwrap_err();
+        assert!(
+            err.to_string().contains("tenant_id"),
+            "Error should mention missing tenant_id, got: {err}"
+        );
     }
 
     struct FailingAppendRepo;

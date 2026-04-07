@@ -892,17 +892,16 @@ impl EventBus {
     /// Publish a workflow event
     pub fn publish_workflow_event(&self, event: WorkflowEvent) {
         // ADR-087 §Observability: record agent cache hit when the pipeline reused an
-        // existing agent. The domain event does not carry tenant_id at this layer, so
-        // the label is left empty; per-tenant breakdown requires adding tenant_id to
-        // IntentExecutionPipelineCompleted in a future iteration.
+        // existing agent. Use the tenant_id carried on the event for per-tenant breakdown.
         if let WorkflowEvent::IntentExecutionPipelineCompleted {
             reused_existing_agent: true,
+            tenant_id,
             ..
         } = &event
         {
             metrics::counter!(
                 "zaru_intent_pipeline_agent_cache_hits_total",
-                "tenant_id" => ""
+                "tenant_id" => tenant_id.as_str().to_owned()
             )
             .increment(1);
         }
@@ -1570,5 +1569,41 @@ mod tests {
         assert_eq!(secret.agent_id(), Some(agent_id));
         assert_eq!(secret.category(), "secrets");
         assert_eq!(secret.stage(), Some("secrets"));
+    }
+
+    /// Regression: IntentExecutionPipelineCompleted must carry a non-empty tenant_id so that
+    /// the zaru_intent_pipeline_agent_cache_hits_total metric label is meaningful rather than
+    /// an empty string.
+    #[test]
+    fn test_intent_execution_pipeline_completed_has_tenant_id() {
+        let execution_id = crate::domain::execution::ExecutionId::new();
+        let tenant_id = crate::domain::tenant::TenantId::from_string("acme-corp").unwrap();
+
+        let event = WorkflowEvent::IntentExecutionPipelineCompleted {
+            pipeline_execution_id: execution_id,
+            workflow_execution_id: execution_id,
+            tenant_id: tenant_id.clone(),
+            final_result: "done".to_string(),
+            duration_ms: 500,
+            reused_existing_agent: true,
+            agent_similarity_score: Some(0.9),
+            completed_at: Utc::now(),
+        };
+
+        let WorkflowEvent::IntentExecutionPipelineCompleted {
+            tenant_id: extracted,
+            reused_existing_agent,
+            ..
+        } = &event
+        else {
+            panic!("Wrong variant");
+        };
+
+        assert_eq!(extracted.as_str(), "acme-corp");
+        assert!(
+            !extracted.as_str().is_empty(),
+            "tenant_id label must not be empty"
+        );
+        assert!(reused_existing_agent);
     }
 }
