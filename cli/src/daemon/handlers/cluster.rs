@@ -9,7 +9,7 @@ use axum::Json;
 
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
-use crate::daemon::cluster_helpers::{cluster_status_view, load_cluster_nodes, ClusterStatusView};
+use crate::daemon::cluster_helpers::{cluster_status_view, load_cluster_nodes};
 use crate::daemon::handlers::{bounded_limit, LimitQuery};
 use crate::daemon::state::AppState;
 

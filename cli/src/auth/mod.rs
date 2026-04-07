@@ -1,7 +1,7 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
 mod device_flow;
-mod env;
+pub(crate) mod env;
 mod profile;
 mod refresh;
 

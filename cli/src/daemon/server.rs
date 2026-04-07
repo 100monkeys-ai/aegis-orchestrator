@@ -471,7 +471,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
             bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
             socket_path: config.spec.runtime.container_socket_path.clone(),
-            network_mode,
+            network_mode: network_mode.clone(),
             orchestrator_url,
             nfs_server_host: nfs_server_host.clone(),
             nfs_port: config.spec.runtime.nfs_port,

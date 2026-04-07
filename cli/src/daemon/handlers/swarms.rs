@@ -5,7 +5,6 @@
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::Json;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
