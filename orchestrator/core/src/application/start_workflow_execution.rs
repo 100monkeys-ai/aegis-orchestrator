@@ -1204,8 +1204,8 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            err.to_string().contains("InvalidExecutionInput"),
-            "expected InvalidExecutionInput, got: {err}"
+            err.to_string().contains("Input validation failed"),
+            "expected input validation error, got: {err}"
         );
         // Temporal must not have been invoked
         assert!(

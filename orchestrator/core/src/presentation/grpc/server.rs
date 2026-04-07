@@ -255,14 +255,16 @@ impl AegisRuntime for AegisRuntimeService {
                 ScopeGuard::default(),
             ),
         };
-        scope_guard.require("agent:execute").map_err(|(_, body)| {
-            tonic::Status::permission_denied(
-                body.0
-                    .get("required")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("insufficient_scope"),
-            )
-        })?;
+        if identity.is_some() {
+            scope_guard.require("agent:execute").map_err(|(_, body)| {
+                tonic::Status::permission_denied(
+                    body.0
+                        .get("required")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("insufficient_scope"),
+                )
+            })?;
+        }
         let req = request.into_inner();
 
         // Parse agent_id — accept UUID or human-readable name (resolved via agent_service)
@@ -733,7 +735,7 @@ impl AegisRuntime for AegisRuntimeService {
         let auth = self
             .authorize(&request, "/aegis.v1.AegisRuntime/IngestStimulus")
             .await?;
-        let (_identity, tenant_id, scope_guard) = match auth {
+        let (identity, tenant_id, scope_guard) = match auth {
             Some((id, tid, sg)) => {
                 let effective_tid = Self::tenant_id_from_request(Some(&id), &request);
                 let final_tid = if matches!(
@@ -752,14 +754,16 @@ impl AegisRuntime for AegisRuntimeService {
                 ScopeGuard::default(),
             ),
         };
-        scope_guard.require("workflow:run").map_err(|(_, body)| {
-            tonic::Status::permission_denied(
-                body.0
-                    .get("required")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("insufficient_scope"),
-            )
-        })?;
+        if identity.is_some() {
+            scope_guard.require("workflow:run").map_err(|(_, body)| {
+                tonic::Status::permission_denied(
+                    body.0
+                        .get("required")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("insufficient_scope"),
+                )
+            })?;
+        }
         let req = request.into_inner();
         let (stimulus_id, workflow_execution_id) = self
             .ingest_stimulus_rpc(
@@ -938,14 +942,16 @@ impl AegisRuntime for AegisRuntimeService {
                 ScopeGuard::default(),
             ),
         };
-        scope_guard.require("agent:list").map_err(|(_, body)| {
-            tonic::Status::permission_denied(
-                body.0
-                    .get("required")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("insufficient_scope"),
-            )
-        })?;
+        if identity.is_some() {
+            scope_guard.require("agent:list").map_err(|(_, body)| {
+                tonic::Status::permission_denied(
+                    body.0
+                        .get("required")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("insufficient_scope"),
+                )
+            })?;
+        }
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(
@@ -1020,14 +1026,16 @@ impl AegisRuntime for AegisRuntimeService {
                 ScopeGuard::default(),
             ),
         };
-        scope_guard.require("workflow:list").map_err(|(_, body)| {
-            tonic::Status::permission_denied(
-                body.0
-                    .get("required")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("insufficient_scope"),
-            )
-        })?;
+        if identity.is_some() {
+            scope_guard.require("workflow:list").map_err(|(_, body)| {
+                tonic::Status::permission_denied(
+                    body.0
+                        .get("required")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("insufficient_scope"),
+                )
+            })?;
+        }
 
         let Some(ref discovery) = self.discovery_service else {
             return Err(Status::unavailable(
