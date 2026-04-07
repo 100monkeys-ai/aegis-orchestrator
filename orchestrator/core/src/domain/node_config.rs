@@ -1134,6 +1134,12 @@ pub struct ClusterConfig {
     /// Re-attest this many seconds before NodeSecurityToken expiry. Default: 120.
     #[serde(default = "default_token_refresh_margin")]
     pub token_refresh_margin_secs: u64,
+    /// Stale threshold in seconds for health sweeper (default: 90)
+    #[serde(default)]
+    pub stale_threshold_secs: Option<u64>,
+    /// Sweep interval in seconds for health sweeper (default: 30)
+    #[serde(default)]
+    pub sweep_interval_secs: Option<u64>,
     /// TLS configuration for NodeClusterService.
     pub tls: Option<ClusterTlsConfig>,
 }

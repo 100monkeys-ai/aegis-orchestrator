@@ -37,6 +37,16 @@ impl HealthSweeper {
         }
     }
 
+    /// Returns the configured stale threshold.
+    pub(crate) fn stale_threshold(&self) -> Duration {
+        self.stale_threshold
+    }
+
+    /// Returns the configured sweep interval.
+    pub(crate) fn sweep_interval(&self) -> Duration {
+        self.sweep_interval
+    }
+
     /// Default sweeper: stale after 90s (3x 30s heartbeat), sweep every 30s
     pub fn with_defaults(
         cluster_repo: Arc<dyn NodeClusterRepository>,
@@ -139,5 +149,79 @@ impl HealthSweeper {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::cluster::{NodeId, NodePeer, RegisteredNode, ResourceSnapshot};
+    use std::collections::HashMap;
+
+    /// Stub repository that panics on every method — only used to construct
+    /// a `HealthSweeper` without exercising the sweep loop.
+    struct StubClusterRepo;
+
+    #[async_trait::async_trait]
+    impl NodeClusterRepository for StubClusterRepo {
+        async fn upsert_peer(&self, _: &NodePeer) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn find_peer(&self, _: &NodeId) -> anyhow::Result<Option<NodePeer>> {
+            unimplemented!()
+        }
+        async fn list_peers_by_status(&self, _: NodePeerStatus) -> anyhow::Result<Vec<NodePeer>> {
+            unimplemented!()
+        }
+        async fn record_heartbeat(&self, _: &NodeId, _: ResourceSnapshot) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn mark_unhealthy(&self, _: &NodeId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn start_drain(&self, _: &NodeId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn deregister(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_config_version(&self, _: &NodeId) -> anyhow::Result<Option<String>> {
+            unimplemented!()
+        }
+        async fn record_config_version(&self, _: &NodeId, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn list_all_peers(&self) -> anyhow::Result<Vec<NodePeer>> {
+            unimplemented!()
+        }
+        async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
+            unimplemented!()
+        }
+        async fn find_registered_node(&self, _: &NodeId) -> anyhow::Result<Option<RegisteredNode>> {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn custom_thresholds_are_stored() {
+        let repo = Arc::new(StubClusterRepo);
+        let bus = Arc::new(EventBus::new(1));
+
+        let sweeper =
+            HealthSweeper::new(repo, bus, Duration::from_secs(120), Duration::from_secs(15));
+
+        assert_eq!(sweeper.stale_threshold(), Duration::from_secs(120));
+        assert_eq!(sweeper.sweep_interval(), Duration::from_secs(15));
+    }
+
+    #[test]
+    fn with_defaults_uses_90s_stale_and_30s_sweep() {
+        let repo = Arc::new(StubClusterRepo);
+        let bus = Arc::new(EventBus::new(1));
+
+        let sweeper = HealthSweeper::with_defaults(repo, bus);
+
+        assert_eq!(sweeper.stale_threshold(), Duration::from_secs(90));
+        assert_eq!(sweeper.sweep_interval(), Duration::from_secs(30));
     }
 }
