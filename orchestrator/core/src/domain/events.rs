@@ -535,6 +535,7 @@ pub enum WorkflowEvent {
     IntentExecutionPipelineCompleted {
         pipeline_execution_id: ExecutionId,
         workflow_execution_id: ExecutionId,
+        tenant_id: crate::domain::tenant::TenantId,
         final_result: String,
         duration_ms: u64,
         reused_existing_agent: bool,
