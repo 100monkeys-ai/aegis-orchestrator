@@ -41,7 +41,9 @@ use crate::domain::credential::{
 use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
-use crate::domain::shared_kernel::{AgentId, DispatchId, ExecutionId, ImagePullPolicy, VolumeId};
+use crate::domain::shared_kernel::{
+    AgentId, DispatchId, ExecutionId, ImagePullPolicy, NodeId, VolumeId,
+};
 use crate::domain::tenancy::TenantQuotaKind;
 use crate::domain::tenant::TenantId;
 use crate::domain::volume::StorageClass;
@@ -137,6 +139,10 @@ pub enum StorageEvent {
         path: String,
         open_mode: String, // "read", "write", "read-write", "create"
         opened_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     FileRead {
         execution_id: ExecutionId,
@@ -146,6 +152,10 @@ pub enum StorageEvent {
         bytes_read: u64,
         duration_ms: u64,
         read_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     FileWritten {
         execution_id: ExecutionId,
@@ -155,12 +165,20 @@ pub enum StorageEvent {
         bytes_written: u64,
         duration_ms: u64,
         written_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     FileClosed {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: String,
         closed_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     DirectoryListed {
         execution_id: ExecutionId,
@@ -168,18 +186,30 @@ pub enum StorageEvent {
         path: String,
         entry_count: usize,
         listed_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     FileCreated {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: String,
         created_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     FileDeleted {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         path: String,
         deleted_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     PathTraversalBlocked {
         execution_id: ExecutionId,
@@ -193,6 +223,10 @@ pub enum StorageEvent {
         path: String,
         policy_rule: String,
         violated_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     QuotaExceeded {
         execution_id: ExecutionId,
@@ -200,11 +234,19 @@ pub enum StorageEvent {
         requested_bytes: u64,
         available_bytes: u64,
         exceeded_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
     UnauthorizedVolumeAccess {
         execution_id: ExecutionId,
         volume_id: VolumeId,
         attempted_at: DateTime<Utc>,
+        /// Node that initiated the cross-node RPC (`None` for local operations).
+        caller_node_id: Option<NodeId>,
+        /// Node that executed the storage operation (`None` for local operations).
+        host_node_id: Option<NodeId>,
     },
 }
 

@@ -125,6 +125,8 @@ fn execution_id_returns_some_for_storage_event() {
         path: "/workspace/main.py".to_string(),
         open_mode: "read".to_string(),
         opened_at: Utc::now(),
+        caller_node_id: None,
+        host_node_id: None,
     });
     assert_eq!(event.execution_id(), Some(eid));
 }
@@ -662,6 +664,8 @@ fn storage_event_file_written_serde_roundtrip() {
         bytes_written: 1024,
         duration_ms: 12,
         written_at: Utc::now(),
+        caller_node_id: None,
+        host_node_id: None,
     };
     let json = serde_json::to_string(&event).unwrap();
     let deser: StorageEvent = serde_json::from_str(&json).unwrap();
@@ -706,6 +710,8 @@ fn storage_event_quota_exceeded_serde_roundtrip() {
         requested_bytes: 10_000_000,
         available_bytes: 500_000,
         exceeded_at: Utc::now(),
+        caller_node_id: None,
+        host_node_id: None,
     };
     let json = serde_json::to_string(&event).unwrap();
     let deser: StorageEvent = serde_json::from_str(&json).unwrap();
