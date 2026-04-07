@@ -29,6 +29,7 @@
 
 pub use crate::domain::shared_kernel::{TenantId, VolumeId};
 
+use crate::domain::cluster::NodeId;
 use crate::domain::iam::ZaruTier;
 use crate::domain::shared_kernel::ExecutionId;
 use chrono::{DateTime, Duration, Utc};
@@ -496,6 +497,11 @@ pub struct Volume {
 
     /// Expiration timestamp (for ephemeral volumes)
     pub expires_at: Option<DateTime<Utc>>,
+
+    /// Authoritative host node for this volume (ADR-064).
+    /// The node that executes final FSAL operations against the storage backend.
+    /// None for volumes hosted on the local node.
+    pub host_node_id: Option<NodeId>,
 }
 
 impl Volume {
@@ -539,6 +545,7 @@ impl Volume {
             attached_at: None,
             detached_at: None,
             expires_at,
+            host_node_id: None,
         })
     }
 

@@ -278,6 +278,7 @@ impl VolumeService for StandardVolumeService {
             attached_at: None,
             detached_at: None,
             expires_at: storage_class.calculate_expiry(Utc::now()),
+            host_node_id: None,
         };
 
         // Provision directory on the selected storage backend.
@@ -737,6 +738,7 @@ impl VolumeService for StandardVolumeService {
                         attached_at: None,
                         detached_at: None,
                         expires_at: storage_class.calculate_expiry(Utc::now()),
+                        host_node_id: None,
                     };
 
                     self.repository
@@ -822,6 +824,7 @@ impl VolumeService for StandardVolumeService {
             attached_at: Some(Utc::now()),
             detached_at: None,
             expires_at: storage_class.calculate_expiry(Utc::now()),
+            host_node_id: None,
         };
 
         self.repository

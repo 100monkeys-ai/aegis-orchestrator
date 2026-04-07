@@ -4,11 +4,12 @@
 //!
 //! Implements [`NodeRegistryRepository`] — the bounded-context-separated
 //! repository for node configuration assignment and registry queries.
-//! Operates against the existing `cluster_nodes` and `config_layers` tables.
+//! Operates against the dedicated `registered_nodes` table (separated from
+//! transient `cluster_nodes` peer state).
 
 use crate::domain::cluster::{
-    ConfigScope, ConfigType, NodeCapabilityAdvertisement, NodeConfigAssignment, NodeId,
-    NodePeerStatus, NodeRegistryRepository, NodeRole, RegisteredNode, RuntimeRegistryAssignment,
+    ConfigScope, ConfigType, NodeConfigAssignment, NodeId, NodeRegistryRepository, NodeRole,
+    RegisteredNode, RegistryStatus, RuntimeRegistryAssignment,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -34,11 +35,10 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
     ) -> anyhow::Result<Option<RegisteredNode>> {
         let row = sqlx::query(
             r#"
-            SELECT node_id, role, grpc_address, status, gpu_count, vram_gb,
-                   cpu_cores, available_mem_gb, supported_runtimes, tags,
-                   last_heartbeat_at, registered_at,
-                   hostname, software_version, metadata, current_config_version
-            FROM cluster_nodes
+            SELECT node_id, hostname, role, software_version, metadata,
+                   registry_status, current_config_version,
+                   registered_at, decommissioned_at
+            FROM registered_nodes
             WHERE node_id = $1
             "#,
         )
@@ -52,11 +52,10 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
     async fn list_registered_nodes(&self) -> anyhow::Result<Vec<RegisteredNode>> {
         let rows = sqlx::query(
             r#"
-            SELECT node_id, role, grpc_address, status, gpu_count, vram_gb,
-                   cpu_cores, available_mem_gb, supported_runtimes, tags,
-                   last_heartbeat_at, registered_at,
-                   hostname, software_version, metadata, current_config_version
-            FROM cluster_nodes
+            SELECT node_id, hostname, role, software_version, metadata,
+                   registry_status, current_config_version,
+                   registered_at, decommissioned_at
+            FROM registered_nodes
             ORDER BY registered_at
             "#,
         )
@@ -68,48 +67,37 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
 
     async fn upsert_registered_node(&self, node: &RegisteredNode) -> anyhow::Result<()> {
         let metadata_json = serde_json::to_value(&node.metadata)?;
+        let status_str = match node.registry_status {
+            RegistryStatus::Pending => "pending",
+            RegistryStatus::Active => "active",
+            RegistryStatus::Decommissioned => "decommissioned",
+        };
         sqlx::query(
             r#"
-            INSERT INTO cluster_nodes (
-                node_id, role, public_key, grpc_address, status,
-                gpu_count, vram_gb, cpu_cores, available_mem_gb,
-                supported_runtimes, tags, registered_at, last_heartbeat_at,
-                hostname, software_version, metadata, current_config_version
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+            INSERT INTO registered_nodes (
+                node_id, hostname, role, software_version, metadata,
+                registry_status, current_config_version,
+                registered_at, decommissioned_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
             ON CONFLICT (node_id) DO UPDATE SET
-                role = EXCLUDED.role,
-                grpc_address = EXCLUDED.grpc_address,
-                status = EXCLUDED.status,
-                gpu_count = EXCLUDED.gpu_count,
-                vram_gb = EXCLUDED.vram_gb,
-                cpu_cores = EXCLUDED.cpu_cores,
-                available_mem_gb = EXCLUDED.available_mem_gb,
-                supported_runtimes = EXCLUDED.supported_runtimes,
-                tags = EXCLUDED.tags,
-                last_heartbeat_at = EXCLUDED.last_heartbeat_at,
                 hostname = EXCLUDED.hostname,
+                role = EXCLUDED.role,
                 software_version = EXCLUDED.software_version,
                 metadata = EXCLUDED.metadata,
-                current_config_version = EXCLUDED.current_config_version
+                registry_status = EXCLUDED.registry_status,
+                current_config_version = EXCLUDED.current_config_version,
+                decommissioned_at = EXCLUDED.decommissioned_at
             "#,
         )
         .bind(node.node_id.0)
-        .bind(format!("{:?}", node.role).to_lowercase())
-        .bind(Vec::<u8>::new()) // public_key — not managed by registry repo
-        .bind(&node.grpc_address)
-        .bind(format!("{:?}", node.status).to_lowercase())
-        .bind(node.capabilities.gpu_count as i32)
-        .bind(node.capabilities.vram_gb as i32)
-        .bind(node.capabilities.cpu_cores as i32)
-        .bind(node.capabilities.available_memory_gb as i32)
-        .bind(&node.capabilities.supported_runtimes)
-        .bind(&node.capabilities.tags)
-        .bind(node.registered_at)
-        .bind(node.last_heartbeat_at)
         .bind(&node.hostname)
+        .bind(format!("{:?}", node.role).to_lowercase())
         .bind(&node.software_version)
         .bind(metadata_json)
+        .bind(status_str)
         .bind(&node.config_version)
+        .bind(node.registered_at)
+        .bind(node.decommissioned_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -232,11 +220,12 @@ impl NodeRegistryRepository for PgNodeRegistryRepository {
 
 fn row_to_registered_node(r: &sqlx::postgres::PgRow) -> RegisteredNode {
     let role_str: String = r.get("role");
-    let status_str: String = r.get("status");
+    let status_str: String = r.get("registry_status");
     let hostname: String = r.get("hostname");
     let software_version: String = r.get("software_version");
     let metadata_json: serde_json::Value = r.get("metadata");
     let config_version: Option<String> = r.get("current_config_version");
+    let decommissioned_at: Option<DateTime<Utc>> = r.get("decommissioned_at");
 
     let metadata: HashMap<String, String> = metadata_json
         .as_object()
@@ -256,25 +245,16 @@ fn row_to_registered_node(r: &sqlx::postgres::PgRow) -> RegisteredNode {
             "hybrid" => NodeRole::Hybrid,
             _ => NodeRole::Worker,
         },
-        status: match status_str.as_str() {
-            "active" => NodePeerStatus::Active,
-            "draining" => NodePeerStatus::Draining,
-            "unhealthy" => NodePeerStatus::Unhealthy,
-            _ => NodePeerStatus::Active,
+        registry_status: match status_str.as_str() {
+            "pending" => RegistryStatus::Pending,
+            "active" => RegistryStatus::Active,
+            "decommissioned" => RegistryStatus::Decommissioned,
+            _ => RegistryStatus::Pending,
         },
-        capabilities: NodeCapabilityAdvertisement {
-            gpu_count: r.get::<i32, _>("gpu_count") as u32,
-            vram_gb: r.get::<i32, _>("vram_gb") as u32,
-            cpu_cores: r.get::<i32, _>("cpu_cores") as u32,
-            available_memory_gb: r.get::<i32, _>("available_mem_gb") as u32,
-            supported_runtimes: r.get("supported_runtimes"),
-            tags: r.get("tags"),
-        },
-        grpc_address: r.get("grpc_address"),
         software_version,
         metadata,
         config_version,
-        last_heartbeat_at: r.get("last_heartbeat_at"),
         registered_at: r.get("registered_at"),
+        decommissioned_at,
     }
 }

@@ -413,6 +413,7 @@ mod tests {
             rate_limit_override_repo: None,
             config_layer_repo: None,
             node_cluster_repo: None,
+            node_registry_repo: None,
             security_context_repo: None,
             realm_repo: None,
             pg_pool: None,

@@ -33,6 +33,7 @@ use crate::application::tool_invocation_service::ToolInvocationService;
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::{
     ConfigLayerRepository, ConfigScope, ConfigType, NodeClusterRepository, NodeId,
+    NodeRegistryRepository,
 };
 use crate::domain::dispatch::AgentMessage;
 use crate::domain::execution::ExecutionInput;
@@ -104,8 +105,10 @@ pub struct AppState {
     pub rate_limit_override_repo: Option<Arc<RateLimitOverrideRepository>>,
     /// Config layer repository for hierarchical config admin (ADR-060). Optional until wired.
     pub config_layer_repo: Option<Arc<dyn ConfigLayerRepository>>,
-    /// Node cluster repository for node registry admin (ADR-059). Optional until wired.
+    /// Node cluster repository for transient peer state (ADR-059). Optional until wired.
     pub node_cluster_repo: Option<Arc<dyn NodeClusterRepository>>,
+    /// Node registry repository for durable node lifecycle (ADR-061). Optional until wired.
+    pub node_registry_repo: Option<Arc<dyn NodeRegistryRepository>>,
     /// Security context repository for SEAL policy admin (ADR-035). Optional until wired.
     pub security_context_repo: Option<Arc<dyn SecurityContextRepository>>,
     /// PostgreSQL pool for direct audit-log queries. Optional until wired.
@@ -147,6 +150,7 @@ pub fn app(
         rate_limit_override_repo: None,
         config_layer_repo: None,
         node_cluster_repo: None,
+        node_registry_repo: None,
         security_context_repo: None,
         pg_pool: None,
         realm_repo: None,
@@ -300,6 +304,7 @@ pub fn app_with_inner_loop(
         rate_limit_override_repo: None,
         config_layer_repo: None,
         node_cluster_repo: None,
+        node_registry_repo: None,
         security_context_repo: None,
         pg_pool: None,
         realm_repo: None,
@@ -2195,12 +2200,12 @@ async fn get_node(
         return resp;
     }
 
-    let repo = match &state.node_cluster_repo {
+    let repo = match &state.node_registry_repo {
         Some(r) => r.clone(),
         None => {
             return (
                 axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error": "Node cluster repository not configured"})),
+                Json(json!({"error": "Node registry repository not configured"})),
             )
                 .into_response();
         }

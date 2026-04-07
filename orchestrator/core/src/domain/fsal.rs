@@ -997,6 +997,7 @@ mod tests {
             attached_at: None,
             detached_at: None,
             expires_at: None,
+            host_node_id: None,
         }
     }
 
@@ -1061,6 +1062,7 @@ mod tests {
             attached_at: None,
             detached_at: None,
             expires_at: None,
+            host_node_id: None,
         };
 
         let repo = Arc::new(InMemoryVolumeRepository::new());

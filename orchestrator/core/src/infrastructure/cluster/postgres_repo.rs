@@ -8,7 +8,7 @@
 use crate::domain::cluster::NodeChallenge;
 use crate::domain::cluster::{
     NodeCapabilityAdvertisement, NodeChallengeRepository, NodeClusterRepository, NodeId, NodePeer,
-    NodePeerStatus, NodeRole, RegisteredNode, ResourceSnapshot, StimulusIdempotencyRepository,
+    NodePeerStatus, NodeRole, ResourceSnapshot, StimulusIdempotencyRepository,
 };
 use crate::domain::stimulus::StimulusId;
 use async_trait::async_trait;
@@ -35,9 +35,8 @@ impl NodeClusterRepository for PgNodeClusterRepository {
             INSERT INTO cluster_nodes (
                 node_id, role, public_key, grpc_address, status,
                 gpu_count, vram_gb, cpu_cores, available_mem_gb,
-                supported_runtimes, tags, registered_at, last_heartbeat_at,
-                hostname, software_version, metadata
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                supported_runtimes, tags, registered_at, last_heartbeat_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (node_id) DO UPDATE SET
                 role = EXCLUDED.role,
                 public_key = EXCLUDED.public_key,
@@ -49,10 +48,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
                 available_mem_gb = EXCLUDED.available_mem_gb,
                 supported_runtimes = EXCLUDED.supported_runtimes,
                 tags = EXCLUDED.tags,
-                last_heartbeat_at = EXCLUDED.last_heartbeat_at,
-                hostname = EXCLUDED.hostname,
-                software_version = EXCLUDED.software_version,
-                metadata = EXCLUDED.metadata
+                last_heartbeat_at = EXCLUDED.last_heartbeat_at
             "#,
         )
         .bind(peer.node_id.0)
@@ -68,9 +64,6 @@ impl NodeClusterRepository for PgNodeClusterRepository {
         .bind(&peer.capabilities.tags)
         .bind(peer.registered_at)
         .bind(peer.last_heartbeat_at)
-        .bind("") // hostname default
-        .bind("") // software_version default
-        .bind(serde_json::json!({})) // metadata default
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -161,7 +154,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
 
     async fn get_config_version(&self, node_id: &NodeId) -> anyhow::Result<Option<String>> {
         let row =
-            sqlx::query("SELECT current_config_version FROM cluster_nodes WHERE node_id = $1")
+            sqlx::query("SELECT current_config_version FROM registered_nodes WHERE node_id = $1")
                 .bind(node_id.0)
                 .fetch_optional(&self.pool)
                 .await?;
@@ -169,7 +162,7 @@ impl NodeClusterRepository for PgNodeClusterRepository {
     }
 
     async fn record_config_version(&self, node_id: &NodeId, hash: &str) -> anyhow::Result<()> {
-        sqlx::query("UPDATE cluster_nodes SET current_config_version = $2 WHERE node_id = $1")
+        sqlx::query("UPDATE registered_nodes SET current_config_version = $2 WHERE node_id = $1")
             .bind(node_id.0)
             .bind(hash)
             .execute(&self.pool)
@@ -216,42 +209,6 @@ impl NodeClusterRepository for PgNodeClusterRepository {
             map.insert(status, count as usize);
         }
         Ok(map)
-    }
-
-    async fn find_registered_node(
-        &self,
-        node_id: &NodeId,
-    ) -> anyhow::Result<Option<RegisteredNode>> {
-        let row = sqlx::query(
-            r#"
-            SELECT node_id, role, public_key, grpc_address, status, gpu_count, vram_gb,
-                   cpu_cores, available_mem_gb, supported_runtimes, tags,
-                   last_heartbeat_at, registered_at,
-                   hostname, software_version, metadata, current_config_version
-            FROM cluster_nodes
-            WHERE node_id = $1
-            "#,
-        )
-        .bind(node_id.0)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(row.map(|r| {
-            let peer = row_to_node_peer(&r);
-            let hostname: String = r.get("hostname");
-            let software_version: String = r.get("software_version");
-            let metadata_json: serde_json::Value = r.get("metadata");
-            let metadata: HashMap<String, String> = metadata_json
-                .as_object()
-                .map(|obj| {
-                    obj.iter()
-                        .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let config_version: Option<String> = r.get("current_config_version");
-            RegisteredNode::from_peer(&peer, hostname, software_version, metadata, config_version)
-        }))
     }
 }
 
