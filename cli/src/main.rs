@@ -49,8 +49,8 @@ mod output;
 
 use commands::auth::AuthCommand;
 use commands::{
-    AgentCommand, ConfigCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand, RestartArgs,
-    StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
+    AgentCommand, ConfigCommand, CredentialCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand,
+    RestartArgs, SecretCommand, StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
 };
 use output::{structured_output_unsupported, OutputFormat};
 
@@ -136,6 +136,20 @@ enum Commands {
         #[command(subcommand)]
         command: WorkflowCommand,
     },
+    /// Manage secrets in the OpenBao-backed secret store
+    #[command(name = "secret")]
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommand,
+    },
+
+    /// Manage provider credential bindings (API keys and OAuth tokens)
+    #[command(name = "credential")]
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommand,
+    },
+
     /// Authenticate with an AEGIS environment.
     #[command(name = "auth")]
     Auth {
@@ -242,6 +256,16 @@ async fn main() -> Result<()> {
         Some(Commands::Workflow { command }) => {
             commands::workflow::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
                 .await
+        }
+        Some(Commands::Secret { command }) => {
+            commands::secret::handle_command(command, cli.config, &cli.host, cli.port, cli.output)
+                .await
+        }
+        Some(Commands::Credential { command }) => {
+            commands::credential::handle_command(
+                command, cli.config, &cli.host, cli.port, cli.output,
+            )
+            .await
         }
         Some(Commands::Auth { command }) => {
             commands::auth::handle_command(command, cli.output).await

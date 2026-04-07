@@ -419,6 +419,286 @@ impl DaemonClient {
             }
         }))
     }
+
+    // ── Secrets ──────────────────────────────────────────────────────────────
+
+    pub async fn put_secret(&self, path: &str, data: serde_json::Value) -> Result<()> {
+        let url = format!("{}/v1/secrets/{}", self.base_url, path);
+        let response = self
+            .request(reqwest::Method::PUT, &url)
+            .json(&data)
+            .send()
+            .await
+            .context("Failed to write secret")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to write secret at '{path}': {err}");
+        }
+        Ok(())
+    }
+
+    pub async fn get_secret(&self, path: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/secrets/{}", self.base_url, path);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .context("Failed to read secret")?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("Secret not found at '{path}'");
+        }
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to read secret at '{path}': {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse secret response")
+    }
+
+    /// Returns `None` when the server responds 501 (listing not implemented).
+    pub async fn list_secrets(&self) -> Result<Option<serde_json::Value>> {
+        let url = format!("{}/v1/secrets", self.base_url);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .context("Failed to list secrets")?;
+
+        if response.status() == reqwest::StatusCode::NOT_IMPLEMENTED {
+            return Ok(None);
+        }
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list secrets: {err}");
+        }
+        let body = response
+            .json()
+            .await
+            .context("Failed to parse list response")?;
+        Ok(Some(body))
+    }
+
+    pub async fn delete_secret(&self, path: &str) -> Result<()> {
+        let url = format!("{}/v1/secrets/{}", self.base_url, path);
+        let response = self
+            .request(reqwest::Method::DELETE, &url)
+            .send()
+            .await
+            .context("Failed to delete secret")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete secret at '{path}': {err}");
+        }
+        Ok(())
+    }
+
+    // ── Credentials ───────────────────────────────────────────────────────────
+
+    pub async fn store_api_key(
+        &self,
+        provider: &str,
+        label: &str,
+        scope: Option<&str>,
+        value: &str,
+    ) -> Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct StoreRequest<'a> {
+            provider: &'a str,
+            label: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            scope: Option<&'a str>,
+            value: &'a str,
+        }
+
+        let url = format!("{}/v1/credentials/api-keys", self.base_url);
+        let response = self
+            .request(reqwest::Method::POST, &url)
+            .json(&StoreRequest {
+                provider,
+                label,
+                scope,
+                value,
+            })
+            .send()
+            .await
+            .context("Failed to store API key")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to store API key: {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse store response")
+    }
+
+    pub async fn initiate_oauth(
+        &self,
+        provider: &str,
+        redirect_uri: &str,
+    ) -> Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct OAuthInitRequest<'a> {
+            provider: &'a str,
+            redirect_uri: &'a str,
+        }
+
+        let url = format!("{}/v1/credentials/oauth/initiate", self.base_url);
+        let response = self
+            .request(reqwest::Method::POST, &url)
+            .json(&OAuthInitRequest {
+                provider,
+                redirect_uri,
+            })
+            .send()
+            .await
+            .context("Failed to initiate OAuth flow")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to initiate OAuth: {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse OAuth initiate response")
+    }
+
+    pub async fn list_credentials(&self) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/credentials", self.base_url);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .context("Failed to list credentials")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list credentials: {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse credentials list")
+    }
+
+    pub async fn get_credential(&self, id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/credentials/{}", self.base_url, id);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .context("Failed to get credential")?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("Credential not found: {id}");
+        }
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to get credential '{id}': {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse credential response")
+    }
+
+    pub async fn delete_credential(&self, id: &str) -> Result<()> {
+        let url = format!("{}/v1/credentials/{}", self.base_url, id);
+        let response = self
+            .request(reqwest::Method::DELETE, &url)
+            .send()
+            .await
+            .context("Failed to delete credential")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to delete credential '{id}': {err}");
+        }
+        Ok(())
+    }
+
+    pub async fn add_credential_grant(
+        &self,
+        binding_id: &str,
+        target_type: &str,
+        target_id: Option<&str>,
+        granted_by: Option<&str>,
+    ) -> Result<serde_json::Value> {
+        #[derive(Serialize)]
+        struct GrantRequest<'a> {
+            target_type: &'a str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            target_id: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            granted_by: Option<&'a str>,
+        }
+
+        let url = format!("{}/v1/credentials/{}/grants", self.base_url, binding_id);
+        let response = self
+            .request(reqwest::Method::POST, &url)
+            .json(&GrantRequest {
+                target_type,
+                target_id,
+                granted_by,
+            })
+            .send()
+            .await
+            .context("Failed to add credential grant")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to add grant for credential '{binding_id}': {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse grant response")
+    }
+
+    pub async fn list_credential_grants(&self, binding_id: &str) -> Result<serde_json::Value> {
+        let url = format!("{}/v1/credentials/{}/grants", self.base_url, binding_id);
+        let response = self
+            .request(reqwest::Method::GET, &url)
+            .send()
+            .await
+            .context("Failed to list credential grants")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!("Failed to list grants for credential '{binding_id}': {err}");
+        }
+        response
+            .json()
+            .await
+            .context("Failed to parse grants response")
+    }
+
+    pub async fn revoke_credential_grant(&self, binding_id: &str, grant_id: &str) -> Result<()> {
+        let url = format!(
+            "{}/v1/credentials/{}/grants/{}",
+            self.base_url, binding_id, grant_id
+        );
+        let response = self
+            .request(reqwest::Method::DELETE, &url)
+            .send()
+            .await
+            .context("Failed to revoke credential grant")?;
+
+        if !response.status().is_success() {
+            let err = response.text().await.unwrap_or_default();
+            anyhow::bail!(
+                "Failed to revoke grant '{grant_id}' from credential '{binding_id}': {err}"
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
