@@ -1393,6 +1393,16 @@ impl AgentEventReceiver {
             DomainEvent::Cluster(_) => false,      // Cluster events are system-wide, not per-agent
             DomainEvent::RateLimit(_) => false, // Rate limit events are system-wide, not per-agent
             DomainEvent::Swarm(_) => false,     // Swarm events are system-wide, not per-agent
+            DomainEvent::Credential(e) => match e {
+                // CredentialAccessed carries an agent_id — filter by it
+                CredentialEvent::CredentialAccessed { agent_id, .. } => agent_id == &self.agent_id,
+                // Remaining variants are tenant/binding lifecycle events with no agent_id
+                CredentialEvent::CredentialCreated { .. }
+                | CredentialEvent::CredentialRevoked { .. }
+                | CredentialEvent::CredentialRotated { .. }
+                | CredentialEvent::CredentialGranted { .. }
+                | CredentialEvent::CredentialGrantRevoked { .. } => false,
+            },
         }
     }
 }
@@ -1602,6 +1612,97 @@ mod tests {
         assert_eq!(secret.agent_id(), Some(agent_id));
         assert_eq!(secret.category(), "secrets");
         assert_eq!(secret.stage(), Some("secrets"));
+    }
+
+    /// Regression: DomainEvent::Credential variants must be handled by AgentEventReceiver.
+    ///
+    /// Before the fix the match in `AgentEventReceiver::matches_agent` was non-exhaustive —
+    /// the `Credential` variant was absent — causing compile error E0004. This test verifies
+    /// the correct filtering semantics for every `CredentialEvent` variant:
+    ///   - `CredentialAccessed` carries an `agent_id` and must be filtered by it.
+    ///   - All other variants have no `agent_id` and must always return false.
+    #[tokio::test]
+    async fn test_agent_receiver_filters_credential_events() {
+        use crate::domain::credential::{
+            CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialType, GrantTarget,
+        };
+        use crate::domain::tenant::TenantId;
+
+        let agent_id = crate::domain::agent::AgentId::new();
+        let other_agent_id = crate::domain::agent::AgentId::new();
+        let event_bus = EventBus::new(32);
+        let mut receiver = event_bus.subscribe_agent(agent_id);
+
+        let binding_id = CredentialBindingId::new();
+        let tenant_id = TenantId::from_string("test-tenant").unwrap();
+
+        // Publish CredentialCreated (no agent_id) — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialCreated {
+            binding_id,
+            owner_user_id: "user-1".to_string(),
+            tenant_id: tenant_id.clone(),
+            provider: CredentialProvider::OpenAI,
+            credential_type: CredentialType::ApiKey,
+        });
+
+        // Publish CredentialAccessed for a different agent — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialAccessed {
+            binding_id,
+            agent_id: other_agent_id,
+            tenant_id: tenant_id.clone(),
+        });
+
+        // Publish CredentialRevoked (no agent_id) — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialRevoked {
+            binding_id,
+            tenant_id: tenant_id.clone(),
+        });
+
+        // Publish CredentialRotated (no agent_id) — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialRotated {
+            binding_id,
+            tenant_id: tenant_id.clone(),
+        });
+
+        let grant_id = CredentialGrantId::new();
+
+        // Publish CredentialGranted (no agent_id) — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialGranted {
+            binding_id,
+            grant_id,
+            target: GrantTarget::Agent {
+                agent_id: other_agent_id,
+            },
+            granted_by: "user-1".to_string(),
+        });
+
+        // Publish CredentialGrantRevoked (no agent_id) — must be filtered out
+        event_bus.publish_credential_event(CredentialEvent::CredentialGrantRevoked {
+            binding_id,
+            grant_id,
+        });
+
+        // Publish CredentialAccessed for our agent — must pass through
+        event_bus.publish_credential_event(CredentialEvent::CredentialAccessed {
+            binding_id,
+            agent_id,
+            tenant_id,
+        });
+
+        let received = receiver
+            .recv()
+            .await
+            .expect("should receive credential event");
+        match &received {
+            DomainEvent::Credential(CredentialEvent::CredentialAccessed {
+                agent_id: received_id,
+                ..
+            }) => assert_eq!(
+                *received_id, agent_id,
+                "received CredentialAccessed must be for the subscribed agent"
+            ),
+            other => panic!("expected CredentialAccessed, got {other:?}"),
+        }
     }
 
     /// Regression: IntentExecutionPipelineCompleted must carry a non-empty tenant_id so that
