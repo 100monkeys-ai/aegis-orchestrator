@@ -75,6 +75,8 @@ impl PostgresStorageEventRepository {
                     path,
                     open_mode,
                     opened_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "FileRead" => {
@@ -95,6 +97,8 @@ impl PostgresStorageEventRepository {
                     bytes_read,
                     duration_ms,
                     read_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "FileWritten" => {
@@ -115,6 +119,8 @@ impl PostgresStorageEventRepository {
                     bytes_written,
                     duration_ms,
                     written_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "FileClosed" => Ok(StorageEvent::FileClosed {
@@ -122,6 +128,8 @@ impl PostgresStorageEventRepository {
                 volume_id,
                 path,
                 closed_at: parse_timestamp("timestamp"),
+                caller_node_id: None,
+                host_node_id: None,
             }),
             "DirectoryListed" => {
                 let entry_count = details
@@ -134,6 +142,8 @@ impl PostgresStorageEventRepository {
                     path,
                     entry_count,
                     listed_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "FileCreated" => Ok(StorageEvent::FileCreated {
@@ -141,12 +151,16 @@ impl PostgresStorageEventRepository {
                 volume_id,
                 path,
                 created_at: parse_timestamp("timestamp"),
+                caller_node_id: None,
+                host_node_id: None,
             }),
             "FileDeleted" => Ok(StorageEvent::FileDeleted {
                 execution_id,
                 volume_id,
                 path,
                 deleted_at: parse_timestamp("timestamp"),
+                caller_node_id: None,
+                host_node_id: None,
             }),
             "PathTraversalBlocked" => Ok(StorageEvent::PathTraversalBlocked {
                 execution_id,
@@ -171,6 +185,8 @@ impl PostgresStorageEventRepository {
                     path,
                     policy_rule,
                     violated_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "QuotaExceeded" => {
@@ -188,12 +204,16 @@ impl PostgresStorageEventRepository {
                     requested_bytes,
                     available_bytes,
                     exceeded_at: parse_timestamp("timestamp"),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
             }
             "UnauthorizedVolumeAccess" => Ok(StorageEvent::UnauthorizedVolumeAccess {
                 execution_id,
                 volume_id,
                 attempted_at: parse_timestamp("timestamp"),
+                caller_node_id: None,
+                host_node_id: None,
             }),
             _ => {
                 warn!("Unknown storage event type: {}", event_type);
@@ -216,6 +236,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path,
                 open_mode,
                 opened_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileOpened",
                 *execution_id,
@@ -224,6 +246,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 serde_json::json!({
                     "open_mode": open_mode,
                     "timestamp": opened_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::FileRead {
@@ -234,6 +258,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 bytes_read,
                 duration_ms,
                 read_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileRead",
                 *execution_id,
@@ -244,6 +270,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                     "bytes_read": bytes_read,
                     "duration_ms": duration_ms,
                     "timestamp": read_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::FileWritten {
@@ -254,6 +282,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 bytes_written,
                 duration_ms,
                 written_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileWritten",
                 *execution_id,
@@ -264,6 +294,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                     "bytes_written": bytes_written,
                     "duration_ms": duration_ms,
                     "timestamp": written_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::FileClosed {
@@ -271,6 +303,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 volume_id,
                 path,
                 closed_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileClosed",
                 *execution_id,
@@ -278,6 +312,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path.clone(),
                 serde_json::json!({
                     "timestamp": closed_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::DirectoryListed {
@@ -286,6 +322,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path,
                 entry_count,
                 listed_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "DirectoryListed",
                 *execution_id,
@@ -294,6 +332,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 serde_json::json!({
                     "entry_count": entry_count,
                     "timestamp": listed_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::FileCreated {
@@ -301,6 +341,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 volume_id,
                 path,
                 created_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileCreated",
                 *execution_id,
@@ -308,6 +350,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path.clone(),
                 serde_json::json!({
                     "timestamp": created_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::FileDeleted {
@@ -315,6 +359,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 volume_id,
                 path,
                 deleted_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FileDeleted",
                 *execution_id,
@@ -322,6 +368,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path.clone(),
                 serde_json::json!({
                     "timestamp": deleted_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::PathTraversalBlocked {
@@ -344,6 +392,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 path,
                 policy_rule,
                 violated_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "FilesystemPolicyViolation",
                 *execution_id,
@@ -353,6 +403,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                     "operation": operation,
                     "policy_rule": policy_rule,
                     "timestamp": violated_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::QuotaExceeded {
@@ -361,6 +413,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 requested_bytes,
                 available_bytes,
                 exceeded_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "QuotaExceeded",
                 *execution_id,
@@ -370,12 +424,16 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                     "requested_bytes": requested_bytes,
                     "available_bytes": available_bytes,
                     "timestamp": exceeded_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
             StorageEvent::UnauthorizedVolumeAccess {
                 execution_id,
                 volume_id,
                 attempted_at,
+                caller_node_id,
+                host_node_id,
             } => (
                 "UnauthorizedVolumeAccess",
                 *execution_id,
@@ -383,6 +441,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
                 "".to_string(),
                 serde_json::json!({
                     "timestamp": attempted_at.to_rfc3339(),
+                    "caller_node_id": caller_node_id,
+                    "host_node_id": host_node_id,
                 }),
             ),
         };

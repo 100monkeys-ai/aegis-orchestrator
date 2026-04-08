@@ -174,6 +174,8 @@ mod tests {
             path: "/workspace/test.txt".to_string(),
             open_mode: "read".to_string(),
             opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         };
 
         event_bus.publish_storage_event(event.clone());

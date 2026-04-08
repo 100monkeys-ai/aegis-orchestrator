@@ -1562,6 +1562,8 @@ mod tests {
             path: "/workspace/src/main.rs".to_string(),
             open_mode: "read".to_string(),
             opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         });
 
         let received = receiver.recv().await.unwrap();

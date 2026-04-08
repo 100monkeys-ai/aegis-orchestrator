@@ -820,6 +820,8 @@ mod tests {
             path: "/workspace/file.rs".to_string(),
             open_mode: "read".to_string(),
             opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         });
 
         let mut saw_live_storage = false;
@@ -881,6 +883,8 @@ mod tests {
             path: "/workspace/secret.txt".to_string(),
             policy_rule: "deny-write".to_string(),
             violated_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         });
 
         let next = timeout(Duration::from_secs(2), stream.next())

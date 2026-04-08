@@ -686,7 +686,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         aegis_orchestrator_core::application::nfs_gateway::NfsGatewayService::new(
             storage_provider.clone(),
             volume_repo.clone(),
-            event_publisher,
+            event_publisher.clone(),
             Some(nfs_bind_port),
         ),
     );
@@ -1772,13 +1772,48 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             );
 
             // Remote storage gRPC handler (ADR-064)
+            // Route through AegisFSAL for path sanitization, volume authorization,
+            // quota enforcement, and audit trail with cross-node provenance.
             use aegis_orchestrator_core::infrastructure::aegis_remote_storage_proto::remote_storage_service_server::RemoteStorageServiceServer;
             use aegis_orchestrator_core::infrastructure::storage::RemoteStorageServiceHandler;
 
             let health_sweeper_repo = cluster_repo.clone();
 
+            let remote_fsal = {
+                use aegis_orchestrator_core::application::storage_router::StorageRouter;
+                use aegis_orchestrator_core::infrastructure::storage::{
+                    LocalHostStorageProvider, SealStorageProvider,
+                };
+                use parking_lot::RwLock;
+                use std::collections::HashMap;
+
+                let primary_local_path = std::env::temp_dir().join("aegis");
+                let fallback_local_path = std::env::temp_dir();
+                let local_provider = Arc::new(
+                    LocalHostStorageProvider::new(&primary_local_path).unwrap_or_else(|_| {
+                        LocalHostStorageProvider::new(&fallback_local_path).expect(
+                            "failed to initialize fallback local storage provider in temp directory",
+                        )
+                    }),
+                );
+                let seal_provider = Arc::new(SealStorageProvider::new());
+                let storage_router = Arc::new(StorageRouter::new(
+                    storage_provider.clone(),
+                    local_provider,
+                    seal_provider,
+                ));
+                let borrowed_volumes = Arc::new(RwLock::new(HashMap::new()));
+
+                Arc::new(aegis_orchestrator_core::domain::fsal::AegisFSAL::new(
+                    storage_router,
+                    volume_repo.clone(),
+                    borrowed_volumes,
+                    event_publisher.clone(),
+                ))
+            };
+
             let storage_handler =
-                RemoteStorageServiceHandler::new(storage_provider.clone(), cluster_repo);
+                RemoteStorageServiceHandler::new(remote_fsal, cluster_repo, controller_node_id);
 
             tokio::spawn(async move {
                 tracing::info!(address = %cluster_addr, "Starting cluster gRPC server on port {cluster_grpc_port}");

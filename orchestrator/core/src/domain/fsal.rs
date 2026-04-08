@@ -282,6 +282,8 @@ impl AegisFSAL {
                         execution_id,
                         volume_id,
                         attempted_at: Utc::now(),
+                        caller_node_id: None,
+                        host_node_id: None,
                     })
                     .await;
 
@@ -335,6 +337,8 @@ impl AegisFSAL {
                     execution_id,
                     volume_id,
                     attempted_at: Utc::now(),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
                 .await;
 
@@ -514,6 +518,8 @@ impl AegisFSAL {
                 bytes_read: data.len() as u64,
                 duration_ms,
                 read_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -561,6 +567,8 @@ impl AegisFSAL {
                     requested_bytes,
                     available_bytes,
                     exceeded_at: Utc::now(),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
                 .await;
 
@@ -592,6 +600,8 @@ impl AegisFSAL {
                 bytes_written: bytes_written as u64,
                 duration_ms,
                 written_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -648,6 +658,8 @@ impl AegisFSAL {
                     volume_id,
                     path: path_str.to_string(),
                     created_at: Utc::now(),
+                    caller_node_id: None,
+                    host_node_id: None,
                 })
                 .await;
         }
@@ -716,6 +728,8 @@ impl AegisFSAL {
                 path: path_str.to_string(),
                 entry_count: entries.len(),
                 listed_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -753,6 +767,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 created_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -790,6 +806,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -827,6 +845,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 
@@ -869,6 +889,8 @@ impl AegisFSAL {
                 volume_id,
                 path: to_str.to_string(),
                 created_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
             })
             .await;
 

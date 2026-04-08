@@ -153,6 +153,7 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             path,
             policy_rule,
             violated_at,
+            ..
         } => StorageViolationView {
             category: "filesystem_policy_violation".to_string(),
             execution_id: execution_id.0.to_string(),
@@ -168,6 +169,7 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             requested_bytes,
             available_bytes,
             exceeded_at,
+            ..
         } => StorageViolationView {
             category: "quota_exceeded".to_string(),
             execution_id: execution_id.0.to_string(),
@@ -183,6 +185,7 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             execution_id,
             volume_id,
             attempted_at,
+            ..
         } => StorageViolationView {
             category: "unauthorized_volume_access".to_string(),
             execution_id: execution_id.0.to_string(),
