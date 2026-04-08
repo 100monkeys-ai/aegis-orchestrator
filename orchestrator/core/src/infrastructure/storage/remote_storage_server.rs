@@ -764,6 +764,9 @@ mod tests {
             },
             created_at: Utc::now(),
             attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
         }
     }
 

@@ -2241,6 +2241,8 @@ mod tests {
             node_keypair_path: PathBuf::from("/etc/aegis/keypair"),
             heartbeat_interval_secs: 30,
             token_refresh_margin_secs: 120,
+            stale_threshold_secs: None,
+            sweep_interval_secs: None,
             tls: None,
         });
 
