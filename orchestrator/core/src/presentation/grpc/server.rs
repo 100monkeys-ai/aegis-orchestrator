@@ -1605,6 +1605,8 @@ pub struct GrpcServerConfig {
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     pub discovery_service: Option<Arc<dyn DiscoveryService>>,
     pub volume_service: Option<Arc<dyn VolumeService>>,
+    pub output_handler_service:
+        Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1640,6 +1642,10 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     if let Some(volume_service) = config.volume_service {
         service = service.with_volume_service(volume_service);
+    }
+
+    if let Some(output_handler) = config.output_handler_service {
+        service = service.with_output_handler_service(output_handler);
     }
 
     let server = service.into_server();
@@ -2089,5 +2095,119 @@ mod tests {
             .expect_err("invoke_tool should be unimplemented via gRPC pending proto update");
 
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    /// Regression: invoke_output_handler returned UNAVAILABLE because
+    /// OutputHandlerService was never wired into the gRPC server. Verify that
+    /// when the service IS attached, the handler does not return UNAVAILABLE.
+    #[tokio::test]
+    async fn invoke_output_handler_not_unavailable_when_service_wired() {
+        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::domain::output_handler::OutputHandlerConfig;
+
+        struct StubOutputHandler;
+        #[async_trait]
+        impl OutputHandlerService for StubOutputHandler {
+            async fn invoke(
+                &self,
+                _config: &OutputHandlerConfig,
+                _final_output: &str,
+                _execution_id: &ExecutionId,
+                _tenant_id: &TenantId,
+            ) -> Result<Option<String>> {
+                Ok(Some("stub-result".to_string()))
+            }
+        }
+
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+
+        // Build service WITH output handler wired — the fix under test.
+        let service = AegisRuntimeService::new(execution_service, validation_service)
+            .with_output_handler_service(Arc::new(StubOutputHandler));
+
+        let exec_id = ExecutionId::new();
+        let webhook_config = serde_json::json!({
+            "Webhook": {
+                "url": "http://localhost:9999/hook",
+                "method": "POST",
+                "headers": {},
+                "required": false
+            }
+        });
+
+        let result = service
+            .invoke_output_handler(Request::new(InvokeOutputHandlerRequest {
+                execution_id: exec_id.0.to_string(),
+                tenant_id: TenantId::system().to_string(),
+                final_output: "hello".to_string(),
+                handler_config_json: webhook_config.to_string(),
+            }))
+            .await;
+
+        // The key assertion: the response MUST NOT be UNAVAILABLE.
+        match &result {
+            Err(status) => {
+                assert_ne!(
+                    status.code(),
+                    tonic::Code::Unavailable,
+                    "invoke_output_handler must not return UNAVAILABLE when service is wired"
+                );
+            }
+            Ok(resp) => {
+                // The stub returns Ok, so we expect success.
+                assert!(
+                    resp.get_ref().success,
+                    "invoke_output_handler should succeed with stub service"
+                );
+            }
+        }
+    }
+
+    /// Regression counterpart: verify that WITHOUT the service wired, the
+    /// handler returns UNAVAILABLE (the pre-fix behavior).
+    #[tokio::test]
+    async fn invoke_output_handler_unavailable_without_service() {
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+
+        // Build service WITHOUT output handler — no .with_output_handler_service() call.
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let exec_id = ExecutionId::new();
+        let webhook_config = serde_json::json!({
+            "Webhook": {
+                "url": "http://localhost:9999/hook",
+                "method": "POST",
+                "headers": {},
+                "required": false
+            }
+        });
+
+        let err = service
+            .invoke_output_handler(Request::new(InvokeOutputHandlerRequest {
+                execution_id: exec_id.0.to_string(),
+                tenant_id: TenantId::system().to_string(),
+                final_output: "hello".to_string(),
+                handler_config_json: webhook_config.to_string(),
+            }))
+            .await
+            .expect_err("invoke_output_handler should fail when service is not wired");
+
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "should return UNAVAILABLE when output_handler_service is None"
+        );
     }
 }
