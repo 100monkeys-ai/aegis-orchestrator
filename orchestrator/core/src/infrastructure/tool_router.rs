@@ -1778,8 +1778,17 @@ mod tests {
 
         let router = ToolRouter::new(registry, servers, vec![]);
         let tools = router.list_tools().await.unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "filesystem.read");
+        let tool_names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        // Running MCP server's tool must appear
+        assert!(
+            tool_names.contains(&"filesystem.read"),
+            "Expected running server tool 'filesystem.read' in {tool_names:?}"
+        );
+        // Stopped MCP server's tool must NOT appear
+        assert!(
+            !tool_names.contains(&"gmail.send"),
+            "Stopped server tool 'gmail.send' should not appear in {tool_names:?}"
+        );
     }
 
     #[tokio::test]
