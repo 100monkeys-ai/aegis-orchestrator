@@ -800,8 +800,8 @@ async fn test_fsal_denies_access_when_execution_id_does_not_match_volume_ownersh
     let fsal = AegisFSAL::new(
         storage_provider,
         volume_repository.clone(),
-        event_publisher,
         empty_borrowed_volume_registry(),
+        event_publisher,
     );
 
     let agent_execution_id = ExecutionId::new();
