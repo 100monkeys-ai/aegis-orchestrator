@@ -2173,12 +2173,11 @@ mod tests {
 
         let exec_id = ExecutionId::new();
         let webhook_config = serde_json::json!({
-            "Webhook": {
-                "url": "http://localhost:9999/hook",
-                "method": "POST",
-                "headers": {},
-                "required": false
-            }
+            "type": "webhook",
+            "url": "http://localhost:9999/hook",
+            "method": "POST",
+            "headers": {},
+            "required": false
         });
 
         let result = service
@@ -2222,12 +2221,11 @@ mod tests {
 
         let exec_id = ExecutionId::new();
         let webhook_config = serde_json::json!({
-            "Webhook": {
-                "url": "http://localhost:9999/hook",
-                "method": "POST",
-                "headers": {},
-                "required": false
-            }
+            "type": "webhook",
+            "url": "http://localhost:9999/hook",
+            "method": "POST",
+            "headers": {},
+            "required": false
         });
 
         let err = service
