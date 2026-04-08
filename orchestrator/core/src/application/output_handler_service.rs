@@ -45,11 +45,17 @@ pub trait OutputHandlerService: Send + Sync {
     ///
     /// Returns an error if the handler invocation fails. The caller decides whether
     /// to propagate the failure based on [`OutputHandlerConfig::is_required`].
+    /// Invoke the configured output handler.
+    ///
+    /// `parent_execution_id` is the agent execution that produced `final_output`.
+    /// When `None` (e.g. ContainerRun or ParallelAgents states that have no single
+    /// agent execution), Agent-type handlers spawn a standalone execution instead
+    /// of a child execution.
     async fn invoke(
         &self,
         config: &OutputHandlerConfig,
         final_output: &str,
-        execution_id: &ExecutionId,
+        parent_execution_id: Option<&ExecutionId>,
         tenant_id: &TenantId,
     ) -> Result<Option<String>>;
 }
@@ -81,14 +87,20 @@ impl OutputHandlerService for StandardOutputHandlerService {
         &self,
         config: &OutputHandlerConfig,
         final_output: &str,
-        execution_id: &ExecutionId,
+        parent_execution_id: Option<&ExecutionId>,
         _tenant_id: &TenantId,
     ) -> Result<Option<String>> {
         let handler_type = config.handler_type_name();
 
+        // Use the parent execution ID for event correlation when available,
+        // otherwise generate a synthetic one for observability.
+        let correlation_id = parent_execution_id
+            .copied()
+            .unwrap_or_else(ExecutionId::new);
+
         self.event_bus
             .publish_execution_event(ExecutionEvent::OutputHandlerStarted {
-                execution_id: *execution_id,
+                execution_id: correlation_id,
                 handler_type: handler_type.to_string(),
             });
 
@@ -105,7 +117,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
                     agent_id,
                     input_template.as_deref(),
                     final_output,
-                    *execution_id,
+                    parent_execution_id.copied(),
                     *timeout_seconds,
                 )
                 .await
@@ -144,7 +156,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
             Ok(output) => {
                 self.event_bus
                     .publish_execution_event(ExecutionEvent::OutputHandlerCompleted {
-                        execution_id: *execution_id,
+                        execution_id: correlation_id,
                         handler_type: handler_type.to_string(),
                         result: output.clone(),
                     });
@@ -152,7 +164,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
             Err(e) => {
                 self.event_bus
                     .publish_execution_event(ExecutionEvent::OutputHandlerFailed {
-                        execution_id: *execution_id,
+                        execution_id: correlation_id,
                         handler_type: handler_type.to_string(),
                         error: e.to_string(),
                     });
@@ -163,14 +175,19 @@ impl OutputHandlerService for StandardOutputHandlerService {
     }
 }
 
-/// Spawn a child execution for the named agent and poll until it completes.
+/// Spawn an execution for the named agent and poll until it completes.
+///
+/// When `parent_execution_id` is `Some`, the execution is spawned as a child of
+/// that parent (preserving hierarchy). When `None` (e.g. output handler on a
+/// ContainerRun state that has no agent execution), a standalone root execution
+/// is created instead.
 async fn invoke_agent_handler(
     execution_service: &Arc<dyn ExecutionService>,
     agent_lifecycle_service: &Arc<dyn AgentLifecycleService>,
     agent_id_str: &str,
     input_template: Option<&str>,
     final_output: &str,
-    parent_execution_id: ExecutionId,
+    parent_execution_id: Option<ExecutionId>,
     timeout_seconds: Option<u64>,
 ) -> Result<Option<String>> {
     // Resolve the agent by name or ID. Use the system tenant so global agents are always
@@ -184,7 +201,7 @@ async fn invoke_agent_handler(
         .find(|a| a.name == agent_id_str || a.id.0.to_string() == agent_id_str)
         .ok_or_else(|| anyhow!("Output handler agent '{}' not found", agent_id_str))?;
 
-    // Build the child execution input.
+    // Build the execution input.
     let input_value = if let Some(template) = input_template {
         // Render the Handlebars template against `{ "output": final_output }`.
         let mut hb = handlebars::Handlebars::new();
@@ -206,9 +223,20 @@ async fn invoke_agent_handler(
         workspace_remote_path: None,
     };
 
-    let child_exec_id = execution_service
-        .start_child_execution(agent.id, exec_input, parent_execution_id)
-        .await?;
+    let child_exec_id = if let Some(parent_id) = parent_execution_id {
+        execution_service
+            .start_child_execution(agent.id, exec_input, parent_id)
+            .await?
+    } else {
+        execution_service
+            .start_execution(
+                agent.id,
+                exec_input,
+                "aegis-system-operator".to_string(),
+                None,
+            )
+            .await?
+    };
 
     // Poll for completion with configurable timeout (default: 300 seconds).
     let timeout_secs = timeout_seconds.unwrap_or(300);

@@ -1331,8 +1331,16 @@ impl AegisRuntime for AegisRuntimeService {
             .as_ref()
             .ok_or_else(|| Status::unavailable("Output handler service is not configured"))?;
 
-        let execution_id = crate::domain::execution::ExecutionId::from_string(&req.execution_id)
-            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {e}")))?;
+        // An empty execution_id means no parent agent execution is available
+        // (e.g. output handler on a ContainerRun or ParallelAgents state).
+        let parent_execution_id = if req.execution_id.is_empty() {
+            None
+        } else {
+            Some(
+                crate::domain::execution::ExecutionId::from_string(&req.execution_id)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {e}")))?,
+            )
+        };
 
         let tenant_id = TenantId::new(&req.tenant_id)
             .map_err(|e| Status::invalid_argument(format!("Invalid tenant_id: {e}")))?;
@@ -1341,7 +1349,7 @@ impl AegisRuntime for AegisRuntimeService {
             .invoke(
                 &handler_config,
                 &req.final_output,
-                &execution_id,
+                parent_execution_id.as_ref(),
                 &tenant_id,
             )
             .await
@@ -2153,7 +2161,7 @@ mod tests {
                 &self,
                 _config: &OutputHandlerConfig,
                 _final_output: &str,
-                _execution_id: &ExecutionId,
+                _parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
             ) -> Result<Option<String>> {
                 Ok(Some("stub-result".to_string()))
@@ -2243,5 +2251,154 @@ mod tests {
             tonic::Code::Unavailable,
             "should return UNAVAILABLE when output_handler_service is None"
         );
+    }
+
+    /// Regression: passing a workflow execution ID (instead of an agent execution
+    /// ID) to InvokeOutputHandler caused `start_child_execution` to fail with
+    /// "Parent execution not found". Empty execution_id must be accepted and
+    /// treated as `None` (no parent), causing the output handler to spawn a
+    /// standalone execution.
+    #[tokio::test]
+    async fn invoke_output_handler_accepts_empty_execution_id() {
+        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::domain::output_handler::OutputHandlerConfig;
+
+        struct AssertNoParentHandler;
+        #[async_trait]
+        impl OutputHandlerService for AssertNoParentHandler {
+            async fn invoke(
+                &self,
+                _config: &OutputHandlerConfig,
+                _final_output: &str,
+                parent_execution_id: Option<&ExecutionId>,
+                _tenant_id: &TenantId,
+            ) -> Result<Option<String>> {
+                assert!(
+                    parent_execution_id.is_none(),
+                    "empty execution_id in gRPC request must be passed as None to invoke()"
+                );
+                Ok(Some("ok".to_string()))
+            }
+        }
+
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service)
+            .with_output_handler_service(Arc::new(AssertNoParentHandler));
+
+        let webhook_config = serde_json::json!({
+            "type": "webhook",
+            "url": "http://localhost:9999/hook",
+            "method": "POST",
+            "headers": {},
+            "required": false
+        });
+
+        let result = service
+            .invoke_output_handler(Request::new(InvokeOutputHandlerRequest {
+                execution_id: String::new(), // empty — ContainerRun/ParallelAgents case
+                tenant_id: TenantId::system().to_string(),
+                final_output: "hello".to_string(),
+                handler_config_json: webhook_config.to_string(),
+            }))
+            .await;
+
+        match result {
+            Ok(resp) => {
+                assert!(
+                    resp.get_ref().success,
+                    "invoke_output_handler with empty execution_id should succeed"
+                );
+            }
+            Err(status) => {
+                panic!(
+                    "invoke_output_handler with empty execution_id should not error: {:?}",
+                    status
+                );
+            }
+        }
+    }
+
+    /// Regression: when a valid agent execution ID is provided, it must be
+    /// passed as `Some(&ExecutionId)` to the output handler service.
+    #[tokio::test]
+    async fn invoke_output_handler_passes_execution_id_when_present() {
+        use crate::application::output_handler_service::OutputHandlerService;
+        use crate::domain::output_handler::OutputHandlerConfig;
+
+        let expected_id = ExecutionId::new();
+        let expected_id_clone = expected_id;
+
+        struct AssertHasParentHandler {
+            expected: ExecutionId,
+        }
+        #[async_trait]
+        impl OutputHandlerService for AssertHasParentHandler {
+            async fn invoke(
+                &self,
+                _config: &OutputHandlerConfig,
+                _final_output: &str,
+                parent_execution_id: Option<&ExecutionId>,
+                _tenant_id: &TenantId,
+            ) -> Result<Option<String>> {
+                let parent = parent_execution_id.expect(
+                    "non-empty execution_id in gRPC request must be passed as Some to invoke()",
+                );
+                assert_eq!(
+                    *parent, self.expected,
+                    "execution_id must match the value from the gRPC request"
+                );
+                Ok(Some("ok".to_string()))
+            }
+        }
+
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service)
+            .with_output_handler_service(Arc::new(AssertHasParentHandler {
+                expected: expected_id_clone,
+            }));
+
+        let webhook_config = serde_json::json!({
+            "type": "webhook",
+            "url": "http://localhost:9999/hook",
+            "method": "POST",
+            "headers": {},
+            "required": false
+        });
+
+        let result = service
+            .invoke_output_handler(Request::new(InvokeOutputHandlerRequest {
+                execution_id: expected_id.0.to_string(),
+                tenant_id: TenantId::system().to_string(),
+                final_output: "hello".to_string(),
+                handler_config_json: webhook_config.to_string(),
+            }))
+            .await;
+
+        match result {
+            Ok(resp) => {
+                assert!(
+                    resp.get_ref().success,
+                    "invoke_output_handler with valid execution_id should succeed"
+                );
+            }
+            Err(status) => {
+                panic!(
+                    "invoke_output_handler with valid execution_id should not error: {:?}",
+                    status
+                );
+            }
+        }
     }
 }
