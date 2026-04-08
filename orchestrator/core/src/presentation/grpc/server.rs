@@ -76,6 +76,9 @@ pub struct AegisRuntimeService {
     discovery_service: Option<Arc<dyn DiscoveryService>>,
     /// BC-7: Volume lifecycle service for workspace volume provisioning (ADR-032/087).
     volume_service: Option<Arc<dyn VolumeService>>,
+    /// ADR-103: Output handler service for post-execution egress dispatch.
+    output_handler_service:
+        Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
 }
 
 impl AegisRuntimeService {
@@ -122,6 +125,7 @@ impl AegisRuntimeService {
             agent_service: None,
             discovery_service: None,
             volume_service: None,
+            output_handler_service: None,
         }
     }
 
@@ -180,6 +184,15 @@ impl AegisRuntimeService {
     /// Set the volume lifecycle service for workspace volume provisioning (ADR-032/087).
     pub fn with_volume_service(mut self, svc: Arc<dyn VolumeService>) -> Self {
         self.volume_service = Some(svc);
+        self
+    }
+
+    /// Attach an output handler service for post-execution egress dispatch (ADR-103).
+    pub fn with_output_handler_service(
+        mut self,
+        svc: Arc<dyn crate::application::output_handler_service::OutputHandlerService>,
+    ) -> Self {
+        self.output_handler_service = Some(svc);
         self
     }
 
@@ -1304,11 +1317,46 @@ impl AegisRuntime for AegisRuntimeService {
 
     async fn invoke_output_handler(
         &self,
-        _request: Request<InvokeOutputHandlerRequest>,
+        request: Request<InvokeOutputHandlerRequest>,
     ) -> Result<Response<InvokeOutputHandlerResponse>, Status> {
-        Err(Status::unimplemented(
-            "invoke_output_handler: dispatch handled internally",
-        ))
+        let req = request.into_inner();
+
+        let handler_config: crate::domain::output_handler::OutputHandlerConfig =
+            serde_json::from_str(&req.handler_config_json).map_err(|e| {
+                Status::invalid_argument(format!("Failed to deserialize handler_config_json: {e}"))
+            })?;
+
+        let svc = self
+            .output_handler_service
+            .as_ref()
+            .ok_or_else(|| Status::unavailable("Output handler service is not configured"))?;
+
+        let execution_id = crate::domain::execution::ExecutionId::from_string(&req.execution_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {e}")))?;
+
+        let tenant_id = TenantId::new(&req.tenant_id)
+            .map_err(|e| Status::invalid_argument(format!("Invalid tenant_id: {e}")))?;
+
+        match svc
+            .invoke(
+                &handler_config,
+                &req.final_output,
+                &execution_id,
+                &tenant_id,
+            )
+            .await
+        {
+            Ok(result) => Ok(Response::new(InvokeOutputHandlerResponse {
+                success: true,
+                result: result.unwrap_or_default(),
+                error: String::new(),
+            })),
+            Err(e) => Ok(Response::new(InvokeOutputHandlerResponse {
+                success: false,
+                result: String::new(),
+                error: e.to_string(),
+            })),
+        }
     }
 }
 

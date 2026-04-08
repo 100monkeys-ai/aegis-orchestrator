@@ -1103,6 +1103,222 @@ mod tests {
         assert_eq!(executions[0].id, parent_execution.id);
     }
 
+    /// Mock OutputHandlerService for regression tests.
+    struct MockOutputHandlerService {
+        result: Mutex<Result<Option<String>>>,
+    }
+
+    impl MockOutputHandlerService {
+        fn returning_ok(output: Option<String>) -> Self {
+            Self {
+                result: Mutex::new(Ok(output)),
+            }
+        }
+
+        fn returning_err(msg: &str) -> Self {
+            Self {
+                result: Mutex::new(Err(anyhow!(msg.to_string()))),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl crate::application::output_handler_service::OutputHandlerService for MockOutputHandlerService {
+        async fn invoke(
+            &self,
+            _config: &crate::domain::output_handler::OutputHandlerConfig,
+            _final_output: &str,
+            _execution_id: &ExecutionId,
+            _tenant_id: &TenantId,
+        ) -> Result<Option<String>> {
+            let mut guard = self.result.lock().unwrap();
+            // Replace with Err to prevent accidental reuse — tests should only invoke once.
+            std::mem::replace(&mut *guard, Err(anyhow!("already consumed")))
+        }
+    }
+
+    fn make_agent_with_output_handler(
+        name: &str,
+        handler: crate::domain::output_handler::OutputHandlerConfig,
+    ) -> Agent {
+        let mut agent = make_agent(name, None, None);
+        agent.manifest.spec.output_handler = Some(handler);
+        agent
+    }
+
+    /// Wait for the first ExecutionCompleted or ExecutionFailed event on the bus.
+    /// The receiver must be created BEFORE triggering the execution.
+    async fn wait_for_terminal_event(
+        receiver: &mut crate::infrastructure::event_bus::EventReceiver,
+    ) -> ExecutionEvent {
+        for _ in 0..200 {
+            if let Ok(event) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
+            {
+                if let Ok(domain_event) = event {
+                    if let crate::domain::events::DomainEvent::Execution(ev) = domain_event {
+                        match &ev {
+                            ExecutionEvent::ExecutionCompleted { .. }
+                            | ExecutionEvent::ExecutionFailed { .. } => return ev,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+        panic!("timed out waiting for terminal execution event");
+    }
+
+    #[tokio::test]
+    async fn output_handler_success_replaces_final_output_in_completed_event() {
+        let tenant_id = CoreTenantId::consumer();
+        let handler = crate::domain::output_handler::OutputHandlerConfig::Agent {
+            agent_id: "formatter".to_string(),
+            input_template: None,
+            timeout_seconds: None,
+            required: false,
+        };
+        let agent = make_agent_with_output_handler("worker", handler);
+        let agent_id = agent.id;
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &agent)
+            .await
+            .unwrap();
+
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        });
+
+        let mock_handler = Arc::new(MockOutputHandlerService::returning_ok(Some(
+            "FORMATTED OUTPUT".to_string(),
+        )));
+
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo,
+            event_bus.clone(),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+        .with_output_handler_service(mock_handler);
+
+        // Subscribe BEFORE starting execution so we don't miss events.
+        let mut receiver = event_bus.subscribe();
+
+        let _exec_id = service
+            .start_execution(
+                agent_id,
+                ExecutionInput {
+                    intent: Some("test".to_string()),
+                    input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                },
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event = wait_for_terminal_event(&mut receiver).await;
+        match event {
+            ExecutionEvent::ExecutionCompleted { final_output, .. } => {
+                assert_eq!(
+                    final_output, "FORMATTED OUTPUT",
+                    "ExecutionCompleted should carry the output handler's formatted result"
+                );
+            }
+            other => panic!(
+                "Expected ExecutionCompleted with formatted output, got: {:?}",
+                other
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn required_output_handler_failure_publishes_execution_failed() {
+        let tenant_id = CoreTenantId::consumer();
+        let handler = crate::domain::output_handler::OutputHandlerConfig::Agent {
+            agent_id: "formatter".to_string(),
+            input_template: None,
+            timeout_seconds: None,
+            required: true,
+        };
+        let agent = make_agent_with_output_handler("worker", handler);
+        let agent_id = agent.id;
+
+        let agent_repo = Arc::new(InMemoryAgentRepository::new());
+        agent_repo
+            .save_for_tenant(&tenant_id, &agent)
+            .await
+            .unwrap();
+
+        let execution_repo: Arc<dyn ExecutionRepository> =
+            Arc::new(InMemoryExecutionRepository::new());
+
+        let runtime = Arc::new(TestRuntime::default());
+        let supervisor = Arc::new(Supervisor::new(runtime.clone()));
+        let event_bus = Arc::new(EventBus::with_default_capacity());
+        let volume_service = Arc::new(TestVolumeService {
+            volumes: HashMap::new(),
+        });
+
+        let mock_handler = Arc::new(MockOutputHandlerService::returning_err("handler crashed"));
+
+        let service = StandardExecutionService::new(
+            agent_repo,
+            volume_service,
+            supervisor,
+            execution_repo,
+            event_bus.clone(),
+            Arc::new(crate::domain::node_config::NodeConfigManifest::default()),
+        )
+        .with_output_handler_service(mock_handler);
+
+        // Subscribe BEFORE starting execution so we don't miss events.
+        let mut receiver = event_bus.subscribe();
+
+        let _exec_id = service
+            .start_execution(
+                agent_id,
+                ExecutionInput {
+                    intent: Some("test".to_string()),
+                    input: serde_json::json!({ "tenant_id": "zaru-consumer" }),
+                    workspace_volume_id: None,
+                    workspace_volume_mount_path: None,
+                    workspace_remote_path: None,
+                },
+                "test-ctx".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let event = wait_for_terminal_event(&mut receiver).await;
+        match event {
+            ExecutionEvent::ExecutionFailed { reason, .. } => {
+                assert!(
+                    reason.contains("Output handler failed"),
+                    "Expected failure reason to mention output handler, got: {reason}"
+                );
+            }
+            other => panic!(
+                "Expected ExecutionFailed when required output handler fails, got: {:?}",
+                other
+            ),
+        }
+    }
+
     #[test]
     fn extract_context_overrides_rejects_reserved_keys() {
         let err = StandardExecutionService::extract_context_overrides(&serde_json::json!({
@@ -2380,39 +2596,49 @@ impl StandardExecutionService {
 
                         StandardExecutionService::store_trajectory_in_cortex(&cortex_client, &exec);
 
-                        event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
-                            execution_id,
-                            agent_id,
-                            final_output: final_output.clone(),
-                            total_iterations,
-                            completed_at: Utc::now(),
-                        });
-
-                        // ADR-103: Invoke output handler if declared on agent manifest.
+                        // ADR-103: Invoke output handler BEFORE publishing ExecutionCompleted
+                        // so that the handler's formatted output is what downstream consumers see.
+                        let mut effective_output = final_output.clone();
                         if let (Some(handler), Some(svc)) =
                             (&agent_output_handler, &output_handler_service)
                         {
-                            let handler_result = svc
+                            match svc
                                 .invoke(
                                     handler,
                                     &final_output,
                                     &execution_id,
                                     &tenant_id_for_output_handler,
                                 )
-                                .await;
-                            if let Err(e) = handler_result {
-                                if handler.is_required() {
+                                .await
+                            {
+                                Ok(Some(formatted_output)) => {
+                                    effective_output = formatted_output;
+                                }
+                                Ok(None) => {
+                                    // Handler produced no output — use raw final_output.
+                                }
+                                Err(e) if handler.is_required() => {
                                     tracing::error!(
                                         execution_id = %execution_id,
                                         "Required output handler failed — marking execution failed: {}",
                                         e
                                     );
-                                    let mut exec_to_fail = exec;
-                                    exec_to_fail.fail(format!("Output handler failed: {e}"));
+                                    exec.fail(format!("Output handler failed: {e}"));
                                     let _ = repository
-                                        .save_for_tenant(&tenant_id_for_task, &exec_to_fail)
+                                        .save_for_tenant(&tenant_id_for_task, &exec)
                                         .await;
-                                } else {
+                                    event_bus.publish_execution_event(
+                                        ExecutionEvent::ExecutionFailed {
+                                            execution_id,
+                                            agent_id,
+                                            reason: format!("Output handler failed: {e}"),
+                                            total_iterations,
+                                            failed_at: Utc::now(),
+                                        },
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
                                     tracing::warn!(
                                         execution_id = %execution_id,
                                         "Optional output handler failed (fire-and-forget): {}",
@@ -2421,6 +2647,14 @@ impl StandardExecutionService {
                                 }
                             }
                         }
+
+                        event_bus.publish_execution_event(ExecutionEvent::ExecutionCompleted {
+                            execution_id,
+                            agent_id,
+                            final_output: effective_output,
+                            total_iterations,
+                            completed_at: Utc::now(),
+                        });
                     }
                 }
                 Err(RuntimeError::TimedOut(timeout_secs)) => {
