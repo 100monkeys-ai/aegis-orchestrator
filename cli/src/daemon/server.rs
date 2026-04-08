@@ -1921,11 +1921,28 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
 
             // ADR-062: Spawn health sweeper for stale heartbeat detection
             {
-                let sweeper =
-                    aegis_orchestrator_core::application::cluster::HealthSweeper::with_defaults(
-                        health_sweeper_repo,
-                        event_bus.clone(),
-                    );
+                let stale_threshold = std::time::Duration::from_secs(
+                    config
+                        .spec
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.stale_threshold_secs)
+                        .unwrap_or(90),
+                );
+                let sweep_interval = std::time::Duration::from_secs(
+                    config
+                        .spec
+                        .cluster
+                        .as_ref()
+                        .and_then(|c| c.sweep_interval_secs)
+                        .unwrap_or(30),
+                );
+                let sweeper = aegis_orchestrator_core::application::cluster::HealthSweeper::new(
+                    health_sweeper_repo,
+                    event_bus.clone(),
+                    stale_threshold,
+                    sweep_interval,
+                );
                 let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
                 tokio::spawn(async move {
                     sweeper.run(shutdown_rx).await;
@@ -1935,7 +1952,9 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 // terminates.
                 std::mem::forget(shutdown_tx);
                 tracing::info!(
-                    "ADR-062: Health sweeper started (stale_threshold=90s, sweep_interval=30s)"
+                    stale_threshold_secs = stale_threshold.as_secs(),
+                    sweep_interval_secs = sweep_interval.as_secs(),
+                    "ADR-062: Health sweeper started"
                 );
             }
         } else {
