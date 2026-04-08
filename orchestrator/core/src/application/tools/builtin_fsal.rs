@@ -1,7 +1,7 @@
 use crate::application::nfs_gateway::NfsVolumeRegistry;
 use crate::application::tool_invocation_service::ToolInvocationResult;
 use crate::domain::execution::ExecutionId;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle};
+use crate::domain::fsal::{AegisFSAL, AegisFileHandle, CreateFsalFileRequest};
 use crate::domain::seal_session::SealSessionError;
 use serde_json::Value;
 use std::path::Path;
@@ -55,15 +55,15 @@ pub async fn invoke_fs_tool(
             let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
 
             let _file_handle = fsal
-                .create_file(
-                    vol_ctx.execution_id,
-                    vol_ctx.volume_id,
-                    &path,
-                    &vol_ctx.policy,
-                    false,
-                    None,
-                    None,
-                )
+                .create_file(CreateFsalFileRequest {
+                    execution_id: vol_ctx.execution_id,
+                    volume_id: vol_ctx.volume_id,
+                    path: &path,
+                    policy: &vol_ctx.policy,
+                    emit_event: false,
+                    caller_node_id: None,
+                    host_node_id: None,
+                })
                 .await
                 .map_err(|e| {
                     SealSessionError::InternalError(format!("FSAL create_file error: {e}"))
@@ -312,15 +312,15 @@ async fn invoke_multi_edit(
     // might not truncate by default. AegisFSAL create_file will truncate SeaweedFS (usually).
     // Let's call create_file to truncate, then write
     let _ = fsal
-        .create_file(
-            vol_ctx.execution_id,
-            vol_ctx.volume_id,
-            &path,
-            &vol_ctx.policy,
-            false,
-            None,
-            None,
-        )
+        .create_file(CreateFsalFileRequest {
+            execution_id: vol_ctx.execution_id,
+            volume_id: vol_ctx.volume_id,
+            path: &path,
+            policy: &vol_ctx.policy,
+            emit_event: false,
+            caller_node_id: None,
+            host_node_id: None,
+        })
         .await
         .map_err(|e| {
             SealSessionError::InternalError(format!("Multi-edit error (truncate): {e}"))
