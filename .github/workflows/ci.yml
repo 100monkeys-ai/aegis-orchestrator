@@ -30,8 +30,8 @@ jobs:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -103,8 +103,8 @@ jobs:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
 
-      - name: Install protobuf compiler
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable

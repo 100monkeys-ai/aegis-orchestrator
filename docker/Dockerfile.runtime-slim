@@ -8,6 +8,7 @@ FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
+    libfuse3-3 \
     curl \
     tini \
     && rm -rf /var/lib/apt/lists/*
