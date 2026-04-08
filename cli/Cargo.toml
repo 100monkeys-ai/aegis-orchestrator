@@ -80,6 +80,7 @@ keyring = "3"
 aes-gcm = "0.10"
 tonic = { workspace = true }
 prost = { workspace = true }
+parking_lot = { workspace = true }
 
 # Platform-specific daemon support
 [target.'cfg(unix)'.dependencies]
