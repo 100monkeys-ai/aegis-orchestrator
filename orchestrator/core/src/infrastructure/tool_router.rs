@@ -485,8 +485,8 @@ impl ToolRouter {
         // Reconciliation pass: ensure every advertisable builtin tool appears in the
         // output even when the builtin_dispatchers vec does not include it (e.g. the
         // daemon was constructed with a partial dispatcher list).
-        let existing_names: std::collections::HashSet<&str> =
-            all_tools.iter().map(|t| t.name.as_str()).collect();
+        let existing_names: std::collections::HashSet<String> =
+            all_tools.iter().map(|t| t.name.clone()).collect();
         for (name, description) in BUILTIN_TOOL_DEFINITIONS {
             if !Self::should_advertise_builtin_tool(name) {
                 continue;
