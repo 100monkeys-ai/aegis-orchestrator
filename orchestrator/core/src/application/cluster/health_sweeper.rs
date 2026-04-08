@@ -155,7 +155,7 @@ impl HealthSweeper {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::cluster::{NodeId, NodePeer, RegisteredNode, ResourceSnapshot};
+    use crate::domain::cluster::{NodeId, NodePeer, ResourceSnapshot};
     use std::collections::HashMap;
 
     /// Stub repository that panics on every method — only used to construct
@@ -195,9 +195,6 @@ mod tests {
             unimplemented!()
         }
         async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
-            unimplemented!()
-        }
-        async fn find_registered_node(&self, _: &NodeId) -> anyhow::Result<Option<RegisteredNode>> {
             unimplemented!()
         }
     }

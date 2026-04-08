@@ -63,7 +63,7 @@ mod tests {
     use super::*;
     use crate::domain::cluster::{
         ConfigLayerRepository, ConfigScope, ConfigSnapshot, ConfigType, MergedConfig,
-        NodeClusterRepository, NodePeer, NodePeerStatus, RegisteredNode, ResourceSnapshot,
+        NodeClusterRepository, NodePeer, NodePeerStatus, ResourceSnapshot,
     };
     use chrono::Utc;
     use std::collections::HashMap;
@@ -183,12 +183,6 @@ mod tests {
         }
         async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>> {
             Ok(HashMap::new())
-        }
-        async fn find_registered_node(
-            &self,
-            _node_id: &NodeId,
-        ) -> anyhow::Result<Option<RegisteredNode>> {
-            Ok(None)
         }
     }
 
