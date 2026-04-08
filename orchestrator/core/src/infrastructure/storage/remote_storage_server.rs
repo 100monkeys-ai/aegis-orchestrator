@@ -248,15 +248,20 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
-        // TODO: propagate caller_node_id + host_node_id into FSAL events once
-        // directory-level FSAL methods accept node provenance parameters.
-        let _caller_node_id = self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
 
         self.fsal
-            .create_directory(execution_id, volume_id, &req.path, &policy)
+            .create_directory(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -268,15 +273,20 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
-        // TODO: propagate caller_node_id + host_node_id into FSAL events once
-        // directory-level FSAL methods accept node provenance parameters.
-        let _caller_node_id = self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
 
         self.fsal
-            .delete_directory(execution_id, volume_id, &req.path, &policy)
+            .delete_directory(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -503,14 +513,21 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<ReaddirResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
 
         let entries = self
             .fsal
-            .readdir(execution_id, volume_id, &req.path, &policy)
+            .readdir(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -532,14 +549,22 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<CreateFileRequest>,
     ) -> Result<Response<OpenFileResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
 
         let _aegis_handle = self
             .fsal
-            .create_file(execution_id, volume_id, &req.path, &policy, true)
+            .create_file(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                true,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -573,15 +598,20 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
-        // TODO: propagate caller_node_id + host_node_id into FSAL events once
-        // file-level FSAL methods accept node provenance parameters.
-        let _caller_node_id = self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
 
         self.fsal
-            .delete_file(execution_id, volume_id, &req.path, &policy)
+            .delete_file(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -593,9 +623,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RenameRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
-        // TODO: propagate caller_node_id + host_node_id into FSAL events once
-        // rename FSAL method accepts node provenance parameters.
-        let _caller_node_id = self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
         let policy = Self::system_policy();
@@ -607,6 +635,8 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.from_path,
                 &req.to_path,
                 &policy,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -869,6 +899,8 @@ mod tests {
                 volume_id,
                 "/../../../etc/passwd",
                 &RemoteStorageServiceHandler::system_policy(),
+                None,
+                None,
             )
             .await;
 
@@ -904,6 +936,8 @@ mod tests {
             volume_id,
             "/workspace/testdir",
             &RemoteStorageServiceHandler::system_policy(),
+            None,
+            None,
         )
         .await
         .expect("create_directory should succeed");
