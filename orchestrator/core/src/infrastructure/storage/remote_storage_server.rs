@@ -33,7 +33,9 @@ use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeSecurityToken};
-use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy, FsalError, NodeStorageRequest};
+use crate::domain::fsal::{
+    AegisFSAL, FsalAccessPolicy, FsalError, NodeStorageRequest, RenameFsalRequest,
+};
 use crate::domain::path_sanitizer::PathSanitizer;
 use crate::domain::shared_kernel::ExecutionId;
 use crate::domain::storage::{FileHandle, FileType, OpenMode, StorageError};
@@ -629,15 +631,15 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         let policy = Self::system_policy();
 
         self.fsal
-            .rename(
+            .rename(RenameFsalRequest {
                 execution_id,
                 volume_id,
-                &req.from_path,
-                &req.to_path,
-                &policy,
-                Some(caller_node_id),
-                Some(self.host_node_id),
-            )
+                from_path: &req.from_path,
+                to_path: &req.to_path,
+                policy: &policy,
+                caller_node_id: Some(caller_node_id),
+                host_node_id: Some(self.host_node_id),
+            })
             .await
             .map_err(Self::fsal_err_to_status)?;
 

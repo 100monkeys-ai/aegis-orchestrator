@@ -185,6 +185,20 @@ pub struct NodeStorageRequest<'a> {
     pub host_node_id: Option<NodeId>,
 }
 
+/// Parameters for [`AegisFSAL::rename`].
+///
+/// Groups the provenance metadata and path parameters to keep the function
+/// signature within Clippy's function-argument-count limit.
+pub struct RenameFsalRequest<'a> {
+    pub execution_id: ExecutionId,
+    pub volume_id: VolumeId,
+    pub from_path: &'a str,
+    pub to_path: &'a str,
+    pub policy: &'a FsalAccessPolicy,
+    pub caller_node_id: Option<NodeId>,
+    pub host_node_id: Option<NodeId>,
+}
+
 /// Parameters for [`AegisFSAL::create_file`].
 ///
 /// Groups the provenance metadata and creation options to keep the function
@@ -1031,16 +1045,17 @@ impl AegisFSAL {
     }
 
     /// Rename a file or directory
-    pub async fn rename(
-        &self,
-        execution_id: ExecutionId,
-        volume_id: VolumeId,
-        from_path: &str,
-        to_path: &str,
-        policy: &FsalAccessPolicy,
-        caller_node_id: Option<NodeId>,
-        host_node_id: Option<NodeId>,
-    ) -> Result<(), FsalError> {
+    pub async fn rename(&self, req: RenameFsalRequest<'_>) -> Result<(), FsalError> {
+        let RenameFsalRequest {
+            execution_id,
+            volume_id,
+            from_path,
+            to_path,
+            policy,
+            caller_node_id,
+            host_node_id,
+        } = req;
+
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
 

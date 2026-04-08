@@ -49,7 +49,7 @@
 //! - **Purpose:** Implements internal responsibilities for server
 
 use crate::domain::execution::ExecutionId;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle, FsalAccessPolicy};
+use crate::domain::fsal::{AegisFSAL, AegisFileHandle, FsalAccessPolicy, RenameFsalRequest};
 use crate::domain::volume::VolumeId;
 use nfsserve::nfs::{fattr3, fileid3, filename3, ftype3, nfspath3, nfsstring, nfstime3, specdata3};
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
@@ -1050,15 +1050,15 @@ impl NFSFileSystem for AegisFsalAdapter {
 
         // Rename via FSAL
         self.fsal
-            .rename(
-                context.execution_id,
-                context.volume_id,
-                &from_path,
-                &to_path,
-                &context.policy,
-                None,
-                None,
-            )
+            .rename(RenameFsalRequest {
+                execution_id: context.execution_id,
+                volume_id: context.volume_id,
+                from_path: &from_path,
+                to_path: &to_path,
+                policy: &context.policy,
+                caller_node_id: None,
+                host_node_id: None,
+            })
             .await
             .map_err(|e| {
                 error!("FSAL rename failed: {}", e);
