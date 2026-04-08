@@ -56,9 +56,9 @@ impl VolumeRepository for PostgresVolumeRepository {
                 id, name, tenant_id, storage_class, backend,
                 size_limit_bytes, status, ownership,
                 created_at, attached_at, detached_at, expires_at,
-                owner_user_id
+                owner_user_id, host_node_id
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (id) DO UPDATE SET
                 storage_class = EXCLUDED.storage_class,
                 backend = EXCLUDED.backend,
@@ -68,7 +68,8 @@ impl VolumeRepository for PostgresVolumeRepository {
                 attached_at = EXCLUDED.attached_at,
                 detached_at = EXCLUDED.detached_at,
                 expires_at = EXCLUDED.expires_at,
-                owner_user_id = EXCLUDED.owner_user_id
+                owner_user_id = EXCLUDED.owner_user_id,
+                host_node_id = EXCLUDED.host_node_id
             -- Note: name and tenant_id are NOT unique - multiple executions can use same logical name
             -- remote_path is unique and includes volume_id, ensuring true isolation
             "#
@@ -86,6 +87,7 @@ impl VolumeRepository for PostgresVolumeRepository {
         .bind(volume.detached_at)
         .bind(volume.expires_at)
         .bind(owner_user_id)
+        .bind(volume.host_node_id.map(|n| n.0))
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save volume: {e}")))?;
@@ -328,6 +330,9 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
         RepositoryError::Serialization(format!("Failed to deserialize ownership: {e}"))
     })?;
 
+    // host_node_id is nullable; read if available, otherwise None
+    let host_node_id: Option<uuid::Uuid> = row.try_get("host_node_id").ok().flatten();
+
     Ok(Volume {
         id: VolumeId(id),
         name,
@@ -342,6 +347,7 @@ fn parse_volume_row(row: sqlx::postgres::PgRow) -> Result<Volume, RepositoryErro
         attached_at,
         detached_at,
         expires_at,
+        host_node_id: host_node_id.map(crate::domain::cluster::NodeId),
     })
 }
 
@@ -410,6 +416,7 @@ mod tests {
             attached_at: None,
             detached_at: None,
             expires_at: Some(now + chrono::Duration::hours(1)),
+            host_node_id: None,
         };
 
         repository
@@ -483,6 +490,7 @@ mod tests {
             attached_at: None,
             detached_at: None,
             expires_at: None,
+            host_node_id: None,
         };
 
         repository
@@ -531,6 +539,7 @@ mod tests {
             attached_at: None,
             detached_at: None,
             expires_at: Some(now + chrono::Duration::hours(1)),
+            host_node_id: None,
         };
 
         repository

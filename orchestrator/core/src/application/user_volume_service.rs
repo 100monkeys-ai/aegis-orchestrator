@@ -322,6 +322,7 @@ mod tests {
                 attached_at: None,
                 detached_at: None,
                 expires_at: None,
+                host_node_id: None,
             };
             vol.status = VolumeStatus::Available;
             self.repo.save(&vol).await?;

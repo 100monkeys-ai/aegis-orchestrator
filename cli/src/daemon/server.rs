@@ -1781,7 +1781,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         if let Some(ref pool) = db_pool {
             use aegis_orchestrator_core::infrastructure::cluster::{
                 NodeClusterServiceHandler, PgConfigLayerRepository, PgNodeChallengeRepository,
-                PgNodeClusterRepository, RoundRobinNodeRouter,
+                PgNodeClusterRepository, PgNodeRegistryRepository, RoundRobinNodeRouter,
             };
             use aegis_orchestrator_core::infrastructure::aegis_cluster_proto::node_cluster_service_server::NodeClusterServiceServer;
 
@@ -1805,9 +1805,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     secret_store,
                 ),
             );
+            let registry_repo: Arc<
+                dyn aegis_orchestrator_core::domain::cluster::NodeRegistryRepository,
+            > = Arc::new(PgNodeRegistryRepository::new(pool.clone()));
             let register_uc = Arc::new(
                 aegis_orchestrator_core::application::cluster::RegisterNodeUseCase::new(
                     cluster_repo.clone(),
+                    registry_repo.clone(),
                     controller_node_id,
                 ),
             );

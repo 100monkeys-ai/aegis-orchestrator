@@ -400,10 +400,6 @@ pub trait NodeClusterRepository: Send + Sync {
     async fn record_config_version(&self, node_id: &NodeId, hash: &str) -> anyhow::Result<()>;
     async fn list_all_peers(&self) -> anyhow::Result<Vec<NodePeer>>;
     async fn count_by_status(&self) -> anyhow::Result<HashMap<NodePeerStatus, usize>>;
-    async fn find_registered_node(
-        &self,
-        node_id: &NodeId,
-    ) -> anyhow::Result<Option<RegisteredNode>>;
 }
 
 /// Repository for node configuration and registry assignment (ADR-061).
@@ -572,21 +568,47 @@ pub trait ConfigLayerRepository: Send + Sync {
 
 // === Node Registry (ADR-061) ===
 
-/// Enriched node record for configuration assignment and registry queries.
-/// Extends NodePeer with additional metadata for operational management.
+/// Registry lifecycle status for a `RegisteredNode`.
+///
+/// Distinct from [`NodePeerStatus`] which tracks transient runtime health.
+/// `RegistryStatus` tracks the operator-managed lifecycle of a node in the
+/// durable registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistryStatus {
+    Pending,
+    Active,
+    Decommissioned,
+}
+
+/// Domain events emitted by [`RegisteredNode`] lifecycle transitions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NodeRegistryEvent {
+    NodeActivated {
+        node_id: NodeId,
+        activated_at: DateTime<Utc>,
+    },
+    NodeDecommissioned {
+        node_id: NodeId,
+        decommissioned_at: DateTime<Utc>,
+    },
+}
+
+/// Aggregate root for the durable node registry (ADR-061).
+///
+/// Separates operator-managed registration state from transient cluster peer
+/// health tracked by [`NodePeer`] / [`NodeCluster`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RegisteredNode {
     pub node_id: NodeId,
     pub hostname: String,
     pub role: NodeRole,
-    pub status: NodePeerStatus,
-    pub capabilities: NodeCapabilityAdvertisement,
-    pub grpc_address: String,
+    pub registry_status: RegistryStatus,
     pub software_version: String,
     pub metadata: HashMap<String, String>,
     pub config_version: Option<String>,
-    pub last_heartbeat_at: DateTime<Utc>,
     pub registered_at: DateTime<Utc>,
+    pub decommissioned_at: Option<DateTime<Utc>>,
 }
 
 impl RegisteredNode {
@@ -602,25 +624,46 @@ impl RegisteredNode {
             node_id: peer.node_id,
             hostname,
             role: peer.role,
-            status: peer.status,
-            capabilities: peer.capabilities.clone(),
-            grpc_address: peer.grpc_address.clone(),
+            registry_status: RegistryStatus::Pending,
             software_version,
             metadata,
             config_version,
-            last_heartbeat_at: peer.last_heartbeat_at,
             registered_at: peer.registered_at,
+            decommissioned_at: None,
         }
     }
 
-    /// Check if node is healthy and eligible for work routing
-    pub fn is_active(&self) -> bool {
-        self.status == NodePeerStatus::Active
+    /// Transition from Pending → Active.
+    pub fn activate(&mut self) -> Result<NodeRegistryEvent, anyhow::Error> {
+        if self.registry_status != RegistryStatus::Pending {
+            return Err(anyhow::anyhow!(
+                "Cannot activate node in {:?} state",
+                self.registry_status
+            ));
+        }
+        self.registry_status = RegistryStatus::Active;
+        Ok(NodeRegistryEvent::NodeActivated {
+            node_id: self.node_id,
+            activated_at: Utc::now(),
+        })
     }
 
-    /// Check if node is intentionally excluded from new work
-    pub fn is_draining(&self) -> bool {
-        self.status == NodePeerStatus::Draining
+    /// Transition to Decommissioned (from Pending or Active).
+    pub fn decommission(&mut self) -> Result<NodeRegistryEvent, anyhow::Error> {
+        if self.registry_status == RegistryStatus::Decommissioned {
+            return Err(anyhow::anyhow!("Node already decommissioned"));
+        }
+        self.registry_status = RegistryStatus::Decommissioned;
+        self.decommissioned_at = Some(Utc::now());
+        Ok(NodeRegistryEvent::NodeDecommissioned {
+            node_id: self.node_id,
+            decommissioned_at: Utc::now(),
+        })
+    }
+
+    /// Check if node is active in the registry and eligible for work routing
+    pub fn is_active(&self) -> bool {
+        self.registry_status == RegistryStatus::Active
     }
 }
 
@@ -714,5 +757,67 @@ mod tests {
         assert!(result.is_err());
         let missing = result.unwrap_err();
         assert!(missing[0].contains("root object"));
+    }
+
+    /// Build a minimal `RegisteredNode` in Pending state for testing.
+    fn make_pending_node() -> RegisteredNode {
+        let peer = NodePeer {
+            node_id: NodeId(Uuid::new_v4()),
+            role: NodeRole::Worker,
+            public_key: vec![],
+            capabilities: NodeCapabilityAdvertisement::default(),
+            grpc_address: "http://localhost:9090".to_string(),
+            status: NodePeerStatus::Active,
+            last_heartbeat_at: Utc::now(),
+            registered_at: Utc::now(),
+        };
+        RegisteredNode::from_peer(&peer, "host-1".into(), "0.1.0".into(), HashMap::new(), None)
+    }
+
+    #[test]
+    fn registered_node_lifecycle_pending_to_active_to_decommissioned() {
+        let mut node = make_pending_node();
+        assert_eq!(node.registry_status, RegistryStatus::Pending);
+        assert!(!node.is_active());
+
+        // Pending → Active
+        let event = node.activate().expect("activate should succeed");
+        assert_eq!(node.registry_status, RegistryStatus::Active);
+        assert!(node.is_active());
+        assert!(matches!(event, NodeRegistryEvent::NodeActivated { .. }));
+
+        // Active → Decommissioned
+        let event = node.decommission().expect("decommission should succeed");
+        assert_eq!(node.registry_status, RegistryStatus::Decommissioned);
+        assert!(!node.is_active());
+        assert!(node.decommissioned_at.is_some());
+        assert!(matches!(
+            event,
+            NodeRegistryEvent::NodeDecommissioned { .. }
+        ));
+    }
+
+    #[test]
+    fn activate_from_non_pending_returns_error() {
+        let mut node = make_pending_node();
+        node.activate().unwrap();
+        // Active → activate again should fail
+        let err = node.activate().unwrap_err();
+        assert!(
+            err.to_string().contains("Cannot activate"),
+            "Expected 'Cannot activate' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn decommission_already_decommissioned_returns_error() {
+        let mut node = make_pending_node();
+        node.decommission().unwrap();
+        // Decommissioned → decommission again should fail
+        let err = node.decommission().unwrap_err();
+        assert!(
+            err.to_string().contains("already decommissioned"),
+            "Expected 'already decommissioned' error, got: {err}"
+        );
     }
 }
