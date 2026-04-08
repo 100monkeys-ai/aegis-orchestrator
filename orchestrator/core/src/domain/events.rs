@@ -1489,6 +1489,8 @@ mod tests {
             path: "/workspace/file.txt".to_string(),
             open_mode: "read".to_string(),
             opened_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         let deserialized: StorageEvent = serde_json::from_str(&json).unwrap();
@@ -1514,6 +1516,8 @@ mod tests {
             requested_bytes: 1024,
             available_bytes: 0,
             exceeded_at: Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("QuotaExceeded"));
