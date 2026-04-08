@@ -779,3 +779,90 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
         }) if execution_id == wrong_execution_id && volume_id == borrowed_alias_id
     ));
 }
+
+/// Regression test: ContainerRun steps use a different execution_id (workflow
+/// execution) than the agent execution that originally registered the workspace
+/// volume. Without re-registering the volume for the ContainerRun's execution_id
+/// and updating DB ownership, FSAL authorize() rejects the access and readdir
+/// returns empty results — the NFS mount appears empty even though files exist.
+#[tokio::test]
+async fn test_fsal_denies_access_when_execution_id_does_not_match_volume_ownership() {
+    let storage_provider = Arc::new(TestStorageProvider) as Arc<dyn StorageProvider>;
+    let volume_repository = Arc::new(TestVolumeRepository::new()) as Arc<dyn VolumeRepository>;
+    let event_bus = Arc::new(EventBus::new(1000));
+    let event_publisher =
+        Arc::new(EventBusPublisher::new(event_bus.clone())) as Arc<dyn EventPublisher>;
+
+    let fsal = AegisFSAL::new(
+        storage_provider,
+        volume_repository.clone(),
+        event_publisher,
+        empty_borrowed_volume_registry(),
+    );
+
+    let agent_execution_id = ExecutionId::new();
+    let container_run_execution_id = ExecutionId::new();
+
+    // Volume is registered with agent_execution_id (as happens during WRITE_CODE)
+    let volume_id =
+        create_attached_test_volume(&volume_repository, agent_execution_id, 1024 * 1024).await;
+
+    let policy = FsalAccessPolicy {
+        read: vec!["/*".to_string()],
+        write: vec!["/*".to_string()],
+    };
+
+    // Access with the agent's execution_id succeeds (normal case)
+    let handle = AegisFileHandle::new(agent_execution_id, volume_id, "/workspace/test.txt");
+    let result = fsal
+        .read(&handle, "/workspace/test.txt", &policy, 0, 100)
+        .await;
+    assert!(
+        result.is_ok(),
+        "read with matching execution_id should succeed"
+    );
+
+    // Access with the ContainerRun's execution_id fails — this is the bug.
+    // The NFS FileHandle encodes the execution_id; when it doesn't match
+    // the volume ownership in the DB, FSAL authorize() denies access.
+    let wrong_handle =
+        AegisFileHandle::new(container_run_execution_id, volume_id, "/workspace/test.txt");
+    let result = fsal
+        .read(&wrong_handle, "/workspace/test.txt", &policy, 0, 100)
+        .await;
+    assert!(
+        matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+        "read with mismatched execution_id should fail before fix"
+    );
+
+    // After updating ownership to match container_run_execution_id (the fix),
+    // access succeeds. This is what container_step_runner now does via
+    // persist_external_volume before creating the container.
+    // (Delete + re-save simulates the upsert that persist_external_volume performs.)
+    volume_repository.delete(volume_id).await.unwrap();
+    let mut volume = Volume::new(
+        "test-volume".to_string(),
+        TenantId::default(),
+        StorageClass::persistent(),
+        VolumeBackend::SeaweedFS {
+            filer_endpoint: FilerEndpoint::new("http://filer:8888").unwrap(),
+            remote_path: "/volume-path".to_string(),
+        },
+        1024 * 1024,
+        VolumeOwnership::execution(container_run_execution_id),
+    )
+    .unwrap();
+    // Preserve the original volume_id
+    volume.id = volume_id;
+    volume.mark_available().unwrap();
+    volume.mark_attached().unwrap();
+    volume_repository.save(&volume).await.unwrap();
+
+    let result = fsal
+        .read(&wrong_handle, "/workspace/test.txt", &policy, 0, 100)
+        .await;
+    assert!(
+        result.is_ok(),
+        "read should succeed after re-registering volume with ContainerRun's execution_id"
+    );
+}
