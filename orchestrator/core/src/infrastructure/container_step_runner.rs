@@ -36,8 +36,8 @@ use bollard::models::{
     MountVolumeOptionsDriverConfig,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
-    WaitContainerOptions,
+    CreateContainerOptions, LogsOptions, RemoveContainerOptions, RemoveVolumeOptions,
+    StartContainerOptions, WaitContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -525,6 +525,29 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // carries the final resolved argv.
         let cmd: Vec<String> = config.command.clone();
 
+        // ─── 5b. Remove stale named volumes so NFS driver options are applied fresh ──
+        // Podman/Docker silently ignore driver_config when reusing an existing named
+        // volume. If a previous run created aegis-vol-{uuid} as a plain local volume,
+        // the NFS options on the new Mount are discarded and the container gets an
+        // empty local volume instead of the NFS-backed SeaweedFS volume.
+        if let Some(ref mounts) = host_config.mounts {
+            for m in mounts {
+                if let Some(ref vol_name) = m.source {
+                    if let Err(e) = self
+                        .docker
+                        .remove_volume(vol_name, None::<RemoveVolumeOptions>)
+                        .await
+                    {
+                        debug!(
+                            volume = %vol_name,
+                            error = %e,
+                            "Could not remove stale volume (may not exist)"
+                        );
+                    }
+                }
+            }
+        }
+
         // ─── 6. Create container ──────────────────────────────────────────────
         let container_name = format!(
             "aegis-step-{}-{}",
@@ -633,6 +656,27 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 error = %e,
                 "Failed to remove container step; resource may linger"
             );
+        }
+
+        // ─── 10b. Clean up named volumes after container removal ──────────────
+        // Remove the named volumes created for this run so they don't accumulate
+        // as stale plain-local volumes across runs.
+        if let Some(ref mounts) = host_config.mounts {
+            for m in mounts {
+                if let Some(ref vol_name) = m.source {
+                    if let Err(e) = self
+                        .docker
+                        .remove_volume(vol_name, None::<RemoveVolumeOptions>)
+                        .await
+                    {
+                        debug!(
+                            volume = %vol_name,
+                            error = %e,
+                            "Could not remove volume after container step (may still be in use)"
+                        );
+                    }
+                }
+            }
         }
 
         let duration_ms = start.elapsed().as_millis() as u64;

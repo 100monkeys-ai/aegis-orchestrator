@@ -46,7 +46,8 @@ use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
 use bollard::models::{ContainerCreateBody, Mount, MountTypeEnum};
 use bollard::query_parameters::{
     CreateContainerOptions, ListContainersOptionsBuilder, PruneImagesOptions,
-    RemoveContainerOptions, StartContainerOptions, StatsOptions, UploadToContainerOptions,
+    RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions, StatsOptions,
+    UploadToContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -624,7 +625,27 @@ impl AgentRuntime for ContainerRuntime {
             );
         }
 
-        // Removed container_config that was causing move issues and unused var warning
+        // Remove stale named volumes so NFS driver options are applied fresh.
+        // Podman/Docker silently ignore driver_config when reusing an existing named
+        // volume. If a previous run created aegis-vol-{uuid} as a plain local volume,
+        // the NFS options on the new Mount are discarded and the container gets an
+        // empty local volume instead of the NFS-backed SeaweedFS volume.
+        if let Some(ref mounts) = host_config.mounts {
+            for m in mounts {
+                if let Some(ref vol_name) = m.source {
+                    if let Err(e) = self
+                        .docker
+                        .remove_volume(vol_name, None::<RemoveVolumeOptions>)
+                        .await
+                    {
+                        debug!(
+                            "Could not remove stale volume '{}' (may not exist): {}",
+                            vol_name, e
+                        );
+                    }
+                }
+            }
+        }
 
         let options = CreateContainerOptions {
             name: Some(format!("aegis-agent-{}", uuid::Uuid::new_v4())),
@@ -891,10 +912,42 @@ impl AgentRuntime for ContainerRuntime {
 
         self.bootstrap_paths.write().await.remove(id.as_str());
 
+        // Inspect the container before removal to discover its named volumes
+        // so we can clean them up and prevent stale volume accumulation.
+        let volume_names: Vec<String> = self
+            .docker
+            .inspect_container(id.as_str(), None)
+            .await
+            .ok()
+            .and_then(|info| info.mounts)
+            .map(|mounts| {
+                mounts
+                    .iter()
+                    .filter_map(|m| m.name.clone())
+                    .filter(|name| name.starts_with("aegis-vol-"))
+                    .collect()
+            })
+            .unwrap_or_default();
+
         self.docker
             .remove_container(id.as_str(), Some(options))
             .await
             .map_err(|e| RuntimeError::TerminationFailed(e.to_string()))?;
+
+        // Clean up named volumes after container removal to prevent stale
+        // plain-local volumes from shadowing NFS driver options on next run.
+        for vol_name in &volume_names {
+            if let Err(e) = self
+                .docker
+                .remove_volume(vol_name, None::<RemoveVolumeOptions>)
+                .await
+            {
+                debug!(
+                    "Could not remove volume '{}' after termination (may still be in use): {}",
+                    vol_name, e
+                );
+            }
+        }
 
         info!("Terminated agent container: {}", id.as_str());
         Ok(())
