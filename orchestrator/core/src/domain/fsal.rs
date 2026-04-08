@@ -255,7 +255,7 @@ pub trait EventPublisher: Send + Sync {
 
 /// Domain-layer abstraction for querying the NFS volume registry.
 ///
-/// Used by [`AegisFSAL::authorize`] to resolve `VolumeOwnership::WorkflowExecution`
+/// Used by `AegisFSAL::authorize()` to resolve `VolumeOwnership::WorkflowExecution`
 /// without the domain layer depending on the application layer (`NfsVolumeRegistry`).
 /// The application layer provides the concrete implementation.
 pub trait VolumeContextLookup: Send + Sync {
