@@ -1605,6 +1605,7 @@ pub struct GrpcServerConfig {
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     pub discovery_service: Option<Arc<dyn DiscoveryService>>,
     pub volume_service: Option<Arc<dyn VolumeService>>,
+    /// Optional output handler service for post-execution egress dispatch (ADR-103).
     pub output_handler_service:
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
 }
@@ -2097,6 +2098,46 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unimplemented);
     }
 
+    /// Regression: GrpcServerConfig must include output_handler_service so the
+    /// InvokeOutputHandler RPC has a service implementation to delegate to.
+    /// Before this fix, the field was missing from GrpcServerConfig and
+    /// start_grpc_server never called with_output_handler_service, causing
+    /// all InvokeOutputHandler calls to fail with UNAVAILABLE.
+    #[test]
+    fn test_grpc_server_config_includes_output_handler_service() {
+        let has_field = |config: &GrpcServerConfig| config.output_handler_service.is_some();
+
+        let execution_id = ExecutionId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: vec![],
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+
+        let config = GrpcServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            execution_service,
+            validation_service,
+            grpc_auth: None,
+            attestation_service: None,
+            tool_invocation_service: None,
+            cortex_client: None,
+            run_container_step_use_case: None,
+            agent_service: None,
+            stimulus_service: None,
+            discovery_service: None,
+            volume_service: None,
+            output_handler_service: None,
+        };
+
+        assert!(
+            !has_field(&config),
+            "output_handler_service should be None when not provided"
+        );
+    }
+
     /// Regression: invoke_output_handler returned UNAVAILABLE because
     /// OutputHandlerService was never wired into the gRPC server. Verify that
     /// when the service IS attached, the handler does not return UNAVAILABLE.
@@ -2127,7 +2168,6 @@ mod tests {
         });
         let validation_service = test_validation_service(execution_service.clone());
 
-        // Build service WITH output handler wired — the fix under test.
         let service = AegisRuntimeService::new(execution_service, validation_service)
             .with_output_handler_service(Arc::new(StubOutputHandler));
 
@@ -2150,7 +2190,6 @@ mod tests {
             }))
             .await;
 
-        // The key assertion: the response MUST NOT be UNAVAILABLE.
         match &result {
             Err(status) => {
                 assert_ne!(
@@ -2160,7 +2199,6 @@ mod tests {
                 );
             }
             Ok(resp) => {
-                // The stub returns Ok, so we expect success.
                 assert!(
                     resp.get_ref().success,
                     "invoke_output_handler should succeed with stub service"
@@ -2169,8 +2207,8 @@ mod tests {
         }
     }
 
-    /// Regression counterpart: verify that WITHOUT the service wired, the
-    /// handler returns UNAVAILABLE (the pre-fix behavior).
+    /// Regression: verify that WITHOUT the service wired, the handler returns
+    /// UNAVAILABLE (the pre-fix behavior, guarding the error path).
     #[tokio::test]
     async fn invoke_output_handler_unavailable_without_service() {
         let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
@@ -2180,8 +2218,6 @@ mod tests {
             tenant_lookups: Mutex::new(Vec::new()),
         });
         let validation_service = test_validation_service(execution_service.clone());
-
-        // Build service WITHOUT output handler — no .with_output_handler_service() call.
         let service = AegisRuntimeService::new(execution_service, validation_service);
 
         let exec_id = ExecutionId::new();
