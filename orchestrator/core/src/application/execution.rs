@@ -1156,7 +1156,9 @@ mod tests {
                 tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
             {
                 if let Ok(domain_event) = event {
-                    if let crate::domain::events::DomainEvent::Execution(ev) = domain_event {
+                    if let crate::infrastructure::event_bus::DomainEvent::Execution(ev) =
+                        domain_event
+                    {
                         match &ev {
                             ExecutionEvent::ExecutionCompleted { .. }
                             | ExecutionEvent::ExecutionFailed { .. } => return ev,
