@@ -406,11 +406,10 @@ impl NodeClusterService for NodeClusterServiceHandler {
             .authenticate_node(request.into_inner().envelope)
             .await?;
 
-        // TODO(ADR-060 Gap 059-6): Pass tenant_id from proto once the
-        // SyncConfigInner message includes a tenant_id field.
+        let tenant_id = inner.tenant_id.as_deref();
         let result = self
             .sync_config_use_case
-            .execute(&node_id, None, &inner.current_config_version)
+            .execute(&node_id, tenant_id, &inner.current_config_version)
             .await
             .map_err(|e| Status::internal(e.to_string()))?;
 
