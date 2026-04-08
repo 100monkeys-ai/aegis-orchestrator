@@ -13,6 +13,7 @@
 //! | [`runtime`] | Docker runtime adapter implementing `AgentRuntime` trait | ADR-027 |
 //! | [`image_manager`] | `DockerImageManager` trait + `StandardDockerImageManager`, `CredentialResolver` | ADR-045 |
 //! | [`nfs`] | NFS Server Gateway: `AegisFSAL`, `NfsServer`, `AegisFileHandle` | ADR-036 |
+//! | [`fuse`] | FUSE FSAL Transport: `FuseFsalDaemon`, bind-mount volume access | ADR-107 |
 //! | [`seal`] | SEAL: attestation, envelope, middleware, policy engine, signature | ADR-035 |
 //! | [`event_bus`] | In-memory pub/sub `EventBus` + `DomainEvent` unified enum | ADR-030 |
 //! | [`llm`] | LLM provider adapters (OpenAI, Anthropic, Ollama) anti-corruption layer | ADR-009 |
@@ -48,6 +49,7 @@ pub mod db;
 pub mod discovery;
 pub mod docker;
 pub mod event_bus;
+pub mod fuse;
 pub mod human_input_service;
 pub mod iam;
 pub mod image_manager;

@@ -112,6 +112,15 @@ pub struct ContainerRuntime {
     image_manager: Arc<dyn DockerImageManager>,
     /// Event bus for publishing image management lifecycle events (ADR-045, ADR-030).
     event_bus: Arc<EventBus>,
+    /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
+    fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
+    /// Host directory prefix for FUSE mountpoints (ADR-107).
+    fuse_mount_prefix: String,
+    /// Active FUSE mount handles keyed by container ID (ADR-107).
+    /// Handles are inserted in `spawn()` and removed in `terminate()`.
+    /// Dropping a handle triggers FUSE_DESTROY + unmount on the host.
+    fuse_mount_handles:
+        RwLock<HashMap<String, Vec<crate::infrastructure::fuse::daemon::FuseMountHandle>>>,
 }
 
 /// Configuration bundle for constructing a [`ContainerRuntime`].
@@ -128,6 +137,13 @@ pub struct ContainerRuntimeConfig {
     pub nfs_mountport: u16,
     pub event_bus: Arc<EventBus>,
     pub credential_resolver: Arc<dyn CredentialResolver>,
+    /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
+    /// When `Some`, the runtime uses FUSE + bind mounts instead of NFS volume
+    /// driver mounts. Required for rootless container runtimes (Podman).
+    pub fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
+    /// Host directory prefix for FUSE mountpoints (ADR-107).
+    /// Default: `/tmp/aegis-fuse-mounts`.
+    pub fuse_mount_prefix: String,
 }
 
 impl ContainerRuntime {
@@ -142,6 +158,8 @@ impl ContainerRuntime {
             nfs_mountport,
             event_bus,
             credential_resolver,
+            fuse_daemon,
+            fuse_mount_prefix,
         } = config;
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
@@ -200,6 +218,9 @@ impl ContainerRuntime {
             bootstrap_paths: RwLock::new(HashMap::new()),
             image_manager,
             event_bus,
+            fuse_daemon,
+            fuse_mount_prefix,
+            fuse_mount_handles: RwLock::new(HashMap::new()),
         })
     }
 
@@ -541,88 +562,159 @@ impl AgentRuntime for ContainerRuntime {
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000_000 / 1000);
         }
 
-        // Apply NFS volume mounts if specified (ADR-036: Orchestrator Proxy Pattern)
+        // ─── Volume mounts: FUSE bind mount (ADR-107) or NFS volume driver (ADR-036) ──
+        // FUSE mount handles must outlive the container. We collect them here and
+        // store them in the per-container map once we know the container ID.
+        let mut pending_fuse_handles: Vec<crate::infrastructure::fuse::daemon::FuseMountHandle> =
+            Vec::new();
         if !config.volumes.is_empty() {
-            // Use explicit NFS server host if provided, otherwise extract from orchestrator_url
-            // This separation is needed because:
-            // - orchestrator_url is used by containers (Docker service name works: "aegis-runtime")
-            // - NFS mounts happen at Docker daemon level on host (needs resolvable hostname: "127.0.0.1")
-            let orchestrator_host = self.nfs_server_host.as_deref().unwrap_or_else(|| {
-                // Fallback: Default to "127.0.0.1" which covers Native Linux and WSL2 deployments.
-                // Prior behavior extracted the hostname from orchestrator_url (e.g., "aegis-runtime"),
-                // but this fails for Docker deployments since the Docker Daemon on the host
-                // cannot resolve internal container network names.
-                "127.0.0.1"
-            });
+            if let Some(ref fuse_daemon) = self.fuse_daemon {
+                // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
+                // Collect (handle, mount) pairs so FuseMountHandle values are kept
+                // alive until terminate() is called. Dropping a handle unmounts.
+                let fuse_pairs: Vec<(crate::infrastructure::fuse::daemon::FuseMountHandle, Mount)> =
+                    config
+                        .volumes
+                        .iter()
+                        .filter_map(|volume_mount| {
+                            let container_path = volume_mount.mount_point.display().to_string();
+                            let is_read_only = matches!(
+                                volume_mount.access_mode,
+                                crate::domain::volume::AccessMode::ReadOnly
+                            );
+                            let policy = crate::domain::fsal::FsalAccessPolicy {
+                                read: vec!["/*".to_string()],
+                                write: if is_read_only {
+                                    vec![]
+                                } else {
+                                    vec!["/*".to_string()]
+                                },
+                            };
 
-            let mounts: Vec<Mount> = config
-                .volumes
-                .iter()
-                .map(|volume_mount| {
-                    let container_path = volume_mount.mount_point.display().to_string();
+                            let mountpoint_path =
+                                format!("{}/{}", self.fuse_mount_prefix, volume_mount.volume_id);
+                            let fuse_context =
+                                crate::infrastructure::fuse::daemon::FuseVolumeContext {
+                                    execution_id: config.execution_id,
+                                    volume_id: volume_mount.volume_id,
+                                    workflow_execution_id: None,
+                                    container_uid: 1000, // Default; overridden by manifest
+                                    container_gid: 1000,
+                                    policy,
+                                };
 
-                    // ADR-036: NFS Server Gateway configuration via local driver
-                    // Mount options: addr={host},nfsvers=3,proto=tcp,soft,timeo=10,nolock
-                    // - NFSv3 protocol (not v4, for simplicity)
-                    // - nolock: No NLM support in Phase 1 (safe for single-agent-per-volume)
-                    // - soft mount with 10-second timeout (fail gracefully on network issues)
-                    // - TCP protocol for reliability
+                            match fuse_daemon
+                                .mount(std::path::Path::new(&mountpoint_path), fuse_context)
+                            {
+                                Ok(handle) => {
+                                    debug!(
+                                        volume_id = %volume_mount.volume_id,
+                                        mountpoint = %mountpoint_path,
+                                        container_path = %container_path,
+                                        read_only = is_read_only,
+                                        "Configured FUSE bind mount for agent container (ADR-107)"
+                                    );
+                                    Some((
+                                        handle,
+                                        Mount {
+                                            target: Some(container_path),
+                                            source: Some(mountpoint_path),
+                                            typ: Some(MountTypeEnum::BIND),
+                                            read_only: Some(is_read_only),
+                                            ..Default::default()
+                                        },
+                                    ))
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        volume_id = %volume_mount.volume_id,
+                                        "FUSE mount failed — skipping volume"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
 
-                    debug!(
-                        "Configuring NFS mount: volume_id={}, path={}, mode={:?}, host={}",
-                        volume_mount.volume_id,
-                        container_path,
-                        volume_mount.access_mode,
-                        orchestrator_host
+                // Split into handles (stored per-container) and mounts (passed to Docker).
+                let (fuse_handles, mounts): (Vec<_>, Vec<_>) = fuse_pairs.into_iter().unzip();
+
+                // Temporarily hold handles; they'll be stored in the per-container
+                // map once we know the container ID (after create_container).
+                pending_fuse_handles = fuse_handles;
+
+                if !mounts.is_empty() {
+                    host_config.mounts = Some(mounts);
+                    info!(
+                        "Configured {} FUSE bind mount(s) for container (ADR-107)",
+                        config.volumes.len()
                     );
+                }
+            } else {
+                // ── NFS volume driver path (ADR-036) ─────────────────────────────
+                let orchestrator_host = self
+                    .nfs_server_host
+                    .as_deref()
+                    .unwrap_or_else(|| "127.0.0.1");
 
-                    // Build NFS mount using local driver (standard Docker approach)
-                    use bollard::models::{MountVolumeOptions, MountVolumeOptionsDriverConfig};
-                    use std::collections::HashMap;
+                let mounts: Vec<Mount> = config
+                    .volumes
+                    .iter()
+                    .map(|volume_mount| {
+                        let container_path = volume_mount.mount_point.display().to_string();
 
-                    let mut driver_opts = HashMap::new();
-                    driver_opts.insert("type".to_string(), "nfs".to_string());
-                    driver_opts.insert(
-                        "o".to_string(),
-                        format!(
-                            "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
-                            orchestrator_host, self.nfs_port, self.nfs_mountport
-                        ),
-                    );
-                    driver_opts.insert(
-                        "device".to_string(),
-                        format!(":{}", volume_mount.remote_path), // remote_path contains /{tenant_id}/{volume_id}
-                    );
-
-                    Mount {
-                        target: Some(container_path),
-                        // Named volumes (source is set) support ReadOnly mode;
-                        // anonymous volumes (source=None) do NOT — Docker returns
-                        // HTTP 400 "must not set ReadOnly mode when using anonymous
-                        // volumes".  Use a deterministic name derived from volume_id.
-                        source: Some(format!("aegis-vol-{}", volume_mount.volume_id)),
-                        typ: Some(MountTypeEnum::VOLUME),
-                        read_only: Some(matches!(
+                        debug!(
+                            "Configuring NFS mount: volume_id={}, path={}, mode={:?}, host={}",
+                            volume_mount.volume_id,
+                            container_path,
                             volume_mount.access_mode,
-                            crate::domain::volume::AccessMode::ReadOnly
-                        )),
-                        volume_options: Some(MountVolumeOptions {
-                            driver_config: Some(MountVolumeOptionsDriverConfig {
-                                name: Some("local".to_string()),
-                                options: Some(driver_opts),
+                            orchestrator_host
+                        );
+
+                        use bollard::models::{MountVolumeOptions, MountVolumeOptionsDriverConfig};
+                        use std::collections::HashMap;
+
+                        let mut driver_opts = HashMap::new();
+                        driver_opts.insert("type".to_string(), "nfs".to_string());
+                        driver_opts.insert(
+                            "o".to_string(),
+                            format!(
+                                "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
+                                orchestrator_host, self.nfs_port, self.nfs_mountport
+                            ),
+                        );
+                        driver_opts.insert(
+                            "device".to_string(),
+                            format!(":{}", volume_mount.remote_path),
+                        );
+
+                        Mount {
+                            target: Some(container_path),
+                            source: Some(format!("aegis-vol-{}", volume_mount.volume_id)),
+                            typ: Some(MountTypeEnum::VOLUME),
+                            read_only: Some(matches!(
+                                volume_mount.access_mode,
+                                crate::domain::volume::AccessMode::ReadOnly
+                            )),
+                            volume_options: Some(MountVolumeOptions {
+                                driver_config: Some(MountVolumeOptionsDriverConfig {
+                                    name: Some("local".to_string()),
+                                    options: Some(driver_opts),
+                                }),
+                                ..Default::default()
                             }),
                             ..Default::default()
-                        }),
-                        ..Default::default()
-                    }
-                })
-                .collect();
+                        }
+                    })
+                    .collect();
 
-            host_config.mounts = Some(mounts);
-            info!(
-                "Configured {} NFS volume mount(s) for container (ADR-036)",
-                config.volumes.len()
-            );
+                host_config.mounts = Some(mounts);
+                info!(
+                    "Configured {} NFS volume mount(s) for container (ADR-036)",
+                    config.volumes.len()
+                );
+            }
         }
 
         // Remove stale named volumes so NFS driver options are applied fresh.
@@ -705,6 +797,16 @@ impl AgentRuntime for ContainerRuntime {
             .map_err(|e| RuntimeError::SpawnFailed(e.to_string()))?;
 
         let id = res.id;
+
+        // Store FUSE mount handles keyed by container ID (ADR-107).
+        // Handles are dropped in terminate() after the container is removed,
+        // triggering FUSE_DESTROY + unmount on the host mountpoints.
+        if !pending_fuse_handles.is_empty() {
+            self.fuse_mount_handles
+                .write()
+                .await
+                .insert(id.clone(), pending_fuse_handles);
+        }
 
         self.keep_container_on_failure
             .write()
@@ -947,6 +1049,17 @@ impl AgentRuntime for ContainerRuntime {
                     vol_name, e
                 );
             }
+        }
+
+        // Drop FUSE mount handles (ADR-107). Dropping triggers FUSE_DESTROY +
+        // unmount on each host mountpoint now that the container is gone.
+        if let Some(handles) = self.fuse_mount_handles.write().await.remove(id.as_str()) {
+            debug!(
+                container_id = id.as_str(),
+                count = handles.len(),
+                "Dropping FUSE mount handles after container termination"
+            );
+            drop(handles);
         }
 
         info!("Terminated agent container: {}", id.as_str());

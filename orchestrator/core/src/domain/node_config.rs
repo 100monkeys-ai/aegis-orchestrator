@@ -422,6 +422,11 @@ pub struct RuntimeConfig {
     /// Default: "runtime-registry.yaml" (relative to daemon working directory)
     #[serde(default = "default_runtime_registry_path")]
     pub runtime_registry_path: String,
+
+    /// Host directory prefix for FUSE mountpoints (ADR-107).
+    /// Each volume gets a FUSE mount at `{fuse_mount_prefix}/{volume_id}`.
+    /// Default: `/tmp/aegis-fuse-mounts`
+    pub fuse_mount_prefix: Option<String>,
 }
 
 fn default_runtime_registry_path() -> String {
@@ -444,6 +449,7 @@ impl Default for RuntimeConfig {
             nfs_port: default_nfs_port(),
             nfs_mountport: default_nfs_port(),
             runtime_registry_path: default_runtime_registry_path(),
+            fuse_mount_prefix: None,
         }
     }
 }

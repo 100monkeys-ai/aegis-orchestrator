@@ -538,6 +538,31 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             }
         });
 
+    // ─── FUSE FSAL Daemon (ADR-107) ─────────────────────────────────────────────
+    // Create a shared FUSE daemon that will be injected into both ContainerRuntime
+    // and ContainerStepRunner. Uses the same FSAL instance as the NFS gateway.
+    let fuse_mount_prefix = config
+        .spec
+        .runtime
+        .fuse_mount_prefix
+        .clone()
+        .unwrap_or_else(|| "/tmp/aegis-fuse-mounts".to_string());
+
+    // Create mount prefix directory on startup
+    if let Err(e) = std::fs::create_dir_all(&fuse_mount_prefix) {
+        warn!(
+            error = %e,
+            path = %fuse_mount_prefix,
+            "Failed to create FUSE mount prefix directory — FUSE transport will be unavailable"
+        );
+    }
+
+    // The FUSE daemon is created after the NFS gateway (which owns the FSAL).
+    // We store None here and set it after nfs_gateway is available.
+    let fuse_daemon_placeholder: Option<
+        Arc<aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon>,
+    > = None;
+
     let runtime = Arc::new(
         ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
             bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
@@ -553,6 +578,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                     config.spec.registry_credentials.clone(),
                 ),
             ),
+            fuse_daemon: fuse_daemon_placeholder.clone(),
+            fuse_mount_prefix: fuse_mount_prefix.clone(),
         })
         .context("Failed to initialize Docker runtime")?,
     );
@@ -763,6 +790,23 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         std::process::exit(1);
     }
     info!(port = nfs_bind_port, "NFS Server Gateway started");
+
+    // ─── Create FUSE FSAL Daemon (ADR-107) ───────────────────────────────────
+    // Shares the same FSAL instance as the NFS gateway. The FUSE daemon provides
+    // an alternative volume transport using host-local FUSE mountpoints + bind
+    // mounts, which works in rootless container runtimes.
+    let fuse_daemon: Option<
+        Arc<aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon>,
+    > = {
+        let fsal = nfs_gateway.fsal().clone();
+        let daemon =
+            aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon::new(fsal);
+        info!(
+            mount_prefix = %fuse_mount_prefix,
+            "FUSE FSAL daemon initialized (ADR-107)"
+        );
+        Some(Arc::new(daemon))
+    };
 
     // Initialize security context repository early — needed by StandardAgentLifecycleService (ADR-102).
     let security_context_repo: Arc<
@@ -1422,6 +1466,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 nfs_port: config.spec.runtime.nfs_port,
                 nfs_mountport: config.spec.runtime.nfs_mountport,
                 network_mode: network_mode.clone(),
+                fuse_daemon: fuse_daemon.clone(),
+                fuse_mount_prefix: fuse_mount_prefix.clone(),
             },
             event_bus.clone(),
             secrets_manager.clone(),

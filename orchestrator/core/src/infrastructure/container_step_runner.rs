@@ -61,6 +61,14 @@ pub struct ContainerStepRunnerConfig {
     /// `addr=127.0.0.1` in NFS mount options resolves to the host NFS
     /// server rather than the container's own loopback (ADR-036).
     pub network_mode: Option<String>,
+    /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
+    /// When `Some`, the runner uses FUSE + bind mounts instead of NFS volume
+    /// driver mounts. This is required for rootless container runtimes (Podman).
+    pub fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
+    /// Host directory prefix for FUSE mountpoints (ADR-107).
+    /// Each volume is mounted at `{fuse_mount_prefix}/{volume_name}`.
+    /// Default: `/tmp/aegis-fuse-mounts`.
+    pub fuse_mount_prefix: String,
 }
 
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
@@ -78,6 +86,10 @@ pub struct ContainerStepRunnerImpl {
     /// Inherited from the same resolved value used for agent containers so
     /// that NFS `addr=127.0.0.1` refers to the host, not the container loopback.
     network_mode: Option<String>,
+    /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
+    fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
+    /// Host directory prefix for FUSE mountpoints (ADR-107).
+    fuse_mount_prefix: String,
     event_bus: Arc<EventBus>,
     /// Used to resolve per-step registry credentials stored in OpenBao (ADR-050).
     /// When `ContainerStepConfig::registry_credentials` is `Some("secret:engine/path")`,
@@ -105,6 +117,8 @@ impl ContainerStepRunnerImpl {
             nfs_port: config.nfs_port,
             nfs_mountport: config.nfs_mountport,
             network_mode: config.network_mode,
+            fuse_daemon: config.fuse_daemon,
+            fuse_mount_prefix: config.fuse_mount_prefix,
             event_bus,
             secrets_manager,
             volume_registry,
@@ -338,7 +352,11 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         }
 
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
-        let host_config = {
+        // _fuse_mount_handles keeps FUSE mounts alive for the container's lifetime.
+        // Dropping the handles triggers unmount, so they must outlive the container.
+        let (host_config, _fuse_mount_handles) = {
+            let mut return_fuse_handles: Vec<crate::infrastructure::fuse::daemon::FuseMountHandle> =
+                Vec::new();
             let readonly_rootfs = config.read_only_root_filesystem;
             let mut hc = HostConfig {
                 // Step-level network_mode overrides the runner-level default (ADR-087 D5).
@@ -416,89 +434,184 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
-            // NFS mounts
+            // ─── Volume mounts: FUSE bind mount (ADR-107) or NFS volume driver (ADR-036) ──
             if !config.volumes.is_empty() {
-                let nfs_host = self.nfs_server_host.as_deref().unwrap_or("127.0.0.1");
+                if let Some(ref fuse_daemon) = self.fuse_daemon {
+                    // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
+                    // Mount a per-volume FUSE filesystem on the host, then bind-mount
+                    // that path into the container. Works with rootless runtimes.
+                    //
+                    // We collect (handle, mount) pairs so the FuseMountHandle values
+                    // are kept alive until the container exits. Dropping a handle
+                    // triggers an unmount, so they must outlive the container.
+                    let fuse_pairs: Vec<(
+                        crate::infrastructure::fuse::daemon::FuseMountHandle,
+                        Mount,
+                    )> = config
+                        .volumes
+                        .iter()
+                        .filter_map(|vm| {
+                            let volume_id = match uuid::Uuid::parse_str(&vm.name) {
+                                Ok(uuid) => VolumeId(uuid),
+                                Err(_) => {
+                                    warn!(
+                                        volume_name = %vm.name,
+                                        "Cannot parse volume name as UUID — skipping FUSE mount"
+                                    );
+                                    return None;
+                                }
+                            };
 
-                let mounts: Vec<Mount> = config
-                    .volumes
-                    .iter()
-                    .map(|vm| {
-                        let mut driver_opts = HashMap::new();
-                        driver_opts.insert("type".to_string(), "nfs".to_string());
-                        driver_opts.insert(
-                            "o".to_string(),
-                            format!(
-                                "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
-                                nfs_host, self.nfs_port, self.nfs_mountport
-                            ),
+                            let existing_ctx = self.volume_registry.lookup(volume_id)?;
+                            let policy = FsalAccessPolicy {
+                                read: vec!["/*".to_string()],
+                                write: if vm.read_only {
+                                    vec![]
+                                } else {
+                                    vec!["/*".to_string()]
+                                },
+                            };
+
+                            let mountpoint_path = format!("{}/{}", self.fuse_mount_prefix, vm.name);
+                            let fuse_context =
+                                crate::infrastructure::fuse::daemon::FuseVolumeContext {
+                                    execution_id: config.execution_id,
+                                    volume_id,
+                                    workflow_execution_id: existing_ctx
+                                        .workflow_execution_id
+                                        .or(config.workflow_execution_id),
+                                    container_uid: existing_ctx.container_uid,
+                                    container_gid: existing_ctx.container_gid,
+                                    policy,
+                                };
+
+                            match fuse_daemon
+                                .mount(std::path::Path::new(&mountpoint_path), fuse_context)
+                            {
+                                Ok(handle) => {
+                                    debug!(
+                                        step_name = %config.name,
+                                        volume_name = %vm.name,
+                                        mountpoint = %mountpoint_path,
+                                        mount_path = %vm.mount_path,
+                                        read_only = vm.read_only,
+                                        "Configured FUSE bind mount for container step (ADR-107)"
+                                    );
+
+                                    Some((
+                                        handle,
+                                        Mount {
+                                            target: Some(vm.mount_path.clone()),
+                                            source: Some(mountpoint_path),
+                                            typ: Some(MountTypeEnum::BIND),
+                                            read_only: Some(vm.read_only),
+                                            ..Default::default()
+                                        },
+                                    ))
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        volume_name = %vm.name,
+                                        "FUSE mount failed — falling back to NFS for this volume"
+                                    );
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+
+                    // Split into handles (kept alive) and mounts (passed to Docker).
+                    let (fuse_handles, mounts): (Vec<_>, Vec<_>) = fuse_pairs.into_iter().unzip();
+
+                    if !mounts.is_empty() {
+                        hc.mounts = Some(mounts);
+                        info!(
+                            step_name = %config.name,
+                            count = config.volumes.len(),
+                            "Configured FUSE bind mount(s) for container step (ADR-107)"
                         );
-                        // Device path: resolve the remote_path registered in the NFS volume
-                        // registry (e.g. /aegis/volumes/{tenant_id}/{volume_id}).
-                        let device_path = uuid::Uuid::parse_str(&vm.name)
-                            .ok()
-                            .and_then(|uuid| {
-                                self.volume_registry.lookup(VolumeId(uuid))
-                            })
-                            .map(|ctx| format!(":{}", ctx.remote_path));
+                    }
 
-                        if device_path.is_none() {
-                            warn!(
+                    return_fuse_handles = fuse_handles;
+                } else {
+                    // ── NFS volume driver path (ADR-036) ─────────────────────────────
+                    let nfs_host = self.nfs_server_host.as_deref().unwrap_or("127.0.0.1");
+
+                    let mounts: Vec<Mount> = config
+                        .volumes
+                        .iter()
+                        .map(|vm| {
+                            let mut driver_opts = HashMap::new();
+                            driver_opts.insert("type".to_string(), "nfs".to_string());
+                            driver_opts.insert(
+                                "o".to_string(),
+                                format!(
+                                    "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
+                                    nfs_host, self.nfs_port, self.nfs_mountport
+                                ),
+                            );
+                            let device_path = uuid::Uuid::parse_str(&vm.name)
+                                .ok()
+                                .and_then(|uuid| {
+                                    self.volume_registry.lookup(VolumeId(uuid))
+                                })
+                                .map(|ctx| format!(":{}", ctx.remote_path));
+
+                            if device_path.is_none() {
+                                warn!(
+                                    step_name = %config.name,
+                                    volume_name = %vm.name,
+                                    execution_id = %config.execution_id,
+                                    "NFS volume registry lookup failed — volume may not be mounted correctly"
+                                );
+                            }
+
+                            let device_path = device_path.unwrap_or_else(|| {
+                                format!(":{}/{}", config.execution_id, vm.name)
+                            });
+                            driver_opts.insert("device".to_string(), device_path.clone());
+
+                            let volume_source_name = format!("aegis-vol-{}", vm.name);
+
+                            debug!(
                                 step_name = %config.name,
                                 volume_name = %vm.name,
-                                execution_id = %config.execution_id,
-                                "NFS volume registry lookup failed — volume may not be mounted correctly"
+                                volume_source = %volume_source_name,
+                                device_path = %device_path,
+                                mount_path = %vm.mount_path,
+                                read_only = vm.read_only,
+                                nfs_host = nfs_host,
+                                "Configuring NFS mount for container step"
                             );
-                        }
 
-                        let device_path = device_path.unwrap_or_else(|| {
-                            format!(":{}/{}", config.execution_id, vm.name)
-                        });
-                        driver_opts.insert("device".to_string(), device_path.clone());
-
-                        // Use the same Docker volume source name as agent containers
-                        // (aegis-vol-{volume_id}) so that Docker reuses the existing
-                        // named volume and its NFS mount, rather than creating a separate
-                        // volume that may not resolve correctly (ADR-036).
-                        let volume_source_name = format!("aegis-vol-{}", vm.name);
-
-                        debug!(
-                            step_name = %config.name,
-                            volume_name = %vm.name,
-                            volume_source = %volume_source_name,
-                            device_path = %device_path,
-                            mount_path = %vm.mount_path,
-                            read_only = vm.read_only,
-                            nfs_host = nfs_host,
-                            "Configuring NFS mount for container step"
-                        );
-
-                        Mount {
-                            target: Some(vm.mount_path.clone()),
-                            source: Some(volume_source_name),
-                            typ: Some(MountTypeEnum::VOLUME),
-                            read_only: Some(vm.read_only),
-                            volume_options: Some(MountVolumeOptions {
-                                driver_config: Some(MountVolumeOptionsDriverConfig {
-                                    name: Some("local".to_string()),
-                                    options: Some(driver_opts),
+                            Mount {
+                                target: Some(vm.mount_path.clone()),
+                                source: Some(volume_source_name),
+                                typ: Some(MountTypeEnum::VOLUME),
+                                read_only: Some(vm.read_only),
+                                volume_options: Some(MountVolumeOptions {
+                                    driver_config: Some(MountVolumeOptionsDriverConfig {
+                                        name: Some("local".to_string()),
+                                        options: Some(driver_opts),
+                                    }),
+                                    ..Default::default()
                                 }),
                                 ..Default::default()
-                            }),
-                            ..Default::default()
-                        }
-                    })
-                    .collect();
+                            }
+                        })
+                        .collect();
 
-                hc.mounts = Some(mounts);
-                info!(
-                    step_name = %config.name,
-                    count = config.volumes.len(),
-                    "Configured NFS volume mount(s) for container step (ADR-036)"
-                );
+                    hc.mounts = Some(mounts);
+                    info!(
+                        step_name = %config.name,
+                        count = config.volumes.len(),
+                        "Configured NFS volume mount(s) for container step (ADR-036)"
+                    );
+                }
             }
 
-            hc
+            (hc, return_fuse_handles)
         };
 
         // ─── 4. Build env vars ────────────────────────────────────────────────
@@ -681,6 +794,12 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 );
             }
         }
+
+        // ─── 10c. Drop FUSE mount handles (ADR-107) ─────────────────────────
+        // _fuse_mount_handles is dropped when this function returns, which is
+        // after the container has been removed. Each handle's Drop impl triggers
+        // FUSE_DESTROY + unmount, so the host mountpoints are cleaned up here.
+        drop(_fuse_mount_handles);
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
