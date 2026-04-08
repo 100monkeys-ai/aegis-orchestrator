@@ -338,13 +338,23 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
 
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
         let host_config = {
+            let readonly_rootfs = config.read_only_root_filesystem;
             let mut hc = HostConfig {
                 // Step-level network_mode overrides the runner-level default (ADR-087 D5).
                 network_mode: config
                     .network_mode
                     .clone()
                     .or_else(|| self.network_mode.clone()),
-                readonly_rootfs: Some(config.read_only_root_filesystem),
+                readonly_rootfs: Some(readonly_rootfs),
+                // When the root filesystem is read-only, mount a writable tmpfs at /tmp
+                // so runtimes (Python, Node, etc.) can use temporary files as expected.
+                tmpfs: if readonly_rootfs {
+                    let mut m = HashMap::new();
+                    m.insert("/tmp".to_string(), "size=64m".to_string());
+                    Some(m)
+                } else {
+                    None
+                },
                 ..Default::default()
             };
 
@@ -730,15 +740,39 @@ async fn do_capture(docker: &Docker, container_id: &str) -> Result<CapturedOutpu
     };
     let mut wait_stream = docker.wait_container(container_id, Some(wait_opts));
 
-    let exit_code = if let Some(result) = wait_stream.next().await {
-        match result {
-            Ok(body) => body.status_code as i32,
-            Err(e) => {
-                return Err(CaptureError::Docker(format!("wait_container error: {e}")));
-            }
+    let exit_code = match wait_stream.next().await {
+        Some(Ok(body)) => body.status_code as i32,
+        Some(Err(e)) => {
+            // Podman compatibility: when a container has already exited before
+            // wait_container is called, Podman returns an error instead of the
+            // exit code. Fall back to inspect_container to retrieve it.
+            warn!(
+                container_id = %container_id,
+                error = %e,
+                "wait_container failed; falling back to inspect for exit code (Podman compatibility)"
+            );
+            let info = docker
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|ie| CaptureError::Docker(format!("inspect after wait failure: {ie}")))?;
+            info.state
+                .and_then(|s| s.exit_code)
+                .map(|c| c as i32)
+                .unwrap_or(-1)
         }
-    } else {
-        0
+        None => {
+            // Empty stream — container already gone. Inspect for exit code.
+            let info = docker
+                .inspect_container(container_id, None)
+                .await
+                .map_err(|ie| {
+                    CaptureError::Docker(format!("inspect after empty wait stream: {ie}"))
+                })?;
+            info.state
+                .and_then(|s| s.exit_code)
+                .map(|c| c as i32)
+                .unwrap_or(0)
+        }
     };
 
     Ok(CapturedOutput {
@@ -779,6 +813,7 @@ fn parse_memory_string(s: &str) -> Option<i64> {
 mod tests {
     use super::{parse_memory_string, ContainerStepRunnerConfig};
     use crate::domain::runtime::ContainerStepConfig;
+    use std::collections::HashMap;
 
     /// Regression: ContainerStepRunnerConfig must propagate network_mode so
     /// container steps use the same Docker network as agent containers.
@@ -856,6 +891,46 @@ mod tests {
             resolved_fallback.as_deref(),
             Some("host"),
             "runner-level network_mode must be used when step has no override"
+        );
+    }
+
+    /// Regression: when `read_only_root_filesystem` is true, the HostConfig must
+    /// include a tmpfs mount at /tmp so that runtimes (Python, Node, etc.) can
+    /// write temporary files. Without this, EXECUTE_CODE containers fail because
+    /// Python cannot create __pycache__ or tempfile entries on a read-only root.
+    #[test]
+    fn test_tmpfs_added_when_readonly_rootfs_is_true() {
+        let readonly_rootfs = true;
+        let tmpfs: Option<HashMap<String, String>> = if readonly_rootfs {
+            let mut m = HashMap::new();
+            m.insert("/tmp".to_string(), "size=64m".to_string());
+            Some(m)
+        } else {
+            None
+        };
+        let tmpfs = tmpfs.expect("tmpfs must be Some when readonly_rootfs is true");
+        assert_eq!(
+            tmpfs.get("/tmp").map(|v| v.as_str()),
+            Some("size=64m"),
+            "/tmp tmpfs must be mounted with size=64m"
+        );
+    }
+
+    /// Regression: when `read_only_root_filesystem` is false, no tmpfs should be
+    /// added — the root filesystem is already writable.
+    #[test]
+    fn test_no_tmpfs_when_readonly_rootfs_is_false() {
+        let readonly_rootfs = false;
+        let tmpfs: Option<HashMap<String, String>> = if readonly_rootfs {
+            let mut m = HashMap::new();
+            m.insert("/tmp".to_string(), "size=64m".to_string());
+            Some(m)
+        } else {
+            None
+        };
+        assert!(
+            tmpfs.is_none(),
+            "tmpfs must be None when readonly_rootfs is false"
         );
     }
 
