@@ -2717,3 +2717,105 @@ async fn test_paid_tier_volume_id_allowed() {
         );
     }
 }
+
+// =============================================================================
+// Regression tests: builtin tool discovery via reconciliation pass
+// =============================================================================
+
+/// Regression: aegis.workflow.wait must appear in list_tools() even when
+/// builtin_dispatchers is empty. Before the fix, tools only appeared if they
+/// were present in the dispatcher vec passed at construction time.
+#[tokio::test]
+async fn list_tools_includes_aegis_workflow_wait() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = ToolRouter::new(registry, servers, vec![]);
+
+    let tools = router.list_tools().await.expect("list_tools failed");
+    let found = tools.iter().find(|t| t.name == "aegis.workflow.wait");
+    assert!(
+        found.is_some(),
+        "aegis.workflow.wait missing from list_tools output"
+    );
+    let schema = &found.unwrap().input_schema;
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["execution_id"]),
+        "aegis.workflow.wait schema missing required execution_id"
+    );
+}
+
+/// Regression: aegis.execute.wait must appear in list_tools() even when
+/// builtin_dispatchers is empty.
+#[tokio::test]
+async fn list_tools_includes_aegis_execute_wait() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = ToolRouter::new(registry, servers, vec![]);
+
+    let tools = router.list_tools().await.expect("list_tools failed");
+    let found = tools.iter().find(|t| t.name == "aegis.execute.wait");
+    assert!(
+        found.is_some(),
+        "aegis.execute.wait missing from list_tools output"
+    );
+    let schema = &found.unwrap().input_schema;
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["execution_id"]),
+        "aegis.execute.wait schema missing required execution_id"
+    );
+}
+
+/// Regression: aegis.workflow.search must appear in list_tools(). Before the
+/// fix it was filtered out by should_advertise_builtin_tool() because
+/// is_supported_builtin_workflow_tool() did not include it.
+#[tokio::test]
+async fn list_tools_includes_aegis_workflow_search() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = ToolRouter::new(registry, servers, vec![]);
+
+    let tools = router.list_tools().await.expect("list_tools failed");
+    let found = tools.iter().find(|t| t.name == "aegis.workflow.search");
+    assert!(
+        found.is_some(),
+        "aegis.workflow.search missing from list_tools output"
+    );
+    let schema = &found.unwrap().input_schema;
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["query"]),
+        "aegis.workflow.search schema missing required query"
+    );
+}
+
+/// Regression: when a tool is already present in the builtin_dispatchers vec,
+/// the reconciliation pass must not duplicate it in the output.
+#[tokio::test]
+async fn list_tools_does_not_duplicate_when_dispatchers_present() {
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+
+    // Provide aegis.workflow.wait as an explicit dispatcher entry
+    let dispatchers = vec![BuiltinDispatcherConfig {
+        name: "aegis.workflow.wait".to_string(),
+        description: "test dispatcher".to_string(),
+        enabled: true,
+        capabilities: vec![CapabilityConfig {
+            name: "aegis.workflow.wait".to_string(),
+            skip_judge: true,
+        }],
+    }];
+    let router = ToolRouter::new(registry, servers, dispatchers);
+
+    let tools = router.list_tools().await.expect("list_tools failed");
+    let count = tools
+        .iter()
+        .filter(|t| t.name == "aegis.workflow.wait")
+        .count();
+    assert_eq!(
+        count, 1,
+        "aegis.workflow.wait appeared {count} times, expected exactly 1"
+    );
+}
