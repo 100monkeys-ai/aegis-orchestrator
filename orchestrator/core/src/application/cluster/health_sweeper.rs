@@ -50,6 +50,14 @@ impl HealthSweeper {
         )
     }
 
+    pub fn stale_threshold(&self) -> Duration {
+        self.stale_threshold
+    }
+
+    pub fn sweep_interval(&self) -> Duration {
+        self.sweep_interval
+    }
+
     /// Run the sweeper loop until shutdown signal received.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut interval = tokio::time::interval(self.sweep_interval);
