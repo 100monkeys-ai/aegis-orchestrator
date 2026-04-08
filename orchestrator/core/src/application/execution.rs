@@ -2608,7 +2608,7 @@ impl StandardExecutionService {
                                 .invoke(
                                     handler,
                                     &final_output,
-                                    &execution_id,
+                                    Some(&execution_id),
                                     &tenant_id_for_output_handler,
                                 )
                                 .await
