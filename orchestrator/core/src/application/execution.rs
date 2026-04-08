@@ -409,6 +409,7 @@ impl StandardExecutionService {
             gateway.register_volume(VolumeRegistration {
                 volume_id: alias_volume_id,
                 execution_id: child_execution_id,
+                workflow_execution_id: None,
                 container_uid: 1000,
                 container_gid: 1000,
                 policy: read_policy.clone(),
@@ -943,6 +944,7 @@ mod tests {
         nfs_gateway.register_volume(VolumeRegistration {
             volume_id: parent_volume.id,
             execution_id: parent_execution.id,
+            workflow_execution_id: None,
             container_uid: 1000,
             container_gid: 1000,
             policy: FsalAccessPolicy {
@@ -3175,6 +3177,7 @@ impl ExecutionService for StandardExecutionService {
                 gw.register_volume(VolumeRegistration {
                     volume_id: mount.volume_id,
                     execution_id: child_execution_id,
+                    workflow_execution_id: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,
