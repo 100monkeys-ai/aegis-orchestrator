@@ -1713,6 +1713,17 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     // Security contexts are loaded from aegis-config.yaml (spec.security_contexts)
     // during repository initialization above. See ADR-071 §ZaruTier SecurityContext Definitions.
 
+    // ADR-103: Output handler service for post-execution egress dispatch.
+    let output_handler_service: Arc<
+        dyn aegis_orchestrator_core::application::output_handler_service::OutputHandlerService,
+    > = Arc::new(
+        aegis_orchestrator_core::application::output_handler_service::StandardOutputHandlerService::new(
+            execution_service.clone(),
+            agent_service.clone(),
+            event_bus.clone(),
+        ),
+    );
+
     // Spawn gRPC server
     let exec_service_clone: Arc<dyn ExecutionService> = execution_service.clone();
     let val_service_clone = validation_service.clone();
@@ -1761,6 +1772,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 stimulus_service: None,
                 discovery_service: discovery_service.clone(),
                 volume_service: Some(volume_service_for_grpc),
+                output_handler_service: Some(output_handler_service),
             },
         )
         .await

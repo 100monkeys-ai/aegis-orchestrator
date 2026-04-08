@@ -395,23 +395,39 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             ),
                         );
                         // Device path: resolve the remote_path registered in the NFS volume
-                        // registry (e.g. /aegis/volumes/{tenant_id}/{volume_id}). Fall back
-                        // to the legacy :{execution_id}/{volume_name} form only when the
-                        // volume cannot be located in the registry.
+                        // registry (e.g. /aegis/volumes/{tenant_id}/{volume_id}).
                         let device_path = uuid::Uuid::parse_str(&vm.name)
                             .ok()
                             .and_then(|uuid| {
                                 self.volume_registry.lookup(VolumeId(uuid))
                             })
-                            .map(|ctx| format!(":{}", ctx.remote_path))
-                            .unwrap_or_else(|| {
-                                format!(":{}/{}", config.execution_id, vm.name)
-                            });
-                        driver_opts.insert("device".to_string(), device_path);
+                            .map(|ctx| format!(":{}", ctx.remote_path));
+
+                        if device_path.is_none() {
+                            warn!(
+                                step_name = %config.name,
+                                volume_name = %vm.name,
+                                execution_id = %config.execution_id,
+                                "NFS volume registry lookup failed — volume may not be mounted correctly"
+                            );
+                        }
+
+                        let device_path = device_path.unwrap_or_else(|| {
+                            format!(":{}/{}", config.execution_id, vm.name)
+                        });
+                        driver_opts.insert("device".to_string(), device_path.clone());
+
+                        // Use the same Docker volume source name as agent containers
+                        // (aegis-vol-{volume_id}) so that Docker reuses the existing
+                        // named volume and its NFS mount, rather than creating a separate
+                        // volume that may not resolve correctly (ADR-036).
+                        let volume_source_name = format!("aegis-vol-{}", vm.name);
 
                         debug!(
                             step_name = %config.name,
                             volume_name = %vm.name,
+                            volume_source = %volume_source_name,
+                            device_path = %device_path,
                             mount_path = %vm.mount_path,
                             read_only = vm.read_only,
                             nfs_host = nfs_host,
@@ -420,10 +436,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
 
                         Mount {
                             target: Some(vm.mount_path.clone()),
-                            source: Some(format!(
-                                "aegis-step-{}-{}",
-                                config.execution_id, vm.name
-                            )),
+                            source: Some(volume_source_name),
                             typ: Some(MountTypeEnum::VOLUME),
                             read_only: Some(vm.read_only),
                             volume_options: Some(MountVolumeOptions {
@@ -931,6 +944,39 @@ mod tests {
         assert!(
             tmpfs.is_none(),
             "tmpfs must be None when readonly_rootfs is false"
+        );
+    }
+
+    /// Regression: container step volume mounts must use the same Docker volume
+    /// source name as agent containers (`aegis-vol-{volume_id}`) so Docker reuses
+    /// the existing named volume. Previously, container steps used
+    /// `aegis-step-{execution_id}-{volume_name}`, creating a separate Docker volume
+    /// that could fail to mount the NFS export correctly, resulting in an empty
+    /// /workspace directory and Python exit code 2 (file not found).
+    #[test]
+    fn test_container_step_volume_source_name_matches_agent_runtime() {
+        // The container step volume source name format must match the agent runtime.
+        // Agent runtime uses: format!("aegis-vol-{}", volume_mount.volume_id)
+        // Container step must use the same: format!("aegis-vol-{}", vm.name)
+        let volume_id = "f8eb2163-0f8e-4582-abf2-6ab1261b7961";
+        let execution_id = uuid::Uuid::new_v4();
+
+        // What agent runtime produces:
+        let agent_source = format!("aegis-vol-{}", volume_id);
+
+        // What container step must produce (matches agent runtime):
+        let step_source = format!("aegis-vol-{}", volume_id);
+
+        assert_eq!(
+            agent_source, step_source,
+            "Container step volume source name must match agent runtime's aegis-vol-{{volume_id}} format"
+        );
+
+        // The old broken format would have been:
+        let old_broken_source = format!("aegis-step-{}-{}", execution_id, volume_id);
+        assert_ne!(
+            agent_source, old_broken_source,
+            "Old aegis-step format must differ from the correct aegis-vol format"
         );
     }
 

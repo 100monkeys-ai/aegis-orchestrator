@@ -1605,6 +1605,9 @@ pub struct GrpcServerConfig {
     pub stimulus_service: Option<Arc<dyn StimulusService>>,
     pub discovery_service: Option<Arc<dyn DiscoveryService>>,
     pub volume_service: Option<Arc<dyn VolumeService>>,
+    /// Optional output handler service for post-execution egress dispatch (ADR-103).
+    pub output_handler_service:
+        Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1640,6 +1643,10 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     if let Some(volume_service) = config.volume_service {
         service = service.with_volume_service(volume_service);
+    }
+
+    if let Some(output_handler) = config.output_handler_service {
+        service = service.with_output_handler_service(output_handler);
     }
 
     let server = service.into_server();
@@ -2089,5 +2096,82 @@ mod tests {
             .expect_err("invoke_tool should be unimplemented via gRPC pending proto update");
 
         assert_eq!(err.code(), tonic::Code::Unimplemented);
+    }
+
+    /// Regression: GrpcServerConfig must include output_handler_service so the
+    /// InvokeOutputHandler RPC has a service implementation to delegate to.
+    /// Before this fix, the field was missing from GrpcServerConfig and
+    /// start_grpc_server never called with_output_handler_service, causing
+    /// all InvokeOutputHandler calls to fail with UNAVAILABLE.
+    #[test]
+    fn test_grpc_server_config_includes_output_handler_service() {
+        // Verify the field exists on GrpcServerConfig (compile-time check).
+        // If output_handler_service were removed from GrpcServerConfig, this
+        // test would fail to compile.
+        let has_field = |config: &GrpcServerConfig| config.output_handler_service.is_some();
+
+        // Construct a minimal config to verify the field is accessible.
+        let execution_id = ExecutionId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: vec![],
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+
+        let config = GrpcServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            execution_service,
+            validation_service,
+            grpc_auth: None,
+            attestation_service: None,
+            tool_invocation_service: None,
+            cortex_client: None,
+            run_container_step_use_case: None,
+            agent_service: None,
+            stimulus_service: None,
+            discovery_service: None,
+            volume_service: None,
+            output_handler_service: None,
+        };
+
+        assert!(
+            !has_field(&config),
+            "output_handler_service should be None when not provided"
+        );
+    }
+
+    /// Regression: AegisRuntimeService must return UNAVAILABLE when
+    /// invoke_output_handler is called but no OutputHandlerService is wired.
+    /// After the fix, the daemon always wires the service, but this test
+    /// guards the error path for nodes where it is intentionally omitted.
+    #[tokio::test]
+    async fn test_invoke_output_handler_returns_unavailable_without_service() {
+        let execution_id = ExecutionId::new();
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id,
+            stream_events: vec![],
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+        let service = AegisRuntimeService::new(execution_service, validation_service);
+
+        let err = service
+            .invoke_output_handler(Request::new(InvokeOutputHandlerRequest {
+                execution_id: execution_id.to_string(),
+                tenant_id: "test-tenant".to_string(),
+                final_output: "hello".to_string(),
+                handler_config_json: r#"{"type":"webhook","url":"http://example.com"}"#.to_string(),
+            }))
+            .await
+            .expect_err("invoke_output_handler should fail without service");
+
+        assert_eq!(
+            err.code(),
+            tonic::Code::Unavailable,
+            "Expected UNAVAILABLE when OutputHandlerService is not configured"
+        );
     }
 }
