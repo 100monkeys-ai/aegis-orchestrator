@@ -23,7 +23,7 @@ use uuid::Uuid;
 use aegis_orchestrator_core::domain::cluster::{
     ClusterSummaryStatus, ConfigScope, ExecutionRoute, NodeCapabilityAdvertisement, NodeChallenge,
     NodeCluster, NodeId, NodePeer, NodePeerStatus, NodeSecurityToken, NodeTokenClaims,
-    RegisteredNode, ResourceSnapshot,
+    RegisteredNode, RegistryStatus, ResourceSnapshot,
 };
 use aegis_orchestrator_core::domain::node_config::NodeRole;
 use aegis_orchestrator_core::domain::shared_kernel::TenantId;
@@ -781,14 +781,14 @@ fn registered_node_from_peer() {
     assert_eq!(registered.node_id, peer.node_id);
     assert_eq!(registered.hostname, "worker-01.local");
     assert_eq!(registered.role, NodeRole::Worker);
-    assert_eq!(registered.status, NodePeerStatus::Active);
+    assert_eq!(registered.registry_status, RegistryStatus::Pending);
     assert_eq!(registered.software_version, "0.14.0-pre-alpha");
     assert_eq!(registered.config_version, Some("v1-abc".to_string()));
     assert_eq!(registered.metadata, metadata);
 }
 
 #[test]
-fn registered_node_is_active() {
+fn registered_node_pending_is_not_active() {
     let peer = make_peer(NodeRole::Worker);
     let node = RegisteredNode::from_peer(
         &peer,
@@ -797,38 +797,41 @@ fn registered_node_is_active() {
         HashMap::new(),
         None,
     );
+    // from_peer initialises to Pending — not yet active
+    assert_eq!(node.registry_status, RegistryStatus::Pending);
+    assert!(!node.is_active());
+}
+
+#[test]
+fn registered_node_active_after_activate() {
+    let peer = make_peer(NodeRole::Worker);
+    let mut node = RegisteredNode::from_peer(
+        &peer,
+        "h".to_string(),
+        "v".to_string(),
+        HashMap::new(),
+        None,
+    );
+    node.activate()
+        .expect("activate should succeed from Pending");
+    assert_eq!(node.registry_status, RegistryStatus::Active);
     assert!(node.is_active());
-    assert!(!node.is_draining());
 }
 
 #[test]
-fn registered_node_is_draining() {
-    let mut peer = make_peer(NodeRole::Worker);
-    peer.status = NodePeerStatus::Draining;
-    let node = RegisteredNode::from_peer(
+fn registered_node_decommissioned_is_not_active() {
+    let peer = make_peer(NodeRole::Worker);
+    let mut node = RegisteredNode::from_peer(
         &peer,
         "h".to_string(),
         "v".to_string(),
         HashMap::new(),
         None,
     );
+    node.decommission()
+        .expect("decommission should succeed from Pending");
+    assert_eq!(node.registry_status, RegistryStatus::Decommissioned);
     assert!(!node.is_active());
-    assert!(node.is_draining());
-}
-
-#[test]
-fn registered_node_unhealthy_is_neither_active_nor_draining() {
-    let mut peer = make_peer(NodeRole::Worker);
-    peer.status = NodePeerStatus::Unhealthy;
-    let node = RegisteredNode::from_peer(
-        &peer,
-        "h".to_string(),
-        "v".to_string(),
-        HashMap::new(),
-        None,
-    );
-    assert!(!node.is_active());
-    assert!(!node.is_draining());
 }
 
 // ── ExecutionRoute ──────────────────────────────────────────────────────────
