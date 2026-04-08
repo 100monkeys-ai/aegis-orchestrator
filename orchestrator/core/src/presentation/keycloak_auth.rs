@@ -12,11 +12,14 @@
 //! auth mechanisms):
 //! - `/health` — health check
 //! - `/v1/dispatch-gateway/*` — Dispatch Protocol (container ↔ orchestrator)
-//! - `/v1/executions/*` — execution SSE stream (uses SEAL SecurityToken)
 //! - `/v1/seal/attest` — SEAL attestation handshake
 //! - `/v1/seal/invoke` — SEAL tool invocation (uses SecurityToken)
 //! - `/v1/seal/tools` — SEAL tool discovery metadata
 //! - `/v1/webhooks/*` — webhook ingestion (HMAC auth)
+//!
+//! Note: ALL `/v1/executions/*` endpoints require JWT auth — each handler
+//! enforces a fine-grained scope via `scope_guard.require(...)`. These paths
+//! are NOT exempt.
 //!
 //! Note: `/v1/temporal-events` is NOT exempt — it validates its own Bearer JWT
 //! from the `aegis-temporal-worker` service account directly in the handler.
@@ -79,7 +82,6 @@ where
 const EXEMPT_PATH_PREFIXES: &[&str] = &[
     "/health",
     "/v1/dispatch-gateway",
-    "/v1/executions",
     "/v1/seal/attest",
     "/v1/seal/invoke",
     "/v1/seal/tools",
@@ -177,8 +179,6 @@ mod tests {
     fn exempt_paths_recognized() {
         assert!(is_exempt("/health"));
         assert!(is_exempt("/v1/dispatch-gateway/some-id"));
-        assert!(is_exempt("/v1/executions"));
-        assert!(is_exempt("/v1/executions/some-id/stream"));
         assert!(is_exempt("/v1/seal/attest"));
         assert!(is_exempt("/v1/seal/invoke"));
         assert!(is_exempt("/v1/seal/tools"));
@@ -192,6 +192,17 @@ mod tests {
         assert!(!is_exempt("/v1/swarms"));
         // temporal-events authenticates via JWT in the handler itself
         assert!(!is_exempt("/v1/temporal-events"));
+    }
+
+    /// Regression: the broad `/v1/executions` prefix was previously exempt,
+    /// causing all execution handlers' `scope_guard.require(...)` calls to
+    /// always 403 because the middleware was skipped and ScopeGuard was empty.
+    #[test]
+    fn execution_paths_are_not_exempt() {
+        assert!(!is_exempt("/v1/executions"));
+        assert!(!is_exempt("/v1/executions/some-id"));
+        assert!(!is_exempt("/v1/executions/some-id/cancel"));
+        assert!(!is_exempt("/v1/executions/some-id/events"));
     }
 
     #[test]
