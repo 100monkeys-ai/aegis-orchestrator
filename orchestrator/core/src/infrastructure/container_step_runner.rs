@@ -1045,6 +1045,8 @@ mod tests {
             nfs_port: 2049,
             nfs_mountport: 2049,
             network_mode: Some("host".to_string()),
+            fuse_daemon: None,
+            fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
         };
         assert_eq!(config.network_mode.as_deref(), Some("host"));
     }
@@ -1202,6 +1204,8 @@ mod tests {
             nfs_port: 2049,
             nfs_mountport: 2049,
             network_mode: None,
+            fuse_daemon: None,
+            fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
         };
         // If this compiles, the VolumeService dependency has been removed.
     }

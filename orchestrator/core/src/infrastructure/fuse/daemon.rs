@@ -66,11 +66,25 @@ pub struct FuseVolumeContext {
     pub policy: FsalAccessPolicy,
 }
 
+/// Wrapper to make `fuser::BackgroundSession` `Send + Sync`.
+///
+/// # Safety
+///
+/// `BackgroundSession` contains a `*mut c_void` (the libfuse session handle).
+/// The orchestrator only creates, holds, and drops sessions sequentially —
+/// the handle is never accessed concurrently from multiple threads. The
+/// underlying libfuse mount/unmount operations are thread-safe.
+struct SendSyncSession(fuser::BackgroundSession);
+
+// SAFETY: see `SendSyncSession` doc comment above.
+unsafe impl Send for SendSyncSession {}
+unsafe impl Sync for SendSyncSession {}
+
 /// Handle to an active FUSE mount. Dropping this handle unmounts the filesystem.
 pub struct FuseMountHandle {
     /// The `fuser::BackgroundSession` keeps the FUSE filesystem mounted.
     /// Dropping it triggers unmount.
-    _session: fuser::BackgroundSession,
+    _session: SendSyncSession,
     mountpoint: String,
 }
 
@@ -152,7 +166,7 @@ impl FuseFsalDaemon {
         );
 
         Ok(FuseMountHandle {
-            _session: session,
+            _session: SendSyncSession(session),
             mountpoint: mountpoint_str,
         })
     }
