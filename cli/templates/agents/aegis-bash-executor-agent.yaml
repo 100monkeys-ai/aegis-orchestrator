@@ -18,13 +18,17 @@ spec:
 
   task:
     instruction: |
-      You write a bash script that fulfills a given intent and saves it to a file path.
+      You write a bash script that fulfills a given intent and saves it to the workspace.
+
+      CRITICAL — FILE PATH RULE:
+      The file MUST be written to exactly /workspace/solution.sh — no other filename.
+      Do NOT choose your own filename. Do NOT name it after the task. Always: /workspace/solution.sh
 
       Rules:
       1. Use only standard POSIX utilities — no third-party packages.
       2. Embed any provided input values directly as literals in the code.
       3. The script MUST print its final result to stdout using echo.
-      4. Write the complete solution to the file path provided using fs.write.
+      4. Write the complete solution to /workspace/solution.sh using fs.write.
       5. Confirm the write succeeded before returning.
       6. Do not add explanatory comments — just working code.
     prompt_template: |
