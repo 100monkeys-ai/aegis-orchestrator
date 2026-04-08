@@ -74,6 +74,7 @@ pub struct FuseVolumeContext {
 /// The orchestrator only creates, holds, and drops sessions sequentially —
 /// the handle is never accessed concurrently from multiple threads. The
 /// underlying libfuse mount/unmount operations are thread-safe.
+#[expect(dead_code, reason = "held for RAII drop — unmounts on drop")]
 struct SendSyncSession(fuser::BackgroundSession);
 
 // SAFETY: see `SendSyncSession` doc comment above.
@@ -213,7 +214,7 @@ impl FuseFsal {
         FileAttr {
             ino,
             size: attrs.size,
-            blocks: (attrs.size + 511) / 512,
+            blocks: attrs.size.div_ceil(512),
             atime: UNIX_EPOCH + Duration::from_secs(attrs.atime.max(0) as u64),
             mtime: UNIX_EPOCH + Duration::from_secs(attrs.mtime.max(0) as u64),
             ctime: UNIX_EPOCH + Duration::from_secs(attrs.ctime.max(0) as u64),

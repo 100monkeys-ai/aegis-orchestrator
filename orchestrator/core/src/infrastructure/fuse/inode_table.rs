@@ -73,6 +73,10 @@ impl InodeTable {
     }
 
     /// Reverse lookup: find the inode for a given path hash, if previously registered.
+    #[expect(
+        dead_code,
+        reason = "public API reserved for future inode reuse optimisation"
+    )]
     pub fn find_by_path_hash(&self, path_hash: u64) -> Option<u64> {
         self.reverse.read().get(&path_hash).copied()
     }
