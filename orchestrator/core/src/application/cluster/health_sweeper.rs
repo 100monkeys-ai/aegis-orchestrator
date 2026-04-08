@@ -37,16 +37,6 @@ impl HealthSweeper {
         }
     }
 
-    /// Returns the configured stale threshold.
-    pub(crate) fn stale_threshold(&self) -> Duration {
-        self.stale_threshold
-    }
-
-    /// Returns the configured sweep interval.
-    pub(crate) fn sweep_interval(&self) -> Duration {
-        self.sweep_interval
-    }
-
     /// Default sweeper: stale after 90s (3x 30s heartbeat), sweep every 30s
     pub fn with_defaults(
         cluster_repo: Arc<dyn NodeClusterRepository>,

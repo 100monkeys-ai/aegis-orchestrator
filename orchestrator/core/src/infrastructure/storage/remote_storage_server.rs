@@ -33,7 +33,7 @@ use parking_lot::RwLock;
 use tonic::{Request, Response, Status};
 
 use crate::domain::cluster::{NodeClusterRepository, NodeId, NodeSecurityToken};
-use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy, FsalError};
+use crate::domain::fsal::{AegisFSAL, FsalAccessPolicy, FsalError, NodeStorageRequest};
 use crate::domain::path_sanitizer::PathSanitizer;
 use crate::domain::shared_kernel::ExecutionId;
 use crate::domain::storage::{FileHandle, FileType, OpenMode, StorageError};
@@ -386,13 +386,15 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
             .fsal
             .read_for_node(
                 &handle,
-                Self::sentinel_execution_id(),
-                meta.volume_id,
-                &meta.path,
+                NodeStorageRequest {
+                    execution_id: Self::sentinel_execution_id(),
+                    volume_id: meta.volume_id,
+                    path: &meta.path,
+                    caller_node_id: Some(caller_node_id),
+                    host_node_id: Some(self.host_node_id),
+                },
                 req.offset,
                 req.length as usize,
-                Some(caller_node_id),
-                Some(self.host_node_id.clone()),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -420,13 +422,15 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
             .fsal
             .write_for_node(
                 &handle,
-                Self::sentinel_execution_id(),
-                meta.volume_id,
-                &meta.path,
+                NodeStorageRequest {
+                    execution_id: Self::sentinel_execution_id(),
+                    volume_id: meta.volume_id,
+                    path: &meta.path,
+                    caller_node_id: Some(caller_node_id),
+                    host_node_id: Some(self.host_node_id),
+                },
                 req.offset,
                 &req.data,
-                Some(caller_node_id),
-                Some(self.host_node_id.clone()),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -1036,13 +1040,15 @@ mod tests {
         let data = fsal
             .read_for_node(
                 &handle,
-                RemoteStorageServiceHandler::sentinel_execution_id(),
-                volume_id,
-                "/workspace/data.bin",
+                NodeStorageRequest {
+                    execution_id: RemoteStorageServiceHandler::sentinel_execution_id(),
+                    volume_id,
+                    path: "/workspace/data.bin",
+                    caller_node_id: Some(caller),
+                    host_node_id: Some(host),
+                },
                 0,
                 64,
-                Some(caller.clone()),
-                Some(host.clone()),
             )
             .await
             .expect("read_for_node should succeed");
@@ -1090,13 +1096,15 @@ mod tests {
         let bytes_written = fsal
             .write_for_node(
                 &handle,
-                RemoteStorageServiceHandler::sentinel_execution_id(),
-                volume_id,
-                "/workspace/output.bin",
+                NodeStorageRequest {
+                    execution_id: RemoteStorageServiceHandler::sentinel_execution_id(),
+                    volume_id,
+                    path: "/workspace/output.bin",
+                    caller_node_id: Some(caller),
+                    host_node_id: Some(host),
+                },
                 0,
                 &[0u8; 100],
-                Some(caller.clone()),
-                Some(host.clone()),
             )
             .await
             .expect("write_for_node should succeed");

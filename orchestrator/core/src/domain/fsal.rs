@@ -172,6 +172,19 @@ impl AegisFileHandle {
     }
 }
 
+/// Parameters for cross-node (SEAL) read and write operations on the FSAL.
+///
+/// Groups the provenance metadata required by [`AegisFSAL::read_for_node`] and
+/// [`AegisFSAL::write_for_node`] to keep those signatures within Clippy's
+/// function-argument-count limit.
+pub struct NodeStorageRequest<'a> {
+    pub execution_id: ExecutionId,
+    pub volume_id: VolumeId,
+    pub path: &'a str,
+    pub caller_node_id: Option<NodeId>,
+    pub host_node_id: Option<NodeId>,
+}
+
 /// AegisFSAL - File System Abstraction Layer
 ///
 /// Domain entity that enforces security policies and provides audit trail
@@ -1015,14 +1028,17 @@ impl AegisFSAL {
     pub async fn read_for_node(
         &self,
         handle: &FileHandle,
-        execution_id: ExecutionId,
-        volume_id: VolumeId,
-        path: &str,
+        req: NodeStorageRequest<'_>,
         offset: u64,
         length: usize,
-        caller_node_id: Option<NodeId>,
-        host_node_id: Option<NodeId>,
     ) -> Result<Vec<u8>, FsalError> {
+        let NodeStorageRequest {
+            execution_id,
+            volume_id,
+            path,
+            caller_node_id,
+            host_node_id,
+        } = req;
         let start = std::time::Instant::now();
 
         let data = self
@@ -1056,14 +1072,17 @@ impl AegisFSAL {
     pub async fn write_for_node(
         &self,
         handle: &FileHandle,
-        execution_id: ExecutionId,
-        volume_id: VolumeId,
-        path: &str,
+        req: NodeStorageRequest<'_>,
         offset: u64,
         data: &[u8],
-        caller_node_id: Option<NodeId>,
-        host_node_id: Option<NodeId>,
     ) -> Result<usize, FsalError> {
+        let NodeStorageRequest {
+            execution_id,
+            volume_id,
+            path,
+            caller_node_id,
+            host_node_id,
+        } = req;
         let start = std::time::Instant::now();
 
         // Quota enforcement
@@ -1082,8 +1101,8 @@ impl AegisFSAL {
                     requested_bytes,
                     available_bytes,
                     exceeded_at: Utc::now(),
-                    caller_node_id: caller_node_id.clone(),
-                    host_node_id: host_node_id.clone(),
+                    caller_node_id,
+                    host_node_id,
                 })
                 .await;
             return Err(FsalError::QuotaExceeded {
