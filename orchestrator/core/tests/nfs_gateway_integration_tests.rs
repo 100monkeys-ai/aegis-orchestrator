@@ -522,7 +522,17 @@ async fn test_fsal_audit_events() {
     // Create, write file
     let path = "/workspace/test.txt";
     let handle = fsal
-        .create_file(execution_id, volume_id, path, &policy, true, None, None)
+        .create_file(
+            aegis_orchestrator_core::domain::fsal::CreateFsalFileRequest {
+                execution_id,
+                volume_id,
+                path,
+                policy: &policy,
+                emit_event: true,
+                caller_node_id: None,
+                host_node_id: None,
+            },
+        )
         .await
         .unwrap();
 
