@@ -491,7 +491,7 @@ impl ToolRouter {
             if !Self::should_advertise_builtin_tool(name) {
                 continue;
             }
-            if existing_names.contains(name) {
+            if existing_names.contains(*name) {
                 continue;
             }
             all_tools.push(ToolMetadata {
