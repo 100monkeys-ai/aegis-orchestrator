@@ -827,15 +827,15 @@ impl NFSFileSystem for AegisFsalAdapter {
         // Create file via FSAL
         let handle = self
             .fsal
-            .create_file(
-                context.execution_id,
-                context.volume_id,
-                &file_path,
-                &context.policy,
-                true,
-                None,
-                None,
-            )
+            .create_file(crate::domain::fsal::CreateFsalFileRequest {
+                execution_id: context.execution_id,
+                volume_id: context.volume_id,
+                path: &file_path,
+                policy: &context.policy,
+                emit_event: true,
+                caller_node_id: None,
+                host_node_id: None,
+            })
             .await
             .map_err(|e| {
                 metrics::counter!("aegis_nfs_operations_total", "operation" => "create", "result" => "error").increment(1);

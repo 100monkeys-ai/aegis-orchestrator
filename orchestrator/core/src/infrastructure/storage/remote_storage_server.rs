@@ -260,7 +260,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.path,
                 &policy,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -285,7 +285,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.path,
                 &policy,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -356,7 +356,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.path,
                 mode,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -472,7 +472,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 meta.volume_id,
                 &meta.path,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -526,7 +526,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.path,
                 &policy,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -556,15 +556,15 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
 
         let _aegis_handle = self
             .fsal
-            .create_file(
+            .create_file(crate::domain::fsal::CreateFsalFileRequest {
                 execution_id,
                 volume_id,
-                &req.path,
-                &policy,
-                true,
-                Some(caller_node_id),
-                Some(self.host_node_id.clone()),
-            )
+                path: &req.path,
+                policy: &policy,
+                emit_event: true,
+                caller_node_id: Some(caller_node_id),
+                host_node_id: Some(self.host_node_id),
+            })
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -610,7 +610,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.path,
                 &policy,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -636,7 +636,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &req.to_path,
                 &policy,
                 Some(caller_node_id),
-                Some(self.host_node_id.clone()),
+                Some(self.host_node_id),
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
