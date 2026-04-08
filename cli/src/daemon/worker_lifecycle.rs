@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 use tracing;
 
 use aegis_orchestrator_core::domain::cluster::NodeId;
@@ -45,7 +46,7 @@ pub struct WorkerLifecycle {
     capabilities: NodeCapabilities,
     grpc_address: String,
     heartbeat_interval: Duration,
-    _token_refresh_margin: Duration,
+    token_refresh_margin: Duration,
     signing_key: Arc<ed25519_dalek::SigningKey>,
 }
 
@@ -68,7 +69,7 @@ impl WorkerLifecycle {
             capabilities,
             grpc_address,
             heartbeat_interval,
-            _token_refresh_margin: token_refresh_margin,
+            token_refresh_margin,
             signing_key,
         }
     }
@@ -117,6 +118,34 @@ impl WorkerLifecycle {
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    // Check if token needs refresh (ADR-059 §3.2)
+                    if let Some(expires_at) = self.client.token_expires_at().await {
+                        let margin = chrono::Duration::from_std(self.token_refresh_margin)
+                            .unwrap_or_else(|_| chrono::Duration::minutes(5));
+                        let refresh_at = expires_at - margin;
+                        if Utc::now() >= refresh_at {
+                            tracing::info!(
+                                node_id = %self.node_id,
+                                expires_at = %expires_at,
+                                "Token approaching expiry, re-attesting"
+                            );
+                            let public_key = self.signing_key.verifying_key().to_bytes().to_vec();
+                            match self.client.attest_and_challenge(
+                                self.role,
+                                public_key,
+                                self.capabilities.clone(),
+                                self.grpc_address.clone(),
+                            ).await {
+                                Ok(_) => tracing::info!(node_id = %self.node_id, "Token refreshed successfully"),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    node_id = %self.node_id,
+                                    "Token refresh failed, will retry on next interval"
+                                ),
+                            }
+                        }
+                    }
+
                     match self.client.heartbeat(0.0, 0).await {
                         Ok(commands) => {
                             for cmd in commands {
@@ -194,5 +223,46 @@ impl WorkerLifecycle {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aegis_orchestrator_core::domain::cluster::NodeId;
+    use aegis_orchestrator_core::infrastructure::cluster::NodeClusterClient;
+    use ed25519_dalek::SigningKey;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    /// Regression test for gap 059-14: token_refresh_margin must be stored as a
+    /// live (non-underscore-prefixed) field so the heartbeat loop can reference it.
+    /// Previously the field was `_token_refresh_margin` which silently discarded
+    /// the configured margin.
+    #[test]
+    fn token_refresh_margin_is_stored_and_accessible() {
+        let signing_key = Arc::new(SigningKey::generate(&mut rand::rngs::OsRng));
+        let node_id = NodeId(Uuid::new_v4());
+        let client = NodeClusterClient::new(
+            "http://localhost:50051".to_string(),
+            signing_key.clone(),
+            node_id,
+        );
+        let margin = Duration::from_secs(300);
+
+        let lifecycle = WorkerLifecycle::new(
+            client,
+            node_id,
+            1, // role
+            NodeCapabilities::default(),
+            "127.0.0.1:50052".to_string(),
+            Duration::from_secs(30),
+            margin,
+            signing_key,
+        );
+
+        // The field is accessible without an underscore prefix — this would fail
+        // to compile if the field were still named `_token_refresh_margin`.
+        assert_eq!(lifecycle.token_refresh_margin, Duration::from_secs(300));
     }
 }

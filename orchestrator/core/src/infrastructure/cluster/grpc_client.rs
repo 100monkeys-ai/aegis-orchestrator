@@ -10,9 +10,12 @@
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use chrono::{DateTime, Utc};
 use ed25519_dalek::Signer;
 use prost::Message;
 use tonic::transport::Channel;
+
+use crate::domain::cluster::NodeSecurityToken;
 
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::NodeId;
@@ -256,6 +259,16 @@ impl NodeClusterClient {
             .context("ForwardExecution RPC failed")?;
 
         Ok(resp.into_inner())
+    }
+
+    /// Returns the expiry time of the current `NodeSecurityToken`, if one is held
+    /// and its claims can be decoded.
+    pub async fn token_expires_at(&self) -> Option<DateTime<Utc>> {
+        let guard = self.token.read().await;
+        let raw = guard.as_ref()?;
+        let nst = NodeSecurityToken(raw.clone());
+        let claims = nst.claims().ok()?;
+        DateTime::from_timestamp(claims.exp, 0)
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
