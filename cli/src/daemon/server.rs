@@ -94,8 +94,8 @@ use aegis_orchestrator_core::{
     },
     domain::{
         cluster::{
-            ConfigLayerRepository, ConfigType, EffectiveConfigValidator, NodeClusterRepository,
-            NodeId, NodeRole,
+            ConfigLayerRepository, ConfigType, EffectiveConfigValidator, MergedConfig,
+            NodeClusterRepository, NodeId, NodeRole,
         },
         iam::IdentityProvider,
         node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
@@ -387,24 +387,42 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             .await
         {
             Ok(merged) => {
-                // Validate effective config before applying (ADR-060 §4, Gap 059-7)
-                if let Err(missing) = EffectiveConfigValidator::validate(&merged) {
-                    return Err(anyhow::anyhow!(
-                        "Effective configuration missing required fields: {:?}",
-                        missing
-                    ));
-                }
+                // An empty payload means no DB layers exist yet; the bootstrap YAML
+                // is the sole source of truth and requires no validation here.
+                let has_db_overlay = merged
+                    .payload
+                    .as_object()
+                    .map(|o| !o.is_empty())
+                    .unwrap_or(false);
 
-                if let Err(e) = config.apply_merged_overlay(&merged) {
-                    warn!(
-                        error = %e,
-                        "Failed to apply merged database config overlay, continuing with YAML-only config"
-                    );
+                if has_db_overlay {
+                    if let Err(e) = config.apply_merged_overlay(&merged) {
+                        warn!(
+                            error = %e,
+                            "Failed to apply merged database config overlay, continuing with YAML-only config"
+                        );
+                    } else {
+                        // Validate the final effective config (bootstrap YAML + DB overlay)
+                        // after the overlay has been applied (ADR-060 §4, Gap 059-7).
+                        let effective_payload = serde_json::to_value(&config.spec)
+                            .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                        let effective = MergedConfig {
+                            payload: effective_payload,
+                            version: merged.version.clone(),
+                        };
+                        if let Err(missing) = EffectiveConfigValidator::validate(&effective) {
+                            return Err(anyhow::anyhow!(
+                                "Effective configuration missing required fields: {:?}",
+                                missing
+                            ));
+                        }
+                        info!(
+                            version = %merged.version,
+                            "Applied merged database config overlay (ADR-060)"
+                        );
+                    }
                 } else {
-                    info!(
-                        version = %merged.version,
-                        "Applied merged database config overlay (ADR-060)"
-                    );
+                    debug!("No database config layers found, using YAML-only config");
                 }
             }
             Err(e) => {

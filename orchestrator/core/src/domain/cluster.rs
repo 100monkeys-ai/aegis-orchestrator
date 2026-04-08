@@ -759,6 +759,43 @@ mod tests {
         assert!(missing[0].contains("root object"));
     }
 
+    /// Regression test: an empty `{}` DB payload (no layers stored yet) must be
+    /// detected as "no overlay" so the validator is never called on it.  Before
+    /// the fix, `EffectiveConfigValidator::validate` was invoked on the raw DB
+    /// result BEFORE `apply_merged_overlay`, causing fresh deployments to fail
+    /// with "missing required fields: [runtime, storage, llm]".
+    ///
+    /// This test confirms:
+    /// 1. An empty-object `MergedConfig` is correctly identified as having no
+    ///    DB overlay (the `is_empty()` guard that skips validation).
+    /// 2. The validator would indeed reject that empty payload — proving it MUST
+    ///    NOT be called before the overlay is applied.
+    #[test]
+    fn test_empty_db_payload_is_detected_as_no_overlay() {
+        let empty_db_result = MergedConfig {
+            payload: serde_json::json!({}),
+            version: "da39a3ee".to_string(), // SHA1 of empty string — what PgConfigLayerRepository returns
+        };
+
+        // Guard that the startup code uses to skip validation on empty payloads.
+        let has_db_overlay = empty_db_result
+            .payload
+            .as_object()
+            .map(|o| !o.is_empty())
+            .unwrap_or(false);
+        assert!(
+            !has_db_overlay,
+            "empty DB payload must be recognised as 'no overlay'"
+        );
+
+        // Confirm the validator would have rejected this, proving the old code was wrong.
+        let validation_result = EffectiveConfigValidator::validate(&empty_db_result);
+        assert!(
+            validation_result.is_err(),
+            "validator must reject an empty payload — it should never be called on one"
+        );
+    }
+
     /// Build a minimal `RegisteredNode` in Pending state for testing.
     fn make_pending_node() -> RegisteredNode {
         let peer = NodePeer {
