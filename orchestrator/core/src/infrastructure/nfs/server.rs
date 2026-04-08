@@ -70,6 +70,10 @@ use tracing::{debug, error, info, warn};
 pub struct NfsVolumeContext {
     pub execution_id: ExecutionId,
     pub volume_id: VolumeId,
+    /// Workflow execution ID when this volume is owned by a workflow execution.
+    /// Used by FSAL `authorize()` to match `VolumeOwnership::WorkflowExecution`
+    /// without mutating DB ownership on every ContainerRun step.
+    pub workflow_execution_id: Option<uuid::Uuid>,
     pub container_uid: u32,
     pub container_gid: u32,
     pub policy: FsalAccessPolicy,
@@ -486,6 +490,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                     .unwrap_or_else(|| NfsVolumeContext {
                         execution_id: ExecutionId::new(),
                         volume_id: VolumeId::new(),
+                        workflow_execution_id: None,
                         container_uid: 1000,
                         container_gid: 1000,
                         policy: FsalAccessPolicy::default(),

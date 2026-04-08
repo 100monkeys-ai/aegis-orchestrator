@@ -890,6 +890,7 @@ mod tests {
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
+                workflow_execution_id: None,
             },
             1,
             "aegis-system-operator".to_string(),
@@ -994,6 +995,7 @@ mod tests {
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
+                    workflow_execution_id: None,
                 },
                 parent_execution.id,
             )
@@ -1085,6 +1087,7 @@ mod tests {
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
+                    workflow_execution_id: None,
                 },
                 parent_execution.id,
             )
@@ -1225,6 +1228,7 @@ mod tests {
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
+                    workflow_execution_id: None,
                 },
                 "test-ctx".to_string(),
                 None,
@@ -1299,6 +1303,7 @@ mod tests {
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
+                    workflow_execution_id: None,
                 },
                 "test-ctx".to_string(),
                 None,
@@ -1420,6 +1425,7 @@ mod tests {
                     workspace_volume_id: None,
                     workspace_volume_mount_path: None,
                     workspace_remote_path: None,
+                    workflow_execution_id: None,
                 },
                 parent_execution.id,
             )
@@ -2025,6 +2031,7 @@ impl StandardExecutionService {
         let workspace_volume_id = input.workspace_volume_id;
         let workspace_volume_mount_path = input.workspace_volume_mount_path.clone();
         let workspace_remote_path = input.workspace_remote_path.clone();
+        let workflow_execution_id = input.workflow_execution_id;
 
         // 2. Prepare execution input (render prompt template if needed)
         let prepared_input = self.prepare_execution_input(input, &agent)?;
@@ -2355,6 +2362,7 @@ impl StandardExecutionService {
                 gw.register_volume(VolumeRegistration {
                     volume_id: mount.volume_id,
                     execution_id,
+                    workflow_execution_id: None,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,
@@ -2389,6 +2397,7 @@ impl StandardExecutionService {
                 gw.register_volume(VolumeRegistration {
                     volume_id: vol_id,
                     execution_id,
+                    workflow_execution_id,
                     container_uid: 1000,
                     container_gid: 1000,
                     policy,
@@ -2403,8 +2412,14 @@ impl StandardExecutionService {
             }
 
             // Persist to DB regardless of NFS gateway presence so FSAL can
-            // authorize the volume on any replica.
+            // authorize the volume on any replica. Use WorkflowExecution ownership
+            // when a workflow_execution_id is present — this prevents ContainerRun
+            // steps from overwriting ownership with their own execution_id.
             const WORKSPACE_SIZE_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB default
+            let ownership = match workflow_execution_id {
+                Some(wf_id) => VolumeOwnership::workflow(wf_id),
+                None => VolumeOwnership::execution(execution_id),
+            };
             self.volume_service
                 .persist_external_volume(
                     vol_id,
@@ -2412,7 +2427,7 @@ impl StandardExecutionService {
                     tenant_id.clone(),
                     remote_path,
                     WORKSPACE_SIZE_BYTES,
-                    VolumeOwnership::execution(execution_id),
+                    ownership,
                 )
                 .await
                 .context("Failed to persist workspace volume to DB")?;

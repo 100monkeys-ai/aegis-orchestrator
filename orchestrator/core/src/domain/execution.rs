@@ -209,6 +209,11 @@ pub struct ExecutionInput {
     /// NFS remote path for the workspace volume in SeaweedFS.
     /// When set, used directly for NFS registration instead of constructing a path.
     pub workspace_remote_path: Option<String>,
+    /// Workflow execution UUID that owns the workspace volume. When set,
+    /// `persist_external_volume` uses `VolumeOwnership::WorkflowExecution` instead
+    /// of `VolumeOwnership::Execution`, and the NFS volume registration carries
+    /// this ID so FSAL `authorize()` can match it without DB ownership mutations.
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -576,6 +581,7 @@ mod tests {
             workspace_volume_id: None,
             workspace_volume_mount_path: None,
             workspace_remote_path: None,
+            workflow_execution_id: None,
         }
     }
 

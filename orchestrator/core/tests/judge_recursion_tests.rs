@@ -19,6 +19,7 @@ fn make_input(intent: &str) -> ExecutionInput {
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
+        workflow_execution_id: None,
     }
 }
 

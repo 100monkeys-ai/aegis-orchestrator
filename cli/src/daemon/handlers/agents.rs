@@ -147,6 +147,7 @@ pub(crate) async fn execute_agent_handler(
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
+        workflow_execution_id: None,
     };
 
     // ADR-083: derive security context from authenticated identity

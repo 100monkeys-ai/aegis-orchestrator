@@ -435,6 +435,12 @@ pub struct ContainerStepConfig {
     /// Docker network mode for this container step (ADR-087 D5).
     /// When set, overrides the runner-level default network mode.
     pub network_mode: Option<String>,
+
+    /// Workflow execution UUID that owns the workspace volume. Used by the
+    /// container step runner to register volumes with the correct
+    /// `workflow_execution_id` in the NFS volume registry so FSAL can
+    /// authorize `VolumeOwnership::WorkflowExecution` without DB mutations.
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 /// Result of a successfully completed container step (ADR-050).

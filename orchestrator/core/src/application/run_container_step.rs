@@ -42,6 +42,8 @@ pub struct RunContainerStepInput {
     pub run_as_user: Option<String>,
     /// Docker network mode override, e.g. "none" (ADR-087 D5).
     pub network_mode: Option<String>,
+    /// Workflow execution UUID that owns the workspace volume.
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 /// Output from a single container step execution.
@@ -107,6 +109,7 @@ impl RunContainerStepUseCase {
                 read_only_root_filesystem: input.read_only_root_filesystem,
                 run_as_user: input.run_as_user.clone(),
                 network_mode: input.network_mode.clone(),
+                workflow_execution_id: input.workflow_execution_id,
             };
 
             match self.runner.run_step(config).await {
@@ -245,6 +248,7 @@ impl RunParallelContainerStepsUseCase {
                         read_only_root_filesystem: false,
                         run_as_user: None,
                         network_mode: None,
+                        workflow_execution_id: None,
                     };
                     let outcome = uc.execute(input).await;
                     ParallelStepResult { name, outcome }
@@ -427,6 +431,7 @@ mod tests {
             read_only_root_filesystem: false,
             run_as_user: None,
             network_mode: None,
+            workflow_execution_id: None,
         }
     }
 

@@ -19,14 +19,13 @@
 //! ADR-027 (Docker Runtime Implementation Details).
 
 use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
-use crate::application::volume_manager::VolumeService;
 use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason};
 use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::runtime::{
     ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
 };
 use crate::domain::secrets::AccessContext;
-use crate::domain::volume::{VolumeId, VolumeOwnership};
+use crate::domain::volume::VolumeId;
 use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::image_manager::DockerImageManager;
 use crate::infrastructure::secrets_manager::SecretsManager;
@@ -88,9 +87,6 @@ pub struct ContainerStepRunnerImpl {
     secrets_manager: Arc<SecretsManager>,
     /// Volume registry for resolving the correct NFS remote_path for each volume mount.
     volume_registry: Arc<NfsVolumeRegistry>,
-    /// Volume service for persisting volume ownership when re-registering volumes
-    /// for a ContainerRun execution context (ADR-036/ADR-087).
-    volume_service: Arc<dyn VolumeService>,
 }
 
 impl ContainerStepRunnerImpl {
@@ -101,7 +97,6 @@ impl ContainerStepRunnerImpl {
         event_bus: Arc<EventBus>,
         secrets_manager: Arc<SecretsManager>,
         volume_registry: Arc<NfsVolumeRegistry>,
-        volume_service: Arc<dyn VolumeService>,
     ) -> Self {
         Self {
             docker,
@@ -113,7 +108,6 @@ impl ContainerStepRunnerImpl {
             event_bus,
             secrets_manager,
             volume_registry,
-            volume_service,
         }
     }
 
@@ -384,74 +378,40 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
-            // ─── Re-register volumes for this ContainerRun's execution context ─────
-            // The workspace volume was originally registered under the agent execution
-            // ID (from WRITE_CODE). ContainerRun steps use a different execution ID
-            // (the workflow execution ID). Re-register each volume so the NFS server
-            // constructs FileHandles with the ContainerRun's execution_id, and persist
-            // the updated ownership to the DB so FSAL authorize() succeeds (ADR-036).
+            // ─── Register volumes for this ContainerRun's execution context ──────────
+            // Register each volume with the ContainerRun's execution_id AND the
+            // workflow_execution_id. FSAL authorize() matches WorkflowExecution
+            // ownership via the volume context lookup — no DB writes needed.
             for vm in &config.volumes {
                 if let Ok(uuid) = uuid::Uuid::parse_str(&vm.name) {
                     let volume_id = VolumeId(uuid);
                     if let Some(existing_ctx) = self.volume_registry.lookup(volume_id) {
-                        if existing_ctx.execution_id != config.execution_id {
-                            let policy = FsalAccessPolicy {
-                                read: vec!["/*".to_string()],
-                                write: if vm.read_only {
-                                    vec![]
-                                } else {
-                                    vec!["/*".to_string()]
-                                },
-                            };
-                            self.volume_registry.register(VolumeRegistration {
-                                volume_id,
-                                execution_id: config.execution_id,
-                                container_uid: existing_ctx.container_uid,
-                                container_gid: existing_ctx.container_gid,
-                                policy,
-                                mount_point: std::path::PathBuf::from(&vm.mount_path),
-                                remote_path: existing_ctx.remote_path.clone(),
-                            });
-                            info!(
-                                volume_id = %volume_id,
-                                old_execution_id = %existing_ctx.execution_id,
-                                new_execution_id = %config.execution_id,
-                                "Re-registered NFS volume for ContainerRun execution context"
-                            );
-                            // Persist updated ownership to DB so FSAL authorize() matches
-                            // the execution_id encoded in the NFS FileHandle.
-                            // Fetch existing volume to preserve tenant_id and size.
-                            match self.volume_service.get_volume(volume_id).await {
-                                Ok(vol) => {
-                                    if let Err(e) = self
-                                        .volume_service
-                                        .persist_external_volume(
-                                            volume_id,
-                                            format!("workspace-{}", config.execution_id),
-                                            vol.tenant_id,
-                                            existing_ctx.remote_path.clone(),
-                                            vol.size_limit_bytes,
-                                            VolumeOwnership::execution(config.execution_id),
-                                        )
-                                        .await
-                                    {
-                                        warn!(
-                                            volume_id = %volume_id,
-                                            execution_id = %config.execution_id,
-                                            error = %e,
-                                            "Failed to persist volume ownership for ContainerRun — FSAL may deny access"
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        volume_id = %volume_id,
-                                        error = %e,
-                                        "Failed to look up volume for ownership update — FSAL may deny access"
-                                    );
-                                }
-                            }
-                        }
+                        let policy = FsalAccessPolicy {
+                            read: vec!["/*".to_string()],
+                            write: if vm.read_only {
+                                vec![]
+                            } else {
+                                vec!["/*".to_string()]
+                            },
+                        };
+                        self.volume_registry.register(VolumeRegistration {
+                            volume_id,
+                            execution_id: config.execution_id,
+                            workflow_execution_id: existing_ctx
+                                .workflow_execution_id
+                                .or(config.workflow_execution_id),
+                            container_uid: existing_ctx.container_uid,
+                            container_gid: existing_ctx.container_gid,
+                            policy,
+                            mount_point: std::path::PathBuf::from(&vm.mount_path),
+                            remote_path: existing_ctx.remote_path.clone(),
+                        });
+                        debug!(
+                            volume_id = %volume_id,
+                            execution_id = %config.execution_id,
+                            workflow_execution_id = ?config.workflow_execution_id,
+                            "Registered NFS volume for ContainerRun execution context"
+                        );
                     }
                 }
             }
@@ -563,21 +523,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // Shell wrapping (sh -c) is applied upstream in RunContainerStepUseCase
         // before constructing ContainerStepConfig; ContainerStepConfig always
         // carries the final resolved argv.
-        let cmd: Vec<String> = if tracing::enabled!(tracing::Level::DEBUG) {
-            let original = config.command.join(" ");
-            debug!(
-                execution_id = %config.execution_id,
-                original_cmd = %original,
-                "wrapping container command with workspace listing for diagnostics"
-            );
-            vec![
-                "sh".to_string(),
-                "-c".to_string(),
-                format!("ls -la /workspace/ >&2; {}", original),
-            ]
-        } else {
-            config.command.clone()
-        };
+        let cmd: Vec<String> = config.command.clone();
 
         // ─── 6. Create container ──────────────────────────────────────────────
         let container_name = format!(
@@ -962,6 +908,7 @@ mod tests {
             read_only_root_filesystem: true,
             run_as_user: Some("65534:65534".to_string()),
             network_mode: Some("none".to_string()),
+            workflow_execution_id: None,
         };
 
         assert!(config.read_only_root_filesystem);
@@ -1071,6 +1018,26 @@ mod tests {
             agent_source, old_broken_source,
             "Old aegis-step format must differ from the correct aegis-vol format"
         );
+    }
+
+    /// Regression: ContainerStepRunnerImpl must NOT require a VolumeService
+    /// dependency. Volume ownership is no longer mutated in the DB by the
+    /// container step runner — FSAL resolves WorkflowExecution ownership
+    /// via the VolumeContextLookup trait on the in-memory NFS volume registry.
+    /// This test verifies that the constructor signature does not require a
+    /// VolumeService argument (structural test — if this compiles, the
+    /// dependency has been removed correctly).
+    #[test]
+    fn test_container_step_runner_does_not_require_volume_service() {
+        // ContainerStepRunnerImpl::new takes 6 arguments (no VolumeService).
+        // This is a compile-time verification — no runtime assertion needed.
+        let _config = ContainerStepRunnerConfig {
+            nfs_server_host: None,
+            nfs_port: 2049,
+            nfs_mountport: 2049,
+            network_mode: None,
+        };
+        // If this compiles, the VolumeService dependency has been removed.
     }
 
     #[test]

@@ -20,7 +20,9 @@ use crate::application::storage_router::StorageRouter;
 use crate::domain::{
     events::StorageEvent,
     execution::ExecutionId,
-    fsal::{AegisFSAL, BorrowedVolumeAccess, EventPublisher, FsalAccessPolicy},
+    fsal::{
+        AegisFSAL, BorrowedVolumeAccess, EventPublisher, FsalAccessPolicy, VolumeContextLookup,
+    },
     repository::VolumeRepository,
     storage::StorageProvider,
     volume::{Volume, VolumeId},
@@ -61,6 +63,10 @@ pub enum NfsGatewayError {
 pub struct VolumeRegistration {
     pub volume_id: VolumeId,
     pub execution_id: ExecutionId,
+    /// Workflow execution ID when this volume is owned by a workflow execution.
+    /// Propagated to `NfsVolumeContext` so FSAL `authorize()` can match
+    /// `VolumeOwnership::WorkflowExecution` without mutating DB ownership.
+    pub workflow_execution_id: Option<uuid::Uuid>,
     pub container_uid: u32,
     pub container_gid: u32,
     pub policy: FsalAccessPolicy,
@@ -91,6 +97,7 @@ impl NfsVolumeRegistry {
         let context = NfsVolumeContext {
             execution_id,
             volume_id,
+            workflow_execution_id: registration.workflow_execution_id,
             container_uid: registration.container_uid,
             container_gid: registration.container_gid,
             policy: registration.policy,
@@ -201,6 +208,13 @@ impl Default for NfsVolumeRegistry {
     }
 }
 
+impl VolumeContextLookup for NfsVolumeRegistry {
+    fn lookup_workflow_execution_id(&self, volume_id: VolumeId) -> Option<uuid::Uuid> {
+        self.lookup(volume_id)
+            .and_then(|ctx| ctx.workflow_execution_id)
+    }
+}
+
 /// NFS Gateway application service
 ///
 /// Provides lifecycle management for the NFS server gateway.
@@ -251,14 +265,17 @@ impl NfsGatewayService {
         ));
         let borrowed_volumes = Arc::new(RwLock::new(HashMap::new()));
 
-        let fsal = Arc::new(AegisFSAL::new(
-            storage_router,
-            volume_repository,
-            borrowed_volumes.clone(),
-            event_publisher,
-        ));
-
         let volume_registry = NfsVolumeRegistry::new();
+
+        let fsal = Arc::new(
+            AegisFSAL::new(
+                storage_router,
+                volume_repository,
+                borrowed_volumes.clone(),
+                event_publisher,
+            )
+            .with_volume_context_lookup(Arc::new(volume_registry.clone())),
+        );
         let bind_port = bind_port.unwrap_or(2049);
         let nfs_server = NfsServer::new(fsal, volume_registry.contexts.clone(), bind_port);
 

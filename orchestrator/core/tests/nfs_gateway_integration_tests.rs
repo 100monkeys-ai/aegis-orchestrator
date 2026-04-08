@@ -344,6 +344,7 @@ async fn test_fsal_mode_validation() {
         policy: policy.clone(),
         mount_point: std::path::PathBuf::from("/workspace"),
         remote_path: String::new(),
+        workflow_execution_id: None,
     });
 
     let path = "/workspace/test.txt";
@@ -405,6 +406,7 @@ async fn test_fsal_path_traversal_prevention() {
         policy: policy.clone(),
         mount_point: std::path::PathBuf::from("/workspace"),
         remote_path: String::new(),
+        workflow_execution_id: None,
     });
 
     // Test: Attempt path traversal attack
@@ -683,6 +685,7 @@ async fn test_gateway_borrowed_volume_alias_allows_judge_read_only_access() {
         },
         mount_point: "/workspace".into(),
         remote_path: String::new(),
+        workflow_execution_id: None,
     });
 
     let policy = FsalAccessPolicy {
@@ -750,6 +753,7 @@ async fn test_gateway_borrowed_volume_alias_rejects_wrong_execution() {
         },
         mount_point: "/workspace".into(),
         remote_path: String::new(),
+        workflow_execution_id: None,
     });
 
     let handle = AegisFileHandle::new(

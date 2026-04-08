@@ -240,12 +240,27 @@ pub struct AegisFSAL {
     path_sanitizer: PathSanitizer,
     /// Event publisher (injected, not owned)
     event_publisher: Arc<dyn EventPublisher>,
+    /// Optional volume context lookup for resolving `VolumeOwnership::WorkflowExecution`.
+    /// When set, `authorize()` can match a requesting execution against the
+    /// workflow_execution_id in the NFS volume registry, avoiding DB ownership
+    /// mutations on every ContainerRun step.
+    volume_context_lookup: Option<Arc<dyn VolumeContextLookup>>,
 }
 
 /// Event publisher trait (abstraction for event bus)
 #[async_trait]
 pub trait EventPublisher: Send + Sync {
     async fn publish_storage_event(&self, event: StorageEvent);
+}
+
+/// Domain-layer abstraction for querying the NFS volume registry.
+///
+/// Used by [`AegisFSAL::authorize`] to resolve `VolumeOwnership::WorkflowExecution`
+/// without the domain layer depending on the application layer (`NfsVolumeRegistry`).
+/// The application layer provides the concrete implementation.
+pub trait VolumeContextLookup: Send + Sync {
+    /// Returns the `workflow_execution_id` registered for the given volume, if any.
+    fn lookup_workflow_execution_id(&self, volume_id: VolumeId) -> Option<uuid::Uuid>;
 }
 
 /// Borrowed read-only access to an existing volume, exposed under a distinct alias volume ID.
@@ -269,7 +284,14 @@ impl AegisFSAL {
             borrowed_volumes,
             path_sanitizer: PathSanitizer::new(),
             event_publisher,
+            volume_context_lookup: None,
         }
+    }
+
+    /// Set the volume context lookup for `WorkflowExecution` ownership resolution.
+    pub fn with_volume_context_lookup(mut self, lookup: Arc<dyn VolumeContextLookup>) -> Self {
+        self.volume_context_lookup = Some(lookup);
+        self
     }
 
     /// Expose storage provider for direct use by application services (e.g. FileOperationsService)
@@ -382,7 +404,19 @@ impl AegisFSAL {
             crate::domain::volume::VolumeOwnership::Execution {
                 execution_id: exec_id,
             } => *exec_id == execution_id,
-            _ => false, // WorkflowExecution or Persistent volumes require different auth
+            crate::domain::volume::VolumeOwnership::WorkflowExecution {
+                workflow_execution_id: wf_id,
+            } => {
+                // Check if the requesting execution is registered for this volume
+                // with a matching workflow_execution_id. The NFS volume registry
+                // is the source of truth — only the orchestrator registers volumes.
+                self.volume_context_lookup
+                    .as_ref()
+                    .and_then(|lookup| lookup.lookup_workflow_execution_id(volume_id))
+                    .map(|ctx_wf_id| ctx_wf_id == *wf_id)
+                    .unwrap_or(false)
+            }
+            _ => false, // Persistent volumes require user-level auth
         };
 
         if !is_owner {
@@ -1500,6 +1534,150 @@ mod tests {
         assert!(
             matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
             "workflow ownership should fail user auth: {:?}",
+            result
+        );
+    }
+
+    // ── VolumeOwnership::WorkflowExecution authorize tests ────────────────
+
+    /// Stub implementation of VolumeContextLookup that returns a fixed
+    /// workflow_execution_id for any volume.
+    struct StubVolumeContextLookup {
+        wf_id: Option<uuid::Uuid>,
+    }
+
+    impl VolumeContextLookup for StubVolumeContextLookup {
+        fn lookup_workflow_execution_id(&self, _volume_id: VolumeId) -> Option<uuid::Uuid> {
+            self.wf_id
+        }
+    }
+
+    fn make_workflow_volume(wf_id: uuid::Uuid) -> crate::domain::volume::Volume {
+        use crate::domain::volume::{FilerEndpoint, StorageClass, VolumeBackend, VolumeOwnership};
+        use chrono::Utc;
+        crate::domain::volume::Volume {
+            id: VolumeId::new(),
+            name: "wf-workspace".to_string(),
+            tenant_id: crate::domain::volume::TenantId::consumer(),
+            storage_class: StorageClass::persistent(),
+            backend: VolumeBackend::SeaweedFS {
+                filer_endpoint: FilerEndpoint::new("http://localhost:8888").unwrap(),
+                remote_path: "/aegis/volumes/test/wf".to_string(),
+            },
+            size_limit_bytes: 1_000_000,
+            status: VolumeStatus::Available,
+            ownership: VolumeOwnership::WorkflowExecution {
+                workflow_execution_id: wf_id,
+            },
+            created_at: Utc::now(),
+            attached_at: None,
+            detached_at: None,
+            expires_at: None,
+            host_node_id: None,
+        }
+    }
+
+    /// Regression: FSAL must authorize an execution accessing a volume with
+    /// WorkflowExecution ownership when the volume context lookup reports
+    /// a matching workflow_execution_id.
+    #[tokio::test]
+    async fn test_fsal_authorizes_workflow_execution_ownership() {
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+
+        let wf_id = uuid::Uuid::new_v4();
+        let vol = make_workflow_volume(wf_id);
+        let vol_id = vol.id;
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+
+        let lookup = Arc::new(StubVolumeContextLookup { wf_id: Some(wf_id) });
+        let fsal = AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        )
+        .with_volume_context_lookup(lookup);
+
+        // Any execution_id should be authorized as long as the volume context
+        // lookup returns a matching workflow_execution_id.
+        let exec_id = ExecutionId::new();
+        let result = fsal.authorize(exec_id, vol_id).await;
+        assert!(
+            result.is_ok(),
+            "execution should be authorized for WorkflowExecution volume \
+             when volume context lookup matches: {:?}",
+            result
+        );
+    }
+
+    /// Regression: FSAL must deny an execution accessing a volume with
+    /// WorkflowExecution ownership when the volume context lookup reports
+    /// a different workflow_execution_id.
+    #[tokio::test]
+    async fn test_fsal_denies_workflow_execution_ownership_mismatch() {
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+
+        let wf_id = uuid::Uuid::new_v4();
+        let vol = make_workflow_volume(wf_id);
+        let vol_id = vol.id;
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+
+        // Volume context reports a *different* workflow_execution_id
+        let wrong_wf_id = uuid::Uuid::new_v4();
+        let lookup = Arc::new(StubVolumeContextLookup {
+            wf_id: Some(wrong_wf_id),
+        });
+        let fsal = AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        )
+        .with_volume_context_lookup(lookup);
+
+        let exec_id = ExecutionId::new();
+        let result = fsal.authorize(exec_id, vol_id).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "mismatched workflow_execution_id should deny access: {:?}",
+            result
+        );
+    }
+
+    /// Regression: FSAL must deny when no volume context lookup is configured
+    /// and the volume has WorkflowExecution ownership (the old behavior was
+    /// `_ => false` which denied all workflow volumes).
+    #[tokio::test]
+    async fn test_fsal_denies_workflow_execution_without_lookup() {
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+
+        let wf_id = uuid::Uuid::new_v4();
+        let vol = make_workflow_volume(wf_id);
+        let vol_id = vol.id;
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+
+        // No volume context lookup configured
+        let fsal = AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        );
+
+        let exec_id = ExecutionId::new();
+        let result = fsal.authorize(exec_id, vol_id).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "should deny without volume context lookup: {:?}",
             result
         );
     }

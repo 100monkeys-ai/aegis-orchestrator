@@ -29,6 +29,7 @@ fn make_input(intent: &str) -> ExecutionInput {
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
+        workflow_execution_id: None,
     }
 }
 
@@ -39,6 +40,7 @@ fn make_input_with_payload(intent: &str, payload: serde_json::Value) -> Executio
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
+        workflow_execution_id: None,
     }
 }
 
@@ -838,6 +840,7 @@ fn execution_input_without_intent() {
         workspace_volume_id: None,
         workspace_volume_mount_path: None,
         workspace_remote_path: None,
+        workflow_execution_id: None,
     };
     assert!(input.intent.is_none());
 }

@@ -339,6 +339,11 @@ impl AegisRuntime for AegisRuntimeService {
                 .map(std::path::PathBuf::from)
                 .or_else(|| Some(std::path::PathBuf::from("/workspace"))),
             workspace_remote_path: req.workspace_remote_path.filter(|s| !s.is_empty()),
+            workflow_execution_id: req
+                .workflow_execution_id
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .and_then(|s| uuid::Uuid::parse_str(s).ok()),
         };
 
         // Channel for streaming events
@@ -900,6 +905,11 @@ impl AegisRuntime for AegisRuntimeService {
             read_only_root_filesystem: false,
             run_as_user: None,
             network_mode: None,
+            workflow_execution_id: if req.workflow_execution_id.is_empty() {
+                None
+            } else {
+                uuid::Uuid::parse_str(&req.workflow_execution_id).ok()
+            },
         };
 
         match use_case.execute(input).await {
@@ -2006,6 +2016,7 @@ mod tests {
                 workspace_volume_id: None,
                 workspace_volume_mount_path: None,
                 workspace_remote_path: None,
+                workflow_execution_id: None,
             },
             started_at: Utc::now(),
             ended_at: Some(Utc::now()),
