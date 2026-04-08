@@ -1128,7 +1128,7 @@ mod tests {
             &self,
             _config: &crate::domain::output_handler::OutputHandlerConfig,
             _final_output: &str,
-            _execution_id: &ExecutionId,
+            _execution_id: Option<&ExecutionId>,
             _tenant_id: &TenantId,
         ) -> Result<Option<String>> {
             let mut guard = self.result.lock().unwrap();
