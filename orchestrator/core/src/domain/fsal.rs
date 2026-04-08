@@ -22,12 +22,13 @@
 //! - **Purpose:** Implements internal responsibilities for fsal
 
 use crate::domain::{
+    cluster::NodeId,
     events::StorageEvent,
     execution::ExecutionId,
     path_sanitizer::{PathSanitizer, PathSanitizerError},
     policy::FilesystemPolicy,
     repository::VolumeRepository,
-    storage::{DirEntry, FileAttributes, OpenMode, StorageError, StorageProvider},
+    storage::{DirEntry, FileAttributes, FileHandle, OpenMode, StorageError, StorageProvider},
     volume::{Volume, VolumeId, VolumeStatus},
 };
 
@@ -440,6 +441,33 @@ impl AegisFSAL {
         Ok(())
     }
 
+    /// Emit a `FilesystemPolicyViolation` storage event.
+    ///
+    /// Called by FSAL methods when `enforce_read_policy` or
+    /// `enforce_write_policy` fails, providing a forensic audit trail
+    /// for misconfigured or malicious access attempts.
+    async fn emit_policy_violation(
+        &self,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        operation: &str,
+        path: &str,
+        error: &FsalError,
+    ) {
+        self.event_publisher
+            .publish_storage_event(StorageEvent::FilesystemPolicyViolation {
+                execution_id,
+                volume_id,
+                operation: operation.to_string(),
+                path: path.to_string(),
+                policy_rule: error.to_string(),
+                violated_at: Utc::now(),
+                caller_node_id: None,
+                host_node_id: None,
+            })
+            .await;
+    }
+
     /// Lookup a file/directory (NFS LOOKUP operation)
     pub async fn lookup(
         &self,
@@ -493,7 +521,11 @@ impl AegisFSAL {
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
-        self.enforce_read_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_read_policy(policy, path_str) {
+            self.emit_policy_violation(handle.execution_id, handle.volume_id, "read", path_str, &e)
+                .await;
+            return Err(e);
+        }
         let full_path = self.routed_storage_path(&volume, path_str);
 
         // 3. Read via storage provider
@@ -546,7 +578,17 @@ impl AegisFSAL {
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
-        self.enforce_write_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(
+                handle.execution_id,
+                handle.volume_id,
+                "write",
+                path_str,
+                &e,
+            )
+            .await;
+            return Err(e);
+        }
         let full_path = self.routed_storage_path(&volume, path_str);
         let usage_path = self.routed_usage_path(&volume);
 
@@ -626,7 +668,11 @@ impl AegisFSAL {
         let path_str = path_string.as_str();
 
         // 3. Enforce write policy
-        self.enforce_write_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(execution_id, volume_id, "write", path_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -712,7 +758,11 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce read policy
-        self.enforce_read_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_read_policy(policy, path_str) {
+            self.emit_policy_violation(execution_id, volume_id, "read", path_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -752,7 +802,11 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy (directory creation is a write operation)
-        self.enforce_write_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(execution_id, volume_id, "write", path_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -791,7 +845,11 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy
-        self.enforce_write_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(execution_id, volume_id, "delete", path_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -830,7 +888,11 @@ impl AegisFSAL {
         let path_str = canonical.to_str().unwrap();
 
         // 3. Enforce write policy
-        self.enforce_write_policy(policy, path_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, path_str) {
+            self.emit_policy_violation(execution_id, volume_id, "delete", path_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote path
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -872,8 +934,16 @@ impl AegisFSAL {
         let to_str = to_canonical.to_str().unwrap();
 
         // 3. Enforce write policy for both paths
-        self.enforce_write_policy(policy, from_str)?;
-        self.enforce_write_policy(policy, to_str)?;
+        if let Err(e) = self.enforce_write_policy(policy, from_str) {
+            self.emit_policy_violation(execution_id, volume_id, "write", from_str, &e)
+                .await;
+            return Err(e);
+        }
+        if let Err(e) = self.enforce_write_policy(policy, to_str) {
+            self.emit_policy_violation(execution_id, volume_id, "write", to_str, &e)
+                .await;
+            return Err(e);
+        }
 
         // 4. Build full remote paths
         let from_full = self.routed_storage_path(&volume, from_str);
@@ -891,6 +961,178 @@ impl AegisFSAL {
                 created_at: Utc::now(),
                 caller_node_id: None,
                 host_node_id: None,
+            })
+            .await;
+
+        Ok(())
+    }
+
+    // ── Node-to-node FSAL methods (ADR-064 remote volume support) ────────
+
+    /// Open a file with path sanitization, volume authorization, and event
+    /// emission for cross-node (SEAL) operations.
+    pub async fn open_file_for_node(
+        &self,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: &str,
+        mode: OpenMode,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
+    ) -> Result<FileHandle, FsalError> {
+        // 1. Authorize
+        let volume = self.authorize(execution_id, volume_id).await?;
+
+        // 2. Sanitize path
+        let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
+        let path_string = canonical.to_str().unwrap().replace('\\', "/");
+
+        // 3. Route to storage backend
+        let storage_path = self.routed_storage_path(&volume, &path_string);
+        let handle = self.storage_provider.open_file(&storage_path, mode).await?;
+
+        // 4. Emit event
+        self.event_publisher
+            .publish_storage_event(StorageEvent::FileOpened {
+                execution_id,
+                volume_id,
+                path: path_string,
+                open_mode: format!("{mode:?}"),
+                opened_at: Utc::now(),
+                caller_node_id,
+                host_node_id,
+            })
+            .await;
+
+        Ok(handle)
+    }
+
+    /// Read from an open file handle with event emission for cross-node
+    /// (SEAL) operations.
+    ///
+    /// Unlike [`Self::read`], this operates on an already-open
+    /// [`FileHandle`] rather than opening/closing per call.
+    pub async fn read_for_node(
+        &self,
+        handle: &FileHandle,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: &str,
+        offset: u64,
+        length: usize,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
+    ) -> Result<Vec<u8>, FsalError> {
+        let start = std::time::Instant::now();
+
+        let data = self
+            .storage_provider
+            .read_at(handle, offset, length)
+            .await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        self.event_publisher
+            .publish_storage_event(StorageEvent::FileRead {
+                execution_id,
+                volume_id,
+                path: path.to_string(),
+                offset,
+                bytes_read: data.len() as u64,
+                duration_ms,
+                read_at: Utc::now(),
+                caller_node_id,
+                host_node_id,
+            })
+            .await;
+
+        Ok(data)
+    }
+
+    /// Write to an open file handle with quota enforcement and event
+    /// emission for cross-node (SEAL) operations.
+    ///
+    /// Unlike [`Self::write`], this operates on an already-open
+    /// [`FileHandle`] rather than opening/closing per call.
+    pub async fn write_for_node(
+        &self,
+        handle: &FileHandle,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: &str,
+        offset: u64,
+        data: &[u8],
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
+    ) -> Result<usize, FsalError> {
+        let start = std::time::Instant::now();
+
+        // Quota enforcement
+        let volume = self.authorize(execution_id, volume_id).await?;
+        let usage_path = self.routed_usage_path(&volume);
+        let current_usage = self.storage_provider.get_usage(&usage_path).await?;
+        let requested_bytes = data.len() as u64;
+        let projected_usage = current_usage.saturating_add(requested_bytes);
+
+        if projected_usage > volume.size_limit_bytes {
+            let available_bytes = volume.size_limit_bytes.saturating_sub(current_usage);
+            self.event_publisher
+                .publish_storage_event(StorageEvent::QuotaExceeded {
+                    execution_id,
+                    volume_id,
+                    requested_bytes,
+                    available_bytes,
+                    exceeded_at: Utc::now(),
+                    caller_node_id: caller_node_id.clone(),
+                    host_node_id: host_node_id.clone(),
+                })
+                .await;
+            return Err(FsalError::QuotaExceeded {
+                requested_bytes,
+                available_bytes,
+            });
+        }
+
+        let bytes_written = self.storage_provider.write_at(handle, offset, data).await?;
+
+        let duration_ms = start.elapsed().as_millis() as u64;
+        self.event_publisher
+            .publish_storage_event(StorageEvent::FileWritten {
+                execution_id,
+                volume_id,
+                path: path.to_string(),
+                offset,
+                bytes_written: bytes_written as u64,
+                duration_ms,
+                written_at: Utc::now(),
+                caller_node_id,
+                host_node_id,
+            })
+            .await;
+
+        Ok(bytes_written)
+    }
+
+    /// Close a file handle with event emission for cross-node (SEAL)
+    /// operations.
+    pub async fn close_for_node(
+        &self,
+        handle: &FileHandle,
+        execution_id: ExecutionId,
+        volume_id: VolumeId,
+        path: &str,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
+    ) -> Result<(), FsalError> {
+        self.storage_provider.close_file(handle).await?;
+
+        self.event_publisher
+            .publish_storage_event(StorageEvent::FileClosed {
+                execution_id,
+                volume_id,
+                path: path.to_string(),
+                closed_at: Utc::now(),
+                caller_node_id,
+                host_node_id,
             })
             .await;
 

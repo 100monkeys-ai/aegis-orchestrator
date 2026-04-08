@@ -64,8 +64,9 @@ pub struct RemoteStorageServiceHandler {
     fsal: Arc<AegisFSAL>,
     cluster_repo: Arc<dyn NodeClusterRepository>,
     host_node_id: NodeId,
-    /// Path sanitizer for handle-based operations where the FSAL is
-    /// not directly invoked (open/read/write/close).
+    /// Path sanitizer for administrative operations (`set_quota`,
+    /// `get_usage`) that bypass the FSAL and for sanitizing paths
+    /// stored in handle metadata.
     path_sanitizer: PathSanitizer,
     /// Maps raw `FileHandle` bytes to metadata so that read_at/write_at/close
     /// can emit events with the original volume_id and path.
@@ -247,6 +248,8 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
+        // TODO: propagate caller_node_id + host_node_id into FSAL events once
+        // directory-level FSAL methods accept node provenance parameters.
         let _caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
@@ -265,6 +268,8 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
+        // TODO: propagate caller_node_id + host_node_id into FSAL events once
+        // directory-level FSAL methods accept node provenance parameters.
         let _caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
@@ -284,8 +289,12 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
         self.authenticate(req.envelope).await?;
-        let path = Self::full_path(&req.volume_id, &req.path);
 
+        // Sanitize path before building full path to prevent traversal.
+        let sanitized = self.sanitize_path(&req.path)?;
+        let path = Self::full_path(&req.volume_id, &sanitized);
+
+        // TODO: emit StorageEvent for quota administrative operations.
         // set_quota is an administrative operation not covered by FSAL;
         // delegate directly to the storage provider.
         self.fsal
@@ -303,7 +312,10 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
     ) -> Result<Response<GetUsageResponse>, Status> {
         let req = request.into_inner();
         self.authenticate(req.envelope).await?;
-        let path = Self::full_path(&req.volume_id, &req.path);
+
+        // Sanitize path before building full path to prevent traversal.
+        let sanitized = self.sanitize_path(&req.path)?;
+        let path = Self::full_path(&req.volume_id, &sanitized);
 
         let bytes_used = self
             .fsal
@@ -320,31 +332,34 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<OpenFileRequest>,
     ) -> Result<Response<OpenFileResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
 
-        // Sanitize path before building full path to prevent traversal.
-        let sanitized = self.sanitize_path(&req.path)?;
-        let volume_id_str = req.volume_id.clone();
-        let full_path = Self::full_path(&volume_id_str, &sanitized);
+        let volume_id = Self::parse_volume_id(&req.volume_id)?;
+        let execution_id = Self::sentinel_execution_id();
         let mode = Self::proto_mode_to_open_mode(req.mode);
 
         let handle = self
             .fsal
-            .storage_provider()
-            .open_file(&full_path, mode)
+            .open_file_for_node(
+                execution_id,
+                volume_id,
+                &req.path,
+                mode,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
-            .map_err(|e| Self::storage_err_to_status(&e))?;
+            .map_err(Self::fsal_err_to_status)?;
 
         // Track handle metadata for event emission on read/write/close.
-        if let Ok(vid) = Self::parse_volume_id(&volume_id_str) {
-            self.open_handles.write().insert(
-                handle.0.clone(),
-                OpenHandleMeta {
-                    volume_id: vid,
-                    path: sanitized,
-                },
-            );
-        }
+        let sanitized = self.sanitize_path(&req.path)?;
+        self.open_handles.write().insert(
+            handle.0.clone(),
+            OpenHandleMeta {
+                volume_id,
+                path: sanitized,
+            },
+        );
 
         Ok(Response::new(OpenFileResponse {
             file_handle: handle.0,
@@ -356,15 +371,31 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<ReadAtRequest>,
     ) -> Result<Response<ReadAtResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
-        let handle = FileHandle(req.file_handle);
+        let caller_node_id = self.authenticate(req.envelope).await?;
+        let handle = FileHandle(req.file_handle.clone());
+
+        // Retrieve tracked metadata for provenance-rich event emission.
+        let meta = self
+            .open_handles
+            .read()
+            .get(&req.file_handle)
+            .cloned()
+            .ok_or_else(|| Status::invalid_argument("Unknown file handle"))?;
 
         let data = self
             .fsal
-            .storage_provider()
-            .read_at(&handle, req.offset, req.length as usize)
+            .read_for_node(
+                &handle,
+                Self::sentinel_execution_id(),
+                meta.volume_id,
+                &meta.path,
+                req.offset,
+                req.length as usize,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
-            .map_err(|e| Self::storage_err_to_status(&e))?;
+            .map_err(Self::fsal_err_to_status)?;
 
         Ok(Response::new(ReadAtResponse { data }))
     }
@@ -374,15 +405,31 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<WriteAtRequest>,
     ) -> Result<Response<WriteAtResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
-        let handle = FileHandle(req.file_handle);
+        let caller_node_id = self.authenticate(req.envelope).await?;
+        let handle = FileHandle(req.file_handle.clone());
+
+        // Retrieve tracked metadata for provenance-rich event emission.
+        let meta = self
+            .open_handles
+            .read()
+            .get(&req.file_handle)
+            .cloned()
+            .ok_or_else(|| Status::invalid_argument("Unknown file handle"))?;
 
         let bytes_written = self
             .fsal
-            .storage_provider()
-            .write_at(&handle, req.offset, &req.data)
+            .write_for_node(
+                &handle,
+                Self::sentinel_execution_id(),
+                meta.volume_id,
+                &meta.path,
+                req.offset,
+                &req.data,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
             .await
-            .map_err(|e| Self::storage_err_to_status(&e))?;
+            .map_err(Self::fsal_err_to_status)?;
 
         Ok(Response::new(WriteAtResponse {
             bytes_written: bytes_written as u32,
@@ -394,17 +441,27 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<CloseFileRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
-        self.authenticate(req.envelope).await?;
+        let caller_node_id = self.authenticate(req.envelope).await?;
         let handle = FileHandle(req.file_handle.clone());
 
-        self.fsal
-            .storage_provider()
-            .close_file(&handle)
-            .await
-            .map_err(|e| Self::storage_err_to_status(&e))?;
+        // Retrieve and remove tracked metadata for event emission.
+        let meta = self
+            .open_handles
+            .write()
+            .remove(&req.file_handle)
+            .ok_or_else(|| Status::invalid_argument("Unknown file handle"))?;
 
-        // Clean up tracked handle metadata.
-        self.open_handles.write().remove(&req.file_handle);
+        self.fsal
+            .close_for_node(
+                &handle,
+                Self::sentinel_execution_id(),
+                meta.volume_id,
+                &meta.path,
+                Some(caller_node_id),
+                Some(self.host_node_id.clone()),
+            )
+            .await
+            .map_err(Self::fsal_err_to_status)?;
 
         Ok(Response::new(Self::ok_response()))
     }
@@ -512,6 +569,8 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RemoteStorageRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
+        // TODO: propagate caller_node_id + host_node_id into FSAL events once
+        // file-level FSAL methods accept node provenance parameters.
         let _caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
@@ -530,6 +589,8 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
         request: Request<RenameRequest>,
     ) -> Result<Response<RemoteStorageResponse>, Status> {
         let req = request.into_inner();
+        // TODO: propagate caller_node_id + host_node_id into FSAL events once
+        // rename FSAL method accepts node provenance parameters.
         let _caller_node_id = self.authenticate(req.envelope).await?;
         let volume_id = Self::parse_volume_id(&req.volume_id)?;
         let execution_id = Self::sentinel_execution_id();
@@ -902,6 +963,267 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), FsalError::QuotaExceeded { .. }),
             "Expected QuotaExceeded error"
+        );
+    }
+
+    // ── Regression tests: FSAL boundary enforcement for handle-based RPCs ──
+
+    /// Regression test: open_file_for_node emits FileOpened event with
+    /// cross-node provenance (audit fix: handle-based RPCs bypass FSAL).
+    #[tokio::test]
+    async fn open_file_for_node_emits_event_with_provenance() {
+        let volume_id = VolumeId::new();
+        let volume_repo = Arc::new(InMemoryVolumeRepository::new());
+        volume_repo
+            .save(&make_sentinel_volume(volume_id))
+            .await
+            .unwrap();
+
+        let publisher = Arc::new(CapturingPublisher::new());
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoopStorage);
+        let fsal = build_fsal(storage, volume_repo, publisher.clone());
+
+        let caller = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let host = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+
+        fsal.open_file_for_node(
+            RemoteStorageServiceHandler::sentinel_execution_id(),
+            volume_id,
+            "/workspace/test.txt",
+            crate::domain::storage::OpenMode::ReadOnly,
+            Some(caller.clone()),
+            Some(host.clone()),
+        )
+        .await
+        .expect("open_file_for_node should succeed");
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1, "Expected exactly one StorageEvent");
+        match &events[0] {
+            StorageEvent::FileOpened {
+                caller_node_id,
+                host_node_id,
+                path,
+                ..
+            } => {
+                assert_eq!(caller_node_id.as_ref(), Some(&caller));
+                assert_eq!(host_node_id.as_ref(), Some(&host));
+                assert_eq!(path, "/workspace/test.txt");
+            }
+            other => panic!("Expected FileOpened event, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: read_for_node emits FileRead event with
+    /// cross-node provenance (audit fix: read_at bypassed FSAL).
+    #[tokio::test]
+    async fn read_for_node_emits_event_with_provenance() {
+        let volume_id = VolumeId::new();
+        let volume_repo = Arc::new(InMemoryVolumeRepository::new());
+        volume_repo
+            .save(&make_sentinel_volume(volume_id))
+            .await
+            .unwrap();
+
+        let publisher = Arc::new(CapturingPublisher::new());
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoopStorage);
+        let fsal = build_fsal(storage, volume_repo, publisher.clone());
+
+        let caller = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let host = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let handle = FileHandle(vec![1, 2, 3]);
+
+        let data = fsal
+            .read_for_node(
+                &handle,
+                RemoteStorageServiceHandler::sentinel_execution_id(),
+                volume_id,
+                "/workspace/data.bin",
+                0,
+                64,
+                Some(caller.clone()),
+                Some(host.clone()),
+            )
+            .await
+            .expect("read_for_node should succeed");
+
+        assert_eq!(data, vec![42], "NoopStorage returns [42]");
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1, "Expected exactly one StorageEvent");
+        match &events[0] {
+            StorageEvent::FileRead {
+                caller_node_id,
+                host_node_id,
+                path,
+                bytes_read,
+                ..
+            } => {
+                assert_eq!(caller_node_id.as_ref(), Some(&caller));
+                assert_eq!(host_node_id.as_ref(), Some(&host));
+                assert_eq!(path, "/workspace/data.bin");
+                assert_eq!(*bytes_read, 1);
+            }
+            other => panic!("Expected FileRead event, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: write_for_node emits FileWritten event with
+    /// cross-node provenance (audit fix: write_at bypassed FSAL).
+    #[tokio::test]
+    async fn write_for_node_emits_event_with_provenance() {
+        let volume_id = VolumeId::new();
+        let volume_repo = Arc::new(InMemoryVolumeRepository::new());
+        volume_repo
+            .save(&make_sentinel_volume(volume_id))
+            .await
+            .unwrap();
+
+        let publisher = Arc::new(CapturingPublisher::new());
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoopStorage);
+        let fsal = build_fsal(storage, volume_repo, publisher.clone());
+
+        let caller = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let host = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let handle = FileHandle(vec![1, 2, 3]);
+
+        let bytes_written = fsal
+            .write_for_node(
+                &handle,
+                RemoteStorageServiceHandler::sentinel_execution_id(),
+                volume_id,
+                "/workspace/output.bin",
+                0,
+                &[0u8; 100],
+                Some(caller.clone()),
+                Some(host.clone()),
+            )
+            .await
+            .expect("write_for_node should succeed");
+
+        assert_eq!(bytes_written, 100);
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1, "Expected exactly one StorageEvent");
+        match &events[0] {
+            StorageEvent::FileWritten {
+                caller_node_id,
+                host_node_id,
+                path,
+                bytes_written: bw,
+                ..
+            } => {
+                assert_eq!(caller_node_id.as_ref(), Some(&caller));
+                assert_eq!(host_node_id.as_ref(), Some(&host));
+                assert_eq!(path, "/workspace/output.bin");
+                assert_eq!(*bw, 100);
+            }
+            other => panic!("Expected FileWritten event, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: close_for_node emits FileClosed event with
+    /// cross-node provenance (audit fix: close_file bypassed FSAL).
+    #[tokio::test]
+    async fn close_for_node_emits_event_with_provenance() {
+        let volume_id = VolumeId::new();
+        let volume_repo = Arc::new(InMemoryVolumeRepository::new());
+        volume_repo
+            .save(&make_sentinel_volume(volume_id))
+            .await
+            .unwrap();
+
+        let publisher = Arc::new(CapturingPublisher::new());
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoopStorage);
+        let fsal = build_fsal(storage, volume_repo, publisher.clone());
+
+        let caller = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let host = crate::domain::cluster::NodeId(uuid::Uuid::new_v4());
+        let handle = FileHandle(vec![1, 2, 3]);
+
+        fsal.close_for_node(
+            &handle,
+            RemoteStorageServiceHandler::sentinel_execution_id(),
+            volume_id,
+            "/workspace/closed.txt",
+            Some(caller.clone()),
+            Some(host.clone()),
+        )
+        .await
+        .expect("close_for_node should succeed");
+
+        let events = publisher.events();
+        assert_eq!(events.len(), 1, "Expected exactly one StorageEvent");
+        match &events[0] {
+            StorageEvent::FileClosed {
+                caller_node_id,
+                host_node_id,
+                path,
+                ..
+            } => {
+                assert_eq!(caller_node_id.as_ref(), Some(&caller));
+                assert_eq!(host_node_id.as_ref(), Some(&host));
+                assert_eq!(path, "/workspace/closed.txt");
+            }
+            other => panic!("Expected FileClosed event, got: {other:?}"),
+        }
+    }
+
+    /// Regression test: FSAL policy violation emits FilesystemPolicyViolation
+    /// event before returning error (audit fix: event never emitted).
+    #[tokio::test]
+    async fn policy_violation_emits_event() {
+        let volume_id = VolumeId::new();
+        let volume_repo = Arc::new(InMemoryVolumeRepository::new());
+        volume_repo
+            .save(&make_sentinel_volume(volume_id))
+            .await
+            .unwrap();
+
+        let publisher = Arc::new(CapturingPublisher::new());
+        let storage: Arc<dyn StorageProvider> = Arc::new(NoopStorage);
+        let fsal = build_fsal(storage, volume_repo, publisher.clone());
+
+        let execution_id = RemoteStorageServiceHandler::sentinel_execution_id();
+        // Policy only allows /allowed/** — /forbidden/secret.txt should be rejected.
+        let restrictive_policy = FsalAccessPolicy {
+            read: vec!["/allowed/**".to_string()],
+            write: vec!["/allowed/**".to_string()],
+        };
+
+        let handle = crate::domain::fsal::AegisFileHandle::new(
+            execution_id,
+            volume_id,
+            "/forbidden/secret.txt",
+        );
+
+        let result = fsal
+            .read(&handle, "/forbidden/secret.txt", &restrictive_policy, 0, 64)
+            .await;
+
+        assert!(
+            matches!(result, Err(FsalError::PolicyViolation(_))),
+            "Expected PolicyViolation error, got: {result:?}"
+        );
+
+        let events = publisher.events();
+        assert!(
+            !events.is_empty(),
+            "Expected at least one StorageEvent for policy violation"
+        );
+        let has_violation = events.iter().any(|e| {
+            matches!(
+                e,
+                StorageEvent::FilesystemPolicyViolation {
+                    operation,
+                    path,
+                    ..
+                } if operation == "read" && path == "/forbidden/secret.txt"
+            )
+        });
+        assert!(
+            has_violation,
+            "Expected FilesystemPolicyViolation event, got: {events:?}"
         );
     }
 }
