@@ -548,6 +548,13 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             }
         }
 
+        // Collect volume source names for post-removal cleanup (before host_config moves)
+        let volume_sources_for_cleanup: Vec<String> = host_config
+            .mounts
+            .as_ref()
+            .map(|mounts| mounts.iter().filter_map(|m| m.source.clone()).collect())
+            .unwrap_or_default();
+
         // ─── 6. Create container ──────────────────────────────────────────────
         let container_name = format!(
             "aegis-step-{}-{}",
@@ -661,21 +668,17 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // ─── 10b. Clean up named volumes after container removal ──────────────
         // Remove the named volumes created for this run so they don't accumulate
         // as stale plain-local volumes across runs.
-        if let Some(ref mounts) = host_config.mounts {
-            for m in mounts {
-                if let Some(ref vol_name) = m.source {
-                    if let Err(e) = self
-                        .docker
-                        .remove_volume(vol_name, None::<RemoveVolumeOptions>)
-                        .await
-                    {
-                        debug!(
-                            volume = %vol_name,
-                            error = %e,
-                            "Could not remove volume after container step (may still be in use)"
-                        );
-                    }
-                }
+        for vol_name in &volume_sources_for_cleanup {
+            if let Err(e) = self
+                .docker
+                .remove_volume(vol_name, None::<RemoveVolumeOptions>)
+                .await
+            {
+                debug!(
+                    volume = %vol_name,
+                    error = %e,
+                    "Could not remove volume after container step (may still be in use)"
+                );
             }
         }
 
