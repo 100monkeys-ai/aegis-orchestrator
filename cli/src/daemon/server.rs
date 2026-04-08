@@ -93,7 +93,10 @@ use aegis_orchestrator_core::{
         CorrelatedActivityStreamService,
     },
     domain::{
-        cluster::{NodeClusterRepository, NodeRole},
+        cluster::{
+            ConfigLayerRepository, ConfigType, EffectiveConfigValidator, NodeClusterRepository,
+            NodeId, NodeRole,
+        },
         iam::IdentityProvider,
         node_config::{resolve_env_value, IamConfig, IamRealmConfig, NodeConfigManifest},
         repository::AgentRepository,
@@ -193,7 +196,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     info!("AEGIS daemon starting (PID: {})", pid);
     // Load configuration
     info!("Loading configuration...");
-    let config = NodeConfigManifest::load_or_default(config_path.clone())
+    let mut config = NodeConfigManifest::load_or_default(config_path.clone())
         .context("Failed to load configuration")?;
 
     // Prefer the discovered config path so Docker deployments that set
@@ -368,6 +371,50 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         };
 
     let cluster_repo: Option<Arc<dyn NodeClusterRepository>> = None;
+
+    // ── ADR-060: Load effective config by merging database layers over bootstrap YAML ──
+    if let Some(ref pool) = db_pool {
+        use aegis_orchestrator_core::infrastructure::cluster::PgConfigLayerRepository;
+
+        let config_repo: Arc<dyn ConfigLayerRepository> =
+            Arc::new(PgConfigLayerRepository::new(Arc::new(pool.clone())));
+        let node_id = NodeId(
+            uuid::Uuid::parse_str(&config.spec.node.id).unwrap_or_else(|_| uuid::Uuid::new_v4()),
+        );
+
+        match config_repo
+            .get_merged_config(&node_id, None, &ConfigType::AegisConfig)
+            .await
+        {
+            Ok(merged) => {
+                // Validate effective config before applying (ADR-060 §4, Gap 059-7)
+                if let Err(missing) = EffectiveConfigValidator::validate(&merged) {
+                    return Err(anyhow::anyhow!(
+                        "Effective configuration missing required fields: {:?}",
+                        missing
+                    ));
+                }
+
+                if let Err(e) = config.apply_merged_overlay(&merged) {
+                    warn!(
+                        error = %e,
+                        "Failed to apply merged database config overlay, continuing with YAML-only config"
+                    );
+                } else {
+                    info!(
+                        version = %merged.version,
+                        "Applied merged database config overlay (ADR-060)"
+                    );
+                }
+            }
+            Err(e) => {
+                debug!(
+                    error = %e,
+                    "No database config layers found, using YAML-only config"
+                );
+            }
+        }
+    }
 
     let event_bus = Arc::new(EventBus::new(100));
     let operator_read_model = OperatorReadModelStore::spawn_collector(event_bus.clone());
@@ -752,20 +799,61 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         security_context_repo.clone(),
     ));
 
-    // Load StandardRuntime registry (ADR-043)
+    // Load StandardRuntime registry (ADR-043 / ADR-060)
+    // Try database-backed merged registry first, fall back to file-based.
     let registry_path = &config.spec.runtime.runtime_registry_path;
-    let runtime_registry = match StandardRuntimeRegistry::from_file(registry_path) {
-        Ok(registry) => {
-            info!(path = %registry_path, "StandardRuntime registry loaded");
-            Arc::new(registry)
-        }
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to load StandardRuntime registry from '{}': {e}. \
-                 Ensure runtime-registry.yaml exists at the configured path \
-                 (spec.runtime.runtime_registry_path in aegis-config.yaml).",
-                registry_path
-            ));
+    let runtime_registry = {
+        let merged_registry = if let Some(ref pool) = db_pool {
+            use aegis_orchestrator_core::infrastructure::cluster::PgConfigLayerRepository;
+            let config_repo: Arc<dyn ConfigLayerRepository> =
+                Arc::new(PgConfigLayerRepository::new(Arc::new(pool.clone())));
+            let node_id = NodeId(
+                uuid::Uuid::parse_str(&config.spec.node.id)
+                    .unwrap_or_else(|_| uuid::Uuid::new_v4()),
+            );
+            config_repo
+                .get_merged_config(&node_id, None, &ConfigType::RuntimeRegistry)
+                .await
+                .ok()
+        } else {
+            None
+        };
+
+        if let Some(ref merged) = merged_registry {
+            match StandardRuntimeRegistry::from_merged_config(merged) {
+                Ok(registry) => {
+                    info!("StandardRuntime registry loaded from merged config (ADR-060)");
+                    Arc::new(registry)
+                }
+                Err(e) => {
+                    debug!(error = %e, "Merged runtime registry unavailable, falling back to file");
+                    Arc::new(
+                        StandardRuntimeRegistry::from_file(registry_path).map_err(|e| {
+                            anyhow::anyhow!(
+                                "Failed to load StandardRuntime registry from '{}': {e}. \
+                             Ensure runtime-registry.yaml exists at the configured path \
+                             (spec.runtime.runtime_registry_path in aegis-config.yaml).",
+                                registry_path
+                            )
+                        })?,
+                    )
+                }
+            }
+        } else {
+            match StandardRuntimeRegistry::from_file(registry_path) {
+                Ok(registry) => {
+                    info!(path = %registry_path, "StandardRuntime registry loaded");
+                    Arc::new(registry)
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to load StandardRuntime registry from '{}': {e}. \
+                         Ensure runtime-registry.yaml exists at the configured path \
+                         (spec.runtime.runtime_registry_path in aegis-config.yaml).",
+                        registry_path
+                    ));
+                }
+            }
         }
     };
 
