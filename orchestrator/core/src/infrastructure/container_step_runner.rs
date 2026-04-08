@@ -484,7 +484,21 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // Shell wrapping (sh -c) is applied upstream in RunContainerStepUseCase
         // before constructing ContainerStepConfig; ContainerStepConfig always
         // carries the final resolved argv.
-        let cmd: Vec<String> = config.command.clone();
+        let cmd: Vec<String> = if tracing::enabled!(tracing::Level::DEBUG) {
+            let original = config.command.join(" ");
+            debug!(
+                execution_id = %config.execution_id,
+                original_cmd = %original,
+                "wrapping container command with workspace listing for diagnostics"
+            );
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("ls -la /workspace/ >&2; {}", original),
+            ]
+        } else {
+            config.command.clone()
+        };
 
         // ─── 6. Create container ──────────────────────────────────────────────
         let container_name = format!(
