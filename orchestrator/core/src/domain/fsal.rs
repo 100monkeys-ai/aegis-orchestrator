@@ -453,6 +453,8 @@ impl AegisFSAL {
         operation: &str,
         path: &str,
         error: &FsalError,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) {
         self.event_publisher
             .publish_storage_event(StorageEvent::FilesystemPolicyViolation {
@@ -462,8 +464,8 @@ impl AegisFSAL {
                 path: path.to_string(),
                 policy_rule: error.to_string(),
                 violated_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
     }
@@ -522,8 +524,16 @@ impl AegisFSAL {
         let path_string = canonical.to_str().unwrap().replace("\\", "/");
         let path_str = path_string.as_str();
         if let Err(e) = self.enforce_read_policy(policy, path_str) {
-            self.emit_policy_violation(handle.execution_id, handle.volume_id, "read", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                handle.execution_id,
+                handle.volume_id,
+                "read",
+                path_str,
+                &e,
+                None,
+                None,
+            )
+            .await;
             return Err(e);
         }
         let full_path = self.routed_storage_path(&volume, path_str);
@@ -585,6 +595,8 @@ impl AegisFSAL {
                 "write",
                 path_str,
                 &e,
+                None,
+                None,
             )
             .await;
             return Err(e);
@@ -658,6 +670,8 @@ impl AegisFSAL {
         path: &str,
         policy: &FsalAccessPolicy,
         emit_event: bool,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<AegisFileHandle, FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -669,8 +683,16 @@ impl AegisFSAL {
 
         // 3. Enforce write policy
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
-            self.emit_policy_violation(execution_id, volume_id, "write", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "write",
+                path_str,
+                &e,
+                caller_node_id,
+                host_node_id,
+            )
+            .await;
             return Err(e);
         }
 
@@ -704,8 +726,8 @@ impl AegisFSAL {
                     volume_id,
                     path: path_str.to_string(),
                     created_at: Utc::now(),
-                    caller_node_id: None,
-                    host_node_id: None,
+                    caller_node_id,
+                    host_node_id,
                 })
                 .await;
         }
@@ -749,6 +771,8 @@ impl AegisFSAL {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<Vec<DirEntry>, FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -759,8 +783,16 @@ impl AegisFSAL {
 
         // 3. Enforce read policy
         if let Err(e) = self.enforce_read_policy(policy, path_str) {
-            self.emit_policy_violation(execution_id, volume_id, "read", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "read",
+                path_str,
+                &e,
+                caller_node_id,
+                host_node_id,
+            )
+            .await;
             return Err(e);
         }
 
@@ -778,8 +810,8 @@ impl AegisFSAL {
                 path: path_str.to_string(),
                 entry_count: entries.len(),
                 listed_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
 
@@ -793,6 +825,8 @@ impl AegisFSAL {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -803,8 +837,16 @@ impl AegisFSAL {
 
         // 3. Enforce write policy (directory creation is a write operation)
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
-            self.emit_policy_violation(execution_id, volume_id, "write", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "write",
+                path_str,
+                &e,
+                caller_node_id,
+                host_node_id,
+            )
+            .await;
             return Err(e);
         }
 
@@ -821,8 +863,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 created_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
 
@@ -836,6 +878,8 @@ impl AegisFSAL {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -846,8 +890,16 @@ impl AegisFSAL {
 
         // 3. Enforce write policy
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
-            self.emit_policy_violation(execution_id, volume_id, "delete", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "delete",
+                path_str,
+                &e,
+                caller_node_id,
+                host_node_id,
+            )
+            .await;
             return Err(e);
         }
 
@@ -864,8 +916,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
 
@@ -879,6 +931,8 @@ impl AegisFSAL {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -889,8 +943,16 @@ impl AegisFSAL {
 
         // 3. Enforce write policy
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
-            self.emit_policy_violation(execution_id, volume_id, "delete", path_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "delete",
+                path_str,
+                &e,
+                caller_node_id,
+                host_node_id,
+            )
+            .await;
             return Err(e);
         }
 
@@ -907,8 +969,8 @@ impl AegisFSAL {
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
 
@@ -923,6 +985,8 @@ impl AegisFSAL {
         from_path: &str,
         to_path: &str,
         policy: &FsalAccessPolicy,
+        caller_node_id: Option<NodeId>,
+        host_node_id: Option<NodeId>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
         let volume = self.authorize(execution_id, volume_id).await?;
@@ -935,13 +999,29 @@ impl AegisFSAL {
 
         // 3. Enforce write policy for both paths
         if let Err(e) = self.enforce_write_policy(policy, from_str) {
-            self.emit_policy_violation(execution_id, volume_id, "write", from_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "write",
+                from_str,
+                &e,
+                caller_node_id.clone(),
+                host_node_id.clone(),
+            )
+            .await;
             return Err(e);
         }
         if let Err(e) = self.enforce_write_policy(policy, to_str) {
-            self.emit_policy_violation(execution_id, volume_id, "write", to_str, &e)
-                .await;
+            self.emit_policy_violation(
+                execution_id,
+                volume_id,
+                "write",
+                to_str,
+                &e,
+                caller_node_id.clone(),
+                host_node_id.clone(),
+            )
+            .await;
             return Err(e);
         }
 
@@ -959,8 +1039,8 @@ impl AegisFSAL {
                 volume_id,
                 path: to_str.to_string(),
                 created_at: Utc::now(),
-                caller_node_id: None,
-                host_node_id: None,
+                caller_node_id,
+                host_node_id,
             })
             .await;
 

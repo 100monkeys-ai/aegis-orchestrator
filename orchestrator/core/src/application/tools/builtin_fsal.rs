@@ -61,6 +61,8 @@ pub async fn invoke_fs_tool(
                     &path,
                     &vol_ctx.policy,
                     false,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -103,6 +105,8 @@ pub async fn invoke_fs_tool(
                     vol_ctx.volume_id,
                     &path,
                     &vol_ctx.policy,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(|e| SealSessionError::InternalError(format!("FSAL readdir error: {e}")))?;
@@ -131,6 +135,8 @@ pub async fn invoke_fs_tool(
                 vol_ctx.volume_id,
                 &path,
                 &vol_ctx.policy,
+                None,
+                None,
             )
             .await
             .map_err(|e| SealSessionError::InternalError(format!("FSAL create_dir error: {e}")))?;
@@ -153,6 +159,8 @@ pub async fn invoke_fs_tool(
                     vol_ctx.volume_id,
                     &path,
                     &vol_ctx.policy,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -164,6 +172,8 @@ pub async fn invoke_fs_tool(
                     vol_ctx.volume_id,
                     &path,
                     &vol_ctx.policy,
+                    None,
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -308,6 +318,8 @@ async fn invoke_multi_edit(
             &path,
             &vol_ctx.policy,
             false,
+            None,
+            None,
         )
         .await
         .map_err(|e| {
@@ -356,6 +368,8 @@ async fn invoke_grep(
                 vol_ctx.volume_id,
                 &current_dir,
                 &vol_ctx.policy,
+                None,
+                None,
             )
             .await
         {
@@ -438,6 +452,8 @@ async fn invoke_glob(
                 vol_ctx.volume_id,
                 &current_dir,
                 &vol_ctx.policy,
+                None,
+                None,
             )
             .await
         {

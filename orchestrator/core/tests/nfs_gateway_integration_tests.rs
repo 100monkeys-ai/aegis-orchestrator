@@ -522,7 +522,7 @@ async fn test_fsal_audit_events() {
     // Create, write file
     let path = "/workspace/test.txt";
     let handle = fsal
-        .create_file(execution_id, volume_id, path, &policy, true)
+        .create_file(execution_id, volume_id, path, &policy, true, None, None)
         .await
         .unwrap();
 

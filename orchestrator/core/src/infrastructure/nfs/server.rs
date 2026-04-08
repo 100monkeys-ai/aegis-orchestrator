@@ -748,6 +748,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                 context.volume_id,
                 &dir_path,
                 &context.policy,
+                None,
+                None,
             )
             .await
             .map_err(|e| {
@@ -831,6 +833,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                 &file_path,
                 &context.policy,
                 true,
+                None,
+                None,
             )
             .await
             .map_err(|e| {
@@ -901,6 +905,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                 context.volume_id,
                 &dir_path,
                 &context.policy,
+                None,
+                None,
             )
             .await
             .map_err(|e| {
@@ -963,6 +969,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                 context.volume_id,
                 &file_path,
                 &context.policy,
+                None,
+                None,
             )
             .await
         {
@@ -975,6 +983,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                         context.volume_id,
                         &file_path,
                         &context.policy,
+                        None,
+                        None,
                     )
                     .await
                     .map_err(|e| {
@@ -1046,6 +1056,8 @@ impl NFSFileSystem for AegisFsalAdapter {
                 &from_path,
                 &to_path,
                 &context.policy,
+                None,
+                None,
             )
             .await
             .map_err(|e| {
