@@ -266,7 +266,7 @@ pub(crate) fn create_router(
                 .delete(delete_secret_handler),
         )
         // User volume management (Gap 079)
-        // Note: /v1/volumes/quota MUST be registered before /v1/volumes/:id to avoid
+        // Note: /v1/volumes/quota MUST be registered before /v1/volumes/{id} to avoid
         // axum routing ambiguity — "quota" would otherwise be matched as an id segment.
         .route(
             "/v1/volumes",
@@ -274,22 +274,22 @@ pub(crate) fn create_router(
         )
         .route("/v1/volumes/quota", get(volumes::get_quota))
         .route(
-            "/v1/volumes/:id",
+            "/v1/volumes/{id}",
             get(volumes::get_volume)
                 .patch(volumes::rename_volume)
                 .delete(volumes::delete_volume),
         )
         .route(
-            "/v1/volumes/:id/files",
+            "/v1/volumes/{id}/files",
             get(volumes::list_files).delete(volumes::delete_path),
         )
         .route(
-            "/v1/volumes/:id/files/download",
+            "/v1/volumes/{id}/files/download",
             get(volumes::download_file),
         )
-        .route("/v1/volumes/:id/files/upload", post(volumes::upload_file))
-        .route("/v1/volumes/:id/files/mkdir", post(volumes::mkdir))
-        .route("/v1/volumes/:id/files/move", post(volumes::move_path))
+        .route("/v1/volumes/{id}/files/upload", post(volumes::upload_file))
+        .route("/v1/volumes/{id}/files/mkdir", post(volumes::mkdir))
+        .route("/v1/volumes/{id}/files/move", post(volumes::move_path))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
