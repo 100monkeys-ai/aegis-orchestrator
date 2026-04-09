@@ -45,6 +45,9 @@ if [ "$#" -eq 0 ]; then
   set -- /usr/local/bin/aegis-runtime --daemon
 fi
 
+# Ensure FUSE mount directory is writable by aegis user
+chown aegis:aegis /tmp/aegis-fuse-mounts 2>/dev/null || true
+
 # Drop root privileges and run runtime in foreground as PID 1 child under tini.
 # With `sh -c`, first arg after `--` becomes $0, so exec must include $0.
 exec su -s /bin/sh aegis -c 'exec "$0" "$@"' -- "$@"
