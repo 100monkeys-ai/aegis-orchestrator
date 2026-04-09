@@ -5,9 +5,9 @@
 //! The `FuseFsal` filesystem implementation calls through this trait instead
 //! of directly referencing `AegisFSAL`. Two implementations exist:
 //!
-//! - [`DirectFsalBackend`]: wraps `Arc<AegisFSAL>` for in-process use
+//! - `DirectFsalBackend`: wraps `Arc<AegisFSAL>` for in-process use
 //!   (orchestrator hosting the FUSE daemon locally)
-//! - [`GrpcFsalBackend`]: calls `FsalService` over gRPC for the host-side
+//! - `GrpcFsalBackend`: calls `FsalService` over gRPC for the host-side
 //!   FUSE daemon running as a separate process
 //!
 //! # Architecture

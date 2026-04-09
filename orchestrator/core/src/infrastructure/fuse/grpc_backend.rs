@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0
 //! GrpcFsalBackend — remote FSAL backend via gRPC (ADR-107)
 //!
-//! Implements [`FsalBackend`] by calling the orchestrator's `FsalService`
+//! Implements `FsalBackend` by calling the orchestrator's `FsalService`
 //! over gRPC. Used by the host-side FUSE daemon when running as a separate
 //! process from the orchestrator.
 //!

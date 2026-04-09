@@ -109,7 +109,7 @@ impl Drop for FuseMountHandle {
 ///
 /// Creates per-volume FUSE mountpoints on the host that agent containers can
 /// access via bind mounts. The daemon delegates all FSAL operations through the
-/// [`FsalBackend`] trait, enabling both in-process (direct) and out-of-process
+/// `FsalBackend` trait, enabling both in-process (direct) and out-of-process
 /// (gRPC) operation.
 pub struct FuseFsalDaemon {
     backend: Arc<dyn FsalBackend>,
@@ -123,9 +123,9 @@ impl FuseFsalDaemon {
         }
     }
 
-    /// Create a new FUSE daemon backed by a [`FsalBackend`] trait object.
+    /// Create a new FUSE daemon backed by a `FsalBackend` trait object.
     ///
-    /// Use this constructor for the host-side daemon with a [`GrpcFsalBackend`],
+    /// Use this constructor for the host-side daemon with a `GrpcFsalBackend`,
     /// or any other backend implementation.
     pub fn with_backend(backend: Arc<dyn FsalBackend>) -> Self {
         Self { backend }
@@ -190,7 +190,7 @@ impl FuseFsalDaemon {
 // fuser::Filesystem implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Internal FUSE filesystem implementation that delegates to [`FsalBackend`].
+/// Internal FUSE filesystem implementation that delegates to `FsalBackend`.
 ///
 /// Each instance is bound to a single (execution_id, volume_id) pair —
 /// unlike the NFS server which multiplexes all volumes on a single port.
