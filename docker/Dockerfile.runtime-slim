@@ -9,9 +9,11 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     libfuse3-3 \
+    fuse3 \
     curl \
     tini \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && echo "user_allow_other" >> /etc/fuse.conf
 
 WORKDIR /app
 
