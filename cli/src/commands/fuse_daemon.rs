@@ -20,7 +20,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status};
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_server::{
     FuseMountService, FuseMountServiceServer,
