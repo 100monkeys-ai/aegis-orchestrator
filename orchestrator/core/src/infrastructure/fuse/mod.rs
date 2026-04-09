@@ -32,4 +32,6 @@
 //! - **Purpose:** FUSE transport frontend for the FSAL domain entity
 
 pub mod daemon;
+pub mod fsal_backend;
+pub mod grpc_backend;
 mod inode_table;

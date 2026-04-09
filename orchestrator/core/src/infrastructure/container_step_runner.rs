@@ -69,6 +69,14 @@ pub struct ContainerStepRunnerConfig {
     /// Each volume is mounted at `{fuse_mount_prefix}/{volume_name}`.
     /// Default: `/tmp/aegis-fuse-mounts`.
     pub fuse_mount_prefix: String,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    /// When `Some`, volume mounts are delegated to the remote daemon via gRPC
+    /// instead of mounting locally. Takes precedence over `fuse_daemon`.
+    pub fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
 }
 
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
@@ -90,6 +98,12 @@ pub struct ContainerStepRunnerImpl {
     fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
     /// Host directory prefix for FUSE mountpoints (ADR-107).
     fuse_mount_prefix: String,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
     event_bus: Arc<EventBus>,
     /// Used to resolve per-step registry credentials stored in OpenBao (ADR-050).
     /// When `ContainerStepConfig::registry_credentials` is `Some("secret:engine/path")`,
@@ -119,6 +133,7 @@ impl ContainerStepRunnerImpl {
             network_mode: config.network_mode,
             fuse_daemon: config.fuse_daemon,
             fuse_mount_prefix: config.fuse_mount_prefix,
+            fuse_mount_client: config.fuse_mount_client,
             event_bus,
             secrets_manager,
             volume_registry,
@@ -434,9 +449,96 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
-            // ─── Volume mounts: FUSE bind mount (ADR-107) or NFS volume driver (ADR-036) ──
+            // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) → NFS (ADR-036) ──
             if !config.volumes.is_empty() {
-                if let Some(ref fuse_daemon) = self.fuse_daemon {
+                if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
+                    // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
+                    // Delegate mount requests to the host-side FUSE daemon over gRPC.
+                    // The daemon creates the FUSE mount and returns the host path.
+                    let mut grpc_mounts: Vec<Mount> = Vec::new();
+                    let mut client = _fuse_mount_client.clone();
+
+                    for vm in &config.volumes {
+                        let volume_id = match uuid::Uuid::parse_str(&vm.name) {
+                            Ok(uuid) => VolumeId(uuid),
+                            Err(_) => {
+                                warn!(
+                                    volume_name = %vm.name,
+                                    "Cannot parse volume name as UUID — skipping gRPC FUSE mount"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let existing_ctx = match self.volume_registry.lookup(volume_id) {
+                            Some(ctx) => ctx,
+                            None => {
+                                warn!(
+                                    volume_name = %vm.name,
+                                    "Volume not found in registry — skipping gRPC FUSE mount"
+                                );
+                                continue;
+                            }
+                        };
+
+                        let grpc_req =
+                            crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
+                                volume_id: volume_id.0.to_string(),
+                                execution_id: config.execution_id.0.to_string(),
+                                mount_point: String::new(), // Let daemon decide
+                                read_paths: vec!["/*".to_string()],
+                                write_paths: if vm.read_only {
+                                    vec![]
+                                } else {
+                                    vec!["/*".to_string()]
+                                },
+                                container_uid: existing_ctx.container_uid,
+                                container_gid: existing_ctx.container_gid,
+                                workflow_execution_id: existing_ctx
+                                    .workflow_execution_id
+                                    .or(config.workflow_execution_id)
+                                    .map(|id| id.to_string())
+                                    .unwrap_or_default(),
+                            };
+
+                        match client.mount(grpc_req).await {
+                            Ok(resp) => {
+                                let mountpoint = resp.into_inner().mountpoint;
+                                debug!(
+                                    step_name = %config.name,
+                                    volume_name = %vm.name,
+                                    mountpoint = %mountpoint,
+                                    mount_path = %vm.mount_path,
+                                    read_only = vm.read_only,
+                                    "Configured gRPC FUSE mount for container step (ADR-107)"
+                                );
+                                grpc_mounts.push(Mount {
+                                    target: Some(vm.mount_path.clone()),
+                                    source: Some(mountpoint),
+                                    typ: Some(MountTypeEnum::BIND),
+                                    read_only: Some(vm.read_only),
+                                    ..Default::default()
+                                });
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    volume_name = %vm.name,
+                                    "gRPC FUSE mount failed — volume will not be available"
+                                );
+                            }
+                        }
+                    }
+
+                    if !grpc_mounts.is_empty() {
+                        hc.mounts = Some(grpc_mounts);
+                        info!(
+                            step_name = %config.name,
+                            count = config.volumes.len(),
+                            "Configured gRPC FUSE mount(s) for container step (ADR-107)"
+                        );
+                    }
+                } else if let Some(ref fuse_daemon) = self.fuse_daemon {
                     // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
                     // Mount a per-volume FUSE filesystem on the host, then bind-mount
                     // that path into the container. Works with rootless runtimes.
@@ -1047,6 +1149,7 @@ mod tests {
             network_mode: Some("host".to_string()),
             fuse_daemon: None,
             fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
+            fuse_mount_client: None,
         };
         assert_eq!(config.network_mode.as_deref(), Some("host"));
     }
@@ -1206,6 +1309,7 @@ mod tests {
             network_mode: None,
             fuse_daemon: None,
             fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
+            fuse_mount_client: None,
         };
         // If this compiles, the VolumeService dependency has been removed.
     }

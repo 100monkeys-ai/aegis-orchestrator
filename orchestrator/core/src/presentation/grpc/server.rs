@@ -1680,6 +1680,347 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
     Ok(())
 }
 
+// =============================================================================
+// FsalService gRPC implementation (ADR-107)
+// Proxies FSAL operations from the host-side FUSE daemon to the shared
+// AegisFSAL instance, preserving identical authorization and audit semantics.
+// =============================================================================
+
+use crate::infrastructure::aegis_runtime_proto::fsal_service_server::FsalService as FsalServiceTrait;
+use crate::infrastructure::aegis_runtime_proto::{
+    FsalCreateFileRequest as ProtoCreateFileReq, FsalCreateFileResponse, FsalDirEntry,
+    FsalGetattrRequest as ProtoGetattrReq, FsalGetattrResponse,
+    FsalLookupRequest as ProtoLookupReq, FsalLookupResponse, FsalMutateRequest as ProtoMutateReq,
+    FsalMutateResponse, FsalReadRequest as ProtoReadReq, FsalReadResponse,
+    FsalReaddirRequest as ProtoReaddirReq, FsalReaddirResponse,
+    FsalRenameRequest as ProtoRenameReq, FsalWriteRequest as ProtoWriteReq, FsalWriteResponse,
+};
+
+/// gRPC implementation of `FsalService` that delegates to the shared `AegisFSAL`.
+pub struct FsalGrpcService {
+    fsal: Arc<crate::domain::fsal::AegisFSAL>,
+}
+
+impl FsalGrpcService {
+    pub fn new(fsal: Arc<crate::domain::fsal::AegisFSAL>) -> Self {
+        Self { fsal }
+    }
+}
+
+/// Parse a UUID string from a proto field, returning a gRPC `InvalidArgument` on failure.
+fn parse_uuid_field(field: &str, name: &str) -> Result<uuid::Uuid, Status> {
+    uuid::Uuid::parse_str(field)
+        .map_err(|e| Status::invalid_argument(format!("Invalid {name}: {e}")))
+}
+
+/// Convert an `FsalError` to a gRPC `Status`.
+fn fsal_error_to_status(e: crate::domain::fsal::FsalError) -> Status {
+    use crate::domain::fsal::FsalError;
+    match &e {
+        FsalError::UnauthorizedAccess { .. } => Status::permission_denied(e.to_string()),
+        FsalError::VolumeNotFound(_) | FsalError::VolumeNotAttached(_) => {
+            Status::not_found(e.to_string())
+        }
+        FsalError::PolicyViolation(_) => Status::permission_denied(e.to_string()),
+        FsalError::PathSanitization(_) => Status::invalid_argument(e.to_string()),
+        _ => Status::internal(e.to_string()),
+    }
+}
+
+/// Convert a proto `FsalAccessPolicy` to the domain type.
+fn proto_to_fsal_policy(
+    proto: Option<crate::infrastructure::aegis_runtime_proto::FsalAccessPolicy>,
+) -> crate::domain::fsal::FsalAccessPolicy {
+    match proto {
+        Some(p) => crate::domain::fsal::FsalAccessPolicy {
+            read: p.read_paths,
+            write: p.write_paths,
+        },
+        None => crate::domain::fsal::FsalAccessPolicy::default(),
+    }
+}
+
+/// Convert a domain `FileType` to the string representation used in proto.
+fn file_type_to_string(ft: crate::domain::storage::FileType) -> String {
+    match ft {
+        crate::domain::storage::FileType::File => "file".to_string(),
+        crate::domain::storage::FileType::Directory => "directory".to_string(),
+        crate::domain::storage::FileType::Symlink => "symlink".to_string(),
+    }
+}
+
+#[tonic::async_trait]
+impl FsalServiceTrait for FsalGrpcService {
+    async fn getattr(
+        &self,
+        request: Request<ProtoGetattrReq>,
+    ) -> Result<Response<FsalGetattrResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+
+        let attrs = self
+            .fsal
+            .getattr(
+                execution_id,
+                volume_id,
+                &req.path,
+                req.container_uid,
+                req.container_gid,
+            )
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalGetattrResponse {
+            size: attrs.size,
+            mode: attrs.mode,
+            nlink: attrs.nlink,
+            atime: attrs.atime,
+            mtime: attrs.mtime,
+            ctime: attrs.ctime,
+            file_type: file_type_to_string(attrs.file_type),
+        }))
+    }
+
+    async fn lookup(
+        &self,
+        request: Request<ProtoLookupReq>,
+    ) -> Result<Response<FsalLookupResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+
+        let parent_handle =
+            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.parent_path);
+
+        let child_handle = self
+            .fsal
+            .lookup(&parent_handle, &req.parent_path, &req.name)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        let handle_bytes = child_handle.to_bytes().map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalLookupResponse {
+            file_handle: handle_bytes,
+        }))
+    }
+
+    async fn readdir(
+        &self,
+        request: Request<ProtoReaddirReq>,
+    ) -> Result<Response<FsalReaddirResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        let entries = self
+            .fsal
+            .readdir(execution_id, volume_id, &req.path, &policy, None, None)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalReaddirResponse {
+            entries: entries
+                .into_iter()
+                .map(|e| FsalDirEntry {
+                    name: e.name,
+                    file_type: file_type_to_string(e.file_type),
+                })
+                .collect(),
+        }))
+    }
+
+    async fn read(
+        &self,
+        request: Request<ProtoReadReq>,
+    ) -> Result<Response<FsalReadResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        let handle = crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path);
+
+        let data = self
+            .fsal
+            .read(&handle, &req.path, &policy, req.offset, req.size as usize)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalReadResponse { data }))
+    }
+
+    async fn write(
+        &self,
+        request: Request<ProtoWriteReq>,
+    ) -> Result<Response<FsalWriteResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        let handle = crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path);
+
+        let bytes_written = self
+            .fsal
+            .write(&handle, &req.path, &policy, req.offset, &req.data)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalWriteResponse {
+            bytes_written: bytes_written as u32,
+        }))
+    }
+
+    async fn create_file(
+        &self,
+        request: Request<ProtoCreateFileReq>,
+    ) -> Result<Response<FsalCreateFileResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        let handle = self
+            .fsal
+            .create_file(crate::domain::fsal::CreateFsalFileRequest {
+                execution_id,
+                volume_id,
+                path: &req.path,
+                policy: &policy,
+                emit_event: true,
+                caller_node_id: None,
+                host_node_id: None,
+            })
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        let handle_bytes = handle.to_bytes().map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalCreateFileResponse {
+            file_handle: handle_bytes,
+        }))
+    }
+
+    async fn create_directory(
+        &self,
+        request: Request<ProtoMutateReq>,
+    ) -> Result<Response<FsalMutateResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        self.fsal
+            .create_directory(execution_id, volume_id, &req.path, &policy, None, None)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalMutateResponse {}))
+    }
+
+    async fn delete_file(
+        &self,
+        request: Request<ProtoMutateReq>,
+    ) -> Result<Response<FsalMutateResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        self.fsal
+            .delete_file(execution_id, volume_id, &req.path, &policy, None, None)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalMutateResponse {}))
+    }
+
+    async fn delete_directory(
+        &self,
+        request: Request<ProtoMutateReq>,
+    ) -> Result<Response<FsalMutateResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        self.fsal
+            .delete_directory(execution_id, volume_id, &req.path, &policy, None, None)
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalMutateResponse {}))
+    }
+
+    async fn rename(
+        &self,
+        request: Request<ProtoRenameReq>,
+    ) -> Result<Response<FsalMutateResponse>, Status> {
+        let req = request.into_inner();
+        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
+            &req.execution_id,
+            "execution_id",
+        )?);
+        let volume_id =
+            crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
+        let policy = proto_to_fsal_policy(req.policy);
+
+        self.fsal
+            .rename(crate::domain::fsal::RenameFsalRequest {
+                execution_id,
+                volume_id,
+                from_path: &req.from_path,
+                to_path: &req.to_path,
+                policy: &policy,
+                caller_node_id: None,
+                host_node_id: None,
+            })
+            .await
+            .map_err(fsal_error_to_status)?;
+
+        Ok(Response::new(FsalMutateResponse {}))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

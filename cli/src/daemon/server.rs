@@ -580,6 +580,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ),
             fuse_daemon: fuse_daemon_placeholder.clone(),
             fuse_mount_prefix: fuse_mount_prefix.clone(),
+            fuse_mount_client: None,
         })
         .context("Failed to initialize Docker runtime")?,
     );
@@ -1468,6 +1469,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 network_mode: network_mode.clone(),
                 fuse_daemon: fuse_daemon.clone(),
                 fuse_mount_prefix: fuse_mount_prefix.clone(),
+                fuse_mount_client: None,
             },
             event_bus.clone(),
             secrets_manager.clone(),

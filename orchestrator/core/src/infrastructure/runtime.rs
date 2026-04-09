@@ -116,6 +116,12 @@ pub struct ContainerRuntime {
     fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
     /// Host directory prefix for FUSE mountpoints (ADR-107).
     fuse_mount_prefix: String,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
     /// Active FUSE mount handles keyed by container ID (ADR-107).
     /// Handles are inserted in `spawn()` and removed in `terminate()`.
     /// Dropping a handle triggers FUSE_DESTROY + unmount on the host.
@@ -144,6 +150,14 @@ pub struct ContainerRuntimeConfig {
     /// Host directory prefix for FUSE mountpoints (ADR-107).
     /// Default: `/tmp/aegis-fuse-mounts`.
     pub fuse_mount_prefix: String,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    /// When `Some`, volume mounts are delegated to the remote daemon via gRPC
+    /// instead of mounting locally. Takes precedence over `fuse_daemon`.
+    pub fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
 }
 
 impl ContainerRuntime {
@@ -160,6 +174,7 @@ impl ContainerRuntime {
             credential_resolver,
             fuse_daemon,
             fuse_mount_prefix,
+            fuse_mount_client,
         } = config;
         // Resolve bootstrap script path to absolute path
         let bootstrap_path = if PathBuf::from(&bootstrap_script).is_absolute() {
@@ -220,6 +235,7 @@ impl ContainerRuntime {
             event_bus,
             fuse_daemon,
             fuse_mount_prefix,
+            fuse_mount_client,
             fuse_mount_handles: RwLock::new(HashMap::new()),
         })
     }
@@ -562,13 +578,72 @@ impl AgentRuntime for ContainerRuntime {
             host_config.nano_cpus = Some((cpu_millis as i64) * 1_000_000_000 / 1000);
         }
 
-        // ─── Volume mounts: FUSE bind mount (ADR-107) or NFS volume driver (ADR-036) ──
+        // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) → NFS (ADR-036) ──
         // FUSE mount handles must outlive the container. We collect them here and
         // store them in the per-container map once we know the container ID.
         let mut pending_fuse_handles: Vec<crate::infrastructure::fuse::daemon::FuseMountHandle> =
             Vec::new();
         if !config.volumes.is_empty() {
-            if let Some(ref fuse_daemon) = self.fuse_daemon {
+            if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
+                // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
+                // Delegate mount requests to the host-side FUSE daemon over gRPC.
+                let mut grpc_mounts: Vec<Mount> = Vec::new();
+                let mut client = _fuse_mount_client.clone();
+
+                for volume_mount in &config.volumes {
+                    let container_path = volume_mount.mount_point.display().to_string();
+                    let is_read_only = matches!(
+                        volume_mount.access_mode,
+                        crate::domain::volume::AccessMode::ReadOnly
+                    );
+
+                    let grpc_req = crate::infrastructure::aegis_runtime_proto::FuseMountRequest {
+                        volume_id: volume_mount.volume_id.0.to_string(),
+                        execution_id: config.execution_id.0.to_string(),
+                        mount_point: String::new(),
+                        read_paths: vec!["/*".to_string()],
+                        write_paths: if is_read_only {
+                            vec![]
+                        } else {
+                            vec!["/*".to_string()]
+                        },
+                        container_uid: 1000,
+                        container_gid: 1000,
+                        workflow_execution_id: String::new(),
+                    };
+
+                    match client.mount(grpc_req).await {
+                        Ok(resp) => {
+                            let mountpoint = resp.into_inner().mountpoint;
+                            debug!(
+                                volume_id = %volume_mount.volume_id,
+                                mountpoint = %mountpoint,
+                                container_path = %container_path,
+                                read_only = is_read_only,
+                                "Configured gRPC FUSE mount for agent container (ADR-107)"
+                            );
+                            grpc_mounts.push(Mount {
+                                target: Some(container_path),
+                                source: Some(mountpoint),
+                                typ: Some(MountTypeEnum::BIND),
+                                read_only: Some(is_read_only),
+                                ..Default::default()
+                            });
+                        }
+                        Err(e) => {
+                            warn!(
+                                error = %e,
+                                volume_id = %volume_mount.volume_id,
+                                "gRPC FUSE mount failed — volume will not be available"
+                            );
+                        }
+                    }
+                }
+
+                if !grpc_mounts.is_empty() {
+                    host_config.mounts = Some(grpc_mounts);
+                }
+            } else if let Some(ref fuse_daemon) = self.fuse_daemon {
                 // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
                 // Collect (handle, mount) pairs so FuseMountHandle values are kept
                 // alive until terminate() is called. Dropping a handle unmounts.

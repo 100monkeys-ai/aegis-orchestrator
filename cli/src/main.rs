@@ -49,8 +49,9 @@ mod output;
 
 use commands::auth::AuthCommand;
 use commands::{
-    AgentCommand, ConfigCommand, CredentialCommand, DaemonCommand, DownArgs, InitArgs, NodeCommand,
-    RestartArgs, SecretCommand, StatusArgs, TaskCommand, UninstallArgs, UpArgs, WorkflowCommand,
+    AgentCommand, ConfigCommand, CredentialCommand, DaemonCommand, DownArgs, FuseDaemonCommand,
+    InitArgs, NodeCommand, RestartArgs, SecretCommand, StatusArgs, TaskCommand, UninstallArgs,
+    UpArgs, WorkflowCommand,
 };
 use output::{structured_output_unsupported, OutputFormat};
 
@@ -155,6 +156,13 @@ enum Commands {
     Auth {
         #[command(subcommand)]
         command: AuthCommand,
+    },
+
+    /// Host-side FUSE daemon for out-of-process volume mounts (ADR-107)
+    #[command(name = "fuse-daemon")]
+    FuseDaemon {
+        #[command(subcommand)]
+        command: FuseDaemonCommand,
     },
 
     /// Update AEGIS database
@@ -269,6 +277,9 @@ async fn main() -> Result<()> {
         }
         Some(Commands::Auth { command }) => {
             commands::auth::handle_command(command, cli.output).await
+        }
+        Some(Commands::FuseDaemon { command }) => {
+            commands::fuse_daemon::handle_command(command, cli.output).await
         }
         Some(Commands::Update { command }) => {
             commands::update::execute(command, cli.config, cli.output).await

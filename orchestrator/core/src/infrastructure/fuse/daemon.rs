@@ -18,9 +18,11 @@
 //! - **Purpose:** FUSE transport frontend for the FSAL domain entity
 
 use crate::domain::execution::ExecutionId;
-use crate::domain::fsal::{AegisFSAL, AegisFileHandle, CreateFsalFileRequest, FsalAccessPolicy};
+use crate::domain::fsal::{AegisFSAL, AegisFileHandle, FsalAccessPolicy};
 use crate::domain::storage::FileType;
 use crate::domain::volume::VolumeId;
+
+use super::fsal_backend::{DirectFsalBackend, FsalBackend};
 
 use super::inode_table::{InodeTable, ROOT_INODE};
 
@@ -106,16 +108,27 @@ impl Drop for FuseMountHandle {
 /// FUSE-based FSAL transport daemon.
 ///
 /// Creates per-volume FUSE mountpoints on the host that agent containers can
-/// access via bind mounts. Shares the same `AegisFSAL` instance as the NFS
-/// transport, preserving identical security semantics.
+/// access via bind mounts. The daemon delegates all FSAL operations through the
+/// [`FsalBackend`] trait, enabling both in-process (direct) and out-of-process
+/// (gRPC) operation.
 pub struct FuseFsalDaemon {
-    fsal: Arc<AegisFSAL>,
+    backend: Arc<dyn FsalBackend>,
 }
 
 impl FuseFsalDaemon {
-    /// Create a new FUSE daemon backed by the given FSAL instance.
+    /// Create a new FUSE daemon backed by the given FSAL instance (in-process).
     pub fn new(fsal: Arc<AegisFSAL>) -> Self {
-        Self { fsal }
+        Self {
+            backend: Arc::new(DirectFsalBackend(fsal)),
+        }
+    }
+
+    /// Create a new FUSE daemon backed by a [`FsalBackend`] trait object.
+    ///
+    /// Use this constructor for the host-side daemon with a [`GrpcFsalBackend`],
+    /// or any other backend implementation.
+    pub fn with_backend(backend: Arc<dyn FsalBackend>) -> Self {
+        Self { backend }
     }
 
     /// Mount a FUSE filesystem at the given host path for a specific volume.
@@ -135,7 +148,7 @@ impl FuseFsalDaemon {
         })?;
 
         let fs = FuseFsal {
-            fsal: self.fsal.clone(),
+            backend: self.backend.clone(),
             context: context.clone(),
             inode_table: Arc::new(InodeTable::new()),
         };
@@ -177,12 +190,12 @@ impl FuseFsalDaemon {
 // fuser::Filesystem implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Internal FUSE filesystem implementation that delegates to AegisFSAL.
+/// Internal FUSE filesystem implementation that delegates to [`FsalBackend`].
 ///
 /// Each instance is bound to a single (execution_id, volume_id) pair —
 /// unlike the NFS server which multiplexes all volumes on a single port.
 struct FuseFsal {
-    fsal: Arc<AegisFSAL>,
+    backend: Arc<dyn FsalBackend>,
     context: FuseVolumeContext,
     inode_table: Arc<InodeTable>,
 }
@@ -291,7 +304,7 @@ impl Filesystem for FuseFsal {
 
         // Perform FSAL lookup to get a child handle
         let child_handle =
-            match self.block_on(self.fsal.lookup(&parent_handle, &parent_path, name_str)) {
+            match self.block_on(self.backend.lookup(&parent_handle, &parent_path, name_str)) {
                 Ok(h) => h,
                 Err(e) => {
                     debug!(error = %e, "FUSE lookup failed");
@@ -304,7 +317,7 @@ impl Filesystem for FuseFsal {
         let child_ino = self.inode_table.allocate(child_handle, child_path.clone());
 
         // Get attributes for the child
-        match self.block_on(self.fsal.getattr(
+        match self.block_on(self.backend.getattr(
             self.context.execution_id,
             self.context.volume_id,
             &child_path,
@@ -345,7 +358,7 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        match self.block_on(self.fsal.getattr(
+        match self.block_on(self.backend.getattr(
             self.context.execution_id,
             self.context.volume_id,
             &path,
@@ -386,7 +399,7 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        match self.block_on(self.fsal.read(
+        match self.block_on(self.backend.read(
             &handle,
             &path,
             &self.context.policy,
@@ -428,7 +441,7 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        match self.block_on(self.fsal.write(
+        match self.block_on(self.backend.write(
             &handle,
             &path,
             &self.context.policy,
@@ -466,13 +479,11 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let entries = match self.block_on(self.fsal.readdir(
+        let entries = match self.block_on(self.backend.readdir(
             self.context.execution_id,
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
-            None,
-            None,
         )) {
             Ok(e) => e,
             Err(e) => {
@@ -550,20 +561,17 @@ impl Filesystem for FuseFsal {
 
         let file_path = Self::child_path(&parent_path, name_str);
 
-        match self.block_on(self.fsal.create_file(CreateFsalFileRequest {
-            execution_id: self.context.execution_id,
-            volume_id: self.context.volume_id,
-            path: &file_path,
-            policy: &self.context.policy,
-            emit_event: true,
-            caller_node_id: None,
-            host_node_id: None,
-        })) {
+        match self.block_on(self.backend.create_file(
+            self.context.execution_id,
+            self.context.volume_id,
+            &file_path,
+            &self.context.policy,
+        )) {
             Ok(handle) => {
                 let child_ino = self.inode_table.allocate(handle, file_path.clone());
 
                 // Get attrs for the newly created file
-                match self.block_on(self.fsal.getattr(
+                match self.block_on(self.backend.getattr(
                     self.context.execution_id,
                     self.context.volume_id,
                     &file_path,
@@ -638,13 +646,11 @@ impl Filesystem for FuseFsal {
 
         let dir_path = Self::child_path(&parent_path, name_str);
 
-        match self.block_on(self.fsal.create_directory(
+        match self.block_on(self.backend.create_directory(
             self.context.execution_id,
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
-            None,
-            None,
         )) {
             Ok(()) => {
                 let handle = AegisFileHandle::new(
@@ -703,13 +709,11 @@ impl Filesystem for FuseFsal {
 
         let file_path = Self::child_path(&parent_path, name_str);
 
-        match self.block_on(self.fsal.delete_file(
+        match self.block_on(self.backend.delete_file(
             self.context.execution_id,
             self.context.volume_id,
             &file_path,
             &self.context.policy,
-            None,
-            None,
         )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "success").increment(1);
@@ -744,13 +748,11 @@ impl Filesystem for FuseFsal {
 
         let dir_path = Self::child_path(&parent_path, name_str);
 
-        match self.block_on(self.fsal.delete_directory(
+        match self.block_on(self.backend.delete_directory(
             self.context.execution_id,
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
-            None,
-            None,
         )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "success").increment(1);
@@ -816,15 +818,13 @@ impl Filesystem for FuseFsal {
         let from_path = Self::child_path(&from_parent_path, name_str);
         let to_path = Self::child_path(&to_parent_path, newname_str);
 
-        match self.block_on(self.fsal.rename(crate::domain::fsal::RenameFsalRequest {
-            execution_id: self.context.execution_id,
-            volume_id: self.context.volume_id,
-            from_path: &from_path,
-            to_path: &to_path,
-            policy: &self.context.policy,
-            caller_node_id: None,
-            host_node_id: None,
-        })) {
+        match self.block_on(self.backend.rename(
+            self.context.execution_id,
+            self.context.volume_id,
+            &from_path,
+            &to_path,
+            &self.context.policy,
+        )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "success").increment(1);
                 reply.ok();
@@ -872,7 +872,7 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        match self.block_on(self.fsal.getattr(
+        match self.block_on(self.backend.getattr(
             self.context.execution_id,
             self.context.volume_id,
             &path,
