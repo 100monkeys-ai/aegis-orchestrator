@@ -1721,6 +1721,45 @@ fn parse_uuid_field(field: &str, name: &str) -> Result<uuid::Uuid, Status> {
         .map_err(|e| Status::invalid_argument(format!("Invalid {name}: {e}")))
 }
 
+/// Parse an optional execution_id from a proto string field.
+/// Empty string (proto3 default) is treated as `None`.
+fn parse_optional_execution_id(field: &str) -> Result<Option<uuid::Uuid>, Status> {
+    if field.is_empty() {
+        Ok(None)
+    } else {
+        uuid::Uuid::parse_str(field)
+            .map(Some)
+            .map_err(|e| Status::invalid_argument(format!("Invalid execution_id: {e}")))
+    }
+}
+
+/// Resolve an execution_id for FSAL handlers.
+///
+/// Workflow-owned volumes send an empty `execution_id` with a populated
+/// `workflow_execution_id`.  In that case we use `Uuid::nil()` as a sentinel —
+/// `authorize_inner` checks the workflow ownership path and never inspects the
+/// execution_id when the workflow_execution_id matches.
+///
+/// Returns `InvalidArgument` when *both* fields are empty.
+fn resolve_fsal_execution_id(
+    execution_id_field: &str,
+    workflow_execution_id_field: &str,
+) -> Result<crate::domain::execution::ExecutionId, Status> {
+    match parse_optional_execution_id(execution_id_field)? {
+        Some(uuid) => Ok(crate::domain::execution::ExecutionId(uuid)),
+        None => {
+            // execution_id is empty — require workflow_execution_id to be present
+            if workflow_execution_id_field.is_empty() {
+                Err(Status::invalid_argument(
+                    "At least one of execution_id or workflow_execution_id must be provided",
+                ))
+            } else {
+                Ok(crate::domain::execution::ExecutionId(uuid::Uuid::nil()))
+            }
+        }
+    }
+}
+
 /// Parse an optional workflow_execution_id from a proto string field.
 /// Empty string (proto3 default) is treated as `None`.
 fn parse_optional_wf_id(field: &str) -> Result<Option<uuid::Uuid>, Status> {
@@ -1776,10 +1815,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoGetattrReq>,
     ) -> Result<Response<FsalGetattrResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
 
@@ -1814,10 +1851,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoLookupReq>,
     ) -> Result<Response<FsalLookupResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
 
@@ -1850,10 +1885,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoReaddirReq>,
     ) -> Result<Response<FsalReaddirResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -1890,10 +1923,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoReadReq>,
     ) -> Result<Response<FsalReadResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -1919,10 +1950,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoWriteReq>,
     ) -> Result<Response<FsalWriteResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -1950,10 +1979,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoCreateFileReq>,
     ) -> Result<Response<FsalCreateFileResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -1987,10 +2014,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoMutateReq>,
     ) -> Result<Response<FsalMutateResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -2018,10 +2043,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoMutateReq>,
     ) -> Result<Response<FsalMutateResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -2049,10 +2072,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoMutateReq>,
     ) -> Result<Response<FsalMutateResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -2080,10 +2101,8 @@ impl FsalServiceTrait for FsalGrpcService {
         request: Request<ProtoRenameReq>,
     ) -> Result<Response<FsalMutateResponse>, Status> {
         let req = request.into_inner();
-        let execution_id = crate::domain::execution::ExecutionId(parse_uuid_field(
-            &req.execution_id,
-            "execution_id",
-        )?);
+        let execution_id =
+            resolve_fsal_execution_id(&req.execution_id, &req.workflow_execution_id)?;
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
@@ -2879,5 +2898,57 @@ mod tests {
             config.fsal.is_none(),
             "GrpcServerConfig.fsal must be accessible and must be None when not provided"
         );
+    }
+
+    /// Regression: `resolve_fsal_execution_id` must accept an empty
+    /// `execution_id` when `workflow_execution_id` is populated (workflow-owned
+    /// volumes send `HandleExecutionContext::Workflow` which has no execution_id).
+    /// Before this fix every FSAL handler called `parse_uuid_field` on
+    /// `execution_id`, which returned `InvalidArgument` on the empty string.
+    #[test]
+    fn test_resolve_fsal_execution_id_empty_with_workflow() {
+        let wf_id = uuid::Uuid::new_v4().to_string();
+
+        // Empty execution_id + populated workflow_execution_id => nil sentinel
+        let result = resolve_fsal_execution_id("", &wf_id);
+        assert!(
+            result.is_ok(),
+            "should accept empty execution_id when workflow_execution_id is set"
+        );
+        assert_eq!(
+            result.unwrap().0,
+            uuid::Uuid::nil(),
+            "sentinel must be the nil UUID"
+        );
+    }
+
+    /// Regression: both fields empty must still be rejected.
+    #[test]
+    fn test_resolve_fsal_execution_id_both_empty_rejected() {
+        let result = resolve_fsal_execution_id("", "");
+        assert!(
+            result.is_err(),
+            "must reject when both execution_id and workflow_execution_id are empty"
+        );
+        let status = result.unwrap_err();
+        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    }
+
+    /// Regression: a valid execution_id must still parse normally regardless of
+    /// workflow_execution_id.
+    #[test]
+    fn test_resolve_fsal_execution_id_valid_uuid() {
+        let exec_id = uuid::Uuid::new_v4();
+
+        // With empty workflow_execution_id
+        let result = resolve_fsal_execution_id(&exec_id.to_string(), "");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, exec_id);
+
+        // With populated workflow_execution_id
+        let wf_id = uuid::Uuid::new_v4().to_string();
+        let result = resolve_fsal_execution_id(&exec_id.to_string(), &wf_id);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, exec_id);
     }
 }
