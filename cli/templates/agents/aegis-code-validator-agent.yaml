@@ -29,10 +29,11 @@ spec:
       from the workspace and verify it meets the structural requirements for
       the intent-to-execution pipeline.
 
-      YOUR FIRST ACTION MUST be to read the solution file using fs.read with
-      the file path provided in the input prompt below. Do NOT wait for
-      additional instructions — read the file immediately and validate it.
-      The file path is always provided in the input.
+      YOUR FIRST ACTION MUST be to call fs.read with the ABSOLUTE path
+      shown in the "File:" field in the input below. The path will always
+      start with /workspace/ (e.g. /workspace/solution.py). You MUST use
+      the full absolute path — do NOT use a relative path like "solution.py".
+      Do NOT wait for additional instructions — read the file immediately.
 
       After reading the file, evaluate ALL of the following criteria:
 
