@@ -205,7 +205,24 @@ impl ToolInvocationService {
         // 4. Tenant is already carried on the session — no DB lookup needed.
         let tenant_id = session.tenant_id.clone();
 
-        // 5. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
+        // 5. Build caller identity from the session's user_id, if present.
+        let seal_caller_identity: Option<crate::domain::iam::UserIdentity> = session
+            .user_id
+            .as_ref()
+            .map(|uid| crate::domain::iam::UserIdentity {
+                sub: uid.clone(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
+                    zaru_tier: crate::domain::iam::ZaruTier::from_security_context_name(
+                        &security_context.name,
+                    )
+                    .unwrap_or(crate::domain::iam::ZaruTier::Free),
+                    tenant_id: tenant_id.clone(),
+                },
+            });
+
+        // 6. Delegate to unified dispatch core (iteration_number=0, empty audit history for SEAL path).
         let result = self
             .dispatch_tool_core(
                 &agent_id,
@@ -216,6 +233,7 @@ impl ToolInvocationService {
                 args,
                 0,
                 Vec::new(),
+                seal_caller_identity.as_ref(),
             )
             .await?;
 
@@ -259,6 +277,20 @@ impl ToolInvocationService {
                 ))
             })?;
 
+        // Extract the caller identity from the parent execution's initiating_user_sub.
+        let caller_identity: Option<crate::domain::iam::UserIdentity> = execution
+            .initiating_user_sub
+            .as_ref()
+            .map(|sub| crate::domain::iam::UserIdentity {
+                sub: sub.clone(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                identity_kind: crate::domain::iam::IdentityKind::ConsumerUser {
+                    zaru_tier: crate::domain::iam::ZaruTier::Free,
+                    tenant_id: execution.tenant_id.clone(),
+                },
+            });
+
         let security_context = self
             .security_context_repo
             .find_by_name(&execution.security_context_name)
@@ -286,6 +318,7 @@ impl ToolInvocationService {
             args,
             iteration_number,
             tool_audit_history,
+            caller_identity.as_ref(),
         )
         .await
     }
@@ -310,6 +343,7 @@ impl ToolInvocationService {
         args: Value,
         iteration_number: u8,
         tool_audit_history: Vec<TrajectoryStep>,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let invocation_id = ToolInvocationId::new();
         let started_at = Instant::now();
@@ -642,6 +676,7 @@ impl ToolInvocationService {
                 iteration_number,
                 &tool_audit_history,
                 security_context,
+                caller_identity,
             )
             .await;
         if let Some(result) = aegis_result {
@@ -811,13 +846,14 @@ impl ToolInvocationService {
         iteration_number: u8,
         tool_audit_history: &[TrajectoryStep],
         security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Option<Result<ToolInvocationResult, SealSessionError>> {
         match tool_name {
             "aegis.agent.create" => Some(self.invoke_aegis_agent_create_tool(args).await),
             "aegis.agent.update" => Some(self.invoke_aegis_agent_update_tool(args).await),
             "aegis.agent.delete" => Some(self.invoke_aegis_agent_delete_tool(args).await),
             "aegis.agent.generate" => Some(
-                self.invoke_aegis_agent_generate_tool(args, security_context)
+                self.invoke_aegis_agent_generate_tool(args, security_context, caller_identity)
                     .await,
             ),
             "aegis.agent.export" => Some(self.invoke_aegis_agent_export_tool(args).await),
@@ -826,7 +862,7 @@ impl ToolInvocationService {
             "aegis.workflow.delete" => Some(self.invoke_aegis_workflow_delete_tool(args).await),
             "aegis.workflow.validate" => Some(self.invoke_aegis_workflow_validate_tool(args).await),
             "aegis.workflow.run" => Some(
-                self.invoke_aegis_workflow_run_tool(args, security_context)
+                self.invoke_aegis_workflow_run_tool(args, security_context, caller_identity)
                     .await,
             ),
             "aegis.workflow.executions.list" => {
@@ -867,7 +903,7 @@ impl ToolInvocationService {
                 .await,
             ),
             "aegis.task.execute" => Some(
-                self.invoke_aegis_task_execute_tool(args, security_context)
+                self.invoke_aegis_task_execute_tool(args, security_context, caller_identity)
                     .await,
             ),
             "aegis.task.status" => Some(self.invoke_aegis_task_status_tool(args).await),
