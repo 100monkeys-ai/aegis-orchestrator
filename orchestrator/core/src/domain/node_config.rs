@@ -427,6 +427,14 @@ pub struct RuntimeConfig {
     /// Each volume gets a FUSE mount at `{fuse_mount_prefix}/{volume_id}`.
     /// Default: `/tmp/aegis-fuse-mounts`
     pub fuse_mount_prefix: Option<String>,
+
+    /// gRPC endpoint for the host-side FUSE daemon's FuseMountService (ADR-107).
+    /// When set, the orchestrator delegates FUSE mount/unmount operations to
+    /// this endpoint rather than managing them in-process.
+    /// Supports env:VAR_NAME syntax for environment variable substitution.
+    /// Default: None (FUSE transport disabled; falls back to in-process daemon)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fuse_daemon_endpoint: Option<String>,
 }
 
 fn default_runtime_registry_path() -> String {
@@ -450,6 +458,7 @@ impl Default for RuntimeConfig {
             nfs_mountport: default_nfs_port(),
             runtime_registry_path: default_runtime_registry_path(),
             fuse_mount_prefix: None,
+            fuse_daemon_endpoint: None,
         }
     }
 }

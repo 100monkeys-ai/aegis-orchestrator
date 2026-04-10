@@ -563,6 +563,49 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Arc<aegis_orchestrator_core::infrastructure::fuse::daemon::FuseFsalDaemon>,
     > = None;
 
+    // Connect to the host-side FUSE daemon's FuseMountService if configured (ADR-107).
+    // Absence of spec.runtime.fuse_daemon_endpoint means in-process FUSE mode — no error, no retry.
+    let fuse_daemon_endpoint: Option<String> = config
+        .spec
+        .runtime
+        .fuse_daemon_endpoint
+        .as_ref()
+        .and_then(|ep| resolve_env_value(ep).ok());
+    let fuse_mount_client: Option<
+        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    > = match fuse_daemon_endpoint {
+        Some(ref endpoint) => {
+            match tonic::transport::Channel::from_shared(endpoint.clone())
+                .map(|ch| ch.connect_lazy())
+            {
+                Ok(channel) => {
+                    tracing::info!(endpoint = %endpoint, "Connected to FUSE daemon gRPC service");
+                    Some(
+                        aegis_orchestrator_core::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient::new(
+                            channel,
+                        ),
+                    )
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        endpoint = %endpoint,
+                        error = %e,
+                        "Failed to construct FUSE daemon gRPC channel; FUSE transport disabled"
+                    );
+                    None
+                }
+            }
+        }
+        None => {
+            tracing::debug!(
+                "FUSE daemon endpoint not configured (spec.runtime.fuse_daemon_endpoint omitted) — FUSE transport disabled"
+            );
+            None
+        }
+    };
+
     let runtime = Arc::new(
         ContainerRuntime::new(aegis_orchestrator_core::infrastructure::runtime::ContainerRuntimeConfig {
             bootstrap_script: config.spec.runtime.bootstrap_script.clone(),
@@ -580,7 +623,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             ),
             fuse_daemon: fuse_daemon_placeholder.clone(),
             fuse_mount_prefix: fuse_mount_prefix.clone(),
-            fuse_mount_client: None,
+            fuse_mount_client: fuse_mount_client.clone(),
         })
         .context("Failed to initialize Docker runtime")?,
     );
@@ -1469,7 +1512,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 network_mode: network_mode.clone(),
                 fuse_daemon: fuse_daemon.clone(),
                 fuse_mount_prefix: fuse_mount_prefix.clone(),
-                fuse_mount_client: None,
+                fuse_mount_client: fuse_mount_client.clone(),
             },
             event_bus.clone(),
             secrets_manager.clone(),

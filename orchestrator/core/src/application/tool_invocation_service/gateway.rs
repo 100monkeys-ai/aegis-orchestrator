@@ -228,6 +228,7 @@ impl ToolInvocationService {
                     volume_id: ctx.volume_id.to_string(),
                     mount_path: ctx.mount_point.to_string_lossy().to_string(),
                     read_only: ctx.policy.write.is_empty(),
+                    remote_path: ctx.remote_path.clone(),
                 })
                 .collect::<Vec<FsalMount>>();
 
