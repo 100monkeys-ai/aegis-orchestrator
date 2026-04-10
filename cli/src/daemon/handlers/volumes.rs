@@ -28,7 +28,6 @@ use crate::daemon::state::AppState;
 pub(crate) struct CreateVolumeRequest {
     pub label: String,
     pub size_limit_bytes: u64,
-    pub zaru_tier: ZaruTier,
 }
 
 #[derive(Debug, serde::Deserialize)]
