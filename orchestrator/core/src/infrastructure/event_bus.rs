@@ -217,7 +217,7 @@ impl DomainEvent {
                 | VolumeEvent::UserVolumeDeleted { .. }
                 | VolumeEvent::UserVolumeQuotaWarning { .. } => None,
             },
-            DomainEvent::Storage(event) => Some(match event {
+            DomainEvent::Storage(event) => match event {
                 StorageEvent::FileOpened { execution_id, .. }
                 | StorageEvent::FileRead { execution_id, .. }
                 | StorageEvent::FileWritten { execution_id, .. }
@@ -229,7 +229,7 @@ impl DomainEvent {
                 | StorageEvent::FilesystemPolicyViolation { execution_id, .. }
                 | StorageEvent::QuotaExceeded { execution_id, .. }
                 | StorageEvent::UnauthorizedVolumeAccess { execution_id, .. } => *execution_id,
-            }),
+            },
             DomainEvent::MCP(event) => match event {
                 MCPToolEvent::InvocationRequested { execution_id, .. }
                 | MCPToolEvent::InvocationStarted { execution_id, .. }
@@ -1557,7 +1557,8 @@ mod tests {
         let mut receiver = event_bus.subscribe_execution_domain(execution_id);
 
         event_bus.publish_storage_event(StorageEvent::FileOpened {
-            execution_id,
+            execution_id: Some(execution_id),
+            workflow_execution_id: None,
             volume_id: crate::domain::volume::VolumeId::new(),
             path: "/workspace/src/main.rs".to_string(),
             open_mode: "read".to_string(),
@@ -1570,7 +1571,7 @@ mod tests {
         match received {
             DomainEvent::Storage(StorageEvent::FileOpened {
                 execution_id: id, ..
-            }) => assert_eq!(id, execution_id),
+            }) => assert_eq!(id, Some(execution_id)),
             other => panic!("Expected storage event, got {other:?}"),
         }
     }

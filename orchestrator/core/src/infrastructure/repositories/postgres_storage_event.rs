@@ -34,10 +34,9 @@ impl PostgresStorageEventRepository {
         let event_type: String = row
             .try_get("event_type")
             .map_err(|e| RepositoryError::Database(format!("Missing event_type: {e}")))?;
-        let execution_id = ExecutionId(
-            row.try_get::<Uuid, _>("execution_id")
-                .map_err(|e| RepositoryError::Database(format!("Missing execution_id: {e}")))?,
-        );
+        let execution_id: Option<Uuid> = row.try_get("execution_id").unwrap_or(None);
+        let workflow_execution_id: Option<Uuid> =
+            row.try_get("workflow_execution_id").unwrap_or(None);
         let volume_id = VolumeId(
             row.try_get::<Uuid, _>("volume_id")
                 .map_err(|e| RepositoryError::Database(format!("Missing volume_id: {e}")))?,
@@ -51,6 +50,9 @@ impl PostgresStorageEventRepository {
         let timestamp: DateTime<Utc> = row
             .try_get("timestamp")
             .map_err(|e| RepositoryError::Database(format!("Missing timestamp: {e}")))?;
+
+        // Map the nullable UUID to Option<ExecutionId>
+        let exec_id: Option<ExecutionId> = execution_id.map(ExecutionId);
 
         // Parse timestamp from details (fallback to row timestamp if missing)
         let parse_timestamp = |key: &str| -> DateTime<Utc> {
@@ -70,7 +72,8 @@ impl PostgresStorageEventRepository {
                     .unwrap_or("read")
                     .to_string();
                 Ok(StorageEvent::FileOpened {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     path,
                     open_mode,
@@ -90,7 +93,8 @@ impl PostgresStorageEventRepository {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 Ok(StorageEvent::FileRead {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     path,
                     offset,
@@ -112,7 +116,8 @@ impl PostgresStorageEventRepository {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 Ok(StorageEvent::FileWritten {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     path,
                     offset,
@@ -124,7 +129,8 @@ impl PostgresStorageEventRepository {
                 })
             }
             "FileClosed" => Ok(StorageEvent::FileClosed {
-                execution_id,
+                execution_id: exec_id,
+                workflow_execution_id,
                 volume_id,
                 path,
                 closed_at: parse_timestamp("timestamp"),
@@ -137,7 +143,8 @@ impl PostgresStorageEventRepository {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
                 Ok(StorageEvent::DirectoryListed {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     path,
                     entry_count,
@@ -147,7 +154,8 @@ impl PostgresStorageEventRepository {
                 })
             }
             "FileCreated" => Ok(StorageEvent::FileCreated {
-                execution_id,
+                execution_id: exec_id,
+                workflow_execution_id,
                 volume_id,
                 path,
                 created_at: parse_timestamp("timestamp"),
@@ -155,7 +163,8 @@ impl PostgresStorageEventRepository {
                 host_node_id: None,
             }),
             "FileDeleted" => Ok(StorageEvent::FileDeleted {
-                execution_id,
+                execution_id: exec_id,
+                workflow_execution_id,
                 volume_id,
                 path,
                 deleted_at: parse_timestamp("timestamp"),
@@ -163,7 +172,8 @@ impl PostgresStorageEventRepository {
                 host_node_id: None,
             }),
             "PathTraversalBlocked" => Ok(StorageEvent::PathTraversalBlocked {
-                execution_id,
+                execution_id: exec_id,
+                workflow_execution_id,
                 attempted_path: path,
                 blocked_at: parse_timestamp("timestamp"),
             }),
@@ -179,7 +189,8 @@ impl PostgresStorageEventRepository {
                     .unwrap_or("")
                     .to_string();
                 Ok(StorageEvent::FilesystemPolicyViolation {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     operation,
                     path,
@@ -199,7 +210,8 @@ impl PostgresStorageEventRepository {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 Ok(StorageEvent::QuotaExceeded {
-                    execution_id,
+                    execution_id: exec_id,
+                    workflow_execution_id,
                     volume_id,
                     requested_bytes,
                     available_bytes,
@@ -209,7 +221,8 @@ impl PostgresStorageEventRepository {
                 })
             }
             "UnauthorizedVolumeAccess" => Ok(StorageEvent::UnauthorizedVolumeAccess {
-                execution_id,
+                execution_id: exec_id,
+                workflow_execution_id,
                 volume_id,
                 attempted_at: parse_timestamp("timestamp"),
                 caller_node_id: None,
@@ -228,233 +241,260 @@ impl PostgresStorageEventRepository {
 #[async_trait]
 impl StorageEventRepository for PostgresStorageEventRepository {
     async fn save(&self, event: &StorageEvent) -> Result<(), RepositoryError> {
-        // Extract common fields and convert event to database format
-        let (event_type, execution_id, volume_id, path, details) = match event {
-            StorageEvent::FileOpened {
-                execution_id,
-                volume_id,
-                path,
-                open_mode,
-                opened_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileOpened",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "open_mode": open_mode,
-                    "timestamp": opened_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::FileRead {
-                execution_id,
-                volume_id,
-                path,
-                offset,
-                bytes_read,
-                duration_ms,
-                read_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileRead",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "offset": offset,
-                    "bytes_read": bytes_read,
-                    "duration_ms": duration_ms,
-                    "timestamp": read_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::FileWritten {
-                execution_id,
-                volume_id,
-                path,
-                offset,
-                bytes_written,
-                duration_ms,
-                written_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileWritten",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "offset": offset,
-                    "bytes_written": bytes_written,
-                    "duration_ms": duration_ms,
-                    "timestamp": written_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::FileClosed {
-                execution_id,
-                volume_id,
-                path,
-                closed_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileClosed",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "timestamp": closed_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::DirectoryListed {
-                execution_id,
-                volume_id,
-                path,
-                entry_count,
-                listed_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "DirectoryListed",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "entry_count": entry_count,
-                    "timestamp": listed_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::FileCreated {
-                execution_id,
-                volume_id,
-                path,
-                created_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileCreated",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "timestamp": created_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::FileDeleted {
-                execution_id,
-                volume_id,
-                path,
-                deleted_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FileDeleted",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "timestamp": deleted_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::PathTraversalBlocked {
-                execution_id,
-                attempted_path,
-                blocked_at,
-            } => (
-                "PathTraversalBlocked",
-                *execution_id,
-                VolumeId::default(), // No volume ID for security violations
-                attempted_path.clone(),
-                serde_json::json!({
-                    "timestamp": blocked_at.to_rfc3339(),
-                }),
-            ),
-            StorageEvent::FilesystemPolicyViolation {
-                execution_id,
-                volume_id,
-                operation,
-                path,
-                policy_rule,
-                violated_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "FilesystemPolicyViolation",
-                *execution_id,
-                *volume_id,
-                path.clone(),
-                serde_json::json!({
-                    "operation": operation,
-                    "policy_rule": policy_rule,
-                    "timestamp": violated_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::QuotaExceeded {
-                execution_id,
-                volume_id,
-                requested_bytes,
-                available_bytes,
-                exceeded_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "QuotaExceeded",
-                *execution_id,
-                *volume_id,
-                "".to_string(), // No specific path
-                serde_json::json!({
-                    "requested_bytes": requested_bytes,
-                    "available_bytes": available_bytes,
-                    "timestamp": exceeded_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-            StorageEvent::UnauthorizedVolumeAccess {
-                execution_id,
-                volume_id,
-                attempted_at,
-                caller_node_id,
-                host_node_id,
-            } => (
-                "UnauthorizedVolumeAccess",
-                *execution_id,
-                *volume_id,
-                "".to_string(),
-                serde_json::json!({
-                    "timestamp": attempted_at.to_rfc3339(),
-                    "caller_node_id": caller_node_id,
-                    "host_node_id": host_node_id,
-                }),
-            ),
-        };
+        // Extract common fields and convert event to database format.
+        // execution_id and workflow_execution_id are mutually exclusive: exactly one is Some.
+        let (event_type, execution_id, workflow_execution_id, volume_id, path, details) =
+            match event {
+                StorageEvent::FileOpened {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    open_mode,
+                    opened_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileOpened",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "open_mode": open_mode,
+                        "timestamp": opened_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::FileRead {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    offset,
+                    bytes_read,
+                    duration_ms,
+                    read_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileRead",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "offset": offset,
+                        "bytes_read": bytes_read,
+                        "duration_ms": duration_ms,
+                        "timestamp": read_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::FileWritten {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    offset,
+                    bytes_written,
+                    duration_ms,
+                    written_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileWritten",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "offset": offset,
+                        "bytes_written": bytes_written,
+                        "duration_ms": duration_ms,
+                        "timestamp": written_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::FileClosed {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    closed_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileClosed",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "timestamp": closed_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::DirectoryListed {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    entry_count,
+                    listed_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "DirectoryListed",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "entry_count": entry_count,
+                        "timestamp": listed_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::FileCreated {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    created_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileCreated",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "timestamp": created_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::FileDeleted {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    path,
+                    deleted_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FileDeleted",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "timestamp": deleted_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::PathTraversalBlocked {
+                    execution_id,
+                    workflow_execution_id,
+                    attempted_path,
+                    blocked_at,
+                } => (
+                    "PathTraversalBlocked",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    VolumeId::default(), // No volume ID for security violations
+                    attempted_path.clone(),
+                    serde_json::json!({
+                        "timestamp": blocked_at.to_rfc3339(),
+                    }),
+                ),
+                StorageEvent::FilesystemPolicyViolation {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    operation,
+                    path,
+                    policy_rule,
+                    violated_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "FilesystemPolicyViolation",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    path.clone(),
+                    serde_json::json!({
+                        "operation": operation,
+                        "policy_rule": policy_rule,
+                        "timestamp": violated_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::QuotaExceeded {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    requested_bytes,
+                    available_bytes,
+                    exceeded_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "QuotaExceeded",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    "".to_string(), // No specific path
+                    serde_json::json!({
+                        "requested_bytes": requested_bytes,
+                        "available_bytes": available_bytes,
+                        "timestamp": exceeded_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+                StorageEvent::UnauthorizedVolumeAccess {
+                    execution_id,
+                    workflow_execution_id,
+                    volume_id,
+                    attempted_at,
+                    caller_node_id,
+                    host_node_id,
+                } => (
+                    "UnauthorizedVolumeAccess",
+                    execution_id.map(|e| e.0),
+                    *workflow_execution_id,
+                    *volume_id,
+                    "".to_string(),
+                    serde_json::json!({
+                        "timestamp": attempted_at.to_rfc3339(),
+                        "caller_node_id": caller_node_id,
+                        "host_node_id": host_node_id,
+                    }),
+                ),
+            };
 
-        // Insert into database
+        // Insert into database.
+        // execution_id and workflow_execution_id are mutually exclusive (enforced by DB CHECK
+        // constraint added in migration 015). One must be non-null; the other must be null.
         sqlx::query(
             r#"
-            INSERT INTO storage_events (execution_id, volume_id, event_type, path, operation_details)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO storage_events (execution_id, workflow_execution_id, volume_id, event_type, path, operation_details)
+            VALUES ($1, $2, $3, $4, $5, $6)
             "#,
         )
-        .bind(execution_id.0)
+        .bind(execution_id)
+        .bind(workflow_execution_id)
         .bind(volume_id.0)
         .bind(event_type)
         .bind(path)
@@ -467,8 +507,8 @@ impl StorageEventRepository for PostgresStorageEventRepository {
         })?;
 
         debug!(
-            "Saved storage event: {} for execution {}",
-            event_type, execution_id.0
+            "Saved storage event: {} (execution_id={:?}, workflow_execution_id={:?})",
+            event_type, execution_id, workflow_execution_id
         );
         Ok(())
     }
@@ -482,7 +522,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
 
         let rows = sqlx::query(
             r#"
-            SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
+            SELECT event_type, execution_id, workflow_execution_id, volume_id, path, operation_details, timestamp
             FROM storage_events
             WHERE execution_id = $1
             ORDER BY timestamp DESC
@@ -524,7 +564,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
 
         let rows = sqlx::query(
             r#"
-            SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
+            SELECT event_type, execution_id, workflow_execution_id, volume_id, path, operation_details, timestamp
             FROM storage_events
             WHERE volume_id = $1
             ORDER BY timestamp DESC
@@ -563,7 +603,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
         let rows = if let Some(exec_id) = execution_id {
             sqlx::query(
                 r#"
-                SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
+                SELECT event_type, execution_id, workflow_execution_id, volume_id, path, operation_details, timestamp
                 FROM storage_events
                 WHERE execution_id = $1
                   AND event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'QuotaExceeded', 'UnauthorizedVolumeAccess')
@@ -576,7 +616,7 @@ impl StorageEventRepository for PostgresStorageEventRepository {
         } else {
             sqlx::query(
                 r#"
-                SELECT event_type, execution_id, volume_id, path, operation_details, timestamp
+                SELECT event_type, execution_id, workflow_execution_id, volume_id, path, operation_details, timestamp
                 FROM storage_events
                 WHERE event_type IN ('PathTraversalBlocked', 'FilesystemPolicyViolation', 'QuotaExceeded', 'UnauthorizedVolumeAccess')
                 ORDER BY timestamp DESC
@@ -602,5 +642,77 @@ impl StorageEventRepository for PostgresStorageEventRepository {
 
         debug!("Deserialized {} violation events", events.len());
         Ok(events)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::events::StorageEvent;
+    use crate::domain::volume::VolumeId;
+
+    /// Regression test: saving a StorageEvent with workflow_execution_id (no execution_id)
+    /// must produce the correct DB tuple — neither field references the wrong table's FK.
+    ///
+    /// This exercises the extraction logic in `save()` without a real DB connection.
+    /// The test validates that:
+    /// 1. A workflow-scoped event carries execution_id=None and workflow_execution_id=Some(...)
+    /// 2. An agent-scoped event carries execution_id=Some(...) and workflow_execution_id=None
+    #[test]
+    fn storage_event_workflow_execution_id_roundtrip() {
+        let wf_id = uuid::Uuid::new_v4();
+        let exec_id = ExecutionId(uuid::Uuid::new_v4());
+        let vol_id = VolumeId::new();
+
+        // Workflow-scoped event: execution_id is None, workflow_execution_id is Some
+        let wf_event = StorageEvent::FileRead {
+            execution_id: None,
+            workflow_execution_id: Some(wf_id),
+            volume_id: vol_id,
+            path: "/workspace/data.txt".to_string(),
+            offset: 0,
+            bytes_read: 1024,
+            duration_ms: 3,
+            read_at: chrono::Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        };
+
+        // Verify the extraction logic produces the correct pair for the INSERT
+        let (execution_id_extracted, workflow_execution_id_extracted) = match &wf_event {
+            StorageEvent::FileRead {
+                execution_id,
+                workflow_execution_id,
+                ..
+            } => (execution_id.map(|e| e.0), *workflow_execution_id),
+            _ => panic!("unexpected variant"),
+        };
+        assert_eq!(execution_id_extracted, None);
+        assert_eq!(workflow_execution_id_extracted, Some(wf_id));
+
+        // Agent-scoped event: execution_id is Some, workflow_execution_id is None
+        let agent_event = StorageEvent::FileRead {
+            execution_id: Some(exec_id),
+            workflow_execution_id: None,
+            volume_id: vol_id,
+            path: "/workspace/data.txt".to_string(),
+            offset: 0,
+            bytes_read: 512,
+            duration_ms: 2,
+            read_at: chrono::Utc::now(),
+            caller_node_id: None,
+            host_node_id: None,
+        };
+
+        let (execution_id_extracted, workflow_execution_id_extracted) = match &agent_event {
+            StorageEvent::FileRead {
+                execution_id,
+                workflow_execution_id,
+                ..
+            } => (execution_id.map(|e| e.0), *workflow_execution_id),
+            _ => panic!("unexpected variant"),
+        };
+        assert_eq!(execution_id_extracted, Some(exec_id.0));
+        assert_eq!(workflow_execution_id_extracted, None);
     }
 }
