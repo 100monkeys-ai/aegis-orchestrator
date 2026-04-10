@@ -65,7 +65,9 @@ spec:
       intent: "{{intent}}"
       input: |
         File path: /workspace/solution.{{input.language_ext}}
-        Input values: {{input.inputs}}
+        Input values (object): {{input.inputs}}
+        INTENT_INPUTS JSON (this is the exact string your code will receive from os.environ["INTENT_INPUTS"]):
+        {{input.inputs_json}}
 
         {{#if blackboard.VALIDATE_CODE}}
         IMPORTANT: Your previous code was rejected by the validator:
