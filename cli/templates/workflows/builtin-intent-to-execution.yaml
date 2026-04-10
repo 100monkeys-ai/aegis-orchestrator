@@ -114,7 +114,7 @@ spec:
       command: ["{{input.runner}}", "{{input.runner_flags}}", "/workspace/solution.{{input.language_ext}}"]
       workdir: /workspace
       env:
-        INTENT_INPUTS: "{{input.inputs_json}}"
+        INTENT_INPUTS: "{{{input.inputs_json}}}"
       volumes:
         - name: workspace
           mount_path: /workspace
