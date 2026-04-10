@@ -578,7 +578,10 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     > = match fuse_daemon_endpoint {
         Some(ref endpoint) => {
             match tonic::transport::Channel::from_shared(endpoint.clone())
-                .map(|ch| ch.connect_lazy())
+                .map(|ch| {
+                    ch.connect_timeout(std::time::Duration::from_secs(5))
+                        .connect_lazy()
+                })
             {
                 Ok(channel) => {
                     tracing::info!(endpoint = %endpoint, "Connected to FUSE daemon gRPC service");

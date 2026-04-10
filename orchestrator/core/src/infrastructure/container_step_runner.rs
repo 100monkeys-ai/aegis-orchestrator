@@ -482,32 +482,45 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                     .unwrap_or_default(),
                             };
 
-                        match client.mount(grpc_req).await {
-                            Ok(resp) => {
-                                let mountpoint = resp.into_inner().mountpoint;
-                                debug!(
-                                    step_name = %config.name,
-                                    volume_name = %vm.name,
-                                    mountpoint = %mountpoint,
-                                    mount_path = %vm.mount_path,
-                                    read_only = vm.read_only,
-                                    "Configured gRPC FUSE mount for container step (ADR-107)"
-                                );
-                                grpc_mounts.push(Mount {
-                                    target: Some(vm.mount_path.clone()),
-                                    source: Some(mountpoint),
-                                    typ: Some(MountTypeEnum::BIND),
-                                    read_only: Some(vm.read_only),
-                                    ..Default::default()
-                                });
-                            }
-                            Err(e) => {
+                        match tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            client.mount(grpc_req),
+                        )
+                        .await
+                        {
+                            Err(_elapsed) => {
                                 warn!(
-                                    error = %e,
                                     volume_name = %vm.name,
-                                    "gRPC FUSE mount failed — volume will not be available"
+                                    "gRPC FUSE mount timed out after 5s — volume will not be available"
                                 );
                             }
+                            Ok(mount_result) => match mount_result {
+                                Ok(resp) => {
+                                    let mountpoint = resp.into_inner().mountpoint;
+                                    debug!(
+                                        step_name = %config.name,
+                                        volume_name = %vm.name,
+                                        mountpoint = %mountpoint,
+                                        mount_path = %vm.mount_path,
+                                        read_only = vm.read_only,
+                                        "Configured gRPC FUSE mount for container step (ADR-107)"
+                                    );
+                                    grpc_mounts.push(Mount {
+                                        target: Some(vm.mount_path.clone()),
+                                        source: Some(mountpoint),
+                                        typ: Some(MountTypeEnum::BIND),
+                                        read_only: Some(vm.read_only),
+                                        ..Default::default()
+                                    });
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        error = %e,
+                                        volume_name = %vm.name,
+                                        "gRPC FUSE mount failed — volume will not be available"
+                                    );
+                                }
+                            },
                         }
                     }
 
