@@ -42,6 +42,7 @@ fn test_map_100monkeys_workflow() {
                 feedback: None,
             }],
             timeout: Some(std::time::Duration::from_secs(60)),
+            max_state_visits: None,
         },
     );
 
@@ -60,6 +61,7 @@ fn test_map_100monkeys_workflow() {
                 feedback: None,
             }],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -74,6 +76,7 @@ fn test_map_100monkeys_workflow() {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -91,6 +94,7 @@ fn test_map_100monkeys_workflow() {
             context: HashMap::from([("task".to_string(), serde_json::json!("Write fibonacci"))]),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap();
@@ -136,6 +140,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -153,6 +158,7 @@ fn test_map_workflow_defaults_missing_version_to_one_zero_zero() {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap();
@@ -176,6 +182,7 @@ fn test_spec_storage_is_mapped_to_temporal_definition() {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -202,6 +209,7 @@ fn test_spec_storage_is_mapped_to_temporal_definition() {
                 }),
                 shared_volumes: vec![],
             },
+            max_total_transitions: None,
         },
     )
     .unwrap();
@@ -261,6 +269,7 @@ fn test_scope_mapped_to_temporal_definition() {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -279,6 +288,7 @@ fn test_scope_mapped_to_temporal_definition() {
             context: HashMap::new(),
             states: states.clone(),
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap();
@@ -305,6 +315,7 @@ fn test_scope_mapped_to_temporal_definition() {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap();

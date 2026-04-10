@@ -78,6 +78,7 @@ fn workflow_with_schema(name: &str, schema: serde_json::Value) -> Workflow {
                 feedback: None,
             }],
             timeout: None,
+            max_state_visits: None,
         },
     );
     states.insert(
@@ -90,6 +91,7 @@ fn workflow_with_schema(name: &str, schema: serde_json::Value) -> Workflow {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
     Workflow::new(
@@ -106,6 +108,7 @@ fn workflow_with_schema(name: &str, schema: serde_json::Value) -> Workflow {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap()

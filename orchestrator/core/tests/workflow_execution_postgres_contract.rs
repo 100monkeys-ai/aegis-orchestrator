@@ -47,6 +47,7 @@ fn build_workflow(name: &str) -> Workflow {
                 feedback: None,
             }],
             timeout: None,
+            max_state_visits: None,
         },
     );
     states.insert(
@@ -59,6 +60,7 @@ fn build_workflow(name: &str) -> Workflow {
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -76,6 +78,7 @@ fn build_workflow(name: &str) -> Workflow {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap()
