@@ -29,6 +29,14 @@ metadata:
         type: string
         description: Executable used to run the generated code file (e.g. python3, node, bash)
         default: python3
+      runner_flags:
+        type: string
+        description: >-
+          Extra flags injected between the runner and the script path.
+          Set to "-s" for Python to prevent sys.path[0] injection of /workspace,
+          which triggers a FUSE readdir on import and causes an I/O error.
+          Leave empty for JavaScript and Bash.
+        default: "-s"
       container_image:
         type: string
         description: OCI container image used to execute the generated code
@@ -74,7 +82,7 @@ spec:
       kind: ContainerRun
       name: execute-user-code
       image: "{{input.container_image}}"
-      command: ["{{input.runner}}", "/workspace/solution.{{input.language_ext}}"]
+      command: ["{{input.runner}}", "{{input.runner_flags}}", "/workspace/solution.{{input.language_ext}}"]
       workdir: /workspace
       env:
         INTENT_INPUTS: "{{input.inputs_json}}"
