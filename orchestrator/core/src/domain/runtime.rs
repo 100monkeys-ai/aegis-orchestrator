@@ -488,7 +488,7 @@ pub enum ContainerStepError {
 /// # Invariants
 /// - Implementors MUST NOT inject bootstrap.py or set `AEGIS_ORCHESTRATOR_URL`
 /// - Implementors MUST clean up the container (stop + remove) on both success and error
-/// - Volumes MUST be mounted via the NFS Server Gateway (ADR-036), never via direct bind mounts
+/// - Volumes MUST be mounted via FUSE transport (ADR-107); no NFS fallback is permitted
 /// - stdout + stderr MUST be tail-truncated at 1 MiB to prevent memory exhaustion
 #[async_trait]
 pub trait ContainerStepRunner: Send + Sync {

@@ -9,13 +9,13 @@
 //! ## Responsibilities
 //! - Pull container image using shared [`crate::infrastructure::image_manager::DockerImageManager`]
 //! - Apply optional resource limits (CPU millicores, memory, timeout)
-//! - Mount NFS volumes via the Orchestrator Proxy Pattern (ADR-036)
+//! - Mount volumes via FUSE transport (gRPC daemon or local FUSE daemon — ADR-107)
 //! - Stream stdout/stderr from the container with a 1 MiB cap per stream
 //! - Return exit code, captured output, and duration to the application layer
 //! - Publish [`ContainerRunEvent`] domain events for audit trail and Cortex learning
 //! - Always remove the container on completion or error (no leaked resources)
 //!
-//! See ADR-050 (CI/CD Orchestration via Workflows), ADR-036 (NFS Server Gateway),
+//! See ADR-050 (CI/CD Orchestration via Workflows), ADR-107 (FUSE Volume Transport),
 //! ADR-027 (Docker Runtime Implementation Details).
 
 use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
@@ -31,13 +31,10 @@ use crate::infrastructure::image_manager::DockerImageManager;
 use crate::infrastructure::secrets_manager::SecretsManager;
 use async_trait::async_trait;
 use bollard::container::LogOutput;
-use bollard::models::{
-    ContainerCreateBody, HostConfig, Mount, MountTypeEnum, MountVolumeOptions,
-    MountVolumeOptionsDriverConfig,
-};
+use bollard::models::{ContainerCreateBody, HostConfig, Mount, MountTypeEnum};
 use bollard::query_parameters::{
-    CreateContainerOptions, LogsOptions, RemoveContainerOptions, RemoveVolumeOptions,
-    StartContainerOptions, WaitContainerOptions,
+    CreateContainerOptions, LogsOptions, RemoveContainerOptions, StartContainerOptions,
+    WaitContainerOptions,
 };
 use bollard::Docker;
 use chrono::Utc;
@@ -51,15 +48,9 @@ use tracing::{debug, info, warn};
 // 1 MiB cap per stream (stdout/stderr) to prevent runaway output from flooding memory.
 const STREAM_BYTES_CAP: usize = 1_048_576;
 
-/// NFS and port configuration for [`ContainerStepRunnerImpl`].
+/// Configuration for [`ContainerStepRunnerImpl`].
 pub struct ContainerStepRunnerConfig {
-    pub nfs_server_host: Option<String>,
-    pub nfs_port: u16,
-    pub nfs_mountport: u16,
     /// Docker network mode for container steps (e.g. `"host"`).
-    /// Must match the network mode used by agent containers so that
-    /// `addr=127.0.0.1` in NFS mount options resolves to the host NFS
-    /// server rather than the container's own loopback (ADR-036).
     pub network_mode: Option<String>,
     /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
     /// When `Some`, the runner uses FUSE + bind mounts instead of NFS volume
@@ -80,19 +71,12 @@ pub struct ContainerStepRunnerConfig {
 }
 
 /// Infrastructure implementation of [`ContainerStepRunner`] backed by the
-/// Docker Engine API (bollard). Shares image management and NFS configuration
-/// with [`crate::infrastructure::runtime::ContainerRuntime`].
+/// Docker Engine API (bollard). Uses FUSE transport (ADR-107) for all volume
+/// mounts — no NFS fallback.
 pub struct ContainerStepRunnerImpl {
     docker: Docker,
     image_manager: Arc<dyn DockerImageManager>,
-    /// Explicit NFS server host used for volume mount options (addr=...).
-    /// Same semantics as `ContainerRuntime::nfs_server_host` (ADR-036).
-    nfs_server_host: Option<String>,
-    nfs_port: u16,
-    nfs_mountport: u16,
     /// Docker network mode applied to every container step (e.g. `"host"`).
-    /// Inherited from the same resolved value used for agent containers so
-    /// that NFS `addr=127.0.0.1` refers to the host, not the container loopback.
     network_mode: Option<String>,
     /// FUSE FSAL daemon for bind-mount-based volume access (ADR-107).
     fuse_daemon: Option<Arc<crate::infrastructure::fuse::daemon::FuseFsalDaemon>>,
@@ -111,7 +95,7 @@ pub struct ContainerStepRunnerImpl {
     /// the vault secret and passes them as a `DockerCredentials` override to
     /// [`DockerImageManager::ensure_image`].
     secrets_manager: Arc<SecretsManager>,
-    /// Volume registry for resolving the correct NFS remote_path for each volume mount.
+    /// Volume registry for resolving per-volume context (remote path, ownership) for FUSE mounts.
     volume_registry: Arc<NfsVolumeRegistry>,
 }
 
@@ -127,9 +111,6 @@ impl ContainerStepRunnerImpl {
         Self {
             docker,
             image_manager,
-            nfs_server_host: config.nfs_server_host,
-            nfs_port: config.nfs_port,
-            nfs_mountport: config.nfs_mountport,
             network_mode: config.network_mode,
             fuse_daemon: config.fuse_daemon,
             fuse_mount_prefix: config.fuse_mount_prefix,
@@ -449,7 +430,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
-            // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) → NFS (ADR-036) ──
+            // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) ────────────────
             if !config.volumes.is_empty() {
                 if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
                     // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
@@ -615,7 +596,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                     warn!(
                                         error = %e,
                                         volume_name = %vm.name,
-                                        "FUSE mount failed — falling back to NFS for this volume"
+                                        "FUSE mount failed — volume will not be available"
                                     );
                                     None
                                 }
@@ -637,79 +618,17 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
 
                     return_fuse_handles = fuse_handles;
                 } else {
-                    // ── NFS volume driver path (ADR-036) ─────────────────────────────
-                    let nfs_host = self.nfs_server_host.as_deref().unwrap_or("127.0.0.1");
-
-                    let mounts: Vec<Mount> = config
-                        .volumes
-                        .iter()
-                        .map(|vm| {
-                            let mut driver_opts = HashMap::new();
-                            driver_opts.insert("type".to_string(), "nfs".to_string());
-                            driver_opts.insert(
-                                "o".to_string(),
-                                format!(
-                                    "addr={},nfsvers=3,proto=tcp,port={},mountport={},soft,timeo=10,nolock",
-                                    nfs_host, self.nfs_port, self.nfs_mountport
-                                ),
-                            );
-                            let device_path = uuid::Uuid::parse_str(&vm.name)
-                                .ok()
-                                .and_then(|uuid| {
-                                    self.volume_registry.lookup(VolumeId(uuid))
-                                })
-                                .map(|ctx| format!(":{}", ctx.remote_path));
-
-                            if device_path.is_none() {
-                                warn!(
-                                    step_name = %config.name,
-                                    volume_name = %vm.name,
-                                    execution_id = %config.execution_id,
-                                    "NFS volume registry lookup failed — volume may not be mounted correctly"
-                                );
-                            }
-
-                            let device_path = device_path.unwrap_or_else(|| {
-                                format!(":{}/{}", config.execution_id, vm.name)
-                            });
-                            driver_opts.insert("device".to_string(), device_path.clone());
-
-                            let volume_source_name = format!("aegis-vol-{}", vm.name);
-
-                            debug!(
-                                step_name = %config.name,
-                                volume_name = %vm.name,
-                                volume_source = %volume_source_name,
-                                device_path = %device_path,
-                                mount_path = %vm.mount_path,
-                                read_only = vm.read_only,
-                                nfs_host = nfs_host,
-                                "Configuring NFS mount for container step"
-                            );
-
-                            Mount {
-                                target: Some(vm.mount_path.clone()),
-                                source: Some(volume_source_name),
-                                typ: Some(MountTypeEnum::VOLUME),
-                                read_only: Some(vm.read_only),
-                                volume_options: Some(MountVolumeOptions {
-                                    driver_config: Some(MountVolumeOptionsDriverConfig {
-                                        name: Some("local".to_string()),
-                                        options: Some(driver_opts),
-                                    }),
-                                    ..Default::default()
-                                }),
-                                ..Default::default()
-                            }
-                        })
-                        .collect();
-
-                    hc.mounts = Some(mounts);
-                    info!(
-                        step_name = %config.name,
-                        count = config.volumes.len(),
-                        "Configured NFS volume mount(s) for container step (ADR-036)"
-                    );
+                    // No FUSE transport configured — this is a fatal misconfiguration.
+                    // Volumes require either a gRPC FUSE client or a local FUSE daemon.
+                    return Err(ContainerStepError::VolumeMountFailed {
+                        volume: config
+                            .volumes
+                            .first()
+                            .map(|v| v.name.clone())
+                            .unwrap_or_default(),
+                        error: "no FUSE transport configured: set fuse_mount_client or fuse_daemon"
+                            .to_string(),
+                    });
                 }
             }
 
@@ -739,36 +658,6 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // before constructing ContainerStepConfig; ContainerStepConfig always
         // carries the final resolved argv.
         let cmd: Vec<String> = config.command.clone();
-
-        // ─── 5b. Remove stale named volumes so NFS driver options are applied fresh ──
-        // Podman/Docker silently ignore driver_config when reusing an existing named
-        // volume. If a previous run created aegis-vol-{uuid} as a plain local volume,
-        // the NFS options on the new Mount are discarded and the container gets an
-        // empty local volume instead of the NFS-backed SeaweedFS volume.
-        if let Some(ref mounts) = host_config.mounts {
-            for m in mounts {
-                if let Some(ref vol_name) = m.source {
-                    if let Err(e) = self
-                        .docker
-                        .remove_volume(vol_name, None::<RemoveVolumeOptions>)
-                        .await
-                    {
-                        debug!(
-                            volume = %vol_name,
-                            error = %e,
-                            "Could not remove stale volume (may not exist)"
-                        );
-                    }
-                }
-            }
-        }
-
-        // Collect volume source names for post-removal cleanup (before host_config moves)
-        let volume_sources_for_cleanup: Vec<String> = host_config
-            .mounts
-            .as_ref()
-            .map(|mounts| mounts.iter().filter_map(|m| m.source.clone()).collect())
-            .unwrap_or_default();
 
         // ─── 6. Create container ──────────────────────────────────────────────
         let container_name = format!(
@@ -880,24 +769,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             );
         }
 
-        // ─── 10b. Clean up named volumes after container removal ──────────────
-        // Remove the named volumes created for this run so they don't accumulate
-        // as stale plain-local volumes across runs.
-        for vol_name in &volume_sources_for_cleanup {
-            if let Err(e) = self
-                .docker
-                .remove_volume(vol_name, None::<RemoveVolumeOptions>)
-                .await
-            {
-                debug!(
-                    volume = %vol_name,
-                    error = %e,
-                    "Could not remove volume after container step (may still be in use)"
-                );
-            }
-        }
-
-        // ─── 10c. Drop FUSE mount handles (ADR-107) ─────────────────────────
+        // ─── 10b. Drop FUSE mount handles (ADR-107) ─────────────────────────
         // _fuse_mount_handles is dropped when this function returns, which is
         // after the container has been removed. Each handle's Drop impl triggers
         // FUSE_DESTROY + unmount, so the host mountpoints are cleaned up here.
@@ -1137,15 +1009,10 @@ mod tests {
 
     /// Regression: ContainerStepRunnerConfig must propagate network_mode so
     /// container steps use the same Docker network as agent containers.
-    /// Without this field, HostConfig defaulted to bridge networking and
-    /// addr=127.0.0.1 in NFS mount options resolved to the container's own
-    /// loopback, making the NFS server unreachable (ADR-036).
+    /// Without this field, HostConfig defaulted to bridge networking.
     #[test]
     fn test_config_network_mode_stored() {
         let config = ContainerStepRunnerConfig {
-            nfs_server_host: None,
-            nfs_port: 2049,
-            nfs_mountport: 2049,
             network_mode: Some("host".to_string()),
             fuse_daemon: None,
             fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
@@ -1258,39 +1125,6 @@ mod tests {
         );
     }
 
-    /// Regression: container step volume mounts must use the same Docker volume
-    /// source name as agent containers (`aegis-vol-{volume_id}`) so Docker reuses
-    /// the existing named volume. Previously, container steps used
-    /// `aegis-step-{execution_id}-{volume_name}`, creating a separate Docker volume
-    /// that could fail to mount the NFS export correctly, resulting in an empty
-    /// /workspace directory and Python exit code 2 (file not found).
-    #[test]
-    fn test_container_step_volume_source_name_matches_agent_runtime() {
-        // The container step volume source name format must match the agent runtime.
-        // Agent runtime uses: format!("aegis-vol-{}", volume_mount.volume_id)
-        // Container step must use the same: format!("aegis-vol-{}", vm.name)
-        let volume_id = "f8eb2163-0f8e-4582-abf2-6ab1261b7961";
-        let execution_id = uuid::Uuid::new_v4();
-
-        // What agent runtime produces:
-        let agent_source = format!("aegis-vol-{}", volume_id);
-
-        // What container step must produce (matches agent runtime):
-        let step_source = format!("aegis-vol-{}", volume_id);
-
-        assert_eq!(
-            agent_source, step_source,
-            "Container step volume source name must match agent runtime's aegis-vol-{{volume_id}} format"
-        );
-
-        // The old broken format would have been:
-        let old_broken_source = format!("aegis-step-{}-{}", execution_id, volume_id);
-        assert_ne!(
-            agent_source, old_broken_source,
-            "Old aegis-step format must differ from the correct aegis-vol format"
-        );
-    }
-
     /// Regression: ContainerStepRunnerImpl must NOT require a VolumeService
     /// dependency. Volume ownership is no longer mutated in the DB by the
     /// container step runner — FSAL resolves WorkflowExecution ownership
@@ -1303,9 +1137,6 @@ mod tests {
         // ContainerStepRunnerImpl::new takes 6 arguments (no VolumeService).
         // This is a compile-time verification — no runtime assertion needed.
         let _config = ContainerStepRunnerConfig {
-            nfs_server_host: None,
-            nfs_port: 2049,
-            nfs_mountport: 2049,
             network_mode: None,
             fuse_daemon: None,
             fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
@@ -1326,5 +1157,26 @@ mod tests {
         assert_eq!(parse_memory_string("2g"), Some(2 * 1_073_741_824));
         assert_eq!(parse_memory_string("256m"), Some(256 * 1_048_576));
         assert_eq!(parse_memory_string("1024k"), Some(1024 * 1_024));
+    }
+
+    /// Regression: ContainerStepRunnerConfig with no FUSE transport configured
+    /// (fuse_mount_client = None AND fuse_daemon = None) must not contain NFS
+    /// fallback fields. The NFS fallback path has been removed; volume mounts
+    /// require a FUSE transport — absence of one is a hard configuration error
+    /// caught at runtime, not silently degraded.
+    #[test]
+    fn test_config_without_fuse_has_no_nfs_fields() {
+        // ContainerStepRunnerConfig must compile without nfs_server_host, nfs_port,
+        // or nfs_mountport — those fields no longer exist.
+        let config = ContainerStepRunnerConfig {
+            network_mode: None,
+            fuse_daemon: None,
+            fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
+            fuse_mount_client: None,
+        };
+        // Structural assertion: no FUSE transport configured.
+        assert!(config.fuse_daemon.is_none());
+        assert!(config.fuse_mount_client.is_none());
+        // If this compiles without nfs_* fields, the NFS fallback is fully removed.
     }
 }

@@ -1506,9 +1506,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             docker_for_steps,
             step_image_manager,
             aegis_orchestrator_core::infrastructure::container_step_runner::ContainerStepRunnerConfig {
-                nfs_server_host,
-                nfs_port: config.spec.runtime.nfs_port,
-                nfs_mountport: config.spec.runtime.nfs_mountport,
                 network_mode: network_mode.clone(),
                 fuse_daemon: fuse_daemon.clone(),
                 fuse_mount_prefix: fuse_mount_prefix.clone(),
