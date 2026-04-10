@@ -135,6 +135,15 @@ spec:
         min_confidence: 0.7
         timeout_seconds: 600
 
+  input_schema:
+    type: object
+    properties:
+      input:
+        type: string
+        description: Natural-language description of the workflow to create or update
+    required:
+      - input
+
   tools:
     - aegis.schema.get
     - aegis.schema.validate

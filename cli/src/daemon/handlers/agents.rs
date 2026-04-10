@@ -270,7 +270,7 @@ pub(crate) async fn list_agents_handler(
                 .iter()
                 .enumerate()
                 .map(|(idx, agent)| {
-                    serde_json::json!({
+                    let mut entry = serde_json::json!({
                         "id": agent.id.0,
                         "name": agent.manifest.metadata.name,
                         "version": agent.manifest.metadata.version,
@@ -281,9 +281,12 @@ pub(crate) async fn list_agents_handler(
                         "created_at": agent.created_at.to_rfc3339(),
                         "updated_at": agent.updated_at.to_rfc3339(),
                         "tenant_id": agent.tenant_id.as_str(),
-                        "input_schema": agent.manifest.spec.input_schema,
                         "execution_count": counts[idx],
-                    })
+                    });
+                    if let Some(schema) = &agent.manifest.spec.input_schema {
+                        entry["input_schema"] = serde_json::json!(schema);
+                    }
+                    entry
                 })
                 .collect();
             Ok(Json(serde_json::json!(json_agents)))
@@ -380,7 +383,7 @@ pub(crate) async fn get_agent_handler(
     {
         Ok(agent) => {
             let manifest_yaml = serde_yaml::to_string(&agent.manifest).unwrap_or_default();
-            Ok(Json(serde_json::json!({
+            let mut response = serde_json::json!({
                 "id": agent.id.0,
                 "name": agent.manifest.metadata.name,
                 "version": agent.manifest.metadata.version,
@@ -393,8 +396,11 @@ pub(crate) async fn get_agent_handler(
                 "tenant_id": agent.tenant_id.as_str(),
                 "manifest": serde_json::to_value(&agent.manifest).unwrap_or_default(),
                 "manifest_yaml": manifest_yaml,
-                "input_schema": agent.manifest.spec.input_schema,
-            })))
+            });
+            if let Some(schema) = &agent.manifest.spec.input_schema {
+                response["input_schema"] = serde_json::json!(schema);
+            }
+            Ok(Json(response))
         }
         Err(e) => Ok(Json(serde_json::json!({"error": e.to_string()}))),
     }

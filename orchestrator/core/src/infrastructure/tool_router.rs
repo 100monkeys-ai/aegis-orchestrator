@@ -1089,17 +1089,11 @@ impl ToolRouter {
                     },
                     "intent": {
                         "type": "string",
-                        "description": "Natural-language description of what the agent should accomplish. Steers the LLM prompt directly. Complementary to structured 'input'."
+                        "description": "Free-form natural-language steering for the agent. Use when the agent has no input_schema. When input_schema is present, intent is optional supplemental context."
                     },
                     "input": {
                         "type": "object",
-                        "description": "Structured data for the agent, validated against its input_schema when declared. Use alongside 'intent' for typed parameters.",
-                        "properties": {
-                            "prompt": {
-                                "type": "string",
-                                "description": "The full task instructions or user request to pass to the agent."
-                            }
-                        }
+                        "description": "Structured data for the agent. When the agent declares input_schema, pass exactly the properties defined there — do not wrap them in additional keys. When the agent has no input_schema, omit this field and use 'intent' instead."
                     },
                     "version": {
                         "type": "string",
