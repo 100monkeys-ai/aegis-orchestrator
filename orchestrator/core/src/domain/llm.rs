@@ -136,7 +136,7 @@ pub struct GenerationOptions {
 impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
-            max_tokens: Some(4096),
+            max_tokens: Some(8192),
             temperature: Some(0.7),
             stop_sequences: None,
         }

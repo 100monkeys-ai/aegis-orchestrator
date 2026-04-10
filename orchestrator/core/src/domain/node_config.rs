@@ -325,6 +325,13 @@ pub struct ModelConfig {
     /// Cost per 1,000 tokens (0.0 for local models)
     #[serde(default)]
     pub cost_per_1k_tokens: f64,
+
+    /// Maximum output tokens for this model alias.
+    /// Overrides the `GenerationOptions` default (8192) when set.
+    /// Useful for models like Gemini 2.5 Pro whose thinking mode consumes
+    /// output tokens for internal reasoning before producing visible output.
+    #[serde(default)]
+    pub max_output_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2119,6 +2126,7 @@ mod tests {
                         capabilities: vec!["chat".to_string(), "reasoning".to_string()],
                         context_window: 8192,
                         cost_per_1k_tokens: 0.0,
+                        max_output_tokens: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),

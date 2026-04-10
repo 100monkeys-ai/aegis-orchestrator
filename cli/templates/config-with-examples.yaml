@@ -72,13 +72,14 @@ spec:
           capabilities: ["code", "reasoning", "general"]
           context_window: 8192
           cost_per_1k_tokens: 0.0  # Free
-        
+          # max_output_tokens: 8192  # Optional: override default (8192)
+
         - alias: "fast"
           model: "qwen2.5-coder:7b"
           capabilities: ["code"]
           context_window: 4096
           cost_per_1k_tokens: 0.0
-    
+
     # Example 2: OpenAI (or compatible API like Azure OpenAI)
     - name: "openai"
       type: "openai"
@@ -91,13 +92,13 @@ spec:
           capabilities: ["code", "reasoning", "general", "vision"]
           context_window: 128000
           cost_per_1k_tokens: 0.005  # $5 per 1M tokens (approximate)
-        
+
         - alias: "fast"
           model: "gpt-4o-mini"
           capabilities: ["code", "general"]
           context_window: 128000
           cost_per_1k_tokens: 0.00015  # $0.15 per 1M tokens
-    
+
     # Example 3: Anthropic Claude
     - name: "anthropic"
       type: "anthropic"
@@ -110,6 +111,22 @@ spec:
           capabilities: ["code", "reasoning", "general"]
           context_window: 200000
           cost_per_1k_tokens: 0.003  # $3 per 1M tokens
+
+    # Example 4: Google Gemini
+    # - name: "gemini"
+    #   type: "gemini"
+    #   enabled: true
+    #   api_key: "env:GEMINI_API_KEY"
+    #   models:
+    #     - alias: "smart"
+    #       model: "gemini-2.5-pro"
+    #       capabilities: ["code", "reasoning", "general"]
+    #       context_window: 1048576
+    #       cost_per_1k_tokens: 0.00125
+    #       # max_output_tokens: Maximum tokens the model may generate per call.
+    #       # Defaults to 8192 if omitted. Increase for models whose thinking mode
+    #       # consumes output tokens for internal reasoning (e.g. Gemini 2.5 Pro).
+    #       max_output_tokens: 16384
   
   # --------------------------------------------------------------------------
   # LLM Selection Strategy

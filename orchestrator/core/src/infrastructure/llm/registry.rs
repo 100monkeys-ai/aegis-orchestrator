@@ -63,6 +63,9 @@ pub struct ProviderRegistry {
     /// alias → raw `api_key` value from the provider config (before env resolution).
     /// Used to determine [`ApiKeySource`] for BYOK exemption (ADR-072).
     raw_api_keys: HashMap<String, Option<String>>,
+    /// alias → per-model `max_output_tokens` override from config.
+    /// When set, overrides `GenerationOptions::max_tokens` for calls on that alias.
+    alias_max_output_tokens: HashMap<String, u32>,
     max_retries: u32,
     retry_delay_ms: u64,
 }
@@ -164,6 +167,7 @@ impl ProviderRegistry {
         // ── Phase 2: build one per-model adapter per winning alias ─────────────────────
         let mut alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
         let mut raw_api_keys: HashMap<String, Option<String>> = HashMap::new();
+        let mut alias_max_output_tokens: HashMap<String, u32> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -179,6 +183,13 @@ impl ProviderRegistry {
                             Ok(adapter) => {
                                 alias_map.insert(alias.clone(), (winner_model.clone(), adapter));
                                 raw_api_keys.insert(alias.clone(), provider_config.api_key.clone());
+                                if let Some(max_tokens) = model_config.max_output_tokens {
+                                    info!(
+                                        "Alias '{}' max_output_tokens override: {}",
+                                        alias, max_tokens
+                                    );
+                                    alias_max_output_tokens.insert(alias.clone(), max_tokens);
+                                }
                             }
                             Err(e) => {
                                 warn!(
@@ -211,6 +222,7 @@ impl ProviderRegistry {
             providers,
             fallback_provider,
             raw_api_keys,
+            alias_max_output_tokens,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
         })
@@ -264,6 +276,20 @@ impl ProviderRegistry {
         }
     }
 
+    /// Apply per-alias `max_output_tokens` override to a copy of the given options.
+    /// If the alias has a configured override, `max_tokens` is replaced; otherwise
+    /// the original options are returned unchanged.
+    fn apply_alias_options(&self, alias: &str, options: &GenerationOptions) -> GenerationOptions {
+        match self.alias_max_output_tokens.get(alias) {
+            Some(&max_tokens) => {
+                let mut opts = options.clone();
+                opts.max_tokens = Some(max_tokens);
+                opts
+            }
+            None => options.clone(),
+        }
+    }
+
     /// Generate a chat response for the given model alias.
     ///
     /// Resolves the alias directly to a pre-configured `Arc<dyn LLMProvider>` adapter;
@@ -283,10 +309,14 @@ impl ProviderRegistry {
 
         info!("LLM inference: alias='{}', model='{}'", alias, model_name);
 
+        let effective_options = self.apply_alias_options(alias, options);
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
-            match provider.generate_chat(messages, tools, options).await {
+            match provider
+                .generate_chat(messages, tools, &effective_options)
+                .await
+            {
                 Ok(response) => {
                     info!(
                         "generate_chat successful: alias='{}', model='{}', attempt={}",
@@ -362,10 +392,11 @@ impl ProviderRegistry {
             alias, model_name
         );
 
+        let effective_options = self.apply_alias_options(alias, options);
         let mut last_error = None;
 
         for attempt in 0..self.max_retries {
-            match provider.generate(prompt, options).await {
+            match provider.generate(prompt, &effective_options).await {
                 Ok(response) => {
                     info!(
                         "Generation successful on attempt {} (model='{}')",
@@ -516,6 +547,7 @@ mod tests {
                         capabilities: vec!["chat".to_string()],
                         context_window: 8192,
                         cost_per_1k_tokens: 0.0,
+                        max_output_tokens: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),
