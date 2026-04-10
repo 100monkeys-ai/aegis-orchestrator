@@ -29,8 +29,12 @@ spec:
       from the workspace and verify it meets the structural requirements for
       the intent-to-execution pipeline.
 
-      Read the file at the path given in the input using fs.read, then evaluate
-      ALL of the following criteria:
+      YOUR FIRST ACTION MUST be to read the solution file using fs.read with
+      the file path provided in the input prompt below. Do NOT wait for
+      additional instructions — read the file immediately and validate it.
+      The file path is always provided in the input.
+
+      After reading the file, evaluate ALL of the following criteria:
 
       1. FUNCTION STRUCTURE — The code MUST define a callable function (e.g.
          `def solve(inputs):` in Python, `function solve(inputs)` in JavaScript,
@@ -49,8 +53,13 @@ spec:
          If INTENT_INPUTS is empty or "{}" (no inputs provided), this criterion
          is automatically satisfied.
 
-      4. STDOUT OUTPUT — The function MUST print its result to stdout (print(),
-         console.log(), echo).
+      4. STDOUT OUTPUT — When the script is executed, output MUST appear on
+         stdout. This criterion is satisfied by EITHER pattern:
+         - The function itself calls print() / console.log() / echo directly
+         - The function returns a value and the if __name__ == "__main__":
+           block (or equivalent entry point) prints the return value
+         The key requirement is that running the script produces stdout output,
+         NOT that the function itself contains a print statement.
 
       5. STANDARD LIBRARY ONLY — No third-party imports or packages. Only
          standard library modules are allowed.
@@ -73,7 +82,7 @@ spec:
       {{instruction}}
 
       ## File to validate:
-      {{intent}}
+      Read the file at {{intent}} using fs.read NOW, then validate it.
 
       ## Input context:
       {{input}}
