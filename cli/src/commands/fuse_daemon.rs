@@ -141,6 +141,40 @@ impl FuseMountService for FuseMountServiceImpl {
         request: Request<FuseUnmountRequest>,
     ) -> Result<Response<FuseUnmountResponse>, Status> {
         let req = request.into_inner();
+
+        if req.execution_id.is_empty() {
+            // Wildcard unmount: remove ALL mounts for this volume_id regardless
+            // of execution_id. Used by DestroyWorkspaceVolume to ensure no stale
+            // FUSE mountpoints survive after volume destruction.
+            let suffix = format!("/{}", req.volume_id);
+            let mut handles = self.handles.write().await;
+            let keys_to_remove: Vec<String> = handles
+                .keys()
+                .filter(|k| k.ends_with(&suffix))
+                .cloned()
+                .collect();
+            let count = keys_to_remove.len();
+            for key in &keys_to_remove {
+                // Dropping the FuseMountHandle triggers the actual unmount.
+                handles.remove(key);
+            }
+            if count > 0 {
+                info!(
+                    volume_id = %req.volume_id,
+                    count,
+                    "FUSE mount(s) removed via gRPC wildcard unmount"
+                );
+            } else {
+                warn!(
+                    volume_id = %req.volume_id,
+                    "No active FUSE mounts found for wildcard unmount request"
+                );
+            }
+            return Ok(Response::new(FuseUnmountResponse {
+                unmounted: count > 0,
+            }));
+        }
+
         let key = mount_key(&req.execution_id, &req.volume_id);
 
         let removed = self.handles.write().await.remove(&key);
@@ -226,5 +260,68 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             eprintln!("{}", "FUSE daemon status not yet implemented".yellow());
             Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mount_key;
+
+    /// Regression: wildcard unmount must correctly identify all mount keys
+    /// matching a given volume_id, regardless of execution_id. Before this fix,
+    /// gRPC FUSE mounts created during container step execution were never
+    /// unmounted — DestroyWorkspaceVolume destroyed the volume but left stale
+    /// FUSE mountpoints generating endless DirectoryListed storage events.
+    ///
+    /// The fix uses a suffix-matching pattern: when execution_id is empty,
+    /// all keys ending with "/{volume_id}" are removed.
+    #[test]
+    fn test_wildcard_unmount_matches_all_executions_for_volume() {
+        let volume_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let exec_1 = "11111111-1111-1111-1111-111111111111";
+        let exec_2 = "22222222-2222-2222-2222-222222222222";
+        let other_volume = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+        let key_1 = mount_key(exec_1, volume_id);
+        let key_2 = mount_key(exec_2, volume_id);
+        let key_other = mount_key(exec_1, other_volume);
+
+        let suffix = format!("/{volume_id}");
+
+        assert!(
+            key_1.ends_with(&suffix),
+            "key for exec_1/volume must match wildcard"
+        );
+        assert!(
+            key_2.ends_with(&suffix),
+            "key for exec_2/volume must match wildcard"
+        );
+        assert!(
+            !key_other.ends_with(&suffix),
+            "key for different volume must NOT match wildcard"
+        );
+    }
+
+    /// Regression: exact unmount (with both execution_id and volume_id) must
+    /// only match the specific (execution_id, volume_id) pair — not other
+    /// executions of the same volume.
+    #[test]
+    fn test_exact_unmount_matches_only_specific_key() {
+        let volume_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let exec_1 = "11111111-1111-1111-1111-111111111111";
+        let exec_2 = "22222222-2222-2222-2222-222222222222";
+
+        let key_1 = mount_key(exec_1, volume_id);
+        let key_2 = mount_key(exec_2, volume_id);
+
+        assert_ne!(
+            key_1, key_2,
+            "different execution_ids must produce different keys"
+        );
+        assert_eq!(
+            key_1,
+            mount_key(exec_1, volume_id),
+            "same inputs must produce identical keys"
+        );
     }
 }

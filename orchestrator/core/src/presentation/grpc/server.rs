@@ -79,6 +79,13 @@ pub struct AegisRuntimeService {
     /// ADR-103: Output handler service for post-execution egress dispatch.
     output_handler_service:
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    /// Used by `destroy_workspace_volume` to unmount FUSE mounts before volume destruction.
+    fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
 }
 
 impl AegisRuntimeService {
@@ -126,6 +133,7 @@ impl AegisRuntimeService {
             discovery_service: None,
             volume_service: None,
             output_handler_service: None,
+            fuse_mount_client: None,
         }
     }
 
@@ -193,6 +201,17 @@ impl AegisRuntimeService {
         svc: Arc<dyn crate::application::output_handler_service::OutputHandlerService>,
     ) -> Self {
         self.output_handler_service = Some(svc);
+        self
+    }
+
+    /// Set the gRPC FUSE mount client for unmounting volumes on workspace destruction (ADR-107).
+    pub fn with_fuse_mount_client(
+        mut self,
+        client: crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    ) -> Self {
+        self.fuse_mount_client = Some(client);
         self
     }
 
@@ -1224,6 +1243,47 @@ impl AegisRuntime for AegisRuntimeService {
             "Destroying workspace volume (ADR-087)"
         );
 
+        // Unmount any FUSE mounts for this volume before destroying it (ADR-107).
+        // Uses wildcard unmount (empty execution_id) to tear down all mounts for
+        // this volume_id, preventing stale FUSE mountpoints that generate endless
+        // DirectoryListed storage events. Best-effort: failures are logged but
+        // do not block volume destruction.
+        if let Some(ref fuse_mount_client) = self.fuse_mount_client {
+            let mut client = fuse_mount_client.clone();
+            let unmount_req = crate::infrastructure::aegis_runtime_proto::FuseUnmountRequest {
+                volume_id: req.volume_id.clone(),
+                execution_id: String::new(), // Wildcard: unmount all executions
+            };
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.unmount(unmount_req),
+            )
+            .await
+            {
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        volume_id = %req.volume_id,
+                        "gRPC FUSE unmount timed out after 5s during workspace volume destruction"
+                    );
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        error = %e,
+                        volume_id = %req.volume_id,
+                        "gRPC FUSE unmount failed during workspace volume destruction"
+                    );
+                }
+                Ok(Ok(resp)) => {
+                    if resp.into_inner().unmounted {
+                        tracing::info!(
+                            volume_id = %req.volume_id,
+                            "FUSE mount(s) unmounted before workspace volume destruction"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(Response::new(DestroyWorkspaceVolumeResponse {
             destroyed: true,
         }))
@@ -1628,6 +1688,13 @@ pub struct GrpcServerConfig {
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
     /// FSAL instance for the FsalService gRPC endpoint used by the external FUSE daemon (ADR-107).
     pub fsal: Option<Arc<crate::domain::fsal::AegisFSAL>>,
+    /// gRPC client to the host-side FUSE daemon's FuseMountService (ADR-107).
+    /// Passed to `AegisRuntimeService` for FUSE unmount on workspace volume destruction.
+    pub fuse_mount_client: Option<
+        crate::infrastructure::aegis_runtime_proto::fuse_mount_service_client::FuseMountServiceClient<
+            tonic::transport::Channel,
+        >,
+    >,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1667,6 +1734,10 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     if let Some(output_handler) = config.output_handler_service {
         service = service.with_output_handler_service(output_handler);
+    }
+
+    if let Some(fuse_client) = config.fuse_mount_client {
+        service = service.with_fuse_mount_client(fuse_client);
     }
 
     let server = service.into_server();

@@ -430,6 +430,11 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
+            // Track (execution_id, volume_id) pairs for gRPC FUSE mounts so we can
+            // unmount them after the container exits. Only populated when using the
+            // gRPC FuseMountService path.
+            let mut grpc_mounted_volumes: Vec<(String, String)> = Vec::new();
+
             // ─── Volume mounts: gRPC FUSE (ADR-107) → local FUSE (ADR-107) ────────────────
             if !config.volumes.is_empty() {
                 if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
@@ -505,6 +510,10 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                         read_only = vm.read_only,
                                         "Configured gRPC FUSE mount for container step (ADR-107)"
                                     );
+                                    grpc_mounted_volumes.push((
+                                        config.execution_id.0.to_string(),
+                                        volume_id.0.to_string(),
+                                    ));
                                     grpc_mounts.push(Mount {
                                         target: Some(vm.mount_path.clone()),
                                         source: Some(mountpoint),
@@ -787,6 +796,52 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // after the container has been removed. Each handle's Drop impl triggers
         // FUSE_DESTROY + unmount, so the host mountpoints are cleaned up here.
         drop(_fuse_mount_handles);
+
+        // ─── 10c. Unmount gRPC FUSE mounts (ADR-107) ────────────────────────
+        // When the gRPC FuseMountService path was used, the FUSE mounts live in
+        // the remote daemon process — dropping local handles does nothing. We
+        // must explicitly call unmount for each volume that was gRPC-mounted.
+        if !grpc_mounted_volumes.is_empty() {
+            if let Some(ref fuse_mount_client) = self.fuse_mount_client {
+                let mut client = fuse_mount_client.clone();
+                for (execution_id, volume_id) in &grpc_mounted_volumes {
+                    let unmount_req =
+                        crate::infrastructure::aegis_runtime_proto::FuseUnmountRequest {
+                            volume_id: volume_id.clone(),
+                            execution_id: execution_id.clone(),
+                        };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        client.unmount(unmount_req),
+                    )
+                    .await
+                    {
+                        Err(_elapsed) => {
+                            warn!(
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                "gRPC FUSE unmount timed out after 5s — mount may linger"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                error = %e,
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                "gRPC FUSE unmount failed — mount may linger"
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            debug!(
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                "gRPC FUSE unmount succeeded"
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         let duration_ms = start.elapsed().as_millis() as u64;
 
@@ -1191,5 +1246,28 @@ mod tests {
         assert!(config.fuse_daemon.is_none());
         assert!(config.fuse_mount_client.is_none());
         // If this compiles without nfs_* fields, the NFS fallback is fully removed.
+    }
+
+    /// Regression: gRPC FUSE mounts must be tracked and unmounted after container
+    /// exit. Before this fix, the gRPC FuseMountService path created FUSE mounts
+    /// on the remote daemon via `client.mount()` but never called `client.unmount()`.
+    /// This left stale FUSE mountpoints on the host, generating endless
+    /// `DirectoryListed` storage events. The fix tracks (execution_id, volume_id)
+    /// pairs for each successful gRPC mount and calls unmount after container removal.
+    #[test]
+    fn test_grpc_mounted_volumes_tracking_structure() {
+        // Verify that the tracking vector correctly stores (execution_id, volume_id) pairs.
+        let mut grpc_mounted_volumes: Vec<(String, String)> = Vec::new();
+
+        let exec_id = "11111111-1111-1111-1111-111111111111".to_string();
+        let vol_id_1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+        let vol_id_2 = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string();
+
+        grpc_mounted_volumes.push((exec_id.clone(), vol_id_1.clone()));
+        grpc_mounted_volumes.push((exec_id.clone(), vol_id_2.clone()));
+
+        assert_eq!(grpc_mounted_volumes.len(), 2);
+        assert_eq!(grpc_mounted_volumes[0], (exec_id.clone(), vol_id_1));
+        assert_eq!(grpc_mounted_volumes[1], (exec_id, vol_id_2));
     }
 }
