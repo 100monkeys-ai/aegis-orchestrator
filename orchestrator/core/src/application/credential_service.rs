@@ -243,7 +243,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
             id: binding_id,
             owner_user_id: owner_user_id.to_string(),
             tenant_id: tenant_id.clone(),
-            credential_type,
+            credential_type: credential_type.clone(),
             provider: provider.clone(),
             secret_path,
             scope,

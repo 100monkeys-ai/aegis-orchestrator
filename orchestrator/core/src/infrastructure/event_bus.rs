@@ -1645,7 +1645,7 @@ mod tests {
             owner_user_id: "user-1".to_string(),
             tenant_id: tenant_id.clone(),
             provider: CredentialProvider::OpenAI,
-            credential_type: CredentialType::ApiKey,
+            credential_type: CredentialType::Secret,
         });
 
         // Publish CredentialAccessed for a different agent — must be filtered out

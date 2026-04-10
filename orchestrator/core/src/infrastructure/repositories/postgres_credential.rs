@@ -46,18 +46,18 @@ impl PostgresCredentialBindingRepository {
 
 fn credential_type_to_str(ct: &CredentialType) -> &'static str {
     match ct {
-        CredentialType::ApiKey => "api_key",
+        CredentialType::Secret => "secret",
         CredentialType::OAuth2 => "oauth2",
-        CredentialType::StaticToken => "static_token",
+        CredentialType::Variable => "variable",
         CredentialType::ServiceAccount => "service_account",
     }
 }
 
 fn str_to_credential_type(s: &str) -> anyhow::Result<CredentialType> {
     match s {
-        "api_key" => Ok(CredentialType::ApiKey),
+        "secret" => Ok(CredentialType::Secret),
         "oauth2" => Ok(CredentialType::OAuth2),
-        "static_token" => Ok(CredentialType::StaticToken),
+        "variable" => Ok(CredentialType::Variable),
         "service_account" => Ok(CredentialType::ServiceAccount),
         other => Err(anyhow::anyhow!("Unknown credential_type: {other}")),
     }
