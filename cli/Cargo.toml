@@ -66,9 +66,9 @@ tonic_12 = { package = "tonic", version = "0.12", features = ["tls", "tls-roots"
 bollard = { workspace = true }
 
 # Internal [dependencies]
-aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.14.0-pre-alpha" }
-aegis-orchestrator-swarm = { path = "../orchestrator/swarm", version = "0.14.0-pre-alpha" }
-aegis-orchestrator-sdk = { path = "../sdks", version = "0.14.0-pre-alpha" }
+aegis-orchestrator-core = { path = "../orchestrator/core", version = "0.15.0-pre-alpha" }
+aegis-orchestrator-swarm = { path = "../orchestrator/swarm", version = "0.15.0-pre-alpha" }
+aegis-orchestrator-sdk = { path = "../sdks", version = "0.15.0-pre-alpha" }
 async-trait = "0.1"
 jsonwebtoken = "10.3.0"
 base64 = "0.22.1"

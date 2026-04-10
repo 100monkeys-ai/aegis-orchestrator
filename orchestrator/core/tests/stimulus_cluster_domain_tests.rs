@@ -774,7 +774,7 @@ fn registered_node_from_peer() {
     let registered = RegisteredNode::from_peer(
         &peer,
         "worker-01.local".to_string(),
-        "0.14.0-pre-alpha".to_string(),
+        "0.15.0-pre-alpha".to_string(), // TODO: Why is the version hardcoded here?
         metadata.clone(),
         Some("v1-abc".to_string()),
     );
@@ -782,7 +782,7 @@ fn registered_node_from_peer() {
     assert_eq!(registered.hostname, "worker-01.local");
     assert_eq!(registered.role, NodeRole::Worker);
     assert_eq!(registered.registry_status, RegistryStatus::Pending);
-    assert_eq!(registered.software_version, "0.14.0-pre-alpha");
+    assert_eq!(registered.software_version, "0.15.0-pre-alpha"); // TODO: Why is the version hardcoded here?
     assert_eq!(registered.config_version, Some("v1-abc".to_string()));
     assert_eq!(registered.metadata, metadata);
 }
