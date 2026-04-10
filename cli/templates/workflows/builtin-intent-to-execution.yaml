@@ -69,11 +69,18 @@ spec:
         INTENT_INPUTS JSON (this is the exact string your code will receive from os.environ["INTENT_INPUTS"]):
         {{input.inputs_json}}
 
+        {{#if blackboard.EXECUTE_CODE}}
+        IMPORTANT: Your previous code FAILED at runtime with exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}.
+        stderr:
+        {{{blackboard.EXECUTE_CODE.output.stderr}}}
+        Fix the bug and rewrite the solution.
+        {{/if}}
+
         {{#if blackboard.VALIDATE_CODE}}
         IMPORTANT: Your previous code was rejected by the validator:
-        {{blackboard.VALIDATE_CODE.output.summary}}
+        {{{blackboard.VALIDATE_CODE.output.summary}}}
         Failed criteria:
-        {{json blackboard.VALIDATE_CODE.output.criteria}}
+        {{{json blackboard.VALIDATE_CODE.output.criteria}}}
         Fix the issues and rewrite the solution.
         {{/if}}
 
@@ -152,4 +159,6 @@ spec:
     EXECUTION_FAILED:
       kind: System
       command: "echo 'Pipeline failed at EXECUTE_CODE, exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}'"
-      transitions: []
+      transitions:
+        - condition: on_success
+          target: WRITE_CODE
