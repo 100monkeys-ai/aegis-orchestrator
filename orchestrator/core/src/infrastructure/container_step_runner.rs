@@ -350,7 +350,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
         // ─── 4. Build NFS volume mounts (ADR-036) ─────────────────────────────────
         // _fuse_mount_handles keeps FUSE mounts alive for the container's lifetime.
         // Dropping the handles triggers unmount, so they must outlive the container.
-        let (host_config, _fuse_mount_handles) = {
+        let (host_config, _fuse_mount_handles, grpc_mounted_volumes) = {
             let mut return_fuse_handles: Vec<crate::infrastructure::fuse::daemon::FuseMountHandle> =
                 Vec::new();
             let readonly_rootfs = config.read_only_root_filesystem;
@@ -654,7 +654,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                 }
             }
 
-            (hc, return_fuse_handles)
+            (hc, return_fuse_handles, grpc_mounted_volumes)
         };
 
         // ─── 4. Build env vars ────────────────────────────────────────────────
