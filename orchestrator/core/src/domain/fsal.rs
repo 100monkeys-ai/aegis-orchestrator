@@ -883,8 +883,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "write",
                     caller_node_id,
@@ -923,8 +927,12 @@ impl AegisFSAL {
         if emit_event {
             self.event_publisher
                 .publish_storage_event(StorageEvent::FileCreated {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     path: path_str.to_string(),
                     created_at: Utc::now(),
@@ -994,8 +1002,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_read_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "read",
                     caller_node_id,
@@ -1017,8 +1029,12 @@ impl AegisFSAL {
         // 6. Publish event
         self.event_publisher
             .publish_storage_event(StorageEvent::DirectoryListed {
-                execution_id: Some(execution_id),
-                workflow_execution_id: None,
+                execution_id: if workflow_execution_id.is_some() {
+                    None
+                } else {
+                    Some(execution_id)
+                },
+                workflow_execution_id,
                 volume_id,
                 path: path_str.to_string(),
                 entry_count: entries.len(),
@@ -1056,8 +1072,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "write",
                     caller_node_id,
@@ -1079,8 +1099,12 @@ impl AegisFSAL {
         // 6. Publish event
         self.event_publisher
             .publish_storage_event(StorageEvent::FileCreated {
-                execution_id: Some(execution_id),
-                workflow_execution_id: None,
+                execution_id: if workflow_execution_id.is_some() {
+                    None
+                } else {
+                    Some(execution_id)
+                },
+                workflow_execution_id,
                 volume_id,
                 path: path_str.to_string(),
                 created_at: Utc::now(),
@@ -1117,8 +1141,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "delete",
                     caller_node_id,
@@ -1140,8 +1168,12 @@ impl AegisFSAL {
         // 6. Publish event
         self.event_publisher
             .publish_storage_event(StorageEvent::FileDeleted {
-                execution_id: Some(execution_id),
-                workflow_execution_id: None,
+                execution_id: if workflow_execution_id.is_some() {
+                    None
+                } else {
+                    Some(execution_id)
+                },
+                workflow_execution_id,
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
@@ -1178,8 +1210,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "delete",
                     caller_node_id,
@@ -1201,8 +1237,12 @@ impl AegisFSAL {
         // 6. Publish event
         self.event_publisher
             .publish_storage_event(StorageEvent::FileDeleted {
-                execution_id: Some(execution_id),
-                workflow_execution_id: None,
+                execution_id: if workflow_execution_id.is_some() {
+                    None
+                } else {
+                    Some(execution_id)
+                },
+                workflow_execution_id,
                 volume_id,
                 path: path_str.to_string(),
                 deleted_at: Utc::now(),
@@ -1242,8 +1282,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, from_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "write",
                     caller_node_id,
@@ -1258,8 +1302,12 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, to_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: Some(execution_id),
-                    workflow_execution_id: None,
+                    execution_id: if workflow_execution_id.is_some() {
+                        None
+                    } else {
+                        Some(execution_id)
+                    },
+                    workflow_execution_id,
                     volume_id,
                     operation: "write",
                     caller_node_id,
@@ -1282,8 +1330,12 @@ impl AegisFSAL {
         // 6. Publish event (reuse FileCreated for rename target)
         self.event_publisher
             .publish_storage_event(StorageEvent::FileCreated {
-                execution_id: Some(execution_id),
-                workflow_execution_id: None,
+                execution_id: if workflow_execution_id.is_some() {
+                    None
+                } else {
+                    Some(execution_id)
+                },
+                workflow_execution_id,
                 volume_id,
                 path: to_str.to_string(),
                 created_at: Utc::now(),
