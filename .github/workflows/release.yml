@@ -168,15 +168,7 @@ jobs:
 
       - name: Generate checksums
         run: |
-          cd artifacts
-          for dir in */; do
-            cd "$dir"
-            for file in *.tar.gz; do
-              sha256sum "$file" > "$file.sha256"
-            done
-            cd ..
-          done
-          cd ..
+          find artifacts -name '*.tar.gz' -exec sh -c 'sha256sum "$1" > "$1.sha256"' _ {} \;
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
