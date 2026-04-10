@@ -154,9 +154,18 @@ impl FuseMountService for FuseMountServiceImpl {
                 .cloned()
                 .collect();
             let count = keys_to_remove.len();
+            // Collect mountpoints before dropping handles
+            let mountpoints: Vec<String> = keys_to_remove
+                .iter()
+                .filter_map(|k| handles.get(k).map(|h| h.mountpoint().to_string()))
+                .collect();
             for key in &keys_to_remove {
                 // Dropping the FuseMountHandle triggers the actual unmount.
                 handles.remove(key);
+            }
+            // Clean up empty mount directories
+            for mp in &mountpoints {
+                let _ = std::fs::remove_dir(mp);
             }
             if count > 0 {
                 info!(
@@ -177,7 +186,10 @@ impl FuseMountService for FuseMountServiceImpl {
 
         let key = mount_key(&req.execution_id, &req.volume_id);
 
-        let removed = self.handles.write().await.remove(&key);
+        let mut handles = self.handles.write().await;
+        let mountpoint = handles.get(&key).map(|h| h.mountpoint().to_string());
+        let removed = handles.remove(&key);
+        drop(handles);
         let unmounted = removed.is_some();
 
         if unmounted {
@@ -186,6 +198,12 @@ impl FuseMountService for FuseMountServiceImpl {
                 execution_id = %req.execution_id,
                 "FUSE mount removed via gRPC"
             );
+            // Dropping the FuseMountHandle triggers the actual unmount.
+            // Clean up the empty mount directory.
+            drop(removed);
+            if let Some(mp) = mountpoint {
+                let _ = std::fs::remove_dir(&mp);
+            }
         } else {
             warn!(
                 volume_id = %req.volume_id,
@@ -194,7 +212,6 @@ impl FuseMountService for FuseMountServiceImpl {
             );
         }
 
-        // Dropping the FuseMountHandle triggers the actual unmount.
         Ok(Response::new(FuseUnmountResponse { unmounted }))
     }
 }
@@ -224,6 +241,35 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             // Ensure mount prefix directory exists
             std::fs::create_dir_all(&mount_prefix)
                 .context("Failed to create mount prefix directory")?;
+
+            // Clean up stale FUSE mounts from previous daemon instances
+            info!("Cleaning up stale FUSE mounts in {}", mount_prefix);
+            if let Ok(entries) = std::fs::read_dir(&mount_prefix) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() {
+                        // Lazy unmount (best-effort) — try fusermount first, fall back to umount
+                        let fusermount_result = std::process::Command::new("fusermount")
+                            .args(["-uz", &path.to_string_lossy()])
+                            .output();
+                        if fusermount_result.is_err() {
+                            let _ = std::process::Command::new("umount")
+                                .args(["-l", &path.to_string_lossy()])
+                                .output();
+                        }
+                        // Remove empty directory
+                        match std::fs::remove_dir(&path) {
+                            Ok(()) => {
+                                info!(path = %path.display(), "Reaped stale FUSE mount directory")
+                            }
+                            Err(_) => warn!(
+                                path = %path.display(),
+                                "Could not remove FUSE mount directory (may still be in use)"
+                            ),
+                        }
+                    }
+                }
+            }
 
             // Start FuseMountService gRPC server
             let addr = listen_addr.parse().context("Invalid listen address")?;
