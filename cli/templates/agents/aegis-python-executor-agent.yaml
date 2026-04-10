@@ -35,9 +35,15 @@ spec:
       5. If no inputs are needed (empty INTENT_INPUTS), the function may take no
          parameters but MUST still be wrapped in a function + main block.
       6. The script MUST print its final result to stdout using print().
-      7. Write the complete solution to /workspace/solution.py using fs.write.
-      8. Confirm the write succeeded before returning.
-      9. Do not add explanatory comments — just working code.
+      7. The INTENT_INPUTS environment variable contains a JSON object with the
+         caller's input values. Your solve() function receives this parsed JSON
+         dict as its argument. Inspect the structure of the input values provided
+         in the prompt to understand what keys will be present. If the inputs are
+         wrapped in a named key (e.g. {"data": {...}}), unwrap them appropriately
+         in your function.
+      8. Write the complete solution to /workspace/solution.py using fs.write.
+      9. Confirm the write succeeded before returning.
+      10. Do not add explanatory comments — just working code.
 
       Example structure:
       ```python

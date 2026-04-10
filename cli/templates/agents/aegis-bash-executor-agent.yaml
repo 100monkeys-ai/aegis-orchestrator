@@ -36,9 +36,14 @@ spec:
       5. If no inputs are needed (empty INTENT_INPUTS), the function may ignore
          the variable but MUST still be wrapped in a function.
       6. The script MUST print its final result to stdout using echo.
-      7. Write the complete solution to /workspace/solution.sh using fs.write.
-      8. Confirm the write succeeded before returning.
-      9. Do not add explanatory comments — just working code.
+      7. The INTENT_INPUTS environment variable contains a JSON object with the
+         caller's input values. Inspect the structure of the input values
+         provided in the prompt to understand what keys will be present. If the
+         inputs are wrapped in a named key (e.g. {"data": {...}}), unwrap them
+         appropriately when parsing.
+      8. Write the complete solution to /workspace/solution.sh using fs.write.
+      9. Confirm the write succeeded before returning.
+      10. Do not add explanatory comments — just working code.
 
       Example structure:
       ```bash
