@@ -1011,6 +1011,7 @@ mod tests {
             _: &str,
             _: u32,
             _: u32,
+            _: Option<uuid::Uuid>,
         ) -> Result<FileAttributes, FsalError> {
             unimplemented!("stub")
         }
@@ -1030,6 +1031,7 @@ mod tests {
             _: VolumeId,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<Vec<DirEntry>, FsalError> {
             unimplemented!("stub")
         }
@@ -1062,6 +1064,7 @@ mod tests {
             _: VolumeId,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<AegisFileHandle, FsalError> {
             unimplemented!("stub")
         }
@@ -1072,6 +1075,7 @@ mod tests {
             _: VolumeId,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<(), FsalError> {
             unimplemented!("stub")
         }
@@ -1082,6 +1086,7 @@ mod tests {
             _: VolumeId,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<(), FsalError> {
             unimplemented!("stub")
         }
@@ -1092,6 +1097,7 @@ mod tests {
             _: VolumeId,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<(), FsalError> {
             unimplemented!("stub")
         }
@@ -1103,6 +1109,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &FsalAccessPolicy,
+            _: Option<uuid::Uuid>,
         ) -> Result<(), FsalError> {
             unimplemented!("stub")
         }

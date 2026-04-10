@@ -263,6 +263,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &policy,
                 Some(caller_node_id),
                 Some(self.host_node_id),
+                None,
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -288,6 +289,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &policy,
                 Some(caller_node_id),
                 Some(self.host_node_id),
+                None,
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
