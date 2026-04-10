@@ -9,10 +9,19 @@
 //! ## Wire Format
 //!
 //! ```text
-//! AegisFileHandle { execution_id: Uuid (16B), volume_id: Uuid (16B), path_hash: u64 (8B) }
-//!   └── bincode::serialize  →  ~44 bytes raw + ~4 bytes length prefix  =  ~48 bytes total
-//!                                                    OK: 48 ≤ 64  ✓
+//! AegisFileHandle {
+//!   execution_context: HandleExecutionContext  →  4B tag + 16B UUID  = 20B
+//!   volume_id: Uuid                            →  16B (fixed)
+//!   path_hash: u64                             →  8B
+//!   created_at: i64                            →  8B
+//! }
+//!   └── bincode_handle_options().serialize  →  52 bytes total   OK: 52 ≤ 64  ✓
 //! ```
+//!
+//! `bincode_handle_options()` uses `with_fixint_encoding()` to eliminate the
+//! 8-byte varint length prefixes that the default bincode encoding adds to
+//! `uuid::Uuid` fields (via its serde seq impl), which would push the total to
+//! 68 bytes — 4 bytes over the NFSv3 hard limit.
 //!
 //! The 64-byte constraint means we **cannot** store the full path in the handle —
 //! only a hash. The server performs a hash→inode lookup in the FSAL layer to
@@ -29,7 +38,8 @@
 //! - **Layer:** Infrastructure Layer
 //! - **Bounded Context:** BC-7 Storage Gateway
 
-use crate::domain::fsal::AegisFileHandle;
+use crate::domain::fsal::{bincode_handle_options, AegisFileHandle};
+use bincode::Options;
 use thiserror::Error;
 
 /// Errors arising from NFS FileHandle serialization/deserialization.
@@ -70,8 +80,9 @@ pub enum FileHandleError {
 /// - [`FileHandleError::Serialization`] — bincode encountered an unexpected type.
 /// - [`FileHandleError::TooLarge`] — encoded size exceeds 64 bytes.
 pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandleError> {
-    let bytes =
-        bincode::serialize(handle).map_err(|e| FileHandleError::Serialization(e.to_string()))?;
+    let bytes = bincode_handle_options()
+        .serialize(handle)
+        .map_err(|e| FileHandleError::Serialization(e.to_string()))?;
 
     if bytes.len() > 64 {
         return Err(FileHandleError::TooLarge { size: bytes.len() });
@@ -91,7 +102,9 @@ pub fn encode_file_handle(handle: &AegisFileHandle) -> Result<Vec<u8>, FileHandl
 /// [`FileHandleError::Deserialization`] if the bytes are corrupt or the type
 /// layout has changed since the handle was created.
 pub fn decode_file_handle(bytes: &[u8]) -> Result<AegisFileHandle, FileHandleError> {
-    bincode::deserialize(bytes).map_err(|e| FileHandleError::Deserialization(e.to_string()))
+    bincode_handle_options()
+        .deserialize(bytes)
+        .map_err(|e| FileHandleError::Deserialization(e.to_string()))
 }
 
 #[cfg(test)]
@@ -111,6 +124,24 @@ mod tests {
         let decoded = decode_file_handle(&bytes).unwrap();
 
         assert_eq!(original, decoded);
+    }
+
+    /// Regression test: default bincode encoding adds 8-byte varint length prefixes to
+    /// `uuid::Uuid` fields, producing 68 bytes — 4 bytes over the NFSv3 64-byte limit.
+    /// `with_fixint_encoding()` eliminates those prefixes, yielding exactly 52 bytes:
+    ///   enum tag (4B) + UUID (16B) + volume_id UUID (16B) + path_hash u64 (8B) + created_at i64 (8B)
+    #[test]
+    fn test_encode_file_handle_serializes_to_52_bytes() {
+        let handle =
+            AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/test.txt");
+
+        let bytes = encode_file_handle(&handle).unwrap();
+        assert_eq!(
+            bytes.len(),
+            52,
+            "encode_file_handle must produce exactly 52 bytes with fixint encoding; got {} bytes",
+            bytes.len()
+        );
     }
 
     /// Regression test: two separate `Option<Uuid>` fields serialized to 66 bytes
