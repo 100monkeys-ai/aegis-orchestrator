@@ -48,7 +48,7 @@ pub enum FuseDaemonCommand {
         mount_prefix: String,
 
         /// Address to listen on for FuseMountService gRPC
-        #[arg(long, default_value = "0.0.0.0:50052")]
+        #[arg(long, default_value = "0.0.0.0:50053")]
         listen_addr: String,
     },
 
