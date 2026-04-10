@@ -1499,7 +1499,8 @@ mod tests {
         let exec_id = ExecutionId::new();
         let vol_id = VolumeId::new();
         let event = StorageEvent::FileOpened {
-            execution_id: exec_id,
+            execution_id: Some(exec_id),
+            workflow_execution_id: None,
             volume_id: vol_id,
             path: "/workspace/file.txt".to_string(),
             open_mode: "read".to_string(),
@@ -1526,7 +1527,8 @@ mod tests {
     #[test]
     fn test_storage_event_quota_exceeded_serialization() {
         let event = StorageEvent::QuotaExceeded {
-            execution_id: ExecutionId::new(),
+            execution_id: Some(ExecutionId::new()),
+            workflow_execution_id: None,
             volume_id: VolumeId::new(),
             requested_bytes: 1024,
             available_bytes: 0,

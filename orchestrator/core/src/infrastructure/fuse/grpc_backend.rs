@@ -120,7 +120,11 @@ impl FsalBackend for GrpcFsalBackend {
             .client
             .clone()
             .lookup(FsalLookupRequest {
-                execution_id: handle.execution_id.0.to_string(),
+                execution_id: handle
+                    .execution_id
+                    .as_ref()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
                 volume_id: handle.volume_id.0.to_string(),
                 parent_path: parent_path.to_string(),
                 name: name.to_string(),
@@ -174,7 +178,11 @@ impl FsalBackend for GrpcFsalBackend {
             .client
             .clone()
             .read(FsalReadRequest {
-                execution_id: handle.execution_id.0.to_string(),
+                execution_id: handle
+                    .execution_id
+                    .as_ref()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
                 volume_id: handle.volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
@@ -200,7 +208,11 @@ impl FsalBackend for GrpcFsalBackend {
             .client
             .clone()
             .write(FsalWriteRequest {
-                execution_id: handle.execution_id.0.to_string(),
+                execution_id: handle
+                    .execution_id
+                    .as_ref()
+                    .map(|id| id.0.to_string())
+                    .unwrap_or_default(),
                 volume_id: handle.volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
