@@ -32,11 +32,30 @@ use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
 use anyhow::anyhow;
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
+
+// ============================================================================
+// Command types
+// ============================================================================
+
+/// Command object for [`CredentialManagementService::store_api_key`].
+///
+/// Bundles all parameters to keep the method signature within clippy's
+/// `too_many_arguments` limit (max 7).
+#[derive(Debug)]
+pub struct StoreApiKeyCommand {
+    pub owner_user_id: String,
+    pub tenant_id: TenantId,
+    pub provider: CredentialProvider,
+    pub label: String,
+    pub scope: CredentialScope,
+    pub api_key_value: SensitiveString,
+    pub tags: Option<serde_json::Value>,
+}
 
 // ============================================================================
 // Return type for OAuth initiation
@@ -68,16 +87,7 @@ pub trait CredentialManagementService: Send + Sync {
     /// Store an API key in OpenBao and create a new [`UserCredentialBinding`].
     ///
     /// Returns the [`CredentialBindingId`] of the newly created binding.
-    async fn store_api_key(
-        &self,
-        owner_user_id: &str,
-        tenant_id: &TenantId,
-        provider: CredentialProvider,
-        label: String,
-        scope: CredentialScope,
-        api_key_value: SensitiveString,
-        tags: Option<serde_json::Value>,
-    ) -> anyhow::Result<CredentialBindingId>;
+    async fn store_api_key(&self, cmd: StoreApiKeyCommand) -> anyhow::Result<CredentialBindingId>;
 
     /// Begin an OAuth2 PKCE authorisation flow for `provider`.
     ///
@@ -203,18 +213,18 @@ impl CredentialManagementService for StandardCredentialManagementService {
     // store_api_key
     // -----------------------------------------------------------------------
 
-    async fn store_api_key(
-        &self,
-        owner_user_id: &str,
-        tenant_id: &TenantId,
-        provider: CredentialProvider,
-        label: String,
-        scope: CredentialScope,
-        api_key_value: SensitiveString,
-        tags: Option<serde_json::Value>,
-    ) -> anyhow::Result<CredentialBindingId> {
+    async fn store_api_key(&self, cmd: StoreApiKeyCommand) -> anyhow::Result<CredentialBindingId> {
+        let StoreApiKeyCommand {
+            owner_user_id,
+            tenant_id,
+            provider,
+            label,
+            scope,
+            api_key_value,
+            tags,
+        } = cmd;
         let binding_id = CredentialBindingId::new();
-        let secret_path = user_credential_path(tenant_id, owner_user_id, &binding_id);
+        let secret_path = user_credential_path(&tenant_id, &owner_user_id, &binding_id);
 
         // Write the raw API key to OpenBao under the binding's path.
         let mut secret_data = HashMap::new();

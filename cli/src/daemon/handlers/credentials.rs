@@ -25,6 +25,7 @@
 //! `CredentialManagementService` and `SecretsManager`.
 
 use crate::daemon::state::AppState;
+use aegis_orchestrator_core::application::credential_service::StoreApiKeyCommand;
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
     CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, GrantTarget,
@@ -33,10 +34,10 @@ use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use axum::{
-    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
+    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -385,15 +386,15 @@ pub(crate) async fn store_api_key_handler(
     };
 
     match svc
-        .store_api_key(
-            &user_id,
-            &tenant_id,
+        .store_api_key(StoreApiKeyCommand {
+            owner_user_id: user_id,
+            tenant_id,
             provider,
-            payload.label,
+            label: payload.label,
             scope,
-            SensitiveString::new(&payload.value),
-            payload.tags,
-        )
+            api_key_value: SensitiveString::new(&payload.value),
+            tags: payload.tags,
+        })
         .await
     {
         Ok(binding_id) => (
