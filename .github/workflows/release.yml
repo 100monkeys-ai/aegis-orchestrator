@@ -75,60 +75,60 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  build-macos:
-    name: Build macOS (Apple Silicon)
-    runs-on: macos-latest
-    
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          path: aegis-orchestrator
-
-      - uses: actions/checkout@v6
-        with:
-          repository: 100monkeys-ai/aegis-proto
-          path: aegis-proto
-
-      - name: Install dependencies
-        run: |
-          brew install protobuf
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-apple-darwin
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: aegis-orchestrator -> target
-
-      - name: Build release binary
-        working-directory: aegis-orchestrator
-        run: |
-          cargo build --release --bin aegis --locked --target aarch64-apple-darwin
-
-      - name: Create tarball
-        working-directory: aegis-orchestrator
-        run: |
-          cd target/aarch64-apple-darwin/release
-          tar -czf aegis-macos-aarch64.tar.gz aegis
-          cd ../../..
-          mv target/aarch64-apple-darwin/release/aegis-macos-aarch64.tar.gz .
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: aegis-macos-aarch64
-          path: aegis-orchestrator/aegis-macos-aarch64.tar.gz
-          if-no-files-found: error
-          retention-days: 1
-
-
+  # build-macos:
+  #   name: Build macOS (Apple Silicon)
+  #   # Disabled: fuser crate requires macFUSE (kernel extension) which cannot be installed
+  #   # in CI without a reboot. Re-enable once fuser dependency is gated to linux only.
+  #   runs-on: macos-latest
+  #
+  #   steps:
+  #     - uses: actions/checkout@v6
+  #       with:
+  #         path: aegis-orchestrator
+  #
+  #     - uses: actions/checkout@v6
+  #       with:
+  #         repository: 100monkeys-ai/aegis-proto
+  #         path: aegis-proto
+  #
+  #     - name: Install dependencies
+  #       run: |
+  #         brew install protobuf
+  #
+  #     - name: Install Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
+  #       with:
+  #         targets: aarch64-apple-darwin
+  #
+  #     - name: Cache cargo registry & build
+  #       uses: Swatinem/rust-cache@v2
+  #       with:
+  #         workspaces: aegis-orchestrator -> target
+  #
+  #     - name: Build release binary
+  #       working-directory: aegis-orchestrator
+  #       run: |
+  #         cargo build --release --bin aegis --locked --target aarch64-apple-darwin
+  #
+  #     - name: Create tarball
+  #       working-directory: aegis-orchestrator
+  #       run: |
+  #         cd target/aarch64-apple-darwin/release
+  #         tar -czf aegis-macos-aarch64.tar.gz aegis
+  #         cd ../../..
+  #         mv target/aarch64-apple-darwin/release/aegis-macos-aarch64.tar.gz .
+  #
+  #     - name: Upload artifact
+  #       uses: actions/upload-artifact@v7
+  #       with:
+  #         name: aegis-macos-aarch64
+  #         path: aegis-orchestrator/aegis-macos-aarch64.tar.gz
+  #         if-no-files-found: error
+  #         retention-days: 1
 
   create-release:
     name: Create GitHub Release
-    needs: [build-linux, build-macos]
+    needs: [build-linux]
     runs-on: ubuntu-latest
     
     steps:
@@ -189,7 +189,5 @@ jobs:
           files: |
             artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz
             artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz.sha256
-            artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz
-            artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
