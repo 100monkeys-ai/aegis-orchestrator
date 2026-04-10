@@ -1859,6 +1859,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 discovery_service: discovery_service.clone(),
                 volume_service: Some(volume_service_for_grpc),
                 output_handler_service: Some(output_handler_service),
+                fsal: Some(nfs_gateway.fsal().clone()),
             },
         )
         .await

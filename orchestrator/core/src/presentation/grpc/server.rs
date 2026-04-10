@@ -1626,6 +1626,8 @@ pub struct GrpcServerConfig {
     /// Optional output handler service for post-execution egress dispatch (ADR-103).
     pub output_handler_service:
         Option<Arc<dyn crate::application::output_handler_service::OutputHandlerService>>,
+    /// FSAL instance for the FsalService gRPC endpoint used by the external FUSE daemon (ADR-107).
+    pub fsal: Option<Arc<crate::domain::fsal::AegisFSAL>>,
 }
 
 pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -1671,11 +1673,15 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 
     tracing::info!("Starting AEGIS gRPC server on {}", config.addr);
 
-    tonic::transport::Server::builder()
+    let mut builder = tonic::transport::Server::builder()
         .layer(GrpcMetricsLayer)
-        .add_service(server)
-        .serve(config.addr)
-        .await?;
+        .add_service(server);
+
+    if let Some(fsal) = config.fsal {
+        builder = builder.add_service(FsalServiceServer::new(FsalGrpcService::new(fsal)));
+    }
+
+    builder.serve(config.addr).await?;
 
     Ok(())
 }
@@ -1686,7 +1692,9 @@ pub async fn start_grpc_server(config: GrpcServerConfig) -> Result<(), Box<dyn s
 // AegisFSAL instance, preserving identical authorization and audit semantics.
 // =============================================================================
 
-use crate::infrastructure::aegis_runtime_proto::fsal_service_server::FsalService as FsalServiceTrait;
+use crate::infrastructure::aegis_runtime_proto::fsal_service_server::{
+    FsalService as FsalServiceTrait, FsalServiceServer,
+};
 use crate::infrastructure::aegis_runtime_proto::{
     FsalCreateFileRequest as ProtoCreateFileReq, FsalCreateFileResponse, FsalDirEntry,
     FsalGetattrRequest as ProtoGetattrReq, FsalGetattrResponse,
@@ -2490,6 +2498,7 @@ mod tests {
             discovery_service: None,
             volume_service: None,
             output_handler_service: None,
+            fsal: None,
         };
 
         assert!(
@@ -2752,5 +2761,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Regression: FsalGrpcService was defined but never registered with the tonic
+    /// server. The FUSE daemon connected to the orchestrator's FsalService endpoint
+    /// and received connection refused, preventing volume mounts for ContainerStep
+    /// executions. GrpcServerConfig must expose a `fsal` field so that
+    /// start_grpc_server can register FsalServiceServer when it is Some.
+    #[test]
+    fn test_grpc_server_config_includes_fsal_field() {
+        let execution_service: Arc<dyn ExecutionService> = Arc::new(TestExecutionService {
+            execution_id: ExecutionId::new(),
+            stream_events: Vec::new(),
+            persisted_execution: None,
+            tenant_lookups: Mutex::new(Vec::new()),
+        });
+        let validation_service = test_validation_service(execution_service.clone());
+
+        // Constructing GrpcServerConfig with fsal: None must compile and the field
+        // must be accessible. This proves the field exists on the struct.
+        let config = GrpcServerConfig {
+            addr: "127.0.0.1:0".parse().unwrap(),
+            execution_service,
+            validation_service,
+            grpc_auth: None,
+            attestation_service: None,
+            tool_invocation_service: None,
+            cortex_client: None,
+            run_container_step_use_case: None,
+            agent_service: None,
+            stimulus_service: None,
+            discovery_service: None,
+            volume_service: None,
+            output_handler_service: None,
+            fsal: None,
+        };
+        assert!(
+            config.fsal.is_none(),
+            "GrpcServerConfig.fsal must be accessible and must be None when not provided"
+        );
     }
 }
