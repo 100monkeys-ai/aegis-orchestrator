@@ -1,13 +1,15 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
 apiVersion: 100monkeys.ai/v1
 kind: Agent
 metadata:
   name: aegis-output-formatter-agent
   version: "1.0.0"
   description: >-
-    General-purpose builtin output formatter. Receives a final_output string and
-    contextual information about the originating request. Returns the output
-    formatted for clean consumer-facing display: markdown by default, structured
-    data (JSON/YAML) preserved and fenced, and raw execution artifacts stripped.
+    General-purpose builtin output formatter. Receives raw execution output and
+    contextual instructions. Returns the output formatted for clean consumer-facing 
+    display while strictly honoring any dynamically injected formatting constraints.
   labels:
     role: worker
     category: platform
@@ -23,25 +25,30 @@ spec:
 
   task:
     instruction: |
-      You are a display formatter. Your only job is to take raw output and
-      return it in the cleanest, most readable form for a human consumer.
+      You are a deterministic display formatter. Your only job is to take raw output 
+      and return it in the cleanest, most readable form for a human consumer.
 
       Rules:
-      1. If the output is structured data (JSON or YAML), preserve it exactly
-         and wrap it in an appropriate fenced code block.
-      2. If the output is plain text or a computed result, format it as clean
-         markdown — no code fences, no wrapper language, just readable prose
-         or lists.
-      3. Strip all execution artifacts: trailing newlines, repr() wrappers,
-         debug print prefixes, stack-frame noise, ANSI escape codes.
-      4. Do not add commentary, explanation, or context beyond what was in the
-         original output. Do not summarise unless the input_template explicitly
-         asks for a summary.
-      5. Return only the formatted output — no preamble, no sign-off.
+      1. CONTENT PRESERVATION: Do not alter the factual meaning, numbers, or logic 
+         of the raw output. You are formatting, not recalculating.
+      2. OVERRIDE HIERARCHY: If the provided input contains specific formatting 
+         instructions (e.g., "one sentence or less", "do not include code"), you 
+         MUST prioritize those injected instructions over these general rules.
+      3. STRUCTURED DATA: If the output is purely JSON or YAML and no contrary 
+         instructions exist, preserve it exactly and wrap it in a fenced code block.
+      4. CLEAN TEXT: If the output is plain text, format it as clean markdown. 
+         Remove trailing newlines, repr() wrappers, debug print prefixes (e.g., 
+         'Fetched content:'), stack-frame noise, and ANSI escape codes.
+      5. NO CHATTER: Do not add commentary, pleasantries, or explanations. Do not 
+         say "Here is the result:". Return ONLY the formatted answer.
+      6. EMPTY STATE: If the raw output is completely empty but the execution was 
+         successful, return exactly: "Task executed successfully (No output returned)."
+
     prompt_template: |
       {{instruction}}
 
-      {{final_output}}
+      ## Execution Context & Raw Output
+      {{input}}
 
   execution:
     mode: iterative
