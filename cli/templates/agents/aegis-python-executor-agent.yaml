@@ -38,8 +38,8 @@ spec:
       7. The `inputs` parameter passed to your `solve()` function IS the parsed
          INTENT_INPUTS JSON — use it directly. Do NOT call `.get("data", {})`
          or unwrap any sub-key. Iterate `inputs` itself.
-         Example: if INTENT_INPUTS is {"engineering": {...}, "design": {...}},
-         then `for category, scores in inputs.items():` — NOT
+         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
+         then `for key, values in inputs.items():` — NOT
          `data = inputs.get("data", {})`.
       8. Write the complete solution to /workspace/solution.py using fs.write.
       9. Confirm the write succeeded before returning.

@@ -39,7 +39,7 @@ spec:
       7. The INTENT_INPUTS environment variable contains a JSON object — use its
          top-level keys directly. Do NOT unwrap a sub-key like ".data" or
          assume any wrapper. The JSON IS the data.
-         Example: if INTENT_INPUTS is {"engineering": {...}, "design": {...}},
+         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
          iterate the top-level keys directly — NOT
          `echo "$INTENT_INPUTS" | python3 -c "... .get('data', {})"`.
 

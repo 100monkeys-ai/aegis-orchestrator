@@ -39,8 +39,8 @@ spec:
       7. The `inputs` parameter passed to your `solve()` function IS the parsed
          INTENT_INPUTS JSON — use it directly. Do NOT access `inputs.data` or
          unwrap any sub-key. Iterate `inputs` itself.
-         Example: if INTENT_INPUTS is {"engineering": {...}, "design": {...}},
-         then `for (const [category, scores] of Object.entries(inputs))` — NOT
+         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
+         then `for (const [key, values] of Object.entries(inputs))` — NOT
          `const data = inputs.data || {}`.
       8. Write the complete solution to /workspace/solution.js using fs.write.
       9. Confirm the write succeeded before returning.
