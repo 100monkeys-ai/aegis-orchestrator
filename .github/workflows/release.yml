@@ -179,9 +179,9 @@ jobs:
           prerelease: ${{ env.FORCE_PRERELEASE == 'true' || steps.version.outputs.IS_PRERELEASE == 'true' }}
           generate_release_notes: true
           files: |
-            artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz
-            artifacts/aegis-linux-x86_64/aegis-linux-x86_64.tar.gz.sha256
-            # artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz
-            # artifacts/aegis-macos-aarch64/aegis-macos-aarch64.tar.gz.sha256
+            artifacts/aegis-linux-x86_64.tar.gz
+            artifacts/aegis-linux-x86_64.tar.gz.sha256
+            # artifacts/aegis-macos-aarch64.tar.gz
+            # artifacts/aegis-macos-aarch64.tar.gz.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
