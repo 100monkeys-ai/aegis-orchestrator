@@ -94,6 +94,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
                 feedback: None,
             }],
             timeout: None,
+            max_state_visits: None,
         },
     );
     states.insert(
@@ -106,6 +107,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             },
             transitions: vec![],
             timeout: None,
+            max_state_visits: None,
         },
     );
 
@@ -125,6 +127,7 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         },
     )
     .unwrap()
