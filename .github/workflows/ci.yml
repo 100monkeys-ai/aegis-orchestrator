@@ -117,3 +117,42 @@ jobs:
       - name: Run tests
         working-directory: aegis-orchestrator
         run: cargo test --workspace --locked
+
+  package:
+    name: Package verification
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: aegis-orchestrator
+
+      - uses: actions/checkout@v6
+        with:
+          repository: 100monkeys-ai/aegis-proto
+          path: aegis-proto
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry & build
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: aegis-orchestrator -> target
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y protobuf-compiler libfuse3-dev
+
+      - name: Prepare proto files for packaging
+        working-directory: aegis-orchestrator
+        run: |
+          mkdir -p orchestrator/core/proto-vendor/aegis
+          if [ ! -f orchestrator/core/proto-vendor/aegis/orchestrator.proto ]; then
+            cp ../aegis-proto/proto/orchestrator.proto orchestrator/core/proto-vendor/aegis/orchestrator.proto
+          fi
+
+      - name: Verify package includes all required files
+        working-directory: aegis-orchestrator/orchestrator/core
+        run: cargo package --no-verify --locked --allow-dirty
