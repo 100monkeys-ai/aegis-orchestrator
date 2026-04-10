@@ -1363,6 +1363,7 @@ async fn workflow_run_tool_forwards_blackboard() {
                 "blackboard": { "priority": "high" },
             }),
             &operator_context,
+            None,
         )
         .await
         .expect("workflow run should return a result");
@@ -2417,6 +2418,7 @@ async fn task_execute_with_version_on_name_lookup_uses_versioned_resolution() {
                 "input": { "task": "hello" },
             }),
             &context,
+            None,
         )
         .await
         .expect("should return a direct result");
@@ -2458,6 +2460,7 @@ async fn task_execute_with_version_on_name_lookup_returns_not_found_for_wrong_ve
                 "input": {},
             }),
             &context,
+            None,
         )
         .await
         .expect("should return a direct result");
@@ -2498,6 +2501,7 @@ async fn task_execute_with_version_on_uuid_returns_error() {
                 "input": {},
             }),
             &context,
+            None,
         )
         .await
         .expect("should return a direct result");
@@ -2575,6 +2579,7 @@ async fn workflow_run_with_version_passes_version_through() {
                 "input": { "task": "demo" },
             }),
             &operator_context,
+            None,
         )
         .await
         .expect("workflow run should return a result");
