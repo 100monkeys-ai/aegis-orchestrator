@@ -93,6 +93,7 @@ spec:
       intent: "Validate /workspace/solution.{{input.language_ext}}"
       input: |
         File: /workspace/solution.{{input.language_ext}}
+        Read /workspace/solution.{{input.language_ext}} using fs.read and validate it.
         Language: {{input.language}}
         INTENT_INPUTS: {{input.inputs_json}}
       transitions:

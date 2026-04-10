@@ -81,11 +81,10 @@ spec:
     prompt_template: |
       {{instruction}}
 
-      ## File to validate:
-      Read the file at {{intent}} using fs.read NOW, then validate it.
-
       ## Input context:
       {{input}}
+
+      YOUR FIRST ACTION: call fs.read with path from the "File:" field above, then validate it.
 
   execution:
     mode: iterative
