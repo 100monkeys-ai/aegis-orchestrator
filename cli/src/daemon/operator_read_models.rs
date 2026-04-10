@@ -137,9 +137,13 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             execution_id,
             attempted_path,
             blocked_at,
+            workflow_execution_id: _,
         } => StorageViolationView {
             category: "path_traversal_blocked".to_string(),
-            execution_id: execution_id.0.to_string(),
+            execution_id: execution_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default(),
             volume_id: None,
             path: Some(attempted_path.clone()),
             operation: Some("path_traversal".to_string()),
@@ -156,7 +160,10 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             ..
         } => StorageViolationView {
             category: "filesystem_policy_violation".to_string(),
-            execution_id: execution_id.0.to_string(),
+            execution_id: execution_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default(),
             volume_id: Some(volume_id.0.to_string()),
             path: Some(path.clone()),
             operation: Some(operation.clone()),
@@ -172,7 +179,10 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             ..
         } => StorageViolationView {
             category: "quota_exceeded".to_string(),
-            execution_id: execution_id.0.to_string(),
+            execution_id: execution_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default(),
             volume_id: Some(volume_id.0.to_string()),
             path: None,
             operation: Some("quota".to_string()),
@@ -188,7 +198,10 @@ pub fn storage_violation_event_view(event: &StorageEvent) -> StorageViolationVie
             ..
         } => StorageViolationView {
             category: "unauthorized_volume_access".to_string(),
-            execution_id: execution_id.0.to_string(),
+            execution_id: execution_id
+                .as_ref()
+                .map(|id| id.0.to_string())
+                .unwrap_or_default(),
             volume_id: Some(volume_id.0.to_string()),
             path: None,
             operation: Some("access".to_string()),
