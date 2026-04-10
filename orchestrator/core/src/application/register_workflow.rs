@@ -143,6 +143,24 @@ impl RegisterWorkflowUseCase for StandardRegisterWorkflowUseCase {
         let mut workflow = WorkflowParser::parse_yaml(yaml_manifest)
             .map_err(|e| anyhow::anyhow!("Failed to parse workflow YAML manifest: {e}"))?;
 
+        // Validate max_total_transitions ceiling
+        if let Some(max_tt) = workflow.spec.max_total_transitions {
+            if !(1..=100).contains(&max_tt) {
+                anyhow::bail!("max_total_transitions must be between 1 and 100, got {max_tt}");
+            }
+        }
+
+        // Validate per-state max_state_visits ceiling
+        for (state_name, state) in &workflow.spec.states {
+            if let Some(max_sv) = state.max_state_visits {
+                if !(1..=20).contains(&max_sv) {
+                    anyhow::bail!(
+                        "max_state_visits for state '{state_name}' must be between 1 and 20, got {max_sv}"
+                    );
+                }
+            }
+        }
+
         // Set scope and tenant_id on the aggregate before any persistence or
         // serialization. The caller supplies the authoritative scope; the parsed
         // YAML default (Tenant / zaru-consumer) must never leak into domain_json.

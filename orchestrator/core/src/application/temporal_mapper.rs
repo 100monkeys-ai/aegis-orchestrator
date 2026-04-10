@@ -59,6 +59,11 @@ pub struct TemporalWorkflowDefinition {
     /// Visibility scope for this workflow definition (ADR-076).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope: Option<String>,
+
+    /// Maximum total state transitions before the workflow terminates.
+    /// Default: 50. Ceiling: 100.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_total_transitions: Option<u32>,
 }
 
 /// Individual state in Temporal workflow
@@ -169,6 +174,11 @@ pub struct TemporalWorkflowState {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_handler: Option<serde_json::Value>,
 
+    /// Maximum number of times this state can be visited in the FSM loop.
+    /// Default: 5. Ceiling: 20.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_state_visits: Option<u32>,
+
     // Transitions
     pub transitions: Vec<TemporalTransitionRule>,
 }
@@ -271,6 +281,7 @@ impl TemporalWorkflowMapper {
                 WorkflowScope::Global => "global".to_string(),
                 WorkflowScope::Tenant => "tenant".to_string(),
             }),
+            max_total_transitions: workflow.spec.max_total_transitions,
         })
     }
 
@@ -352,6 +363,7 @@ impl TemporalWorkflowMapper {
                     output_handler: output_handler
                         .as_ref()
                         .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+                    max_state_visits: state.max_state_visits,
                     transitions,
                 })
             }
@@ -399,6 +411,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_result_key: None,
                 subworkflow_input: None,
                 output_handler: None,
+                max_state_visits: state.max_state_visits,
                 transitions,
             }),
 
@@ -444,6 +457,7 @@ impl TemporalWorkflowMapper {
                 subworkflow_result_key: None,
                 subworkflow_input: None,
                 output_handler: None,
+                max_state_visits: state.max_state_visits,
                 transitions,
             }),
 
@@ -525,6 +539,7 @@ impl TemporalWorkflowMapper {
                     output_handler: output_handler
                         .as_ref()
                         .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+                    max_state_visits: state.max_state_visits,
                     transitions,
                 })
             }
@@ -601,6 +616,7 @@ impl TemporalWorkflowMapper {
                     output_handler: output_handler
                         .as_ref()
                         .map(|h| serde_json::to_value(h).unwrap_or(serde_json::Value::Null)),
+                    max_state_visits: state.max_state_visits,
                     transitions,
                 })
             }
@@ -654,6 +670,7 @@ impl TemporalWorkflowMapper {
                     subworkflow_result_key: None,
                     subworkflow_input: None,
                     output_handler: None,
+                    max_state_visits: state.max_state_visits,
                     transitions,
                 })
             }
@@ -716,6 +733,7 @@ impl TemporalWorkflowMapper {
                     // Output handler (ADR-103): Subworkflow states do not carry an output_handler
                     output_handler: None,
                     // Transitions
+                    max_state_visits: state.max_state_visits,
                     transitions,
                 })
             }
@@ -1019,6 +1037,7 @@ mod tests {
                     feedback: None,
                 }],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         states.insert(
@@ -1031,6 +1050,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
 
@@ -1048,6 +1068,7 @@ mod tests {
                 context: HashMap::new(),
                 states,
                 storage: Default::default(),
+                max_total_transitions: None,
             },
         )
         .unwrap();
@@ -1089,6 +1110,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
 
@@ -1106,6 +1128,7 @@ mod tests {
                 context: HashMap::new(),
                 states,
                 storage: Default::default(),
+                max_total_transitions: None,
             },
         )
         .unwrap();

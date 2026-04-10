@@ -98,6 +98,10 @@ pub struct WorkflowSpecYaml {
     /// Workflow-level storage configuration (WORKFLOW_MANIFEST_SPEC_V1 §spec.storage)
     #[serde(default)]
     pub storage: crate::domain::workflow::WorkflowStorageSpec,
+    /// Maximum total state transitions before the workflow terminates.
+    /// Default: 50. Ceiling: 100.
+    #[serde(default)]
+    pub max_total_transitions: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -109,6 +113,10 @@ pub struct WorkflowStateYaml {
     #[serde(with = "humantime_serde")]
     #[schemars(with = "Option<String>")]
     pub timeout: Option<std::time::Duration>,
+    /// Maximum number of times this state can be visited in the FSM loop
+    /// before the workflow terminates. Default: 5. Ceiling: 20.
+    #[serde(default)]
+    pub max_state_visits: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -398,6 +406,7 @@ impl WorkflowParser {
                     kind,
                     transitions,
                     timeout: state_yaml.timeout,
+                    max_state_visits: state_yaml.max_state_visits,
                 },
             );
         }
@@ -411,6 +420,7 @@ impl WorkflowParser {
             context: manifest.spec.context,
             states,
             storage: manifest.spec.storage,
+            max_total_transitions: manifest.spec.max_total_transitions,
         };
 
         // Create and validate workflow
@@ -652,6 +662,7 @@ impl WorkflowParser {
                         .map(Self::transition_to_yaml)
                         .collect(),
                     timeout: state.timeout,
+                    max_state_visits: state.max_state_visits,
                 },
             );
         }
@@ -661,6 +672,7 @@ impl WorkflowParser {
             context: workflow.spec.context.clone(),
             states,
             storage: workflow.spec.storage.clone(),
+            max_total_transitions: workflow.spec.max_total_transitions,
         };
 
         WorkflowManifest {

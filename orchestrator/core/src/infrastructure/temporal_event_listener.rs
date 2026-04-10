@@ -1387,6 +1387,7 @@ mod tests {
                     feedback: None,
                 }],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         states.insert(
@@ -1399,6 +1400,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
 
@@ -1416,6 +1418,7 @@ mod tests {
                 context: HashMap::new(),
                 states,
                 storage: Default::default(),
+                max_total_transitions: None,
             },
         )
         .unwrap()

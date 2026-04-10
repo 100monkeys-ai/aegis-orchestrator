@@ -655,6 +655,11 @@ pub struct WorkflowSpec {
     /// under `storage.shared_volumes`.
     #[serde(default, skip_serializing_if = "is_default_storage")]
     pub storage: WorkflowStorageSpec,
+
+    /// Maximum total state transitions before the workflow terminates.
+    /// Default: 50. Ceiling: 100.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_total_transitions: Option<u32>,
 }
 
 fn is_default_storage(s: &WorkflowStorageSpec) -> bool {
@@ -674,6 +679,11 @@ pub struct WorkflowState {
     #[serde(default)]
     #[serde(with = "humantime_serde")]
     pub timeout: Option<Duration>,
+
+    /// Maximum number of times this state can be visited in the FSM loop
+    /// before the workflow terminates. Default: 5. Ceiling: 20.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_state_visits: Option<u32>,
 }
 
 // ============================================================================
@@ -1586,6 +1596,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         states.insert(
@@ -1623,6 +1634,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
 
@@ -1643,6 +1655,7 @@ mod tests {
                 context: std::collections::HashMap::new(),
                 states,
                 storage: Default::default(),
+                max_total_transitions: None,
             },
             created_at: Utc::now(),
             updated_at: None,
@@ -1675,6 +1688,7 @@ mod tests {
             context: HashMap::new(),
             states: HashMap::new(),
             storage: Default::default(),
+            max_total_transitions: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1703,6 +1717,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
 
@@ -1711,6 +1726,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1753,6 +1769,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1760,6 +1777,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1812,6 +1830,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1819,6 +1838,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1865,6 +1885,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1872,6 +1893,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
 
         let result = Workflow::new(metadata, spec);
@@ -1903,6 +1925,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1910,6 +1933,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1942,6 +1966,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1949,6 +1974,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_err());
@@ -1981,6 +2007,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -1988,6 +2015,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
@@ -2015,6 +2043,7 @@ mod tests {
                 },
                 transitions: vec![],
                 timeout: None,
+                max_state_visits: None,
             },
         );
         let spec = WorkflowSpec {
@@ -2022,6 +2051,7 @@ mod tests {
             context: HashMap::new(),
             states,
             storage: Default::default(),
+            max_total_transitions: None,
         };
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());

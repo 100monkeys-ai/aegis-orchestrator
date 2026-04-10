@@ -51,6 +51,7 @@ metadata:
         default: "{}"
 spec:
   initial_state: WRITE_CODE
+  max_total_transitions: 20
 
   storage:
     workspace:
@@ -61,6 +62,7 @@ spec:
   states:
     WRITE_CODE:
       kind: Agent
+      max_state_visits: 3
       agent: "aegis-{{input.language}}-executor-agent"
       intent: "{{intent}}"
       input: |
@@ -98,6 +100,7 @@ spec:
 
     VALIDATE_CODE:
       kind: Agent
+      max_state_visits: 3
       agent: aegis-code-validator-agent
       intent: "Validate /workspace/solution.{{input.language_ext}}"
       input: |
@@ -116,6 +119,7 @@ spec:
 
     EXECUTE_CODE:
       kind: ContainerRun
+      max_state_visits: 3
       name: execute-user-code
       image: "{{input.container_image}}"
       command: ["{{input.runner}}", "{{input.runner_flags}}", "/workspace/solution.{{input.language_ext}}"]
@@ -158,6 +162,7 @@ spec:
 
     EXECUTION_FAILED:
       kind: System
+      max_state_visits: 2
       command: "echo 'Pipeline failed at EXECUTE_CODE, exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}'"
       transitions:
         - condition: on_success
