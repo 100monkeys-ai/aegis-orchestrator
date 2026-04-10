@@ -195,10 +195,23 @@ impl Capability {
     }
 
     fn path_in_allowlist(&self, path: &str, allowlist: &[PathBuf]) -> bool {
-        let path = PathBuf::from(path);
+        let path_buf = PathBuf::from(path);
         for allowed_path in allowlist {
-            if path.starts_with(allowed_path) {
+            // Direct match (absolute paths)
+            if path_buf.starts_with(allowed_path) {
                 return true;
+            }
+            // Relative path resolution: treat as relative to the allowed directory,
+            // but only if no component is ".." (blocks traversal attacks)
+            if !path_buf.has_root()
+                && !path_buf
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                let resolved = allowed_path.join(&path_buf);
+                if resolved.starts_with(allowed_path) {
+                    return true;
+                }
             }
         }
         false
@@ -262,5 +275,49 @@ mod tests {
             cap.allows("cmd.run", &json!({"command": "npm", "args": ["install"]})),
             Err(PolicyViolation::CommandNotAllowed { .. })
         ));
+    }
+
+    #[test]
+    fn test_path_in_allowlist_relative_path_resolves_under_allowed_dir() {
+        let cap = Capability {
+            tool_pattern: "fs.*".to_string(),
+            path_allowlist: Some(vec![PathBuf::from("/workspace")]),
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        };
+
+        // Relative path resolves under allowed directory
+        assert!(cap
+            .allows("fs.read", &json!({"path": "solution.py"}))
+            .is_ok());
+
+        // Absolute path under allowed directory
+        assert!(cap
+            .allows("fs.read", &json!({"path": "/workspace/solution.py"}))
+            .is_ok());
+
+        // Traversal attack blocked
+        assert!(cap
+            .allows("fs.read", &json!({"path": "../etc/passwd"}))
+            .is_err());
+
+        // Relative path with empty allowlist fails
+        let cap_empty = Capability {
+            tool_pattern: "fs.*".to_string(),
+            path_allowlist: Some(vec![]),
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        };
+        assert!(cap_empty
+            .allows("fs.read", &json!({"path": "solution.py"}))
+            .is_err());
     }
 }
