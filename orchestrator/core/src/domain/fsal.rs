@@ -113,20 +113,46 @@ pub enum FsalError {
     },
 }
 
+/// Compact execution context for NFSv3 file handles.
+///
+/// Serialized as: 1 byte tag + 16 bytes UUID = 17 bytes, compared to the previous
+/// two `Option<Uuid>` fields which serialized to 18–34 bytes and pushed the total
+/// handle size over the 64-byte NFSv3 hard limit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub enum HandleExecutionContext {
+    /// Agent execution context.
+    Agent(ExecutionId),
+    /// Workflow execution context (ContainerStep FUSE path).
+    Workflow(uuid::Uuid),
+}
+
+impl HandleExecutionContext {
+    /// Returns the agent `ExecutionId` if this is an `Agent` context.
+    pub fn execution_id(&self) -> Option<&ExecutionId> {
+        match self {
+            Self::Agent(id) => Some(id),
+            Self::Workflow(_) => None,
+        }
+    }
+
+    /// Returns the workflow execution UUID if this is a `Workflow` context.
+    pub fn workflow_execution_id(&self) -> Option<uuid::Uuid> {
+        match self {
+            Self::Agent(_) => None,
+            Self::Workflow(id) => Some(*id),
+        }
+    }
+}
+
 /// Aegis File Handle - encodes execution and volume ownership
 ///
 /// Serialized with bincode to fit within NFSv3's 64-byte limit.
-/// Exactly one of `execution_id` or `workflow_execution_id` must be `Some`.
-/// With Option encoding, each arm is 17 bytes (Some) or 1 byte (None),
-/// keeping the worst-case serialized size ≤ 54 bytes (well under the 64-byte NFS limit).
+/// Uses a compact [`HandleExecutionContext`] enum (1-byte tag + 16-byte UUID = 17 bytes)
+/// rather than two separate `Option<Uuid>` fields, which exceeded the 64-byte limit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct AegisFileHandle {
-    /// Agent execution that opened this file. Mutually exclusive with
-    /// `workflow_execution_id` — exactly one must be `Some`.
-    pub execution_id: Option<ExecutionId>,
-    /// Workflow execution that opened this file (ContainerStep FUSE path).
-    /// Mutually exclusive with `execution_id` — exactly one must be `Some`.
-    pub workflow_execution_id: Option<uuid::Uuid>,
+    /// Execution context that owns this file handle.
+    pub execution_context: HandleExecutionContext,
     /// Volume containing this file
     pub volume_id: VolumeId,
     /// Hash of file path (for integrity check)
@@ -148,8 +174,7 @@ impl AegisFileHandle {
         let path_hash = hasher.finish();
 
         Self {
-            execution_id: Some(execution_id),
-            workflow_execution_id: None,
+            execution_context: HandleExecutionContext::Agent(execution_id),
             volume_id,
             path_hash,
             created_at: Utc::now().timestamp(),
@@ -172,12 +197,21 @@ impl AegisFileHandle {
         let path_hash = hasher.finish();
 
         Self {
-            execution_id: None,
-            workflow_execution_id: Some(workflow_execution_id),
+            execution_context: HandleExecutionContext::Workflow(workflow_execution_id),
             volume_id,
             path_hash,
             created_at: Utc::now().timestamp(),
         }
+    }
+
+    /// Returns the agent `ExecutionId` if this handle belongs to an agent execution.
+    pub fn execution_id(&self) -> Option<&ExecutionId> {
+        self.execution_context.execution_id()
+    }
+
+    /// Returns the workflow execution UUID if this handle belongs to a workflow execution.
+    pub fn workflow_execution_id(&self) -> Option<uuid::Uuid> {
+        self.execution_context.workflow_execution_id()
     }
 
     /// Serialize to bytes (for NFS file handle)
@@ -382,8 +416,8 @@ impl AegisFSAL {
     /// the handle's `execution_id` / `workflow_execution_id` fields.
     async fn authorize_handle(&self, handle: &AegisFileHandle) -> Result<Volume, FsalError> {
         self.authorize_inner(
-            handle.execution_id,
-            handle.workflow_execution_id,
+            handle.execution_id().copied(),
+            handle.workflow_execution_id(),
             handle.volume_id,
         )
         .await
@@ -424,7 +458,7 @@ impl AegisFSAL {
                     .await;
 
                 return Err(FsalError::UnauthorizedAccess {
-                    execution_id: execution_id.unwrap_or_else(ExecutionId::new),
+                    execution_id: execution_id.unwrap_or_default(),
                     volume_id,
                 });
             }
@@ -497,7 +531,7 @@ impl AegisFSAL {
                 .await;
 
             return Err(FsalError::UnauthorizedAccess {
-                execution_id: execution_id.unwrap_or_else(ExecutionId::new),
+                execution_id: execution_id.unwrap_or_default(),
                 volume_id,
             });
         }
@@ -645,13 +679,13 @@ impl AegisFSAL {
         let canonical_str = canonical.to_str().unwrap().replace("\\", "/");
 
         // 4. Create new handle — propagate the same execution context as the parent
-        let new_handle = if let Some(exec_id) = handle.execution_id {
-            AegisFileHandle::new(exec_id, handle.volume_id, &canonical_str)
-        } else if let Some(wf_id) = handle.workflow_execution_id {
-            AegisFileHandle::new_for_workflow(wf_id, handle.volume_id, &canonical_str)
-        } else {
-            // Degenerate handle with no context — create a placeholder
-            AegisFileHandle::new_for_workflow(uuid::Uuid::nil(), handle.volume_id, &canonical_str)
+        let new_handle = match &handle.execution_context {
+            HandleExecutionContext::Agent(exec_id) => {
+                AegisFileHandle::new(*exec_id, handle.volume_id, &canonical_str)
+            }
+            HandleExecutionContext::Workflow(wf_id) => {
+                AegisFileHandle::new_for_workflow(*wf_id, handle.volume_id, &canonical_str)
+            }
         };
 
         Ok(new_handle)
@@ -678,8 +712,8 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_read_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: handle.execution_id,
-                    workflow_execution_id: handle.workflow_execution_id,
+                    execution_id: handle.execution_id().copied(),
+                    workflow_execution_id: handle.workflow_execution_id(),
                     volume_id: handle.volume_id,
                     operation: "read",
                     caller_node_id: None,
@@ -708,8 +742,8 @@ impl AegisFSAL {
         let duration_ms = start.elapsed().as_millis() as u64;
         self.event_publisher
             .publish_storage_event(StorageEvent::FileRead {
-                execution_id: handle.execution_id,
-                workflow_execution_id: handle.workflow_execution_id,
+                execution_id: handle.execution_id().copied(),
+                workflow_execution_id: handle.workflow_execution_id(),
                 volume_id: handle.volume_id,
                 path: path_str.to_string(),
                 offset,
@@ -745,8 +779,8 @@ impl AegisFSAL {
         if let Err(e) = self.enforce_write_policy(policy, path_str) {
             self.emit_policy_violation(
                 PolicyViolationContext {
-                    execution_id: handle.execution_id,
-                    workflow_execution_id: handle.workflow_execution_id,
+                    execution_id: handle.execution_id().copied(),
+                    workflow_execution_id: handle.workflow_execution_id(),
                     volume_id: handle.volume_id,
                     operation: "write",
                     caller_node_id: None,
@@ -773,8 +807,8 @@ impl AegisFSAL {
             // Publish quota exceeded event
             self.event_publisher
                 .publish_storage_event(StorageEvent::QuotaExceeded {
-                    execution_id: handle.execution_id,
-                    workflow_execution_id: handle.workflow_execution_id,
+                    execution_id: handle.execution_id().copied(),
+                    workflow_execution_id: handle.workflow_execution_id(),
                     volume_id: handle.volume_id,
                     requested_bytes,
                     available_bytes,
@@ -805,8 +839,8 @@ impl AegisFSAL {
         let duration_ms = start.elapsed().as_millis() as u64;
         self.event_publisher
             .publish_storage_event(StorageEvent::FileWritten {
-                execution_id: handle.execution_id,
-                workflow_execution_id: handle.workflow_execution_id,
+                execution_id: handle.execution_id().copied(),
+                workflow_execution_id: handle.workflow_execution_id(),
                 volume_id: handle.volume_id,
                 path: path_str.to_string(),
                 offset,

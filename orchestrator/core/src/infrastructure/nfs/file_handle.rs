@@ -113,17 +113,51 @@ mod tests {
         assert_eq!(original, decoded);
     }
 
+    /// Regression test: two separate `Option<Uuid>` fields serialized to 66 bytes
+    /// via bincode, exceeding the 64-byte NFSv3 hard limit. The `HandleExecutionContext`
+    /// enum (1-byte tag + 16-byte UUID) must keep both agent and workflow handles ≤ 64 bytes.
     #[test]
-    fn test_size_limit() {
+    fn test_size_limit_agent_handle() {
         let handle =
             AegisFileHandle::new(ExecutionId::new(), VolumeId::new(), "/workspace/test.txt");
 
         let bytes = encode_file_handle(&handle).unwrap();
         assert!(
             bytes.len() <= 64,
-            "FileHandle exceeds 64-byte NFSv3 limit: {} bytes",
+            "Agent FileHandle exceeds 64-byte NFSv3 limit: {} bytes",
             bytes.len()
         );
+    }
+
+    /// Regression test: workflow handles must also fit within the 64-byte NFSv3 limit.
+    #[test]
+    fn test_size_limit_workflow_handle() {
+        let handle = AegisFileHandle::new_for_workflow(
+            uuid::Uuid::new_v4(),
+            VolumeId::new(),
+            "/workspace/test.txt",
+        );
+
+        let bytes = encode_file_handle(&handle).unwrap();
+        assert!(
+            bytes.len() <= 64,
+            "Workflow FileHandle exceeds 64-byte NFSv3 limit: {} bytes",
+            bytes.len()
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_workflow_roundtrip() {
+        let original = AegisFileHandle::new_for_workflow(
+            uuid::Uuid::new_v4(),
+            VolumeId::new(),
+            "/workspace/container/out.txt",
+        );
+
+        let bytes = encode_file_handle(&original).unwrap();
+        let decoded = decode_file_handle(&bytes).unwrap();
+
+        assert_eq!(original, decoded);
     }
 
     #[test]
