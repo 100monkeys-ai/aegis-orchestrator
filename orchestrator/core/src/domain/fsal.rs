@@ -65,7 +65,6 @@ impl From<FilesystemPolicy> for FsalAccessPolicy {
     }
 }
 use async_trait::async_trait;
-use bincode::Options;
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -145,19 +144,6 @@ impl HandleExecutionContext {
     }
 }
 
-/// Returns the bincode options used for [`AegisFileHandle`] serialization.
-///
-/// `with_fixint_encoding()` uses fixed-width integers for all lengths and
-/// integer fields, eliminating the 8-byte varint length prefixes that bincode's
-/// default encoding adds to sequences (including `uuid::Uuid`'s serde impl).
-/// This keeps the serialized handle at 52 bytes, well within the NFSv3 64-byte limit.
-///
-/// `with_no_limit()` removes the default 128 MiB read limit; the handle is tiny
-/// so there is no risk of malicious over-allocation.
-pub(crate) fn bincode_handle_options() -> impl bincode::Options {
-    bincode::options().with_fixint_encoding().with_no_limit()
-}
-
 /// Aegis File Handle - encodes execution and volume ownership
 ///
 /// Serialized with bincode to fit within NFSv3's 64-byte limit.
@@ -171,8 +157,6 @@ pub struct AegisFileHandle {
     pub volume_id: VolumeId,
     /// Hash of file path (for integrity check)
     pub path_hash: u64,
-    /// Handle creation timestamp (Unix timestamp)
-    pub created_at: i64,
 }
 
 impl AegisFileHandle {
@@ -191,7 +175,6 @@ impl AegisFileHandle {
             execution_context: HandleExecutionContext::Agent(execution_id),
             volume_id,
             path_hash,
-            created_at: Utc::now().timestamp(),
         }
     }
 
@@ -214,7 +197,6 @@ impl AegisFileHandle {
             execution_context: HandleExecutionContext::Workflow(workflow_execution_id),
             volume_id,
             path_hash,
-            created_at: Utc::now().timestamp(),
         }
     }
 
@@ -230,16 +212,12 @@ impl AegisFileHandle {
 
     /// Serialize to bytes (for NFS file handle)
     pub fn to_bytes(&self) -> Result<Vec<u8>, FsalError> {
-        bincode_handle_options()
-            .serialize(self)
-            .map_err(|e| FsalError::HandleDeserialization(e.to_string()))
+        bincode::serialize(self).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
     }
 
     /// Deserialize from bytes
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, FsalError> {
-        bincode_handle_options()
-            .deserialize(bytes)
-            .map_err(|e| FsalError::HandleDeserialization(e.to_string()))
+        bincode::deserialize(bytes).map_err(|e| FsalError::HandleDeserialization(e.to_string()))
     }
 
     /// Validate handle size fits in NFSv3 limit (64 bytes)
@@ -1478,12 +1456,12 @@ impl AegisFSAL {
 mod tests {
     use super::*;
 
-    /// Regression test: default bincode encoding adds 8-byte varint length prefixes to
-    /// `uuid::Uuid` fields, producing 68 bytes — 4 bytes over the NFSv3 64-byte limit.
-    /// `with_fixint_encoding()` eliminates those prefixes, yielding exactly 52 bytes:
-    ///   enum tag (4B) + UUID (16B) + volume_id UUID (16B) + path_hash u64 (8B) + created_at i64 (8B)
+    /// Regression test: `uuid::Uuid`'s serde impl serializes as a 16-element u8 sequence;
+    /// bincode adds an 8-byte length prefix per sequence. With `created_at` removed, the
+    /// layout is: enum tag (4B) + UUID length+data (8+16=24B) + volume_id length+data (8+16=24B)
+    /// + path_hash u64 (8B) = 60 bytes, well within the NFSv3 64-byte limit.
     #[test]
-    fn test_aegis_file_handle_serializes_to_52_bytes() {
+    fn test_aegis_file_handle_serializes_to_60_bytes() {
         let handle = AegisFileHandle::new(
             ExecutionId::new(),
             VolumeId::new(),
@@ -1493,8 +1471,8 @@ mod tests {
         let bytes = handle.to_bytes().unwrap();
         assert_eq!(
             bytes.len(),
-            52,
-            "AegisFileHandle must serialize to exactly 52 bytes with fixint encoding; got {} bytes",
+            60,
+            "AegisFileHandle must serialize to exactly 60 bytes; got {} bytes",
             bytes.len()
         );
     }
