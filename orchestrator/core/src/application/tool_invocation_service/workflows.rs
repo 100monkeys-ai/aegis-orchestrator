@@ -142,6 +142,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         _security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let tenant_id = Self::resolve_tenant_arg(args)?;
         let name = args.get("name").and_then(|v| v.as_str()).ok_or_else(|| {
@@ -172,7 +173,8 @@ impl ToolInvocationService {
         };
 
         match start_use_case
-            .start_execution(
+            .start_execution_for_tenant(
+                &tenant_id,
                 crate::application::start_workflow_execution::StartWorkflowExecutionRequest {
                     workflow_id: name.to_string(),
                     input,
@@ -182,6 +184,7 @@ impl ToolInvocationService {
                     security_context_name: Some("aegis-system-agent-runtime".to_string()),
                     intent,
                 },
+                caller_identity,
             )
             .await
         {

@@ -2793,6 +2793,324 @@ async fn list_tools_includes_aegis_workflow_search() {
     );
 }
 
+/// Regression: `invoke_tool_internal` must propagate `initiating_user_sub` from
+/// the parent execution to the `identity` argument of `start_execution` so that
+/// user-scoped rate-limit counters are written for child executions.
+///
+/// Before the fix, `start_execution` was always called with `None` identity,
+/// meaning child executions started via tool invocations had no rate-limit subject.
+#[tokio::test]
+async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
+    use std::sync::Mutex as StdMutex;
+
+    // --- Capturing execution service ---
+    struct CapturingExecutionService {
+        execution: Execution,
+        agent_id_for_new_exec: AgentId,
+        captured_identity: Arc<StdMutex<Option<Option<String>>>>,
+    }
+
+    #[async_trait]
+    impl ExecutionService for CapturingExecutionService {
+        async fn start_execution(
+            &self,
+            _agent_id: AgentId,
+            _input: ExecutionInput,
+            _security_context_name: String,
+            identity: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            *self.captured_identity.lock().unwrap() = Some(identity.map(|id| id.sub.clone()));
+            Ok(ExecutionId::new())
+        }
+
+        async fn start_execution_with_id(
+            &self,
+            execution_id: ExecutionId,
+            _: AgentId,
+            _: ExecutionInput,
+            _: String,
+            _: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<ExecutionId> {
+            Ok(execution_id)
+        }
+
+        async fn start_child_execution(
+            &self,
+            _: AgentId,
+            _: ExecutionInput,
+            _: ExecutionId,
+        ) -> Result<ExecutionId> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn get_execution(&self, id: ExecutionId) -> Result<Execution> {
+            if self.execution.id == id {
+                Ok(self.execution.clone())
+            } else {
+                anyhow::bail!("execution not found")
+            }
+        }
+
+        async fn get_execution_unscoped(&self, id: ExecutionId) -> Result<Execution> {
+            if self.execution.id == id {
+                Ok(self.execution.clone())
+            } else {
+                anyhow::bail!("execution not found")
+            }
+        }
+
+        async fn get_iterations(&self, _: ExecutionId) -> Result<Vec<Iteration>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn cancel_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn stream_execution(
+            &self,
+            _: ExecutionId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<ExecutionEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn stream_agent_events(
+            &self,
+            _: AgentId,
+        ) -> Result<Pin<Box<dyn Stream<Item = Result<DomainEvent>> + Send>>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn list_executions(&self, _: Option<AgentId>, _: usize) -> Result<Vec<Execution>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn delete_execution(&self, _: ExecutionId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn record_llm_interaction(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: crate::domain::execution::LlmInteraction,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn store_iteration_trajectory(
+            &self,
+            _: ExecutionId,
+            _: u8,
+            _: Vec<crate::domain::execution::TrajectoryStep>,
+        ) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+    }
+
+    // --- Agent lifecycle that resolves the agent for aegis.task.execute ---
+    struct ResolvingAgentLifecycleService {
+        agent: Agent,
+    }
+
+    #[async_trait]
+    impl AgentLifecycleService for ResolvingAgentLifecycleService {
+        async fn deploy_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            manifest: AgentManifest,
+            force: bool,
+            _: crate::domain::agent::AgentScope,
+            _: Option<&crate::domain::iam::UserIdentity>,
+        ) -> Result<AgentId> {
+            self.deploy_agent(manifest, force).await
+        }
+
+        async fn deploy_agent(&self, _: AgentManifest, _: bool) -> Result<AgentId> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn get_agent_for_tenant(&self, _: &TenantId, id: AgentId) -> Result<Agent> {
+            self.get_agent(id).await
+        }
+
+        async fn get_agent(&self, _: AgentId) -> Result<Agent> {
+            Ok(self.agent.clone())
+        }
+
+        async fn update_agent_for_tenant(
+            &self,
+            _: &TenantId,
+            id: AgentId,
+            manifest: AgentManifest,
+        ) -> Result<()> {
+            self.update_agent(id, manifest).await
+        }
+
+        async fn update_agent(&self, _: AgentId, _: AgentManifest) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn delete_agent_for_tenant(&self, _: &TenantId, id: AgentId) -> Result<()> {
+            self.delete_agent(id).await
+        }
+
+        async fn delete_agent(&self, _: AgentId) -> Result<()> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn list_agents_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+            self.list_agents().await
+        }
+
+        async fn list_agents(&self) -> Result<Vec<Agent>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn lookup_agent_for_tenant(&self, _: &TenantId, _: &str) -> Result<Option<AgentId>> {
+            self.lookup_agent("").await
+        }
+
+        async fn lookup_agent(&self, _: &str) -> Result<Option<AgentId>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn lookup_agent_visible_for_tenant(
+            &self,
+            _: &TenantId,
+            _: &str,
+        ) -> Result<Option<AgentId>> {
+            Ok(Some(self.agent.id))
+        }
+
+        async fn lookup_agent_for_tenant_with_version(
+            &self,
+            _: &TenantId,
+            _: &str,
+            _: &str,
+        ) -> Result<Option<AgentId>> {
+            anyhow::bail!("not exercised")
+        }
+
+        async fn list_agents_visible_for_tenant(&self, _: &TenantId) -> Result<Vec<Agent>> {
+            Ok(vec![self.agent.clone()])
+        }
+
+        async fn list_versions_for_tenant(
+            &self,
+            _: &TenantId,
+            _: AgentId,
+        ) -> Result<Vec<AgentVersion>> {
+            Ok(vec![])
+        }
+    }
+
+    // --- Setup ---
+    let parent_agent = test_agent_with_tools(&["aegis.task.execute"]);
+    let parent_agent_id = parent_agent.id;
+    let exec_id = ExecutionId::new();
+    let target_agent = test_agent_with_tools(&[]);
+    let target_agent_id = target_agent.id;
+
+    let context = SecurityContext {
+        name: "aegis-system-operator".to_string(),
+        description: "operator".to_string(),
+        capabilities: vec![crate::domain::security_context::Capability {
+            tool_pattern: "aegis.*".to_string(),
+            path_allowlist: None,
+            command_allowlist: None,
+            subcommand_allowlist: None,
+            domain_allowlist: None,
+            max_response_size: None,
+            rate_limit: None,
+            max_concurrent: None,
+        }],
+        deny_list: vec![],
+        metadata: crate::domain::security_context::SecurityContextMetadata {
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            version: 1,
+        },
+    };
+
+    let security_context_repo =
+        Arc::new(crate::infrastructure::security_context::InMemorySecurityContextRepository::new());
+    security_context_repo.save(context).await.unwrap();
+
+    // Parent execution with initiating_user_sub set
+    let mut parent_execution = Execution::new_with_id(
+        exec_id,
+        parent_agent_id,
+        ExecutionInput {
+            intent: None,
+            input: serde_json::json!({}),
+            workspace_volume_id: None,
+            workspace_volume_mount_path: None,
+            workspace_remote_path: None,
+            workflow_execution_id: None,
+        },
+        5,
+        "aegis-system-operator".to_string(),
+    );
+    parent_execution.initiating_user_sub = Some("test-user-123".to_string());
+
+    let captured_identity = Arc::new(StdMutex::new(None));
+    let exec_service = Arc::new(CapturingExecutionService {
+        execution: parent_execution,
+        agent_id_for_new_exec: target_agent_id,
+        captured_identity: Arc::clone(&captured_identity),
+    });
+
+    let repo = Arc::new(InMemorySealSessionRepository::new());
+    let registry: Arc<dyn crate::domain::mcp::ToolRegistry> = Arc::new(InMemoryToolRegistry::new());
+    let servers = Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let router = Arc::new(ToolRouter::new(registry, servers, vec![]));
+    let middleware = Arc::new(SealMiddleware::new());
+    let (fsal, volume_registry) = test_fsal_deps();
+
+    let service = ToolInvocationService::new(
+        repo,
+        security_context_repo,
+        middleware,
+        router,
+        fsal,
+        volume_registry,
+        Arc::new(ResolvingAgentLifecycleService {
+            agent: target_agent,
+        }),
+        exec_service,
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
+        None,
+    );
+
+    let result = service
+        .invoke_tool_internal(
+            &parent_agent_id,
+            exec_id,
+            crate::domain::tenant::TenantId::consumer(),
+            0,
+            vec![],
+            "aegis.task.execute".to_string(),
+            serde_json::json!({ "agent_id": target_agent_id.0.to_string() }),
+        )
+        .await;
+
+    assert!(result.is_ok(), "invoke_tool_internal failed: {result:?}");
+
+    let captured = captured_identity.lock().unwrap().clone();
+    assert!(
+        captured.is_some(),
+        "start_execution was not called — aegis.task.execute did not reach start_execution"
+    );
+    let identity_sub = captured.unwrap();
+    assert_eq!(
+        identity_sub,
+        Some("test-user-123".to_string()),
+        "start_execution was called with identity={identity_sub:?}, expected Some(\"test-user-123\")"
+    );
+}
+
 /// Regression: when a tool is already present in the builtin_dispatchers vec,
 /// the reconciliation pass must not duplicate it in the output.
 #[tokio::test]

@@ -5,6 +5,7 @@ impl ToolInvocationService {
         &self,
         args: &Value,
         _security_context: &crate::domain::security_context::SecurityContext,
+        caller_identity: Option<&crate::domain::iam::UserIdentity>,
     ) -> Result<ToolInvocationResult, SealSessionError> {
         let agent_ref = args
             .get("agent_id")
@@ -87,7 +88,7 @@ impl ToolInvocationService {
                     workflow_execution_id: None,
                 },
                 "aegis-system-agent-runtime".to_string(),
-                None,
+                caller_identity,
             )
             .await
         {
