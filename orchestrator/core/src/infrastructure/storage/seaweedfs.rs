@@ -222,6 +222,7 @@ impl StorageProvider for SeaweedFSAdapter {
         let response = self
             .client
             .get(&url)
+            .header("Accept", "application/json")
             .query(&[("path", path)])
             .send()
             .await?;
@@ -280,7 +281,12 @@ impl StorageProvider for SeaweedFSAdapter {
 
         let url = self.build_url(path);
 
-        let response = self.client.get(&url).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
 
         match response.status() {
             StatusCode::OK => {
@@ -474,7 +480,12 @@ impl StorageProvider for SeaweedFSAdapter {
     async fn readdir(&self, path: &str) -> Result<Vec<DirEntry>, StorageError> {
         let url = self.build_url(path);
 
-        let response = self.client.get(&url).send().await?;
+        let response = self
+            .client
+            .get(&url)
+            .header("Accept", "application/json")
+            .send()
+            .await?;
 
         match response.status() {
             StatusCode::OK => {
@@ -599,24 +610,12 @@ struct DirectoryStatus {
     file_count: u64,
 }
 
-fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Default + serde::Deserialize<'de>,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 struct DirectoryListing {
     #[serde(rename = "Path", default)]
     path: String,
 
-    #[serde(
-        rename = "Entries",
-        default,
-        deserialize_with = "deserialize_null_default"
-    )]
+    #[serde(rename = "Entries", default)]
     entries: Vec<DirectoryEntry>,
 }
 
@@ -687,18 +686,20 @@ mod tests {
     // Regression tests for DirectoryListing deserialization
 
     #[test]
-    fn test_directory_listing_null_entries_deserializes_to_empty_vec() {
-        // SeaweedFS returns "Entries": null for directories with no subdirectory listings
-        let json = r#"{"Path": "/foo", "Entries": null}"#;
+    fn test_directory_listing_with_entries_deserializes() {
+        // Canonical SeaweedFS filer response shape
+        let json = r#"{"Version":"2.x","Path":"/foo","Entries":[{"FullPath":"/foo/bar","Mtime":"2026-01-01T00:00:00Z","Mode":0,"IsDirectory":true}],"Limit":100}"#;
         let listing: DirectoryListing =
-            serde_json::from_str(json).expect("should deserialize when Entries is null");
+            serde_json::from_str(json).expect("should deserialize canonical filer response");
         assert_eq!(listing.path, "/foo");
-        assert!(listing.entries.is_empty());
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "/foo/bar");
+        assert!(listing.entries[0].is_directory);
     }
 
     #[test]
     fn test_directory_listing_absent_entries_deserializes_to_empty_vec() {
-        // SeaweedFS may omit the Entries field entirely in some response variants
+        // SeaweedFS may omit the Entries field for empty directories
         let json = r#"{"Path": "/foo"}"#;
         let listing: DirectoryListing =
             serde_json::from_str(json).expect("should deserialize when Entries is absent");
@@ -706,14 +707,76 @@ mod tests {
         assert!(listing.entries.is_empty());
     }
 
-    #[test]
-    fn test_directory_listing_absent_path_and_null_entries_deserializes() {
-        // SeaweedFS may omit Path and send null Entries in some response variants
-        let json = r#"{"Entries": null}"#;
-        let listing: DirectoryListing = serde_json::from_str(json)
-            .expect("should deserialize when Path is absent and Entries is null");
-        assert_eq!(listing.path, "");
-        assert!(listing.entries.is_empty());
+    // Regression: readdir and list_directories must send Accept: application/json so that
+    // SeaweedFS returns JSON instead of an HTML directory listing page.
+    // Before this fix, the filer returned HTML, causing JSON deserialization to fail with
+    // a Serialization error rather than returning directory entries.
+
+    #[tokio::test]
+    async fn test_readdir_sends_accept_json_header() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/tenant/vol")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Path":"/tenant/vol","Entries":[]}"#)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.readdir("/tenant/vol").await;
+        assert!(
+            result.is_ok(),
+            "readdir must succeed when Accept header is present: {result:?}"
+        );
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_directories_sends_accept_json_header() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/tenant/vol")
+            .match_header("accept", "application/json")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"Path":"/tenant/vol","Entries":[]}"#)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.list_directories("/tenant/vol").await;
+        assert!(
+            result.is_ok(),
+            "list_directories must succeed when Accept header is present: {result:?}"
+        );
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_get_usage_sends_accept_json_header() {
+        let mut server = mockito::Server::new_async().await;
+        let _mock = server
+            .mock("GET", "/dir/status")
+            .match_header("accept", "application/json")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "path".into(),
+                "/tenant/vol".into(),
+            ))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"TotalSize":4096,"FileCount":1}"#)
+            .create_async()
+            .await;
+
+        let adapter = SeaweedFSAdapter::new(server.url());
+        let result = adapter.get_usage("/tenant/vol").await;
+        assert_eq!(
+            result,
+            Ok(4096),
+            "get_usage must parse JSON when Accept header is present"
+        );
     }
 
     // Integration tests require running SeaweedFS instance
