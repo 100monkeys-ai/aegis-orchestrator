@@ -65,6 +65,7 @@ impl From<FilesystemPolicy> for FsalAccessPolicy {
     }
 }
 use async_trait::async_trait;
+use bincode::Options;
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
@@ -154,7 +155,6 @@ impl HandleExecutionContext {
 /// `with_no_limit()` removes the default 128 MiB read limit; the handle is tiny
 /// so there is no risk of malicious over-allocation.
 pub(crate) fn bincode_handle_options() -> impl bincode::Options {
-    use bincode::Options;
     bincode::options().with_fixint_encoding().with_no_limit()
 }
 
