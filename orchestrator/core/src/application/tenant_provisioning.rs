@@ -82,9 +82,13 @@ impl TenantProvisioningService {
 
         self.tenant_repo.insert(&tenant).await?;
 
-        // Set tenant_id attribute on Keycloak user
+        // Set tenant_id and zaru_tier attributes on Keycloak user so the
+        // protocol mappers can include them as JWT claims on subsequent logins.
         self.keycloak_admin
             .set_user_attribute("zaru-consumer", user_sub, "tenant_id", &slug)
+            .await?;
+        self.keycloak_admin
+            .set_user_attribute("zaru-consumer", user_sub, "zaru_tier", tier_to_str(&tier))
             .await?;
 
         self.event_bus
