@@ -151,6 +151,7 @@ impl FuseFsalDaemon {
             backend: self.backend.clone(),
             context: context.clone(),
             inode_table: Arc::new(InodeTable::new()),
+            runtime: tokio::runtime::Handle::current(),
         };
 
         // Mount options:
@@ -198,6 +199,13 @@ struct FuseFsal {
     backend: Arc<dyn FsalBackend>,
     context: FuseVolumeContext,
     inode_table: Arc<InodeTable>,
+    /// Tokio runtime handle captured before `fuser::spawn_mount2()` is called.
+    ///
+    /// FUSE callbacks run on OS threads spawned by `fuser` that have no Tokio
+    /// runtime context. `Handle::current()` would panic in those threads, so the
+    /// handle is captured in the Tokio context and stored here for use by
+    /// `block_on`.
+    runtime: tokio::runtime::Handle,
 }
 
 impl FuseFsal {
@@ -275,10 +283,13 @@ impl FuseFsal {
 
     /// Bridge async FSAL calls into the synchronous FUSE callback context.
     ///
-    /// FUSE callbacks run on dedicated `fuser` threads, not on the tokio
-    /// executor, so `block_on` is safe and does not risk deadlock.
+    /// Uses the Tokio runtime handle captured before `fuser::spawn_mount2()` was
+    /// called. FUSE callbacks run on OS threads that have no Tokio runtime
+    /// context, so `Handle::current()` would panic — the stored handle avoids
+    /// that. `block_on` is safe here because FUSE callbacks never run on the
+    /// Tokio executor threads themselves.
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
-        tokio::runtime::Handle::current().block_on(f)
+        self.runtime.block_on(f)
     }
 }
 
@@ -948,5 +959,190 @@ fn fsal_error_to_errno(e: &crate::domain::fsal::FsalError) -> i32 {
         FsalError::InvalidFileHandle => libc::ESTALE,
         FsalError::HandleDeserialization(_) => libc::EIO,
         FsalError::QuotaExceeded { .. } => libc::ENOSPC,
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::execution::ExecutionId;
+    use crate::domain::fsal::{AegisFileHandle, FsalAccessPolicy, FsalError};
+    use crate::domain::storage::{DirEntry, FileAttributes};
+    use crate::domain::volume::VolumeId;
+    use async_trait::async_trait;
+
+    // ── Stub backend ──────────────────────────────────────────────────────────
+
+    /// Minimal no-op `FsalBackend` used only to construct `FuseFsal` in tests.
+    struct StubBackend;
+
+    #[async_trait]
+    impl FsalBackend for StubBackend {
+        async fn getattr(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: u32,
+            _: u32,
+        ) -> Result<FileAttributes, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn lookup(
+            &self,
+            _: &AegisFileHandle,
+            _: &str,
+            _: &str,
+        ) -> Result<AegisFileHandle, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn readdir(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<Vec<DirEntry>, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn read(
+            &self,
+            _: &AegisFileHandle,
+            _: &str,
+            _: &FsalAccessPolicy,
+            _: u64,
+            _: usize,
+        ) -> Result<Vec<u8>, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn write(
+            &self,
+            _: &AegisFileHandle,
+            _: &str,
+            _: &FsalAccessPolicy,
+            _: u64,
+            _: &[u8],
+        ) -> Result<usize, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn create_file(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<AegisFileHandle, FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn create_directory(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<(), FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn delete_file(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<(), FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn delete_directory(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<(), FsalError> {
+            unimplemented!("stub")
+        }
+
+        async fn rename(
+            &self,
+            _: ExecutionId,
+            _: VolumeId,
+            _: &str,
+            _: &str,
+            _: &FsalAccessPolicy,
+        ) -> Result<(), FsalError> {
+            unimplemented!("stub")
+        }
+    }
+
+    // ── Helper ────────────────────────────────────────────────────────────────
+
+    /// Build a `FuseFsal` with the given runtime handle and a stub backend.
+    fn make_fuse_fsal(runtime: tokio::runtime::Handle) -> FuseFsal {
+        FuseFsal {
+            backend: Arc::new(StubBackend),
+            context: FuseVolumeContext {
+                execution_id: ExecutionId::new(),
+                volume_id: VolumeId::new(),
+                workflow_execution_id: None,
+                container_uid: 1000,
+                container_gid: 1000,
+                policy: FsalAccessPolicy::default(),
+            },
+            inode_table: Arc::new(InodeTable::new()),
+            runtime,
+        }
+    }
+
+    // ── Regression test ───────────────────────────────────────────────────────
+
+    /// Regression: `FuseFsal::block_on` must work on OS threads that have no
+    /// Tokio runtime context (as is the case for threads spawned by
+    /// `fuser::spawn_mount2`).
+    ///
+    /// Before the fix, `block_on` called `Handle::current()` which panics on
+    /// any thread without a Tokio runtime. After the fix, the handle is captured
+    /// before mounting and stored in `FuseFsal::runtime`, so FUSE callback
+    /// threads can safely use it.
+    #[test]
+    fn block_on_works_from_non_tokio_thread() {
+        // Build a multi-thread Tokio runtime to act as the "outer" runtime that
+        // would normally be running the orchestrator (i.e. the runtime context
+        // that exists *before* spawn_mount2 is called).
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("failed to build tokio runtime");
+
+        // Capture the handle while we're inside the runtime context — this
+        // mirrors exactly what `FuseFsalDaemon::mount()` now does.
+        let handle = rt.handle().clone();
+
+        // Construct FuseFsal with the captured handle (simulates post-fix code).
+        let fsal = make_fuse_fsal(handle);
+
+        // Spawn a plain OS thread (no Tokio context) — this simulates a FUSE
+        // callback thread created by fuser::spawn_mount2.
+        let result = std::thread::spawn(move || {
+            // This would panic with "there is no reactor running" before the fix.
+            fsal.block_on(async { 42_u32 })
+        })
+        .join()
+        .expect("thread panicked — block_on failed on non-Tokio thread");
+
+        assert_eq!(result, 42, "block_on must return the future's output");
+
+        rt.shutdown_background();
     }
 }
