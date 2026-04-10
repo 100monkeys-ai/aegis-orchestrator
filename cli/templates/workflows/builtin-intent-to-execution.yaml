@@ -67,14 +67,40 @@ spec:
         File path: /workspace/solution.{{input.language_ext}}
         Input values: {{input.inputs}}
 
+        {{#if blackboard.VALIDATE_CODE}}
+        IMPORTANT: Your previous code was rejected by the validator:
+        {{blackboard.VALIDATE_CODE.output.summary}}
+        Failed criteria:
+        {{json blackboard.VALIDATE_CODE.output.criteria}}
+        Fix the issues and rewrite the solution.
+        {{/if}}
+
         Write the complete solution to /workspace/solution.{{input.language_ext}}.
+        The solution MUST define a function that reads inputs from the
+        INTENT_INPUTS environment variable — do NOT hardcode input values.
         The solution MUST print its final result to stdout.
-        Embed the input values directly in the code.
         Use only the standard library — no third-party packages.
         Confirm the write succeeded before returning.
       transitions:
         - condition: on_success
+          target: VALIDATE_CODE
+        - condition: on_failure
+          target: WRITE_FAILED
+
+    VALIDATE_CODE:
+      kind: Agent
+      agent: aegis-code-validator-agent
+      intent: "Validate /workspace/solution.{{input.language_ext}}"
+      input: |
+        File: /workspace/solution.{{input.language_ext}}
+        Language: {{input.language}}
+        INTENT_INPUTS: {{input.inputs_json}}
+      transitions:
+        - condition: custom
+          expression: "state_output.output.valid"
           target: EXECUTE_CODE
+        - condition: on_success
+          target: WRITE_CODE
         - condition: on_failure
           target: WRITE_FAILED
 

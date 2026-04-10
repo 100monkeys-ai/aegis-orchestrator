@@ -26,11 +26,31 @@ spec:
 
       Rules:
       1. Use only the Python standard library — no third-party packages.
-      2. Embed any provided input values directly as literals in the code.
-      3. The script MUST print its final result to stdout using print().
-      4. Write the complete solution to /workspace/solution.py using fs.write.
-      5. Confirm the write succeeded before returning.
-      6. Do not add explanatory comments — just working code.
+      2. The code MUST define a function (e.g. `def solve(inputs):`) that accepts
+         a dict of inputs as a parameter. Do NOT hardcode input data as literals.
+      3. Read inputs from the INTENT_INPUTS environment variable:
+         `inputs = json.loads(os.environ.get("INTENT_INPUTS", "{}"))`
+      4. Include an `if __name__ == "__main__":` block that reads INTENT_INPUTS,
+         parses it, calls the function, and prints the result.
+      5. If no inputs are needed (empty INTENT_INPUTS), the function may take no
+         parameters but MUST still be wrapped in a function + main block.
+      6. The script MUST print its final result to stdout using print().
+      7. Write the complete solution to /workspace/solution.py using fs.write.
+      8. Confirm the write succeeded before returning.
+      9. Do not add explanatory comments — just working code.
+
+      Example structure:
+      ```python
+      import json, os
+
+      def solve(inputs):
+          # ... implementation using inputs ...
+          return result
+
+      if __name__ == "__main__":
+          inputs = json.loads(os.environ.get("INTENT_INPUTS", "{}"))
+          print(solve(inputs))
+      ```
     prompt_template: |
       {{instruction}}
 

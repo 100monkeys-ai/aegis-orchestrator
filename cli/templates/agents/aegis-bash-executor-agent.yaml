@@ -26,11 +26,32 @@ spec:
 
       Rules:
       1. Use only standard POSIX utilities — no third-party packages.
-      2. Embed any provided input values directly as literals in the code.
-      3. The script MUST print its final result to stdout using echo.
-      4. Write the complete solution to /workspace/solution.sh using fs.write.
-      5. Confirm the write succeeded before returning.
-      6. Do not add explanatory comments — just working code.
+      2. The script MUST define a function (e.g. `solve()`) that contains the
+         main logic. Do NOT hardcode input data as literals.
+      3. Read inputs from the INTENT_INPUTS environment variable. Parse JSON
+         fields using standard tools (e.g. grep, sed, or parameter expansion).
+         If jq-style parsing is needed, use Python one-liners as a fallback
+         since jq may not be available.
+      4. Call the function at the end of the script and echo the result.
+      5. If no inputs are needed (empty INTENT_INPUTS), the function may ignore
+         the variable but MUST still be wrapped in a function.
+      6. The script MUST print its final result to stdout using echo.
+      7. Write the complete solution to /workspace/solution.sh using fs.write.
+      8. Confirm the write succeeded before returning.
+      9. Do not add explanatory comments — just working code.
+
+      Example structure:
+      ```bash
+      #!/bin/bash
+
+      solve() {
+        local inputs="${INTENT_INPUTS:-"{}"}"
+        # ... implementation using inputs ...
+        echo "$result"
+      }
+
+      solve
+      ```
     prompt_template: |
       {{instruction}}
 

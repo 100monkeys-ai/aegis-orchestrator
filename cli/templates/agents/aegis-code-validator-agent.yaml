@@ -1,0 +1,119 @@
+# Copyright (c) 2026 100monkeys.ai
+# SPDX-License-Identifier: AGPL-3.0
+
+apiVersion: 100monkeys.ai/v1
+kind: Agent
+metadata:
+  name: aegis-code-validator-agent
+  version: "1.0.0"
+  description: >-
+    Validates generated code is a reusable function that reads inputs from
+    the INTENT_INPUTS environment variable rather than hardcoding literals.
+    Returns structured JSON with a valid field used by workflow transition
+    conditions to gate execution.
+  labels:
+    role: judge
+    category: platform
+    builtin: "true"
+spec:
+  security_context: aegis-system-agent-runtime
+  runtime:
+    language: python
+    version: "3.11"
+    model: smart
+    isolation: inherit
+
+  task:
+    instruction: |
+      You are a code validation agent. Your job is to read the solution file
+      from the workspace and verify it meets the structural requirements for
+      the intent-to-execution pipeline.
+
+      Read the file at the path given in the input using fs.read, then evaluate
+      ALL of the following criteria:
+
+      1. FUNCTION STRUCTURE — The code MUST define a callable function (e.g.
+         `def solve(inputs):` in Python, `function solve(inputs)` in JavaScript,
+         `solve()` in bash). Top-level inline script logic without a function
+         wrapper is NOT acceptable.
+
+      2. NO HARDCODED DATA — If the INTENT_INPUTS value in the input is not
+         empty or "{}", the function MUST NOT hardcode the input values as
+         literals. It must read them from the environment.
+
+      3. INPUT CONSUMPTION — The code MUST read inputs from the INTENT_INPUTS
+         environment variable. Acceptable patterns:
+         - Python: os.environ["INTENT_INPUTS"] or os.environ.get("INTENT_INPUTS", "{}")
+         - JavaScript: process.env.INTENT_INPUTS
+         - Bash: $INTENT_INPUTS or ${INTENT_INPUTS}
+         If INTENT_INPUTS is empty or "{}" (no inputs provided), this criterion
+         is automatically satisfied.
+
+      4. STDOUT OUTPUT — The function MUST print its result to stdout (print(),
+         console.log(), echo).
+
+      5. STANDARD LIBRARY ONLY — No third-party imports or packages. Only
+         standard library modules are allowed.
+
+      After analysis, return ONLY a JSON object with this structure:
+      {
+        "valid": true or false,
+        "criteria": {
+          "function_structure": {"pass": true/false, "reason": "..."},
+          "no_hardcoded_data": {"pass": true/false, "reason": "..."},
+          "input_consumption": {"pass": true/false, "reason": "..."},
+          "stdout_output": {"pass": true/false, "reason": "..."},
+          "stdlib_only": {"pass": true/false, "reason": "..."}
+        },
+        "summary": "One sentence overall verdict"
+      }
+
+      Set "valid" to true ONLY if ALL five criteria pass.
+    prompt_template: |
+      {{instruction}}
+
+      ## File to validate:
+      {{intent}}
+
+      ## Input context:
+      {{input}}
+
+  execution:
+    mode: iterative
+    max_iterations: 1
+    llm_timeout_seconds: 60
+
+    validation:
+      - type: json_schema
+        schema:
+          type: object
+          required: [valid, criteria, summary]
+          properties:
+            valid:
+              type: boolean
+            criteria:
+              type: object
+              required:
+                - function_structure
+                - no_hardcoded_data
+                - input_consumption
+                - stdout_output
+                - stdlib_only
+            summary:
+              type: string
+              minLength: 10
+
+  tools:
+    - fs.read
+
+  security:
+    network:
+      mode: none
+    filesystem:
+      read:
+        - /workspace
+      write: []
+    resources:
+      cpu: 500
+      memory: 256Mi
+      timeout: 60s
