@@ -2668,6 +2668,7 @@ mod tests {
             volume_service: None,
             output_handler_service: None,
             fsal: None,
+            fuse_mount_client: None,
         };
 
         assert!(
