@@ -783,6 +783,20 @@ impl VolumeService for StandardVolumeService {
         size_limit_bytes: u64,
         ownership: VolumeOwnership,
     ) -> Result<()> {
+        // Idempotency guard: in multi-state workflows the same workspace volume
+        // is passed to every state transition.  The first state persists it; all
+        // subsequent states must skip the insert to avoid a unique-constraint
+        // violation (the volume_id is identical but the name includes the
+        // per-state execution_id, so it differs across states).
+        if let Ok(Some(_)) = self.repository.find_by_id(volume_id).await {
+            debug!(
+                %volume_id,
+                %name,
+                "Workspace volume already persisted — skipping duplicate insert"
+            );
+            return Ok(());
+        }
+
         info!(
             %volume_id,
             %name,
@@ -1457,5 +1471,66 @@ mod tests {
             } => assert_eq!(stored_path, &remote_path),
             other => panic!("unexpected backend variant: {other:?}"),
         }
+    }
+
+    /// Regression: calling persist_external_volume twice with the same volume_id
+    /// but a different name (as happens in multi-state workflows where each state
+    /// gets its own execution_id appended to the name) must succeed without error.
+    /// Before the fix, the second call hit a unique-constraint violation.
+    #[tokio::test]
+    async fn test_persist_external_volume_idempotent_across_states() {
+        let (service, repository, _storage_provider) = create_test_service();
+
+        let volume_id = VolumeId::new();
+        let tenant_id = TenantId::default();
+        let remote_path = format!("/aegis/volumes/{tenant_id}/{volume_id}");
+
+        let exec_id_1 = ExecutionId::new();
+        let exec_id_2 = ExecutionId::new();
+
+        // First state transition — persists the volume.
+        service
+            .persist_external_volume(
+                volume_id,
+                format!("workspace-{exec_id_1}"),
+                tenant_id.clone(),
+                remote_path.clone(),
+                256 * 1024 * 1024,
+                VolumeOwnership::Execution {
+                    execution_id: exec_id_1,
+                },
+            )
+            .await
+            .expect("first persist should succeed");
+
+        // Second state transition — same volume_id, different name & ownership.
+        service
+            .persist_external_volume(
+                volume_id,
+                format!("workspace-{exec_id_2}"),
+                tenant_id.clone(),
+                remote_path.clone(),
+                256 * 1024 * 1024,
+                VolumeOwnership::Execution {
+                    execution_id: exec_id_2,
+                },
+            )
+            .await
+            .expect("second persist with same volume_id must not fail");
+
+        // The original record should still be intact (idempotency — first write wins).
+        let volume = repository
+            .find_by_id(volume_id)
+            .await
+            .expect("repository error")
+            .expect("volume should exist");
+
+        assert_eq!(volume.id, volume_id);
+        // Name should be from the first persist (skip, not overwrite).
+        assert!(
+            volume.name.contains(&exec_id_1.to_string()),
+            "volume name should retain the first execution's name, got: {}",
+            volume.name
+        );
     }
 }
