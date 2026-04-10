@@ -970,6 +970,7 @@ impl AegisFSAL {
     }
 
     /// List directory contents (readdir)
+    #[allow(clippy::too_many_arguments)]
     pub async fn readdir(
         &self,
         execution_id: ExecutionId,
@@ -1031,6 +1032,7 @@ impl AegisFSAL {
     }
 
     /// Create a directory
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_directory(
         &self,
         execution_id: ExecutionId,
@@ -1091,6 +1093,7 @@ impl AegisFSAL {
     }
 
     /// Delete a file
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_file(
         &self,
         execution_id: ExecutionId,
@@ -1151,6 +1154,7 @@ impl AegisFSAL {
     }
 
     /// Delete a directory
+    #[allow(clippy::too_many_arguments)]
     pub async fn delete_directory(
         &self,
         execution_id: ExecutionId,

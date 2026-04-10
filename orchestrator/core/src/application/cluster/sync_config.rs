@@ -65,7 +65,7 @@ mod tests {
         ConfigLayerRepository, ConfigScope, ConfigSnapshot, ConfigType, MergedConfig,
         NodeClusterRepository, NodePeer, NodePeerStatus, ResourceSnapshot,
     };
-    use chrono::Utc;
+
     use std::collections::HashMap;
 
     /// Mock repository that records which tenant_id was passed to get_merged_config.

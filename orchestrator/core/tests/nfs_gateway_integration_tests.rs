@@ -533,6 +533,7 @@ async fn test_fsal_audit_events() {
                 emit_event: true,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id: None,
             },
         )
         .await

@@ -35,7 +35,7 @@ use std::sync::Arc;
 
 use aegis_orchestrator_core::application::ports::WorkflowEnginePort;
 use aegis_orchestrator_core::application::temporal_mapper::TemporalWorkflowDefinition;
-use aegis_orchestrator_core::domain::execution::ExecutionId;
+
 use async_trait::async_trait;
 
 // ---------------------------------------------------------------------------
