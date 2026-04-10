@@ -54,6 +54,10 @@ pub const AEGIS_OUTPUT_FORMATTER_AGENT_NAME: &str = "aegis-output-formatter-agen
 pub const AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/aegis-output-formatter-agent.yaml");
 
+pub const AEGIS_CODE_VALIDATOR_AGENT_NAME: &str = "aegis-code-validator-agent";
+pub const AEGIS_CODE_VALIDATOR_AGENT_TEMPLATE: &str =
+    include_str!("../../templates/agents/aegis-code-validator-agent.yaml");
+
 pub const AEGIS_PYTHON_EXECUTOR_AGENT_NAME: &str = "aegis-python-executor-agent";
 pub const AEGIS_PYTHON_EXECUTOR_AGENT_TEMPLATE: &str =
     include_str!("../../templates/agents/aegis-python-executor-agent.yaml");
@@ -94,6 +98,10 @@ pub const BUILTIN_AGENTS: &[(&str, &str)] = &[
     (
         AEGIS_OUTPUT_FORMATTER_AGENT_NAME,
         AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE,
+    ),
+    (
+        AEGIS_CODE_VALIDATOR_AGENT_NAME,
+        AEGIS_CODE_VALIDATOR_AGENT_TEMPLATE,
     ),
     (
         AEGIS_PYTHON_EXECUTOR_AGENT_NAME,
@@ -173,6 +181,11 @@ const BUILTIN_TEMPLATES: &[BuiltinTemplateSpec] = &[
         category: "agents",
         file_name: "aegis-output-formatter-agent.yaml",
         content: AEGIS_OUTPUT_FORMATTER_AGENT_TEMPLATE,
+    },
+    BuiltinTemplateSpec {
+        category: "agents",
+        file_name: "aegis-code-validator-agent.yaml",
+        content: AEGIS_CODE_VALIDATOR_AGENT_TEMPLATE,
     },
     BuiltinTemplateSpec {
         category: "agents",
