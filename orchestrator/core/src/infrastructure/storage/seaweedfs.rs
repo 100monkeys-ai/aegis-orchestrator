@@ -599,12 +599,24 @@ struct DirectoryStatus {
     file_count: u64,
 }
 
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Default + serde::Deserialize<'de>,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct DirectoryListing {
-    #[serde(rename = "Path")]
+    #[serde(rename = "Path", default)]
     path: String,
 
-    #[serde(rename = "Entries")]
+    #[serde(
+        rename = "Entries",
+        default,
+        deserialize_with = "deserialize_null_default"
+    )]
     entries: Vec<DirectoryEntry>,
 }
 
@@ -670,6 +682,38 @@ mod tests {
         let adapter = SeaweedFSAdapter::new(server.url());
         let result = adapter.get_usage("/tenant/vol").await;
         assert_eq!(result, Ok(0), "404 from /dir/status must yield Ok(0)");
+    }
+
+    // Regression tests for DirectoryListing deserialization
+
+    #[test]
+    fn test_directory_listing_null_entries_deserializes_to_empty_vec() {
+        // SeaweedFS returns "Entries": null for directories with no subdirectory listings
+        let json = r#"{"Path": "/foo", "Entries": null}"#;
+        let listing: DirectoryListing =
+            serde_json::from_str(json).expect("should deserialize when Entries is null");
+        assert_eq!(listing.path, "/foo");
+        assert!(listing.entries.is_empty());
+    }
+
+    #[test]
+    fn test_directory_listing_absent_entries_deserializes_to_empty_vec() {
+        // SeaweedFS may omit the Entries field entirely in some response variants
+        let json = r#"{"Path": "/foo"}"#;
+        let listing: DirectoryListing =
+            serde_json::from_str(json).expect("should deserialize when Entries is absent");
+        assert_eq!(listing.path, "/foo");
+        assert!(listing.entries.is_empty());
+    }
+
+    #[test]
+    fn test_directory_listing_absent_path_and_null_entries_deserializes() {
+        // SeaweedFS may omit Path and send null Entries in some response variants
+        let json = r#"{"Entries": null}"#;
+        let listing: DirectoryListing = serde_json::from_str(json)
+            .expect("should deserialize when Path is absent and Entries is null");
+        assert_eq!(listing.path, "");
+        assert!(listing.entries.is_empty());
     }
 
     // Integration tests require running SeaweedFS instance
