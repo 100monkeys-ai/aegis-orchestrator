@@ -157,34 +157,30 @@ pub struct ValidationContext {
 
 /// Extract the first JSON value from `text`, stripping markdown code fences.
 ///
-/// Looks first for a ` ```json ... ``` ` block, then a generic ` ``` ... ``` ` block.
-/// Returns the trimmed interior, or `None` if neither fence is found.
+/// Handles all common LLM fence patterns (case-insensitive language tags,
+/// extra backticks, leading/trailing prose). Returns the trimmed interior,
+/// or `None` if no fence block is found.
 pub fn extract_json_from_text(text: &str) -> Option<String> {
-    let json_marker = "```json";
-    if let Some(start) = text.find(json_marker) {
-        let content_start = start + json_marker.len();
-        if let Some(end_offset) = text[content_start..].find("```") {
-            return Some(
-                text[content_start..content_start + end_offset]
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
+    // Find the opening ``` (3+ backticks)
+    let fence_start = text.find("```")?;
+    let after_backticks = fence_start + 3;
 
-    let generic_marker = "```";
-    if let Some(start) = text.find(generic_marker) {
-        let content_start = start + generic_marker.len();
-        if let Some(end_offset) = text[content_start..].find("```") {
-            return Some(
-                text[content_start..content_start + end_offset]
-                    .trim()
-                    .to_string(),
-            );
-        }
-    }
+    // Skip any additional backticks (e.g. ```` or `````)
+    let rest = &text[after_backticks..];
+    let extra_backticks = rest.len() - rest.trim_start_matches('`').len();
+    let after_all_backticks = after_backticks + extra_backticks;
 
-    None
+    // Skip optional language tag + whitespace up to (and including) the first newline.
+    let content_start = if let Some(nl_offset) = text[after_all_backticks..].find('\n') {
+        after_all_backticks + nl_offset + 1
+    } else {
+        return None;
+    };
+
+    // Find the closing ``` fence
+    let closing_fence = text[content_start..].find("```")?;
+    let content = &text[content_start..content_start + closing_fence];
+    Some(content.trim().to_string())
 }
 
 /// Domain trait for gradient validators (ADR-017).
@@ -304,33 +300,40 @@ impl OutputGradientValidator {
         }
     }
 
-    /// Strip the first markdown code fence (` ```json … ``` ` or ` ``` … ``` `) from `text`.
+    /// Strip the first markdown code fence from `text`, returning the interior content.
     /// Returns `None` when no fence is found; callers should fall back to the original text.
+    ///
+    /// Handles all common LLM fence patterns:
+    /// - ` ```json\n{...}\n``` `  (standard, case-insensitive language tag)
+    /// - ` ``` json\n{...}\n``` ` (space before language tag)
+    /// - ` ```\n{...}\n``` `      (no language tag)
+    /// - Leading/trailing text outside the fence is ignored.
     ///
     /// LLMs commonly wrap structured output in fences even when instructed to emit raw JSON.
     /// Stripping here keeps `OutputGradientValidator` compatible with both raw and fenced output.
     fn strip_code_fence(text: &str) -> Option<String> {
-        if let Some(start) = text.find("```json") {
-            let content_start = start + "```json".len();
-            if let Some(end_offset) = text[content_start..].find("```") {
-                return Some(
-                    text[content_start..content_start + end_offset]
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-        if let Some(start) = text.find("```") {
-            let content_start = start + "```".len();
-            if let Some(end_offset) = text[content_start..].find("```") {
-                return Some(
-                    text[content_start..content_start + end_offset]
-                        .trim()
-                        .to_string(),
-                );
-            }
-        }
-        None
+        // Find the opening ``` (3+ backticks)
+        let fence_start = text.find("```")?;
+        let after_backticks = fence_start + 3;
+
+        // Skip any additional backticks (e.g. ```` or `````)
+        let rest = &text[after_backticks..];
+        let extra_backticks = rest.len() - rest.trim_start_matches('`').len();
+        let after_all_backticks = after_backticks + extra_backticks;
+
+        // Skip optional language tag + whitespace up to (and including) the first newline.
+        // The language tag is everything between the backticks and the first newline.
+        let content_start = if let Some(nl_offset) = text[after_all_backticks..].find('\n') {
+            after_all_backticks + nl_offset + 1
+        } else {
+            // No newline after opening fence — no valid fence block
+            return None;
+        };
+
+        // Find the closing ``` fence
+        let closing_fence = text[content_start..].find("```")?;
+        let content = &text[content_start..content_start + closing_fence];
+        Some(content.trim().to_string())
     }
 }
 
@@ -748,5 +751,149 @@ mod tests {
         let deserialized: ValidationSignal = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.category, "performance");
         assert_eq!(deserialized.score, 0.6);
+    }
+
+    // ── Code Fence Stripping (regression: markdown fences breaking JSON parsing) ──
+
+    #[test]
+    fn strip_code_fence_json_tag() {
+        let input = "```json\n{\"key\": \"value\"}\n```";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert_eq!(result.unwrap(), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn strip_code_fence_no_language_tag() {
+        let input = "```\n{\"key\": \"value\"}\n```";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert_eq!(result.unwrap(), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn strip_code_fence_uppercase_json_tag() {
+        // Regression: LLMs sometimes emit ```JSON instead of ```json
+        let input = "```JSON\n{\"key\": \"value\"}\n```";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert_eq!(result.unwrap(), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn strip_code_fence_with_leading_text() {
+        let input = "Here is the result:\n```json\n{\"key\": \"value\"}\n```\n";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert_eq!(result.unwrap(), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn strip_code_fence_multiline_json() {
+        // Regression test for the exact error scenario:
+        // "Validation score 0.00 below minimum 1.00: Output is not valid JSON:
+        //  expected ',' or '}' at line 18 column 71"
+        let json_body = r#"{
+  "analysis": {
+    "score": 0.95,
+    "reasoning": "The output meets all criteria",
+    "signals": [
+      {"category": "format", "score": 1.0, "message": "Valid JSON structure"},
+      {"category": "content", "score": 0.9, "message": "Content is relevant"}
+    ]
+  },
+  "metadata": {
+    "judge_id": "validator-agent",
+    "timestamp": "2026-04-09T12:00:00Z",
+    "model": "claude-sonnet-4-20250514",
+    "iteration": 1,
+    "execution_id": "exec-12345",
+    "additional_context": "This is a test with enough lines to reach line 18"
+  }
+}"#;
+        let fenced = format!("```json\n{}\n```", json_body);
+        let result = OutputGradientValidator::strip_code_fence(&fenced);
+        let stripped = result.unwrap();
+        // Must parse as valid JSON after stripping
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&stripped).is_ok(),
+            "Stripped content should be valid JSON but got: {stripped}"
+        );
+    }
+
+    #[test]
+    fn strip_code_fence_returns_none_without_fences() {
+        let input = "{\"key\": \"value\"}";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn strip_code_fence_with_space_before_language_tag() {
+        // Some LLMs emit ``` json instead of ```json
+        let input = "``` json\n{\"key\": \"value\"}\n```";
+        let result = OutputGradientValidator::strip_code_fence(input);
+        assert_eq!(result.unwrap(), "{\"key\": \"value\"}");
+    }
+
+    #[test]
+    fn extract_json_from_text_strips_fences() {
+        let input = "Some preamble\n```json\n{\"result\": true}\n```\nSome postamble";
+        let result = extract_json_from_text(input);
+        assert_eq!(result.unwrap(), "{\"result\": true}");
+    }
+
+    #[test]
+    fn extract_json_from_text_uppercase_tag() {
+        let input = "```JSON\n{\"result\": true}\n```";
+        let result = extract_json_from_text(input);
+        assert_eq!(result.unwrap(), "{\"result\": true}");
+    }
+
+    #[tokio::test]
+    async fn output_validator_passes_json_in_fences() {
+        // Regression: OutputGradientValidator must strip markdown fences before
+        // parsing and validating against JSON schema. Without stripping, the
+        // fence markers cause serde_json to report "Output is not valid JSON".
+        let schema = serde_json::json!({
+            "type": "object",
+            "required": ["result"],
+            "properties": {
+                "result": { "type": "boolean" }
+            }
+        });
+        let validator = OutputGradientValidator::new("json".to_string(), Some(schema), None);
+        let ctx = ValidationContext {
+            task: "test".to_string(),
+            output: "```json\n{\"result\": true}\n```".to_string(),
+            exit_code: 0,
+            stderr: String::new(),
+            worker_mounts: vec![],
+            policy_violations: vec![],
+            tool_trajectory: vec![],
+        };
+        let result = validator.validate(&ctx).await.unwrap();
+        assert_eq!(
+            result.score, 1.0,
+            "JSON in fences should pass validation but got: {}",
+            result.reasoning
+        );
+    }
+
+    #[tokio::test]
+    async fn output_validator_passes_json_in_uppercase_fences() {
+        // Regression: ```JSON tag (uppercase) was not stripped, causing parse failure.
+        let validator = OutputGradientValidator::new("json".to_string(), None, None);
+        let ctx = ValidationContext {
+            task: "test".to_string(),
+            output: "```JSON\n{\"key\": \"value\"}\n```".to_string(),
+            exit_code: 0,
+            stderr: String::new(),
+            worker_mounts: vec![],
+            policy_violations: vec![],
+            tool_trajectory: vec![],
+        };
+        let result = validator.validate(&ctx).await.unwrap();
+        assert_eq!(
+            result.score, 1.0,
+            "JSON in uppercase-tagged fences should pass validation but got: {}",
+            result.reasoning
+        );
     }
 }
