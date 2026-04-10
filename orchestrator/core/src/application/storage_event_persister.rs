@@ -169,7 +169,8 @@ mod tests {
 
         // Act: Publish storage event
         let event = StorageEvent::FileOpened {
-            execution_id: ExecutionId::new(),
+            execution_id: Some(ExecutionId::new()),
+            workflow_execution_id: None,
             volume_id: VolumeId::new(),
             path: "/workspace/test.txt".to_string(),
             open_mode: "read".to_string(),

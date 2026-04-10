@@ -1130,37 +1130,37 @@ impl StorageEventRepository for InMemoryStorageEventRepository {
                 match e {
                     StorageEvent::FileOpened {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FileRead {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FileWritten {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FileClosed {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::DirectoryListed {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FileCreated {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FileDeleted {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::PathTraversalBlocked {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::FilesystemPolicyViolation {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::QuotaExceeded {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                     StorageEvent::UnauthorizedVolumeAccess {
                         execution_id: eid, ..
-                    } => *eid == execution_id,
+                    } => *eid == Some(execution_id),
                 }
             })
             .cloned()
@@ -1241,19 +1241,19 @@ impl StorageEventRepository for InMemoryStorageEventRepository {
                         StorageEvent::PathTraversalBlocked {
                             execution_id: e_eid,
                             ..
-                        } => *e_eid == eid,
+                        } => *e_eid == Some(eid),
                         StorageEvent::FilesystemPolicyViolation {
                             execution_id: e_eid,
                             ..
-                        } => *e_eid == eid,
+                        } => *e_eid == Some(eid),
                         StorageEvent::QuotaExceeded {
                             execution_id: e_eid,
                             ..
-                        } => *e_eid == eid,
+                        } => *e_eid == Some(eid),
                         StorageEvent::UnauthorizedVolumeAccess {
                             execution_id: e_eid,
                             ..
-                        } => *e_eid == eid,
+                        } => *e_eid == Some(eid),
                         _ => false,
                     }
                 } else {

@@ -211,7 +211,11 @@ struct FuseFsal {
 impl FuseFsal {
     /// Get or create the root file handle for this volume.
     fn root_handle(&self) -> AegisFileHandle {
-        AegisFileHandle::new(self.context.execution_id, self.context.volume_id, "/")
+        if let Some(wf_id) = self.context.workflow_execution_id {
+            AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, "/")
+        } else {
+            AegisFileHandle::new(self.context.execution_id, self.context.volume_id, "/")
+        }
     }
 
     /// Resolve an inode to its (AegisFileHandle, path) pair.
@@ -517,11 +521,15 @@ impl Filesystem for FuseFsal {
 
         for entry in &entries {
             let entry_path = Self::child_path(&dir_path, &entry.name);
-            let child_handle = AegisFileHandle::new(
-                self.context.execution_id,
-                self.context.volume_id,
-                &entry_path,
-            );
+            let child_handle = if let Some(wf_id) = self.context.workflow_execution_id {
+                AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, &entry_path)
+            } else {
+                AegisFileHandle::new(
+                    self.context.execution_id,
+                    self.context.volume_id,
+                    &entry_path,
+                )
+            };
             let child_ino = self.inode_table.allocate(child_handle, entry_path);
             let kind = match entry.file_type {
                 FileType::File => FuseFileType::RegularFile,
@@ -664,11 +672,15 @@ impl Filesystem for FuseFsal {
             &self.context.policy,
         )) {
             Ok(()) => {
-                let handle = AegisFileHandle::new(
-                    self.context.execution_id,
-                    self.context.volume_id,
-                    &dir_path,
-                );
+                let handle = if let Some(wf_id) = self.context.workflow_execution_id {
+                    AegisFileHandle::new_for_workflow(wf_id, self.context.volume_id, &dir_path)
+                } else {
+                    AegisFileHandle::new(
+                        self.context.execution_id,
+                        self.context.volume_id,
+                        &dir_path,
+                    )
+                };
                 let child_ino = self.inode_table.allocate(handle, dir_path.clone());
 
                 let attr = FileAttr {

@@ -816,7 +816,8 @@ mod tests {
         assert_eq!(first.execution_id, Some(execution_id));
 
         event_bus.publish_storage_event(StorageEvent::FileOpened {
-            execution_id,
+            execution_id: Some(execution_id),
+            workflow_execution_id: None,
             volume_id: crate::domain::volume::VolumeId::new(),
             path: "/workspace/file.rs".to_string(),
             open_mode: "read".to_string(),
@@ -879,7 +880,8 @@ mod tests {
         let _ = stream.next().await.unwrap().unwrap();
 
         event_bus.publish_storage_event(StorageEvent::FilesystemPolicyViolation {
-            execution_id,
+            execution_id: Some(execution_id),
+            workflow_execution_id: None,
             volume_id: crate::domain::volume::VolumeId::new(),
             operation: "write".to_string(),
             path: "/workspace/secret.txt".to_string(),

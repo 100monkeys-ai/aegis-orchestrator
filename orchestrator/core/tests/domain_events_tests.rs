@@ -120,7 +120,8 @@ fn execution_id_returns_some_for_storage_event() {
     let eid = ExecutionId::new();
     let vid = VolumeId::new();
     let event = DomainEvent::Storage(StorageEvent::FileOpened {
-        execution_id: eid,
+        execution_id: Some(eid),
+        workflow_execution_id: None,
         volume_id: vid,
         path: "/workspace/main.py".to_string(),
         open_mode: "read".to_string(),
@@ -657,7 +658,8 @@ fn storage_event_file_written_serde_roundtrip() {
     let eid = ExecutionId::new();
     let vid = VolumeId::new();
     let event = StorageEvent::FileWritten {
-        execution_id: eid,
+        execution_id: Some(eid),
+        workflow_execution_id: None,
         volume_id: vid,
         path: "/workspace/output.txt".to_string(),
         offset: 0,
@@ -686,7 +688,8 @@ fn storage_event_file_written_serde_roundtrip() {
 fn storage_event_path_traversal_blocked_serde_roundtrip() {
     let eid = ExecutionId::new();
     let event = StorageEvent::PathTraversalBlocked {
-        execution_id: eid,
+        execution_id: Some(eid),
+        workflow_execution_id: None,
         attempted_path: "../../../etc/passwd".to_string(),
         blocked_at: Utc::now(),
     };
@@ -705,7 +708,8 @@ fn storage_event_quota_exceeded_serde_roundtrip() {
     let eid = ExecutionId::new();
     let vid = VolumeId::new();
     let event = StorageEvent::QuotaExceeded {
-        execution_id: eid,
+        execution_id: Some(eid),
+        workflow_execution_id: None,
         volume_id: vid,
         requested_bytes: 10_000_000,
         available_bytes: 500_000,

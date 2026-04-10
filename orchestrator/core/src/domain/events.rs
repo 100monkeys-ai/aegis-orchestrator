@@ -134,7 +134,12 @@ pub enum ImageManagementEvent {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StorageEvent {
     FileOpened {
-        execution_id: ExecutionId,
+        /// Agent execution that performed this operation. Mutually exclusive with
+        /// `workflow_execution_id` — exactly one must be `Some`.
+        execution_id: Option<ExecutionId>,
+        /// Workflow execution that performed this operation (ContainerStep FUSE path).
+        /// Mutually exclusive with `execution_id` — exactly one must be `Some`.
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         open_mode: String, // "read", "write", "read-write", "create"
@@ -145,7 +150,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     FileRead {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         offset: u64,
@@ -158,7 +164,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     FileWritten {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         offset: u64,
@@ -171,7 +178,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     FileClosed {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         closed_at: DateTime<Utc>,
@@ -181,7 +189,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     DirectoryListed {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         entry_count: usize,
@@ -192,7 +201,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     FileCreated {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         created_at: DateTime<Utc>,
@@ -202,7 +212,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     FileDeleted {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         path: String,
         deleted_at: DateTime<Utc>,
@@ -212,12 +223,14 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     PathTraversalBlocked {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         attempted_path: String,
         blocked_at: DateTime<Utc>,
     },
     FilesystemPolicyViolation {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         operation: String, // "read", "write", "delete"
         path: String,
@@ -229,7 +242,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     QuotaExceeded {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         requested_bytes: u64,
         available_bytes: u64,
@@ -240,7 +254,8 @@ pub enum StorageEvent {
         host_node_id: Option<NodeId>,
     },
     UnauthorizedVolumeAccess {
-        execution_id: ExecutionId,
+        execution_id: Option<ExecutionId>,
+        workflow_execution_id: Option<uuid::Uuid>,
         volume_id: VolumeId,
         attempted_at: DateTime<Utc>,
         /// Node that initiated the cross-node RPC (`None` for local operations).
