@@ -32,7 +32,7 @@ use crate::infrastructure::event_bus::EventBus;
 use crate::infrastructure::secrets_manager::SecretsManager;
 use anyhow::anyhow;
 use async_trait::async_trait;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::Utc;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -76,6 +76,7 @@ pub trait CredentialManagementService: Send + Sync {
         label: String,
         scope: CredentialScope,
         api_key_value: SensitiveString,
+        tags: Option<serde_json::Value>,
     ) -> anyhow::Result<CredentialBindingId>;
 
     /// Begin an OAuth2 PKCE authorisation flow for `provider`.
@@ -210,6 +211,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
         label: String,
         scope: CredentialScope,
         api_key_value: SensitiveString,
+        tags: Option<serde_json::Value>,
     ) -> anyhow::Result<CredentialBindingId> {
         let binding_id = CredentialBindingId::new();
         let secret_path = user_credential_path(tenant_id, owner_user_id, &binding_id);
@@ -238,7 +240,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
             status: CredentialStatus::Active,
             metadata: CredentialMetadata {
                 label,
-                tags: None,
+                tags,
                 service_url: None,
                 external_account_id: None,
                 oauth_scopes: None,

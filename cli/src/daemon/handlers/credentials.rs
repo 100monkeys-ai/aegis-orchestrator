@@ -33,10 +33,10 @@ use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
 use aegis_orchestrator_core::domain::tenant::TenantId;
 use axum::{
+    Json,
     extract::{Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -124,6 +124,8 @@ pub(crate) struct StoreApiKeyRequest {
     pub(crate) scope: Option<String>,
     /// The raw API key value — treated as sensitive
     pub(crate) value: String,
+    /// Arbitrary key/value tags for filtering and organisation.
+    pub(crate) tags: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -390,6 +392,7 @@ pub(crate) async fn store_api_key_handler(
             payload.label,
             scope,
             SensitiveString::new(&payload.value),
+            payload.tags,
         )
         .await
     {
