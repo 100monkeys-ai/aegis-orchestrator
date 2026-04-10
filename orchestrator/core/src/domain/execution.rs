@@ -174,6 +174,12 @@ pub struct Execution {
     /// Security context name governing tool access for this execution (ADR-083).
     #[serde(default = "default_security_context_name")]
     pub security_context_name: String,
+
+    /// The `sub` claim of the user who initiated this execution, if available.
+    /// Used by the dispatch gateway to reconstruct a minimal `UserIdentity` for
+    /// user-scoped rate limiting (ADR-072) when the agent runtime calls back in.
+    #[serde(default)]
+    pub initiating_user_sub: Option<String>,
 }
 
 fn default_container_uid() -> u32 {
@@ -360,6 +366,7 @@ impl Execution {
             container_gid: 1000,
             hierarchy: ExecutionHierarchy::root(id),
             security_context_name,
+            initiating_user_sub: None,
         }
     }
 
@@ -389,6 +396,7 @@ impl Execution {
             container_gid: 1000,
             hierarchy,
             security_context_name: parent.security_context_name.clone(),
+            initiating_user_sub: parent.initiating_user_sub.clone(),
         })
     }
 

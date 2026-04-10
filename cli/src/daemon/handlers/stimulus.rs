@@ -16,7 +16,7 @@
 //! - Return `503 Service Unavailable` if stimulus service is not wired in app state
 
 use axum::{
-    extract::{Request, State},
+    extract::{Extension, Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     Json,
@@ -28,6 +28,7 @@ use tracing::warn;
 
 use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::stimulus::StimulusError;
+use aegis_orchestrator_core::domain::iam::UserIdentity;
 use aegis_orchestrator_core::domain::stimulus::{Stimulus, StimulusSource};
 use aegis_orchestrator_core::presentation::webhook_guard::WebhookHmacGuard;
 
@@ -88,6 +89,7 @@ fn workflow_execution_logs_location(workflow_execution_id: &str) -> String {
 /// Returns `202 Accepted` with `{ stimulus_id, workflow_execution_id }`.
 pub(crate) async fn ingest_stimulus_handler(
     State(state): State<Arc<AppState>>,
+    identity: Option<Extension<UserIdentity>>,
     headers: HeaderMap,
     Json(body): Json<IngestStimulusBody>,
 ) -> impl IntoResponse {
@@ -110,7 +112,8 @@ pub(crate) async fn ingest_stimulus_handler(
         stimulus
     };
 
-    match stimulus_service.ingest(stimulus).await {
+    let caller_identity = identity.map(|ext| ext.0);
+    match stimulus_service.ingest(stimulus, caller_identity).await {
         Ok(resp) => {
             let location = workflow_execution_logs_location(&resp.workflow_execution_id);
             let mut response_headers = HeaderMap::new();
@@ -185,7 +188,7 @@ pub(crate) async fn webhook_handler(
     )
     .with_headers(axum_headers_to_map(&headers));
 
-    match stimulus_service.ingest(stimulus).await {
+    match stimulus_service.ingest(stimulus, None).await {
         Ok(resp) => {
             let location = workflow_execution_logs_location(&resp.workflow_execution_id);
             let mut response_headers = HeaderMap::new();

@@ -197,7 +197,7 @@ fn spawn_sensor_loop(
                 }
                 Some(stimulus) => {
                     let stimulus_id = stimulus.id;
-                    match stimulus_service.ingest(stimulus).await {
+                    match stimulus_service.ingest(stimulus, None).await {
                         Ok(resp) => {
                             info!(
                                 sensor = %sensor_name,

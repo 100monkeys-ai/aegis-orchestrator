@@ -1464,7 +1464,7 @@ impl AegisRuntimeService {
             .with_headers(headers)
             .with_idempotency_key(idempotency_key);
 
-        match stimulus_service.ingest(stimulus).await {
+        match stimulus_service.ingest(stimulus, None).await {
             Ok(resp) => Ok((resp.stimulus_id.to_string(), resp.workflow_execution_id)),
             Err(e) => {
                 use crate::application::stimulus::StimulusError;
@@ -2543,6 +2543,7 @@ mod tests {
             container_uid: 1000,
             container_gid: 1000,
             security_context_name: "aegis-system-operator".to_string(),
+            initiating_user_sub: None,
         };
         let execution_service = Arc::new(TestExecutionService {
             execution_id,

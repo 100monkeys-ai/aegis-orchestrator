@@ -103,9 +103,9 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 current_iteration, max_iterations, final_output, error_message,
                 container_uid, container_gid,
                 started_at, completed_at, parent_execution_id,
-                security_context_name
+                security_context_name, initiating_user_sub
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (id) DO UPDATE SET
                 tenant_id = EXCLUDED.tenant_id,
                 status = EXCLUDED.status,
@@ -117,7 +117,8 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 container_gid = EXCLUDED.container_gid,
                 completed_at = EXCLUDED.completed_at,
                 parent_execution_id = EXCLUDED.parent_execution_id,
-                security_context_name = EXCLUDED.security_context_name
+                security_context_name = EXCLUDED.security_context_name,
+                initiating_user_sub = EXCLUDED.initiating_user_sub
             "#,
         )
         .bind(execution.id.0)
@@ -136,6 +137,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
         .bind(execution.ended_at)
         .bind(parent_execution_id)
         .bind(&execution.security_context_name)
+        .bind(&execution.initiating_user_sub)
         .execute(&self.pool)
         .await
         .map_err(|e| RepositoryError::Database(format!("Failed to save execution: {e}")))?;
@@ -154,7 +156,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message,
-                parent_execution_id, security_context_name
+                parent_execution_id, security_context_name, initiating_user_sub
             FROM executions
             WHERE tenant_id = $1 AND id = $2
             "#,
@@ -179,6 +181,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -255,6 +258,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error: error_message,
                 hierarchy,
                 security_context_name,
+                initiating_user_sub,
             }))
         } else {
             Ok(None)
@@ -273,7 +277,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id,
-                security_context_name
+                security_context_name, initiating_user_sub
             FROM executions
             WHERE tenant_id = $1 AND agent_id = $2
             ORDER BY started_at DESC
@@ -303,6 +307,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -368,6 +373,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error: error_message,
                 hierarchy,
                 security_context_name,
+                initiating_user_sub,
             });
         }
 
@@ -386,7 +392,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 e.id, e.agent_id, e.input, e.status, e.iterations, e.max_iterations,
                 e.container_uid, e.container_gid,
                 e.started_at, e.completed_at, e.error_message, e.parent_execution_id,
-                e.security_context_name
+                e.security_context_name, e.initiating_user_sub
             FROM executions e
             INNER JOIN workflow_executions we ON e.workflow_execution_id = we.id
             WHERE e.tenant_id = $1 AND we.workflow_id = $2
@@ -416,6 +422,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -481,6 +488,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error: error_message,
                 hierarchy,
                 security_context_name,
+                initiating_user_sub,
             });
         }
 
@@ -498,7 +506,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message, parent_execution_id,
-                security_context_name
+                security_context_name, initiating_user_sub
             FROM executions
             WHERE tenant_id = $1
             ORDER BY started_at DESC
@@ -526,6 +534,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let status = match status_str.as_str() {
                 "pending" => Ok(ExecutionStatus::Pending),
@@ -591,6 +600,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error: error_message,
                 hierarchy,
                 security_context_name,
+                initiating_user_sub,
             });
         }
         Ok(executions)
@@ -641,7 +651,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 id, tenant_id, agent_id, input, status, iterations, max_iterations,
                 container_uid, container_gid,
                 started_at, completed_at, error_message,
-                parent_execution_id, security_context_name
+                parent_execution_id, security_context_name, initiating_user_sub
             FROM executions
             WHERE id = $1
             "#,
@@ -666,6 +676,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
             let error_message: Option<String> = row.get("error_message");
             let parent_execution_id: Option<uuid::Uuid> = row.get("parent_execution_id");
             let security_context_name: String = row.get("security_context_name");
+            let initiating_user_sub: Option<String> = row.get("initiating_user_sub");
 
             let tenant_id = TenantId::from_string(&tenant_id_str).map_err(|e| {
                 RepositoryError::Serialization(format!("Invalid tenant_id in database: {e}"))
@@ -734,6 +745,7 @@ impl ExecutionRepository for PostgresExecutionRepository {
                 error: error_message,
                 hierarchy,
                 security_context_name,
+                initiating_user_sub,
             }))
         } else {
             Ok(None)

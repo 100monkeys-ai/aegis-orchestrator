@@ -2065,6 +2065,9 @@ impl StandardExecutionService {
         };
         let execution_id = execution.id;
 
+        // Persist the initiating user's sub for later recovery by the dispatch gateway.
+        execution.initiating_user_sub = identity.map(|id| id.sub.clone());
+
         // 3. Save initial state
         self.repository
             .save_for_tenant(&tenant_id, &execution)

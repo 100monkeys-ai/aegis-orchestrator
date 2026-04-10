@@ -11,7 +11,7 @@ use axum::Json;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::execution::ExecutionService;
-use aegis_orchestrator_core::domain::iam::IdentityKind;
+use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
 use aegis_orchestrator_core::infrastructure::TemporalEventPayload;
 
 use crate::daemon::state::AppState;
@@ -40,26 +40,41 @@ pub(crate) async fn dispatch_gateway_handler(
         }
     };
 
-    // Resolve agent_id for event logging and inner loop request
-    let agent_id = if let Some(exec_id) = exec_id_opt {
+    // Resolve agent_id and initiating user identity from the execution record.
+    let (agent_id, user_identity) = if let Some(exec_id) = exec_id_opt {
         let execution_id = aegis_orchestrator_core::domain::execution::ExecutionId(exec_id);
         if let Ok(exec) = state
             .execution_service
             .get_execution_unscoped(execution_id)
             .await
         {
-            exec.agent_id
+            let identity = exec.initiating_user_sub.as_ref().map(|sub| UserIdentity {
+                sub: sub.clone(),
+                realm_slug: "zaru-consumer".to_string(),
+                email: None,
+                identity_kind: IdentityKind::ConsumerUser {
+                    zaru_tier: ZaruTier::Free,
+                    tenant_id: exec.tenant_id.clone(),
+                },
+            });
+            (exec.agent_id, identity)
         } else {
             tracing::warn!("Could not find execution {} for LLM event", exec_id);
-            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
+            (
+                aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
+                None,
+            )
         }
     } else {
-        aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil())
+        (
+            aegis_orchestrator_core::domain::agent::AgentId(Uuid::nil()),
+            None,
+        )
     };
 
     match state
         .inner_loop_service
-        .handle_agent_message(agent_msg)
+        .handle_agent_message_with_identity(agent_msg, user_identity, None)
         .await
     {
         Ok(OrchestratorMessage::Final {

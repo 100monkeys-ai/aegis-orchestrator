@@ -114,13 +114,21 @@ pub trait StimulusService: Send + Sync {
     /// Returns `StimulusIngestResponse` on success containing the `stimulus_id` and
     /// the newly created `workflow_execution_id`.
     ///
+    /// `identity` should be `Some` for requests authenticated via IAM/OIDC JWT so that
+    /// user-scoped rate limit counters are written in addition to tenant-scoped ones.
+    /// Pass `None` for webhook/sensor/gRPC callers that carry no user identity.
+    ///
     /// # Errors
     ///
     /// - `LowConfidence` — RouterAgent returned confidence below threshold
     /// - `NoRouterConfigured` — No direct route and no RouterAgent wired
     /// - `IdempotentDuplicate` — Identical `(source, idempotency_key)` already processed
     /// - `RouterAgentFailed` — The RouterAgent execution itself failed
-    async fn ingest(&self, stimulus: Stimulus) -> Result<StimulusIngestResponse, StimulusError>;
+    async fn ingest(
+        &self,
+        stimulus: Stimulus,
+        identity: Option<crate::domain::iam::UserIdentity>,
+    ) -> Result<StimulusIngestResponse, StimulusError>;
 
     /// Register a direct route: `(tenant_id, source_name) → workflow_id`.
     ///
@@ -432,7 +440,11 @@ impl StandardStimulusService {
 
 #[async_trait]
 impl StimulusService for StandardStimulusService {
-    async fn ingest(&self, stimulus: Stimulus) -> Result<StimulusIngestResponse, StimulusError> {
+    async fn ingest(
+        &self,
+        stimulus: Stimulus,
+        identity: Option<crate::domain::iam::UserIdentity>,
+    ) -> Result<StimulusIngestResponse, StimulusError> {
         let start = std::time::Instant::now();
 
         // ── 1. Idempotency check ──────────────────────────────────────────────
@@ -520,7 +532,7 @@ impl StimulusService for StandardStimulusService {
 
         let started = self
             .start_workflow_use_case
-            .start_execution(workflow_request)
+            .start_execution_for_tenant(&stimulus_tenant_id, workflow_request, identity.as_ref())
             .await
             .map_err(|e| {
                 metrics::counter!("aegis_stimuli_rejected_total", "reason" => "workflow_error")
@@ -754,6 +766,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingStartWorkflowUseCase {
         calls: Mutex<Vec<StartWorkflowExecutionRequest>>,
+        identities: Mutex<Vec<Option<crate::domain::iam::UserIdentity>>>,
         response_execution_id: String,
     }
 
@@ -761,12 +774,17 @@ mod tests {
         fn new(response_execution_id: &str) -> Self {
             Self {
                 calls: Mutex::new(Vec::new()),
+                identities: Mutex::new(Vec::new()),
                 response_execution_id: response_execution_id.to_string(),
             }
         }
 
         fn calls(&self) -> Vec<StartWorkflowExecutionRequest> {
             self.calls.lock().unwrap().clone()
+        }
+
+        fn recorded_identities(&self) -> Vec<Option<crate::domain::iam::UserIdentity>> {
+            self.identities.lock().unwrap().clone()
         }
     }
 
@@ -776,9 +794,10 @@ mod tests {
             &self,
             _tenant_id: &TenantId,
             request: StartWorkflowExecutionRequest,
-            _identity: Option<&crate::domain::iam::UserIdentity>,
+            identity: Option<&crate::domain::iam::UserIdentity>,
         ) -> Result<StartedWorkflowExecution> {
             self.calls.lock().unwrap().push(request.clone());
+            self.identities.lock().unwrap().push(identity.cloned());
             Ok(StartedWorkflowExecution {
                 execution_id: self.response_execution_id.clone(),
                 workflow_id: request.workflow_id.clone(),
@@ -848,7 +867,7 @@ mod tests {
             std::collections::HashMap::from([("x-github-event".to_string(), "issues".to_string())]),
         );
 
-        let response = service.ingest(stimulus.clone()).await.unwrap();
+        let response = service.ingest(stimulus.clone(), None).await.unwrap();
 
         assert_eq!(response.workflow_execution_id, "wf-exec-123");
         assert!(execution_service.start_calls().is_empty());
@@ -899,7 +918,7 @@ mod tests {
         );
 
         let stimulus = make_stimulus("github", "payload");
-        let error = service.ingest(stimulus.clone()).await.unwrap_err();
+        let error = service.ingest(stimulus.clone(), None).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -945,7 +964,7 @@ mod tests {
             )]),
         );
 
-        let error = service.ingest(stimulus.clone()).await.unwrap_err();
+        let error = service.ingest(stimulus.clone(), None).await.unwrap_err();
 
         assert!(matches!(
             error,
@@ -1001,7 +1020,7 @@ mod tests {
             std::collections::HashMap::from([("x-tenant-id".to_string(), "tenant-99".to_string())]),
         );
 
-        let response = service.ingest(stimulus.clone()).await.unwrap();
+        let response = service.ingest(stimulus.clone(), None).await.unwrap();
 
         assert_eq!(response.workflow_execution_id, "wf-exec-456");
         let execution_calls = execution_service.start_calls();
@@ -1051,8 +1070,8 @@ mod tests {
             .with_idempotency_ttl(Duration::from_secs(300));
 
         let stimulus = make_stimulus("github", "payload").with_idempotency_key("dup-1");
-        let first = service.ingest(stimulus.clone()).await.unwrap();
-        let second = service.ingest(stimulus).await.unwrap_err();
+        let first = service.ingest(stimulus.clone(), None).await.unwrap();
+        let second = service.ingest(stimulus, None).await.unwrap_err();
 
         assert_eq!(starter.calls().len(), 1);
         assert!(matches!(
@@ -1068,5 +1087,49 @@ mod tests {
         }
         assert_eq!(event_count, 2);
         assert!(matches!(receiver.try_recv(), Err(EventBusError::Empty)));
+    }
+
+    /// Regression test: identity passed to `ingest()` must be forwarded to
+    /// `start_execution_for_tenant` so that user-scoped rate limit counters are
+    /// written.  Previously `ingest()` accepted no identity parameter and called
+    /// the identity-free `start_execution()` convenience method, causing
+    /// `scope_type="user"` rows to never be written.
+    #[tokio::test]
+    async fn ingest_with_identity_forwards_identity_to_workflow_use_case() {
+        use crate::domain::iam::{IdentityKind, UserIdentity, ZaruTier};
+
+        let workflow_id = make_workflow_id();
+        let mut registry = WorkflowRegistry::new(None);
+        registry
+            .register_route(&TenantId::consumer(), "api", workflow_id)
+            .unwrap();
+
+        let execution_service = Arc::new(RecordingExecutionService::default());
+        let starter = Arc::new(RecordingStartWorkflowUseCase::new("wf-exec-id-threaded"));
+        let event_bus = EventBus::new(8);
+        let service = build_service(registry, execution_service, starter.clone(), event_bus);
+
+        let identity = UserIdentity {
+            sub: "user-sub-abc123".to_string(),
+            realm_slug: "zaru-consumer".to_string(),
+            email: Some("user@example.com".to_string()),
+            identity_kind: IdentityKind::ConsumerUser {
+                zaru_tier: ZaruTier::Pro,
+                tenant_id: TenantId::consumer(),
+            },
+        };
+
+        let stimulus = make_stimulus("api", "{\"event\":\"test\"}");
+        let response = service
+            .ingest(stimulus, Some(identity.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(response.workflow_execution_id, "wf-exec-id-threaded");
+
+        let identities = starter.recorded_identities();
+        assert_eq!(identities.len(), 1);
+        let forwarded = identities[0].as_ref().expect("identity must be forwarded");
+        assert_eq!(forwarded.sub, "user-sub-abc123");
     }
 }
