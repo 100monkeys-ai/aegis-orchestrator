@@ -35,11 +35,12 @@ spec:
       5. If no inputs are needed (empty INTENT_INPUTS), the function may take no
          parameters but MUST still be wrapped in a function + main block.
       6. The script MUST print its final result to stdout using print().
-      7. The INTENT_INPUTS environment variable contains a JSON object with the
-         caller's input values. Your solve() function receives this parsed JSON
-         dict as its argument. The INTENT_INPUTS JSON string is shown in your
-         prompt. Use its EXACT top-level keys in your code — do NOT assume
-         wrapper keys like "data" unless they are explicitly present in the JSON.
+      7. The `inputs` parameter passed to your `solve()` function IS the parsed
+         INTENT_INPUTS JSON — use it directly. Do NOT call `.get("data", {})`
+         or unwrap any sub-key. Iterate `inputs` itself.
+         Example: if INTENT_INPUTS is {"engineering": {...}, "design": {...}},
+         then `for category, scores in inputs.items():` — NOT
+         `data = inputs.get("data", {})`.
       8. Write the complete solution to /workspace/solution.py using fs.write.
       9. Confirm the write succeeded before returning.
       10. Do not add explanatory comments — just working code.
