@@ -493,7 +493,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
 
         let attrs = self
             .fsal
-            .getattr(execution_id, volume_id, &req.path, 0, 0)
+            .getattr(execution_id, volume_id, &req.path, 0, 0, None)
             .await
             .map_err(Self::fsal_err_to_status)?;
 
@@ -529,6 +529,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &policy,
                 Some(caller_node_id),
                 Some(self.host_node_id),
+                None,
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -566,6 +567,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 emit_event: true,
                 caller_node_id: Some(caller_node_id),
                 host_node_id: Some(self.host_node_id),
+                workflow_execution_id: None,
             })
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -613,6 +615,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 &policy,
                 Some(caller_node_id),
                 Some(self.host_node_id),
+                None,
             )
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -639,6 +642,7 @@ impl RemoteStorageService for RemoteStorageServiceHandler {
                 policy: &policy,
                 caller_node_id: Some(caller_node_id),
                 host_node_id: Some(self.host_node_id),
+                workflow_execution_id: None,
             })
             .await
             .map_err(Self::fsal_err_to_status)?;
@@ -903,6 +907,7 @@ mod tests {
                 &RemoteStorageServiceHandler::system_policy(),
                 None,
                 None,
+                None,
             )
             .await;
 
@@ -938,6 +943,7 @@ mod tests {
             volume_id,
             "/workspace/testdir",
             &RemoteStorageServiceHandler::system_policy(),
+            None,
             None,
             None,
         )

@@ -63,6 +63,7 @@ pub async fn invoke_fs_tool(
                     emit_event: false,
                     caller_node_id: None,
                     host_node_id: None,
+                    workflow_execution_id: None,
                 })
                 .await
                 .map_err(|e| {
@@ -107,6 +108,7 @@ pub async fn invoke_fs_tool(
                     &vol_ctx.policy,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| SealSessionError::InternalError(format!("FSAL readdir error: {e}")))?;
@@ -137,6 +139,7 @@ pub async fn invoke_fs_tool(
                 &vol_ctx.policy,
                 None,
                 None,
+                None,
             )
             .await
             .map_err(|e| SealSessionError::InternalError(format!("FSAL create_dir error: {e}")))?;
@@ -161,6 +164,7 @@ pub async fn invoke_fs_tool(
                     &vol_ctx.policy,
                     None,
                     None,
+                    None,
                 )
                 .await
                 .map_err(|e| {
@@ -172,6 +176,7 @@ pub async fn invoke_fs_tool(
                     vol_ctx.volume_id,
                     &path,
                     &vol_ctx.policy,
+                    None,
                     None,
                     None,
                 )
@@ -320,6 +325,7 @@ async fn invoke_multi_edit(
             emit_event: false,
             caller_node_id: None,
             host_node_id: None,
+            workflow_execution_id: None,
         })
         .await
         .map_err(|e| {
@@ -368,6 +374,7 @@ async fn invoke_grep(
                 vol_ctx.volume_id,
                 &current_dir,
                 &vol_ctx.policy,
+                None,
                 None,
                 None,
             )
@@ -452,6 +459,7 @@ async fn invoke_glob(
                 vol_ctx.volume_id,
                 &current_dir,
                 &vol_ctx.policy,
+                None,
                 None,
                 None,
             )

@@ -258,6 +258,7 @@ pub struct RenameFsalRequest<'a> {
     pub policy: &'a FsalAccessPolicy,
     pub caller_node_id: Option<NodeId>,
     pub host_node_id: Option<NodeId>,
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 /// Parameters for [`AegisFSAL::create_file`].
@@ -272,6 +273,7 @@ pub struct CreateFsalFileRequest<'a> {
     pub emit_event: bool,
     pub caller_node_id: Option<NodeId>,
     pub host_node_id: Option<NodeId>,
+    pub workflow_execution_id: Option<uuid::Uuid>,
 }
 
 /// Provenance context for a filesystem policy violation event.
@@ -864,10 +866,13 @@ impl AegisFSAL {
             emit_event,
             caller_node_id,
             host_node_id,
+            workflow_execution_id,
         } = req;
 
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -940,9 +945,12 @@ impl AegisFSAL {
         path: &str,
         container_uid: u32,
         container_gid: u32,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<FileAttributes, FsalError> {
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -970,9 +978,12 @@ impl AegisFSAL {
         policy: &FsalAccessPolicy,
         caller_node_id: Option<NodeId>,
         host_node_id: Option<NodeId>,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<Vec<DirEntry>, FsalError> {
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -1028,9 +1039,12 @@ impl AegisFSAL {
         policy: &FsalAccessPolicy,
         caller_node_id: Option<NodeId>,
         host_node_id: Option<NodeId>,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -1085,9 +1099,12 @@ impl AegisFSAL {
         policy: &FsalAccessPolicy,
         caller_node_id: Option<NodeId>,
         host_node_id: Option<NodeId>,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path — NFS paths are volume-local (root = "/")
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -1142,9 +1159,12 @@ impl AegisFSAL {
         policy: &FsalAccessPolicy,
         caller_node_id: Option<NodeId>,
         host_node_id: Option<NodeId>,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize path
         let canonical = self.path_sanitizer.canonicalize(path, Some("/"))?;
@@ -1200,10 +1220,13 @@ impl AegisFSAL {
             policy,
             caller_node_id,
             host_node_id,
+            workflow_execution_id,
         } = req;
 
         // 1. Authorize
-        let volume = self.authorize(execution_id, volume_id).await?;
+        let volume = self
+            .authorize_inner(Some(execution_id), workflow_execution_id, volume_id)
+            .await?;
 
         // 2. Sanitize both paths
         let from_canonical = self.path_sanitizer.canonicalize(from_path, Some("/"))?;
@@ -1850,6 +1873,56 @@ mod tests {
         assert!(
             matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
             "should deny without volume context lookup: {:?}",
+            result
+        );
+    }
+
+    /// Regression: getattr with workflow_execution_id set should authorize
+    /// against a WorkflowExecution-owned volume via authorize_inner, not
+    /// via the agent-only authorize() path that always passes None.
+    /// This was the root cause of the FUSE daemon failing to access
+    /// workflow-owned volumes through the FsalService gRPC RPCs.
+    #[tokio::test]
+    async fn test_getattr_with_workflow_execution_id_authorizes_workflow_volume() {
+        use parking_lot::RwLock;
+        use std::collections::HashMap;
+
+        let wf_id = uuid::Uuid::new_v4();
+        let vol = make_workflow_volume(wf_id);
+        let vol_id = vol.id;
+
+        let repo = Arc::new(InMemoryVolumeRepository::new());
+        repo.save(&vol).await.unwrap();
+
+        // No VolumeContextLookup needed — the workflow_execution_id is passed
+        // directly through the getattr call, so authorize_inner gets it
+        // without needing the NFS registry fallback.
+        let fsal = AegisFSAL::new(
+            Arc::new(NoopStorage),
+            repo as Arc<dyn crate::domain::repository::VolumeRepository>,
+            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(NoopPublisher),
+        );
+
+        // Without workflow_execution_id, this should fail (agent path).
+        let exec_id = ExecutionId::new();
+        let result = fsal.getattr(exec_id, vol_id, "/", 1000, 1000, None).await;
+        assert!(
+            matches!(result, Err(FsalError::UnauthorizedAccess { .. })),
+            "getattr without workflow_execution_id should deny: {:?}",
+            result
+        );
+
+        // With the correct workflow_execution_id, this should succeed.
+        let result = fsal
+            .getattr(exec_id, vol_id, "/", 1000, 1000, Some(wf_id))
+            .await;
+        // NoopStorage returns FileNotFound for stat, but we get past authorization.
+        // The error proves authorize_inner succeeded — it's a Storage error, not Unauthorized.
+        assert!(
+            matches!(result, Err(FsalError::Storage(_))),
+            "getattr with correct workflow_execution_id should pass authorization \
+             (Storage error expected from NoopStorage stat): {:?}",
             result
         );
     }

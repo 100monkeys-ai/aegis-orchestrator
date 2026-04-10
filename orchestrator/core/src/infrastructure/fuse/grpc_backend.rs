@@ -94,6 +94,12 @@ fn timeout_to_fsal_error(_: tokio::time::error::Elapsed) -> FsalError {
     ))
 }
 
+/// Convert an optional workflow execution UUID to the proto string field.
+/// Empty string signals "not set" (proto3 default).
+fn wf_id_to_proto(wf_id: Option<uuid::Uuid>) -> String {
+    wf_id.map(|id| id.to_string()).unwrap_or_default()
+}
+
 #[async_trait]
 impl FsalBackend for GrpcFsalBackend {
     async fn getattr(
@@ -103,6 +109,7 @@ impl FsalBackend for GrpcFsalBackend {
         path: &str,
         uid: u32,
         gid: u32,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<FileAttributes, FsalError> {
         let resp = tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -112,6 +119,7 @@ impl FsalBackend for GrpcFsalBackend {
                 path: path.to_string(),
                 container_uid: uid,
                 container_gid: gid,
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -148,6 +156,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: handle.volume_id.0.to_string(),
                 parent_path: parent_path.to_string(),
                 name: name.to_string(),
+                workflow_execution_id: wf_id_to_proto(handle.workflow_execution_id()),
             }),
         )
         .await
@@ -164,6 +173,7 @@ impl FsalBackend for GrpcFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<Vec<DirEntry>, FsalError> {
         let resp = tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -172,6 +182,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -209,6 +220,7 @@ impl FsalBackend for GrpcFsalBackend {
                 policy: policy_to_proto(policy),
                 offset,
                 size: size as u32,
+                workflow_execution_id: wf_id_to_proto(handle.workflow_execution_id()),
             }),
         )
         .await
@@ -239,6 +251,7 @@ impl FsalBackend for GrpcFsalBackend {
                 policy: policy_to_proto(policy),
                 offset,
                 data: data.to_vec(),
+                workflow_execution_id: wf_id_to_proto(handle.workflow_execution_id()),
             }),
         )
         .await
@@ -255,6 +268,7 @@ impl FsalBackend for GrpcFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<AegisFileHandle, FsalError> {
         let resp = tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -263,6 +277,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -279,6 +294,7 @@ impl FsalBackend for GrpcFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -287,6 +303,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -301,6 +318,7 @@ impl FsalBackend for GrpcFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -309,6 +327,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -323,6 +342,7 @@ impl FsalBackend for GrpcFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -331,6 +351,7 @@ impl FsalBackend for GrpcFsalBackend {
                 volume_id: volume_id.0.to_string(),
                 path: path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await
@@ -346,6 +367,7 @@ impl FsalBackend for GrpcFsalBackend {
         from_path: &str,
         to_path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         tokio::time::timeout(
             GRPC_CALL_TIMEOUT,
@@ -355,6 +377,7 @@ impl FsalBackend for GrpcFsalBackend {
                 from_path: from_path.to_string(),
                 to_path: to_path.to_string(),
                 policy: policy_to_proto(policy),
+                workflow_execution_id: wf_id_to_proto(workflow_execution_id),
             }),
         )
         .await

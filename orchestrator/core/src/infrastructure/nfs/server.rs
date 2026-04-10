@@ -610,6 +610,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                     &path,
                     context.container_uid,
                     context.container_gid,
+                    context.workflow_execution_id,
                 )
                 .await
                 .map_err(|e| {
@@ -755,6 +756,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 &context.policy,
                 None,
                 None,
+                context.workflow_execution_id,
             )
             .await
             .map_err(|e| {
@@ -840,6 +842,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 emit_event: true,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id: context.workflow_execution_id,
             })
             .await
             .map_err(|e| {
@@ -912,6 +915,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 &context.policy,
                 None,
                 None,
+                context.workflow_execution_id,
             )
             .await
             .map_err(|e| {
@@ -976,6 +980,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 &context.policy,
                 None,
                 None,
+                context.workflow_execution_id,
             )
             .await
         {
@@ -990,6 +995,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                         &context.policy,
                         None,
                         None,
+                        context.workflow_execution_id,
                     )
                     .await
                     .map_err(|e| {
@@ -1063,6 +1069,7 @@ impl NFSFileSystem for AegisFsalAdapter {
                 policy: &context.policy,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id: context.workflow_execution_id,
             })
             .await
             .map_err(|e| {

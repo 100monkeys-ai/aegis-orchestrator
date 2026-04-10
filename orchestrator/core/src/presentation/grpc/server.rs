@@ -1721,6 +1721,18 @@ fn parse_uuid_field(field: &str, name: &str) -> Result<uuid::Uuid, Status> {
         .map_err(|e| Status::invalid_argument(format!("Invalid {name}: {e}")))
 }
 
+/// Parse an optional workflow_execution_id from a proto string field.
+/// Empty string (proto3 default) is treated as `None`.
+fn parse_optional_wf_id(field: &str) -> Result<Option<uuid::Uuid>, Status> {
+    if field.is_empty() {
+        Ok(None)
+    } else {
+        uuid::Uuid::parse_str(field)
+            .map(Some)
+            .map_err(|e| Status::invalid_argument(format!("Invalid workflow_execution_id: {e}")))
+    }
+}
+
 /// Convert an `FsalError` to a gRPC `Status`.
 fn fsal_error_to_status(e: crate::domain::fsal::FsalError) -> Status {
     use crate::domain::fsal::FsalError;
@@ -1771,6 +1783,8 @@ impl FsalServiceTrait for FsalGrpcService {
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         let attrs = self
             .fsal
             .getattr(
@@ -1779,6 +1793,7 @@ impl FsalServiceTrait for FsalGrpcService {
                 &req.path,
                 req.container_uid,
                 req.container_gid,
+                wf_id,
             )
             .await
             .map_err(fsal_error_to_status)?;
@@ -1806,8 +1821,16 @@ impl FsalServiceTrait for FsalGrpcService {
         let volume_id =
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
 
-        let parent_handle =
-            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.parent_path);
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+        let parent_handle = if let Some(wf_uuid) = wf_id {
+            crate::domain::fsal::AegisFileHandle::new_for_workflow(
+                wf_uuid,
+                volume_id,
+                &req.parent_path,
+            )
+        } else {
+            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.parent_path)
+        };
 
         let child_handle = self
             .fsal
@@ -1835,9 +1858,19 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         let entries = self
             .fsal
-            .readdir(execution_id, volume_id, &req.path, &policy, None, None)
+            .readdir(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                None,
+                None,
+                wf_id,
+            )
             .await
             .map_err(fsal_error_to_status)?;
 
@@ -1865,7 +1898,12 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
-        let handle = crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path);
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+        let handle = if let Some(wf_uuid) = wf_id {
+            crate::domain::fsal::AegisFileHandle::new_for_workflow(wf_uuid, volume_id, &req.path)
+        } else {
+            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path)
+        };
 
         let data = self
             .fsal
@@ -1889,7 +1927,12 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
-        let handle = crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path);
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+        let handle = if let Some(wf_uuid) = wf_id {
+            crate::domain::fsal::AegisFileHandle::new_for_workflow(wf_uuid, volume_id, &req.path)
+        } else {
+            crate::domain::fsal::AegisFileHandle::new(execution_id, volume_id, &req.path)
+        };
 
         let bytes_written = self
             .fsal
@@ -1915,6 +1958,8 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         let handle = self
             .fsal
             .create_file(crate::domain::fsal::CreateFsalFileRequest {
@@ -1925,6 +1970,7 @@ impl FsalServiceTrait for FsalGrpcService {
                 emit_event: true,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id: wf_id,
             })
             .await
             .map_err(fsal_error_to_status)?;
@@ -1949,8 +1995,18 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         self.fsal
-            .create_directory(execution_id, volume_id, &req.path, &policy, None, None)
+            .create_directory(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                None,
+                None,
+                wf_id,
+            )
             .await
             .map_err(fsal_error_to_status)?;
 
@@ -1970,8 +2026,18 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         self.fsal
-            .delete_file(execution_id, volume_id, &req.path, &policy, None, None)
+            .delete_file(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                None,
+                None,
+                wf_id,
+            )
             .await
             .map_err(fsal_error_to_status)?;
 
@@ -1991,8 +2057,18 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         self.fsal
-            .delete_directory(execution_id, volume_id, &req.path, &policy, None, None)
+            .delete_directory(
+                execution_id,
+                volume_id,
+                &req.path,
+                &policy,
+                None,
+                None,
+                wf_id,
+            )
             .await
             .map_err(fsal_error_to_status)?;
 
@@ -2012,6 +2088,8 @@ impl FsalServiceTrait for FsalGrpcService {
             crate::domain::volume::VolumeId(parse_uuid_field(&req.volume_id, "volume_id")?);
         let policy = proto_to_fsal_policy(req.policy);
 
+        let wf_id = parse_optional_wf_id(&req.workflow_execution_id)?;
+
         self.fsal
             .rename(crate::domain::fsal::RenameFsalRequest {
                 execution_id,
@@ -2021,6 +2099,7 @@ impl FsalServiceTrait for FsalGrpcService {
                 policy: &policy,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id: wf_id,
             })
             .await
             .map_err(fsal_error_to_status)?;

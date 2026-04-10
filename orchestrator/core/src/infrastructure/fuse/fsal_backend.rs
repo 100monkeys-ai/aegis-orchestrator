@@ -41,6 +41,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         path: &str,
         uid: u32,
         gid: u32,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<FileAttributes, FsalError>;
 
     /// Lookup a child entry in a directory.
@@ -58,6 +59,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<Vec<DirEntry>, FsalError>;
 
     /// Read data from a file.
@@ -87,6 +89,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<AegisFileHandle, FsalError>;
 
     /// Create a directory.
@@ -96,6 +99,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError>;
 
     /// Delete a file.
@@ -105,6 +109,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError>;
 
     /// Delete a directory.
@@ -114,6 +119,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError>;
 
     /// Rename a file or directory.
@@ -124,6 +130,7 @@ pub trait FsalBackend: Send + Sync + 'static {
         from_path: &str,
         to_path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError>;
 }
 
@@ -143,9 +150,17 @@ impl FsalBackend for DirectFsalBackend {
         path: &str,
         uid: u32,
         gid: u32,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<FileAttributes, FsalError> {
         self.0
-            .getattr(execution_id, volume_id, path, uid, gid)
+            .getattr(
+                execution_id,
+                volume_id,
+                path,
+                uid,
+                gid,
+                workflow_execution_id,
+            )
             .await
     }
 
@@ -164,9 +179,18 @@ impl FsalBackend for DirectFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<Vec<DirEntry>, FsalError> {
         self.0
-            .readdir(execution_id, volume_id, path, policy, None, None)
+            .readdir(
+                execution_id,
+                volume_id,
+                path,
+                policy,
+                None,
+                None,
+                workflow_execution_id,
+            )
             .await
     }
 
@@ -198,6 +222,7 @@ impl FsalBackend for DirectFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<AegisFileHandle, FsalError> {
         self.0
             .create_file(CreateFsalFileRequest {
@@ -208,6 +233,7 @@ impl FsalBackend for DirectFsalBackend {
                 emit_event: true,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id,
             })
             .await
     }
@@ -218,9 +244,18 @@ impl FsalBackend for DirectFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         self.0
-            .create_directory(execution_id, volume_id, path, policy, None, None)
+            .create_directory(
+                execution_id,
+                volume_id,
+                path,
+                policy,
+                None,
+                None,
+                workflow_execution_id,
+            )
             .await
     }
 
@@ -230,9 +265,18 @@ impl FsalBackend for DirectFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         self.0
-            .delete_file(execution_id, volume_id, path, policy, None, None)
+            .delete_file(
+                execution_id,
+                volume_id,
+                path,
+                policy,
+                None,
+                None,
+                workflow_execution_id,
+            )
             .await
     }
 
@@ -242,9 +286,18 @@ impl FsalBackend for DirectFsalBackend {
         volume_id: VolumeId,
         path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         self.0
-            .delete_directory(execution_id, volume_id, path, policy, None, None)
+            .delete_directory(
+                execution_id,
+                volume_id,
+                path,
+                policy,
+                None,
+                None,
+                workflow_execution_id,
+            )
             .await
     }
 
@@ -255,6 +308,7 @@ impl FsalBackend for DirectFsalBackend {
         from_path: &str,
         to_path: &str,
         policy: &FsalAccessPolicy,
+        workflow_execution_id: Option<uuid::Uuid>,
     ) -> Result<(), FsalError> {
         self.0
             .rename(RenameFsalRequest {
@@ -265,6 +319,7 @@ impl FsalBackend for DirectFsalBackend {
                 policy,
                 caller_node_id: None,
                 host_node_id: None,
+                workflow_execution_id,
             })
             .await
     }

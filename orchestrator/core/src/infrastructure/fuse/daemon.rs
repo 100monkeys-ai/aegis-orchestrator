@@ -338,6 +338,7 @@ impl Filesystem for FuseFsal {
             &child_path,
             self.context.container_uid,
             self.context.container_gid,
+            self.context.workflow_execution_id,
         )) {
             Ok(attrs) => {
                 let fuse_attr = self.convert_attrs(&attrs, child_ino);
@@ -379,6 +380,7 @@ impl Filesystem for FuseFsal {
             &path,
             self.context.container_uid,
             self.context.container_gid,
+            self.context.workflow_execution_id,
         )) {
             Ok(attrs) => {
                 let fuse_attr = self.convert_attrs(&attrs, ino);
@@ -499,6 +501,7 @@ impl Filesystem for FuseFsal {
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(e) => e,
             Err(e) => {
@@ -585,6 +588,7 @@ impl Filesystem for FuseFsal {
             self.context.volume_id,
             &file_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(handle) => {
                 let child_ino = self.inode_table.allocate(handle, file_path.clone());
@@ -596,6 +600,7 @@ impl Filesystem for FuseFsal {
                     &file_path,
                     self.context.container_uid,
                     self.context.container_gid,
+                    self.context.workflow_execution_id,
                 )) {
                     Ok(attrs) => {
                         let fuse_attr = self.convert_attrs(&attrs, child_ino);
@@ -670,6 +675,7 @@ impl Filesystem for FuseFsal {
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(()) => {
                 let handle = if let Some(wf_id) = self.context.workflow_execution_id {
@@ -737,6 +743,7 @@ impl Filesystem for FuseFsal {
             self.context.volume_id,
             &file_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "unlink", "result" => "success").increment(1);
@@ -776,6 +783,7 @@ impl Filesystem for FuseFsal {
             self.context.volume_id,
             &dir_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "rmdir", "result" => "success").increment(1);
@@ -847,6 +855,7 @@ impl Filesystem for FuseFsal {
             &from_path,
             &to_path,
             &self.context.policy,
+            self.context.workflow_execution_id,
         )) {
             Ok(()) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "rename", "result" => "success").increment(1);
@@ -901,6 +910,7 @@ impl Filesystem for FuseFsal {
             &path,
             self.context.container_uid,
             self.context.container_gid,
+            self.context.workflow_execution_id,
         )) {
             Ok(attrs) => {
                 reply.attr(&FUSE_TTL, &self.convert_attrs(&attrs, ino));
