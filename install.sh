@@ -33,11 +33,11 @@ if [[ "$AEGIS_VERSION" == "latest" ]]; then
     # Fall back to the pinned version if resolution fails.
     LATEST_TAG=""
     if command -v curl >/dev/null 2>&1; then
-        GITHUB_API_URL="https://api.github.com/repos/100monkeys-ai/aegis-orchestrator/releases/latest"
+        GITHUB_API_URL="https://api.github.com/repos/100monkeys-ai/aegis-orchestrator/releases?per_page=1"
         RAW_RELEASE_JSON="$(curl -fsSL "$GITHUB_API_URL" 2>/dev/null || true)"
         if [[ -n "${RAW_RELEASE_JSON:-}" ]]; then
             if command -v jq >/dev/null 2>&1; then
-                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | jq -r '.tag_name // empty')"
+                LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | jq -r '.[0].tag_name // empty')"
             else
                 # Minimal JSON parsing fallback if jq is unavailable.
                 LATEST_TAG="$(printf '%s' "$RAW_RELEASE_JSON" | grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
