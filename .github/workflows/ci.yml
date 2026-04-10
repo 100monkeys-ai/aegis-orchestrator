@@ -148,10 +148,10 @@ jobs:
       - name: Prepare proto files for packaging
         working-directory: aegis-orchestrator
         run: |
-          mkdir -p orchestrator/core/proto-vendor/aegis
-          if [ ! -f orchestrator/core/proto-vendor/aegis/orchestrator.proto ]; then
-            cp ../aegis-proto/proto/orchestrator.proto orchestrator/core/proto-vendor/aegis/orchestrator.proto
-          fi
+          mkdir -p orchestrator/core/proto-vendor/temporal/api
+          mkdir -p orchestrator/core/proto-vendor/google
+          cp -r proto/temporal/api/* orchestrator/core/proto-vendor/temporal/api/
+          cp -r proto/google/* orchestrator/core/proto-vendor/google/
 
       - name: Verify package includes all required files
         working-directory: aegis-orchestrator/orchestrator/core
