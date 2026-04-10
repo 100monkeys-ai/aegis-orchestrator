@@ -109,13 +109,13 @@ impl std::fmt::Display for CredentialGrantId {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CredentialType {
-    /// Static API key (e.g. `sk-...` for OpenAI).
-    ApiKey,
+    /// Sensitive value — masked after creation (covers API keys, static tokens, passwords).
+    Secret,
+    /// Non-sensitive configuration value — readable after creation (env vars, URLs, config).
+    Variable,
     /// OAuth 2.0 token (access + optional refresh).
     OAuth2,
-    /// Opaque static bearer token that doesn't conform to OAuth2.
-    StaticToken,
-    /// Machine identity / service account credential.
+    /// Machine identity / service account credential (JSON blob).
     ServiceAccount,
 }
 
@@ -392,7 +392,7 @@ mod tests {
             id: CredentialBindingId::new(),
             owner_user_id: "user-sub-123".to_string(),
             tenant_id: TenantId::consumer(),
-            credential_type: CredentialType::ApiKey,
+            credential_type: CredentialType::Secret,
             provider: CredentialProvider::OpenAI,
             secret_path: SecretPath::new("aegis-system", "kv", "openai/key"),
             scope: CredentialScope::Personal,

@@ -28,7 +28,8 @@ use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::credential_service::StoreApiKeyCommand;
 use aegis_orchestrator_core::domain::api_scope::ApiScope;
 use aegis_orchestrator_core::domain::credential::{
-    CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, GrantTarget,
+    CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialScope, CredentialType,
+    GrantTarget,
 };
 use aegis_orchestrator_core::domain::iam::{AegisRole, IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::secrets::{AccessContext, SensitiveString};
@@ -125,8 +126,8 @@ pub(crate) struct StoreApiKeyRequest {
     pub(crate) scope: Option<String>,
     /// The raw API key value — treated as sensitive
     pub(crate) value: String,
-    /// Arbitrary key/value tags for filtering and organisation.
-    pub(crate) tags: Option<serde_json::Value>,
+    /// "secret" | "variable" | "service_account" | "oauth2"
+    pub(crate) credential_type: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -285,6 +286,21 @@ fn parse_grant_id(id: &str) -> Result<CredentialGrantId, Response> {
         })
 }
 
+#[allow(clippy::result_large_err)]
+fn parse_credential_type(s: &str) -> Result<CredentialType, Response> {
+    match s {
+        "secret" => Ok(CredentialType::Secret),
+        "variable" => Ok(CredentialType::Variable),
+        "service_account" => Ok(CredentialType::ServiceAccount),
+        "oauth2" => Ok(CredentialType::OAuth2),
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("Unknown credential type: {}", s)})),
+        )
+            .into_response()),
+    }
+}
+
 // ============================================================================
 // Credential Handlers
 // ============================================================================
@@ -374,6 +390,11 @@ pub(crate) async fn store_api_key_handler(
         Err(r) => return r,
     };
 
+    let credential_type = match parse_credential_type(&payload.credential_type) {
+        Ok(t) => t,
+        Err(r) => return r,
+    };
+
     let svc = match &state.credential_service {
         Some(s) => s.clone(),
         None => {
@@ -393,7 +414,7 @@ pub(crate) async fn store_api_key_handler(
             label: payload.label,
             scope,
             api_key_value: SensitiveString::new(&payload.value),
-            tags: payload.tags,
+            credential_type,
         })
         .await
     {

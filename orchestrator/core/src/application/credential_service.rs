@@ -54,7 +54,7 @@ pub struct StoreApiKeyCommand {
     pub label: String,
     pub scope: CredentialScope,
     pub api_key_value: SensitiveString,
-    pub tags: Option<serde_json::Value>,
+    pub credential_type: CredentialType,
 }
 
 // ============================================================================
@@ -221,7 +221,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
             label,
             scope,
             api_key_value,
-            tags,
+            credential_type,
         } = cmd;
         let binding_id = CredentialBindingId::new();
         let secret_path = user_credential_path(&tenant_id, &owner_user_id, &binding_id);
@@ -243,14 +243,14 @@ impl CredentialManagementService for StandardCredentialManagementService {
             id: binding_id,
             owner_user_id: owner_user_id.to_string(),
             tenant_id: tenant_id.clone(),
-            credential_type: CredentialType::ApiKey,
+            credential_type,
             provider: provider.clone(),
             secret_path,
             scope,
             status: CredentialStatus::Active,
             metadata: CredentialMetadata {
                 label,
-                tags,
+                tags: None,
                 service_url: None,
                 external_account_id: None,
                 oauth_scopes: None,
@@ -268,7 +268,7 @@ impl CredentialManagementService for StandardCredentialManagementService {
                 owner_user_id: owner_user_id.to_string(),
                 tenant_id: tenant_id.clone(),
                 provider,
-                credential_type: CredentialType::ApiKey,
+                credential_type,
             });
 
         Ok(binding_id)
