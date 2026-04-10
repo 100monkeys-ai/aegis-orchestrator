@@ -241,10 +241,11 @@ pub(crate) async fn get_user_rate_limit_usage_handler(
         (i64, chrono::DateTime<chrono::Utc>),
     > = std::collections::HashMap::new();
     for row in &usage_rows {
-        counter_map.insert(
-            (row.resource_type.clone(), row.bucket.clone()),
-            (row.counter, row.window_start),
-        );
+        // Rows are ordered window_start DESC; use or_insert so the first (newest)
+        // entry for each (resource_type, bucket) key wins.
+        counter_map
+            .entry((row.resource_type.clone(), row.bucket.clone()))
+            .or_insert((row.counter, row.window_start));
     }
 
     let resolver = HierarchicalPolicyResolver::new(repo.pool().clone());
@@ -323,5 +324,37 @@ fn resource_type_to_db_str(rt: &RateLimitResourceType) -> String {
         RateLimitResourceType::SealToolCall { tool_pattern } => {
             format!("seal_tool:{tool_pattern}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn counter_map_dedup_uses_newest_window() {
+        use chrono::{Duration, TimeZone, Utc};
+        use std::collections::HashMap;
+
+        let now = Utc.with_ymd_and_hms(2026, 4, 10, 12, 0, 0).unwrap();
+        let older = now - Duration::days(1);
+        let oldest = now - Duration::days(2);
+
+        // Simulate rows returned ORDER BY window_start DESC (newest first)
+        let rows: Vec<(String, String, i64, chrono::DateTime<Utc>)> = vec![
+            ("agent_execution".into(), "daily".into(), 42, now),
+            ("agent_execution".into(), "daily".into(), 10, older),
+            ("agent_execution".into(), "daily".into(), 5, oldest),
+        ];
+
+        let mut counter_map: HashMap<(String, String), (i64, chrono::DateTime<Utc>)> =
+            HashMap::new();
+        for (resource_type, bucket, counter, window_start) in &rows {
+            counter_map
+                .entry((resource_type.clone(), bucket.clone()))
+                .or_insert((*counter, *window_start));
+        }
+
+        let (count, ws) = counter_map[&("agent_execution".into(), "daily".into())];
+        assert_eq!(count, 42, "must use newest window counter, not stale one");
+        assert_eq!(ws, now, "must use newest window_start");
     }
 }
