@@ -33,6 +33,8 @@ spec:
 
       {{intent}}
 
+      {{input}}
+
   execution:
     mode: iterative
     max_iterations: 3
