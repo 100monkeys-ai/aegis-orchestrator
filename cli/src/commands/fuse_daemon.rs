@@ -274,11 +274,48 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
             // Start FuseMountService gRPC server
             let addr = listen_addr.parse().context("Invalid listen address")?;
 
+            let handles: MountHandleMap = Arc::new(RwLock::new(HashMap::new()));
+
             let service = FuseMountServiceImpl {
                 daemon,
-                mount_prefix,
-                handles: Arc::new(RwLock::new(HashMap::new())),
+                mount_prefix: mount_prefix.clone(),
+                handles: handles.clone(),
             };
+
+            // Spawn periodic mount reaper — cleans up orphaned FUSE mount
+            // directories that have no corresponding active handle (e.g. after
+            // a crash or missed unmount RPC).
+            let reaper_handles = handles.clone();
+            let reaper_prefix = mount_prefix.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    if let Ok(entries) = std::fs::read_dir(&reaper_prefix) {
+                        let active = reaper_handles.read().await;
+                        for entry in entries.flatten() {
+                            let path = entry.path();
+                            if path.is_dir() {
+                                let path_str = path.to_string_lossy().to_string();
+                                // A directory is active if any handle's mountpoint matches it
+                                let is_active = active.values().any(|h| h.mountpoint() == path_str);
+                                if !is_active {
+                                    let _ = std::process::Command::new("fusermount")
+                                        .args(["-uz", &path_str])
+                                        .output();
+                                    match std::fs::remove_dir(&path) {
+                                        Ok(()) => info!(
+                                            path = %path.display(),
+                                            "Reaped orphaned FUSE mount directory"
+                                        ),
+                                        Err(_) => {} // Still mounted or not empty — skip
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            });
 
             println!(
                 "{}",
