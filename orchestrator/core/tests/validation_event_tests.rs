@@ -212,6 +212,7 @@ impl AgentLifecycleService for MockAgentLifecycleService {
                     image_pull_policy: ImagePullPolicy::IfNotPresent,
                     isolation: "inherit".to_string(),
                     model: "judge".to_string(),
+                    temperature: None,
                 },
                 task: None,
                 context: vec![],

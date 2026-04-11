@@ -47,6 +47,7 @@ fn make_standard_manifest(name: &str) -> AgentManifest {
                 image_pull_policy: ImagePullPolicy::IfNotPresent,
                 isolation: "inherit".to_string(),
                 model: "default".to_string(),
+                temperature: None,
             },
             task: Some(TaskConfig {
                 instruction: Some("Test instruction".to_string()),
@@ -78,6 +79,7 @@ fn make_custom_runtime_manifest(name: &str, image: &str) -> AgentManifest {
         image_pull_policy: ImagePullPolicy::Always,
         isolation: "docker".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     m
 }
@@ -289,6 +291,7 @@ fn runtime_config_valid_standard() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     assert!(rc.validate().is_ok());
     assert_eq!(rc.runtime_type(), RuntimeType::Standard);
@@ -303,6 +306,7 @@ fn runtime_config_valid_custom() {
         image_pull_policy: ImagePullPolicy::Always,
         isolation: "docker".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     assert!(rc.validate().is_ok());
     assert_eq!(rc.runtime_type(), RuntimeType::Custom);
@@ -317,6 +321,7 @@ fn runtime_config_both_specified_is_error() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     let err = rc.validate().unwrap_err();
     assert!(err.contains("mutually exclusive"));
@@ -331,6 +336,7 @@ fn runtime_config_neither_specified_is_error() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     let err = rc.validate().unwrap_err();
     assert!(err.contains("must specify"));
@@ -345,6 +351,7 @@ fn runtime_config_language_without_version_is_error() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     let err = rc.validate().unwrap_err();
     assert!(err.contains("language requires version"));
@@ -359,6 +366,7 @@ fn runtime_config_version_without_language_is_error() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     let err = rc.validate().unwrap_err();
     assert!(err.contains("version requires language"));
@@ -373,6 +381,7 @@ fn runtime_config_custom_image_must_be_fully_qualified() {
         image_pull_policy: ImagePullPolicy::IfNotPresent,
         isolation: "inherit".to_string(),
         model: "default".to_string(),
+        temperature: None,
     };
     let err = rc.validate().unwrap_err();
     assert!(err.contains("fully-qualified"));

@@ -1457,6 +1457,7 @@ mod tests {
                         image_pull_policy: crate::domain::agent::ImagePullPolicy::IfNotPresent,
                         isolation: "docker".to_string(),
                         model: "default".to_string(),
+                        temperature: None,
                     },
                     task: None,
                     context: vec![],

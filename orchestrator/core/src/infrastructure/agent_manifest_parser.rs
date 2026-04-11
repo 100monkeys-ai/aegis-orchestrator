@@ -305,6 +305,7 @@ spec:
                     image_pull_policy: ImagePullPolicy::IfNotPresent,
                     isolation: "docker".to_string(),
                     model: "default".to_string(),
+                    temperature: None,
                 },
                 task: Some(TaskConfig {
                     instruction: Some("Do something useful".to_string()),
