@@ -303,12 +303,11 @@ pub async fn handle_command(command: FuseDaemonCommand, _output: OutputFormat) -
                                     let _ = std::process::Command::new("fusermount")
                                         .args(["-uz", &path_str])
                                         .output();
-                                    match std::fs::remove_dir(&path) {
-                                        Ok(()) => info!(
+                                    if let Ok(()) = std::fs::remove_dir(&path) {
+                                        info!(
                                             path = %path.display(),
                                             "Reaped orphaned FUSE mount directory"
-                                        ),
-                                        Err(_) => {} // Still mounted or not empty — skip
+                                        );
                                     }
                                 }
                             }
