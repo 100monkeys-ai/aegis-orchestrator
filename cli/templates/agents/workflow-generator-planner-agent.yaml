@@ -74,6 +74,14 @@ spec:
       This planning flow is payload-first. Do not assume any `/workspace` filesystem artifacts are
       available unless `worker_mounts` in the evaluation payload explicitly says so.
 
+      When generating prompts for missing agents or judge agents, the generation_prompts and
+      judge_generation_prompts MUST include guidance on `spec.runtime.temperature`:
+        0.1 — judges, validators, formatters (deterministic, consistent output)
+        0.2 — code generators, executors (low creativity, precise code)
+        0.4 — general-purpose agents (default if not specified)
+        0.7 — creative agents, brainstorming, content generation
+      Include the recommended temperature value in each generation prompt based on the agent's role.
+
       When generating prompts for missing agents or judge agents that need to write files,
       the generation_prompts and judge_generation_prompts MUST instruct the agent-creator-agent
       to use /workspace/* for all filesystem write paths. Writing to /tmp, /var, /home, or

@@ -36,6 +36,12 @@ spec:
          - Ensure state transitions are explicit and safe.
          - Ensure all referenced states and volumes are declared.
          - Favor clear state names and deterministic transitions.
+         - When workflow states reference agents, verify their `spec.runtime.temperature` is
+           appropriate for the agent's role:
+             0.1 — judges, validators, formatters (deterministic, consistent output)
+             0.2 — code generators, executors (low creativity, precise code)
+             0.4 — general-purpose agents (default if not specified)
+             0.7 — creative agents, brainstorming, content generation
          - For validator or judge states that use score-based routing, emit explicit threshold branches.
          - When score thresholds govern routing, use `score_above`, `score_below`, or `score_and_confidence_above`
            for every success-path outcome instead of relying on generic fallbacks.

@@ -54,6 +54,12 @@ spec:
       6. Compose the complete YAML manifest following the schema strictly.
          - Use lowercase DNS-safe metadata.name.
          - Keep runtime and security settings explicit.
+         - Set `temperature` in `spec.runtime` to control LLM sampling creativity:
+             0.1 — judges, validators, formatters (deterministic, consistent output)
+             0.2 — code generators, executors (low creativity, precise code)
+             0.4 — general-purpose agents (default if not specified)
+             0.7 — creative agents, brainstorming, content generation
+           Choose the value that best matches the agent's role. Omit only if 0.4 (the default) is appropriate.
          - Prefer deterministic validation in execution.validation when feasible.
          - For updates, ensure the version is incremented OR use `force: true` to overwrite (only if specifically requested).
          REQUIRED FIELDS — every manifest MUST include ALL of the following or it will be rejected:
@@ -63,6 +69,12 @@ spec:
            Write it as a complete, role-establishing directive in the imperative voice.
            Example for a python-code-execution-agent:
              spec:
+               runtime:
+                 language: python
+                 version: "3.11"
+                 isolation: inherit
+                 model: smart
+                 temperature: 0.2
                task:
                  instruction: |
                    You are a Python code execution agent.
