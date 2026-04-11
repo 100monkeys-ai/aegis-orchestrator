@@ -16,11 +16,14 @@ use aegis_orchestrator_core::{
         cluster::NodeClusterRepository,
         iam::{IdentityProvider, RealmRepository},
         node_config::NodeConfigManifest,
-        repository::{StorageEventRepository, WorkflowExecutionRepository, WorkflowRepository},
+        repository::{
+            StorageEventRepository, TenantRepository, WorkflowExecutionRepository,
+            WorkflowRepository,
+        },
     },
     infrastructure::{
-        event_bus::EventBus, secrets_manager::SecretsManager, temporal_client::TemporalClient,
-        TemporalEventListener,
+        event_bus::EventBus, iam::keycloak_admin_client::KeycloakAdminClient,
+        secrets_manager::SecretsManager, temporal_client::TemporalClient, TemporalEventListener,
     },
     presentation::webhook_guard::WebhookSecretProvider,
 };
@@ -84,4 +87,8 @@ pub(crate) struct AppState {
     pub(crate) file_operations_service: Arc<FileOperationsService>,
     pub(crate) config: NodeConfigManifest,
     pub(crate) start_time: std::time::Instant,
+    /// Keycloak Admin REST client for colony management endpoints.
+    pub(crate) keycloak_admin: Option<Arc<KeycloakAdminClient>>,
+    /// Tenant repository for subscription queries.
+    pub(crate) tenant_repo: Option<Arc<dyn TenantRepository>>,
 }

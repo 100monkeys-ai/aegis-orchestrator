@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{middleware, Router};
 
 use aegis_orchestrator_core::domain::iam::IdentityProvider;
@@ -27,6 +27,10 @@ use crate::daemon::handlers::approvals::{
     reject_request_handler,
 };
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
+use crate::daemon::handlers::colony::{
+    get_saml_config, get_subscription, invite_member, list_members, remove_member, set_saml_config,
+    update_role,
+};
 use crate::daemon::handlers::cortex::{
     get_cortex_metrics_handler, get_cortex_skills_handler, list_cortex_patterns_handler,
 };
@@ -290,6 +294,12 @@ pub(crate) fn create_router(
         .route("/v1/volumes/{id}/files/upload", post(volumes::upload_file))
         .route("/v1/volumes/{id}/files/mkdir", post(volumes::mkdir))
         .route("/v1/volumes/{id}/files/move", post(volumes::move_path))
+        // Colony management (BC-12 / ADR-097): member, SAML IdP, subscription endpoints
+        .route("/v1/colony/members", get(list_members).post(invite_member))
+        .route("/v1/colony/members/{user_id}", delete(remove_member))
+        .route("/v1/colony/roles", put(update_role))
+        .route("/v1/colony/saml", get(get_saml_config).put(set_saml_config))
+        .route("/v1/colony/subscription", get(get_subscription))
         .with_state(app_state);
 
     if let Some(iam_service) = iam_service {
