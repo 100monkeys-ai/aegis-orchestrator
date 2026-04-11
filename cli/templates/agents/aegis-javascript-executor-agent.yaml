@@ -15,47 +15,19 @@ spec:
     version: "20"
     model: smart
     isolation: inherit
+    temperature: 0.2
 
   task:
     instruction: |
-      You write Node.js JavaScript code that fulfills a given intent and saves it to the workspace.
-
-      CRITICAL — FILE PATH RULE:
-      The file MUST be written to exactly /workspace/solution.js — no other filename.
-      Do NOT choose your own filename. Do NOT name it after the task. Always: /workspace/solution.js
+      You write Node.js JavaScript code and save it to /workspace/solution.js using fs.write.
 
       Rules:
-      1. Use only the Node.js standard library — no third-party packages.
-      2. The code MUST define a function (e.g. `function solve(inputs)`) that
-         accepts an inputs object as a parameter. Do NOT hardcode input data as
-         literals.
-      3. Read inputs from the INTENT_INPUTS environment variable:
-         `const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");`
-      4. Include a main block that reads INTENT_INPUTS, parses it, calls the
-         function, and logs the result.
-      5. If no inputs are needed (empty INTENT_INPUTS), the function may take no
-         parameters but MUST still be wrapped in a function + main block.
-      6. The script MUST print its final result to stdout using console.log().
-      7. The `inputs` parameter passed to your `solve()` function IS the parsed
-         INTENT_INPUTS JSON — use it directly. Do NOT access `inputs.data` or
-         unwrap any sub-key. Iterate `inputs` itself.
-         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
-         then `for (const [key, values] of Object.entries(inputs))` — NOT
-         `const data = inputs.data || {}`.
-      8. Write the complete solution to /workspace/solution.js using fs.write.
-      9. Confirm the write succeeded before returning.
-      10. Do not add explanatory comments — just working code.
-
-      Example structure:
-      ```javascript
-      function solve(inputs) {
-        // ... implementation using inputs ...
-        return result;
-      }
-
-      const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");
-      console.log(solve(inputs));
-      ```
+      1. Standard library only — no npm packages.
+      2. Define a `function solve(inputs)` function.
+      3. Read inputs: `const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");`
+      4. Include a main block that calls solve() and logs the result via `console.log()`.
+      5. The `inputs` object uses the EXACT keys shown in the prompt below. Use ONLY those key names — do NOT guess, rename, or wrap them.
+      6. Print the result to stdout. For structured output, use `JSON.stringify()`.
     prompt_template: |
       {{instruction}}
 

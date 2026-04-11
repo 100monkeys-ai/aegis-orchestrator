@@ -332,6 +332,10 @@ pub struct ModelConfig {
     /// output tokens for internal reasoning before producing visible output.
     #[serde(default)]
     pub max_output_tokens: Option<u32>,
+
+    /// Optional temperature override for this model alias.
+    #[serde(default)]
+    pub temperature: Option<f32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2127,6 +2131,7 @@ mod tests {
                         context_window: 8192,
                         cost_per_1k_tokens: 0.0,
                         max_output_tokens: None,
+                        temperature: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),

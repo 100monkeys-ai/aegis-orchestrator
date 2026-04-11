@@ -66,32 +66,20 @@ spec:
       agent: "aegis-{{input.language}}-executor-agent"
       intent: "{{intent}}"
       input: |
-        File path: /workspace/solution.{{input.language_ext}}
-        Input values (object): {{input.inputs}}
-        INTENT_INPUTS JSON (this is the exact string your code will receive from os.environ["INTENT_INPUTS"]):
-        {{input.inputs_json}}
+        INTENT_INPUTS keys: {{{keys input.inputs}}}
+        INTENT_INPUTS JSON: {{{input.inputs_json}}}
 
         {{#if blackboard.EXECUTE_CODE}}
-        IMPORTANT: Your previous code FAILED at runtime with exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}.
-        stderr:
+        PREVIOUS RUNTIME ERROR (exit_code={{blackboard.EXECUTE_CODE.output.exit_code}}):
         {{{blackboard.EXECUTE_CODE.output.stderr}}}
         Fix the bug and rewrite the solution.
         {{/if}}
 
         {{#if blackboard.VALIDATE_CODE}}
-        IMPORTANT: Your previous code was rejected by the validator:
+        PREVIOUS VALIDATION FAILURE:
         {{{blackboard.VALIDATE_CODE.output.summary}}}
-        Failed criteria:
-        {{{json blackboard.VALIDATE_CODE.output.criteria}}}
         Fix the issues and rewrite the solution.
         {{/if}}
-
-        Write the complete solution to /workspace/solution.{{input.language_ext}}.
-        The solution MUST define a function that reads inputs from the
-        INTENT_INPUTS environment variable — do NOT hardcode input values.
-        The solution MUST print its final result to stdout.
-        Use only the standard library — no third-party packages.
-        Confirm the write succeeded before returning.
       transitions:
         - condition: on_success
           target: VALIDATE_CODE

@@ -15,48 +15,19 @@ spec:
     version: "3.11"
     model: smart
     isolation: inherit
+    temperature: 0.2
 
   task:
     instruction: |
-      You write Python 3 code that fulfills a given intent and saves it to the workspace.
-
-      CRITICAL — FILE PATH RULE:
-      The file MUST be written to exactly /workspace/solution.py — no other filename.
-      Do NOT choose your own filename. Do NOT name it after the task. Always: /workspace/solution.py
+      You write Python 3 code and save it to /workspace/solution.py using fs.write.
 
       Rules:
-      1. Use only the Python standard library — no third-party packages.
-      2. The code MUST define a function (e.g. `def solve(inputs):`) that accepts
-         a dict of inputs as a parameter. Do NOT hardcode input data as literals.
-      3. Read inputs from the INTENT_INPUTS environment variable:
-         `inputs = json.loads(os.environ.get("INTENT_INPUTS", "{}"))`
-      4. Include an `if __name__ == "__main__":` block that reads INTENT_INPUTS,
-         parses it, calls the function, and prints the result.
-      5. If no inputs are needed (empty INTENT_INPUTS), the function may take no
-         parameters but MUST still be wrapped in a function + main block.
-      6. The script MUST print its final result to stdout using print().
-      7. The `inputs` parameter passed to your `solve()` function IS the parsed
-         INTENT_INPUTS JSON — use it directly. Do NOT call `.get("data", {})`
-         or unwrap any sub-key. Iterate `inputs` itself.
-         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
-         then `for key, values in inputs.items():` — NOT
-         `data = inputs.get("data", {})`.
-      8. Write the complete solution to /workspace/solution.py using fs.write.
-      9. Confirm the write succeeded before returning.
-      10. Do not add explanatory comments — just working code.
-
-      Example structure:
-      ```python
-      import json, os
-
-      def solve(inputs):
-          # ... implementation using inputs ...
-          return result
-
-      if __name__ == "__main__":
-          inputs = json.loads(os.environ.get("INTENT_INPUTS", "{}"))
-          print(solve(inputs))
-      ```
+      1. Standard library only — no pip packages.
+      2. Define a `def solve(inputs):` function.
+      3. Read inputs: `inputs = json.loads(os.environ.get("INTENT_INPUTS", "{}"))`
+      4. Include `if __name__ == "__main__":` that calls solve() and prints the result.
+      5. The `inputs` dict uses the EXACT keys shown in the prompt below. Use ONLY those key names — do NOT guess, rename, or wrap them.
+      6. Print the result to stdout. For structured output, use `json.dumps()`.
     prompt_template: |
       {{instruction}}
 

@@ -73,6 +73,7 @@ spec:
           context_window: 8192
           cost_per_1k_tokens: 0.0  # Free
           # max_output_tokens: 8192  # Optional: override default (8192)
+          # temperature: 0.4  # Optional: override default (0.4)
 
         - alias: "fast"
           model: "qwen2.5-coder:7b"

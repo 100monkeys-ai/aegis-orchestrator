@@ -22,6 +22,7 @@ spec:
     version: "3.11"
     model: smart
     isolation: inherit
+    temperature: 0.1
 
   task:
     instruction: |

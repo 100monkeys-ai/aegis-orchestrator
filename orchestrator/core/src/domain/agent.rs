@@ -263,6 +263,12 @@ pub struct RuntimeConfig {
     /// Standard aliases: `default`, `fast`, `smart`, `cheap`, `local`.
     #[serde(default = "default_model_alias")]
     pub model: String,
+
+    /// Optional temperature override for this agent's LLM calls.
+    /// Lower values (0.1-0.3) for deterministic agents (judges, validators).
+    /// Higher values (0.5-0.7) for creative agents (generators).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f32>,
 }
 
 impl RuntimeConfig {

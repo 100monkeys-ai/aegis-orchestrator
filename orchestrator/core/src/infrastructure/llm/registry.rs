@@ -66,6 +66,9 @@ pub struct ProviderRegistry {
     /// alias → per-model `max_output_tokens` override from config.
     /// When set, overrides `GenerationOptions::max_tokens` for calls on that alias.
     alias_max_output_tokens: HashMap<String, u32>,
+    /// alias → per-model `temperature` override from config.
+    /// When set, overrides `GenerationOptions::temperature` for calls on that alias.
+    alias_temperatures: HashMap<String, f32>,
     max_retries: u32,
     retry_delay_ms: u64,
 }
@@ -168,6 +171,7 @@ impl ProviderRegistry {
         let mut alias_map: HashMap<String, (String, Arc<dyn LLMProvider>)> = HashMap::new();
         let mut raw_api_keys: HashMap<String, Option<String>> = HashMap::new();
         let mut alias_max_output_tokens: HashMap<String, u32> = HashMap::new();
+        let mut alias_temperatures: HashMap<String, f32> = HashMap::new();
 
         for provider_config in &config.spec.llm_providers {
             if !provider_config.enabled {
@@ -189,6 +193,10 @@ impl ProviderRegistry {
                                         alias, max_tokens
                                     );
                                     alias_max_output_tokens.insert(alias.clone(), max_tokens);
+                                }
+                                if let Some(temp) = model_config.temperature {
+                                    info!("Alias '{}' temperature override: {}", alias, temp);
+                                    alias_temperatures.insert(alias.clone(), temp);
                                 }
                             }
                             Err(e) => {
@@ -223,6 +231,7 @@ impl ProviderRegistry {
             fallback_provider,
             raw_api_keys,
             alias_max_output_tokens,
+            alias_temperatures,
             max_retries: config.spec.llm_selection.max_retries,
             retry_delay_ms: config.spec.llm_selection.retry_delay_ms,
         })
@@ -280,14 +289,14 @@ impl ProviderRegistry {
     /// If the alias has a configured override, `max_tokens` is replaced; otherwise
     /// the original options are returned unchanged.
     fn apply_alias_options(&self, alias: &str, options: &GenerationOptions) -> GenerationOptions {
-        match self.alias_max_output_tokens.get(alias) {
-            Some(&max_tokens) => {
-                let mut opts = options.clone();
-                opts.max_tokens = Some(max_tokens);
-                opts
-            }
-            None => options.clone(),
+        let mut opts = options.clone();
+        if let Some(&max_tokens) = self.alias_max_output_tokens.get(alias) {
+            opts.max_tokens = Some(max_tokens);
         }
+        if let Some(&temp) = self.alias_temperatures.get(alias) {
+            opts.temperature = Some(temp);
+        }
+        opts
     }
 
     /// Generate a chat response for the given model alias.
@@ -548,6 +557,7 @@ mod tests {
                         context_window: 8192,
                         cost_per_1k_tokens: 0.0,
                         max_output_tokens: None,
+                        temperature: None,
                     }],
                 }],
                 llm_selection: LLMSelection::default(),

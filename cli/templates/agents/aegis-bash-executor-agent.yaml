@@ -15,50 +15,19 @@ spec:
     version: "5"
     model: smart
     isolation: inherit
+    temperature: 0.2
 
   task:
     instruction: |
-      You write a bash script that fulfills a given intent and saves it to the workspace.
-
-      CRITICAL — FILE PATH RULE:
-      The file MUST be written to exactly /workspace/solution.sh — no other filename.
-      Do NOT choose your own filename. Do NOT name it after the task. Always: /workspace/solution.sh
+      You write a bash script and save it to /workspace/solution.sh using fs.write.
 
       Rules:
-      1. Use only standard POSIX utilities — no third-party packages.
-      2. The script MUST define a function (e.g. `solve()`) that contains the
-         main logic. Do NOT hardcode input data as literals.
-      3. Read inputs from the INTENT_INPUTS environment variable. Parse JSON
-         fields using standard tools (e.g. grep, sed, or parameter expansion).
-         If jq-style parsing is needed, use Python one-liners as a fallback
-         since jq may not be available.
+      1. Standard POSIX utilities only — no third-party packages. Use Python one-liners for JSON parsing if jq is unavailable.
+      2. Define a `solve()` function containing the main logic.
+      3. Read inputs from `$INTENT_INPUTS`. The variable contains a JSON object — use its top-level keys directly.
       4. Call the function at the end of the script and echo the result.
-      5. If no inputs are needed (empty INTENT_INPUTS), the function may ignore
-         the variable but MUST still be wrapped in a function.
-      6. The script MUST print its final result to stdout using echo.
-      7. The INTENT_INPUTS environment variable contains a JSON object — use its
-         top-level keys directly. Do NOT unwrap a sub-key like ".data" or
-         assume any wrapper. The JSON IS the data.
-         Example: if INTENT_INPUTS is {"group_a": {...}, "group_b": {...}},
-         iterate the top-level keys directly — NOT
-         `echo "$INTENT_INPUTS" | python3 -c "... .get('data', {})"`.
-
-      8. Write the complete solution to /workspace/solution.sh using fs.write.
-      9. Confirm the write succeeded before returning.
-      10. Do not add explanatory comments — just working code.
-
-      Example structure:
-      ```bash
-      #!/bin/bash
-
-      solve() {
-        local inputs="${INTENT_INPUTS:-"{}"}"
-        # ... implementation using inputs ...
-        echo "$result"
-      }
-
-      solve
-      ```
+      5. The `INTENT_INPUTS` JSON uses the EXACT keys shown in the prompt below. Use ONLY those key names — do NOT guess, rename, or wrap them.
+      6. Print the result to stdout via `echo`.
     prompt_template: |
       {{instruction}}
 

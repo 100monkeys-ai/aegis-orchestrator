@@ -137,7 +137,7 @@ impl Default for GenerationOptions {
     fn default() -> Self {
         Self {
             max_tokens: Some(8192),
-            temperature: Some(0.7),
+            temperature: Some(0.4),
             stop_sequences: None,
         }
     }
