@@ -126,7 +126,7 @@ pub enum CredentialProvider {
     OpenAI,
     Anthropic,
     GitHub,
-    GoogleWorkspace,
+    Google,
     /// Any provider not explicitly enumerated above; the inner string is the
     /// canonical service identifier chosen by the user (e.g. `"stripe"`).
     Custom(String),
@@ -138,7 +138,7 @@ impl std::fmt::Display for CredentialProvider {
             CredentialProvider::OpenAI => write!(f, "openai"),
             CredentialProvider::Anthropic => write!(f, "anthropic"),
             CredentialProvider::GitHub => write!(f, "github"),
-            CredentialProvider::GoogleWorkspace => write!(f, "google_workspace"),
+            CredentialProvider::Google => write!(f, "google"),
             CredentialProvider::Custom(name) => write!(f, "{name}"),
         }
     }

@@ -176,7 +176,7 @@ fn parse_provider(s: &str) -> Result<CredentialProvider, Response> {
         "openai" => CredentialProvider::OpenAI,
         "anthropic" => CredentialProvider::Anthropic,
         "github" => CredentialProvider::GitHub,
-        "google_workspace" => CredentialProvider::GoogleWorkspace,
+        "google" => CredentialProvider::Google,
         other if !other.is_empty() => CredentialProvider::Custom(other.to_string()),
         _ => {
             return Err((

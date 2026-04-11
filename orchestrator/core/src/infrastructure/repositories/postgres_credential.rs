@@ -68,7 +68,7 @@ fn provider_to_str(p: &CredentialProvider) -> String {
         CredentialProvider::OpenAI => "openai".to_string(),
         CredentialProvider::Anthropic => "anthropic".to_string(),
         CredentialProvider::GitHub => "github".to_string(),
-        CredentialProvider::GoogleWorkspace => "google_workspace".to_string(),
+        CredentialProvider::Google => "google".to_string(),
         CredentialProvider::Custom(name) => format!("custom:{name}"),
     }
 }
@@ -78,7 +78,7 @@ fn str_to_provider(s: &str) -> CredentialProvider {
         "openai" => CredentialProvider::OpenAI,
         "anthropic" => CredentialProvider::Anthropic,
         "github" => CredentialProvider::GitHub,
-        "google_workspace" => CredentialProvider::GoogleWorkspace,
+        "google" => CredentialProvider::Google,
         other => {
             let name = other.strip_prefix("custom:").unwrap_or(other);
             CredentialProvider::Custom(name.to_string())
