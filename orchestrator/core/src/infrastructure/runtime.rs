@@ -127,6 +127,12 @@ pub struct ContainerRuntime {
     /// Dropping a handle triggers FUSE_DESTROY + unmount on the host.
     fuse_mount_handles:
         RwLock<HashMap<String, Vec<crate::infrastructure::fuse::daemon::FuseMountHandle>>>,
+    /// gRPC FUSE mounts keyed by container ID (ADR-107).
+    /// Stores (execution_id, volume_id) pairs for each container so that
+    /// `terminate()` can call `client.unmount()` on the remote FUSE daemon.
+    /// Without this, agent containers using gRPC FUSE mounts leave orphaned
+    /// mountpoints that spam `DirectoryListed` events every 2 seconds.
+    grpc_fuse_mounts: RwLock<HashMap<String, Vec<(String, String)>>>,
 }
 
 /// Configuration bundle for constructing a [`ContainerRuntime`].
@@ -237,6 +243,7 @@ impl ContainerRuntime {
             fuse_mount_prefix,
             fuse_mount_client,
             fuse_mount_handles: RwLock::new(HashMap::new()),
+            grpc_fuse_mounts: RwLock::new(HashMap::new()),
         })
     }
 
@@ -583,12 +590,20 @@ impl AgentRuntime for ContainerRuntime {
         // store them in the per-container map once we know the container ID.
         let mut pending_fuse_handles: Vec<crate::infrastructure::fuse::daemon::FuseMountHandle> =
             Vec::new();
+        // gRPC FUSE mount tracking: (execution_id, volume_id) pairs collected
+        // during the gRPC mount path, stored per-container after creation so
+        // terminate() can call unmount on the remote daemon.
+        let mut pending_grpc_fuse_pairs_outer: Vec<(String, String)> = Vec::new();
         if !config.volumes.is_empty() {
             if let Some(ref _fuse_mount_client) = self.fuse_mount_client {
                 // ── gRPC FuseMountService path (ADR-107) ─────────────────────────
                 // Delegate mount requests to the host-side FUSE daemon over gRPC.
                 let mut grpc_mounts: Vec<Mount> = Vec::new();
                 let mut client = _fuse_mount_client.clone();
+
+                // Track (execution_id, volume_id) pairs so terminate() can call
+                // unmount on the remote FUSE daemon after the container exits.
+                let mut pending_grpc_fuse_pairs: Vec<(String, String)> = Vec::new();
 
                 for volume_mount in &config.volumes {
                     let container_path = volume_mount.mount_point.display().to_string();
@@ -622,6 +637,10 @@ impl AgentRuntime for ContainerRuntime {
                                 read_only = is_read_only,
                                 "Configured gRPC FUSE mount for agent container (ADR-107)"
                             );
+                            pending_grpc_fuse_pairs.push((
+                                config.execution_id.0.to_string(),
+                                volume_mount.volume_id.0.to_string(),
+                            ));
                             grpc_mounts.push(Mount {
                                 target: Some(container_path),
                                 source: Some(mountpoint),
@@ -642,6 +661,17 @@ impl AgentRuntime for ContainerRuntime {
 
                 if !grpc_mounts.is_empty() {
                     host_config.mounts = Some(grpc_mounts);
+                }
+
+                // Temporarily stash the pairs; they'll be stored keyed by container
+                // ID after create_container succeeds (same pattern as pending_fuse_handles).
+                pending_fuse_handles = Vec::new(); // no local handles for gRPC path
+
+                // Stash the gRPC pairs so we can store them keyed by container ID
+                // after create_container succeeds.
+                #[allow(unused_assignments)]
+                {
+                    pending_grpc_fuse_pairs_outer = pending_grpc_fuse_pairs;
                 }
             } else if let Some(ref fuse_daemon) = self.fuse_daemon {
                 // ── FUSE + bind mount path (ADR-107) ─────────────────────────────
@@ -881,6 +911,16 @@ impl AgentRuntime for ContainerRuntime {
                 .write()
                 .await
                 .insert(id.clone(), pending_fuse_handles);
+        }
+
+        // Store gRPC FUSE mount pairs keyed by container ID (ADR-107).
+        // terminate() iterates these and calls client.unmount() on the remote
+        // FUSE daemon for each (execution_id, volume_id) pair.
+        if !pending_grpc_fuse_pairs_outer.is_empty() {
+            self.grpc_fuse_mounts
+                .write()
+                .await
+                .insert(id.clone(), pending_grpc_fuse_pairs_outer);
         }
 
         self.keep_container_on_failure
@@ -1137,6 +1177,55 @@ impl AgentRuntime for ContainerRuntime {
             drop(handles);
         }
 
+        // Unmount gRPC FUSE mounts (ADR-107). When the gRPC FuseMountService
+        // path was used, the FUSE mounts live in the remote daemon process —
+        // dropping local handles does nothing. We must explicitly call unmount
+        // for each volume that was gRPC-mounted during spawn().
+        if let Some(grpc_pairs) = self.grpc_fuse_mounts.write().await.remove(id.as_str()) {
+            if let Some(ref fuse_mount_client) = self.fuse_mount_client {
+                let mut client = fuse_mount_client.clone();
+                for (execution_id, volume_id) in &grpc_pairs {
+                    let unmount_req =
+                        crate::infrastructure::aegis_runtime_proto::FuseUnmountRequest {
+                            volume_id: volume_id.clone(),
+                            execution_id: execution_id.clone(),
+                        };
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        client.unmount(unmount_req),
+                    )
+                    .await
+                    {
+                        Err(_elapsed) => {
+                            warn!(
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                container_id = id.as_str(),
+                                "gRPC FUSE unmount timed out after 5s — mount may linger"
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            warn!(
+                                error = %e,
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                container_id = id.as_str(),
+                                "gRPC FUSE unmount failed — mount may linger"
+                            );
+                        }
+                        Ok(Ok(_)) => {
+                            debug!(
+                                volume_id = %volume_id,
+                                execution_id = %execution_id,
+                                container_id = id.as_str(),
+                                "gRPC FUSE unmount succeeded for agent container"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         info!("Terminated agent container: {}", id.as_str());
         Ok(())
     }
@@ -1261,6 +1350,50 @@ mod tests {
             labels.get(AEGIS_KEEP_CONTAINER_ON_FAILURE_LABEL),
             Some(&"true".to_string())
         );
+    }
+
+    /// Regression: gRPC FUSE mounts in agent containers (via ContainerRuntime)
+    /// must be tracked per-container and unmounted in terminate(). Before this
+    /// fix, only ContainerStepRunner tracked gRPC-mounted volumes — agent
+    /// containers using the gRPC FuseMountService path in spawn() created FUSE
+    /// mounts on the remote daemon but never called unmount(), leaving orphaned
+    /// mountpoints that spammed `DirectoryListed` events every 2 seconds.
+    #[test]
+    fn test_grpc_fuse_mounts_tracking_structure() {
+        use std::collections::HashMap;
+        use tokio::sync::RwLock;
+
+        // Simulate the grpc_fuse_mounts map that ContainerRuntime now maintains.
+        let grpc_fuse_mounts: RwLock<HashMap<String, Vec<(String, String)>>> =
+            RwLock::new(HashMap::new());
+
+        let container_id = "abc123".to_string();
+        let exec_id = "11111111-1111-1111-1111-111111111111".to_string();
+        let vol_id_1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+        let vol_id_2 = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string();
+
+        // Insert tracking entries (simulates what spawn() now does).
+        let pairs = vec![
+            (exec_id.clone(), vol_id_1.clone()),
+            (exec_id.clone(), vol_id_2.clone()),
+        ];
+        grpc_fuse_mounts
+            .blocking_write()
+            .insert(container_id.clone(), pairs);
+
+        // Verify terminate() can retrieve and consume them.
+        let removed = grpc_fuse_mounts.blocking_write().remove(&container_id);
+        assert!(removed.is_some());
+        let removed = removed.unwrap();
+        assert_eq!(removed.len(), 2);
+        assert_eq!(removed[0], (exec_id.clone(), vol_id_1));
+        assert_eq!(removed[1], (exec_id, vol_id_2));
+
+        // After removal, the container entry is gone.
+        assert!(grpc_fuse_mounts
+            .blocking_read()
+            .get(&container_id)
+            .is_none());
     }
 }
 // Private helper methods for ContainerRuntime (Docker/Podman)
