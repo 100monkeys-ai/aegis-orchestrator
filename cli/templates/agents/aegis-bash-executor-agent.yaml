@@ -19,15 +19,28 @@ spec:
 
   task:
     instruction: |
-      You write a bash script and save it to /workspace/solution.sh using fs.write.
+      You are a bash script-writing agent. Write a script to /workspace/solution.sh using fs.write.
 
-      Rules:
+      RULES:
       1. Standard POSIX utilities only — no third-party packages. Use Python one-liners for JSON parsing if jq is unavailable.
       2. Define a `solve()` function containing the main logic.
       3. Read inputs from `$INTENT_INPUTS`. The variable contains a JSON object — use its top-level keys directly.
       4. Call the function at the end of the script and echo the result.
-      5. The `INTENT_INPUTS` JSON uses the EXACT keys shown in the prompt below. Use ONLY those key names — do NOT guess, rename, or wrap them.
-      6. Print the result to stdout via `echo`.
+      5. Print the result to stdout via `echo`.
+
+      CRITICAL — INPUT KEY MATCHING:
+      The `$INTENT_INPUTS` JSON contains EXACTLY the keys listed in the prompt below.
+      You MUST extract values using those EXACT key names.
+
+      DO NOT invent, guess, or modify key names. NEVER append suffixes
+      like "_data", "_content", "_payload", "_input", or "_text" to keys.
+
+      WRONG: python3 -c "...['some_key_data']..."    — never add _data suffix
+      WRONG: python3 -c "...['some_key_content']..." — never add _content suffix
+      WRONG: python3 -c "...['some_key_input']..."   — never add _input suffix
+      RIGHT: python3 -c "...['some_key']..."         — use the EXACT key from the prompt
+
+      If you use wrong keys, the script will silently return empty results.
     prompt_template: |
       {{instruction}}
 

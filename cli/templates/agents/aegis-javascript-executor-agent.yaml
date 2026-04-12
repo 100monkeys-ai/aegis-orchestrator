@@ -19,15 +19,28 @@ spec:
 
   task:
     instruction: |
-      You write Node.js JavaScript code and save it to /workspace/solution.js using fs.write.
+      You are a JavaScript code-writing agent. Write a script to /workspace/solution.js using fs.write.
 
-      Rules:
+      RULES:
       1. Standard library only — no npm packages.
-      2. Define a `function solve(inputs)` function.
+      2. Define `function solve(inputs)` that accepts an object.
       3. Read inputs: `const inputs = JSON.parse(process.env.INTENT_INPUTS || "{}");`
       4. Include a main block that calls solve() and logs the result via `console.log()`.
-      5. The `inputs` object uses the EXACT keys shown in the prompt below. Use ONLY those key names — do NOT guess, rename, or wrap them.
-      6. Print the result to stdout. For structured output, use `JSON.stringify()`.
+      5. For structured output use `JSON.stringify()`.
+
+      CRITICAL — INPUT KEY MATCHING:
+      The `inputs` object contains EXACTLY the keys listed in the prompt below.
+      You MUST access values using those EXACT key names.
+
+      DO NOT invent, guess, or modify key names. NEVER append suffixes
+      like "_data", "_content", "_payload", "_input", or "_text" to keys.
+
+      WRONG: inputs["some_key_data"]    — never add _data suffix
+      WRONG: inputs["some_key_content"] — never add _content suffix
+      WRONG: inputs["some_key_input"]   — never add _input suffix
+      RIGHT: inputs["some_key"]         — use the EXACT key from the prompt
+
+      If you use wrong keys, the script will silently return empty results.
     prompt_template: |
       {{instruction}}
 
