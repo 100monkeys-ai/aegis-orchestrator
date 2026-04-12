@@ -488,7 +488,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             };
 
                         match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
+                            std::time::Duration::from_secs(10),
                             client.mount(grpc_req),
                         )
                         .await
@@ -811,7 +811,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             execution_id: execution_id.clone(),
                         };
                     match tokio::time::timeout(
-                        std::time::Duration::from_secs(5),
+                        std::time::Duration::from_secs(10),
                         client.unmount(unmount_req),
                     )
                     .await

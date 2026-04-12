@@ -579,7 +579,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         Some(ref endpoint) => {
             match tonic::transport::Channel::from_shared(endpoint.clone())
                 .map(|ch| {
-                    ch.connect_timeout(std::time::Duration::from_secs(5))
+                    ch.connect_timeout(std::time::Duration::from_secs(10))
                         .connect_lazy()
                 })
             {
