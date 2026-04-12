@@ -496,7 +496,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             Err(_elapsed) => {
                                 warn!(
                                     volume_name = %vm.name,
-                                    "gRPC FUSE mount timed out after 5s — volume will not be available"
+                                    "gRPC FUSE mount timed out after 10s — volume will not be available"
                                 );
                             }
                             Ok(mount_result) => match mount_result {
@@ -820,7 +820,7 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             warn!(
                                 volume_id = %volume_id,
                                 execution_id = %execution_id,
-                                "gRPC FUSE unmount timed out after 5s — mount may linger"
+                                "gRPC FUSE unmount timed out after 10s — mount may linger"
                             );
                         }
                         Ok(Err(e)) => {
