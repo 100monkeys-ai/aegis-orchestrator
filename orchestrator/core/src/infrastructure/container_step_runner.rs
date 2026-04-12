@@ -48,6 +48,9 @@ use tracing::{debug, info, warn};
 // 1 MiB cap per stream (stdout/stderr) to prevent runaway output from flooding memory.
 const STREAM_BYTES_CAP: usize = 1_048_576;
 
+/// Timeout for gRPC FUSE mount/unmount operations.
+pub(crate) const FUSE_GRPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Configuration for [`ContainerStepRunnerImpl`].
 pub struct ContainerStepRunnerConfig {
     /// Docker network mode for container steps (e.g. `"host"`).
@@ -487,16 +490,13 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                                     .unwrap_or_default(),
                             };
 
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(10),
-                            client.mount(grpc_req),
-                        )
-                        .await
+                        match tokio::time::timeout(FUSE_GRPC_TIMEOUT, client.mount(grpc_req)).await
                         {
                             Err(_elapsed) => {
                                 warn!(
                                     volume_name = %vm.name,
-                                    "gRPC FUSE mount timed out after 10s — volume will not be available"
+                                    timeout_secs = FUSE_GRPC_TIMEOUT.as_secs(),
+                                    "gRPC FUSE mount timed out — volume will not be available"
                                 );
                             }
                             Ok(mount_result) => match mount_result {
@@ -810,17 +810,14 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
                             volume_id: volume_id.clone(),
                             execution_id: execution_id.clone(),
                         };
-                    match tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        client.unmount(unmount_req),
-                    )
-                    .await
+                    match tokio::time::timeout(FUSE_GRPC_TIMEOUT, client.unmount(unmount_req)).await
                     {
                         Err(_elapsed) => {
                             warn!(
                                 volume_id = %volume_id,
                                 execution_id = %execution_id,
-                                "gRPC FUSE unmount timed out after 10s — mount may linger"
+                                timeout_secs = FUSE_GRPC_TIMEOUT.as_secs(),
+                                "gRPC FUSE unmount timed out — mount may linger"
                             );
                         }
                         Ok(Err(e)) => {

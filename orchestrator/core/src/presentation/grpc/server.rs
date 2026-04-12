@@ -1255,7 +1255,7 @@ impl AegisRuntime for AegisRuntimeService {
                 execution_id: String::new(), // Wildcard: unmount all executions
             };
             match tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                crate::infrastructure::container_step_runner::FUSE_GRPC_TIMEOUT,
                 client.unmount(unmount_req),
             )
             .await
@@ -1263,7 +1263,8 @@ impl AegisRuntime for AegisRuntimeService {
                 Err(_elapsed) => {
                     tracing::warn!(
                         volume_id = %req.volume_id,
-                        "gRPC FUSE unmount timed out after 10s during workspace volume destruction"
+                        timeout_secs = crate::infrastructure::container_step_runner::FUSE_GRPC_TIMEOUT.as_secs(),
+                        "gRPC FUSE unmount timed out during workspace volume destruction"
                     );
                 }
                 Ok(Err(e)) => {
