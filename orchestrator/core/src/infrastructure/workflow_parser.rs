@@ -1309,4 +1309,130 @@ spec:
         let reparsed = WorkflowParser::parse_yaml(&yaml_out).expect("Should re-parse from YAML");
         assert_eq!(reparsed.metadata.name, "parent-workflow");
     }
+
+    // ========================================================================
+    // Regression tests: output_schema and output_template parsing
+    // ========================================================================
+
+    #[test]
+    fn test_parse_workflow_with_output_schema_and_template() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: output-fields-test
+  version: "1.0.0"
+  output_schema:
+    type: object
+    properties:
+      summary:
+        type: string
+    required:
+      - summary
+  output_template:
+    summary: "{{blackboard.final_summary}}"
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#;
+
+        let workflow = WorkflowParser::parse_yaml(yaml)
+            .expect("workflow with output_schema and output_template should parse");
+
+        assert!(
+            workflow.metadata.output_schema.is_some(),
+            "output_schema must be populated when present in YAML"
+        );
+        let schema = workflow.metadata.output_schema.as_ref().unwrap();
+        assert_eq!(
+            schema["type"], "object",
+            "output_schema.type must be 'object'"
+        );
+        assert_eq!(
+            schema["properties"]["summary"]["type"], "string",
+            "output_schema must preserve nested property types"
+        );
+
+        assert!(
+            workflow.metadata.output_template.is_some(),
+            "output_template must be populated when present in YAML"
+        );
+        let template = workflow.metadata.output_template.as_ref().unwrap();
+        assert_eq!(
+            template["summary"], "{{blackboard.final_summary}}",
+            "output_template must preserve Handlebars expressions"
+        );
+    }
+
+    #[test]
+    fn test_parse_workflow_without_output_fields_is_backwards_compatible() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: no-output-fields
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#;
+
+        let workflow = WorkflowParser::parse_yaml(yaml)
+            .expect("workflow without output fields should parse (backwards compatible)");
+
+        assert!(
+            workflow.metadata.output_schema.is_none(),
+            "output_schema must be None when absent from YAML"
+        );
+        assert!(
+            workflow.metadata.output_template.is_none(),
+            "output_template must be None when absent from YAML"
+        );
+    }
+
+    #[test]
+    fn test_output_schema_and_template_round_trip() {
+        let yaml = r#"
+apiVersion: 100monkeys.ai/v1
+kind: Workflow
+metadata:
+  name: output-roundtrip
+  output_schema:
+    type: object
+    properties:
+      answer:
+        type: string
+  output_template:
+    answer: "{{blackboard.result}}"
+spec:
+  initial_state: START
+  states:
+    START:
+      kind: System
+      command: echo "done"
+      transitions: []
+"#;
+
+        let workflow = WorkflowParser::parse_yaml(yaml).expect("initial parse should succeed");
+        let yaml_out =
+            WorkflowParser::to_yaml(&workflow).expect("serialization to YAML should succeed");
+        let reparsed =
+            WorkflowParser::parse_yaml(&yaml_out).expect("re-parsed YAML should succeed");
+
+        assert_eq!(
+            workflow.metadata.output_schema, reparsed.metadata.output_schema,
+            "output_schema must survive round-trip serialization"
+        );
+        assert_eq!(
+            workflow.metadata.output_template, reparsed.metadata.output_template,
+            "output_template must survive round-trip serialization"
+        );
+    }
 }

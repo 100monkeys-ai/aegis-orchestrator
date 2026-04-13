@@ -2090,4 +2090,140 @@ mod tests {
         let result = Workflow::new(metadata, spec);
         assert!(result.is_ok());
     }
+
+    // ========================================================================
+    // Regression tests: output_schema, output_template, final_output
+    // ========================================================================
+
+    #[test]
+    fn test_workflow_execution_new_has_final_output_none() {
+        let metadata = WorkflowMetadata {
+            name: "output-test".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            input_schema: None,
+            output_schema: Some(serde_json::json!({"type": "object"})),
+            output_template: Some(serde_json::json!({"result": "{{blackboard.answer}}"})),
+        };
+
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+                max_state_visits: None,
+            },
+        );
+
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            storage: Default::default(),
+            max_total_transitions: None,
+        };
+
+        let workflow = Workflow::new(metadata, spec).expect("valid workflow");
+        let execution = WorkflowExecution::new(
+            &workflow,
+            ExecutionId::new(),
+            serde_json::json!({"prompt": "hello"}),
+        );
+
+        assert!(
+            execution.final_output.is_none(),
+            "WorkflowExecution::new() must initialise final_output to None"
+        );
+    }
+
+    #[test]
+    fn test_workflow_execution_final_output_can_be_set() {
+        let metadata = WorkflowMetadata {
+            name: "output-set".to_string(),
+            version: None,
+            description: None,
+            labels: HashMap::new(),
+            annotations: HashMap::new(),
+            input_schema: None,
+            output_schema: None,
+            output_template: None,
+        };
+
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::System {
+                    command: "echo".to_string(),
+                    env: HashMap::new(),
+                    workdir: None,
+                },
+                transitions: vec![],
+                timeout: None,
+                max_state_visits: None,
+            },
+        );
+
+        let spec = WorkflowSpec {
+            initial_state: StateName::new("START").unwrap(),
+            context: HashMap::new(),
+            states,
+            storage: Default::default(),
+            max_total_transitions: None,
+        };
+
+        let workflow = Workflow::new(metadata, spec).expect("valid workflow");
+        let mut execution =
+            WorkflowExecution::new(&workflow, ExecutionId::new(), serde_json::json!({}));
+
+        let output = serde_json::json!({"result": "hello", "score": 0.95});
+        execution.final_output = Some(output.clone());
+
+        assert_eq!(
+            execution.final_output,
+            Some(output),
+            "final_output must persist the assigned value"
+        );
+    }
+
+    #[test]
+    fn test_final_output_json_serialization_some() {
+        // Validates that when final_output is Some, serde_json::json! macro
+        // (used in the workflow wait response) includes the value under the key.
+        let final_output: Option<serde_json::Value> = Some(serde_json::json!({"result": "hello"}));
+        let response = serde_json::json!({
+            "tool": "aegis.workflow.wait",
+            "last_output": final_output,
+        });
+
+        assert_eq!(
+            response["last_output"],
+            serde_json::json!({"result": "hello"}),
+            "last_output must contain the final_output value when Some"
+        );
+    }
+
+    #[test]
+    fn test_final_output_json_serialization_none() {
+        // Validates that when final_output is None, serde_json::json! macro
+        // (used in the workflow wait response) serializes to null.
+        let final_output: Option<serde_json::Value> = None;
+        let response = serde_json::json!({
+            "tool": "aegis.workflow.wait",
+            "last_output": final_output,
+        });
+
+        assert!(
+            response["last_output"].is_null(),
+            "last_output must be null when final_output is None"
+        );
+    }
 }
