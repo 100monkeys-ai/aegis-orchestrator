@@ -121,6 +121,8 @@ fn build_workflow_with_description(name: &str, description: Option<&str>) -> Wor
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),

@@ -72,6 +72,8 @@ fn build_workflow(name: &str) -> Workflow {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),

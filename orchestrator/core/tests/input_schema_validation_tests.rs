@@ -102,6 +102,8 @@ fn workflow_with_schema(name: &str, schema: serde_json::Value) -> Workflow {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: Some(schema),
+            output_schema: None,
+            output_template: None,
         },
         WorkflowSpec {
             initial_state: StateName::new("START").unwrap(),
