@@ -29,6 +29,7 @@ use crate::domain::execution::ExecutionId;
 use crate::domain::execution::ExecutionStatus;
 use crate::domain::repository::WorkflowExecutionRepository;
 use crate::domain::tenant::TenantId;
+use crate::domain::workflow::StateName;
 use crate::infrastructure::event_bus::EventBus;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -53,6 +54,11 @@ pub struct CompleteWorkflowExecutionRequest {
     pub final_output: Option<serde_json::Value>,
     pub error_reason: Option<String>,
     pub artifacts: Option<serde_json::Value>,
+    /// The last FSM state the workflow actually executed (e.g. "EXECUTE_CODE").
+    /// When present, `WorkflowExecution.current_state` is updated so that the
+    /// persisted execution reflects the true final state rather than a stale
+    /// mid-execution snapshot.
+    pub final_state: Option<String>,
 }
 
 /// Completed workflow execution response
@@ -153,6 +159,13 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
         let final_status_str = format!("{final_status:?}").to_lowercase();
         execution.status = final_status;
         let completed_at = Utc::now();
+
+        // Step 3b: Update current_state to the final FSM state if provided
+        if let Some(ref final_state) = request.final_state {
+            let state_name = StateName::new(final_state.clone())
+                .context("Invalid final_state name in completion request")?;
+            execution.transition_to(state_name);
+        }
 
         // Step 4: Merge final blackboard state if provided
         if let Some(blackboard_json) = request.final_blackboard {
@@ -334,6 +347,7 @@ mod tests {
                     final_output: None,
                     error_reason: None,
                     artifacts: Some(json!({"report":"ok"})),
+                    final_state: None,
                 },
             )
             .await
@@ -384,6 +398,7 @@ mod tests {
                     final_output: None,
                     error_reason: Some("boom".to_string()),
                     artifacts: None,
+                    final_state: None,
                 },
             )
             .await
@@ -426,6 +441,7 @@ mod tests {
                 final_output: None,
                 error_reason: None,
                 artifacts: None,
+                final_state: None,
             })
             .await
             .unwrap_err();
@@ -451,6 +467,7 @@ mod tests {
                 final_output: None,
                 error_reason: None,
                 artifacts: None,
+                final_state: None,
             })
             .await
             .unwrap_err();
@@ -478,6 +495,7 @@ mod tests {
                     final_output: None,
                     error_reason: None,
                     artifacts: None,
+                    final_state: None,
                 },
             )
             .await
@@ -497,6 +515,92 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "cross-tenant lookup should not see executions from a different tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_execution_updates_current_state_to_final_state() {
+        // Regression: completing a workflow used to leave current_state at its
+        // mid-execution value (e.g. "START") instead of advancing to the final
+        // FSM state reported by the Temporal worker.
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let tenant_id = TenantId::consumer();
+        let execution_id = seed_execution(&repo, &tenant_id, "final-state-regression").await;
+
+        // Confirm the execution starts at "START"
+        let before = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.current_state, StateName::new("START").unwrap());
+
+        let event_bus = Arc::new(EventBus::new(8));
+        let service = StandardCompleteWorkflowExecutionUseCase::new(repo.clone(), event_bus);
+
+        service
+            .complete_execution_for_tenant(
+                &tenant_id,
+                CompleteWorkflowExecutionRequest {
+                    execution_id: execution_id.to_string(),
+                    status: CompletionStatus::Success,
+                    final_blackboard: None,
+                    final_output: None,
+                    error_reason: None,
+                    artifacts: None,
+                    final_state: Some("END".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.current_state,
+            StateName::new("END").unwrap(),
+            "current_state must be updated to the final_state from the completion request"
+        );
+        assert_eq!(saved.status, ExecutionStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn complete_execution_leaves_current_state_unchanged_when_final_state_is_none() {
+        // When no final_state is provided, current_state should remain as-is.
+        let repo = Arc::new(InMemoryWorkflowExecutionRepository::new());
+        let tenant_id = TenantId::consumer();
+        let execution_id = seed_execution(&repo, &tenant_id, "no-final-state-regression").await;
+        let event_bus = Arc::new(EventBus::new(8));
+        let service = StandardCompleteWorkflowExecutionUseCase::new(repo.clone(), event_bus);
+
+        service
+            .complete_execution_for_tenant(
+                &tenant_id,
+                CompleteWorkflowExecutionRequest {
+                    execution_id: execution_id.to_string(),
+                    status: CompletionStatus::Success,
+                    final_blackboard: None,
+                    final_output: None,
+                    error_reason: None,
+                    artifacts: None,
+                    final_state: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let saved = repo
+            .find_by_id_for_tenant(&tenant_id, execution_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.current_state,
+            StateName::new("START").unwrap(),
+            "current_state should remain at initial state when final_state is None"
         );
     }
 }

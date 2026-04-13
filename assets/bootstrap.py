@@ -17,6 +17,7 @@ DESIGN CONSTRAINTS (DO NOT VIOLATE):
   - All policy enforcement is server-side; bootstrap.py is a trusted executor
   - Add complexity to the orchestrator, not here
 """
+
 import base64
 import json
 import os
@@ -31,7 +32,9 @@ import urllib.request
 # ---------------------------------------------------------------------------
 
 SEAL_ENABLED = os.environ.get("AEGIS_SEAL_ENABLED", "").lower() in ("true", "1", "yes")
-SEAL_GATEWAY_URL = os.environ.get("AEGIS_SEAL_GATEWAY_URL", "http://host.docker.internal:8090")
+SEAL_GATEWAY_URL = os.environ.get(
+    "AEGIS_SEAL_GATEWAY_URL", "http://host.docker.internal:8090"
+)
 
 if SEAL_ENABLED:
     try:
@@ -77,13 +80,15 @@ class SealClient:
 
     def attest(self):
         """Perform SEAL attestation handshake and store the returned SecurityToken."""
-        payload = json.dumps({
-            "public_key": self._public_key_b64,
-            "container_id": self.container_id,
-            "security_context": self.security_context,
-            "agent_id": self.agent_id,
-            "execution_id": self.execution_id,
-        }).encode("utf-8")
+        payload = json.dumps(
+            {
+                "public_key": self._public_key_b64,
+                "container_id": self.container_id,
+                "security_context": self.security_context,
+                "agent_id": self.agent_id,
+                "execution_id": self.execution_id,
+            }
+        ).encode("utf-8")
 
         req = urllib.request.Request(
             f"{self.orchestrator_url}/v1/seal/attest",
@@ -205,14 +210,20 @@ def post_json(payload: dict, timeout: int = 0) -> dict:
                 debug_print(f"← {resp.status} ({len(body)} bytes)")
                 return json.loads(body)
         except urllib.error.HTTPError as e:
+            # Server IS reachable but returned an error — do NOT fall through
+            # to the next candidate URL.  Only connection-level failures
+            # (URLError / OSError) should trigger URL fallback.
             body = e.read().decode("utf-8")
-            err = f"{base_url}: HTTP {e.code} {e.reason} — {body}"
-            errors.append(err)
-            debug_print(f"HTTP error: {err}")
+            debug_print(f"HTTP error: {base_url}: HTTP {e.code} {e.reason} — {body}")
+            print(
+                f"Error: Orchestrator returned HTTP {e.code}: {body}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         except Exception as e:
             err = f"{base_url}: {e}"
             errors.append(err)
-            debug_print(f"Error: {err}")
+            debug_print(f"Connection error: {err}")
 
     print(
         "Error: Failed to reach orchestrator.\n"
@@ -428,7 +439,11 @@ def main():
     # -- SEAL attestation (optional) ------------------------------------------
     seal_client = None
     if SEAL_ENABLED:
-        orchestrator_url = _candidate_urls()[0] if _candidate_urls() else "http://host.docker.internal:8088"
+        orchestrator_url = (
+            _candidate_urls()[0]
+            if _candidate_urls()
+            else "http://host.docker.internal:8088"
+        )
         seal_client = SealClient(
             orchestrator_url=orchestrator_url,
             seal_gateway_url=SEAL_GATEWAY_URL,

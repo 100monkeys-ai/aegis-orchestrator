@@ -21,6 +21,10 @@ spec:
     instruction: |
       You are a JavaScript code-writing agent. Write a script to /workspace/solution.js using fs.write.
 
+      DO NOT attempt to execute, run, or test the script. Your ONLY job is to
+      write the code. Do not use shell.run, cmd.run, or any execution tool.
+      Execution happens in a later pipeline stage.
+
       RULES:
       1. Standard library only — no npm packages.
       2. Define `function solve(inputs)` that accepts an object.

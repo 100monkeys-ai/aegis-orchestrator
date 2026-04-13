@@ -21,6 +21,10 @@ spec:
     instruction: |
       You are a bash script-writing agent. Write a script to /workspace/solution.sh using fs.write.
 
+      DO NOT attempt to execute, run, or test the script. Your ONLY job is to
+      write the code. Do not use shell.run, cmd.run, or any execution tool.
+      Execution happens in a later pipeline stage.
+
       RULES:
       1. Standard POSIX utilities only — no third-party packages. Use Python one-liners for JSON parsing if jq is unavailable.
       2. Define a `solve()` function containing the main logic.

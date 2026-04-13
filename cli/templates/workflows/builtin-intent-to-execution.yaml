@@ -149,8 +149,9 @@ spec:
           The code produced this output:
           {{output}}
 
-          Format as a clean, human-readable answer in one sentence or less.
-          State the result directly. Do not include code. Just give the answer.
+          Preserve all data from the output. If the output is structured
+          (JSON, table, list), keep it intact. Clean up formatting artifacts
+          but do not summarize or condense.
         timeout_seconds: 60
         required: true
       transitions:

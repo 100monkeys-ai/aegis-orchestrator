@@ -515,28 +515,10 @@ impl InnerLoopService {
                                 self.active_executions.write().await.insert(execution_id_str.to_string(), next_ctx);
                             }
                             Err(e) => {
-                                // Differentiate fatal policy/validation errors from
-                                // recoverable tool execution errors.
-                                //
-                                // The following are configuration or security errors that will
-                                // never self-resolve by retrying. Fail the execution
-                                // immediately instead of looping forever (ADR-049).
-                                //   - SignatureVerificationFailed: Ed25519 crypto / validation rejection
-                                //   - PolicyViolation: security context denial
-                                //   - SessionInactive: session expired or revoked
-                                //   - NotFound: missing agent/resource (e.g. judge agent not found)
-                                //   - ConfigurationError: misconfigured security context or gateway
-                                use crate::domain::seal_session::SealSessionError;
-                                let is_fatal = matches!(
-                                    &e,
-                                    SealSessionError::SignatureVerificationFailed(_)
-                                        | SealSessionError::PolicyViolation(_)
-                                        | SealSessionError::SessionInactive(_)
-                                        | SealSessionError::NotFound(_)
-                                        | SealSessionError::ConfigurationError(_)
-                                );
+                                // Differentiate fatal, policy-feedback, and recoverable errors.
+                                let classification = classify_seal_error(&e);
 
-                                if is_fatal {
+                                if classification == SealErrorClass::Fatal {
                                     tracing::error!(
                                         tool = %tool_call.name,
                                         error = %e,
@@ -560,17 +542,31 @@ impl InnerLoopService {
                                     );
                                 }
 
-                                // Recoverable errors (e.g. MalformedPayload, SessionExpired)
-                                // are fed back to the LLM as tool error messages so it can
-                                // adjust its approach.
-                                tracing::debug!(
-                                    execution_id = %execution_id_str,
-                                    tool = %tool_call.name,
-                                    tool_call_id = %tool_call.id,
-                                    error = %e,
-                                    "Tool returned recoverable error — feeding back to LLM"
-                                );
-                                let tool_result = format!("Tool execution error: {e}");
+                                // Policy violations and not-found errors are fed back as
+                                // explicit "tool not available" messages so the LLM stops
+                                // retrying the denied tool (ADR-005 iterative refinement).
+                                let tool_result = if classification == SealErrorClass::PolicyFeedback {
+                                    tracing::warn!(
+                                        execution_id = %execution_id_str,
+                                        tool = %tool_call.name,
+                                        tool_call_id = %tool_call.id,
+                                        error = %e,
+                                        "Policy/not-found error — feeding back to LLM as tool error"
+                                    );
+                                    policy_feedback_message(&tool_call.name)
+                                } else {
+                                    // Recoverable errors (e.g. MalformedPayload, SessionExpired)
+                                    // are fed back to the LLM as tool error messages so it can
+                                    // adjust its approach.
+                                    tracing::debug!(
+                                        execution_id = %execution_id_str,
+                                        tool = %tool_call.name,
+                                        tool_call_id = %tool_call.id,
+                                        error = %e,
+                                        "Tool returned recoverable error — feeding back to LLM"
+                                    );
+                                    format!("Tool execution error: {e}")
+                                };
                                 let mut next_ctx = {
                                     let lock = self.active_executions.read().await;
                                     lock.get(execution_id_str)
@@ -830,5 +826,121 @@ impl InnerLoopService {
             }
             Err(e) => Err(anyhow::anyhow!("LLM call failed: {e}")),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error classification helper (extracted for testability)
+// ---------------------------------------------------------------------------
+
+/// Classification of a [`SealSessionError`] for inner-loop error handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealErrorClass {
+    /// Unrecoverable — terminate the inner loop immediately.
+    Fatal,
+    /// The tool is unavailable due to policy or missing resource — feed a
+    /// "tool not available" message back to the LLM so it can adjust.
+    PolicyFeedback,
+    /// Transient or correctable — feed the raw error back to the LLM.
+    Recoverable,
+}
+
+/// Classify a [`SealSessionError`] into one of three buckets used by the
+/// inner-loop error handler.
+fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> SealErrorClass {
+    use crate::domain::seal_session::SealSessionError;
+    match e {
+        // Truly unrecoverable — crypto, session revocation, misconfiguration.
+        SealSessionError::SignatureVerificationFailed(_)
+        | SealSessionError::SessionInactive(_)
+        | SealSessionError::ConfigurationError(_) => SealErrorClass::Fatal,
+
+        // Policy denial or missing resource — LLM should stop trying this tool.
+        SealSessionError::PolicyViolation(_) | SealSessionError::NotFound(_) => {
+            SealErrorClass::PolicyFeedback
+        }
+
+        // Everything else (MalformedPayload, SessionExpired, etc.) is recoverable.
+        _ => SealErrorClass::Recoverable,
+    }
+}
+
+/// Build the tool-error message that gets fed back to the LLM for a
+/// policy-feedback error.
+fn policy_feedback_message(tool_name: &str) -> String {
+    format!("Tool '{tool_name}' is not available. Do not retry this tool.")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::seal_session::SealSessionError;
+    use crate::domain::security_context::PolicyViolation;
+
+    // -----------------------------------------------------------------------
+    // Regression: PolicyViolation must NOT be classified as fatal (was bail!).
+    // Prior to the fix, PolicyViolation triggered `anyhow::bail!` which
+    // terminated the inner loop and returned HTTP 500.  ADR-005 requires
+    // tool errors to be fed back to the agent for iterative refinement.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn policy_violation_is_classified_as_feedback_not_fatal() {
+        let err = SealSessionError::PolicyViolation(PolicyViolation::ToolNotAllowed {
+            tool_name: "shell.run".to_string(),
+            allowed_tools: vec!["fs.write".to_string()],
+        });
+        let class = classify_seal_error(&err);
+        assert_eq!(
+            class,
+            SealErrorClass::PolicyFeedback,
+            "PolicyViolation must be PolicyFeedback, not Fatal"
+        );
+    }
+
+    #[test]
+    fn not_found_is_classified_as_feedback_not_fatal() {
+        let err = SealSessionError::NotFound("judge agent not found".into());
+        let class = classify_seal_error(&err);
+        assert_eq!(
+            class,
+            SealErrorClass::PolicyFeedback,
+            "NotFound must be PolicyFeedback, not Fatal"
+        );
+    }
+
+    #[test]
+    fn policy_feedback_message_contains_tool_name() {
+        let msg = policy_feedback_message("shell.run");
+        assert_eq!(
+            msg,
+            "Tool 'shell.run' is not available. Do not retry this tool."
+        );
+    }
+
+    // Verify that truly fatal errors are still classified as Fatal.
+    #[test]
+    fn signature_verification_failed_is_fatal() {
+        let err = SealSessionError::SignatureVerificationFailed("bad sig".into());
+        assert_eq!(classify_seal_error(&err), SealErrorClass::Fatal);
+    }
+
+    #[test]
+    fn configuration_error_is_fatal() {
+        let err = SealSessionError::ConfigurationError("bad config".into());
+        assert_eq!(classify_seal_error(&err), SealErrorClass::Fatal);
+    }
+
+    // Verify recoverable errors stay recoverable.
+    #[test]
+    fn malformed_payload_is_recoverable() {
+        let err = SealSessionError::MalformedPayload("missing field".into());
+        assert_eq!(classify_seal_error(&err), SealErrorClass::Recoverable);
+    }
+
+    #[test]
+    fn session_expired_is_recoverable() {
+        let err = SealSessionError::SessionExpired;
+        assert_eq!(classify_seal_error(&err), SealErrorClass::Recoverable);
     }
 }

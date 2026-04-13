@@ -1422,6 +1422,7 @@ impl AegisRuntime for AegisRuntimeService {
                 &req.final_output,
                 parent_execution_id.as_ref(),
                 &tenant_id,
+                req.intent.as_deref(),
             )
             .await
         {
@@ -2696,6 +2697,7 @@ mod tests {
                 _final_output: &str,
                 _parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
+                _intent: Option<&str>,
             ) -> Result<Option<String>> {
                 Ok(Some("stub-result".to_string()))
             }
@@ -2727,6 +2729,7 @@ mod tests {
                 tenant_id: TenantId::system().to_string(),
                 final_output: "hello".to_string(),
                 handler_config_json: webhook_config.to_string(),
+                intent: None,
             }))
             .await;
 
@@ -2775,6 +2778,7 @@ mod tests {
                 tenant_id: TenantId::system().to_string(),
                 final_output: "hello".to_string(),
                 handler_config_json: webhook_config.to_string(),
+                intent: None,
             }))
             .await
             .expect_err("invoke_output_handler should fail when service is not wired");
@@ -2805,6 +2809,7 @@ mod tests {
                 _final_output: &str,
                 parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
+                _intent: Option<&str>,
             ) -> Result<Option<String>> {
                 assert!(
                     parent_execution_id.is_none(),
@@ -2838,6 +2843,7 @@ mod tests {
                 tenant_id: TenantId::system().to_string(),
                 final_output: "hello".to_string(),
                 handler_config_json: webhook_config.to_string(),
+                intent: None,
             }))
             .await;
 
@@ -2878,6 +2884,7 @@ mod tests {
                 _final_output: &str,
                 parent_execution_id: Option<&ExecutionId>,
                 _tenant_id: &TenantId,
+                _intent: Option<&str>,
             ) -> Result<Option<String>> {
                 let parent = parent_execution_id.expect(
                     "non-empty execution_id in gRPC request must be passed as Some to invoke()",
@@ -2916,6 +2923,7 @@ mod tests {
                 tenant_id: TenantId::system().to_string(),
                 final_output: "hello".to_string(),
                 handler_config_json: webhook_config.to_string(),
+                intent: None,
             }))
             .await;
 

@@ -57,6 +57,7 @@ pub trait OutputHandlerService: Send + Sync {
         final_output: &str,
         parent_execution_id: Option<&ExecutionId>,
         tenant_id: &TenantId,
+        intent: Option<&str>,
     ) -> Result<Option<String>>;
 }
 
@@ -89,6 +90,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
         final_output: &str,
         parent_execution_id: Option<&ExecutionId>,
         _tenant_id: &TenantId,
+        intent: Option<&str>,
     ) -> Result<Option<String>> {
         let handler_type = config.handler_type_name();
 
@@ -119,6 +121,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
                     final_output,
                     parent_execution_id.copied(),
                     *timeout_seconds,
+                    intent,
                 )
                 .await
             }
@@ -189,6 +192,7 @@ async fn invoke_agent_handler(
     final_output: &str,
     parent_execution_id: Option<ExecutionId>,
     timeout_seconds: Option<u64>,
+    intent: Option<&str>,
 ) -> Result<Option<String>> {
     // Resolve the agent by name or ID. Use the system tenant so global agents are always
     // visible regardless of the execution's tenant context.
@@ -203,10 +207,13 @@ async fn invoke_agent_handler(
 
     // Build the execution input.
     let input_value = if let Some(template) = input_template {
-        // Render the Handlebars template against `{ "output": final_output }`.
+        // Render the Handlebars template against `{ "output": final_output, "intent": ... }`.
         let mut hb = handlebars::Handlebars::new();
         hb.set_strict_mode(false);
-        let ctx = serde_json::json!({ "output": final_output });
+        let ctx = serde_json::json!({
+            "output": final_output,
+            "intent": intent.unwrap_or(""),
+        });
         let rendered = hb
             .render_template(template, &ctx)
             .unwrap_or_else(|_| final_output.to_string());

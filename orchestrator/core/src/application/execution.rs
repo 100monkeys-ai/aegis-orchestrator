@@ -2631,6 +2631,7 @@ impl StandardExecutionService {
                                     &final_output,
                                     Some(&execution_id),
                                     &tenant_id_for_output_handler,
+                                    exec_input.intent.as_deref(),
                                 )
                                 .await
                             {

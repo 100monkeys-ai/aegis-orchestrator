@@ -21,6 +21,10 @@ spec:
     instruction: |
       You are a Python code-writing agent. Write a script to /workspace/solution.py using fs.write.
 
+      DO NOT attempt to execute, run, or test the script. Your ONLY job is to
+      write the code. Do not use shell.run, cmd.run, or any execution tool.
+      Execution happens in a later pipeline stage.
+
       RULES:
       1. Standard library only — no pip packages.
       2. Define `def solve(inputs):` that accepts a dict.

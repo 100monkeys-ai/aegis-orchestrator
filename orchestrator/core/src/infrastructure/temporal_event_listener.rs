@@ -666,6 +666,7 @@ impl TemporalEventListener {
                     .artifacts
                     .as_ref()
                     .map(|artifacts| serde_json::json!(artifacts)),
+                final_state: payload.state_name.clone(),
             },
             WorkflowEvent::WorkflowExecutionFailed { reason, .. } => {
                 CompleteWorkflowExecutionRequest {
@@ -675,6 +676,7 @@ impl TemporalEventListener {
                     final_output: payload.final_output.clone(),
                     error_reason: Some(reason.clone()),
                     artifacts: None,
+                    final_state: payload.state_name.clone(),
                 }
             }
             WorkflowEvent::WorkflowExecutionCancelled { .. } => CompleteWorkflowExecutionRequest {
@@ -684,6 +686,7 @@ impl TemporalEventListener {
                 final_output: None,
                 error_reason: None,
                 artifacts: None,
+                final_state: payload.state_name.clone(),
             },
             _ => unreachable!("non-terminal workflow event passed to terminal reconciler"),
         };
