@@ -1136,6 +1136,7 @@ mod tests {
             _final_output: &str,
             _execution_id: Option<&ExecutionId>,
             _tenant_id: &TenantId,
+            _intent: Option<&str>,
         ) -> Result<Option<String>> {
             let mut guard = self.result.lock().unwrap();
             // Replace with Err to prevent accidental reuse — tests should only invoke once.
@@ -2574,6 +2575,7 @@ impl StandardExecutionService {
         let agent_output_handler = agent.manifest.spec.output_handler.clone();
         let output_handler_service = self.output_handler_service.clone();
         let tenant_id_for_output_handler = tenant_id.clone();
+        let intent_for_handler = exec_input.intent.clone();
 
         tokio::spawn(async move {
             let result = supervisor
@@ -2631,7 +2633,7 @@ impl StandardExecutionService {
                                     &final_output,
                                     Some(&execution_id),
                                     &tenant_id_for_output_handler,
-                                    exec_input.intent.as_deref(),
+                                    intent_for_handler.as_deref(),
                                 )
                                 .await
                             {
