@@ -116,6 +116,10 @@ pub struct TemporalEventPayload {
     /// Final blackboard state (optional, for completion events)
     pub final_blackboard: Option<serde_json::Value>,
 
+    /// Structured output produced by applying the workflow's output_template (optional, for completion events)
+    #[serde(default)]
+    pub final_output: Option<serde_json::Value>,
+
     /// Artifacts produced (optional)
     pub artifacts: Option<Vec<String>>,
 
@@ -656,6 +660,7 @@ impl TemporalEventListener {
                 execution_id: execution_id.to_string(),
                 status: CompletionStatus::Success,
                 final_blackboard: payload.final_blackboard.clone(),
+                final_output: payload.final_output.clone(),
                 error_reason: None,
                 artifacts: payload
                     .artifacts
@@ -667,6 +672,7 @@ impl TemporalEventListener {
                     execution_id: execution_id.to_string(),
                     status: CompletionStatus::Failed,
                     final_blackboard: payload.final_blackboard.clone(),
+                    final_output: payload.final_output.clone(),
                     error_reason: Some(reason.clone()),
                     artifacts: None,
                 }
@@ -675,6 +681,7 @@ impl TemporalEventListener {
                 execution_id: execution_id.to_string(),
                 status: CompletionStatus::Cancelled,
                 final_blackboard: payload.final_blackboard.clone(),
+                final_output: None,
                 error_reason: None,
                 artifacts: None,
             },
@@ -1412,6 +1419,8 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 input_schema: None,
+                output_schema: None,
+                output_template: None,
             },
             WorkflowSpec {
                 initial_state: StateName::new("START").unwrap(),

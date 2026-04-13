@@ -434,6 +434,7 @@ impl ToolInvocationService {
                             "status": status_str,
                             "current_state": execution.current_state.as_str(),
                             "blackboard": execution.blackboard.data(),
+                            "last_output": execution.final_output,
                             "started_at": execution.started_at,
                             "last_transition_at": execution.last_transition_at,
                         })));

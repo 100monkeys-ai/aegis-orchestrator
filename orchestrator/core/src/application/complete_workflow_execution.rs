@@ -50,6 +50,7 @@ pub struct CompleteWorkflowExecutionRequest {
     pub execution_id: String,
     pub status: CompletionStatus,
     pub final_blackboard: Option<serde_json::Value>,
+    pub final_output: Option<serde_json::Value>,
     pub error_reason: Option<String>,
     pub artifacts: Option<serde_json::Value>,
 }
@@ -163,6 +164,11 @@ impl CompleteWorkflowExecutionUseCase for StandardCompleteWorkflowExecutionUseCa
                     execution.blackboard.set(key, value);
                 }
             }
+        }
+
+        // Step 4b: Store final structured output if provided
+        if request.final_output.is_some() {
+            execution.final_output = request.final_output;
         }
 
         // Step 5: Persist to repository
@@ -279,6 +285,8 @@ mod tests {
                 labels: HashMap::new(),
                 annotations: HashMap::new(),
                 input_schema: None,
+                output_schema: None,
+                output_template: None,
             },
             WorkflowSpec {
                 initial_state: StateName::new("START").unwrap(),
@@ -323,6 +331,7 @@ mod tests {
                         "existing": "updated",
                         "new_key": 42
                     })),
+                    final_output: None,
                     error_reason: None,
                     artifacts: Some(json!({"report":"ok"})),
                 },
@@ -372,6 +381,7 @@ mod tests {
                     execution_id: execution_id.to_string(),
                     status: CompletionStatus::Failed,
                     final_blackboard: Some(json!(["not", "an", "object"])),
+                    final_output: None,
                     error_reason: Some("boom".to_string()),
                     artifacts: None,
                 },
@@ -413,6 +423,7 @@ mod tests {
                 execution_id: "not-a-uuid".to_string(),
                 status: CompletionStatus::Cancelled,
                 final_blackboard: None,
+                final_output: None,
                 error_reason: None,
                 artifacts: None,
             })
@@ -437,6 +448,7 @@ mod tests {
                 execution_id: missing.clone(),
                 status: CompletionStatus::Cancelled,
                 final_blackboard: None,
+                final_output: None,
                 error_reason: None,
                 artifacts: None,
             })
@@ -463,6 +475,7 @@ mod tests {
                     execution_id: execution_id.to_string(),
                     status: CompletionStatus::Cancelled,
                     final_blackboard: Some(json!({"tenant": "alpha"})),
+                    final_output: None,
                     error_reason: None,
                     artifacts: None,
                 },

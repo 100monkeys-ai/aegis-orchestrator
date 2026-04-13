@@ -218,6 +218,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
 
         let start_name = StateName::new("START").expect("valid state name");

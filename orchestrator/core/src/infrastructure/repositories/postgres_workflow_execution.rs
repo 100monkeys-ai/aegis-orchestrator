@@ -99,19 +99,23 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         let temporal_run_id = String::new();
         let state_history_json = serde_json::json!([execution.current_state.as_str()]);
 
+        let final_output_json = execution.final_output.clone();
+
         sqlx::query(
             r#"
             INSERT INTO workflow_executions (
                 id, tenant_id, workflow_id, temporal_workflow_id, temporal_run_id,
-                input_params, status, 
+                input_params, status,
                 current_state, blackboard, state_outputs, state_history,
+                final_output,
                 started_at, last_transition_at, completed_at
             )
             VALUES (
                 $1, $2, $3, $4, $5,
                 $6, $7,
                 $8, $9, $10, $11,
-                $12, $13,
+                $12,
+                $13, $14,
                 CASE WHEN $7 IN ('completed', 'failed', 'cancelled') THEN NOW() ELSE NULL END
             )
             ON CONFLICT (id) DO UPDATE SET
@@ -125,6 +129,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 blackboard = EXCLUDED.blackboard,
                 state_outputs = EXCLUDED.state_outputs,
                 state_history = workflow_executions.state_history || EXCLUDED.state_history,
+                final_output = EXCLUDED.final_output,
                 last_transition_at = EXCLUDED.last_transition_at,
                 completed_at = EXCLUDED.completed_at
             "#,
@@ -140,6 +145,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
         .bind(blackboard_json)
         .bind(state_outputs_json)
         .bind(state_history_json)
+        .bind(final_output_json)
         .bind(execution.started_at)
         .bind(execution.last_transition_at)
         .execute(&self.pool)
@@ -189,9 +195,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     ) -> Result<Option<WorkflowExecution>, RepositoryError> {
         let row = sqlx::query(
             r#"
-            SELECT 
-                id, workflow_id, input_params, status, 
+            SELECT
+                id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
+                final_output,
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE tenant_id = $1 AND id = $2
@@ -211,6 +218,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let current_state_str: String = row.get("current_state");
             let blackboard_val: serde_json::Value = row.get("blackboard");
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
+            let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
 
@@ -250,6 +258,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 blackboard,
                 input: input_val,
                 state_outputs,
+                final_output,
                 started_at,
                 last_transition_at,
             }))
@@ -289,9 +298,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                id, workflow_id, input_params, status, 
+            SELECT
+                id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
+                final_output,
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE tenant_id = $1 AND status = 'running'
@@ -311,6 +321,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let current_state_str: String = row.get("current_state");
             let blackboard_val: serde_json::Value = row.get("blackboard");
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
+            let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
 
@@ -345,6 +356,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 blackboard,
                 input: input_val,
                 state_outputs,
+                final_output,
                 started_at,
                 last_transition_at,
             });
@@ -364,6 +376,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             SELECT
                 id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
+                final_output,
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE tenant_id = $1 AND workflow_id = $2
@@ -388,6 +401,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let current_state_str: String = row.get("current_state");
             let blackboard_val: serde_json::Value = row.get("blackboard");
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
+            let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
 
@@ -426,6 +440,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 blackboard,
                 input: input_val,
                 state_outputs,
+                final_output,
                 started_at,
                 last_transition_at,
             });
@@ -552,9 +567,10 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
     ) -> Result<Vec<WorkflowExecution>, RepositoryError> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                id, workflow_id, input_params, status, 
+            SELECT
+                id, workflow_id, input_params, status,
                 current_state, blackboard, state_outputs,
+                final_output,
                 started_at, last_transition_at
             FROM workflow_executions
             WHERE tenant_id = $1
@@ -578,6 +594,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
             let current_state_str: String = row.get("current_state");
             let blackboard_val: serde_json::Value = row.get("blackboard");
             let state_outputs_val: serde_json::Value = row.get("state_outputs");
+            let final_output: Option<serde_json::Value> = row.get("final_output");
             let started_at: chrono::DateTime<chrono::Utc> = row.get("started_at");
             let last_transition_at: chrono::DateTime<chrono::Utc> = row.get("last_transition_at");
 
@@ -616,6 +633,7 @@ impl WorkflowExecutionRepository for PostgresWorkflowExecutionRepository {
                 blackboard,
                 input: input_val,
                 state_outputs,
+                final_output,
                 started_at,
                 last_transition_at,
             });

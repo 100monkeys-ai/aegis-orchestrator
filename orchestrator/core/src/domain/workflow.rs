@@ -464,6 +464,14 @@ pub struct WorkflowMetadata {
     /// Optional JSON Schema describing workflow execution inputs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<serde_json::Value>,
+
+    /// Optional JSON Schema describing the workflow's structured output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+
+    /// Optional Handlebars template mapping blackboard values to output fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_template: Option<serde_json::Value>,
 }
 
 impl WorkflowMetadata {
@@ -1316,6 +1324,11 @@ pub struct WorkflowExecution {
     /// State outputs (state_name -> output_json)
     pub state_outputs: HashMap<StateName, serde_json::Value>,
 
+    /// Final structured output produced by applying the workflow's `output_template`
+    /// to the terminal blackboard state. Set on completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_output: Option<serde_json::Value>,
+
     /// Execution started at
     pub started_at: DateTime<Utc>,
 
@@ -1337,6 +1350,7 @@ impl WorkflowExecution {
             blackboard: Blackboard::new(),
             input,
             state_outputs: HashMap::new(),
+            final_output: None,
             started_at: now,
             last_transition_at: now,
         }
@@ -1649,6 +1663,8 @@ mod tests {
                 labels: std::collections::HashMap::new(),
                 annotations: std::collections::HashMap::new(),
                 input_schema: None,
+                output_schema: None,
+                output_template: None,
             },
             spec: WorkflowSpec {
                 initial_state: StateName::new("START").unwrap(),
@@ -1681,6 +1697,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
 
         let spec = WorkflowSpec {
@@ -1704,6 +1722,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
 
         let mut states = HashMap::new();
@@ -1745,6 +1765,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1796,6 +1818,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1857,6 +1881,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1912,6 +1938,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1953,6 +1981,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -1994,6 +2024,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
@@ -2030,6 +2062,8 @@ mod tests {
             labels: HashMap::new(),
             annotations: HashMap::new(),
             input_schema: None,
+            output_schema: None,
+            output_template: None,
         };
         let mut states = HashMap::new();
         states.insert(
