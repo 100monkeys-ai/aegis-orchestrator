@@ -93,6 +93,15 @@ spec:
         PREVIOUS VALIDATION FAILURE:
         {{{blackboard.VALIDATE_CODE.output.summary}}}
         Fix the issues and rewrite the solution.
+        {{#if blackboard.VALIDATE_CODE.output.criteria.correct_key_usage}}
+        {{#unless blackboard.VALIDATE_CODE.output.criteria.correct_key_usage.pass}}
+        KEY MISMATCH — Your code uses input keys that do not exist:
+        {{{blackboard.VALIDATE_CODE.output.criteria.correct_key_usage.reason}}}
+
+        The ONLY valid input keys are: {{{keys input.inputs}}}
+        Use these EXACT key names. Do not add suffixes or modify them.
+        {{/unless}}
+        {{/if}}
         {{/if}}
       transitions:
         - condition: on_success

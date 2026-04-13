@@ -64,6 +64,14 @@ pub struct TemporalWorkflowDefinition {
     /// Default: 50. Ceiling: 100.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_total_transitions: Option<u32>,
+
+    /// Optional JSON Schema describing the workflow's structured output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<serde_json::Value>,
+
+    /// Optional Handlebars template mapping blackboard values to output fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_template: Option<serde_json::Value>,
 }
 
 /// Individual state in Temporal workflow
@@ -282,6 +290,8 @@ impl TemporalWorkflowMapper {
                 WorkflowScope::Tenant => "tenant".to_string(),
             }),
             max_total_transitions: workflow.spec.max_total_transitions,
+            output_schema: workflow.metadata.output_schema.clone(),
+            output_template: workflow.metadata.output_template.clone(),
         })
     }
 
@@ -1149,5 +1159,122 @@ mod tests {
                 .as_deref(),
             Some("if_not_present")
         );
+    }
+
+    #[test]
+    fn test_output_schema_and_template_mapped_to_temporal_definition() {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::Agent {
+                    agent: "test-agent".to_string(),
+                    input: "do work".to_string(),
+                    intent: None,
+                    isolation: None,
+                    judges: vec![],
+                    max_iterations: None,
+                    pre_execution_validator: None,
+                    output_handler: None,
+                },
+                transitions: vec![],
+                timeout: None,
+                max_state_visits: None,
+            },
+        );
+
+        let output_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "summary": { "type": "string" }
+            }
+        });
+        let output_template = serde_json::json!({
+            "summary": "{{blackboard.result}}"
+        });
+
+        let workflow = Workflow::new(
+            WorkflowMetadata {
+                name: "output-template-test".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                input_schema: None,
+                output_schema: Some(output_schema.clone()),
+                output_template: Some(output_template.clone()),
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                storage: Default::default(),
+                max_total_transitions: None,
+            },
+        )
+        .unwrap();
+
+        let temporal_def =
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
+                .unwrap();
+
+        assert_eq!(temporal_def.output_schema, Some(output_schema));
+        assert_eq!(temporal_def.output_template, Some(output_template));
+    }
+
+    #[test]
+    fn test_output_schema_and_template_none_when_absent() {
+        let mut states = HashMap::new();
+        states.insert(
+            StateName::new("START").unwrap(),
+            WorkflowState {
+                kind: StateKind::Agent {
+                    agent: "test-agent".to_string(),
+                    input: "do work".to_string(),
+                    intent: None,
+                    isolation: None,
+                    judges: vec![],
+                    max_iterations: None,
+                    pre_execution_validator: None,
+                    output_handler: None,
+                },
+                transitions: vec![],
+                timeout: None,
+                max_state_visits: None,
+            },
+        );
+
+        let workflow = Workflow::new(
+            WorkflowMetadata {
+                name: "no-output-template".to_string(),
+                version: Some("1.0.0".to_string()),
+                description: None,
+                labels: HashMap::new(),
+                annotations: HashMap::new(),
+                input_schema: None,
+                output_schema: None,
+                output_template: None,
+            },
+            WorkflowSpec {
+                initial_state: StateName::new("START").unwrap(),
+                context: HashMap::new(),
+                states,
+                storage: Default::default(),
+                max_total_transitions: None,
+            },
+        )
+        .unwrap();
+
+        let temporal_def =
+            TemporalWorkflowMapper::to_temporal_definition(&workflow, &TenantId::consumer())
+                .unwrap();
+
+        assert!(temporal_def.output_schema.is_none());
+        assert!(temporal_def.output_template.is_none());
+
+        // Verify skip_serializing_if works: serialized JSON should not contain the keys
+        let json = serde_json::to_value(&temporal_def).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("output_schema"));
+        assert!(!json.as_object().unwrap().contains_key("output_template"));
     }
 }

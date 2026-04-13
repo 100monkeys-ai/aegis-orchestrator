@@ -66,6 +66,22 @@ spec:
       5. STANDARD LIBRARY ONLY — No third-party imports or packages. Only
          standard library modules are allowed.
 
+      6. CORRECT KEY USAGE — Every key the code extracts from the parsed
+         INTENT_INPUTS JSON must match a key actually present in the
+         INTENT_INPUTS value supplied in the input below. Extract all
+         dictionary/object key accesses from the code:
+         - Python: data.get("KEY"), data["KEY"], inputs.get("KEY"),
+           inputs["KEY"], or any variable holding the parsed JSON
+         - JavaScript: inputs["KEY"], inputs.KEY
+         - Bash: jq '.KEY', jq -r '.KEY', or variables extracted from
+           parsed JSON
+         Compare every extracted KEY against the top-level keys in the
+         INTENT_INPUTS JSON object. If INTENT_INPUTS is empty or "{}",
+         this criterion is automatically satisfied (no keys to validate).
+         PASS if every extracted key exists in INTENT_INPUTS. FAIL if any
+         extracted key is NOT in INTENT_INPUTS — list every hallucinated
+         key in the reason.
+
       After analysis, return ONLY a JSON object with this structure:
       {
         "valid": true or false,
@@ -74,12 +90,13 @@ spec:
           "no_hardcoded_data": {"pass": true/false, "reason": "..."},
           "input_consumption": {"pass": true/false, "reason": "..."},
           "stdout_output": {"pass": true/false, "reason": "..."},
-          "stdlib_only": {"pass": true/false, "reason": "..."}
+          "stdlib_only": {"pass": true/false, "reason": "..."},
+          "correct_key_usage": {"pass": true/false, "reason": "..."}
         },
         "summary": "One sentence overall verdict"
       }
 
-      Set "valid" to true ONLY if ALL five criteria pass.
+      Set "valid" to true ONLY if ALL six criteria pass.
     prompt_template: |
       {{instruction}}
 
@@ -109,6 +126,7 @@ spec:
                 - input_consumption
                 - stdout_output
                 - stdlib_only
+                - correct_key_usage
             summary:
               type: string
               minLength: 10
