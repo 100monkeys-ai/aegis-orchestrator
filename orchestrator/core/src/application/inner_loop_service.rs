@@ -833,7 +833,7 @@ impl InnerLoopService {
 // Error classification helper (extracted for testability)
 // ---------------------------------------------------------------------------
 
-/// Classification of a [`SealSessionError`] for inner-loop error handling.
+/// Classification of a `SealSessionError` for inner-loop error handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SealErrorClass {
     /// Unrecoverable — terminate the inner loop immediately.
@@ -845,7 +845,7 @@ enum SealErrorClass {
     Recoverable,
 }
 
-/// Classify a [`SealSessionError`] into one of three buckets used by the
+/// Classify a `SealSessionError` into one of three buckets used by the
 /// inner-loop error handler.
 fn classify_seal_error(e: &crate::domain::seal_session::SealSessionError) -> SealErrorClass {
     use crate::domain::seal_session::SealSessionError;
