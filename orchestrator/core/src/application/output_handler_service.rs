@@ -184,6 +184,7 @@ impl OutputHandlerService for StandardOutputHandlerService {
 /// that parent (preserving hierarchy). When `None` (e.g. output handler on a
 /// ContainerRun state that has no agent execution), a standalone root execution
 /// is created instead.
+#[allow(clippy::too_many_arguments)]
 async fn invoke_agent_handler(
     execution_service: &Arc<dyn ExecutionService>,
     agent_lifecycle_service: &Arc<dyn AgentLifecycleService>,
