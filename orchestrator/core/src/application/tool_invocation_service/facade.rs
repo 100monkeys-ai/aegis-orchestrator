@@ -946,7 +946,10 @@ impl ToolInvocationService {
             "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
             "aegis.execution.file" => {
-                let tenant_id = Self::resolve_tenant_arg(args)?;
+                let tenant_id = match Self::resolve_tenant_arg(args) {
+                    Ok(id) => id,
+                    Err(e) => return Some(Err(e)),
+                };
                 match &self.file_operations_service {
                     Some(svc) => Some(
                         crate::application::tools::builtin_execution_file::invoke_execution_file_tool(
