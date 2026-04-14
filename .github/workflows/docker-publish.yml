@@ -35,24 +35,24 @@ jobs:
           repository: 100monkeys-ai/aegis-proto
           path: aegis-proto
 
-      # --- Native Rust build (replaces in-Docker compilation) ---
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libfuse3-dev
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-gnu
-
-      - name: Cache cargo registry & build
-        uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: aegis-orchestrator -> target
-
-      - name: Build release binary
-        working-directory: aegis-orchestrator
-        run: cargo build --release --bin aegis --locked
+      # Build inside Ubuntu 22.04 for glibc 2.35 compatibility.
+      # One binary runs everywhere: host (22.04+) and container (22.04+).
+      - name: Build release binary (Ubuntu 22.04 — glibc 2.35)
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace/aegis-orchestrator \
+            ubuntu:22.04 bash -c '
+              set -euo pipefail
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update && apt-get install -y \
+                curl build-essential pkg-config \
+                libfuse3-dev protobuf-compiler \
+                && rm -rf /var/lib/apt/lists/*
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+              . "$HOME/.cargo/env"
+              cargo build --release --bin aegis --locked
+            '
 
       - name: Stage binary for Docker context
         run: cp aegis-orchestrator/target/release/aegis ./aegis

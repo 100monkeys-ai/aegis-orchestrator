@@ -39,7 +39,7 @@ subtle = "2.6"
 dashmap = "6"
 governor = { version = "0.10", features = ["std", "dashmap"] }
 bollard.workspace = true
-sqlx = { workspace = true, features = ["runtime-tokio-native-tls", "postgres", "uuid", "chrono", "json"] }
+sqlx = { workspace = true, features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "json"] }
 tracing.workspace = true
 metrics.workspace = true
 metrics-exporter-prometheus.workspace = true

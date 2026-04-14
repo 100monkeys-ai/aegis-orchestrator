@@ -52,8 +52,8 @@ COPY aegis-proto /aegis-proto
 RUN cargo build --release --bin aegis --locked
 
 # Stage 2: Runtime image
-# Using Ubuntu 24.04 for GLIBC 2.39 compatibility with rust:1.94 builder image
-FROM ubuntu:24.04
+# Using Ubuntu 22.04 for glibc 2.35 compatibility (matches CI build container)
+FROM ubuntu:22.04
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

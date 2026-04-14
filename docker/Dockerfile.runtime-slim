@@ -2,12 +2,11 @@
 # Requires a pre-built 'aegis' binary at the build context root.
 # Use Dockerfile.runtime for a self-contained multi-stage build.
 
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 
-# Install runtime dependencies
+# Install runtime dependencies (rustls — no libssl needed)
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl3 \
     libfuse3-3 \
     fuse3 \
     curl \
