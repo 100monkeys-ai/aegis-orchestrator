@@ -676,6 +676,13 @@ impl ToolInvocationService {
             ),
         };
 
+        // Inject session tenant_id into args so aegis.* tools resolve the
+        // correct tenant instead of falling back to CONSUMER_SLUG.
+        if let Value::Object(ref mut map) = args {
+            map.entry("tenant_id")
+                .or_insert_with(|| Value::String(tenant_id.to_string()));
+        }
+
         // Built-in orchestrator aegis.* tool dispatch chain.
         let aegis_result = self
             .try_dispatch_aegis_tool(
