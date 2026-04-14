@@ -42,8 +42,8 @@ use crate::daemon::handlers::credentials::{
 };
 use crate::daemon::handlers::dispatch::{dispatch_gateway_handler, temporal_events_handler};
 use crate::daemon::handlers::executions::{
-    cancel_execution_handler, delete_execution_handler, get_execution_handler,
-    list_executions_handler, stream_events_handler,
+    cancel_execution_handler, delete_execution_handler, get_execution_file_handler,
+    get_execution_handler, list_executions_handler, stream_events_handler,
 };
 use crate::daemon::handlers::health::{health_handler, readiness_handler};
 use crate::daemon::handlers::observability::{
@@ -87,6 +87,10 @@ pub(crate) fn create_router(
         .route(
             "/v1/executions/{execution_id}/events",
             get(stream_events_handler),
+        )
+        .route(
+            "/v1/executions/{execution_id}/files/{*path}",
+            get(get_execution_file_handler),
         )
         .route(
             "/v1/agents/{agent_id}/events",

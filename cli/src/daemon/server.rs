@@ -1547,6 +1547,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     let tool_catalog =
         Arc::new(aegis_orchestrator_core::application::tool_catalog::StandardToolCatalog::new());
 
+    let file_operations_service = Arc::new(
+        aegis_orchestrator_core::application::file_operations_service::FileOperationsService::new(
+            nfs_gateway.fsal().clone(),
+        ),
+    );
+
     let mut tool_invocation_service_builder =
         aegis_orchestrator_core::application::tool_invocation_service::ToolInvocationService::new(
             seal_session_repo.clone(),
@@ -1582,7 +1588,8 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             execution_repo: execution_repo.clone(),
         }))
         .with_tool_catalog(tool_catalog.clone())
-        .with_runtime_registry(runtime_registry.clone());
+        .with_runtime_registry(runtime_registry.clone())
+        .with_file_operations_service(file_operations_service.clone());
 
     // Wire discovery service into ToolInvocationService if available (ADR-075)
     if let Some(ref disc_svc) = discovery_service {
@@ -1706,12 +1713,6 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             volume_service.clone(),
             event_bus.clone(),
             aegis_orchestrator_core::domain::volume::StorageTierLimits::default(),
-        ),
-    );
-
-    let file_operations_service = Arc::new(
-        aegis_orchestrator_core::application::file_operations_service::FileOperationsService::new(
-            nfs_gateway.fsal().clone(),
         ),
     );
 

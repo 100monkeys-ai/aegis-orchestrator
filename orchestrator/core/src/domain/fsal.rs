@@ -363,6 +363,12 @@ impl AegisFSAL {
         &self.storage_provider
     }
 
+    /// Exposes the volume repository for callers that need to look up volumes
+    /// by ownership (e.g., finding the workspace volume for a completed execution).
+    pub fn volume_repository(&self) -> &Arc<dyn VolumeRepository> {
+        &self.volume_repository
+    }
+
     fn routed_storage_path(&self, volume: &Volume, path: &str) -> String {
         match &volume.backend {
             crate::domain::volume::VolumeBackend::HostPath { path: host_path } => host_path

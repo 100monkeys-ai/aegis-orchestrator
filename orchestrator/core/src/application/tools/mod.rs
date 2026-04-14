@@ -1,4 +1,5 @@
 pub mod builtin_dispatch;
+pub mod builtin_execution_file;
 pub mod builtin_fsal;
 pub mod builtin_schema;
 pub mod builtin_web;

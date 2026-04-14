@@ -336,6 +336,73 @@ impl FileOperationsService {
             ),
         })
     }
+
+    /// Read a file from an execution-owned workspace volume (post-mortem).
+    ///
+    /// Looks up the volume by `VolumeOwnership::Execution { execution_id }`,
+    /// verifies the volume belongs to the given tenant, sanitizes the path,
+    /// and returns the file content.
+    pub async fn read_file_for_execution(
+        &self,
+        execution_id: crate::domain::execution::ExecutionId,
+        tenant_id: &crate::domain::tenant::TenantId,
+        path: &str,
+    ) -> Result<FileContent, FileOperationsError> {
+        use crate::domain::volume::VolumeOwnership;
+
+        let ownership = VolumeOwnership::execution(execution_id);
+        let volumes = self
+            .fsal
+            .volume_repository()
+            .find_by_ownership(&ownership)
+            .await
+            .map_err(|e| FileOperationsError::Repository(e.to_string()))?;
+
+        let volume = volumes.into_iter().next().ok_or_else(|| {
+            FileOperationsError::NotFound(format!(
+                "no workspace volume for execution {}",
+                execution_id.0
+            ))
+        })?;
+
+        // Tenant isolation check
+        if &volume.tenant_id != tenant_id {
+            return Err(FileOperationsError::Unauthorized);
+        }
+
+        let sanitized = self.sanitize(path)?;
+        let full_path = routed_path(&volume, &sanitized);
+
+        let handle = self
+            .fsal
+            .storage_provider()
+            .open_file(&full_path, OpenMode::ReadOnly)
+            .await
+            .map_err(|e| match e {
+                StorageError::FileNotFound(p) => FileOperationsError::NotFound(p),
+                StorageError::NotFound(p) => FileOperationsError::NotFound(p),
+                other => FileOperationsError::Fsal(other.to_string()),
+            })?;
+
+        let attrs = self
+            .fsal
+            .storage_provider()
+            .stat(&full_path)
+            .await
+            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+
+        let data = self
+            .fsal
+            .storage_provider()
+            .read_at(&handle, 0, attrs.size as usize)
+            .await
+            .map_err(|e| FileOperationsError::Fsal(e.to_string()))?;
+
+        let _ = self.fsal.storage_provider().close_file(&handle).await;
+
+        let content_type = guess_content_type(path);
+        Ok(FileContent { data, content_type })
+    }
 }
 
 // ============================================================================

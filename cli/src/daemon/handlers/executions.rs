@@ -1,15 +1,17 @@
 // Copyright (c) 2026 100monkeys.ai
 // SPDX-License-Identifier: AGPL-3.0
-//! Execution handlers: get, cancel, list, delete, stream events.
+//! Execution handlers: get, cancel, list, delete, stream events, file retrieval.
 
 use std::sync::Arc;
 
 use axum::extract::{Extension, Path, State};
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::response::IntoResponse;
 use futures::StreamExt;
 use uuid::Uuid;
 
+use aegis_orchestrator_core::application::file_operations_service::FileOperationsError;
 use aegis_orchestrator_core::domain::agent::AgentId;
 use aegis_orchestrator_core::domain::execution::ExecutionId;
 use aegis_orchestrator_core::domain::iam::UserIdentity;
@@ -204,4 +206,47 @@ pub(crate) async fn list_executions_handler(
         }
         Err(e) => Ok(axum::Json(serde_json::json!({"error": e.to_string()}))),
     }
+}
+
+/// GET /v1/executions/:execution_id/files/*path
+///
+/// Read a single file from a completed execution's workspace volume post-mortem.
+/// The path segment is normalized: a `/workspace/` prefix is stripped if present.
+pub(crate) async fn get_execution_file_handler(
+    State(state): State<Arc<AppState>>,
+    scope_guard: ScopeGuard,
+    identity: Option<Extension<UserIdentity>>,
+    Path((execution_id, file_path)): Path<(Uuid, String)>,
+) -> Result<impl IntoResponse, (StatusCode, axum::Json<serde_json::Value>)> {
+    scope_guard.require("execution:read")?;
+    let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+
+    // Normalize: strip /workspace/ prefix if present
+    let normalized = file_path
+        .strip_prefix("workspace/")
+        .or_else(|| file_path.strip_prefix("/workspace/"))
+        .unwrap_or(&file_path);
+
+    state
+        .file_operations_service
+        .read_file_for_execution(ExecutionId(execution_id), &tenant_id, normalized)
+        .await
+        .map(|content| {
+            (
+                [(axum::http::header::CONTENT_TYPE, content.content_type)],
+                content.data,
+            )
+                .into_response()
+        })
+        .map_err(|e| {
+            let (status, message) = match &e {
+                FileOperationsError::NotFound(_) => (StatusCode::NOT_FOUND, e.to_string()),
+                FileOperationsError::Unauthorized => (StatusCode::FORBIDDEN, e.to_string()),
+                FileOperationsError::InvalidPath(_) => {
+                    (StatusCode::UNPROCESSABLE_ENTITY, e.to_string())
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+            };
+            (status, axum::Json(serde_json::json!({"error": message})))
+        })
 }

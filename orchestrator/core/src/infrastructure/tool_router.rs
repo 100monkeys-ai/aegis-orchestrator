@@ -188,6 +188,7 @@ const SKIP_JUDGE_TOOLS: &[&str] = &[
     "aegis.system.info",
     "aegis.system.config",
     "aegis.runtime.list",
+    "aegis.execution.file",
 ];
 
 /// Canonical registry of all builtin tool dispatchers.
@@ -254,6 +255,7 @@ const BUILTIN_TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("aegis.system.info", "Returns system version, status, and capabilities."),
     ("aegis.system.config", "Returns the current node configuration."),
     ("aegis.runtime.list", "List all supported standard runtime environments (language/version pairs). Call this before creating an agent manifest to ensure the declared runtime is valid."),
+    ("aegis.execution.file", "Read a file from a completed execution's workspace volume. Use this to retrieve output files after an agent or task execution finishes."),
 ];
 
 impl ToolRouter {
@@ -1320,6 +1322,20 @@ impl ToolRouter {
                         "description": "Optional: filter by language name (e.g. \"python\", \"go\")"
                     }
                 }
+            }),
+            "aegis.execution.file" => json!({
+                "type": "object",
+                "properties": {
+                    "execution_id": {
+                        "type": "string",
+                        "description": "The execution ID."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "File path (e.g. 'output.md' or '/workspace/output.md')."
+                    }
+                },
+                "required": ["execution_id", "path"]
             }),
             _ => json!({ "type": "object" }),
         }

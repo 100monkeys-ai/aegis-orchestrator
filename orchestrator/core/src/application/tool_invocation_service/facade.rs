@@ -52,6 +52,7 @@ impl ToolInvocationService {
             tool_catalog: None,
             discovery_service: None,
             runtime_registry: None,
+            file_operations_service: None,
         }
     }
 
@@ -140,6 +141,15 @@ impl ToolInvocationService {
         registry: Arc<crate::domain::runtime_registry::StandardRuntimeRegistry>,
     ) -> Self {
         self.runtime_registry = Some(registry);
+        self
+    }
+
+    /// Attach a `FileOperationsService` to enable `aegis.execution.file`.
+    pub fn with_file_operations_service(
+        mut self,
+        svc: Arc<crate::application::file_operations_service::FileOperationsService>,
+    ) -> Self {
+        self.file_operations_service = Some(svc);
         self
     }
 
@@ -935,6 +945,22 @@ impl ToolInvocationService {
             "aegis.execute.status" => Some(self.invoke_aegis_execute_status_tool(args).await),
             "aegis.execute.wait" => Some(self.invoke_aegis_workflow_wait_tool(args).await),
             "aegis.runtime.list" => Some(self.invoke_aegis_runtime_list_tool(args).await),
+            "aegis.execution.file" => {
+                let tenant_id = Self::resolve_tenant_arg(args)?;
+                match &self.file_operations_service {
+                    Some(svc) => Some(
+                        crate::application::tools::builtin_execution_file::invoke_execution_file_tool(
+                            svc,
+                            &tenant_id,
+                            args,
+                        )
+                        .await,
+                    ),
+                    None => Some(Err(SealSessionError::InternalError(
+                        "aegis.execution.file: file operations service not configured".to_string(),
+                    ))),
+                }
+            }
             _ => None,
         }
     }

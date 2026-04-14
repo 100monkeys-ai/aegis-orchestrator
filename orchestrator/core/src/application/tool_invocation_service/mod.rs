@@ -118,4 +118,7 @@ pub struct ToolInvocationService {
     discovery_service: Option<Arc<dyn crate::application::discovery_service::DiscoveryService>>,
     /// Optional StandardRuntime registry for aegis.runtime.list tool.
     runtime_registry: Option<Arc<StandardRuntimeRegistry>>,
+    /// File operations service for post-mortem execution file reads (aegis.execution.file).
+    file_operations_service:
+        Option<Arc<crate::application::file_operations_service::FileOperationsService>>,
 }
