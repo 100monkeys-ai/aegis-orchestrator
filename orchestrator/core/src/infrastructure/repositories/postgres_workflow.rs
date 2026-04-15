@@ -612,6 +612,40 @@ impl WorkflowRepository for PostgresWorkflowRepository {
         Ok(None)
     }
 
+    async fn find_yaml_source_by_name_visible(
+        &self,
+        tenant_id: &TenantId,
+        name: &str,
+    ) -> Result<Option<String>, RepositoryError> {
+        let row = sqlx::query(
+            r#"
+            SELECT yaml_source
+            FROM workflows
+            WHERE name = $2
+              AND (tenant_id = $1 OR (scope = 'global' AND tenant_id = 'aegis-system'))
+            ORDER BY
+              CASE WHEN tenant_id = $1 THEN 0 ELSE 1 END,
+              version DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(tenant_id.as_str())
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| RepositoryError::Database(e.to_string()))?;
+
+        match row {
+            Some(row) => {
+                let yaml_source: Option<String> = row
+                    .try_get("yaml_source")
+                    .map_err(|e| RepositoryError::Database(e.to_string()))?;
+                Ok(yaml_source)
+            }
+            None => Ok(None),
+        }
+    }
+
     async fn delete_for_tenant(
         &self,
         tenant_id: &TenantId,

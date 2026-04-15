@@ -221,15 +221,53 @@ pub(crate) async fn list_workflows_handler(
     Ok((StatusCode::OK, Json(workflow_list)))
 }
 
-/// GET /v1/workflows/:name - Get workflow details as JSON
+/// GET /v1/workflows/:name - Get workflow details (JSON or raw YAML via Accept header)
 pub(crate) async fn get_workflow_handler(
     State(state): State<Arc<AppState>>,
     scope_guard: ScopeGuard,
     identity: Option<Extension<UserIdentity>>,
+    headers: axum::http::HeaderMap,
     Path(name): Path<String>,
 ) -> Result<impl IntoResponse, (axum::http::StatusCode, axum::Json<serde_json::Value>)> {
     scope_guard.require("workflow:read")?;
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
+
+    let wants_plain_text = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/plain"));
+
+    if wants_plain_text {
+        return match state
+            .workflow_repo
+            .find_yaml_source_by_name_visible(&tenant_id, &name)
+            .await
+        {
+            Ok(Some(yaml_source)) => Ok((
+                StatusCode::OK,
+                [(
+                    axum::http::header::CONTENT_TYPE,
+                    "text/plain; charset=utf-8",
+                )],
+                yaml_source,
+            )
+                .into_response()),
+            Ok(None) => Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Workflow '{name}' not found")
+                })),
+            )
+                .into_response()),
+            Err(_) => Ok((
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("Workflow '{name}' not found")
+                })),
+            )
+                .into_response()),
+        };
+    }
 
     match state
         .workflow_repo
