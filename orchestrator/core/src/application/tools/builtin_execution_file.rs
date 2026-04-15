@@ -12,6 +12,7 @@ use crate::domain::seal_session::SealSessionError;
 use crate::domain::tenant::TenantId;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use tracing::{debug, info, warn};
 
 /// Normalize a file path by stripping the `/workspace/` or `/workspace` prefix
 /// that agents typically use as their working directory mount point.
@@ -61,12 +62,25 @@ pub async fn invoke_execution_file_tool(
 
     let path = normalize_path(raw_path);
 
+    info!(
+        %execution_id,
+        path,
+        tenant_id = %tenant_id,
+        "aegis.execution.file: reading file"
+    );
+
     match file_ops
         .read_file_for_execution(execution_id, tenant_id, path)
         .await
     {
         Ok(content) => {
             let text = String::from_utf8_lossy(&content.data).to_string();
+            debug!(
+                %execution_id,
+                path,
+                size_bytes = content.data.len(),
+                "aegis.execution.file: success"
+            );
             Ok(ToolInvocationResult::Direct(json!({
                 "status": "success",
                 "path": raw_path,
@@ -75,19 +89,54 @@ pub async fn invoke_execution_file_tool(
                 "content_type": content.content_type,
             })))
         }
-        Err(FileOperationsError::NotFound(msg)) => Ok(ToolInvocationResult::Direct(json!({
-            "status": "error",
-            "error": "not_found",
-            "message": msg,
-        }))),
-        Err(FileOperationsError::Unauthorized) => Ok(ToolInvocationResult::Direct(json!({
-            "status": "error",
-            "error": "forbidden",
-            "message": "execution does not belong to your tenant",
-        }))),
-        Err(e) => Err(SealSessionError::InternalError(format!(
-            "aegis.execution.file: {e}"
-        ))),
+        Err(FileOperationsError::NotFound(msg)) => {
+            warn!(%execution_id, path, %msg, "aegis.execution.file: not found");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "not_found",
+                "message": msg,
+            })))
+        }
+        Err(FileOperationsError::Unauthorized) => {
+            warn!(%execution_id, path, "aegis.execution.file: unauthorized");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "forbidden",
+                "message": "execution does not belong to your tenant",
+            })))
+        }
+        Err(FileOperationsError::InvalidPath(msg)) => {
+            warn!(%execution_id, path, %msg, "aegis.execution.file: invalid path");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "invalid_path",
+                "message": msg,
+            })))
+        }
+        Err(FileOperationsError::FileTooLarge) => {
+            warn!(%execution_id, path, "aegis.execution.file: file too large");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "file_too_large",
+                "message": "file exceeds the maximum allowed size",
+            })))
+        }
+        Err(FileOperationsError::Fsal(msg)) => {
+            warn!(%execution_id, path, %msg, "aegis.execution.file: fsal error");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "storage_error",
+                "message": format!("storage backend error: {msg}"),
+            })))
+        }
+        Err(FileOperationsError::Repository(msg)) => {
+            warn!(%execution_id, path, %msg, "aegis.execution.file: repository error");
+            Ok(ToolInvocationResult::Direct(json!({
+                "status": "error",
+                "error": "internal_error",
+                "message": format!("repository error: {msg}"),
+            })))
+        }
     }
 }
 

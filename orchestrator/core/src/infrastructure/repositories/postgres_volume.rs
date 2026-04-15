@@ -185,6 +185,7 @@ impl VolumeRepository for PostgresVolumeRepository {
                 created_at, attached_at, detached_at, expires_at
             FROM volumes
             WHERE ownership @> $1
+              AND status #>> '{}' NOT IN ('deleted', 'deleting', 'failed')
             ORDER BY created_at DESC
             "#,
         )
