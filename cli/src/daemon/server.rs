@@ -1517,6 +1517,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             event_bus.clone(),
             secrets_manager.clone(),
             Arc::new(nfs_gateway.volume_registry().clone()),
+            Some(volume_service.clone()),
         ),
     );
     let run_container_step_use_case = Arc::new(

@@ -198,6 +198,21 @@ impl FuseMountService for FuseMountServiceImpl {
                 execution_id = %req.execution_id,
                 "FUSE mount removed via gRPC"
             );
+            // Flush the kernel page cache before dropping the FUSE mount handle.
+            if let Some(ref handle) = removed {
+                if let Ok(fd) = std::fs::File::open(handle.mountpoint()) {
+                    use std::os::unix::io::AsRawFd;
+                    // SAFETY: fd is a valid open file descriptor.
+                    if unsafe { libc::syncfs(fd.as_raw_fd()) } != 0 {
+                        let err = std::io::Error::last_os_error();
+                        warn!(
+                            mountpoint = %handle.mountpoint(),
+                            error = %err,
+                            "syncfs before FUSE unmount failed"
+                        );
+                    }
+                }
+            }
             // Dropping the FuseMountHandle triggers the actual unmount.
             // Clean up the empty mount directory.
             drop(removed);

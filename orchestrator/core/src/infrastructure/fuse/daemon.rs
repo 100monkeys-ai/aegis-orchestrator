@@ -100,7 +100,13 @@ impl FuseMountHandle {
 
 impl Drop for FuseMountHandle {
     fn drop(&mut self) {
-        debug!(mountpoint = %self.mountpoint, "FUSE mount handle dropped — unmounting");
+        debug!(mountpoint = %self.mountpoint, "FUSE mount handle dropped — flushing and unmounting");
+        // Flush kernel page cache before BackgroundSession::drop() unmounts.
+        if let Ok(fd) = std::fs::File::open(&self.mountpoint) {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: fd is a valid open file descriptor.
+            let _ = unsafe { libc::syncfs(fd.as_raw_fd()) };
+        }
         // BackgroundSession::drop() sends FUSE_DESTROY and unmounts automatically.
     }
 }
@@ -941,6 +947,22 @@ impl Filesystem for FuseFsal {
         _flags: i32,
         reply: fuser::ReplyEmpty,
     ) {
+        reply.ok();
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        // All FSAL writes are synchronous — the gRPC call to the storage
+        // backend completes before the FUSE write callback returns. There are
+        // no pending writes to drain, so flush is a no-op success.
+        debug!(ino = ino, "FUSE FLUSH (synchronous write path — no-op)");
+        metrics::counter!("aegis_fuse_operations_total", "operation" => "flush", "result" => "success").increment(1);
         reply.ok();
     }
 

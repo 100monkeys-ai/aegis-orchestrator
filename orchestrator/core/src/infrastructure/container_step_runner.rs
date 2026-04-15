@@ -19,10 +19,11 @@
 //! ADR-027 (Docker Runtime Implementation Details).
 
 use crate::application::nfs_gateway::{NfsVolumeRegistry, VolumeRegistration};
+use crate::application::volume_manager::VolumeService;
 use crate::domain::events::{ContainerRunEvent, ContainerRunFailureReason};
 use crate::domain::fsal::FsalAccessPolicy;
 use crate::domain::runtime::{
-    ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner,
+    ContainerStepConfig, ContainerStepError, ContainerStepResult, ContainerStepRunner, InstanceId,
 };
 use crate::domain::secrets::AccessContext;
 use crate::domain::volume::VolumeId;
@@ -100,6 +101,8 @@ pub struct ContainerStepRunnerImpl {
     secrets_manager: Arc<SecretsManager>,
     /// Volume registry for resolving per-volume context (remote path, ownership) for FUSE mounts.
     volume_registry: Arc<NfsVolumeRegistry>,
+    /// Volume service for detaching volumes on execution completion.
+    volume_service: Option<Arc<dyn VolumeService>>,
 }
 
 impl ContainerStepRunnerImpl {
@@ -110,6 +113,7 @@ impl ContainerStepRunnerImpl {
         event_bus: Arc<EventBus>,
         secrets_manager: Arc<SecretsManager>,
         volume_registry: Arc<NfsVolumeRegistry>,
+        volume_service: Option<Arc<dyn VolumeService>>,
     ) -> Self {
         Self {
             docker,
@@ -121,6 +125,7 @@ impl ContainerStepRunnerImpl {
             event_bus,
             secrets_manager,
             volume_registry,
+            volume_service,
         }
     }
 
@@ -840,6 +845,35 @@ impl ContainerStepRunner for ContainerStepRunnerImpl {
             }
         }
 
+        // ─── 10d. Detach workspace volumes ─────────────────────────────────
+        // Transition attached volumes back to Available so they can be reused
+        // or deleted. Best-effort: warn and continue on failure.
+        if let Some(ref volume_service) = self.volume_service {
+            let instance_id = InstanceId::new(container_id.clone());
+            for vm in &config.volumes {
+                if let Ok(uuid) = uuid::Uuid::parse_str(&vm.name) {
+                    let volume_id = VolumeId(uuid);
+                    if let Err(e) = volume_service
+                        .detach_volume(volume_id, instance_id.clone())
+                        .await
+                    {
+                        warn!(
+                            volume_id = %volume_id,
+                            container_id = %container_id,
+                            error = %e,
+                            "Failed to detach volume after execution — volume may remain in Attached state"
+                        );
+                    } else {
+                        debug!(
+                            volume_id = %volume_id,
+                            container_id = %container_id,
+                            "Volume detached after execution"
+                        );
+                    }
+                }
+            }
+        }
+
         let duration_ms = start.elapsed().as_millis() as u64;
 
         // ─── 11. Map capture result to domain result / event ───────────────────
@@ -1190,24 +1224,20 @@ mod tests {
         );
     }
 
-    /// Regression: ContainerStepRunnerImpl must NOT require a VolumeService
-    /// dependency. Volume ownership is no longer mutated in the DB by the
-    /// container step runner — FSAL resolves WorkflowExecution ownership
-    /// via the VolumeContextLookup trait on the in-memory NFS volume registry.
-    /// This test verifies that the constructor signature does not require a
-    /// VolumeService argument (structural test — if this compiles, the
-    /// dependency has been removed correctly).
+    /// The VolumeService dependency is optional — the runner can be constructed
+    /// without one (e.g. in tests or lightweight deployments). When absent,
+    /// `detach_volume` is simply skipped on execution cleanup.
     #[test]
-    fn test_container_step_runner_does_not_require_volume_service() {
-        // ContainerStepRunnerImpl::new takes 6 arguments (no VolumeService).
-        // This is a compile-time verification — no runtime assertion needed.
+    fn test_container_step_runner_volume_service_is_optional() {
+        // ContainerStepRunnerImpl::new accepts Option<Arc<dyn VolumeService>>.
+        // Passing None is valid — compile-time verification.
         let _config = ContainerStepRunnerConfig {
             network_mode: None,
             fuse_daemon: None,
             fuse_mount_prefix: "/tmp/aegis-fuse-mounts".to_string(),
             fuse_mount_client: None,
         };
-        // If this compiles, the VolumeService dependency has been removed.
+        // If this compiles, the VolumeService is properly optional.
     }
 
     #[test]
