@@ -14,6 +14,14 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use tracing::{debug, info, warn};
 
+/// Returns `true` if the MIME content type represents text-like content that
+/// can be safely rendered as a UTF-8 string.
+fn is_text_content_type(content_type: &str) -> bool {
+    content_type.starts_with("text/")
+        || content_type == "application/json"
+        || content_type == "application/xml"
+}
+
 /// Normalize a file path by stripping the `/workspace/` or `/workspace` prefix
 /// that agents typically use as their working directory mount point.
 fn normalize_path(path: &str) -> &str {
@@ -74,20 +82,37 @@ pub async fn invoke_execution_file_tool(
         .await
     {
         Ok(content) => {
-            let text = String::from_utf8_lossy(&content.data).to_string();
+            let size_bytes = content.data.len();
+            let is_binary = !is_text_content_type(&content.content_type);
+            let download_url = format!("/v1/executions/{}/files/{}", execution_id.0, raw_path);
+
             debug!(
                 %execution_id,
                 path,
-                size_bytes = content.data.len(),
+                size_bytes,
+                is_binary,
+                content_type = %content.content_type,
                 "aegis.execution.file: success"
             );
-            Ok(ToolInvocationResult::Direct(json!({
+
+            let mut result = json!({
                 "status": "success",
                 "path": raw_path,
-                "content": text,
-                "size_bytes": content.data.len(),
                 "content_type": content.content_type,
-            })))
+                "is_binary": is_binary,
+                "size_bytes": size_bytes,
+                "download_url": download_url,
+            });
+
+            if !is_binary {
+                let text = String::from_utf8_lossy(&content.data).to_string();
+                result
+                    .as_object_mut()
+                    .expect("result is an object")
+                    .insert("content".to_string(), Value::String(text));
+            }
+
+            Ok(ToolInvocationResult::Direct(result))
         }
         Err(FileOperationsError::NotFound(msg)) => {
             warn!(%execution_id, path, %msg, "aegis.execution.file: not found");
