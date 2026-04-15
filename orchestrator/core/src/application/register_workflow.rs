@@ -611,6 +611,14 @@ spec:
         ) -> Result<Option<Workflow>, RepositoryError> {
             Ok(None)
         }
+
+        async fn find_yaml_source_by_name_visible(
+            &self,
+            _tenant_id: &TenantId,
+            _name: &str,
+        ) -> Result<Option<String>, RepositoryError> {
+            Ok(None)
+        }
     }
 
     #[tokio::test]
