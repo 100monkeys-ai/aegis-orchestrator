@@ -52,7 +52,7 @@ opentelemetry-appender-tracing = { version = "0.27" }
 
 # Metrics
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.15", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
 
 # CLI
 clap = { version = "4.6", features = ["derive", "cargo"] }
