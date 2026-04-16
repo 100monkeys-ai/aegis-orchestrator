@@ -12,7 +12,7 @@ use tracing::{debug, info};
 
 use super::log_sanitizer::sanitize_url;
 
-const MAX_SEARCH_RESULTS: usize = 20;
+const MAX_SEARCH_RESULTS: u32 = 20;
 
 pub struct ReqwestWebToolAdapter {
     api_key: Option<String>,

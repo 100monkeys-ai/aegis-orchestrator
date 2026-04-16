@@ -1623,6 +1623,7 @@ impl Default for NodeConfigSpec {
             deploy_builtins: false,
             force_deploy_builtins: None,
             max_execution_list_limit: None,
+            billing: None,
         }
     }
 }
