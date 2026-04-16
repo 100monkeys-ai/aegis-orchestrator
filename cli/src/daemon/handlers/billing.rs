@@ -770,13 +770,9 @@ async fn handle_checkout_completed(
     billing_repo: &dyn BillingRepository,
     payload: &serde_json::Value,
 ) {
-    let obj = match payload.get("object") {
-        Some(o) => o,
-        None => {
-            warn!("checkout.session.completed: missing object");
-            return;
-        }
-    };
+    // payload is already event.data.object (the session object itself),
+    // extracted by the stimulus handler before calling process_stripe_event.
+    let obj = payload;
 
     let customer_id = obj
         .get("customer")
@@ -858,10 +854,7 @@ async fn handle_subscription_updated(
     billing_repo: &dyn BillingRepository,
     payload: &serde_json::Value,
 ) {
-    let obj = match payload.get("object") {
-        Some(o) => o,
-        None => return,
-    };
+    let obj = payload;
 
     let customer_id = obj
         .get("customer")
@@ -913,10 +906,7 @@ async fn handle_subscription_deleted(
     billing_repo: &dyn BillingRepository,
     payload: &serde_json::Value,
 ) {
-    let obj = match payload.get("object") {
-        Some(o) => o,
-        None => return,
-    };
+    let obj = payload;
 
     let customer_id = obj
         .get("customer")
@@ -955,10 +945,7 @@ async fn handle_subscription_deleted(
 }
 
 async fn handle_payment_failed(billing_repo: &dyn BillingRepository, payload: &serde_json::Value) {
-    let obj = match payload.get("object") {
-        Some(o) => o,
-        None => return,
-    };
+    let obj = payload;
 
     let customer_id = obj
         .get("customer")
