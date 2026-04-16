@@ -141,6 +141,10 @@ Use these when you are ready to configure and build:
 - [Building Workflows](https://docs.100monkeys.ai/docs/guides/building-workflows)
 - [Building Swarms](https://docs.100monkeys.ai/docs/guides/building-swarms)
 
+## Billing
+
+Stripe billing integration is available for SaaS deployments (e.g. Zaru at myzaru.com). Billing is a deployment-level concern configured via environment variables in the Zaru client and `aegis-platform-deployment`, not in the orchestrator node config. Self-hosted deployments can omit all Stripe variables and the billing UI is hidden automatically. See the [Billing Configuration](https://docs.100monkeys.ai/docs/guides/billing) guide for setup details.
+
 ## Development
 
 ### Git hooks
