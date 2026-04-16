@@ -47,7 +47,7 @@ jobs:
               export DEBIAN_FRONTEND=noninteractive
               apt-get update && apt-get install -y \
                 curl build-essential pkg-config \
-                libfuse3-dev protobuf-compiler libssl-dev \
+                libfuse3-dev protobuf-compiler \
                 && rm -rf /var/lib/apt/lists/*
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
               . "$HOME/.cargo/env"
