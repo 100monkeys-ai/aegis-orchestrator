@@ -85,6 +85,10 @@ vaultrs = "0.7"
 # Secrets Manager (ADR-034)
 lru = "0.16"
 
+# Git Repository Volumes (ADR-081)
+git2 = { version = "0.19", default-features = true }
+scopeguard = "1.2"
+
 [dev-dependencies]
 tokio-test = "0.4"
 tempfile = "3.27"

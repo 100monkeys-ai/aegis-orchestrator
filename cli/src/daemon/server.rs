@@ -1714,6 +1714,33 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         ),
     );
 
+    // Initialize git repo service (ADR-081 Wave A2). Requires a Postgres
+    // pool for the binding repository; left as `None` when the pool is
+    // absent. The handlers return 503 in that case.
+    let git_repo_service: Option<Arc<aegis_orchestrator_core::application::git_repo_service::GitRepoService>> = db_pool.as_ref().map(|pool| {
+        let repo = Arc::new(
+            aegis_orchestrator_core::infrastructure::repositories::PostgresGitRepoBindingRepository::new(
+                pool.clone(),
+            ),
+        ) as Arc<dyn aegis_orchestrator_core::domain::git_repo::GitRepoBindingRepository>;
+        let clone_executor = Arc::new(
+            aegis_orchestrator_core::application::git_clone_executor::GitCloneExecutor::new(
+                secrets_manager.clone(),
+                nfs_gateway.fsal().clone(),
+                None,
+            ),
+        );
+        Arc::new(
+            aegis_orchestrator_core::application::git_repo_service::GitRepoService::new(
+                repo,
+                user_volume_service.clone(),
+                clone_executor,
+                secrets_manager.clone(),
+                event_bus.clone(),
+            ),
+        )
+    });
+
     let app_state = AppState {
         agent_service: agent_service.clone(),
         execution_service: execution_service.clone(),
@@ -1762,6 +1789,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         stimulus_service: None,
         user_volume_service,
         file_operations_service,
+        git_repo_service,
         config: config.clone(),
         start_time: std::time::Instant::now(),
         keycloak_admin: colony_keycloak_admin,
