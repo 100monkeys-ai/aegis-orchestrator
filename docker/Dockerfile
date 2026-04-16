@@ -32,6 +32,13 @@ COPY aegis-proto ./aegis-proto
 # real stubs, not an empty placeholder.
 COPY aegis-orchestrator/orchestrator/vendor/bollard-stubs ./aegis-orchestrator/orchestrator/vendor/bollard-stubs
 
+# Create stub source files so cargo can resolve the workspace manifests.
+# These are throwaway — the real source is copied after cargo fetch.
+RUN mkdir -p aegis-orchestrator/cli/src && echo "fn main() {}" > aegis-orchestrator/cli/src/main.rs \
+    && mkdir -p aegis-orchestrator/orchestrator/core/src && touch aegis-orchestrator/orchestrator/core/src/lib.rs \
+    && mkdir -p aegis-orchestrator/orchestrator/swarm/src && touch aegis-orchestrator/orchestrator/swarm/src/lib.rs \
+    && mkdir -p aegis-orchestrator/sdks/src && touch aegis-orchestrator/sdks/src/lib.rs
+
 # Download all crates (cached if Cargo.lock is unchanged)
 RUN cd aegis-orchestrator && cargo fetch --locked
 
