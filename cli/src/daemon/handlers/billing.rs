@@ -8,6 +8,7 @@
 //!
 //! | Method | Path | Description |
 //! |--------|------|-------------|
+//! | `GET`  | `/v1/billing/prices` | List all active prices from Stripe (public) |
 //! | `POST` | `/v1/billing/checkout` | Create a Stripe Checkout session |
 //! | `POST` | `/v1/billing/portal` | Create a Stripe Customer Portal session |
 //! | `GET`  | `/v1/billing/subscription` | Get current subscription details |
@@ -24,9 +25,7 @@ use tracing::{info, warn};
 
 use aegis_orchestrator_core::domain::billing::{SubscriptionStatus, TenantSubscription};
 use aegis_orchestrator_core::domain::iam::UserIdentity;
-use aegis_orchestrator_core::domain::node_config::{
-    resolve_env_value, BillingConfig, BillingPriceIds,
-};
+use aegis_orchestrator_core::domain::node_config::{resolve_env_value, BillingConfig};
 use aegis_orchestrator_core::domain::tenancy::TenantTier;
 use aegis_orchestrator_core::infrastructure::repositories::BillingRepository;
 
@@ -51,43 +50,49 @@ fn not_implemented() -> axum::response::Response {
         .into_response()
 }
 
-// ── Price resolution ─────────────────────────────────────────────────────────
+// ── Response types ──────────────────────────────────────────────────────────
 
-/// Resolve a Stripe Price ID from the `BillingPriceIds` config.
-/// Values support `env:VAR_NAME` syntax via [`resolve_env_value`].
-fn resolve_price_id(price_ids: &BillingPriceIds, tier: &str, interval: &str) -> Option<String> {
-    let raw = match (tier, interval) {
-        ("pro", "monthly") => price_ids.pro_monthly.as_deref(),
-        ("pro", "yearly") | ("pro", "annual") => price_ids.pro_annual.as_deref(),
-        ("business", "monthly") => price_ids.business_monthly.as_deref(),
-        ("business", "yearly") | ("business", "annual") => price_ids.business_annual.as_deref(),
-        ("enterprise", "monthly") => price_ids.enterprise_monthly.as_deref(),
-        ("enterprise", "yearly") | ("enterprise", "annual") => {
-            price_ids.enterprise_annual.as_deref()
-        }
-        _ => None,
-    };
-    raw.and_then(|v| resolve_env_value(v).ok())
-        .filter(|v| !v.is_empty())
+#[derive(Debug, serde::Serialize)]
+struct PriceInfo {
+    price_id: String,
+    amount: i64,
+    currency: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct TierPricing {
+    tier: String,
+    product_id: String,
+    name: String,
+    description: Option<String>,
+    included_seats: u32,
+    monthly: Option<PriceInfo>,
+    annual: Option<PriceInfo>,
+    seat_monthly: Option<PriceInfo>,
+    seat_annual: Option<PriceInfo>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PricesResponse {
+    tiers: Vec<TierPricing>,
 }
 
 // ── Request types ────────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct CheckoutRequest {
-    /// Target tier: "pro", "business", or "enterprise".
-    pub tier: String,
-    /// Billing interval: "monthly" or "yearly".
-    #[serde(default = "default_interval")]
-    pub interval: String,
+    /// Stripe Price ID for the base plan (from the prices endpoint).
+    pub price_id: String,
+    /// Optional Stripe Price ID for extra seat add-on.
+    #[serde(default)]
+    pub seat_price_id: Option<String>,
+    /// Number of extra seats beyond the included count.
+    #[serde(default)]
+    pub seats: u32,
     /// URL to redirect after successful checkout.
     pub success_url: String,
     /// URL to redirect on cancellation.
     pub cancel_url: String,
-}
-
-fn default_interval() -> String {
-    "monthly".to_string()
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -96,9 +101,203 @@ pub(crate) struct PortalRequest {
     pub return_url: String,
 }
 
+// ── Tier mapping helpers ────────────────────────────────────────────────────
+
+/// Map a Stripe product name to a (tier, included_seats) tuple.
+/// Returns `None` for products that are seat add-ons.
+fn product_name_to_tier(name: &str) -> Option<(&'static str, u32)> {
+    // Skip seat add-on products — they are matched separately
+    if name.contains("Extra Seat") {
+        return None;
+    }
+    if name.starts_with("Zaru Pro") {
+        Some(("pro", 3))
+    } else if name.starts_with("Zaru Business") {
+        Some(("business", 5))
+    } else if name.starts_with("Zaru Enterprise") {
+        Some(("enterprise", 10))
+    } else {
+        None
+    }
+}
+
+/// Extract the tier prefix from a seat add-on product name.
+/// e.g. "Zaru Pro - Extra Seat" -> "pro"
+fn seat_product_tier(name: &str) -> Option<&'static str> {
+    if !name.contains("Extra Seat") {
+        return None;
+    }
+    if name.starts_with("Zaru Pro") {
+        Some("pro")
+    } else if name.starts_with("Zaru Business") {
+        Some("business")
+    } else if name.starts_with("Zaru Enterprise") {
+        Some("enterprise")
+    } else {
+        None
+    }
+}
+
 // ── Handlers ─────────────────────────────────────────────────────────────────
 
+/// `GET /v1/billing/prices` — List all active Zaru prices from Stripe.
+///
+/// This endpoint is **public** (no auth required) — it returns pricing information
+/// that is displayed on the public pricing page.
+pub(crate) async fn list_prices_handler(
+    State(state): State<Arc<AppState>>,
+) -> axum::response::Response {
+    let billing = match &state.billing_config {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+    let client = match stripe_client_from_config(billing) {
+        Some(c) => c,
+        None => return not_implemented(),
+    };
+
+    // 1. List all active products
+    let mut product_params = stripe::ListProducts::new();
+    product_params.active = Some(true);
+    product_params.limit = Some(100);
+
+    let products = match stripe::Product::list(&client, &product_params).await {
+        Ok(list) => list.data,
+        Err(e) => {
+            warn!(error = %e, "Failed to list Stripe products");
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({"error": format!("Failed to list products from Stripe: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Filter to Zaru products only
+    let zaru_products: Vec<_> = products
+        .iter()
+        .filter(|p| {
+            p.name
+                .as_deref()
+                .map(|n| n.starts_with("Zaru"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    // 2. Build a map of tier -> TierPricing
+    use std::collections::HashMap;
+    let mut tier_map: HashMap<&str, TierPricing> = HashMap::new();
+
+    // Initialize base plan entries
+    for product in &zaru_products {
+        let name = match product.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+        if let Some((tier, included_seats)) = product_name_to_tier(name) {
+            tier_map.entry(tier).or_insert_with(|| TierPricing {
+                tier: tier.to_string(),
+                product_id: product.id.to_string(),
+                name: name.to_string(),
+                description: product.description.clone(),
+                included_seats,
+                monthly: None,
+                annual: None,
+                seat_monthly: None,
+                seat_annual: None,
+            });
+        }
+    }
+
+    // 3. For each Zaru product, list active prices and assign to tiers
+    for product in &zaru_products {
+        let name = match product.name.as_deref() {
+            Some(n) => n,
+            None => continue,
+        };
+
+        let product_id_str = product.id.to_string();
+        let mut price_params = stripe::ListPrices::new();
+        price_params.product = Some(stripe::IdOrCreate::Id(&product_id_str));
+        price_params.active = Some(true);
+        price_params.limit = Some(50);
+
+        let prices = match stripe::Price::list(&client, &price_params).await {
+            Ok(list) => list.data,
+            Err(e) => {
+                warn!(error = %e, product_id = %product.id, "Failed to list prices for product");
+                continue;
+            }
+        };
+
+        let is_seat_addon = name.contains("Extra Seat");
+        let tier_key = if is_seat_addon {
+            seat_product_tier(name)
+        } else {
+            product_name_to_tier(name).map(|(t, _)| t)
+        };
+
+        let tier_key = match tier_key {
+            Some(t) => t,
+            None => continue,
+        };
+
+        let tier_entry = match tier_map.get_mut(tier_key) {
+            Some(e) => e,
+            None => continue,
+        };
+
+        for price in &prices {
+            let amount = price.unit_amount.unwrap_or(0);
+            let currency = price
+                .currency
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "usd".to_string());
+
+            let info = PriceInfo {
+                price_id: price.id.to_string(),
+                amount,
+                currency,
+            };
+
+            let interval = price
+                .recurring
+                .as_ref()
+                .map(|r| r.interval)
+                .unwrap_or(stripe::RecurringInterval::Month);
+
+            match (is_seat_addon, interval) {
+                (false, stripe::RecurringInterval::Month) => {
+                    tier_entry.monthly = Some(info);
+                }
+                (false, stripe::RecurringInterval::Year) => {
+                    tier_entry.annual = Some(info);
+                }
+                (true, stripe::RecurringInterval::Month) => {
+                    tier_entry.seat_monthly = Some(info);
+                }
+                (true, stripe::RecurringInterval::Year) => {
+                    tier_entry.seat_annual = Some(info);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // 4. Build ordered response
+    let tier_order = ["pro", "business", "enterprise"];
+    let tiers: Vec<TierPricing> = tier_order
+        .iter()
+        .filter_map(|t| tier_map.remove(t))
+        .collect();
+
+    (StatusCode::OK, Json(PricesResponse { tiers })).into_response()
+}
+
 /// `POST /v1/billing/checkout` — Create a Stripe Checkout Session.
+///
+/// The client sends the exact `price_id` (obtained from `GET /v1/billing/prices`)
+/// along with optional seat add-on details.
 pub(crate) async fn create_checkout_handler(
     State(state): State<Arc<AppState>>,
     identity: Option<Extension<UserIdentity>>,
@@ -124,15 +323,13 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    let price_id = match resolve_price_id(&billing.price_ids, &body.tier, &body.interval) {
-        Some(id) => id,
-        None => {
+    // Validate price_id format
+    let price_id_parsed: stripe::PriceId = match body.price_id.parse() {
+        Ok(id) => id,
+        Err(e) => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "invalid_plan",
-                    "message": format!("No price configured for tier={} interval={}", body.tier, body.interval),
-                })),
+                Json(json!({"error": format!("Invalid price_id: {e}")})),
             )
                 .into_response();
         }
@@ -221,35 +418,34 @@ pub(crate) async fn create_checkout_handler(
         }
     };
 
-    let price_id_parsed: stripe::PriceId = match price_id.parse() {
-        Ok(id) => id,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("Invalid price ID: {e}")})),
-            )
-                .into_response();
+    // Build line items: base plan + optional seat add-on
+    let mut line_items = vec![stripe::CreateCheckoutSessionLineItems {
+        price: Some(price_id_parsed.to_string()),
+        quantity: Some(1),
+        ..Default::default()
+    }];
+
+    if let Some(ref seat_price_id) = body.seat_price_id {
+        if body.seats > 0 {
+            line_items.push(stripe::CreateCheckoutSessionLineItems {
+                price: Some(seat_price_id.clone()),
+                quantity: Some(body.seats as u64),
+                ..Default::default()
+            });
         }
-    };
+    }
 
     let mut params = stripe::CreateCheckoutSession::new();
     params.customer = Some(customer_id_parsed);
     params.mode = Some(stripe::CheckoutSessionMode::Subscription);
     params.success_url = Some(&body.success_url);
     params.cancel_url = Some(&body.cancel_url);
-    params.line_items = Some(vec![stripe::CreateCheckoutSessionLineItems {
-        price: Some(price_id_parsed.to_string()),
-        quantity: Some(1),
-        ..Default::default()
-    }]);
+    params.line_items = Some(line_items);
     params.subscription_data = Some(stripe::CreateCheckoutSessionSubscriptionData {
         metadata: Some(
-            [
-                ("tenant_id".to_string(), tenant_id.as_str().to_string()),
-                ("tier".to_string(), body.tier.clone()),
-            ]
-            .into_iter()
-            .collect(),
+            [("tenant_id".to_string(), tenant_id.as_str().to_string())]
+                .into_iter()
+                .collect(),
         ),
         ..Default::default()
     });
@@ -257,7 +453,7 @@ pub(crate) async fn create_checkout_handler(
     match stripe::CheckoutSession::create(&stripe, params).await {
         Ok(session) => {
             let url = session.url.unwrap_or_default();
-            info!(tenant_id = %tenant_id, tier = %body.tier, "Checkout session created");
+            info!(tenant_id = %tenant_id, price_id = %body.price_id, "Checkout session created");
             (StatusCode::OK, Json(json!({"url": url}))).into_response()
         }
         Err(e) => {
@@ -887,51 +1083,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolve_price_id_from_config() {
-        let price_ids = BillingPriceIds {
-            pro_monthly: Some("price_pro_m".to_string()),
-            pro_annual: Some("price_pro_a".to_string()),
-            business_monthly: Some("price_biz_m".to_string()),
-            business_annual: None,
-            enterprise_monthly: None,
-            enterprise_annual: Some("price_ent_a".to_string()),
-        };
+    fn product_name_to_tier_maps_base_plans() {
+        assert_eq!(product_name_to_tier("Zaru Pro"), Some(("pro", 3)));
+        assert_eq!(product_name_to_tier("Zaru Business"), Some(("business", 5)));
         assert_eq!(
-            resolve_price_id(&price_ids, "pro", "monthly"),
-            Some("price_pro_m".to_string())
-        );
-        assert_eq!(
-            resolve_price_id(&price_ids, "pro", "yearly"),
-            Some("price_pro_a".to_string())
-        );
-        assert_eq!(
-            resolve_price_id(&price_ids, "pro", "annual"),
-            Some("price_pro_a".to_string())
-        );
-        assert_eq!(
-            resolve_price_id(&price_ids, "business", "monthly"),
-            Some("price_biz_m".to_string())
-        );
-        assert_eq!(
-            resolve_price_id(&price_ids, "enterprise", "annual"),
-            Some("price_ent_a".to_string())
+            product_name_to_tier("Zaru Enterprise"),
+            Some(("enterprise", 10))
         );
     }
 
     #[test]
-    fn resolve_price_id_returns_none_when_unset() {
-        let price_ids = BillingPriceIds::default();
-        assert!(resolve_price_id(&price_ids, "pro", "monthly").is_none());
-        assert!(resolve_price_id(&price_ids, "nonexistent", "yearly").is_none());
+    fn product_name_to_tier_excludes_seat_addons() {
+        assert_eq!(product_name_to_tier("Zaru Pro - Extra Seat"), None);
+        assert_eq!(product_name_to_tier("Zaru Business - Extra Seat"), None);
     }
 
     #[test]
-    fn resolve_price_id_returns_none_for_empty_value() {
-        let price_ids = BillingPriceIds {
-            pro_monthly: Some(String::new()),
-            ..Default::default()
-        };
-        assert!(resolve_price_id(&price_ids, "pro", "monthly").is_none());
+    fn product_name_to_tier_excludes_non_zaru() {
+        assert_eq!(product_name_to_tier("Some Other Product"), None);
+    }
+
+    #[test]
+    fn seat_product_tier_maps_correctly() {
+        assert_eq!(seat_product_tier("Zaru Pro - Extra Seat"), Some("pro"));
+        assert_eq!(
+            seat_product_tier("Zaru Business - Extra Seat"),
+            Some("business")
+        );
+        assert_eq!(
+            seat_product_tier("Zaru Enterprise - Extra Seat"),
+            Some("enterprise")
+        );
+    }
+
+    #[test]
+    fn seat_product_tier_rejects_non_seat_products() {
+        assert_eq!(seat_product_tier("Zaru Pro"), None);
+        assert_eq!(seat_product_tier("Zaru Business"), None);
     }
 
     #[test]
@@ -981,10 +1169,5 @@ mod tests {
     fn extract_tier_returns_none_when_absent() {
         let obj = serde_json::json!({});
         assert_eq!(extract_tier_from_subscription(&obj), None);
-    }
-
-    #[test]
-    fn default_interval_is_monthly() {
-        assert_eq!(default_interval(), "monthly");
     }
 }

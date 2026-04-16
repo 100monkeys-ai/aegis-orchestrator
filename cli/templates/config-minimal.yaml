@@ -110,5 +110,4 @@ spec:
 
   # billing:                                # Stripe billing (SaaS mode only, omit for self-hosted)
   #   stripe_secret_key: "env:STRIPE_SECRET_KEY"
-  #   price_ids:
-  #     pro_monthly: "env:STRIPE_PRICE_PRO_MONTHLY"
+  #   stripe_webhook_secret: "env:STRIPE_WEBHOOK_SECRET"
