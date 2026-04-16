@@ -41,7 +41,7 @@ fn generate_api_key() -> String {
     let mut rng = rand::thread_rng();
     let suffix: String = (0..40)
         .map(|_| {
-            let idx = rng.gen_range(0..62u8);
+            let idx = rng.random_range(0..62u8);
             if idx < 10 {
                 (b'0' + idx) as char
             } else if idx < 36 {

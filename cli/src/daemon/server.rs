@@ -1882,7 +1882,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     });
 
     // Keep sweeper shutdown sender alive until daemon shutdown.
-    let mut health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+    let mut _health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
 
     // ─── Cluster gRPC server (ADR-059) ─────────────────────────────────────
     // When clustering is enabled, start a second gRPC server on the dedicated
@@ -2094,7 +2094,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 });
                 // Keep sender in lifecycle state so it is dropped during daemon
                 // shutdown, allowing the sweeper to exit cleanly.
-                health_sweeper_shutdown = Some(shutdown_tx);
+                _health_sweeper_shutdown = Some(shutdown_tx);
                 tracing::info!(
                     stale_threshold_secs = stale_threshold.as_secs(),
                     sweep_interval_secs = sweep_interval.as_secs(),
