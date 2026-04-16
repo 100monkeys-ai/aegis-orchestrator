@@ -28,8 +28,9 @@ use super::inode_table::{InodeTable, ROOT_INODE};
 
 use fuser::{
     AccessFlags, BsdFileFlags, Config as FuseConfig, Errno, FileAttr, FileHandle,
-    FileType as FuseFileType, Filesystem, INodeNo, LockOwner, OpenFlags, RenameFlags, ReplyAttr,
-    ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request, SessionACL, WriteFlags,
+    FileType as FuseFileType, Filesystem, FopenFlags, Generation, INodeNo, LockOwner, OpenFlags,
+    RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry, ReplyWrite, Request, SessionACL,
+    WriteFlags,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -165,15 +166,13 @@ impl FuseFsalDaemon {
         // - allow_other: let the container user access the mount (requires /etc/fuse.conf)
         // - default_permissions: let the kernel enforce basic permission checks
         // - fsname: identifies this mount in /proc/mounts
-        let config = FuseConfig {
-            mount_options: vec![
-                fuser::MountOption::FSName(format!("aegis-fsal-{}", context.volume_id)),
-                fuser::MountOption::DefaultPermissions,
-                fuser::MountOption::RW,
-            ],
-            acl: SessionACL::All, // allow_other: let the container user access the mount
-            ..FuseConfig::default()
-        };
+        let mut config = FuseConfig::default();
+        config.mount_options = vec![
+            fuser::MountOption::FSName(format!("aegis-fsal-{}", context.volume_id)),
+            fuser::MountOption::DefaultPermissions,
+            fuser::MountOption::RW,
+        ];
+        config.acl = SessionACL::All; // allow_other: let the container user access the mount
 
         let session = fuser::spawn_mount2(fs, mountpoint, &config).map_err(|e| {
             FuseDaemonError::MountFailed {
@@ -247,7 +246,7 @@ impl FuseFsal {
         };
 
         FileAttr {
-            ino,
+            ino: INodeNo(ino),
             size: attrs.size,
             blocks: attrs.size.div_ceil(512),
             atime: UNIX_EPOCH + Duration::from_secs(attrs.atime.max(0) as u64),
@@ -268,7 +267,7 @@ impl FuseFsal {
     /// Synthesize directory attributes for the volume root.
     fn root_attr(&self) -> FileAttr {
         FileAttr {
-            ino: ROOT_INODE,
+            ino: INodeNo(ROOT_INODE),
             size: 4096,
             blocks: 8,
             atime: UNIX_EPOCH,
@@ -354,7 +353,7 @@ impl Filesystem for FuseFsal {
             Ok(attrs) => {
                 let fuse_attr = self.convert_attrs(&attrs, child_ino);
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "lookup", "result" => "success").increment(1);
-                reply.entry(&FUSE_TTL, &fuse_attr, 0);
+                reply.entry(&FUSE_TTL, &fuse_attr, Generation(0));
             }
             Err(e) => {
                 // Path exists (lookup succeeded) but stat failed — may be a race
@@ -495,7 +494,7 @@ impl Filesystem for FuseFsal {
         ino: INodeNo,
         _fh: FileHandle,
         offset: u64,
-        reply: ReplyDirectory,
+        mut reply: ReplyDirectory,
     ) {
         let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, "FUSE READDIR");
@@ -557,7 +556,7 @@ impl Filesystem for FuseFsal {
         // Skip entries before offset and add remaining
         for (i, (child_ino, kind, name)) in full_entries.iter().enumerate().skip(offset as usize) {
             // reply.add returns true when the buffer is full
-            if reply.add(*child_ino, (i + 1) as i64, *kind, name) {
+            if reply.add(INodeNo(*child_ino), (i + 1) as u64, *kind, name) {
                 break;
             }
         }
@@ -618,14 +617,20 @@ impl Filesystem for FuseFsal {
                     Ok(attrs) => {
                         let fuse_attr = self.convert_attrs(&attrs, child_ino);
                         metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "success").increment(1);
-                        reply.created(&FUSE_TTL, &fuse_attr, 0, 0, 0);
+                        reply.created(
+                            &FUSE_TTL,
+                            &fuse_attr,
+                            Generation(0),
+                            FileHandle(0),
+                            FopenFlags::empty(),
+                        );
                     }
                     Err(e) => {
                         // File was created but stat failed — unlikely but handle gracefully.
                         // Return a synthetic file attr rather than failing.
                         warn!(error = %e, path = %file_path, "FUSE create getattr failed — using synthetic attrs");
                         let attr = FileAttr {
-                            ino: child_ino,
+                            ino: INodeNo(child_ino),
                             size: 0,
                             blocks: 0,
                             atime: SystemTime::now(),
@@ -642,7 +647,13 @@ impl Filesystem for FuseFsal {
                             flags: 0,
                         };
                         metrics::counter!("aegis_fuse_operations_total", "operation" => "create", "result" => "success").increment(1);
-                        reply.created(&FUSE_TTL, &attr, 0, 0, 0);
+                        reply.created(
+                            &FUSE_TTL,
+                            &attr,
+                            Generation(0),
+                            FileHandle(0),
+                            FopenFlags::empty(),
+                        );
                     }
                 }
             }
@@ -704,7 +715,7 @@ impl Filesystem for FuseFsal {
                 let child_ino = self.inode_table.allocate(handle, dir_path.clone());
 
                 let attr = FileAttr {
-                    ino: child_ino,
+                    ino: INodeNo(child_ino),
                     size: 4096,
                     blocks: 8,
                     atime: SystemTime::now(),
@@ -721,7 +732,7 @@ impl Filesystem for FuseFsal {
                     flags: 0,
                 };
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "mkdir", "result" => "success").increment(1);
-                reply.entry(&FUSE_TTL, &attr, 0);
+                reply.entry(&FUSE_TTL, &attr, Generation(0));
             }
             Err(e) => {
                 error!(error = %e, "FUSE mkdir failed");
@@ -945,13 +956,13 @@ impl Filesystem for FuseFsal {
         // Return fh=0, no special flags.
         let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE OPEN (stateless)");
-        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: fuser::ReplyOpen) {
         let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE OPENDIR (stateless)");
-        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
+        reply.opened(FileHandle(0), FopenFlags::empty());
     }
 
     fn releasedir(
