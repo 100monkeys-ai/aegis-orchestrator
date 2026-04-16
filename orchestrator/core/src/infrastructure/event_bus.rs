@@ -64,9 +64,9 @@
 use crate::domain::agent::AgentId;
 use crate::domain::cluster::ClusterEvent;
 use crate::domain::events::{
-    AgentLifecycleEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent, IamEvent,
-    ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent, SealEvent,
-    SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent,
+    AgentLifecycleEvent, ContainerRunEvent, CredentialEvent, ExecutionEvent, GitRepoEvent,
+    IamEvent, ImageManagementEvent, LearningEvent, MCPToolEvent, PolicyEvent, RateLimitEvent,
+    SealEvent, SecretEvent, StimulusEvent, StorageEvent, SwarmEvent, TenantEvent, ValidationEvent,
     VolumeEvent, WorkflowEvent,
 };
 use crate::domain::execution::ExecutionId;
@@ -97,6 +97,7 @@ fn domain_event_type(event: &DomainEvent) -> &'static str {
         DomainEvent::RateLimit(_) => "rate_limit",
         DomainEvent::Swarm(_) => "swarm",
         DomainEvent::Credential(_) => "credential",
+        DomainEvent::GitRepo(_) => "git_repo",
     }
 }
 
@@ -134,6 +135,8 @@ pub enum DomainEvent {
     Swarm(SwarmEvent),
     /// BC-11 Credential binding lifecycle events (ADR-078)
     Credential(CredentialEvent),
+    /// BC-7 Git repository binding lifecycle events (ADR-081)
+    GitRepo(GitRepoEvent),
 }
 
 impl DomainEvent {
@@ -144,7 +147,8 @@ impl DomainEvent {
             | DomainEvent::Iam(_)
             | DomainEvent::Tenant(_)
             | DomainEvent::RateLimit(_)
-            | DomainEvent::Credential(_) => None,
+            | DomainEvent::Credential(_)
+            | DomainEvent::GitRepo(_) => None,
             DomainEvent::Execution(event) => Some(match event {
                 ExecutionEvent::ExecutionStarted { execution_id, .. }
                 | ExecutionEvent::IterationStarted { execution_id, .. }
@@ -368,7 +372,8 @@ impl DomainEvent {
             | DomainEvent::Cluster(_)
             | DomainEvent::RateLimit(_)
             | DomainEvent::Swarm(_)
-            | DomainEvent::Credential(_) => None,
+            | DomainEvent::Credential(_)
+            | DomainEvent::GitRepo(_) => None,
         }
     }
 
@@ -560,6 +565,19 @@ impl DomainEvent {
                 | SwarmEvent::MessageBroadcast { .. } => Utc::now(),
             },
             DomainEvent::Credential(_) => Utc::now(),
+            DomainEvent::GitRepo(event) => match event {
+                GitRepoEvent::BindingCreated { created_at, .. } => *created_at,
+                GitRepoEvent::CloneStarted { started_at, .. } => *started_at,
+                GitRepoEvent::CloneCompleted { completed_at, .. } => *completed_at,
+                GitRepoEvent::CloneFailed { failed_at, .. } => *failed_at,
+                GitRepoEvent::RefreshStarted { started_at, .. } => *started_at,
+                GitRepoEvent::RefreshCompleted { completed_at, .. } => *completed_at,
+                GitRepoEvent::RefreshFailed { failed_at, .. } => *failed_at,
+                GitRepoEvent::WebhookReceived { received_at, .. } => *received_at,
+                GitRepoEvent::BindingDeleted { deleted_at, .. } => *deleted_at,
+                GitRepoEvent::CommitMade { committed_at, .. } => *committed_at,
+                GitRepoEvent::PushCompleted { pushed_at, .. } => *pushed_at,
+            },
         }
     }
 
@@ -754,6 +772,19 @@ impl DomainEvent {
                 CredentialEvent::CredentialGrantRevoked { .. } => "credential_grant_revoked",
                 CredentialEvent::CredentialAccessed { .. } => "credential_accessed",
             },
+            DomainEvent::GitRepo(event) => match event {
+                GitRepoEvent::BindingCreated { .. } => "git_repo_binding_created",
+                GitRepoEvent::CloneStarted { .. } => "git_repo_clone_started",
+                GitRepoEvent::CloneCompleted { .. } => "git_repo_clone_completed",
+                GitRepoEvent::CloneFailed { .. } => "git_repo_clone_failed",
+                GitRepoEvent::RefreshStarted { .. } => "git_repo_refresh_started",
+                GitRepoEvent::RefreshCompleted { .. } => "git_repo_refresh_completed",
+                GitRepoEvent::RefreshFailed { .. } => "git_repo_refresh_failed",
+                GitRepoEvent::WebhookReceived { .. } => "git_repo_webhook_received",
+                GitRepoEvent::BindingDeleted { .. } => "git_repo_binding_deleted",
+                GitRepoEvent::CommitMade { .. } => "git_repo_commit_made",
+                GitRepoEvent::PushCompleted { .. } => "git_repo_push_completed",
+            },
         }
     }
 
@@ -778,6 +809,7 @@ impl DomainEvent {
             DomainEvent::RateLimit(_) => "rate_limit",
             DomainEvent::Swarm(_) => "swarm",
             DomainEvent::Credential(_) => "credential",
+            DomainEvent::GitRepo(_) => "git_repo",
         }
     }
 
@@ -881,6 +913,7 @@ impl DomainEvent {
             DomainEvent::RateLimit(_) => Some("rate_limit"),
             DomainEvent::Swarm(_) => Some("swarm"),
             DomainEvent::Credential(_) => Some("credential"),
+            DomainEvent::GitRepo(_) => Some("git_repo"),
         }
     }
 }
@@ -1009,6 +1042,11 @@ impl EventBus {
     /// Publish a credential binding lifecycle event (BC-11 ADR-078)
     pub fn publish_credential_event(&self, event: CredentialEvent) {
         self.publish(DomainEvent::Credential(event));
+    }
+
+    /// Publish a git repo binding lifecycle event (BC-7 ADR-081)
+    pub fn publish_git_repo_event(&self, event: GitRepoEvent) {
+        self.publish(DomainEvent::GitRepo(event));
     }
 
     /// Publish a domain event to all subscribers
@@ -1403,6 +1441,7 @@ impl AgentEventReceiver {
                 | CredentialEvent::CredentialGranted { .. }
                 | CredentialEvent::CredentialGrantRevoked { .. } => false,
             },
+            DomainEvent::GitRepo(_) => false, // Git repo binding events are tenant-scoped, not per-agent
         }
     }
 }

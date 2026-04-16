@@ -38,6 +38,9 @@ use crate::domain::agent::{AgentManifest, AgentScope};
 use crate::domain::credential::{
     CredentialBindingId, CredentialGrantId, CredentialProvider, CredentialType, GrantTarget,
 };
+// Re-export BC-7 git repo binding events so they sit alongside the other
+// `*Event` enums in the single domain event catalog (ADR-081).
+pub use super::git_repo::GitRepoEvent;
 use crate::domain::execution::{CodeDiff, IterationError};
 use crate::domain::runtime::InstanceId;
 use crate::domain::secrets::AccessContext;
