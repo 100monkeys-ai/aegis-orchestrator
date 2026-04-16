@@ -50,6 +50,8 @@
 
 pub mod postgres_agent;
 pub mod postgres_api_key;
+pub mod postgres_billing;
+pub use postgres_billing::{BillingRepository, PostgresBillingRepository};
 pub mod postgres_credential;
 pub mod postgres_execution;
 pub mod postgres_realm;

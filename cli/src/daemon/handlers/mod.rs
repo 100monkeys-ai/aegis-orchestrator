@@ -11,6 +11,7 @@ pub(crate) mod admin;
 pub(crate) mod agents;
 pub(crate) mod api_keys;
 pub(crate) mod approvals;
+pub(crate) mod billing;
 pub(crate) mod cluster;
 pub(crate) mod colony;
 pub(crate) mod cortex;

@@ -44,6 +44,7 @@
 pub mod agent;
 pub mod api_key;
 pub mod api_scope;
+pub mod billing;
 pub mod cluster;
 pub mod credential;
 pub mod discovery;
