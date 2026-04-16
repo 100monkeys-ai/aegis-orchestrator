@@ -5,4 +5,8 @@
 # RUSTSEC-2023-0071: rsa timing sidechannel (Marvin Attack)
 # This is a transitive dependency via sqlx-mysql. We only use PostgreSQL,
 # so this crate is never exercised. No fix is available upstream.
-ignore = ["RUSTSEC-2023-0071"]
+#
+# RUSTSEC-2026-0098, RUSTSEC-2026-0099: rustls-webpki name constraint issues
+# Transitive via async-stripe → hyper-rustls 0.24 → rustls 0.21 → rustls-webpki 0.101.
+# Requires misissuance to exploit. Fix depends on async-stripe upgrading their TLS stack.
+ignore = ["RUSTSEC-2023-0071", "RUSTSEC-2026-0098", "RUSTSEC-2026-0099"]
