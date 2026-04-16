@@ -151,19 +151,139 @@ pub(crate) async fn webhook_handler(
     State(state): State<Arc<AppState>>,
     req: Request,
 ) -> impl IntoResponse {
-    // ── HMAC verification ─────────────────────────────────────────────────────
-    // Extract headers before verification for later stimulus construction.
-    // WebhookHmacGuard::from_request takes ownership of the request and reads
-    // the body; we snapshot headers first.
+    // Extract source from the URI path: /v1/webhooks/{source}
+    let source = req
+        .uri()
+        .path()
+        .strip_prefix("/v1/webhooks/")
+        .unwrap_or("")
+        .to_string();
+
     let headers = req.headers().clone();
 
+    // ── Stripe webhook: use Stripe signature verification ────────────────────
+    // Stripe sends `Stripe-Signature` header, not `X-Aegis-Signature`.
+    // Verify using HMAC-SHA256 with the Stripe webhook secret from BillingConfig.
+    if source == "stripe" {
+        let stripe_sig = match headers
+            .get("stripe-signature")
+            .and_then(|v| v.to_str().ok())
+        {
+            Some(s) => s.to_string(),
+            None => {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({ "error": "Missing Stripe-Signature header" })),
+                )
+                    .into_response();
+            }
+        };
+
+        let body_bytes = match axum::body::to_bytes(req.into_body(), 1_048_576).await {
+            Ok(b) => b,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "Failed to read request body" })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Verify Stripe signature: extract timestamp and v1 signature from header
+        let webhook_secret = state.billing_config.as_ref().and_then(|c| {
+            use aegis_orchestrator_core::domain::node_config::resolve_env_value;
+            c.stripe_webhook_secret
+                .as_ref()
+                .and_then(|s| resolve_env_value(s).ok())
+        });
+
+        let webhook_secret = match webhook_secret {
+            Some(s) if !s.is_empty() => s,
+            _ => {
+                warn!("Stripe webhook secret not configured");
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({ "error": "Stripe webhook secret not configured" })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Parse Stripe-Signature: t=TIMESTAMP,v1=SIGNATURE
+        let mut timestamp = "";
+        let mut sig_v1 = "";
+        for part in stripe_sig.split(',') {
+            if let Some(t) = part.strip_prefix("t=") {
+                timestamp = t;
+            } else if let Some(v) = part.strip_prefix("v1=") {
+                sig_v1 = v;
+            }
+        }
+
+        if timestamp.is_empty() || sig_v1.is_empty() {
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Malformed Stripe-Signature header" })),
+            )
+                .into_response();
+        }
+
+        // Compute expected signature: HMAC-SHA256(webhook_secret, "TIMESTAMP.BODY")
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        type HmacSha256 = Hmac<Sha256>;
+
+        let mut mac = match HmacSha256::new_from_slice(webhook_secret.as_bytes()) {
+            Ok(m) => m,
+            Err(_) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": "Invalid webhook secret" })),
+                )
+                    .into_response();
+            }
+        };
+        mac.update(timestamp.as_bytes());
+        mac.update(b".");
+        mac.update(&body_bytes);
+        let expected = hex::encode(mac.finalize().into_bytes());
+
+        if expected != sig_v1 {
+            warn!("Stripe webhook signature mismatch");
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(json!({ "error": "Invalid Stripe signature" })),
+            )
+                .into_response();
+        }
+
+        // Signature verified — process Stripe event
+        let body_str = String::from_utf8_lossy(&body_bytes).to_string();
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(&body_str) {
+            let event_type = event
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("unknown");
+            let data = event
+                .get("data")
+                .and_then(|d| d.get("object"))
+                .cloned()
+                .unwrap_or_default();
+            info!(event_type, "Processing Stripe webhook event");
+
+            crate::daemon::handlers::billing::process_stripe_event(&state, event_type, &data).await;
+        }
+
+        return (StatusCode::OK, Json(json!({ "received": true }))).into_response();
+    }
+
+    // ── HMAC verification (non-Stripe webhooks) ─────────────────────────────
     let guard =
         match WebhookHmacGuard::from_request(req, state.webhook_secret_provider.as_ref()).await {
             Ok(g) => g,
             Err(e) => return e.into_response(),
         };
-
-    let source = guard.source.clone();
 
     let stimulus_service = match &state.stimulus_service {
         Some(svc) => svc.clone(),
@@ -177,22 +297,6 @@ pub(crate) async fn webhook_handler(
     };
 
     // Convert verified body bytes to String (treat as UTF-8 if possible, else base64)
-    // ── Stripe billing webhook shortcut ──────────────────────────────────────
-    // Stripe events carry structured JSON with `type` and `data` fields.
-    // Route them directly to the billing handler, then continue into the
-    // generic stimulus pipeline so that stimulus registrations still fire.
-    if source == "stripe" {
-        if let Ok(event) = serde_json::from_slice::<serde_json::Value>(&guard.body) {
-            if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
-                let data = event
-                    .get("data")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                super::billing::process_stripe_event(&state, event_type, &data).await;
-            }
-        }
-    }
-
     let content = String::from_utf8(guard.body.to_vec())
         .unwrap_or_else(|_| base64::engine::general_purpose::STANDARD.encode(&guard.body));
 
