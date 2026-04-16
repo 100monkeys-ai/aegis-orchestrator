@@ -40,7 +40,7 @@ use opentelemetry_sdk::logs::SdkLoggerProvider;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{info, warn};
-use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, Layer};
 
 mod auth;
 mod commands;
@@ -53,7 +53,7 @@ use commands::{
     InitArgs, NodeCommand, RestartArgs, SecretCommand, StatusArgs, TaskCommand, UninstallArgs,
     UpArgs, WorkflowCommand,
 };
-use output::{OutputFormat, structured_output_unsupported};
+use output::{structured_output_unsupported, OutputFormat};
 
 /// AEGIS Agent Host - Enable autonomous agent execution
 #[derive(Parser)]
@@ -386,7 +386,10 @@ fn init_logging(level: &str, config: Option<&LoggingConfig>) -> Result<Option<Sd
 
                     if let Some(ca) = &cfg.tls.ca_cert_path {
                         let pem = std::fs::read(ca).with_context(|| {
-                            format!("Failed to read OTLP gRPC CA certificate from path: {ca}")
+                            format!(
+                                "Failed to read OTLP gRPC CA certificate from path: {}",
+                                ca.display()
+                            )
                         })?;
                         let cert = tonic::transport::Certificate::from_pem(pem);
                         let tls_config =
