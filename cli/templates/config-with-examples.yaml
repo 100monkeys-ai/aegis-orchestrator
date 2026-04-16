@@ -552,13 +552,9 @@ spec:
   # billing:
   #   stripe_secret_key: "env:STRIPE_SECRET_KEY"
   #   stripe_webhook_secret: "env:STRIPE_WEBHOOK_SECRET"
-  #   price_ids:
-  #     pro_monthly: "env:STRIPE_PRICE_PRO_MONTHLY"
-  #     pro_annual: "env:STRIPE_PRICE_PRO_ANNUAL"
-  #     business_monthly: "env:STRIPE_PRICE_BUSINESS_MONTHLY"
-  #     business_annual: "env:STRIPE_PRICE_BUSINESS_ANNUAL"
-  #     enterprise_monthly: "env:STRIPE_PRICE_ENTERPRISE_MONTHLY"
-  #     enterprise_annual: "env:STRIPE_PRICE_ENTERPRISE_ANNUAL"
+  #   # Price IDs are fetched dynamically from Stripe via GET /v1/billing/prices.
+  #   # Create Stripe products named "Zaru Pro", "Zaru Business", "Zaru Enterprise"
+  #   # (plus "... - Extra Seat" variants) with monthly and annual prices.
 
   # --------------------------------------------------------------------------
   # Execution Limits (Optional)

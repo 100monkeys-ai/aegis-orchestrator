@@ -1400,6 +1400,9 @@ pub struct SealGatewayConfig {
 
 /// Stripe billing configuration (SaaS mode only).
 /// If omitted from `NodeConfigSpec`, billing endpoints return 501 Not Implemented.
+///
+/// Price IDs are fetched dynamically from Stripe at runtime via `GET /v1/billing/prices`
+/// rather than being hardcoded in configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BillingConfig {
     /// Stripe API secret key. Supports `env:VAR_NAME` syntax.
@@ -1408,21 +1411,6 @@ pub struct BillingConfig {
     /// Stripe webhook signing secret. Supports `env:VAR_NAME` syntax.
     #[serde(default)]
     pub stripe_webhook_secret: Option<String>,
-
-    /// Stripe Price IDs per tier and interval.
-    #[serde(default)]
-    pub price_ids: BillingPriceIds,
-}
-
-/// Stripe Price ID mapping for each subscription tier and billing interval.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct BillingPriceIds {
-    pub pro_monthly: Option<String>,
-    pub pro_annual: Option<String>,
-    pub business_monthly: Option<String>,
-    pub business_annual: Option<String>,
-    pub enterprise_monthly: Option<String>,
-    pub enterprise_annual: Option<String>,
 }
 
 // Default value functions

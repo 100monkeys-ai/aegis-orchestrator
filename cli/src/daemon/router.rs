@@ -27,7 +27,8 @@ use crate::daemon::handlers::approvals::{
     reject_request_handler,
 };
 use crate::daemon::handlers::billing::{
-    create_checkout_handler, create_portal_handler, get_subscription_handler, list_invoices_handler,
+    create_checkout_handler, create_portal_handler, get_subscription_handler,
+    list_invoices_handler, list_prices_handler,
 };
 use crate::daemon::handlers::cluster::{cluster_nodes_handler, cluster_status_handler};
 use crate::daemon::handlers::colony::{
@@ -308,6 +309,7 @@ pub(crate) fn create_router(
         .route("/v1/colony/saml", get(get_saml_config).put(set_saml_config))
         .route("/v1/colony/subscription", get(get_subscription))
         // Stripe billing integration (BC-12)
+        .route("/v1/billing/prices", get(list_prices_handler))
         .route("/v1/billing/checkout", post(create_checkout_handler))
         .route("/v1/billing/portal", post(create_portal_handler))
         .route("/v1/billing/subscription", get(get_subscription_handler))
