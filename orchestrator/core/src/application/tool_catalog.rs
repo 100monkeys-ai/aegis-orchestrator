@@ -330,7 +330,6 @@ impl StandardToolCatalog {
             "fs.edit",
             "fs.multi_edit",
             "fs.create_dir",
-            "fs.create.dir",
             "fs.delete",
             "cmd.run",
         ];
