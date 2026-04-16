@@ -24,15 +24,16 @@ COPY aegis-orchestrator/orchestrator/swarm/Cargo.toml ./aegis-orchestrator/orche
 COPY aegis-orchestrator/sdks/Cargo.toml ./aegis-orchestrator/sdks/
 COPY aegis-proto ./aegis-proto
 
+# Copy vendored bollard-stubs in full (patched for Podman "stopping" state);
+# it must be present before the dependency pre-build so bollard compiles
+# against the real stubs, not an empty placeholder.
+COPY aegis-orchestrator/orchestrator/vendor/bollard-stubs ./aegis-orchestrator/orchestrator/vendor/bollard-stubs
+
 # Create stub lib.rs files so cargo can resolve the workspace
 RUN mkdir -p aegis-orchestrator/cli/src && echo "fn main() {}" > aegis-orchestrator/cli/src/main.rs \
     && mkdir -p aegis-orchestrator/orchestrator/core/src && touch aegis-orchestrator/orchestrator/core/src/lib.rs \
     && mkdir -p aegis-orchestrator/orchestrator/swarm/src && touch aegis-orchestrator/orchestrator/swarm/src/lib.rs \
-    && mkdir -p aegis-orchestrator/sdks/src && touch aegis-orchestrator/sdks/src/lib.rs \
-    && mkdir -p aegis-orchestrator/orchestrator/vendor/bollard-stubs/src && touch aegis-orchestrator/orchestrator/vendor/bollard-stubs/src/lib.rs
-
-# Copy vendor Cargo.toml
-COPY aegis-orchestrator/orchestrator/vendor/bollard-stubs/Cargo.toml ./aegis-orchestrator/orchestrator/vendor/bollard-stubs/
+    && mkdir -p aegis-orchestrator/sdks/src && touch aegis-orchestrator/sdks/src/lib.rs
 
 # Pre-build dependencies (this layer is cached)
 RUN cd aegis-orchestrator && cargo build --release --bin aegis 2>/dev/null || true
