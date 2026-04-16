@@ -435,18 +435,22 @@ pub(crate) async fn create_checkout_handler(
         }
     }
 
+    let tenant_meta: std::collections::HashMap<String, String> =
+        [("tenant_id".to_string(), tenant_id.as_str().to_string())]
+            .into_iter()
+            .collect();
+
     let mut params = stripe::CreateCheckoutSession::new();
     params.customer = Some(customer_id_parsed);
     params.mode = Some(stripe::CheckoutSessionMode::Subscription);
     params.success_url = Some(&body.success_url);
     params.cancel_url = Some(&body.cancel_url);
     params.line_items = Some(line_items);
+    // Set metadata on both the session and the subscription so the webhook
+    // handler can find tenant_id regardless of which object Stripe sends.
+    params.metadata = Some(tenant_meta.clone());
     params.subscription_data = Some(stripe::CreateCheckoutSessionSubscriptionData {
-        metadata: Some(
-            [("tenant_id".to_string(), tenant_id.as_str().to_string())]
-                .into_iter()
-                .collect(),
-        ),
+        metadata: Some(tenant_meta),
         ..Default::default()
     });
 
