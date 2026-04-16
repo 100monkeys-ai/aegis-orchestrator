@@ -38,7 +38,7 @@ pub(crate) struct CreateApiKeyRequest {
 
 /// Generate a new API key: `aegis_` prefix + 40 random alphanumeric chars.
 fn generate_api_key() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let suffix: String = (0..40)
         .map(|_| {
             let idx = rng.random_range(0..62u8);
