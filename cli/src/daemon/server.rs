@@ -1174,6 +1174,12 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
         }
     }
 
+    let web_search_api_key = builtin_dispatchers
+        .iter()
+        .find(|d| d.name == "web.search")
+        .and_then(|d| d.api_key.as_ref())
+        .and_then(|k| resolve_env_value(k).ok());
+
     let tool_router = Arc::new(
         aegis_orchestrator_core::infrastructure::tool_router::ToolRouter::new(
             tool_registry.clone(),
@@ -1555,11 +1561,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             execution_service.clone(),
             Arc::new(
                 aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(
-                    builtin_dispatchers
-                        .iter()
-                        .find(|d| d.name == "web.search")
-                        .and_then(|d| d.api_key.as_ref())
-                        .and_then(|k| resolve_env_value(k).ok()),
+                    web_search_api_key,
                 ),
             ),
             event_bus.clone(),
