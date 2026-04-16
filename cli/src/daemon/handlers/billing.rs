@@ -366,8 +366,16 @@ pub(crate) async fn create_checkout_handler(
     } else {
         // Create a new Stripe customer
         let email = identity.email.as_deref().unwrap_or("");
+        let name = identity
+            .raw_claims
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         let mut params = stripe::CreateCustomer::new();
         params.email = Some(email);
+        if !name.is_empty() {
+            params.name = Some(name);
+        }
         params.metadata = Some(
             [("tenant_id".to_string(), tenant_id.as_str().to_string())]
                 .into_iter()
