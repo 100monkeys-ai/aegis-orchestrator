@@ -35,6 +35,8 @@ dependencies = [
  "dotenvy",
  "ed25519-dalek",
  "futures",
+ "hex",
+ "hmac",
  "indicatif",
  "jsonwebtoken",
  "keyring",
