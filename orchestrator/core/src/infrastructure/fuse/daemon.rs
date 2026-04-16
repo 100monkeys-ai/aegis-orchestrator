@@ -27,8 +27,9 @@ use super::fsal_backend::{DirectFsalBackend, FsalBackend};
 use super::inode_table::{InodeTable, ROOT_INODE};
 
 use fuser::{
-    FileAttr, FileType as FuseFileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory,
-    ReplyEntry, ReplyWrite, Request,
+    AccessFlags, BsdFileFlags, FileAttr, FileHandle, FileType as FuseFileType, Filesystem, INodeNo,
+    LockOwner, OpenFlags, RenameFlags, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
+    ReplyWrite, Request, WriteFlags,
 };
 use std::ffi::OsStr;
 use std::path::Path;
@@ -304,7 +305,7 @@ impl FuseFsal {
 }
 
 impl Filesystem for FuseFsal {
-    fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+    fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -313,9 +314,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        debug!(parent = parent, name = %name_str, "FUSE LOOKUP");
+        let parent_u64: u64 = parent.into();
+        debug!(parent = parent_u64, name = %name_str, "FUSE LOOKUP");
 
-        let (parent_handle, parent_path) = match self.resolve_inode(parent) {
+        let (parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -362,7 +364,8 @@ impl Filesystem for FuseFsal {
         }
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
+    fn getattr(&self, _req: &Request, ino: INodeNo, _fh: Option<FileHandle>, reply: ReplyAttr) {
+        let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE GETATTR");
 
         if ino == ROOT_INODE {
@@ -402,16 +405,17 @@ impl Filesystem for FuseFsal {
     }
 
     fn read(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         size: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyData,
     ) {
+        let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, size = size, "FUSE READ");
 
         let (handle, path) = match self.resolve_inode(ino) {
@@ -426,7 +430,7 @@ impl Filesystem for FuseFsal {
             &handle,
             &path,
             &self.context.policy,
-            offset.max(0) as u64,
+            offset,
             size as usize,
         )) {
             Ok(data) => {
@@ -443,17 +447,18 @@ impl Filesystem for FuseFsal {
     }
 
     fn write(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
         data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _write_flags: WriteFlags,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
+        let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, len = data.len(), "FUSE WRITE");
 
         let (handle, path) = match self.resolve_inode(ino) {
@@ -464,13 +469,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        match self.block_on(self.backend.write(
-            &handle,
-            &path,
-            &self.context.policy,
-            offset.max(0) as u64,
-            data,
-        )) {
+        match self.block_on(
+            self.backend
+                .write(&handle, &path, &self.context.policy, offset, data),
+        ) {
             Ok(bytes_written) => {
                 metrics::counter!("aegis_fuse_operations_total", "operation" => "write", "result" => "success").increment(1);
                 metrics::counter!("aegis_fuse_bytes_written_total").increment(bytes_written as u64);
@@ -485,13 +487,14 @@ impl Filesystem for FuseFsal {
     }
 
     fn readdir(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        offset: i64,
-        mut reply: ReplyDirectory,
+        ino: INodeNo,
+        _fh: FileHandle,
+        offset: u64,
+        reply: ReplyDirectory,
     ) {
+        let ino: u64 = ino.into();
         debug!(ino = ino, offset = offset, "FUSE READDIR");
 
         let (_handle, dir_path) = match self.resolve_inode(ino) {
@@ -560,9 +563,9 @@ impl Filesystem for FuseFsal {
     }
 
     fn create(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -577,9 +580,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        debug!(parent = parent, name = %name_str, "FUSE CREATE");
+        let parent_u64: u64 = parent.into();
+        debug!(parent = parent_u64, name = %name_str, "FUSE CREATE");
 
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent) {
+        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -648,9 +652,9 @@ impl Filesystem for FuseFsal {
     }
 
     fn mkdir(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
         _mode: u32,
         _umask: u32,
@@ -664,9 +668,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        debug!(parent = parent, name = %name_str, "FUSE MKDIR");
+        let parent_u64: u64 = parent.into();
+        debug!(parent = parent_u64, name = %name_str, "FUSE MKDIR");
 
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent) {
+        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -723,7 +728,7 @@ impl Filesystem for FuseFsal {
         }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+    fn unlink(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -732,9 +737,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        debug!(parent = parent, name = %name_str, "FUSE UNLINK");
+        let parent_u64: u64 = parent.into();
+        debug!(parent = parent_u64, name = %name_str, "FUSE UNLINK");
 
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent) {
+        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -763,7 +769,7 @@ impl Filesystem for FuseFsal {
         }
     }
 
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
+    fn rmdir(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: fuser::ReplyEmpty) {
         let name_str = match name.to_str() {
             Some(n) => n,
             None => {
@@ -772,9 +778,10 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        debug!(parent = parent, name = %name_str, "FUSE RMDIR");
+        let parent_u64: u64 = parent.into();
+        debug!(parent = parent_u64, name = %name_str, "FUSE RMDIR");
 
-        let (_parent_handle, parent_path) = match self.resolve_inode(parent) {
+        let (_parent_handle, parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -804,13 +811,13 @@ impl Filesystem for FuseFsal {
     }
 
     fn rename(
-        &mut self,
+        &self,
         _req: &Request,
-        parent: u64,
+        parent: INodeNo,
         name: &OsStr,
-        newparent: u64,
+        newparent: INodeNo,
         newname: &OsStr,
-        _flags: u32,
+        _flags: RenameFlags,
         reply: fuser::ReplyEmpty,
     ) {
         let name_str = match name.to_str() {
@@ -828,15 +835,17 @@ impl Filesystem for FuseFsal {
             }
         };
 
+        let parent_u64: u64 = parent.into();
+        let newparent_u64: u64 = newparent.into();
         debug!(
-            parent = parent,
+            parent = parent_u64,
             name = %name_str,
-            newparent = newparent,
+            newparent = newparent_u64,
             newname = %newname_str,
             "FUSE RENAME"
         );
 
-        let (_from_handle, from_parent_path) = match self.resolve_inode(parent) {
+        let (_from_handle, from_parent_path) = match self.resolve_inode(parent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -844,7 +853,7 @@ impl Filesystem for FuseFsal {
             }
         };
 
-        let (_to_handle, to_parent_path) = match self.resolve_inode(newparent) {
+        let (_to_handle, to_parent_path) = match self.resolve_inode(newparent_u64) {
             Some(v) => v,
             None => {
                 reply.error(libc::ENOENT);
@@ -876,9 +885,9 @@ impl Filesystem for FuseFsal {
     }
 
     fn setattr(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
+        ino: INodeNo,
         _mode: Option<u32>,
         _uid: Option<u32>,
         _gid: Option<u32>,
@@ -886,15 +895,16 @@ impl Filesystem for FuseFsal {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        _fh: Option<FileHandle>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        _flags: Option<u32>,
+        _flags: Option<BsdFileFlags>,
         reply: ReplyAttr,
     ) {
         // FSAL does not support chmod/chown/truncate as discrete operations.
         // Return current attributes unchanged (UID/GID squashing makes this a no-op).
+        let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE SETATTR (no-op, returning current attrs)");
 
         if ino == ROOT_INODE {
@@ -927,59 +937,62 @@ impl Filesystem for FuseFsal {
         }
     }
 
-    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: fuser::ReplyOpen) {
         // Stateless open — all I/O goes through read/write with inode lookup.
         // Return fh=0, no special flags.
+        let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE OPEN (stateless)");
-        reply.opened(0, 0);
+        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
     }
 
-    fn opendir(&mut self, _req: &Request, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+    fn opendir(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: fuser::ReplyOpen) {
+        let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE OPENDIR (stateless)");
-        reply.opened(0, 0);
+        reply.opened(FileHandle(0), fuser::FopenFlags::empty());
     }
 
     fn releasedir(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
         reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
     fn flush(
-        &mut self,
+        &self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
-        _lock_owner: u64,
+        ino: INodeNo,
+        _fh: FileHandle,
+        _lock_owner: LockOwner,
         reply: fuser::ReplyEmpty,
     ) {
         // All FSAL writes are synchronous — the gRPC call to the storage
         // backend completes before the FUSE write callback returns. There are
         // no pending writes to drain, so flush is a no-op success.
+        let ino: u64 = ino.into();
         debug!(ino = ino, "FUSE FLUSH (synchronous write path — no-op)");
         metrics::counter!("aegis_fuse_operations_total", "operation" => "flush", "result" => "success").increment(1);
         reply.ok();
     }
 
     fn release(
-        &mut self,
+        &self,
         _req: &Request,
-        _ino: u64,
-        _fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
+        _ino: INodeNo,
+        _fh: FileHandle,
+        _flags: OpenFlags,
+        _lock_owner: Option<LockOwner>,
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
         reply.ok();
     }
 
-    fn access(&mut self, _req: &Request, _ino: u64, _mask: i32, reply: fuser::ReplyEmpty) {
+    fn access(&self, _req: &Request, _ino: INodeNo, _mask: AccessFlags, reply: fuser::ReplyEmpty) {
         // All access control is handled by FSAL policy enforcement.
         // DefaultPermissions mount option handles basic kernel checks.
         reply.ok();
