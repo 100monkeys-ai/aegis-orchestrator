@@ -1874,7 +1874,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
     });
 
     // Keep sweeper shutdown sender alive until daemon shutdown.
-    let mut _health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
+    let mut health_sweeper_shutdown: Option<tokio::sync::watch::Sender<bool>> = None;
 
     // ─── Cluster gRPC server (ADR-059) ─────────────────────────────────────
     // When clustering is enabled, start a second gRPC server on the dedicated
@@ -2009,13 +2009,16 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 let local_provider = Arc::new(
                     match LocalHostStorageProvider::new(&primary_local_path) {
                         Ok(provider) => provider,
-                        Err(primary_err) => {
+                        Err(primary_error) => {
                             match LocalHostStorageProvider::new(&fallback_local_path) {
                                 Ok(provider) => provider,
-                                Err(fallback_err) => {
+                                Err(fallback_error) => {
                                     panic!(
-                                        "Failed to initialize local storage provider. Primary path failed: {}. Fallback temp directory failed: {}. Ensure the temp directory is writable and has sufficient space.",
-                                        primary_err, fallback_err
+                                        "Failed to initialize local storage provider: primary path '{}' failed: {}; fallback temp directory '{}' failed: {}. Remediation: ensure the temp directory is writable and has sufficient space.",
+                                        primary_local_path.display(),
+                                        primary_error,
+                                        fallback_local_path.display(),
+                                        fallback_error
                                     );
                                 }
                             }
@@ -2083,7 +2086,7 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
                 });
                 // Keep sender in lifecycle state so it is dropped during daemon
                 // shutdown, allowing the sweeper to exit cleanly.
-                _health_sweeper_shutdown = Some(shutdown_tx);
+                health_sweeper_shutdown = Some(shutdown_tx);
                 tracing::info!(
                     stale_threshold_secs = stale_threshold.as_secs(),
                     sweep_interval_secs = sweep_interval.as_secs(),

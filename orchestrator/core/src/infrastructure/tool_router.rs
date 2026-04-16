@@ -1660,6 +1660,10 @@ impl ToolServerManager {
                 Err(_) => {
                     // If tasklist itself fails, fail closed and report unhealthy.
                     // This avoids masking real process failures.
+                    warn!(
+                        pid,
+                        "tasklist health check command failed; reporting process as unhealthy"
+                    );
                     false
                 }
             }
