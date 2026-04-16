@@ -21,8 +21,6 @@
 //!
 //! Builtin tool names are defined canonically in `BUILTIN_TOOL_DEFINITIONS`.
 //! For filesystem tools, the canonical create-directory name is `fs.create_dir`.
-//! The alternate dotted form `fs.create.dir` is retained as a legacy compatibility
-//! alias and should not be used for new integrations.
 
 use crate::domain::execution::ExecutionId;
 use crate::domain::mcp::{DomainError, ToolRegistry, ToolServer, ToolServerId, ToolServerStatus};
