@@ -1113,6 +1113,7 @@ mod tests {
             sub: "user-sub-abc123".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: Some("user@example.com".to_string()),
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
                 tenant_id: TenantId::consumer(),

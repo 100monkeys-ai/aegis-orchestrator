@@ -579,6 +579,7 @@ mod tests {
             sub: "admin-1".into(),
             realm_slug: "aegis-system".into(),
             email: Some("admin@example.com".into()),
+            name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Admin,
             },
@@ -590,6 +591,7 @@ mod tests {
             sub: "op-1".into(),
             realm_slug: "aegis-system".into(),
             email: Some("op@example.com".into()),
+            name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Operator,
             },
@@ -601,6 +603,7 @@ mod tests {
             sub: "ro-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Readonly,
             },
@@ -612,6 +615,7 @@ mod tests {
             sub: "user-1".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
                 tenant_id: TenantId::consumer(),
@@ -624,6 +628,7 @@ mod tests {
             sub: "user-2".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
                 tenant_id: TenantId::consumer(),
@@ -636,6 +641,7 @@ mod tests {
             sub: "user-3".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Business,
                 tenant_id: TenantId::consumer(),
@@ -746,6 +752,7 @@ mod tests {
             sub: "tu-1".into(),
             realm_slug: "tenant-acme".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "acme".into(),
             },

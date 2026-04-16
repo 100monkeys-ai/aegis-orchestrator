@@ -125,6 +125,7 @@ mod tests {
             sub: "user-1".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
                 tenant_id: TenantId::consumer(),
@@ -139,6 +140,7 @@ mod tests {
             sub: "admin-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::Operator {
                 aegis_role: AegisRole::Admin,
             },
@@ -152,6 +154,7 @@ mod tests {
             sub: "tu-1".to_string(),
             realm_slug: "tenant-acme".to_string(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: "tenant-acme".to_string(),
             },
@@ -166,6 +169,7 @@ mod tests {
             sub: "sa-1".to_string(),
             realm_slug: "aegis-system".to_string(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "sdk-python".to_string(),
             },

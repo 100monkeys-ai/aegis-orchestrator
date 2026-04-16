@@ -90,6 +90,7 @@ mod tests {
             sub: "svc-1".into(),
             realm_slug: "aegis-system".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ServiceAccount {
                 client_id: "aegis-temporal-worker".into(),
             },
@@ -101,6 +102,7 @@ mod tests {
             sub: "user-1".into(),
             realm_slug: "zaru-consumer".into(),
             email: None,
+            name: None,
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Free,
                 tenant_id: TenantId::consumer(),
@@ -113,6 +115,7 @@ mod tests {
             sub: "tu-1".into(),
             realm_slug: format!("tenant-{slug}"),
             email: None,
+            name: None,
             identity_kind: IdentityKind::TenantUser {
                 tenant_slug: slug.into(),
             },

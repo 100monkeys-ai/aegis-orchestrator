@@ -102,6 +102,8 @@ pub struct UserIdentity {
     pub realm_slug: String,
     /// User email if present in claims
     pub email: Option<String>,
+    /// User's display name if present in claims (e.g. "given_name family_name")
+    pub name: Option<String>,
     /// Classification of this identity
     pub identity_kind: IdentityKind,
 }
@@ -431,6 +433,7 @@ mod tests {
             sub: "550e8400-e29b-41d4-a716-446655440000".to_string(),
             realm_slug: "zaru-consumer".to_string(),
             email: Some("user@example.com".to_string()),
+            name: Some("Test User".to_string()),
             identity_kind: IdentityKind::ConsumerUser {
                 zaru_tier: ZaruTier::Pro,
                 tenant_id: TenantId::consumer(),

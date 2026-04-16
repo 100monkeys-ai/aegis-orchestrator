@@ -363,11 +363,7 @@ pub(crate) async fn create_checkout_handler(
 
     let customer_id = if let Some(ref sub) = existing_sub {
         // Sync name/email to Stripe on every checkout in case they changed
-        let name = identity
-            .raw_claims
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let name = identity.name.as_deref().unwrap_or("");
         let email = identity.email.as_deref().unwrap_or("");
         if let Ok(cid) = sub.stripe_customer_id.parse::<stripe::CustomerId>() {
             let mut update = stripe::UpdateCustomer::new();
@@ -385,11 +381,7 @@ pub(crate) async fn create_checkout_handler(
     } else {
         // Create a new Stripe customer
         let email = identity.email.as_deref().unwrap_or("");
-        let name = identity
-            .raw_claims
-            .get("name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let name = identity.name.as_deref().unwrap_or("");
         let mut params = stripe::CreateCustomer::new();
         params.email = Some(email);
         if !name.is_empty() {

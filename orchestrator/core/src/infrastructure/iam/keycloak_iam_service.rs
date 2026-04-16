@@ -440,6 +440,11 @@ impl IdentityProvider for StandardIamService {
             sub: claims.sub.clone(),
             realm_slug: realm.realm_slug.clone(),
             email: claims.email.clone(),
+            name: claims
+                .extra
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             identity_kind: identity_kind.clone(),
         };
 
@@ -647,6 +652,7 @@ mod tests {
                 sub: "test-sub".to_string(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Pro,
                     tenant_id: crate::domain::tenant::TenantId::consumer(),
@@ -677,6 +683,7 @@ mod tests {
                 sub: "test-sub".to_string(),
                 realm_slug: "aegis-system".to_string(),
                 email: None,
+                name: None,
                 identity_kind: IdentityKind::Operator {
                     aegis_role: AegisRole::Admin,
                 },

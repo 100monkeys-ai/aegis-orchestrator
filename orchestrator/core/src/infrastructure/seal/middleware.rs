@@ -214,6 +214,7 @@ async fn check_rate_limit(
         sub: user_id.clone(),
         realm_slug: "zaru-consumer".to_string(),
         email: None,
+        name: None,
         identity_kind: IdentityKind::ConsumerUser {
             zaru_tier: tier,
             tenant_id: crate::domain::tenant::TenantId::consumer(),

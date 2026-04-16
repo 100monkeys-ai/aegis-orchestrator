@@ -670,6 +670,7 @@ impl InnerLoopService {
                             sub: "inner-loop".to_string(),
                             realm_slug: "aegis-system".to_string(),
                             email: None,
+                            name: None,
                             identity_kind: crate::domain::iam::IdentityKind::TenantUser {
                                 tenant_slug: "aegis-system".to_string(),
                             },
@@ -752,6 +753,7 @@ impl InnerLoopService {
                                     sub: "inner-loop".to_string(),
                                     realm_slug: "aegis-system".to_string(),
                                     email: None,
+                                    name: None,
                                     identity_kind: crate::domain::iam::IdentityKind::TenantUser {
                                         tenant_slug: "aegis-system".to_string(),
                                     },

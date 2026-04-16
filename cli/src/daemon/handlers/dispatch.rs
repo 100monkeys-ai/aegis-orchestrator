@@ -52,6 +52,7 @@ pub(crate) async fn dispatch_gateway_handler(
                 sub: sub.clone(),
                 realm_slug: "zaru-consumer".to_string(),
                 email: None,
+                name: None,
                 identity_kind: IdentityKind::ConsumerUser {
                     zaru_tier: ZaruTier::Free,
                     tenant_id: exec.tenant_id.clone(),
