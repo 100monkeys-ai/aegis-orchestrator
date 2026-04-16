@@ -17,6 +17,7 @@ use aegis_orchestrator_core::application::start_workflow_execution::{
 };
 use aegis_orchestrator_core::domain::iam::{IdentityKind, UserIdentity};
 use aegis_orchestrator_core::domain::tenant::TenantId;
+use aegis_orchestrator_core::infrastructure::workflow_parser::WorkflowParser;
 use aegis_orchestrator_core::presentation::keycloak_auth::ScopeGuard;
 
 use crate::daemon::handlers::tenant_id_from_identity;
@@ -236,22 +237,26 @@ pub(crate) async fn get_workflow_handler(
         .find_by_name_visible(&tenant_id, &name)
         .await
     {
-        Ok(Some(workflow)) => Ok((
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "id": workflow.id.0,
-                "name": workflow.metadata.name,
-                "version": workflow.metadata.version,
-                "description": workflow.metadata.description,
-                "scope": workflow.scope.to_string(),
-                "labels": workflow.metadata.labels,
-                "created_at": workflow.created_at.to_rfc3339(),
-                "updated_at": workflow.updated_at.map(|t| t.to_rfc3339()),
-                "tenant_id": workflow.tenant_id.as_str(),
-                "input_schema": workflow.metadata.input_schema,
-            })),
-        )
-            .into_response()),
+        Ok(Some(workflow)) => {
+            let manifest_yaml = WorkflowParser::to_yaml(&workflow).unwrap_or_default();
+            Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "id": workflow.id.0,
+                    "name": workflow.metadata.name,
+                    "version": workflow.metadata.version,
+                    "description": workflow.metadata.description,
+                    "scope": workflow.scope.to_string(),
+                    "labels": workflow.metadata.labels,
+                    "created_at": workflow.created_at.to_rfc3339(),
+                    "updated_at": workflow.updated_at.map(|t| t.to_rfc3339()),
+                    "tenant_id": workflow.tenant_id.as_str(),
+                    "input_schema": workflow.metadata.input_schema,
+                    "manifest_yaml": manifest_yaml,
+                })),
+            )
+                .into_response())
+        }
         _ => Ok((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
