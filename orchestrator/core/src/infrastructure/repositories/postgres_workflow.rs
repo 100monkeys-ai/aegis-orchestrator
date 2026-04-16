@@ -69,7 +69,7 @@ impl PostgresWorkflowRepository {
         match value {
             serde_json::Value::Object(map) => {
                 let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
-                entries.sort_by_key(|(k, _)| k.clone());
+                entries.sort_by_key(|(k, _)| (*k).clone());
 
                 let mut sorted_map = serde_json::Map::with_capacity(entries.len());
                 for (key, val) in entries {
