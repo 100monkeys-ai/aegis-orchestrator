@@ -4,11 +4,12 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::Json;
 use chrono::Utc;
+use tracing::warn;
 use uuid::Uuid;
 
 use aegis_orchestrator_core::application::register_workflow::RegisterWorkflowUseCase;
@@ -167,19 +168,35 @@ pub(crate) async fn list_workflows_handler(
     let tenant_id = tenant_id_from_identity(identity.as_ref().map(|identity| &identity.0));
 
     let workflows = if query.scope.as_deref() == Some("global") {
-        state.workflow_repo.list_global().await.unwrap_or_default()
+        match state.workflow_repo.list_global().await {
+            Ok(workflows) => workflows,
+            Err(err) => {
+                warn!("Failed to list global workflows: {}", err);
+                Vec::new()
+            }
+        }
     } else if query.visible.unwrap_or(false) {
-        state
-            .workflow_repo
-            .list_visible(&tenant_id)
-            .await
-            .unwrap_or_default()
+        match state.workflow_repo.list_visible(&tenant_id).await {
+            Ok(workflows) => workflows,
+            Err(err) => {
+                warn!(
+                    "Failed to list visible workflows for tenant_id={}: {}",
+                    tenant_id, err
+                );
+                Vec::new()
+            }
+        }
     } else {
-        state
-            .workflow_repo
-            .list_all_for_tenant(&tenant_id)
-            .await
-            .unwrap_or_default()
+        match state.workflow_repo.list_all_for_tenant(&tenant_id).await {
+            Ok(workflows) => workflows,
+            Err(err) => {
+                warn!(
+                    "Failed to list all workflows for tenant_id={}: {}",
+                    tenant_id, err
+                );
+                Vec::new()
+            }
+        }
     };
 
     let counts: Vec<i64> = {
@@ -190,9 +207,18 @@ pub(crate) async fn list_workflows_handler(
                 let tid = w.tenant_id.clone();
                 let wid = w.id;
                 async move {
-                    repo.count_by_workflow_for_tenant(&tid, wid)
-                        .await
-                        .unwrap_or(0)
+                    match repo.count_by_workflow_for_tenant(&tid, wid).await {
+                        Ok(count) => count,
+                        Err(err) => {
+                            warn!(
+                                workflow_id = %wid.0,
+                                tenant_id = %tid,
+                                error = %err,
+                                "Failed to fetch workflow execution count; defaulting to 0"
+                            );
+                            0
+                        }
+                    }
                 }
             })
             .collect();
@@ -238,7 +264,18 @@ pub(crate) async fn get_workflow_handler(
         .await
     {
         Ok(Some(workflow)) => {
-            let manifest_yaml = WorkflowParser::to_yaml(&workflow).unwrap_or_default();
+            let manifest_yaml = match WorkflowParser::to_yaml(&workflow) {
+                Ok(yaml) => yaml,
+                Err(err) => {
+                    warn!(
+                        workflow_name = %workflow.metadata.name,
+                        workflow_id = %workflow.id.0,
+                        error = %err,
+                        "Failed to serialize workflow to YAML in get_workflow_handler"
+                    );
+                    String::new()
+                }
+            };
             Ok((
                 StatusCode::OK,
                 Json(serde_json::json!({
