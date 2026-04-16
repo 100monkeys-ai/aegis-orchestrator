@@ -24,7 +24,7 @@ use axum::{
 use base64::Engine as _;
 use serde_json::json;
 use std::{collections::HashMap, sync::Arc};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::daemon::state::AppState;
 use aegis_orchestrator_core::application::stimulus::StimulusError;
