@@ -175,17 +175,6 @@ fn temporal_connection_max_retries(raw_value: Option<i32>) -> i32 {
 // cluster_status_view, load_cluster_nodes moved to cluster_helpers.rs
 
 pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()> {
-    // Daemonize on Unix
-    // NOTE: We skip internal daemonization because calling fork() (via daemonize)
-    // inside a Tokio runtime (#[tokio::main]) breaks the reactor.
-    // The CLI 'daemon start' command already spawns this process as a detached background child.
-    /*
-    #[cfg(unix)]
-    {
-        daemonize_process()?;
-    }
-    */
-
     // Write PID file
     let pid = std::process::id();
     write_pid_file(pid)?;
