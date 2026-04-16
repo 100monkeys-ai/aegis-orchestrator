@@ -801,7 +801,7 @@ async fn test_invoke_tool_no_session() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -858,7 +858,7 @@ async fn test_invoke_tool_bad_signature() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -891,7 +891,7 @@ async fn workflow_validate_tool_returns_success_for_valid_manifest() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -933,7 +933,7 @@ async fn workflow_update_tool_returns_failure_with_deterministic_validation_deta
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -1033,7 +1033,7 @@ async fn workflow_create_semantic_validation_rejects_ambiguous_thresholded_succe
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -1328,7 +1328,7 @@ async fn workflow_run_tool_forwards_blackboard() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -1429,7 +1429,7 @@ async fn workflow_execution_tools_list_and_get() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -1552,7 +1552,7 @@ async fn task_logs_tool_returns_paginated_execution_events() {
         Arc::new(LogsTestExecutionService {
             execution: execution.clone(),
         }),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -1617,7 +1617,7 @@ async fn task_logs_tool_returns_execution_fetch_error() {
         Arc::new(LogsTestExecutionService {
             execution: missing_execution,
         }),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -1713,7 +1713,7 @@ async fn test_invoke_tool_execution_modes() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -1842,7 +1842,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -1922,7 +1922,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -2001,7 +2001,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -2084,7 +2084,7 @@ async fn invoke_tool_internal_blocks_destructive_workflow_tools_for_low_trust_ti
         volume_registry,
         Arc::new(FilteringAgentLifecycleService { agent }),
         Arc::new(exec_service),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -2153,7 +2153,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
         volume_registry,
         Arc::new(FilteringAgentLifecycleService { agent }),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );
@@ -2384,7 +2384,7 @@ fn build_version_aware_service(
             agent_id,
         }),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -2544,7 +2544,7 @@ async fn workflow_run_with_version_passes_version_through() {
             agent_id,
         }),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -2635,7 +2635,7 @@ fn make_execute_intent_service() -> ToolInvocationService {
         volume_registry,
         Arc::new(TestAgentLifecycleService),
         Arc::new(TestExecutionService),
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     )
@@ -3084,7 +3084,7 @@ async fn tool_invocation_propagates_initiating_user_sub_to_child_execution() {
             agent: target_agent,
         }),
         exec_service,
-        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::new()),
+        Arc::new(crate::infrastructure::web_tools::ReqwestWebToolAdapter::unconfigured()),
         Arc::new(crate::infrastructure::event_bus::EventBus::new(1024)),
         None,
     );

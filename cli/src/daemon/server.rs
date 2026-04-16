@@ -1565,7 +1565,13 @@ pub async fn start_daemon(config_path: Option<PathBuf>, port: u16) -> Result<()>
             agent_service.clone(),
             execution_service.clone(),
             Arc::new(
-                aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(),
+                aegis_orchestrator_core::infrastructure::web_tools::ReqwestWebToolAdapter::new(
+                    builtin_dispatchers
+                        .iter()
+                        .find(|d| d.name == "web.search")
+                        .and_then(|d| d.api_key.as_ref())
+                        .and_then(|k| resolve_env_value(k).ok()),
+                ),
             ),
             event_bus.clone(),
             config.spec.seal_gateway.as_ref().map(|gateway| {

@@ -72,9 +72,7 @@ fuser = "0.15"
 libc = "0.2"
 
 url = "2.5.8"
-scraper = "0.25.0"
 html2md = "0.2"
-urlencoding = "2.1"
 
 # Cryptography & Security (SEAL)
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }

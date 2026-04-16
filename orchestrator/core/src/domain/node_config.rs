@@ -857,6 +857,11 @@ pub struct BuiltinDispatcherConfig {
     /// Capabilities provided by this dispatcher
     #[serde(default)]
     pub capabilities: Vec<CapabilityConfig>,
+
+    /// Optional API key for builtins that call external services.
+    /// Supports "env:VAR_NAME" and "secret:path/to/secret" resolution.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 /// MCP Server configuration
