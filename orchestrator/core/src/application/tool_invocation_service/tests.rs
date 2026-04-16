@@ -1827,6 +1827,7 @@ async fn get_available_tools_returns_builtin_dispatcher_metadata() {
                 name: "fs.read".to_string(),
                 skip_judge: true,
             }],
+            api_key: None,
         }],
     ));
     let middleware = Arc::new(SealMiddleware::new());
@@ -1874,6 +1875,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
                     name: "fs.read".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "cmd.run".to_string(),
@@ -1883,6 +1885,7 @@ async fn get_available_tools_for_context_filters_disallowed_tools() {
                     name: "cmd.run".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
         ],
     ));
@@ -1953,6 +1956,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.delete".to_string(),
@@ -1962,6 +1966,7 @@ async fn get_available_tools_for_context_hides_destructive_workflow_tools_for_lo
                     name: "aegis.workflow.delete".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
         ],
     ));
@@ -2126,6 +2131,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
                     name: "fs.read".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "cmd.run".to_string(),
@@ -2135,6 +2141,7 @@ async fn get_available_tools_for_agent_filters_to_declared_manifest_tools() {
                     name: "cmd.run".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
         ],
     ));
@@ -3132,6 +3139,7 @@ async fn list_tools_does_not_duplicate_when_dispatchers_present() {
             name: "aegis.workflow.wait".to_string(),
             skip_judge: true,
         }],
+        api_key: None,
     }];
     let router = ToolRouter::new(registry, servers, dispatchers);
 

@@ -275,6 +275,7 @@ impl ToolRouter {
                         name: name.to_string(),
                         skip_judge,
                     }],
+                    api_key: None,
                 }
             })
             .collect()
@@ -1834,6 +1835,7 @@ mod tests {
                     name: "aegis.agent.create".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.create".to_string(),
@@ -1843,6 +1845,7 @@ mod tests {
                     name: "aegis.workflow.create".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.task.logs".to_string(),
@@ -1852,6 +1855,7 @@ mod tests {
                     name: "aegis.task.logs".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.status".to_string(),
@@ -1861,6 +1865,7 @@ mod tests {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
         ];
 
@@ -1936,6 +1941,7 @@ mod tests {
                     name: "aegis.workflow.cancel".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.signal".to_string(),
@@ -1945,6 +1951,7 @@ mod tests {
                     name: "aegis.workflow.signal".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.remove".to_string(),
@@ -1954,6 +1961,7 @@ mod tests {
                     name: "aegis.workflow.remove".to_string(),
                     skip_judge: false,
                 }],
+                api_key: None,
             },
             BuiltinDispatcherConfig {
                 name: "aegis.workflow.status".to_string(),
@@ -1963,6 +1971,7 @@ mod tests {
                     name: "aegis.workflow.status".to_string(),
                     skip_judge: true,
                 }],
+                api_key: None,
             },
         ];
 
