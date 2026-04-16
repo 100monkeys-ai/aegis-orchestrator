@@ -362,6 +362,25 @@ pub(crate) async fn create_checkout_handler(
     };
 
     let customer_id = if let Some(ref sub) = existing_sub {
+        // Sync name/email to Stripe on every checkout in case they changed
+        let name = identity
+            .raw_claims
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let email = identity.email.as_deref().unwrap_or("");
+        if let Ok(cid) = sub.stripe_customer_id.parse::<stripe::CustomerId>() {
+            let mut update = stripe::UpdateCustomer::new();
+            if !name.is_empty() {
+                update.name = Some(name);
+            }
+            if !email.is_empty() {
+                update.email = Some(email);
+            }
+            if let Err(e) = stripe::Customer::update(&stripe, &cid, update).await {
+                warn!(error = %e, "Failed to sync customer name/email to Stripe");
+            }
+        }
         sub.stripe_customer_id.clone()
     } else {
         // Create a new Stripe customer
