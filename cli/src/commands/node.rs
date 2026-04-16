@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use colored::Colorize;
 use ed25519_dalek::{Signer, SigningKey};
-use rand::rngs::OsRng;
+use rand_core::OsRng;
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;

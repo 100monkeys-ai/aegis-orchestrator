@@ -241,7 +241,7 @@ mod tests {
     /// the configured margin.
     #[test]
     fn token_refresh_margin_is_stored_and_accessible() {
-        let signing_key = Arc::new(SigningKey::generate(&mut rand::rngs::OsRng));
+        let signing_key = Arc::new(SigningKey::generate(&mut rand_core::OsRng));
         let node_id = NodeId(Uuid::new_v4());
         let client = NodeClusterClient::new(
             "http://localhost:50051".to_string(),
